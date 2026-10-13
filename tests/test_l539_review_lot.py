@@ -243,6 +243,40 @@ class ReviewLotDbTest(PgTestCase):
         self.assertEqual(
             storage.of(self.db).work.open_by_ref(review_lot.ref_of(self.lot)), [])
 
+    def test_deux_ouvertures_concurrentes_ne_donnent_qu_un_lot(self):
+        """Revue #544 r2 : le verrou de la ligne marquée sérialise les appels ;
+        le perdant relit la référence, voit le lot du gagnant et rend son
+        identifiant sans rien écrire."""
+        import threading
+        ref = review_lot.ref_of(self.lot)
+        other = self.connect()
+        opened = other.transaction()
+        tx = opened.__enter__()
+        outcome: dict = {}
+        thread = threading.Thread(target=lambda: outcome.update(
+            out=review_lot.open_after_merge(
+                self.db, lot=self.lot, klass={"class": "light", "why": "policy"},
+                merged_sha="f" * 40)))
+        try:
+            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE", (self.lot,))
+            thread.start()
+            thread.join(1.5)
+            self.assertTrue(thread.is_alive(), "l'appel n'a pas attendu le verrou")
+            winner = tx.query(
+                "INSERT INTO work_items (type, source, app, title, body, issue_ref, state)"
+                " VALUES ('evolution', %s, 'ameesh', 'REVUE', '', %s, 'intake')"
+                " RETURNING id", (ref, ref))[0]["id"]
+        finally:
+            opened.__exit__(None, None, None)
+            thread.join(30)
+            other.close()
+        self.assertFalse(thread.is_alive())
+        out = outcome["out"]
+        self.assertFalse(out["created"], out)
+        self.assertEqual(out["id"], winner)
+        self.assertEqual([i["id"] for i in storage.of(self.db).work.by_issue_ref(ref)],
+                         [winner])
+
     def test_un_lot_inconnu_est_rendu_sans_erreur(self):
         out = review_lot.open_after_merge(self.db, lot=99999,
                                           klass={"class": "light"}, merged_sha="c" * 40)

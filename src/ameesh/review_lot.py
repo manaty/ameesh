@@ -15,7 +15,9 @@ toute erreur de cette écriture est **rendue**, jamais levée — le lot d'origi
 reste fusionné. L'idempotence tient à deux marques écrites **dans la même
 transaction** que la création (revue #544 r1) : le lot de relecture lui-même
 (`issue_ref = review-after-merge:#<lot>`, **quel que soit son état**) et une
-ligne de journal sur le lot fusionné, qui reste un confort.
+ligne de journal sur le lot fusionné, qui reste un confort. Deux appels
+**concurrents** sont sérialisés par le verrou de la ligne marquée, qui est
+posé avant l'insertion : le perdant rend le lot du gagnant (revue #544 r2).
 """
 from __future__ import annotations
 
@@ -193,6 +195,14 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
             mark_note="%s lot #{lot} ouvert (classe light, relecture due %s)"
                       % (ref, deadline()))
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
+        # revue #544 r2 : un appel concurrent a pu créer le lot pendant
+        # l'attente du verrou ; on rend l'identifiant du gagnant, pas un échec
+        existing = _open(ops, ref)
+        if existing is not None:
+            out.update({"id": int(existing["id"]),
+                        "why": "lot de relecture #%d déjà ouvert (course perdue : %s)"
+                               % (int(existing["id"]), type(exc).__name__)})
+            return out
         out["why"] = "lot de relecture non ouvert : %s: %s" % (
             type(exc).__name__, str(exc)[:200])
         return out

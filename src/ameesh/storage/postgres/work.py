@@ -199,8 +199,27 @@ class WorkItems(interface.WorkItems):
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
-        si bien qu'un échec de la marque annule la création (et l'inverse)."""
+        si bien qu'un échec de la marque annule la création (et l'inverse).
+        La ligne marquée est verrouillée **avant** l'insertion et la
+        `issue_ref` est relue sous ce verrou : deux appels concurrents ne
+        peuvent pas créer deux lots pour la même référence (revue #544 r2)."""
         with self.db.transaction() as tx:
+            marked = None
+            if mark_item_id is not None:
+                marked = tx.query(
+                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                    (int(mark_item_id),))
+                if not marked:
+                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+                if str(issue_ref or "").strip():
+                    # le verrou sur la ligne marquée sérialise les créateurs :
+                    # le second relit la référence après le commit du premier
+                    duplicate = tx.query(
+                        "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                        " ORDER BY id LIMIT 1", (issue_ref,))
+                    if duplicate:
+                        raise DbError("issue_ref %s is already carried by lot #%d"
+                                      % (issue_ref, int(duplicate[0]["id"])))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -225,11 +244,6 @@ class WorkItems(interface.WorkItems):
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             if mark_item_id is not None and str(mark_note or "").strip():
-                marked = tx.query(
-                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                    (int(mark_item_id),))
-                if not marked:
-                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
                 WorkItems(tx)._event(
                     int(mark_item_id), marked[0]["state"],
                     str(mark_note).replace("{lot}", str(item["id"])), actor)

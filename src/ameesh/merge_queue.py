@@ -207,11 +207,17 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     the frozen head, a non-draft PR, and a target that is not `release/*`.
     Any doubt about the class (unreadable canon, unreachable diff, `cfg`
     absent) leaves the verdict requirement in place; the class and its reason
-    are traced in the queue note.
+    are traced in the queue note. The target resolved here (`branch_target`,
+    then the project's, then the repository's default) carries through the
+    classification and the admission (revue #544 r2).
 
-    The CI is required **explicitly**: `ci=None` (no reader) and a reader that
-    answers nothing are refused, like a red CI — an absent status is not a
-    green one (revue #544 r1)."""
+    The CI is required **explicitly**: for a project without `ci_required`,
+    `ci=None` (no reader) and a reader that answers nothing are refused, like
+    a red CI — an absent status is not a green one (revue #544 r1). A project
+    with `ci_required` may instead certify admission with GitHub's CI on the
+    frozen commit when no PR vouches for it (`ci=None`, or a reader that
+    answers nothing because there is no open PR): a green commit CI is not
+    blocked by the absence of a PR (revue #544 r2)."""
     from . import lot_class
     from . import plan_github, radar
     row = work.get(db, lot)
@@ -248,7 +254,6 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
-    target = row.get("branch_target") or plan_git.default_target(repo)
     klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
     light = klass.get("class") == lot_class.LIGHT
     verdict = latest_verdict(marks)
@@ -258,28 +263,33 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
                             if verdict else "", klass.get("class") or "?"))
+    needs_commit_ci = project is not None and getattr(project, "ci_required", False)
+    status = None
     if ci is None:
-        raise QueueError("lot #%d has no CI reader: a green CI on the frozen head %s is "
-                         "required before entering the queue" % (lot, tip[:12]))
-    try:
-        status = ci(row["branch"])
-    except plan_github.GithubError as exc:
-        raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
-                         "gh works" % (row["branch"], exc)) from exc
-    if not status:
-        raise QueueError("no CI status for branch %s (lot #%d): a green CI on the frozen "
-                         "head %s is required" % (row["branch"], lot, tip[:12]))
-    if not _same(status.get("head"), tip):
-        raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
-                         "vouch for the frozen commit" % (status.get("number"),
-                                                         (status.get("head") or "?")[:12],
-                                                         tip[:12]))
-    if not status.get("green"):
-        raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-    if light and status.get("draft"):
-        raise QueueError("PR #%s is a draft: a light lot merges only from a "
-                         "non-draft PR" % status.get("number"))
-    if project is not None and getattr(project, "ci_required", False):
+        if not needs_commit_ci:
+            raise QueueError("lot #%d has no CI reader: a green CI on the frozen head %s is "
+                             "required before entering the queue" % (lot, tip[:12]))
+    else:
+        try:
+            status = ci(row["branch"])
+        except plan_github.GithubError as exc:
+            raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
+                             "gh works" % (row["branch"], exc)) from exc
+        if not status and not needs_commit_ci:
+            raise QueueError("no CI status for branch %s (lot #%d): a green CI on the frozen "
+                             "head %s is required" % (row["branch"], lot, tip[:12]))
+    if status:
+        if not _same(status.get("head"), tip):
+            raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
+                             "vouch for the frozen commit" % (status.get("number"),
+                                                             (status.get("head") or "?")[:12],
+                                                             tip[:12]))
+        if not status.get("green"):
+            raise QueueError("the CI of PR #%s is not green" % status.get("number"))
+        if light and status.get("draft"):
+            raise QueueError("PR #%s is a draft: a light lot merges only from a "
+                             "non-draft PR" % status.get("number"))
+    if needs_commit_ci:
         _required_ci(project, tip, commit_ci)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),

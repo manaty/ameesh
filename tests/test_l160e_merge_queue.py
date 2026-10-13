@@ -173,6 +173,24 @@ class EntryTest(_Base):
             self.enter(2, ci=None)
         self.assertEqual(set(self.fake.queue_rows), {1})
 
+    def test_required_commit_ci_certifies_a_landing_without_a_pr(self):
+        """Revue #544 r2 : sans PR (lecteur muet ou `None`), un projet
+        `ci_required` se certifie par la CI du commit gelé — le refus de
+        l'absence de PR ne passe plus avant elle."""
+        self.ready(1)
+        project = radar.Project(name="p", repo=self.repo, github="o/r", ci_required=True)
+        red = {"runs": 1, "green": False, "pending": [], "failed": ["ci"]}
+        with self.assertRaisesRegex(merge_queue.QueueError, "is red"):
+            merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                              ci=lambda branch: None, project=project,
+                              commit_ci=lambda sha: red)
+        self.assertEqual(self.fake.queue_rows, {})
+        green = {"runs": 1, "green": True, "pending": [], "failed": []}
+        row = merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                                ci=lambda branch: None, project=project,
+                                commit_ci=lambda sha: green)
+        self.assertEqual(row["state"], "queued")
+
     def test_sha_prefixes_are_resolved_and_compared_whole(self):
         tip = self.tip(1)
         self.ready(1, sha=tip[:1])  # "a": any tip starting with that letter would match
@@ -358,6 +376,39 @@ class LightClassTest(_Base):
         rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
                  "title": "t", "assignee": "a1", "frozen_sha": "a" * 12, "reason": ""}]
         self.assertIn("class light", merge_queue.show_lines(rows, {1: "light"})[1])
+
+
+class TargetResolutionTest(_Base):
+    """Revue #544 r2 : la cible résolue au départ (`project.target` compris)
+    porte la classification et l'admission ; le défaut du dépôt ne l'écrase
+    plus."""
+
+    def project(self):
+        return radar.Project(name="p", repo=self.repo, target="develop", github="o/r")
+
+    def test_the_project_target_carries_the_classification(self):
+        tip = self.tip(1)
+        self.marks[1] = [{"id": 1, "kind": "frozen", "sha": tip, "at_ts": 1.0}]
+        bases = []
+
+        def of_lot(db, lot, **kw):
+            bases.append(kw.get("base"))
+            return {"class": "light" if kw.get("base") == "main" else "sensitive",
+                    "why": "base %s" % kw.get("base")}
+        with mock.patch.object(lot_class, "of_lot", side_effect=of_lot):
+            with self.assertRaisesRegex(merge_queue.QueueError, "class: sensitive"):
+                merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                                  ci=self.green(1), project=self.project())
+        self.assertEqual(bases, ["develop"])
+
+    def test_the_project_target_carries_the_admission(self):
+        self.ready(1)
+        with mock.patch.object(lot_class, "of_lot",
+                               return_value={"class": "sensitive", "why": "policy"}):
+            row = merge_queue.enter(None, 1, repo=self.repo, actor="orch",
+                                    ci=self.green(1), project=self.project())
+        self.assertEqual(row["target"], "develop")
+        self.assertEqual(self.fake.queue_rows[1]["target"], "develop")
 
 
 class ClassOfSourcesTest(unittest.TestCase):

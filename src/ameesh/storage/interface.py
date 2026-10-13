@@ -1005,7 +1005,10 @@ class WorkItems(Domain):
         `mark_note`, si non vide, est écrit au journal de `mark_item_id` dans
         la **même** transaction (L539 : la marque d'idempotence du lot de
         relecture ne peut pas survivre seule à l'échec de l'autre écriture) ;
-        `{lot}` y est remplacé par l'identifiant du lot créé."""
+        `{lot}` y est remplacé par l'identifiant du lot créé. La ligne
+        `mark_item_id` est verrouillée avant l'insertion et `issue_ref` y est
+        relue sous ce verrou : deux créations concurrentes de la même
+        référence ne peuvent pas aboutir toutes les deux (revue #544 r2)."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
