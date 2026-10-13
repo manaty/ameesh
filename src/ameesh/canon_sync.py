@@ -1472,20 +1472,19 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
 
     with db.transaction() as tx:
         st = storage.of(tx)
-        # #802 : au démarrage d'un hôte, N exécutants synchronisent le même
+        # #802/#831 : au démarrage d'un hôte, N exécutants synchronisent le même
         # canon en parallèle. Sans sérialisation, chacun lit le même état
         # initial (`before`), rejoue les mêmes upserts et attend les verrous de
         # ligne du premier : la file de verrous dépasse statement_timeout, le
         # sync échoue et la porte d'hôte reste fermée (« canon not read in
-        # full, no claim »). Le verrou consultatif est pris AVANT la lecture :
-        # une fois le premier sync commité, les suivants relisent l'état à
-        # jour et n'écrivent rien. Lié à la transaction, il est relâché au
-        # commit comme au rollback ; la clé est le canon ET le schéma (la table
-        # `work_packages` est partagée, et une base de test porte plusieurs
-        # schémas : deux schémas ne doivent pas s'attendre).
-        tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
-                 "current_schema() || ':canon-sync-packages:' || %s, 0))",
-                 (ident or "",))
+        # full, no claim »). Le verrou est pris AVANT la lecture
+        # (`packages.lock_sync`) : une fois le premier sync commité, les
+        # suivants relisent l'état à jour et n'écrivent rien. Lié à la
+        # transaction, il est relâché au commit comme au rollback ; un seul
+        # verrou par schéma, tous canons confondus — les identifiants de
+        # paquets sont globaux (le premier canon qui en déclare un le garde),
+        # et la bascule du canon par défaut écrit la même colonne.
+        st.packages.lock_sync()
         before = {row["id"]: row for row in st.packages.all(include_absent=True)}
         seen: set[str] = set()
         for package in canon.packages:

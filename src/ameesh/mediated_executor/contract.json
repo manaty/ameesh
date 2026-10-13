@@ -3773,7 +3773,7 @@
   }
  ],
  "refused": {
-  "interface_total": 385,
+  "interface_total": 386,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4027,6 +4027,7 @@
    "packages": [
     "all",
     "get",
+    "lock_sync",
     "retire",
     "upsert"
    ],
