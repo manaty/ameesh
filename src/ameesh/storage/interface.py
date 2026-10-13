@@ -993,13 +993,22 @@ class WorkItems(Domain):
             package_id: str | None = None, package_parent: str | None = None,
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
-            estimate_source: str | None = None, change_size: str | None = None) -> dict:
+            estimate_source: str | None = None, change_size: str | None = None,
+            mark_item_id: int | None = None, mark_note: str = "") -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
         si `change_size`, L157b) et sa première ligne de journal ; rend le
-        lot."""
+        lot.
+
+        `mark_note`, si non vide, est écrit au journal de `mark_item_id` dans
+        la **même** transaction (L539 : la marque d'idempotence du lot de
+        relecture ne peut pas survivre seule à l'échec de l'autre écriture) ;
+        `{lot}` y est remplacé par l'identifiant du lot créé. La ligne
+        `mark_item_id` est verrouillée avant l'insertion et `issue_ref` y est
+        relue sous ce verrou : deux créations concurrentes de la même
+        référence ne peuvent pas aboutir toutes les deux (revue #544 r2)."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1167,6 +1176,12 @@ class WorkItems(Domain):
     def open_by_ref(self, ref: str) -> list[dict]:
         """L118 : les lots ouverts désignés par une référence (issue, fiche,
         branche, premier mot du titre)."""
+
+    @abc.abstractmethod
+    def by_issue_ref(self, ref: str) -> list[dict]:
+        """L539 : les lots portant exactement cette `issue_ref`, **quel que
+        soit leur état** — l'identité d'un lot de relecture après fusion
+        survit à sa fermeture, sinon un second lot serait ouvert."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
