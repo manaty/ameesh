@@ -334,22 +334,16 @@ class PgBackend:
     # -- agents ------------------------------------------------------------
     def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,
                  *, leased: bool = True) -> None:
-        if not leased:
-            # L36 → L46 : un hook sans bail (session externe, shell qui a hérité
-            # de AGENT_MAIL_NAME) ne touche à la ligne d'un agent `execute` que
-            # pour `last_seen` : ni session, ni dossier, ni hôte, ni harnais —
-            # l'exécuteur reprendrait sinon une session étrangère, ailleurs.
-            # Un agent NÉ d'un hook sans bail est `externe` (L37, 0030). Une
-            # seule instruction : pas de course lecture → écriture.
-            registry.upsert_unleased(
-                self.db, name, chantier=identity.chantier_of(name, self.cfg),
-                harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
-            return
-        registry.upsert(
-            self.db, name,
-            chantier=identity.chantier_of(name, self.cfg),
-            harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id,
-        )
+        # #1037 : le harnais, le modèle et le dossier de la ligne sont
+        # DÉCLARÉS (canon, `agent-runner register`, `adopt`) ; le harnais du
+        # tour, lui, peut être EMPRUNTÉ (L242b : un agent critique au seuil
+        # tourne sous un autre harnais). Un hook — sous bail ou non — ne
+        # réécrit donc jamais la déclaration : les mêmes règles que L46
+        # s'appliquent dans les deux cas (agent `execute` : seul `last_seen`
+        # avance ; agent `externe` : hôte, harnais et session suivis).
+        registry.upsert_unleased(
+            self.db, name, chantier=identity.chantier_of(name, self.cfg),
+            harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
 
     def agents(self) -> list[dict]:
         rows = registry.overview(self.db)
