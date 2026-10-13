@@ -4,8 +4,11 @@
 Un runner arrêté (saturation #747) tue le publisher de `scripts/ci-flow.py
 publish` *et* l'étape `close` : le check restait `in_progress` pour toujours et
 la PR ne pouvait plus paraître verte. `sweep` relit l'état terminal réel du job
-et de l'exécution qui ont publié le check (par son `details_url`) et conclut
-`cancelled` — jamais `success`, faute de ligne `fin`. Aucun check dont
+et de l'exécution qui ont publié le check et conclut `cancelled` — jamais
+`success`, faute de ligne `fin`. L'exécution se lit dans le `details_url` quand
+il porte `/actions/runs/<id>` ; sinon dans le `check_suite` du check, car
+GitHub laisse l'URL par défaut `…/runs/<id_du_check>` sur les checks publiés
+par un jeton d'exécution (cas réel constaté, #856). Aucun check dont
 l'exécution est encore active, ni d'une autre tête, n'est touché.
 """
 from __future__ import annotations
@@ -31,13 +34,20 @@ ciflux = _charger("ci_flux_856", "ci-flow.py")
 TETE = "a" * 40
 AUTRE_TETE = "b" * 40
 EXECUTION = 500
+SUITE = 38436010127
 
 
 def check(ident=11, name="tests (flux) psql 1/1", status="in_progress",
-          execution=EXECUTION, details=True):
-    lien = "https://github.com/manaty/ameesh/actions/runs/%d" % execution
-    return {"id": ident, "name": name, "status": status,
-            "details_url": lien if details else "",
+          execution=EXECUTION, details=True, suite=SUITE):
+    """Un check « tests (flux) ».
+
+    `details=True` : le `details_url` nomme l'exécution (`/actions/runs/<id>`).
+    `details=False` : la forme par défaut réelle de GitHub
+    (`…/runs/<id_du_check>`), que seule la `check_suite` éclaire."""
+    lien = ("https://github.com/manaty/ameesh/actions/runs/%d" % execution
+            if details else "https://github.com/manaty/ameesh/runs/%d" % ident)
+    return {"id": ident, "name": name, "status": status, "details_url": lien,
+            "check_suite": {"id": suite} if suite is not None else None,
             "output": {"title": "3 test(s) passés, en cours",
                        "summary": "Part psql 1/1 : en cours.",
                        "text": "<!-- ameesh-test-event/1 -->\n```jsonl\n```"}}
@@ -53,12 +63,17 @@ def job(name="psql 1/1", status="completed", conclusion="cancelled"):
 
 class FauxGitHub:
     def __init__(self, checks=(), jobs=None, run_state=None, refus=False,
-                 ready=True, tete=TETE, par_execution=None):
+                 ready=True, tete=TETE, par_execution=None, par_suite=None,
+                 suite_executions=None, refus_suite=False):
         self.checks = list(checks)
         self.job_list = jobs if jobs is not None else [job()]
         self.run_state = run_state if run_state is not None else run()
         self.par_execution = par_execution or {}
+        self.par_suite = par_suite or {}
+        self.suite_executions = ([EXECUTION] if suite_executions is None
+                                 else suite_executions)
         self.refus = refus
+        self.refus_suite = refus_suite
         self._ready = ready
         self.tete = tete
         self.lectures = []
@@ -80,6 +95,12 @@ class FauxGitHub:
 
     def jobs(self, execution):
         return self.par_execution.get(execution, (self.run_state, self.job_list))[1]
+
+    def runs_of_suite(self, suite):
+        self.lectures.append(("suite", suite))
+        if self.refus or self.refus_suite:
+            raise ciflux.urllib.error.URLError("boom")
+        return self.par_suite.get(suite, [{"id": e} for e in self.suite_executions])
 
     def update(self, ident, output, conclusion=None):
         if self.refus:
@@ -139,7 +160,8 @@ class ReconciliationTest(unittest.TestCase):
         self.assertEqual(gh.maj, [])
 
     def test_check_sans_execution_identifiable_non_touche(self):
-        gh = FauxGitHub([check(details=False)])
+        """Ni `/actions/runs/<id>` ni `check_suite` : aucune preuve, on ne juge pas."""
+        gh = FauxGitHub([check(details=False, suite=None)])
         ciflux.sweep(args(), gh=gh)
         self.assertEqual(gh.maj, [])
 
@@ -183,6 +205,83 @@ class ReconciliationTest(unittest.TestCase):
         ciflux.sweep(args(), gh=gh)
         self.assertEqual([m[0] for m in gh.maj], [11])
         self.assertEqual(gh.maj[0][2], "cancelled")
+
+
+class LegacyDetailsUrlTest(unittest.TestCase):
+    """Le cas réel : GitHub laisse l'URL par défaut `…/runs/<id_du_check>`.
+
+    Le `details_url` ne nomme alors pas l'exécution ; c'est le `check_suite` du
+    check qui la retrouve, et la preuve de terminalité reste la même (celle du
+    job et de l'exécution). Sans preuve, aucun check n'est conclu.
+    """
+
+    def test_url_par_defaut_resolue_par_le_check_suite(self):
+        gh = FauxGitHub([check(details=False)], par_suite={SUITE: [{"id": 777}]})
+        self.assertEqual(ciflux.sweep(args(), gh=gh), 0)
+        self.assertIn(("suite", SUITE), gh.lectures)
+        self.assertEqual([m[0] for m in gh.maj], [11])
+        self.assertEqual(gh.maj[0][2], "cancelled")
+
+    def test_check_suite_sans_execution_non_touche(self):
+        gh = FauxGitHub([check(details=False)], suite_executions=[])
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_check_suite_illisible_non_touche(self):
+        gh = FauxGitHub([check(details=False)], refus_suite=True)
+        self.assertEqual(ciflux.sweep(args(), gh=gh), 0)
+        self.assertEqual(gh.maj, [])
+
+    def test_execution_du_check_suite_encore_active_non_touchee(self):
+        gh = FauxGitHub([check(details=False)], suite_executions=[501],
+                        par_execution={501: (run("in_progress"),
+                                             [job(status="in_progress", conclusion=None)])})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_job_du_check_suite_encore_actif_non_touche(self):
+        gh = FauxGitHub([check(details=False)], suite_executions=[501],
+                        par_execution={501: (run("completed"),
+                                             [job(status="in_progress", conclusion=None)])})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_plusieurs_executions_du_check_suite_toutes_terminales_concluent(self):
+        gh = FauxGitHub([check(details=False)], suite_executions=[500, 501],
+                        par_execution={500: (run("completed"), [job()]),
+                                       501: (run("completed"), [job()])})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual([m[2] for m in gh.maj], ["cancelled"])
+
+    def test_une_execution_du_check_suite_encore_active_bloque_tout(self):
+        """Toutes les exécutions candidates doivent être terminales."""
+        gh = FauxGitHub([check(details=False)], suite_executions=[500, 501],
+                        par_execution={500: (run("completed"), [job()]),
+                                       501: (run("in_progress"),
+                                             [job(status="in_progress", conclusion=None)])})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual(gh.maj, [])
+
+    def test_deux_checks_meme_suite_une_seule_lecture(self):
+        gh = FauxGitHub([check(ident=11, details=False),
+                         check(ident=12, name="tests (flux) psql 2/2", details=False)],
+                        jobs=[job(), job(name="psql 2/2")])
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual([m[0] for m in gh.maj], [11, 12])
+        self.assertEqual([l for l in gh.lectures if l[0] == "suite"], [("suite", SUITE)])
+
+    def test_details_url_nommant_l_execution_prime_sur_la_suite(self):
+        """Quand `details_url` nomme l'exécution, la suite n'est pas lue."""
+        gh = FauxGitHub([check(details=True)], par_suite={SUITE: [{"id": 777}]})
+        ciflux.sweep(args(), gh=gh)
+        self.assertEqual([m[0] for m in gh.maj], [11])
+        self.assertNotIn(("suite", SUITE), gh.lectures)
+
+    def test_suite_of(self):
+        self.assertEqual(ciflux._suite_of(check(details=False)), SUITE)
+        self.assertIsNone(ciflux._suite_of(check(details=False, suite=None)))
+        self.assertIsNone(ciflux._suite_of({"check_suite": {"id": "x"}}))
+        self.assertIsNone(ciflux._suite_of({}))
 
 
 class FauxGitHubPublication:

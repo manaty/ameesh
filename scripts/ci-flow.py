@@ -49,11 +49,14 @@ l'étape reste verte : la publication n'est jamais une cause d'échec.
 `close` : le check restait `in_progress` pour toujours, la PR ne pouvait plus
 paraître verte. `sweep` est la réconciliation, indépendante du publisher : il
 relit chaque check « tests (flux) » encore en cours et l'état terminal réel du
-job et de l'exécution qui l'ont publié (son `details_url`), puis conclut
-`cancelled` — jamais `success`, faute de ligne `fin`. Un check dont le job
-tourne encore, une autre tentative ou une autre tête ne sont pas touchés.
-`publish` qui atteint son arrêt de sûreté sans ligne `fin` laisse le check
-ouvert (le publisher vit encore) : `close` ou `sweep` le conclura.
+job et de l'exécution qui l'ont publié, puis conclut `cancelled` — jamais
+`success`, faute de ligne `fin`. L'exécution se lit dans le `details_url`
+quand il porte `/actions/runs/<id>` ; sinon dans le `check_suite` du check
+(GitHub laisse l'URL par défaut `…/runs/<id_du_check>` sur les checks publiés
+par un jeton d'exécution). Un check dont le job tourne encore, une autre
+tentative ou une autre tête ne sont pas touchés. `publish` qui atteint son
+arrêt de sûreté sans ligne `fin` laisse le check ouvert (le publisher vit
+encore) : `close` ou `sweep` le conclura.
 """
 from __future__ import annotations
 
@@ -291,8 +294,17 @@ class GitHub:
             page += 1
 
     def run(self, execution: int) -> dict:
-        """L'exécution GitHub qui a publié un check (lue dans son details_url)."""
+        """L'exécution GitHub qui a publié un check (details_url ou check_suite)."""
         return self.read("actions/runs/%d" % execution)
+
+    def runs_of_suite(self, suite: int) -> list[dict]:
+        """Les exécutions d'une suite de checks (#856).
+
+        GitHub laisse le `details_url` par défaut `…/runs/<id_du_check>` sur
+        les checks publiés par un jeton d'exécution : il ne nomme alors pas
+        l'exécution, mais le `check_suite` du check la retrouve exactement."""
+        return self.read("actions/runs?check_suite_id=%d&per_page=100" % suite
+                         ).get("workflow_runs") or []
 
     def jobs(self, execution: int) -> list[dict]:
         """Les jobs d'une exécution : leur état terminal fait foi (#856)."""
@@ -416,9 +428,39 @@ def close(args, gh: GitHub | None = None) -> int:
 
 
 def _execution_of(check: dict) -> int | None:
-    """Le numéro d'exécution GitHub lu dans le `details_url` du check."""
+    """Le numéro d'exécution lu dans le `details_url`, quand il le nomme.
+
+    Les checks publiés par un jeton d'exécution portent l'URL par défaut
+    `…/runs/<id_du_check>`, qui ne nomme pas l'exécution : c'est alors le
+    `check_suite` qui la retrouve (`_executions_of`)."""
     trouve = re.search(r"/actions/runs/(\d+)", check.get("details_url") or "")
     return int(trouve.group(1)) if trouve else None
+
+
+def _suite_of(check: dict) -> int | None:
+    """Le `check_suite` du check : l'exécution s'y retrouve par l'API (#856)."""
+    ident = (check.get("check_suite") or {}).get("id")
+    try:
+        return int(ident) if ident is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _executions_of(check: dict, gh: GitHub, suites: dict[int, list[int]]) -> list[int]:
+    """Les exécutions qui ont pu publier le check (#856).
+
+    Celle du `details_url` quand il porte `/actions/runs/<id>` ; sinon celles
+    de son `check_suite`. Une liste vide veut dire « non identifiable », jamais
+    « orphelin » : sans exécution prouvée terminale, on ne conclut pas."""
+    execution = _execution_of(check)
+    if execution is not None:
+        return [execution]
+    suite = _suite_of(check)
+    if suite is None:
+        return []
+    if suite not in suites:
+        suites[suite] = [int(run["id"]) for run in gh.runs_of_suite(suite)]
+    return suites[suite]
 
 
 def orphaned(check: dict, jobs: list[dict], execution_status: str) -> bool:
@@ -442,15 +484,37 @@ def orphaned(check: dict, jobs: list[dict], execution_status: str) -> bool:
     return execution_status == "completed"
 
 
+def _proved_terminal(check: dict, executions: list[int], gh: GitHub,
+                     etats: dict[int, tuple[dict, list[dict]] | None]) -> bool:
+    """Le publisher est-il mort dans *toutes* les exécutions candidates ? (#856)
+
+    Vrai si chaque exécution est terminale et que le job homonyme y est terminal
+    (ou absent, l'exécution terminale faisant foi). Une lecture en erreur rend
+    faux : on ne conclut jamais sans preuve."""
+    for execution in executions:
+        if execution not in etats:
+            try:
+                etats[execution] = (gh.run(execution), gh.jobs(execution))
+            except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+                print("ci-flow : exécution %d illisible (%s)" % (execution, exc),
+                      file=sys.stderr)
+                etats[execution] = None
+        etat = etats[execution]
+        if etat is None or not orphaned(check, etat[1], etat[0].get("status", "")):
+            return False
+    return True
+
+
 def sweep(args, gh: GitHub | None = None) -> int:
     """Conclut les checks « tests (flux) » laissés en cours par un job terminal.
 
     Réconciliation indépendante du publisher (#856) : chaque check encore en
     cours est jugé sur l'état terminal réel du job et de l'exécution qui l'ont
-    publié (relus par son `details_url`). Sans ligne `fin`, la conclusion est
-    `cancelled`, jamais `success`. Ne ferme aucun check dont l'exécution est
-    encore active, ni ceux d'une autre tête. Ne fait jamais échouer le job : une
-    erreur d'API est tracée et la fonction rend 0."""
+    publié (retrouvée par son `details_url` ou, à défaut, par son
+    `check_suite`). Sans ligne `fin`, la conclusion est `cancelled`, jamais
+    `success`. Ne ferme aucun check dont l'exécution est encore active, ni ceux
+    d'une autre tête. Ne fait jamais échouer le job : une erreur d'API est
+    tracée et la fonction rend 0."""
     try:
         return _sweep(args, gh)
     except Exception as exc:  # la réconciliation n'échoue jamais le job
@@ -471,23 +535,24 @@ def _sweep(args, gh: GitHub | None = None) -> int:
         print("ci-flow : checks de %s illisibles (%s)" % (tete[:8], exc), file=sys.stderr)
         return 0
     etats: dict[int, tuple[dict, list[dict]] | None] = {}
+    suites: dict[int, list[int]] = {}
     for check in checks:
         nom = check.get("name") or ""
         if check.get("status") != "in_progress" or not nom.startswith(FLUX_PREFIX):
             continue
-        execution = _execution_of(check)
-        if execution is None:
-            # publié hors CI (pas d'exécution identifiable) : on ne juge pas
+        try:
+            executions = _executions_of(check, gh, suites)
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            print("ci-flow : exécution du check %s illisible (%s)"
+                  % (check.get("id"), exc), file=sys.stderr)
             continue
-        if execution not in etats:
-            try:
-                etats[execution] = (gh.run(execution), gh.jobs(execution))
-            except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
-                print("ci-flow : exécution %d illisible (%s)" % (execution, exc),
-                      file=sys.stderr)
-                etats[execution] = None
-        etat = etats[execution]
-        if etat is None or not orphaned(check, etat[1], etat[0].get("status", "")):
+        if not executions:
+            # publié hors CI, ni details_url ni check_suite exploitables : on
+            # ne juge pas (#856)
+            print("ci-flow : check %s « %s » sans exécution identifiable : non conclu"
+                  % (check.get("id"), nom), file=sys.stderr)
+            continue
+        if not _proved_terminal(check, executions, gh, etats):
             continue
         sortie = check.get("output") or {}
         resume = (sortie.get("summary") or "").rstrip()
