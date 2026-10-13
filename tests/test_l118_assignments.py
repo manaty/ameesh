@@ -32,6 +32,15 @@ class _Base(PgTestCase):
         registry.upsert(self.db, name, harness="claude", host=kw.pop("host", self.cfg.host),
                         **kw)
 
+    def diverge(self, name):
+        """#858 : agent du canon, admis à sa dernière évaluation, dont le profil
+        a divergé depuis (le prochain canon sync le réévaluera) : il n'est plus
+        réclamable, donc plus réveillable — sans être arrêté."""
+        self.db.execute(
+            "UPDATE agent_registry SET canon_ref = %s, placement_ok = true, "
+            "placement_profile = 'ancien' WHERE name = %s",
+            ("agents/%s.md" % name, name))
+
     def unread(self, name):
         return self.db.query("SELECT body, work_item_id, kind FROM agent_mailbox"
                              " WHERE recipient = %s ORDER BY id", (name,))
@@ -95,6 +104,39 @@ class MailLinksLotsTest(_Base):
                          [("CI plus rapide", "agent/dev2-ci")])
         self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(rows[0]["id"]))
         self.assertIn("created and assigned to dev2", proc.stdout)
+
+    def test_lot_d_un_destinataire_non_reveillable_part_quand_meme(self):
+        """#858 : profil divergé (admission en attente du prochain canon sync) —
+        le message ne doit pas être perdu avec le réveil ; le lot reste une
+        étiquette du fil et l'attribution est différée."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        self.diverge("dev1")
+        proc = self.send("dev1", "À toi : reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
+        self.assertIn("profile diverged", proc.stderr)
+        self.assertIn("dropped for: dev1", proc.stdout)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        rows = self.unread("dev1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["work_item_id"], str(lot["id"]))
+
+    def test_new_lot_pour_un_destinataire_non_reveillable_cree_sans_assigne(self):
+        """#858 : `--new-lot` vers un agent non réveillable crée le lot sans
+        assigné au lieu de perdre le message et la demande."""
+        self.diverge("dev2")
+        proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
+                         "--new-lot", "CI plus rapide", "--estimate", "2h", "--app", "p",
+                         "--new-project")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("created for dev2 without assignee", proc.stdout)
+        self.assertIn("not assigned to dev2", proc.stderr)
+        rows = work.list_items(self.db)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["assignee"])
+        self.assertIsNone(rows[0]["branch"])       # pas la branche d'un lot non attribué
+        self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(rows[0]["id"]))
 
     def test_garde_d_attribution_rien_n_est_depose(self):
         proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",

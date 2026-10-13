@@ -445,9 +445,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             thread_meta = {"avertissement": "; ".join(linked["warnings"])}
         item = linked["lot"]
         if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
+            # #858 : un lot créé pour un destinataire non attribuable à
+            # l'instant est créé sans assigné (l'avertissement dit pourquoi).
+            if linked["created"]:
+                quoi = ("created and assigned to %s" % dest if linked["assigned"]
+                        else "created for %s without assignee" % dest)
+            else:
+                quoi = "assigned to %s" % dest if linked["assigned"] else "linked"
             print("lot #%d %s%s%s" % (
-                int(item["id"]), "created and assigned to %s" % dest if linked["created"]
-                else "assigned to %s" % dest if linked["assigned"] else "linked",
+                int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
         if payload.get("ack") and (linked["created"] or linked["assigned"]):

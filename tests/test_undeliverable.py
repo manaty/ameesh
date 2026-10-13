@@ -204,6 +204,27 @@ class EnvoiRefuseTest(_Base):
         self.assertEqual(self.send("human:proprio", "x", AGENT_MAIL_NAME="claude1").returncode,
                          2)
 
+    def test_destinataire_non_reveillable_le_message_part_avec_avertissement(self):
+        """#858 : agent inscrit mais non réveillable à l'instant (profil divergé,
+        en attente du prochain canon sync) : le message est déposé, le réveil
+        est différé — l'expéditeur doit le savoir."""
+        self.db.execute("UPDATE agent_registry SET canon_ref = 'agents/claude2.md', "
+                        "placement_ok = true, placement_profile = 'ancien' "
+                        "WHERE name = 'claude2'")
+        proc = self.send("claude2", "Relecture demandée sur ce lot.",
+                         AGENT_MAIL_NAME="claude1")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("dropped for: claude2", proc.stdout)
+        self.assertIn("warning: claude2 is not wakeable right now", proc.stderr)
+        self.assertIn("profile diverged", proc.stderr)
+        self.assertEqual(self.pending("claude2"), ["Relecture demandée sur ce lot."])
+        # une session EXTERNE n'est pas réveillée par construction : pas d'alerte
+        self.agent("coord", mode="externe")
+        proc = self.send("coord", "Pour information.", AGENT_MAIL_NAME="claude1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("not wakeable", proc.stderr)
+        self.assertEqual(self.pending("coord"), ["Pour information."])
+
     def test_un_envoi_ne_touche_pas_le_registre_du_destinataire(self):
         self.agent("ailleurs", host="autre-hote")
         before = registry.get(self.db, "ailleurs")
