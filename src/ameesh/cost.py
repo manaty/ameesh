@@ -1490,8 +1490,17 @@ class CostBook:
                     pair = estimated(mine, low, high)
                     if agent != "all":
                         part = estimated(ours, max(low, start), high)
-                        real_in += drop * part / pair if pair >= balance.GAP_MIN_USD \
-                            else part * ratio
+                        # #513 r2 (P2 des deux relecteurs) : `part <= pair`
+                        # (mêmes lignes, fenêtre incluse), donc
+                        # `drop * part / pair` est borné par `drop` : `pair > 0`
+                        # suffit, `GAP_MIN_USD` n'est pas requis pour la
+                        # stabilité du quotient. Sous le seuil, l'ancien repli
+                        # `part * ratio` ignorait la baisse réelle quand le
+                        # compte entier restait sous le seuil (ratio = 1,0) :
+                        # un agent seul, 0,40 $ estimés pour 0,80 $ de baisse,
+                        # n'en comptait que 0,40 $ et passait sous son plafond.
+                        # `pair == 0` n'attribue rien (`part` l'est aussi).
+                        real_in += drop * part / pair if pair > 0 else part * ratio
                     elif low >= start:
                         real_in += drop
                     elif pair >= balance.GAP_MIN_USD:

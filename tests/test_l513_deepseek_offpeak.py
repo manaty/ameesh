@@ -180,6 +180,33 @@ class MeasuredCapsTest(_Paye):
         self.assertIn("daily budget of agent ds (pay-per-token): 7.50 $",
                       self.book.over("ds", paid_harnesses=["deepseek"], pace=False))
 
+    def test_sous_le_seuil_l_agent_suit_quand_meme_la_baisse(self):
+        # #513 r2 (P2 des deux relecteurs) : baisse de 0,80 $ pour 0,40 $
+        # estimés (pair < GAP_MIN_USD = 0,50) ; l'ancien repli `part * ratio`
+        # (ratio 1,0) n'en comptait que 0,40 $ et le plafond de l'agent ne se
+        # déclenchait pas.
+        self.solde(10.0, 10 * HEURE)
+        self.ligne(0.40, 6 * HEURE)
+        self.solde(9.20, 4 * HEURE)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 86400), 0.80, places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 86400, "ds"), 0.80, places=3)
+        self.book.agent_limits = {"ds": {86400: 0.50}}
+        self.assertIn("daily budget of agent ds (pay-per-token): 0.80 $ over the last 24 hours "
+                      "(cap 0.50 $)",
+                      self.book.over("ds", paid_harnesses=["deepseek"], pace=False))
+
+    def test_sous_le_seuil_les_parts_des_agents_somment_a_la_baisse(self):
+        # deux agents estimés 0,20 $ chacun (pair = 0,40 $ < seuil) pour une
+        # baisse de 0,80 $ : chacun 0,40 $, et la somme des parts vaut le mesh.
+        self.solde(10.0, 10 * HEURE)
+        self.ligne(0.20, 6 * HEURE)
+        self.ligne(0.20, 5 * HEURE, agent="autre")
+        self.solde(9.20, 4 * HEURE)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 86400, "ds"), 0.40, places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 86400, "autre"), 0.40,
+                               places=3)
+        self.assertAlmostEqual(self.book.paid_spent(["deepseek"], 86400), 0.80, places=3)
+
     def test_le_plafond_horaire_decide_sur_le_solde_le_grand_livre_reste_brut(self):
         # 30 $ comptés dans l'heure, 6 $ réels : pas de pause sous 20 $
         self.solde(100.0, 50 * 60)
