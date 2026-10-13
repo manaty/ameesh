@@ -36,6 +36,17 @@ def _numbers(repo, sha, layout):
             if (match := re.match(r'^(\d+)_', name.rsplit('/', 1)[-1]))}
 
 
+def _ancestor(repo, previous, target):
+    try:
+        result = subprocess.run(['git', '-C', repo, 'merge-base', '--is-ancestor', previous, target],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise work.WorkError('reservation ancestry unavailable; fetch target history') from exc
+    if result.returncode not in (0, 1):
+        raise work.WorkError('reservation ancestry unavailable; fetch target history')
+    return result.returncode == 0
+
+
 def record(row):
     return {'lot': int(row['work_item_id']), 'slot': row['slot'], 'id': int(row['id']),
             'number': int(row['number']), 'project': row['project'],
@@ -85,42 +96,56 @@ def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='
     if action != 'release' and _tip(checkout, branch) != target_sha:
         raise work.WorkError('target advanced past targetSha; fetch and requalify')
     numbers = _numbers(checkout, target_sha, layout)
-    api = storage.of(db).migration_reservations
-    expected = None
-    if action != 'reserve':
-        rows = api.for_lot(item_id)
-        expected = {row['slot']: row for row in rows if row['slot'] in slots}
-        if reservation_ids is not None and (len(reservation_ids) != len(slots) or any(
-                expected.get(slot, {}).get('id') != identity
-                for slot, identity in zip(slots, reservation_ids))):
-            raise work.WorkError('reservation id does not match slot')
-        for slot in slots:
-            row = expected.get(slot)
-            if not row or not row['target_sha']:
-                raise work.WorkError('slot not reserved with a target SHA')
-            if action == 'release' and row['target_sha'] != target_sha:
-                raise work.WorkError('release targetSha does not match reservation')
-            if action == 'landed':
-                _git(checkout, 'merge-base', '--is-ancestor', row['target_sha'], target_sha)
-                if int(row['number']) not in numbers:
-                    raise work.WorkError('reserved migration number is absent from landing target')
-    elif reservation_ids:
+    if action == 'reserve' and reservation_ids:
         raise work.WorkError('reservation ids apply only to lifecycle transitions')
     for attempt in range(5):
         try:
             with db.transaction() as tx:
-                result = storage.of(tx).migration_reservations.update(
+                api = storage.of(tx).migration_reservations
+                # Inspect lifecycle and ancestry after serialization, so a
+                # competing reserve/landed cannot invalidate the observation.
+                api.lock_target(canonical, branch)
+                expected, observed, requalified = None, None, None
+                if action != 'reserve':
+                    rows = api.for_lot(item_id)
+                    expected = {row['slot']: row for row in rows if row['slot'] in slots}
+                    if reservation_ids is not None and (len(reservation_ids) != len(slots) or any(
+                            expected.get(slot, {}).get('id') != identity
+                            for slot, identity in zip(slots, reservation_ids))):
+                        raise work.WorkError('reservation id does not match slot')
+                    for slot in slots:
+                        row = expected.get(slot)
+                        if not row or not row['target_sha']:
+                            raise work.WorkError('slot not reserved with a target SHA')
+                        if action == 'release' and row['target_sha'] != target_sha:
+                            raise work.WorkError('release targetSha does not match reservation')
+                        if action == 'landed':
+                            _git(checkout, 'merge-base', '--is-ancestor', row['target_sha'], target_sha)
+                            if int(row['number']) not in numbers:
+                                raise work.WorkError('reserved migration number is absent from landing target')
+                else:
+                    observed = api.for_target(canonical, branch)
+                    requalified = {}
+                    for row in observed:
+                        previous = row['target_sha']
+                        if previous and previous != target_sha and _ancestor(checkout, previous, target_sha):
+                            requalified[int(row['id'])] = (
+                                'landed' if int(row['number']) in numbers else 'released')
+                result = api.update(
                     item_id, slots, project, canonical, branch, target_sha, max(numbers or {0}) + 1,
-                    action=action, actor=actor, expected=expected)
+                    action=action, actor=actor, expected=expected,
+                    observed=observed, requalified=requalified)
                 if isinstance(result, dict):
                     raise work.WorkError(result['error'])
                 if action != 'release' and _tip(checkout, branch) != target_sha:
                     raise work.WorkError('target advanced during reservation; requalify')
                 return [record(row) for row in result]
         except DbError as exc:
-            # A legacy client may write its projection without taking the
-            # target lock. The shared unique index still wins; recalculate.
-            if attempt == 4 or not is_unique_violation(exc, 'work_migration_reservations_active_idx'):
+            # Pre-0419 clients lock their lot before the compatibility guard
+            # can lock the repo. A deadlock victim rolls back, then retries in
+            # the correct order; no duplicate is accepted during rollout.
+            conflict = is_unique_violation(exc, 'work_migration_reservations_active_idx')
+            if attempt == 4 or not (conflict or exc.sqlstate == '40P01'):
                 raise
     raise work.WorkError('reservation contention, retry')
 

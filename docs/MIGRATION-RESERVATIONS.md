@@ -41,7 +41,8 @@ Slots are unique per lot. `default` belongs to the legacy single reservation.
 paths lowercased and nondefault ports retained. It is distinct from the local
 clone path. Branches omit `origin/`, `refs/heads/` and `refs/remotes/origin/`.
 
-The allocator uses the key `(project, target.repo, target.branch)`. The first
+The allocator uses the key `(target.repo, target.branch)`. `project` is
+context data: projects sharing a repository and target share their numbers. The first
 number is `max(migrations on the target at targetSha, active reservations of
 the same key) + 1`. Source branches, other branches, the worktree and installed
 package do not contribute to this floor. Legacy reservations are projected
@@ -54,8 +55,15 @@ freshness. A landing coordinator must fetch, reserve and recheck the remote
 target before applying a batch. A mismatch of the supplied SHA and the clone's
 target is refused. A target ref moving during allocation rolls the transaction
 back. Reservations at an earlier SHA of this key become `released` when a new
-SHA is used for reservation. Requalification assigns numbers from the new
-floor, retaining each slot's technical identity.
+SHA is used for reservation, but only if the original SHA is an ancestor
+of the new target and the number is absent from its migration directory.
+When the ancestor's number is already present, the record becomes `landed`,
+including when another lot reserves before the landing caller reports success.
+Reservations whose SHA is not an ancestor remain active and contribute to the
+maximum; a stale or diverged clone cannot release them. Requalifying one's own
+slot to a non-descendant is refused. Missing history also refuses allocation,
+requiring a fetch before ancestry can be proved. Requalification retains each
+slot's technical identity.
 
 Replaying the same batch at the same SHA preserves its numbers and creates no
 new journal entries. A batch containing already reserved slots must replay
@@ -91,6 +99,25 @@ invalidated by target requalification.
 Migration `0419_migration_reservation_slots.sql` adds the reservation table,
 a partial unique index on reserved numbers and a trigger for the old
 `work_items.migration` projection. Existing legacy records have a null
-`targetSha`; they appear under `default` and use `branch_target`, or `main`
-when no target was recorded. They keep the original CLI lifecycle. New named
+`targetSha`; they appear under `default` and use `branch_target` when recorded.
+When no target was recorded, `target.branch` stays null: SQL cannot determine
+the Git default branch. That reservation conservatively occupies its number
+on every target of the repository until a target is set or the legacy record
+is released/landed. A SQL guard serializes this overlap check with named slots,
+so an absent project or target cannot bypass uniqueness. They keep the original CLI lifecycle. New named
 slots always have a pinned SHA and use the explicit lifecycle above.
+
+The named allocator takes a repository advisory lock (unknown legacy targets
+span branches), then the target lock, then affected lot rows in id order.
+Ancestry and lifecycle observations are made under the repository and target
+locks, before lot rows are edited.
+The upgraded legacy allocator also takes the repository lock before its lot
+update. The named path retries a deadlock victim from clients using the older
+lock order; every failed attempt rolls its records and journal back.
+
+During rollout, install the additive schema and upgrade/restart legacy writers
+before enabling named reservations. Pre-0419 code does not see named slots or
+recognize the compatibility guard's constraint in its retry loop: it may receive
+a uniqueness error or be a deadlock victim. The database rejects the conflicting
+write, so no duplicate is accepted. Enabling the new code first on an unmigrated
+schema fails because the reservation table is missing.

@@ -657,6 +657,11 @@ class WorkItems(interface.WorkItems):
         while True:
             try:
                 with self.db.transaction() as tx:
+                    # Match the named allocator's lock order: repository
+                    # before lot rows. Unknown legacy targets span branches.
+                    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                               "current_schema() || ':migration-repo:' || %s, 0))",
+                               ("github.com/" + (repo or ""),))
                     rows = tx.query(
                         "UPDATE work_items SET migration = %s, migration_repo = %%s,"
                         "       updated_at = now()"
