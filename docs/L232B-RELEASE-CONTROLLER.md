@@ -392,10 +392,10 @@ final file/readiness observations before each effect.
 
 Activation requires an active independent controller in `system.slice` and a
 root-private readiness receipt bound to host/enrollment, current boot/systemd
-invocation and verified read-only runtime/source trees. The service coordinator
-and fixed unit are now prepared as described below. **The complete host adapter
-factory remains unfinished**, so the real backend holds before activation.
-There is no installed bootstrap CLI, automatic
+invocation and verified read-only runtime/source trees. The service coordinator,
+fixed unit and pinned host factory are now prepared as described below; the
+recovery-set and health companions still refuse activation until they are
+installed. There is no installed bootstrap CLI, automatic
 root executor or runtime/credential enrollment. No real root/account/SSH/systemd
 effect is executed by this work. Tests combine disposable filesystem copies with
 simulated accounts/services and synthetic real signatures on disposable PostgreSQL
@@ -445,11 +445,54 @@ Tests use simulated factory/systemd effects and private disposable filesystem
 documents. They verify stable receipts across process replacement, failed
 admission, code drift, lost replies, reservation priority, wrong jobs, backoff,
 withdrawal ownership and generic diagnostics. They establish coordinator behavior,
-not a launched system service or authenticated host pilot. **The pinned concrete
-`adaptateur-hote-release.py` factory is not supplied yet**; real startup therefore
-fails before DB connection/readiness instead of admitting simulated backends.
-Full host adapters, health probe, release configuration/caps/guard snapshots and
-installer/provider wiring remain build work.
+not a launched system service or authenticated host pilot.
+
+## Pinned host factory
+
+`adaptateur-hote-release.py` is the pinned concrete factory. It is fixed source
+loaded by the service, never a module named by a job, transport message or
+enrollment document. It composes the protected documents under
+`/etc/ameesh-release` — `card.json` (effective configuration card),
+`destinations.json` (bounded destination map) and `transport.json` (SSH restart
+endpoint) — with the fixed private state under `/var/lib/ameesh-release` and the
+versioned release store under `/opt/ameesh-release/store`. Enrollment, database
+and operation documents keep the exact shapes checked by the dispatcher and the
+service. A missing, linked, group/world-writable or inexact document refuses the
+factory before any host effect; document bodies and credential values never
+enter an error.
+
+`HostFactory.admit(enrollment)` returns exactly the controller's step set only
+after the real checks: exact enrollment and host binding, restart policy
+validation, host-card validation, every enrolled runner unit inside that card,
+configuration destinations, the SSH endpoint files and their host-key digest,
+private state directories, fixed root-owned `systemctl`/`systemd-analyze` paths,
+a live database ping and a read of the release-fence receipt table. Admission
+is honest: every `prepare`, `backup`, `pin`, `fence`, `migrate`, `configure`,
+`activate`, `restart`, `health`, `accept`, `unfence` and recovery step must be
+bound to a concrete capability, and the service refuses a partial set instead of
+admitting simulated backends.
+
+`for_operation(job, authority)` returns one operation's adapter. It revalidates
+authority before every effect, delegates `fence`, `unfence` and their recovery
+steps to the signed fence, `restart` and `recovery_restart` to the pinned SSH
+transport, `configure` and `rollback` to the configuration journal plus the
+effective systemd/caps/guard verification, `activate`/`rollback` to the versioned
+release pointer, `prepare` to the completed release receipt, destination
+inventory, unit allowlist and disk floor, and `migrate` to the release source's
+migration directory with unconditional additive-only election. A definitive
+refusal becomes the controller's `ok: false`; an ambiguous or unauthorized
+failure raises so the durable intent reconciles instead of repeating an effect.
+Provider exceptions and their text are replaced by a generic category.
+
+Two companion pinned sources remain to be supplied: `sauvegarde-release.py`
+exposing `RecoverySet(db, store=, root=, retention=)` for `backup`, `pin` and
+`accept`, and `sante-release.py` exposing `HealthProbe(db, store=, card=,
+system=)` for `health` and `recovery_health`. Both answer True after verified
+completion or raise; the factory refuses admission and operation construction
+while either is absent. Installer/provider wiring and the authenticated host
+pilot therefore remain build work. Tests use real disposable documents and a
+real versioned store with simulated systemd, database and companions; no root,
+SSH, migration or production effect is executed.
 
 ## Operation-specific code and environment recovery
 
@@ -502,8 +545,9 @@ These are **file receipts only**, deliberately without the controller's `ok`
 field. The host adapter must still validate syntax, reconcile daemon reloads and
 verify effective units, caps and guard policy before returning a full configure
 or rollback receipt; `verification-release.py` (below) now supplies that
-effectiveness half. The concrete factory and the authenticated health/rollback
-pilot remain unfinished. Targeted tests exercise real disposable files with
+effectiveness half and the pinned factory binds both halves. The recovery-set and
+health companions, installer wiring and the authenticated health/rollback pilot
+remain unfinished. Targeted tests exercise real disposable files with
 simulated signed authority and database gates; no real host configuration or
 service is changed.
 

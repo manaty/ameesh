@@ -34,23 +34,29 @@ class ConfigurationError(ValueError):
     pass
 
 
+def validate_destinations(destinations):
+    """Exact protected destination map; the host factory also admits it alone."""
+    if not isinstance(destinations,dict) or not 1<=len(destinations)<=32:
+        raise ConfigurationError('bounded enrolled configuration required')
+    value=dict(destinations)
+    for name,logical in value.items():
+        if (not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',name)
+                or not isinstance(logical,str) or '..' in Path(logical).parts
+                or str(Path(logical))!=logical
+                or not (logical.startswith('/etc/systemd/system/') or logical.startswith('/etc/ameesh/'))):
+            raise ConfigurationError('protected configuration destination required')
+    if len(set(value.values()))!=len(value):
+        raise ConfigurationError('distinct configuration destinations required')
+    return value
+
+
 class ConfigurationFiles:
     def __init__(self,journal,destinations, *, authority,gate,root='/',clock=time.time):
         # root is administrator/test mapping only; neither a job nor transport
         # can select it. User-writable units require separate enrollment policy.
         self.journal=Path(journal); self.root=Path(root).absolute()
         runtime.trusted(self.root)
-        if not isinstance(destinations,dict) or not 1<=len(destinations)<=32:
-            raise ConfigurationError('bounded enrolled configuration required')
-        self.destinations=dict(destinations)
-        for name,logical in self.destinations.items():
-            if (not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,79}',name)
-                    or not isinstance(logical,str) or '..' in Path(logical).parts
-                    or str(Path(logical))!=logical
-                    or not (logical.startswith('/etc/systemd/system/') or logical.startswith('/etc/ameesh/'))):
-                raise ConfigurationError('protected configuration destination required')
-        if len(set(self.destinations.values()))!=len(self.destinations):
-            raise ConfigurationError('distinct configuration destinations required')
+        self.destinations=validate_destinations(destinations)
         self.authority,self.gate,self.clock=authority,gate,clock
 
     def path(self,name):
