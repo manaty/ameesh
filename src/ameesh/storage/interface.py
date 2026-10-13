@@ -1653,6 +1653,12 @@ class Canon(Domain):
         """Tous les états enregistrés pour l'hôte, un par canon (L42)."""
 
     @abc.abstractmethod
+    def claim_commit(self, host: str, old: str, new: str, canon: str = "") -> bool:
+        """#793 : avance `last_good_commit` de `old` à `new`, si aucune autre
+        synchronisation ne l'a fait ; False sinon. Dans la transaction de
+        l'appelant, la ligne reste verrouillée jusqu'à son commit."""
+
+    @abc.abstractmethod
     def key_for_root(self, host: str, root: str) -> str | None:
         """Clé (non vide) d'un canon non par défaut déjà enregistré pour l'hôte
         avec cette racine, ou None (L42 : identité d'un canon illisible)."""
