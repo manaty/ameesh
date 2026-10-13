@@ -54,6 +54,10 @@ FIL_MAX_BYTES = 8000
 FIL_ENTRY_CHARS = 400
 LOTS_MAX = 40
 
+#: #538 : les règles de travail des fiches Process du canon ouvrent le brief
+#: (nouvelle session, rotation, reprise), avant le rôle et la consigne.
+PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
+
 
 class RepriseError(ValueError):
     """Refus d'adoption ou de reprise : le message dit pourquoi et quoi faire."""
@@ -257,6 +261,56 @@ def _clip(text: str, limit: int) -> str:
     return data[: max(0, limit - 4)].decode("utf-8", "ignore") + " […]"
 
 
+def _process_rules(cfg: Config) -> str:
+    """#538 : le texte des fiches Process valides du canon, prêt pour un brief.
+
+    Une fiche invalide (clé obligatoire manquante) n'est jamais injectée ; un
+    canon illisible ne casse pas le brief (mêmes règles que `_role`)."""
+    if not getattr(cfg, "canon", None):
+        return ""
+    try:
+        from . import canon as canon_mod
+        canons = canon_mod.load_configured(cfg)
+    except Exception:
+        return ""
+    blocs = []
+    for charge in canons:
+        for process in getattr(charge, "processes", ()) or ():
+            if not process.valid:
+                continue
+            entete = ["### %s" % process.title,
+                      "- responsible: %s" % process.responsible,
+                      "- updated: %s" % process.updated]
+            if process.expire:
+                entete.append("- expire: %s" % process.expire)
+            corps = (process.body or "").strip()
+            blocs.append("\n".join(entete) + ("\n\n" + corps if corps else ""))
+    return "\n\n".join(blocs).strip()
+
+
+def with_process_rules(cfg: Config, text: str) -> str:
+    """#538 : ouvre `text` sur les règles du canon, sans doubler ni couper la
+    consigne. Les règles sont bornées pour tenir dans `BRIEF_MAX_BYTES` avec le
+    texte : la consigne prime toujours."""
+    if text.startswith(PROCESS_RULES_HEADER):
+        return text
+    rules = _process_rules(cfg)
+    if not rules:
+        return text
+    entete = PROCESS_RULES_HEADER + "\n"
+    place = BRIEF_MAX_BYTES - _octets(text) - _octets(entete) - 2
+    if place <= 0:
+        return text
+    if _octets(rules) > place:
+        # `_clip` ajoute « […] » (2 octets de plus que la limite demandée) :
+        # on lui laisse la marge, sinon le brief dépasse d'autant.
+        coupe = place - 2
+        if coupe <= 6:
+            return text
+        rules = _clip(rules, coupe)
+    return entete + rules + "\n\n" + text
+
+
 def _role(cfg: Config, name: str) -> list[str]:
     """Rôle tiré du canon (fiche de l'agent) ; rien si aucun canon lisible."""
     if not getattr(cfg, "canon", None):
@@ -405,7 +459,7 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
         fil_sec.append(line)
     text = "\n".join(head + ident + [""] + lots_sec + fil_sec + [""] + courrier + [""]
                      + ancienne + fin)
-    return _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES)
+    return with_process_rules(cfg, _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES))
 
 
 # --------------------------------------------------------------------------

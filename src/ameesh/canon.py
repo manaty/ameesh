@@ -64,8 +64,15 @@ except Exception:  # pragma: no cover - dépend de l'environnement
     _yaml = None
 
 #: `Persona` (L51, 0029/0032) replaces `Agent`; both card types remain
-#: readable during the transition.
-PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage")
+#: readable during the transition. `Process` (#538) carries the working rules
+#: (`processus/*.md`), read to open every agent's brief.
+PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage",
+                 "Process")
+#: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
+PROCESS_TYPE = "Process"
+#: #538 : deux pages ≈ 6 000 caractères ; au-delà `canon check` signale un
+#: dépassement (avertissement, jamais bloquant) et le brief coupe le texte.
+PROCESS_BODY_MAX = 6000
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -682,6 +689,21 @@ def split_frontmatter(text: str) -> str | None:
     raise YamlError("unclosed frontmatter (or larger than %d KiB)" % (FRONTMATTER_MAX // 1024))
 
 
+def body_of(text: str) -> str:
+    """Le corps d'une fiche Markdown : ce qui suit le frontmatter (`---`).
+
+    Sans frontmatter fermé, le texte entier est le corps ; c'est ce que lit le
+    brief (#538, fiches Process) et la feuille de route (L96, fiches Decision).
+    """
+    lines = text.lstrip("﻿").split("\n")
+    if not lines or lines[0].rstrip("\r \t") != "---":
+        return text
+    for idx in range(1, len(lines)):
+        if lines[idx].rstrip("\r \t") in ("---", "..."):
+            return "\n".join(lines[idx + 1:])
+    return ""
+
+
 _TYPED_RE = re.compile(r"^type:\s*[\"']?(%s)[\"']?\s*(#.*)?$" % "|".join(PROFILE_TYPES), re.M)
 
 
@@ -702,6 +724,7 @@ class Finding:
     host: str = ""          # hôte concerné (une erreur bloque ses agents)
     untrusted: bool = False  # lu hors source approuvée
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
+    process: str = ""       # fiche Process concernée (ne bloque aucun agent)
 
     def to_dict(self) -> dict:
         out = {"code": self.code, "severity": self.severity, "member": self.member,
@@ -712,6 +735,8 @@ class Finding:
             out["host"] = self.host
         if self.package:
             out["package"] = self.package
+        if self.process:
+            out["process"] = self.process
         if self.untrusted:
             out["untrusted"] = True
         return out
@@ -1018,6 +1043,38 @@ class DecisionNote:
 
 
 @dataclass
+class Process:
+    """#538 : une fiche `Process` du canon (`processus/*.md`) — les règles de
+    travail, lues pour ouvrir le brief des agents et poussées après un sync.
+
+    `valid` est faux quand une clé obligatoire manque ou est illisible : la
+    fiche reste listée (`canon show`), jamais injectée dans un brief.
+    """
+
+    fiche: Fiche
+    description: str = ""
+    responsible: str = ""
+    updated: str = ""       # jour ISO (AAAA-MM-JJ), obligatoire
+    expire: str = ""        # jour ISO, vide sans échéance
+    body: str = ""
+    valid: bool = True
+
+    @property
+    def title(self) -> str:
+        return self.fiche.title
+
+    def to_dict(self) -> dict:
+        out = {"title": self.title, "member": self.fiche.member,
+               "path": self.fiche.path, "ref": self.fiche.ref,
+               "description": self.description, "responsible": self.responsible,
+               "updated": self.updated, "expire": self.expire,
+               "body_bytes": len(self.body.encode("utf-8")), "valid": self.valid}
+        if self.fiche.untrusted:
+            out["untrusted"] = True
+        return out
+
+
+@dataclass
 class Canon:
     root: str
     sources: list[Source] = field(default_factory=list)
@@ -1028,6 +1085,8 @@ class Canon:
     packages: list[WorkPackage] = field(default_factory=list)
     #: L96 : fiches Decision (frontmatter et corps), pour `ameesh plan propose`
     decisions: list[DecisionNote] = field(default_factory=list)
+    #: #538 : fiches Process (règles de travail), injectées dans les briefs
+    processes: list[Process] = field(default_factory=list)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -1133,6 +1192,12 @@ class Canon:
                 return package
         return None
 
+    def process(self, title: str) -> Process | None:
+        for process in self.processes:
+            if process.title == title:
+                return process
+        return None
+
     def placements_of(self, agent: str) -> list[Placement]:
         return [p for p in self.placements if p.agent == agent]
 
@@ -1196,6 +1261,7 @@ class Canon:
                               responsible=w.responsible, team=w.team, scope=w.scope,
                               status=w.status, **fiche(w.fiche))
                          for w in self.packages],
+            "processes": [p.to_dict() for p in self.processes],
             "federation": {"id": (self.federation or {}).get("id"),
                            "roles": self.roles, "review_policies": self.review_policies,
                            "naming": self.naming.to_dict() if self.naming else None},
@@ -2373,7 +2439,11 @@ class _Loader:
                      **subject)
             return
         build = getattr(self, "_build_" + kind.lower())
-        build(fiche, where)
+        if kind == PROCESS_TYPE:
+            # #538 : le corps de la fiche (les règles) est lu avec elle
+            build(fiche, where, body=body_of(text))
+        else:
+            build(fiche, where)
 
     # -- types ---------------------------------------------------------------------
     def _list(self, fiche: Fiche, key: str, where: dict, code: str, **subject) -> list[str] | None:
@@ -2737,16 +2807,51 @@ class _Loader:
                      **where, **subject)
             return None
 
+    def _build_process(self, fiche: Fiche, where: dict, *, body: str = "") -> None:
+        """#538 : une fiche Process (`processus/*.md`) — `title`, `updated` et
+        `responsible` sont obligatoires. Une clé manquante ou illisible rend la
+        fiche invalide (elle n'est jamais injectée dans un brief), sans bloquer
+        aucun agent : c'est une règle, pas un droit."""
+        subject = {"process": fiche.title}
+        responsible = _text(fiche.data.get("responsible"))
+        if not responsible:
+            self.add("process-responsible-missing", ERROR,
+                     "Process card without `responsible` (the human who answers "
+                     "for the rule)", **where, **subject)
+        updated = self._process_day(fiche, "updated", where, required=True, **subject)
+        expire = self._process_day(fiche, "expire", where, required=False, **subject)
+        declared_expire = fiche.data.get("expire")
+        valid = bool(responsible) and updated is not None \
+            and (declared_expire in (None, "") or expire is not None)
+        self.canon.processes.append(Process(
+            fiche=fiche, description=_text(fiche.data.get("description")) or "",
+            responsible=responsible or "", updated=updated or "", expire=expire or "",
+            body=body, valid=valid))
+
+    def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
+                     **subject) -> str | None:
+        """#538 : un jour ISO d'une fiche Process (`AAAA-MM-JJ`). Vide : erreur
+        si la clé est obligatoire, silence sinon ; illisible : erreur."""
+        value = fiche.data.get(key)
+        if value is None or value == "":
+            if required:
+                self.add("process-%s-missing" % key, ERROR,
+                         "Process card without `%s` (expected YYYY-MM-DD)" % key,
+                         **where, **subject)
+            return None
+        text = str(value).strip()[:10]
+        try:
+            return _dt.date.fromisoformat(text).isoformat()
+        except ValueError:
+            self.add("process-%s-invalid" % key, ERROR,
+                     "`%s`: unreadable date %r (expected YYYY-MM-DD)" % (key, value),
+                     **where, **subject)
+            return None
+
     def _decision(self, source, path: str, content: bytes, version: str, data: dict) -> None:
         """L96 : garde une fiche Decision (frontmatter et corps, borné)."""
         title = _text(data.get("title")) or _package_stem(path)
-        text = content[:DECISION_BODY_MAX].decode("utf-8", "replace")
-        lines = text.lstrip("\ufeff").split("\n")
-        body = text
-        for idx in range(1, len(lines)):
-            if lines[idx].rstrip("\r \t") in ("---", "..."):
-                body = "\n".join(lines[idx + 1:])
-                break
+        body = body_of(content[:DECISION_BODY_MAX].decode("utf-8", "replace"))
         fiche = Fiche(type=DECISION_TYPE, title=title, member=source.member, path=path,
                       ref=make_ref(self.canon, source.member, path, version), data=data,
                       untrusted=source.mode != "git")
@@ -3252,6 +3357,9 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     # -- plan de travail (L29) ----------------------------------------------------------
     _validate_packages(canon, add)
 
+    # -- règles de travail (#538) -------------------------------------------------------
+    _validate_processes(canon, add)
+
     # -- avertissements -----------------------------------------------------------------
     for agent in canon.agents:
         if agent.title not in by_agent:
@@ -3362,6 +3470,31 @@ def _validate_packages(canon: Canon, add) -> None:
                 package=package.id)
 
 
+def _validate_processes(canon: Canon, add) -> None:
+    """#538 : fiches Process (`processus/*.md`) — les règles de travail.
+
+    Un texte plus long que `PROCESS_BODY_MAX` (environ deux pages) et une
+    échéance dépassée sont des avertissements : ils ne bloquent la réclamation
+    d'aucun agent (voir `blocking`). Les clés obligatoires sont vérifiées à la
+    lecture (`_build_process`), qui marque la fiche invalide."""
+    today = _dt.date.today().isoformat()
+    for process in canon.processes:
+        where = process.fiche
+        subject = {"process": process.title}
+        taille = len(process.body.encode("utf-8"))
+        if taille > PROCESS_BODY_MAX:
+            add("process-too-long", WARNING,
+                "Process card %s: %d bytes of rules (limit %s, about two pages); "
+                "a brief keeps only the beginning" % (process.title, taille,
+                                                      PROCESS_BODY_MAX),
+                where, **subject)
+        if process.expire and process.expire < today:
+            add("process-expired", WARNING,
+                "Process card %s marked `expire: %s`, a past date: the rule is "
+                "still read, review it" % (process.title, process.expire),
+                where, **subject)
+
+
 def errors(findings: Iterable[Finding]) -> list[Finding]:
     return [f for f in findings if f.severity == ERROR]
 
@@ -3384,11 +3517,12 @@ class Blocking:
 
 def blocking(findings: Iterable[Finding]) -> Blocking:
     """Une erreur liée à un agent bloque cet agent ; à un hôte, les agents qui y
-    sont placés ; à une fiche du plan (WorkPackage, L29), aucun agent ; sinon
-    (fédération, frontmatter d'une fiche du profil, …) tous."""
+    sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
+    travail (Process, #538), aucun agent ; sinon (fédération, frontmatter d'une
+    fiche du profil, …) tous."""
     result = Blocking([], defaultdict(list), defaultdict(list))
     for finding in errors(findings):
-        if finding.package:
+        if finding.package or finding.process:
             continue
         if finding.agent:
             result.by_agent[finding.agent].append(finding)

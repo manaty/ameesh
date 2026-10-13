@@ -1446,7 +1446,10 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
-        if not self._resume_keep(resume, "agent"):
+        # #538 : les règles de travail du canon ouvrent le résumé qui porte la
+        # session neuve ; l'historique garde le résumé rendu par l'agent, brut.
+        from . import reprise
+        if not self._resume_keep(reprise.with_process_rules(self.cfg, resume), "agent"):
             self._fil_note("Session rotation cancelled: the resume summary could not "
                            "be kept on disk. The old session is kept.",
                            meta={"action": "rotation", "etat": "annulee"})

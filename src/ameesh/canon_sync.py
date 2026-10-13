@@ -287,6 +287,8 @@ class SyncReport:
     authenticators: AuthenticatorSync | None = None
     #: plan de travail (L29) : fiches WorkPackage recopiées
     packages: "PackageSync | None" = None
+    #: #538 : règles de travail (fiches Process) poussées aux agents de l'hôte
+    processes: "ProcessSync | None" = None
 
     @property
     def errors(self) -> list[Finding]:
@@ -309,7 +311,9 @@ class SyncReport:
                 "findings": [f.to_dict() for f in self.findings],
                 "authenticators": (self.authenticators.to_dict()
                                    if self.authenticators is not None else None),
-                "packages": self.packages.to_dict() if self.packages is not None else None}
+                "packages": self.packages.to_dict() if self.packages is not None else None,
+                "processes": (self.processes.to_dict()
+                              if self.processes is not None else None)}
 
 
 # --------------------------------------------------------------------------
@@ -1385,7 +1389,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     _inherit_placements(db, host, canon)
     packages = sync_packages(db, canon, findings, ident=ident)
     findings.extend(packages.findings)
+    processes = ProcessSync()
     if status == CANON_OK:
+        # #538 : les règles de travail modifiées partent aux agents de cet hôte
+        # AVANT que l'état n'avance (le repère de comparaison est l'ancien
+        # commit, encore dans canon_state).
+        processes = sync_processes(db, canon, host, sorted(admitted_here))
         # les conflits de noms (L42) figurent au diagnostic, sans fermer le canon
         status, diagnostic = assess(canon, host, findings)
         record_state(db, host, status, diagnostic, canon, key=key)
@@ -1401,7 +1410,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
                       diagnostic=diagnostic, authenticators=authenticators,
-                      packages=packages)
+                      packages=packages, processes=processes)
 
 
 # --------------------------------------------------------------------------
@@ -1494,6 +1503,72 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
         st.packages.retire(gone)
         done.retired = sorted(gone)
         done.relinked = st.work.refresh_package_parents()
+    return done
+
+
+# --------------------------------------------------------------------------
+# règles de travail (#538)
+# --------------------------------------------------------------------------
+
+@dataclass
+class ProcessSync:
+    """#538 : fiches Process modifiées depuis le dernier commit appliqué,
+    poussées en message `event` aux agents de l'hôte — leur prochain tour les
+    lit, sans réveiller personne."""
+
+    #: titres des fiches poussées
+    changed: list[str] = field(default_factory=list)
+    #: événements déposés (une fiche × ses destinataires)
+    sent: int = 0
+    #: diff git illisible : aucune poussée, les règles restent lues par le brief
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        out = {"changed": self.changed, "sent": self.sent}
+        if self.error:
+            out["error"] = self.error
+        return out
+
+
+def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> ProcessSync:
+    """#538 : pousse aux agents de `host` les fiches Process modifiées depuis
+    le dernier commit appliqué (`canon_state.last_good_commit`).
+
+    La première synchronisation ne pousse rien : elle pose le repère. Un diff
+    illisible ne pousse rien non plus (`error`) : mieux vaut manquer un
+    rappel que pousser un texte qu'on n'a pas su relire — la règle, elle, est
+    déjà dans le brief de la prochaine session."""
+    done = ProcessSync()
+    if not canon.sources or not canon.processes or not agents:
+        return done
+    source = canon.sources[0]
+    if source.mode != "git" or not source.commit:
+        return done
+    previous = state(db, host, canon) or {}
+    old = previous.get("last_good_commit") or ""
+    if not old or old == source.commit:
+        return done
+    try:
+        touched = set(canon_mod.git_changed_paths(source.repo, old))
+    except canon_mod.GitError as exc:
+        done.error = str(exc)
+        return done
+    from . import mail as mail_mod
+    from . import work as work_mod
+    for process in canon.processes:
+        if not process.valid or process.fiche.member != source.member \
+                or process.fiche.path not in touched:
+            continue
+        texte = ("Règles de travail du canon : %s\n\n%s"
+                 % (process.title, (process.body or "").strip())).strip()
+        for name in sorted(set(agents)):
+            mail_mod.send(db, work_mod.SYSTEM_SENDER, name, texte, host=host,
+                          kind="event",
+                          payload={"event": "canon-process",
+                                   "path": process.fiche.path},
+                          thread=False)
+            done.sent += 1
+        done.changed.append(process.title)
     return done
 
 
