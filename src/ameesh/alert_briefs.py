@@ -10,8 +10,9 @@ appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
 
 #705 : pour un lot en `qa`, `stale_lot` va au relecteur DÉSIGNÉ (le verdict
 lui est dû) ; sans relecteur désigné, l'alerte part aux orchestrateurs du
-projet du lot et demande d'en désigner un (`ameesh work move <id> qa
---reviewer <agent>`).
+projet du lot et demande d'en désigner un (`ameesh work reviewer <id>
+<agent>` — le lot est déjà en qa). La désignation à l'entrée en qa se fait,
+elle, par `ameesh work move <id> qa --reviewer <agent>`.
 
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
