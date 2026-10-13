@@ -459,15 +459,42 @@ def open_lots(db: Db, assignee: str) -> list[dict]:
     return storage.of(db).work.open_for(assignee)
 
 
-def release_lots(db: Db, agent: str, *, reason: str, actor: str = "") -> list[dict]:
+def release_lots(db: Db, agent: str, *, reason: str, actor: str = "",
+                 measure_actor: str = "", measure_reason: str = "",
+                 dry_run: bool = False) -> list[dict]:
     """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
     d'équipe — assigné effacé (assignee = NULL), journal au lot avec la raison,
-    délégation en cours annulée. Rend les lots rendus ; idempotent (un lot
-    repris ou fermé entre-temps n'est pas touché)."""
+    délégation en cours annulée —, et ses lots promus dont la mesure reste à
+    refaire vont à `measure_actor` (l'auditeur), avec `measure_reason`. Rend
+    les lots rendus ; idempotent (un lot repris ou fermé entre-temps n'est pas
+    touché). `dry_run` : ce qui serait fait, rien n'est écrit."""
     name = (agent or "").strip()
     if not name:
         return []
-    return storage.of(db).work.release_agent(name, reason=reason, actor=actor)
+    return storage.of(db).work.release_agent(
+        name, reason=reason, actor=actor, measure_actor=measure_actor,
+        measure_reason=measure_reason, dry_run=dry_run)
+
+
+def measurement_actor(db: Db, cfg=None, *, listing=None) -> str:
+    """#753 : l'acteur de la mesure d'un lot promu — l'auditeur du registre
+    (l'agent `auditeur`, ou celui dont la fiche Agent du canon porte le rôle).
+    Chaîne vide s'il n'y en a aucun, ou plusieurs sans choix évident : les lots
+    promus restent alors en place, et l'alerte `orphan_lot` les signale si leur
+    assigné est arrêté. Jamais d'exception."""
+    from . import alert_briefs, registry
+
+    try:
+        if listing is None:
+            listing = registry.overview(db)
+    except Exception:  # noqa: BLE001 - jamais fatal à l'arrêt d'un agent
+        return ""
+    default = [row["name"] for row in listing
+               if row.get("name") == alert_briefs.AUDITOR_NAME]
+    if len(default) == 1:            # le nom suffit : pas de canon à charger
+        return default[0]
+    names = alert_briefs.auditors(listing, configured_canons(cfg))
+    return names[0] if len(names) == 1 else ""
 
 
 # --------------------------------------------------------------------------

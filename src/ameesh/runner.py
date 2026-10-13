@@ -5024,10 +5024,11 @@ class Runner:
 
     def release_stopped_lots_once(self) -> list[dict]:
         """#753 : un agent arrêté ne garde pas ses lots. À chaque passe, les
-        lots ouverts d'un agent `stopped` retournent à la file d'équipe
-        (assigné effacé, journal au lot). Ne dépend d'aucun agent : tout
-        exécuteur vivant le fait ; idempotent (verrou de ligne et recontrôle
-        côté base). Une erreur de base n'est pas fatale à la passe."""
+        lots ouverts d'un agent `stopped` retournent à la file d'équipe, et ses
+        lots promus dont la mesure reste à refaire vont à l'auditeur. Ne dépend
+        d'aucun agent : tout exécuteur vivant le fait ; idempotent (verrou de
+        ligne et recontrôle côté base). Une erreur de base n'est pas fatale à
+        la passe ; `--dry-run` dit ce qui serait fait sans écrire."""
         from . import work as work_mod
 
         if getattr(self, "mediated", False):
@@ -5041,6 +5042,9 @@ class Runner:
             self._stopped_lots_error = message
             return []
         self._stopped_lots_error = None
+        measure_actor = work_mod.measurement_actor(self.db, self.cfg, listing=agents)
+        measure_reason = ("promoted lot whose measurement is still to be redone: "
+                          "handed to %s (#753)" % measure_actor) if measure_actor else ""
         out: list[dict] = []
         for agent in agents:
             if agent.get("status") != "stopped":
@@ -5049,7 +5053,9 @@ class Runner:
                 done = work_mod.release_lots(
                     self.db, agent["name"],
                     reason="agent stopped: returned to the team queue (#753)",
-                    actor="runner %s" % self.runner_id)
+                    actor="runner %s" % self.runner_id,
+                    measure_actor=measure_actor, measure_reason=measure_reason,
+                    dry_run=self.dry_run)
             except db_mod.DbError as exc:
                 message = "stopped lots of %s not released (%s)" % (agent["name"], exc)
                 if message != getattr(self, "_stopped_lots_error", None):
@@ -5057,8 +5063,15 @@ class Runner:
                 self._stopped_lots_error = message
                 continue
             for row in done:
-                log_async("lot #%s returned to the team queue (%s stopped)"
-                          % (row["id"], agent["name"]))
+                to = row.get("assigned_to")
+                if to:
+                    log_async("lot #%s handed to %s (%s stopped, measurement to redo)%s"
+                              % (row["id"], to, agent["name"],
+                                 " [dry-run]" if row.get("dry_run") else ""))
+                else:
+                    log_async("lot #%s returned to the team queue (%s stopped)%s"
+                              % (row["id"], agent["name"],
+                                 " [dry-run]" if row.get("dry_run") else ""))
             out.extend(done)
         return out
 
@@ -6881,14 +6894,22 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     registry.set_status(db, args[0], "stopped", status_text="stopped by hand",
                         stop_reason="manuel")
     # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
-    # retournent à la file d'équipe (assignee = NULL, journal avec la raison).
+    # retournent à la file d'équipe (assignee = NULL, journal avec la raison),
+    # et ses lots promus dont la mesure reste à refaire vont à l'auditeur.
     from . import work as work_mod
+    measure_actor = work_mod.measurement_actor(db, cfg)
     returned = work_mod.release_lots(
         db, args[0],
         reason="stopped by hand: returned to the team queue (#753)",
-        actor="stop")
+        actor="stop", measure_actor=measure_actor,
+        measure_reason=("promoted lot whose measurement is still to be redone: "
+                        "handed to %s (#753)" % measure_actor) if measure_actor else "")
     for row in returned:
-        log("lot #%s returned to the team queue" % row["id"])
+        to = row.get("assigned_to")
+        if to:
+            log("lot #%s handed to %s (measurement to redo)" % (row["id"], to))
+        else:
+            log("lot #%s returned to the team queue" % row["id"])
     log("agent %s marked stopped" % args[0])
     return 0
 

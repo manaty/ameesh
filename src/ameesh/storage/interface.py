@@ -1181,11 +1181,16 @@ class WorkItems(Domain):
         """L118 : les lots ouverts d'un assigné."""
 
     @abc.abstractmethod
-    def release_agent(self, agent: str, *, reason: str, actor: str) -> list[dict]:
-        """#753 : les lots ouverts d'un agent retournent à la file d'équipe
-        (assigné effacé, journal au lot avec la raison), en une transaction.
-        Rend les lots rendus. Idempotent : un lot dont l'assigné a changé
-        entre-temps n'est pas touché."""
+    def release_agent(self, agent: str, *, reason: str, actor: str,
+                      measure_actor: str = "", measure_reason: str = "",
+                      dry_run: bool = False) -> list[dict]:
+        """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
+        d'équipe (assigné effacé, journal au lot avec la raison), et ses lots
+        promus dont la mesure reste à refaire allaient à ``measure_actor``
+        (l'auditeur, ``measure_reason`` au journal), en une transaction. Rend
+        les lots touchés. Idempotent : un lot dont l'assigné a changé
+        entre-temps n'est pas touché. ``dry_run`` : ce qui serait fait, rien
+        n'est écrit."""
 
     @abc.abstractmethod
     def open_by_ref(self, ref: str) -> list[dict]:
