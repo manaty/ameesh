@@ -39,7 +39,10 @@ L125 :
   dans le verdict.
 
 Une exécution rouge sur main lève aussi l'alerte `ci_main_red`
-(`exploitation`, poussée par `ameesh notify` au responsable humain).
+(`exploitation`, poussée par `ameesh notify` au responsable humain) : #846,
+dès qu'un échec est relevé sur une exécution de main encore en cours, sans
+attendre ses jobs agrégateurs — un job rouge sans événement de test publié
+(part `job`) compte aussi.
 
 Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas encore
 émis par le flux : un échec compte dès sa première occurrence.
@@ -67,6 +70,11 @@ ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
                 "cancelled": "cancelled", "stale": "cancelled"}
+#: #846 : conclusions d'un check run de job qui disent un main rouge, même
+#: sans événement de test publié (panne d'installation, délai dépassé)
+FAILED_JOB_CONCLUSIONS = ("failure", "timed_out")
+#: #846 : part des échecs de job relevés ainsi (`ci_test_failures.part`)
+JOB_PART = "job"
 #: lignes d'extrait au plus dans un message
 EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
@@ -109,6 +117,26 @@ def events_of(check_runs, run_id: int) -> list[dict]:
                 seen.add(key)
                 out.append(ev)
     return out
+
+
+def failed_jobs_of(check_runs, run_id: int) -> list[str]:
+    """#846 : les jobs de l'exécution `run_id` déjà en échec, d'après les check
+    runs natifs de GitHub — les seuls publiés même quand aucun événement de
+    test ne l'est (panne d'installation, délai dépassé). Un check run d'un
+    autre workflow, ou d'une autre exécution du même commit, est écarté par le
+    lien vers son job (`/actions/runs/<run_id>/job/<job_id>`)."""
+    out = set()
+    for check in check_runs or ():
+        name = str(check.get("name") or "").strip()
+        if not name or name.startswith(CHECK_PREFIX):
+            continue
+        if (check.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
+            continue
+        link = str(check.get("details_url") or check.get("url") or "")
+        if "/actions/runs/%d/job/" % int(run_id) not in link:
+            continue
+        out.add(name)
+    return sorted(out)
 
 
 def lot_of_run(run: dict, lots: list[dict]) -> int | None:
@@ -352,6 +380,7 @@ class Watcher:
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
+        self._record_failed_jobs(st, repo, row, checks.get("check_runs"))
         if not events:
             return []
         reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0])
@@ -401,6 +430,19 @@ class Watcher:
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
+    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs) -> None:
+        """#846 : sur une branche de base, un job déjà en échec est un main
+        rouge, même sans événement de test publié (panne d'installation, délai
+        dépassé). Relevé ici pour que `ci.main_red` alerte sans attendre la
+        conclusion de l'exécution. Aucun courrier n'en part : `_failures` ne
+        signale que les événements de test (part `job` mise à part)."""
+        if row.get("branch") not in BASE_BRANCHES:
+            return
+        for job in failed_jobs_of(check_runs, int(row["run_id"])):
+            st.ci.add_failure(repo, int(row["run_id"]), part=JOB_PART, test=job,
+                              module="", status="echec", inherited=False,
+                              excerpt="", replay="", duration_s=None, failed_at=None)
+
     def _conclude(self, db, repo: str, row: dict) -> list[dict]:
         """Une exécution qui n'est plus en cours : son verdict."""
         from . import work
@@ -449,7 +491,10 @@ def describe(record: dict) -> str:
 # --------------------------------------------------------------------------
 
 def main_red(db) -> list[dict]:
-    """Les dernières exécutions conclues des branches de base qui sont rouges :
+    """Les exécutions des branches de base qui sont rouges : la dernière
+    exécution conclue rouge, et une exécution encore en cours dont un échec
+    est déjà relevé (#846 : un main rouge ne reste pas silencieux derrière ses
+    jobs agrégateurs, qui peuvent attendre un runner des heures).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
     out = []
@@ -458,6 +503,13 @@ def main_red(db) -> list[dict]:
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
+    for row in st.ci.running_on(BASE_BRANCHES):
+        # hérités exclus : un échec déjà rouge à la dernière exécution conclue
+        # de la base est déjà porté par l'alerte de celle-ci, de même clé
+        own = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))
+               if not f.get("inherited")]
+        if own:
+            out.append(dict(row, tests=own))
     return out
 
 

@@ -7,7 +7,8 @@ pendant la part et `close` le termine ; côté ameesh, `ci.Watcher` (mené par
 envoie un urgent au premier échec d'une tête, des événements ordinaires
 ensuite et le verdict à la fin, n'impute jamais un rouge hérité de main, et
 retire les messages non lus d'une tête remplacée. `ci_main_red` signale main
-rouge ; `ameesh ci status` montre les exécutions d'un lot.
+rouge dès le premier échec relevé, agrégateurs encore en file compris (#846) ;
+`ameesh ci status` montre les exécutions d'un lot.
 """
 from __future__ import annotations
 
@@ -53,6 +54,13 @@ def ev_test(test, statut="echec", execution=101, part="psycopg 1/4", **extra):
 def check_run(events, name="tests (flux) psycopg 1/4"):
     """Un check run tel que GitHub le rend, sortie produite par ci-flow.py."""
     return {"name": name, "output": ciflux.check_output(events)}
+
+
+def check_job(name, run_id, conclusion="failure"):
+    """Un check run natif de GitHub pour un job de l'exécution `run_id`."""
+    return {"name": name, "conclusion": conclusion,
+            "details_url": "https://github.com/%s/actions/runs/%d/job/%d"
+                           % (DEPOT, run_id, run_id * 10)}
 
 
 # --------------------------------------------------------------------------
@@ -500,6 +508,54 @@ class WatcherTest(PgTestCase):
                 cle = exploitation.alert_key(alerte)
         self.assertEqual(alerte["lot"], self.lot["id"])
         self.assertEqual(exploitation.alert_key(alerte), cle)
+
+    def test_main_rouge_sans_attendre_les_agregateurs(self):
+        # #846 : un échec relevé sur une exécution de main encore en cours
+        # (ses jobs agrégateurs attendent un runner) alerte déjà ; la
+        # conclusion rouge ne change pas la clé, donc pas de doublon
+        sha = "9" * 40
+        self.api.live = [run_view(801, sha, "main",
+                                  message="L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"])]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=801)])]
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertEqual(row["status"], "running")   # agrégateurs encore en file
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                     if a["type"] == "ci_main_red"]
+        self.assertEqual((alerte["agent"], alerte["lot"]), ("dev-b", self.lot_main["id"]))
+        self.assertIn("tests.test_a.T.test_1", alerte["detail"])
+        cle = exploitation.alert_key(alerte)
+        # la conclusion rouge ne double pas l'alerte
+        self.api.live = []
+        self.api.done[801] = {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)
+        (alerte2,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                      if a["type"] == "ci_main_red"]
+        self.assertEqual(exploitation.alert_key(alerte2), cle)
+
+    def test_main_rouge_sur_un_job_sans_evenement(self):
+        # #846 : un job en échec sans événement de test publié (installation,
+        # délai dépassé) est un main rouge ; il est relevé, alerte, et ne
+        # produit aucun courrier de test (les jobs d'une autre exécution du
+        # même commit sont écartés)
+        sha = "a9" * 20
+        self.api.live = [run_view(802, sha, "main",
+                                  message="L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"])]
+        self.api.checks[sha] = [check_job("psycopg 2/4", 802),
+                                check_job("plan", 802, conclusion="success"),
+                                check_job("psycopg 3/4", 999),
+                                check_job("psql 1/1", 802, conclusion="cancelled")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-b"), [])
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                     if a["type"] == "ci_main_red"]
+        self.assertEqual((alerte["agent"], alerte["lot"]), ("dev-b", self.lot_main["id"]))
+        self.assertIn("psycopg 2/4", alerte["detail"])
+        self.assertNotIn("psycopg 3/4", alerte["detail"])
+        # le relevé suivant ne double ni le relevé ni l'alerte
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(len([a for a in exploitation.alerts(self.cfg, self.db)
+                              if a["type"] == "ci_main_red"]), 1)
 
     def test_extrait_illisible_part_sans_extrait(self):
         sha = "7" * 40
