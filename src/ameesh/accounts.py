@@ -541,7 +541,9 @@ class Evaluation:
     profile: Profile
     reason: str = ""                     #: '' = sous le seuil
     gauges: list = field(default_factory=list)
-    until: float | None = None           #: remise à zéro attendue si au seuil
+    until: float | None = None           #: reprise attendue si au seuil : l'heure
+                                         #: de croisement du rythme, ou la remise
+                                         #: à zéro d'un plafond fixe
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
@@ -706,13 +708,28 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                 profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
         if reserve and not hard:
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
-        resets = [g.resets_at for g in depasses if g.resets_at]
-        result.until = max(resets) if len(resets) == len(depasses) else None
-        if result.until is not None:
-            # #373 r2 : la pause affichée est celle de la fenêtre qui bloque
-            # le plus longtemps
-            late = max(depasses, key=lambda g: float(g.resets_at))
+        # #373 r2, #898 : la pause affichée est celle de la fenêtre qui bloque
+        # le plus longtemps — l'heure de croisement pour une tenue de rythme
+        # (la garde est réévaluée à chaque tour), la remise à zéro pour un
+        # plafond fixe ou un plafond court, qui ne redescendent pas avant la
+        # fenêtre suivante ; aucune heure si une fenêtre n'est pas datée.
+        cut = RESERVE if reserve else 0.0
+        free = []
+        for g in depasses:
+            constant = any(g.used_at(now) >= cap for cap, _ in fixed)
+            if not constant and profile.short_window_cap is not None \
+                    and g.window_s <= SHORT_WINDOW_S:
+                constant = g.used_at(now) >= max(0.0, profile.short_window_cap - cut)
+            if constant:
+                free.append(float(g.resets_at) if g.resets_at else None)
+            else:
+                free.append(g.held_until(now, cut))
+        if all(when is not None for when in free):
+            result.until = max(free)
+            late = depasses[free.index(result.until)]
             result.held = (late.key, late.used)
+        else:
+            result.until = None
         return result
     if profile.hourly_usd > 0 and book.db is not None:
         spent = book.spent("all", 3600, account=profile.name, harnesses=[profile.harness])

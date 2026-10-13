@@ -257,6 +257,30 @@ class Gauge:
         """Au seuil de rythme ; `reserve` (L242b) l'abaisse d'autant."""
         return self.used_at(now) >= max(0.0, self.pace_cap(now) - reserve)
 
+    def held_until(self, now: float, reserve: float = 0.0) -> float | None:
+        """L'heure où la fenêtre cesse de retenir un compte tenu par le rythme.
+
+        Le rythme se relâche à mesure que la fenêtre s'écoule : un compte tenu
+        par le seul rythme repart quand le plafond de rythme (moins `reserve`,
+        L242b) rejoint son utilisation — l'heure de croisement, pas la remise à
+        zéro (#898), la garde étant réévaluée à chaque tour. Quand
+        l'utilisation a atteint le plafond de rythme lui-même (`PACE_CEILING`
+        moins la réserve), il ne redescend pas avant la fenêtre suivante : la
+        reprise est alors la remise à zéro. None : fenêtre non datée, aucune
+        heure à annoncer.
+        """
+        if not self.resets_at:
+            return None
+        reset = float(self.resets_at)
+        cut = max(0.0, reserve)
+        used = self.used_at(now)
+        if used >= PACE_CEILING - cut:
+            return reset
+        # la part écoulée qui libère : le plafond vaut part écoulée +
+        # PACE_MARGIN, moins la réserve (borné par le genou du plafond)
+        elapsed = min(max(used + cut - PACE_MARGIN, 0.0), PACE_CEILING - PACE_MARGIN)
+        return reset - (1.0 - elapsed) * self.window_s
+
     def reset_passed(self, now: float) -> bool:
         """La fenêtre publiée est-elle déjà remise à zéro (`resets_at` passé) ?
 
@@ -793,15 +817,17 @@ class CostBook:
             return ""
         # L242b (4), #373 r1 : la pause en court d'abord, comme avec des
         # comptes déclarés (`accounts.pause_label`) ; sans compte déclaré,
-        # c'est le compte par défaut du harnais. #373 r2 : la pause dure
-        # jusqu'à la remise à zéro la plus tardive des fenêtres qui bloquent
-        # — aucune date si l'une d'elles n'est pas datée.
+        # c'est le compte par défaut du harnais. #373 r2, #898 : la pause dure
+        # jusqu'à la fenêtre qui bloque le plus longtemps — l'heure de
+        # croisement pour une tenue de rythme, la remise à zéro pour une
+        # utilisation au plafond ; aucune date si l'une d'elles n'est pas datée.
         head = ""
-        if all(gauge.resets_at for gauge in held):
-            gauge = max(held, key=lambda g: float(g.resets_at))
+        freed = [(gauge, gauge.held_until(now, reserve)) for gauge in held]
+        if all(when is not None for _, when in freed):
+            gauge, when = max(freed, key=lambda pair: pair[1])
             head = "pause (account %s, %s %.0f %%) until %s; " % (
                 DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
-                until_label(gauge.resets_at, now))
+                until_label(when, now))
         else:
             gauge = held[0]
         return head + ("plan %s %s: %.0f%% used with %.0f%% of the window "
