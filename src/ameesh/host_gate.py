@@ -7,6 +7,10 @@ Extracted from the L112 gate of path B (`lot/v170-voie-b`,
 mediated device needs (socket gate, availability relay to the server). Path
 B can later import this module instead of its own copy.
 
+Guest runners on lending hosts select this gate by default (#501).
+Native runners select none unless explicitly configured. An ack permission
+error removes a native gate; guests remain closed until ack recovery.
+
 A guard (`ameesh guard`, L159e, or Nexlink Compute) writes
 `ameesh-host-state/1` to `/run/ameesh-gate/state/state.json` (temporary
 file, then `rename`). The runner reads it on inotify, else every 2 s, and
@@ -47,6 +51,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import dataclasses
+import errno
 import fcntl
 import json
 import math
@@ -57,6 +62,7 @@ import threading
 import time
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from . import platform as platform_mod
 from .capacity_guard import (ACK_PATH, FALLBACK_CLASSIC, FALLBACK_LENDING, SCHEMA_HOST_ACK,
                              SCHEMA_HOST_STATE, STATE_PATH, STATES, state_problem)
 
@@ -416,6 +422,11 @@ class FileGate:
         self._part: tuple[str, int] | None = None
         self._last_seq = -1
         self._last_error = ""
+        self.ack_error: str = ""
+        self.ack_errno: int | None = None
+        self._ack_permission_denied = False
+        self._ack_retry_at = 0.0
+        self._ack_retry_delay = 1.0
         self._wake_r, self._wake_w = os.pipe()
         os.set_blocking(self._wake_r, False)
 
@@ -490,6 +501,8 @@ class FileGate:
         return self._publish(None) if self._part is not None else True
 
     def _publish(self, body: dict | None) -> bool:
+        if time.monotonic() < self._ack_retry_at:
+            return False
         parts = os.path.join(os.path.dirname(self.ack_path) or ".", "parts")
         lock = -1
         try:
@@ -515,12 +528,27 @@ class FileGate:
                 if _without_ts(_read_json(self.ack_path)) != _without_ts(merged):
                     _atomic_write(self.ack_path, merged)
         except OSError as exc:
-            self._log("host gate: ack not written (%s)" % exc)
+            message = str(exc)
+            if (exc.errno, message) != (self.ack_errno, self.ack_error):
+                self._log("host gate: ack not written (%s)" % exc)
+            self.ack_errno, self.ack_error = exc.errno, message
+            self._ack_permission_denied |= exc.errno in (errno.EACCES, errno.EPERM)
+            self._ack_retry_at = time.monotonic() + self._ack_retry_delay
+            self._ack_retry_delay = min(60.0, 2 * self._ack_retry_delay)
             return False
         finally:
             if lock >= 0:
                 os.close(lock)
+        if self.ack_error:
+            self._log("host gate: ack writable again")
+        self.ack_errno, self.ack_error = None, ""
+        self._ack_permission_denied = False
+        self._ack_retry_at, self._ack_retry_delay = 0.0, 1.0
         return True
+
+    @property
+    def ack_permission_denied(self) -> bool:
+        return self._ack_permission_denied
 
     def _drop_part(self) -> None:
         """Under the parts' lock, after `_closed` is set: a `_publish` running
@@ -576,17 +604,67 @@ def default_fallback(cfg, lending: bool = False) -> str:
     return FALLBACK_LENDING if lending else FALLBACK_CLASSIC
 
 
-def gate_kind(cfg, lending: bool = False) -> str:
-    """The gate of this host: `host_gate`, else `file` on a lending host
-    (closed by default: no state, no claim) and '' on a classic one."""
+# Linux identity is cached; a confirmed or uncertain guest never becomes native.
+_guest_identity = False
+_native_identity = False
+_guest_identity_lock = threading.Lock()
+
+
+def is_guest(cfg, runner_id: str | None = None) -> bool:
+    """Linux identity is cached for life; other OSes only use the runner ID."""
+    global _guest_identity, _native_identity
+    ident = runner_id if runner_id is not None else getattr(cfg, "runner_id", "")
+    guest_id = str(ident or "").startswith("guest-")
+    if platform_mod.SYSTEM != "linux":
+        return guest_id  # pwd and kernel cgroups only identify Linux guests.
+    with _guest_identity_lock:
+        if _guest_identity:
+            return True
+        if guest_id:
+            _guest_identity = True
+            return True
+        if _native_identity:
+            return False
+        try:
+            import pwd
+            uid = os.geteuid()
+            pwd.getpwuid(uid)  # Validate lookup availability, without trusting its name.
+            # Successful enumeration distinguishes an absent guest account
+            # from a failed lookup. Never swallow KeyError from an account
+            # that exists: it is an uncertain identity and latches guest.
+            guest_exists = any(entry.pw_name == "ameesh-guest" for entry in pwd.getpwall())
+            guest_uid = pwd.getpwnam("ameesh-guest").pw_uid if guest_exists else None
+            if uid == guest_uid:
+                _guest_identity = True
+                return True
+            _guest_identity = any(
+                part.startswith("ameesh-guest-runner@") and part.endswith(".service")
+                for path in platform_mod.self_cgroup_paths() for part in path.split("/"))
+            _native_identity = not _guest_identity
+        except (ImportError, KeyError, OSError, UnicodeError, platform_mod.NotAvailable):
+            _guest_identity = True
+        return _guest_identity
+
+
+def gate_choice(cfg, lending: bool = False, *, runner_id: str | None = None) -> tuple[str, str]:
+    """Native overrides are preserved; guests always require the file gate."""
     kind = str(getattr(cfg, "host_gate", "") or "").strip().lower()
+    guest = is_guest(cfg, runner_id)
+    if guest and kind and kind != "file":
+        raise ValueError("guest runner requires host_gate=file; refusing host_gate=%s" % kind)
     if kind == "none":
-        return ""
-    if not kind:
-        return "file" if lending else ""
-    if kind not in GATE_KINDS:
-        raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
-    return kind
+        return "", "explicit host_gate=none"
+    if kind:
+        if kind not in GATE_KINDS:
+            raise ValueError("host_gate: unknown %r (%s)" % (kind, " | ".join(GATE_KINDS)))
+        return kind, "explicit host_gate=%s" % kind
+    if guest:
+        return "file", "guest runner on lending host" if lending else "guest runner requires file gate"
+    return "", "native runner; guest gate excluded" if lending else "classic host default"
+
+
+def gate_kind(cfg, lending: bool = False, *, runner_id: str | None = None) -> str:
+    return gate_choice(cfg, lending, runner_id=runner_id)[0]
 
 
 def drain_seconds(cfg, offer: Optional[Mapping] = None) -> float:
@@ -599,10 +677,10 @@ def drain_seconds(cfg, offer: Optional[Mapping] = None) -> float:
     return float(seconds) if _number(seconds) and seconds > 0 else DEFAULT_DRAIN_S
 
 
-def from_config(cfg, *, lending: bool = False,
+def from_config(cfg, *, lending: bool = False, runner_id: str | None = None,
                 log: Callable[[str], None] | None = None) -> Optional[FileGate]:
     """The configured gate, or None (no gate: nothing changes)."""
-    if not gate_kind(cfg, lending):
+    if not gate_kind(cfg, lending, runner_id=runner_id):
         return None
     fallback = default_fallback(cfg, lending)
     return FileGate(str(getattr(cfg, "host_gate_path", "") or "") or STATE_PATH,
@@ -744,11 +822,15 @@ class GateController:
         only a later seq, or the same seq closing (the fallback of an
         unreadable file): a state read before the loop applied a newer one
         never reopens the controller (r5)."""
+        if getattr(self.gate, "ack_error", "") and is_guest(
+                getattr(self.runner, "cfg", None), getattr(self.runner, "runner_id", None)):
+            state = dataclasses.replace(state, state="stopped", reason="ack failed")
         now = self._clock()
         with self._lock:
             if newer_only and self._applied is not None and (
                     state.seq < self._state.seq
-                    or (state.seq == self._state.seq and state.may_claim)):
+                    or (state.seq == self._state.seq and state.may_claim
+                        and self._state.reason != "ack failed")):
                 return False
             self._account_freeze(state, now)
             if _key(state) == self._applied:
@@ -862,6 +944,8 @@ class GateController:
         if key != self._ack_key:
             if self.gate.acknowledge(ack):
                 self._ack_key = key
+                if state.reason == "ack failed":
+                    self.apply(self.gate.state(), newer_only=True)
                 self.acks = (self.acks + [ack])[-20:]
                 if drained:
                     self._log("host gate: drained (seq %d), no lease held, no background "
@@ -872,6 +956,13 @@ class GateController:
             merge = getattr(self.gate, "merge", None)
             if merge is not None:
                 merge()
+        if getattr(self.gate, "ack_error", "") and is_guest(
+                getattr(self.runner, "cfg", None), getattr(self.runner, "runner_id", None)):
+            self.apply(dataclasses.replace(state, state="stopped", reason="ack failed"))
+        elif getattr(self.gate, "ack_permission_denied", False):
+            reject = getattr(self.runner, "reject_host_gate", None)
+            if reject is not None:
+                reject(self, self.gate.ack_error)
         return ack
 
 
@@ -879,7 +970,7 @@ def controller_from_config(runner, *, lending: bool = False, offer: Optional[Map
                            log: Callable[[str], None] | None = None) -> Optional[GateController]:
     """The runner's controller, or None without a gate (`gate_kind`)."""
     cfg = runner.cfg
-    gate = from_config(cfg, lending=lending, log=log)
+    gate = from_config(cfg, lending=lending, runner_id=getattr(runner, "runner_id", None), log=log)
     if gate is None:
         return None
     return GateController(runner, gate, drain_s=drain_seconds(cfg, offer), log=log)

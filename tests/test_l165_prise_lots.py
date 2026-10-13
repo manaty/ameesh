@@ -70,6 +70,50 @@ class PriseDeLotTest(_Lots):
         self.assertEqual(st.auto_takes_since(3600, backlog.LOT_TAKE_NOTE), 1)
         self.assertEqual(self.take(), [])
 
+    def test_forfait_au_seuil_laisse_le_lot_a_l_agent_au_token(self):
+        # #754 : quand le seul agent au forfait de l'équipe est en pause
+        # budget, l'agent au token de la même équipe prend le lot (owner,
+        # 13/10 : « quand les forfaits Claude sont au seuil, le travail passe
+        # à DeepSeek et Codex »).
+        self.agent("claude1", team="nexlink", status="blocked")
+        self.db.execute("UPDATE agent_registry SET status_text = 'budget : plafond'"
+                        " WHERE name = 'claude1'")
+        self.agent("deepseek7", "deepseek", team="nexlink")
+        self.agent("dev1", team="ameesh")
+        lot = self.lot("corriger l'export")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"], t["kind"]) for t in out],
+                         [("deepseek7", lot["id"], "lot")])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "deepseek7")
+
+    def test_forfait_libre_de_l_equipe_garde_le_lot(self):
+        # #754 : un forfait libre de l'équipe passe toujours avant un agent
+        # au token — le tri de `candidates` le garantit.
+        self.agent("claude1", team="nexlink")
+        self.agent("deepseek7", "deepseek", team="nexlink")
+        lot = self.lot("corriger l'export")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("claude1", lot["id"])])
+
+    def test_forfait_qui_ne_peut_pas_prendre_ne_bloque_pas_le_token(self):
+        # #754 r1 (mesh-design) : un forfait libre de l'équipe qui ne peut pas
+        # prendre un lot (`lot_fits` le refuse, ou il vient d'en prendre un)
+        # ne prive plus les agents au token de ce lot : les deux partent dans
+        # le même passage. Sans le tri, `paid_allowed` rendait [] ici.
+        self.agent("claude1", team="nexlink")
+        self.agent("deepseek7", "deepseek", team="nexlink")
+        pour_deepseek = self.lot("exige deepseek")
+        self.db.execute("UPDATE work_items SET required_capabilities ="
+                        " '{harness:deepseek}' WHERE id = %s", (pour_deepseek["id"],))
+        ordinaire = self.lot("ordinaire")
+        out = self.take()
+        self.assertEqual(sorted((t["agent"], t["item"]["id"]) for t in out),
+                         sorted([("claude1", ordinaire["id"]),
+                                 ("deepseek7", pour_deepseek["id"])]))
+        self.assertEqual(work.get(self.db, ordinaire["id"])["assignee"], "claude1")
+        self.assertEqual(work.get(self.db, pour_deepseek["id"])["assignee"], "deepseek7")
+
     def test_seuil_de_repos_propre_aux_lots(self):
         self.agent("claude1", team="nexlink", since_s=20 * 60)
         lot = self.lot("lot")
@@ -198,11 +242,10 @@ class PriseDeLotTest(_Lots):
         un = self.lot("un")
         deux = self.lot("deux")
         out = self.take()
-        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out], [("claude1", un["id"])])
-        self.assertIsNone(work.get(self.db, deux["id"])["assignee"])
-        out = self.take(allow_paid=True)
+        # #754 : le forfait prend le premier lot, le token le reste, dans le
+        # même passage ; l'orchestrateur, lui, ne se sert jamais.
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
-                         [("deepseek7", deux["id"])])
+                         [("claude1", un["id"]), ("deepseek7", deux["id"])])
 
     def test_lot_avant_la_file_et_garde_fous(self):
         self.agent("claude1", team="nexlink")
@@ -240,11 +283,16 @@ class NotifyTest(_Lots):
                          [("claude1", lot["id"], "lot de l'équipe")])
         parser = notify.build_parser()
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-idle", "0"])),
-                         {"idle_s": 0.0, "max_per_hour": 0, "allow_paid": False,
+                         {"idle_s": 0.0, "max_per_hour": 0,
                           "lot_idle_s": backlog.DEFAULT_LOT_IDLE_S,
                           "lot_max_per_hour": backlog.DEFAULT_LOT_MAX_PER_HOUR})
         self.assertEqual(notify.take_settings(parser.parse_args(["--take-lot-idle", "0"]))
                          ["lot_max_per_hour"], 0)
+        # #754 : l'ancien `--take-paid` reste accepté, sans effet : la prise
+        # par un agent au token est acquise après les forfaits.
+        self.assertEqual(notify.take_settings(parser.parse_args(["--take-idle", "60"])),
+                         notify.take_settings(parser.parse_args(["--take-idle", "60",
+                                                                 "--take-paid"])))
 
 
 if __name__ == "__main__":
