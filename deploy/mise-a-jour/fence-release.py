@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Signed-authority gate for independent-controller PostgreSQL release fences."""
 import hashlib
+from contextlib import contextmanager
 import importlib.util
 import json
 from pathlib import Path
@@ -85,3 +86,12 @@ class SignedReleaseFence:
             return self.store.drained(request, authorize=lambda: self._authorized(request))
         except Exception:
             raise FenceError('live fence unavailable') from None
+
+    @contextmanager
+    def guard(self,request):
+        self._authorized(request)
+        try:
+            with self.store.guard(request,authorize=lambda:self._authorized(request)):
+                yield
+        except Exception:
+            raise FenceError('guarded host boundary unavailable') from None

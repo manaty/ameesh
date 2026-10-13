@@ -17,7 +17,7 @@ SELECT format('GRANT SELECT ON %I.agent_registry,%I.agent_mailbox,%I.mesh_approv
               :'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'schema',:'role') \gexec
 SELECT format('GRANT SELECT ON %I.mesh_approvals_status TO %I', :'schema', :'role') \gexec
 -- SELECT FOR UPDATE locks the agent boundary without changing its state.
-SELECT format('GRANT UPDATE(name) ON %I.agent_registry TO %I', :'schema', :'role') \gexec
+SELECT format('GRANT UPDATE(updated_at) ON %I.agent_registry TO %I', :'schema', :'role') \gexec
 SELECT format('GRANT INSERT,UPDATE,DELETE ON %I.host_release_operations,%I.host_release_fences,%I.host_release_fence_receipts TO %I',
               :'schema',:'schema',:'schema',:'role') \gexec
 DO $audit$
@@ -47,7 +47,7 @@ BEGIN
         FOREACH p IN ARRAY ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','TRIGGER','REFERENCES','MAINTAIN'] LOOP
             IF item.relname='agent_registry' AND p='UPDATE' THEN
                 -- Table UPDATE would allow turn/lease and owner-key changes;
-                -- only the name column is admitted for row-locking.
+                -- only the metadata timestamp is admitted for row-locking.
                 IF has_table_privilege(r.oid,item.oid,p) THEN
                     RAISE EXCEPTION 'release controller has broad registry UPDATE';
                 END IF;
@@ -64,7 +64,7 @@ BEGIN
             FOR column_right IN SELECT attnum,attname FROM pg_attribute WHERE attrelid=item.oid
                                 AND attnum>0 AND NOT attisdropped LOOP
                 FOREACH p IN ARRAY ARRAY['INSERT','UPDATE','REFERENCES'] LOOP
-                    IF item.relname='agent_registry' AND column_right.attname='name' AND p='UPDATE' THEN
+                    IF item.relname='agent_registry' AND column_right.attname='updated_at' AND p='UPDATE' THEN
                         CONTINUE;
                     END IF;
                     IF has_column_privilege(r.oid,item.oid,column_right.attnum,p) THEN

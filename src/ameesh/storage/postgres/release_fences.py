@@ -5,6 +5,7 @@ Not exposed through the mediated executor API. Its enrolled controller caller
 must validate signed authority before writes; these methods do not grant it.
 """
 import json
+from contextlib import contextmanager
 
 from ... import db as db_mod
 from .hosts import Hosts
@@ -103,6 +104,21 @@ class ReleaseFences:
             return bool(rows and rows[0] == {'operation': request['operation'],
                                              'manifest_digest': request['manifest_digest']}
                         and self._quiet(tx, host))
+
+    @contextmanager
+    def guard(self, request, *, authorize):
+        """Keep owned closure serialized through the synchronous host submit."""
+        host = request['manifest']['host']
+        with self.db.transaction() as tx:
+            self._lock(tx,host)
+            if authorize() is not True:
+                raise FenceError('release fence authority denied')
+            rows = tx.query('SELECT f.operation,o.manifest_digest FROM host_release_fences f '
+                            'JOIN host_release_operations o USING(operation) WHERE f.host=%s',(host,))
+            if (not rows or rows[0] != {'operation':request['operation'],'manifest_digest':request['manifest_digest']}
+                    or not self._quiet(tx,host)):
+                raise FenceError('owned drained release fence required')
+            yield
 
     def open(self, request, *, authorize):
         """Atomically remove only this fence and persist completion for replay."""

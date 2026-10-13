@@ -190,12 +190,70 @@ the three control tables. Reapplying executor or canon-writer roles preserves
 read access and removes their direct fence writes; the executor audit also
 rejects inherited writes. `deploy/sql/role-release-controller.sql` prepares a
 separate NOLOGIN group with read access needed for proof/drain validation,
-registry row-lock access through UPDATE(name) only, and writes to the fence
+registry row-lock access through UPDATE(updated_at) only, and writes to the fence
 tables. Its audit rejects unrelated table/column writes, inherited roles and
 schema/database creation. It grants no migration/backup/root authority and
 creates no login or credential. This storage is deliberately outside the
 mediated executor API. Enrollment remains a prepared administrative operation;
 no role or migration is applied to a live mesh by this development work.
+
+## Narrow restart host helper
+
+`helper-redemarrage.py.RestartHelper` supplies system-mode restart and recovery
+restart, restricted to exact enrolled `ameesh-runner@…` or
+`ameesh-runner-agent@…` instances. Its policy identifies the host, allowlist,
+independent controller service and 5–300 second restart budget. The signed
+manifest's policy reference must be `policy-` plus the canonical policy digest,
+so changing that allowlist or budget invalidates operation authority. The
+controller service itself is outside the allowlist and `system.slice` holds
+the action workers independently of runner slices.
+
+Before launch, the helper verifies current signed authority, the live drained
+database fence, and cgroup process inventories. A runner's MainPID can remain;
+any other process in its cgroup or descendants blocks restart, including an
+orphan after its lease expired. Missing identities/inventories fail closed.
+Authority is checked again after slow observations. These checks depend on
+trusted system units and host/cgroup enrollment; they are not persona isolation.
+The database gate/agent locks span the synchronous systemd submission, so a
+concurrent authorized unfence must wait for that boundary instead of opening
+claims between observation and submission.
+
+A private fsynced intent precedes submission of a deterministic transient
+systemd action service, with Type=oneshot, RemainAfterExit=yes and a bounded
+TimeoutStartSec. The fixed action program is `systemctl restart` over the exact
+approved unit list. No caller-selected shell, executable, path or service is
+run. Unit Result, ExecMainStatus and InvocationID establish a completion receipt;
+the action service must remain loaded until that receipt is durable. After a
+lost SSH/submission reply or a crash before receipt publication, the same action
+is observed rather than submitted again. A missing action unit or changed boot
+identity with an incomplete intent requires reconciliation and holds the release;
+it is not guessed to mean no effect occurred. Helper receipts prevent a second
+restart, and raw systemd/provider exception text does not escape.
+
+`hote-release.py` is a stdin dispatcher for a future root-owned forced command.
+It requires the isolated immutable interpreter at
+`/opt/ameesh-release/runtime/bin/python`, root-owned trusted source/runtime
+paths, an exact enrolled machine-id and private root-owned files under
+`/etc/ameesh-release`: enrollment.json (`host`, `machine_id`, `database`,
+`policy`), database.json (explicit postgres backend and controller credentials),
+and operations/OPERATION.json (`operation`, `decision_id`, full `manifest`).
+The request only carries operation, action id, step and manifest digest; it
+cannot supply units, credentials, manifests or filesystem paths. The protected
+operation file supplies the manifest checked against the signed decide answer.
+The exact pending action must also appear as the current intent in the private
+root-owned independent controller journal under
+`/var/lib/ameesh-release/controller`; a transport caller cannot skip the
+controller's protocol steps merely by possessing the operation reference.
+Ambient account/libpq/config/trace variables are removed before connecting.
+Input is size/time bounded; errors return only a structured generic category.
+
+The helper/dispatcher remain **source only**, not installed, exposed through SSH,
+or enabled as a service. Tests simulate systemd and cgroup filesystem fixtures;
+they do not prove a real host restart. The bootstrap, pinned helper runtime,
+restricted SSH/sudo enrollment, full independent-service adapter, config/caps/
+guard snapshots, installer wiring and authenticated health/rollback pilot are
+still required. This checkpoint implements neither user-mode systemd nor other
+root operations and grants no root authority to an agent.
 
 ## Operation-specific code and environment recovery
 

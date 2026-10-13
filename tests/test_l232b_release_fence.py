@@ -216,3 +216,59 @@ class ReleaseFenceTest(PgTestCase):
         self.assertEqual(storage.of(self.db).host_lifecycle.listing(), [])
         self.assertEqual(storage.of(self.db).handoffs.active('dev'), None)
         self.assertTrue(self.db.query("SELECT NOT ameesh_host_claims_open('release-host') AS closed")[0]['closed'])
+
+    def test_host_submit_guard_serializes_concurrent_unfence(self):
+        self.perform()
+        other = db_mod.connect(self.cfg)
+        adapter = fence.SignedReleaseFence(other, release.SignedDecisionAuthority(
+            other,self.view['id'],self.operation,self.manifest))
+        started, result, errors = threading.Event(), [], []
+        original = adapter.store._lock
+        def observed_lock(tx,host):
+            started.set()
+            original(tx,host)
+        def open_gate():
+            try:
+                result.append(adapter.perform('unfence',self.request('unfence')))
+            except Exception as exc:
+                errors.append(str(exc))
+        thread = threading.Thread(target=open_gate)
+        try:
+            with mock.patch.object(adapter.store,'_lock',observed_lock):
+                with self.adapter.guard(self.request('restart')):
+                    thread.start()
+                    self.assertTrue(started.wait(10))
+                    thread.join(0.1)
+                    self.assertTrue(thread.is_alive())
+                    self.assertEqual(self.db.query('SELECT operation FROM host_release_fences')[0]['operation'],self.operation)
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors,[])
+            self.assertEqual(result,[dict(self.request('unfence'),ok=True)])
+        finally:
+            thread.join(10)
+            other.close()
+
+    def test_restart_helper_uses_real_signed_authority_and_database_guard(self):
+        from tests.test_l232b_restart_helper import helper, System
+        policy = dict(host=self.manifest['host'],units=['ameesh-runner@test.service'],
+                      controller_unit='ameesh-release-controller.service',restart_seconds=5)
+        self.manifest = dict(self.manifest,units=policy['units'],policy=helper.policy_id(policy))
+        self.operation = 'guarded-release'
+        lot = work.add(self.db,title='Synthetic guarded restart',assignee='fixture-controller')
+        view = decisions.ask(self.cfg,self.db,requester='fixture-controller',lot=str(lot['id']),
+            question=release.question(self.operation,self.manifest,expires_at=int(self.now)+600),
+            options=['%s=%s' % (o['key'],o['label']) for o in release.OPTIONS],needs_signature=True)
+        digest = decisions.answer_digest(view,'apply','apply','human:fixture-owner')
+        authority.create_approval(self.db,self.seed,approver='fixture-owner',action=decisions.APPROVAL_ACTION,
+            artifact_kind=decisions.APPROVAL_KIND,artifact_hash=digest,ttl=900)
+        decisions.answer(self.cfg,self.db,view['id'],'apply',human='human:fixture-owner',channel='cli',signed=True)
+        signed = release.SignedDecisionAuthority(self.db,view['id'],self.operation,self.manifest)
+        gate = fence.SignedReleaseFence(self.db,signed)
+        gate.perform('fence',self.request())
+        system = System()
+        engine = helper.RestartHelper(Path(self.tmp)/'signed-helper',policy,authority=signed,fence=gate,system=system)
+        expected = dict(self.request('restart'),ok=True)
+        self.assertEqual(engine.perform('restart',self.request('restart')),expected)
+        self.assertEqual(engine.perform('restart',self.request('restart')),expected)
+        self.assertEqual(len(system.submissions),1)
