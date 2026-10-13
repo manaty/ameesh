@@ -146,6 +146,9 @@ verifier() {
 sauvegarder() {
   local jour dsn; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
+  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
+  # d'ouvrir le canal privé de sauvegarde, comme pour « migrer ».
+  dsn_part dsn "$CONFIG" dsn || return
   "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
     --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
@@ -158,6 +161,7 @@ sauvegarder() {
     test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
   if ancienne; then
     etape "ancienne base"
+    dsn_part dsn "$CONFIG_RESTE" dsn || return
     "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
       --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
