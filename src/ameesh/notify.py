@@ -4,7 +4,7 @@
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
-                [--take-idle S] [--take-max-per-hour N] [--take-paid]
+                [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
                 [--handoff-max-per-hour N] [--handoff-idle S]
         follows the operations alerts (`ameesh alerts --follow`, same
@@ -1633,10 +1633,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
                         help="maximum auto-takes per rolling hour, for the whole mesh "
                              "(default 2)")
-    parser.add_argument("--take-paid", action="store_true",
-                        default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
-                        help="allow auto-take by pay-per-token agents (after plan agents; "
-                             "never during balance_low)")
+    # #754 : la prise par un agent au token est acquise — après les forfaits,
+    # jamais sous `balance_low` (owner, 13/10) ; l'ancien `--take-paid` reste
+    # accepté, sans effet, pour les unités qui le passent encore.
+    parser.add_argument("--take-paid", action="store_true", help=argparse.SUPPRESS)
     # L165 : prise d'un lot non assigné de l'équipe, avant la file
     parser.add_argument("--take-lot-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
@@ -1687,7 +1687,6 @@ def take_settings(args) -> dict | None:
     if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "allow_paid": bool(getattr(args, "take_paid", False)),
             "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
 
 

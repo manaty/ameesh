@@ -261,10 +261,10 @@ Safeguards:
 * **never an irreversible or production action**: the pick-up mail
   forbids it (deployment, merge, data deletion, production
   server, committed spending); the agent proposes it to a human;
-* plans first; the token only with `--take-paid`, never during
-  `balance_low`; nothing under a reached cap nor on a host under pressure,
-  on low battery or not ready; at most `--take-max-per-hour` (2) pick-ups
-  per sliding hour for the whole mesh.
+* plans first; what they leave is taken by the pay-per-token agents in the
+  same pass, never during `balance_low`; nothing under a reached cap nor on a
+  host under pressure, on low battery or not ready; at most
+  `--take-max-per-hour` (2) pick-ups per sliding hour for the whole mesh.
 
 When agents are idle and the queue is empty (and no lot of the
 project is waiting), the `backlog_empty` alert invites the human lead to
