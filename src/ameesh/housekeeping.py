@@ -1185,6 +1185,18 @@ def _unlink_in_root(path: str, root: str, *, expected=None,
     return freed
 
 
+def _dir_writable(path: str, writable: dict) -> bool:
+    """#762: `path`'s directory lets us unlink it (cached by directory).
+
+    Unlike the ownership test of `_removable`, this is what the kernel
+    enforces: an unlink in a directory we may not write is refused whatever
+    the file's owner."""
+    parent = os.path.dirname(path)
+    if parent not in writable:
+        writable[parent] = os.access(parent, os.W_OK | os.X_OK)
+    return writable[parent]
+
+
 def _removable(path: str, uid: int | None, writable: dict) -> bool:
     """#500: this pass can unlink `path`: owned by us (any owner when the
     platform has no uid) and its directory writable (cached in `writable`)."""
@@ -1194,10 +1206,7 @@ def _removable(path: str, uid: int | None, writable: dict) -> bool:
         return False
     if uid is not None and st.st_uid != uid:
         return False
-    parent = os.path.dirname(path)
-    if parent not in writable:
-        writable[parent] = os.access(parent, os.W_OK | os.X_OK)
-    return writable[parent]
+    return _dir_writable(path, writable)
 
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
@@ -1338,6 +1347,15 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 # escapes the walk: `st_nlink` counts them all, the walked
                 # ones included. Reading `st_nlink == 1` alone counted a fully
                 # walked inode as unremovable and blocked the dry-run.
+                # A walked name whose directory forbids the unlink would be
+                # refused by the pass, which stops there: predict that stop
+                # rather than crediting the block.
+                if not all(_dir_writable(other, writable) for other in others):
+                    unremovable += size
+                    counted -= size
+                    blocked = unremovable > quota
+                    failed.append(path)
+                    break
                 freed = st.st_nlink == len(set(others)) + 1
             else:
                 # #500 r6 (codex P2 r5): an inode with hard links is counted

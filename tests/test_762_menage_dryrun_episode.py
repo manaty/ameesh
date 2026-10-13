@@ -92,6 +92,29 @@ class DryRunTest(unittest.TestCase):
         self.assertFalse(os.path.exists(inside))
         self.assertTrue(os.path.exists(keep))
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores the directory permissions")
+    def test_dry_run_predicts_a_name_it_cannot_unlink(self):
+        # un nom dans un dossier inscriptible, l'autre dans un dossier en
+        # lecture seule : la passe réelle refuse le second et s'arrête sans
+        # créditer le bloc ; le dry-run doit prédire ce refus (mêmes champs),
+        # pas annoncer une éviction qu'il ne ferait pas
+        first = os.path.join(self.mine, "w", "a")
+        _write(first, size=5)
+        readonly = os.path.join(self.mine, "r")
+        os.makedirs(readonly)
+        os.link(first, os.path.join(readonly, "b"))
+        os.chmod(readonly, 0o500)
+        self.addCleanup(os.chmod, readonly, 0o700)
+        dry = menage.evict_lru([self.mine], self.root, 0, dry_run=True)
+        self.assertEqual(self._fields(dry), (0, 0, B, True, B))
+        self.assertEqual(dry["failed"], [first])
+        self.assertTrue(os.path.exists(first))
+        apply_ = menage.evict_lru([self.mine], self.root, 0)
+        self.assertEqual(self._fields(apply_), (0, 0, B, True, B))
+        self.assertEqual(apply_["failed"], [first])
+        self.assertTrue(os.path.exists(first))
+
 
 class EpisodeTest(PgTestCase):
     """Point 2 : `mounts_unreadable` → `truncated`, un seul épisode `tmp_unscanned`."""
