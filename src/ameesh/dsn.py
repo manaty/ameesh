@@ -10,16 +10,18 @@ describes is the one the whole string described:
 
 * a URI (`postgresql://` or `postgres://`): the password of the userinfo
   (before the first `@` that comes before any `/`) and every `password` query
-  parameter are taken out, percent-decoded; the user and every other part are
-  kept as written, never re-encoded. A password in both places is refused;
+  parameter are taken out, percent-decoded (a query key too, and blanks
+  around a token dropped); the user and every other part are kept as
+  written, never re-encoded. A password in both places is refused;
 * key/value pairs: libpq's tokenizer (blanks around `=`, single-quoted values,
   backslash escapes in quoted and bare values); every `password` entry is
   taken out, the last one wins, and the other entries are written back in
   order, quoted as libpq reads them;
 * anything else is a bare database name, with no password.
 
-A string libpq would refuse is refused (`DsnError`), with a message that
-never quotes the string. Standard library only: `deploy/mise-a-jour/poste.sh`
+A string libpq's parser would refuse is refused (`DsnError`), with a message
+that never quotes the string; an unknown keyword or a bad value is left to
+libpq, which refuses it. Standard library only: `deploy/mise-a-jour/poste.sh`
 runs this file with the host's python3 before ameesh is installed
 (`python3 dsn.py password|dsn`, the DSN on standard input).
 """
@@ -50,8 +52,12 @@ def split_password(dsn: str) -> tuple[str, str]:
 # -- URI ---------------------------------------------------------------------
 
 def _uri_decode(text: str) -> str:
-    """libpq's conninfo_uri_decode: %XX only, %00 forbidden."""
-    raw = text.encode("utf-8", "surrogateescape")
+    """libpq's conninfo_uri_decode: %XX only, %00 forbidden; blanks (" ")
+    around the token are dropped and a blank inside it is refused, as libpq
+    16 to 18 do (an older one may keep them)."""
+    raw = text.encode("utf-8", "surrogateescape").strip(b" ")
+    if b" " in raw:
+        raise DsnError("unexpected blank inside a URI token (use %20)")
     out = bytearray()
     i = 0
     while i < len(raw):
@@ -81,7 +87,9 @@ def _split_uri(dsn: str) -> tuple[str, str]:
         user, colon, secret = rest[:end].partition(":")
         if colon and secret:   # libpq ignores an empty one
             in_userinfo = _uri_decode(secret)
-        userinfo = user + "@" if user else ""
+        # the "@" stays, even after an empty user: without it, a later "@"
+        # would end a userinfo libpq never read
+        userinfo = user + "@"
         rest = rest[end + 1:]
     base, question, query = rest.partition("?")
     in_query = None

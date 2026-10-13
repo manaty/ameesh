@@ -36,9 +36,15 @@ CASES = [
      "Pw-last-3", "postgresql://u@h.invalid/db?application_name=x"),
     ("postgresql://u:Pw-ipv6-4@[::1]:5432,h2.invalid:5433/db?target_session_attrs=any",
      "Pw-ipv6-4", "postgresql://u@[::1]:5432,h2.invalid:5433/db?target_session_attrs=any"),
-    ("postgresql://:Pw-nouser-5@h.invalid/db", "Pw-nouser-5", "postgresql://h.invalid/db"),
+    ("postgresql://:Pw-nouser-5@h.invalid/db", "Pw-nouser-5", "postgresql://@h.invalid/db"),
     ("postgresql://a?b:Pw-13@h.invalid/db?sslmode=require", "Pw-13",
      "postgresql://a?b@h.invalid/db?sslmode=require"),
+    ("postgresql://u@h.invalid/db?password =Pw-key-14&sslmode=require", "Pw-key-14",
+     "postgresql://u@h.invalid/db?sslmode=require"),
+    ("postgresql://u@h.invalid/db? password=Pw-key-15", "Pw-key-15",
+     "postgresql://u@h.invalid/db"),
+    ("postgresql://u: Pw-trim-16 @h.invalid/db", "Pw-trim-16", "postgresql://u@h.invalid/db"),
+    ("postgresql://@u:not-a-password@h.invalid/db", "", None),
     ("postgres://u@h.invalid/db?sslnegotiation=direct&sslmode=require", "", None),
     ("postgresql://u@h.invalid/db?passfile=/home/u/.pgpass&", "",
      "postgresql://u@h.invalid/db?passfile=/home/u/.pgpass"),
@@ -66,12 +72,20 @@ REFUSED = [
     "postgresql://u@h.invalid/db?password",
     "postgresql://u:Pw%zz@h.invalid/db",
     "postgresql://u@h.invalid/db?a=1&&password=Pw-c",
+    "postgresql://u:Pw inner@h.invalid/db",
+    "postgresql://u@h.invalid/db?password=Pw inner",
 ]
 
 
 def case(prefix):
     """The table's case whose DSN starts with `prefix`."""
     return next(c for c in CASES if c[0].startswith(prefix))
+
+
+def blanks_in_uri(dsn):
+    """libpq 16 to 18 drop the blanks around a URI token and refuse one
+    inside it, as ameesh.dsn does; an older libpq may keep them."""
+    return dsn.startswith(("postgresql://", "postgres://")) and " " in dsn
 
 
 def expected(case):
@@ -94,7 +108,7 @@ class SplitPasswordTest(unittest.TestCase):
 
     def test_libpq_reads_the_same_connection(self):
         try:
-            from psycopg import errors as pg_errors
+            from psycopg import errors as pg_errors, pq
             from psycopg.conninfo import conninfo_to_dict
         except ImportError:
             self.skipTest("psycopg not importable: libpq's own parser unavailable")
@@ -102,12 +116,16 @@ class SplitPasswordTest(unittest.TestCase):
             dsn = case[0]
             if not dsn.startswith(("postgresql://", "postgres://")) and "=" not in dsn:
                 continue   # a bare database name is not a connection string
+            if blanks_in_uri(dsn) and pq.version() < 160000:
+                continue
             with self.subTest(dsn=dsn):
                 password, rest = expected(case)
                 whole = conninfo_to_dict(dsn)
                 self.assertEqual(whole.pop("password", ""), password)
                 self.assertEqual(conninfo_to_dict(rest), whole)
         for dsn in REFUSED[1:]:
+            if blanks_in_uri(dsn) and pq.version() < 160000:
+                continue
             with self.subTest(refused=dsn), self.assertRaises(pg_errors.ProgrammingError):
                 conninfo_to_dict(dsn)
 
