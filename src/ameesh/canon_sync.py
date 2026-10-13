@@ -1541,7 +1541,8 @@ class ProcessSync:
 
 def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> ProcessSync:
     """#538 : pousse aux agents de `host` les fiches Process modifiées depuis
-    le dernier commit appliqué (`canon_state.last_good_commit`).
+    le dernier commit poussé (`canon_state.process_commit` ; au premier envoi,
+    le dernier état connu `last_good_commit`).
 
     La première synchronisation ne pousse rien : elle pose le repère. Un diff
     illisible ne pousse rien non plus (`error`) : mieux vaut manquer un
@@ -1550,7 +1551,9 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
 
     #793 : les synchronisations concurrentes d'un hôte lisent le même ancien
     commit ; seule celle qui l'avance (`claim_commit`, dans la transaction
-    des envois) pousse, les autres ne poussent rien."""
+    des envois) pousse, les autres ne poussent rien. Le repère est indépendant
+    de `record_state`, qu'un sync ancien peut écrire après un sync récent ;
+    un commit antérieur au repère ne pousse jamais des règles périmées."""
     done = ProcessSync()
     if not canon.sources or not canon.processes or not agents:
         return done
@@ -1558,10 +1561,12 @@ def sync_processes(db: Db, canon: Canon, host: str, agents: list[str]) -> Proces
     if source.mode != "git" or not source.commit:
         return done
     previous = state(db, host, canon) or {}
-    old = previous.get("last_good_commit") or ""
+    old = previous.get("process_commit") or previous.get("last_good_commit") or ""
     if not old or old == source.commit:
         return done
     try:
+        if not canon_mod.git_contains(source.repo, old, source.commit):
+            return done  # ancien sync ou historique divergé : repère conservé
         # #538 : la comparaison porte sur la RÉFÉRENCE APPROUVÉE (`source.commit`),
         # pas sur HEAD ni l'arbre de travail : si la référence avance sans que le
         # checkout suive, le changement est quand même poussé (sinon le point de
