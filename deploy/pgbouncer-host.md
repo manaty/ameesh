@@ -147,16 +147,26 @@ again on recovery. A successful reading below the threshold resolves it.
 
 When the effective DSN is the local pool socket itself (its `host` is the
 `unix_socket_dir` of `~/.config/pgbouncer/pgbouncer.ini`), `ameesh alerts` and
-`ameesh notify` also read the pool console (`SHOW POOLS`, `SHOW LISTS`) on that
-socket. They raise `pgbouncer_pool_waiting` — urgent, pushed by default — as
-soon as a client has queued for at least a second (`cl_waiting > 0`,
-`maxwait >= 1`): the server pool is exhausted, well before the client ceiling
-refuses anyone. The console is deliberately not subject to `max_client_conn`
-(pgbouncer only refuses connections to other databases), so the reading still
-works while clients are being refused. A host without a local pool, or whose
-DSN does not use it yet, adds no probe; the warning is local to the host that
-runs the notifier. An unreadable console does not resolve an active warning:
-the observation error is raised, as for the server capacity probe.
+`ameesh notify` also read the pool console (`SHOW POOLS`, `SHOW LISTS`,
+`SHOW CONFIG`) on that socket. They raise `pgbouncer_pool_waiting` — urgent,
+pushed by default — as soon as a client has queued for at least a second
+(`cl_waiting > 0`, `maxwait >= 1`): the server pool is exhausted, well before
+the client ceiling refuses anyone. The console is deliberately not subject to
+`max_client_conn` (pgbouncer only refuses connections to other databases). The
+display reads the real ceiling (`used_clients` / `max_client_conn` from
+`SHOW CONFIG`): `free_clients` counts client objects kept for reuse, it is not
+free capacity.
+
+`ameesh notify` reads this console from `cfg` alone, **before** its database
+pass and without opening the ordinary DSN. While `max_client_conn` refuses the
+notifier's own connection — the incident this warning reports — the console
+still answers, so the warning is routed and pushed anyway. A database outage
+never resolves the other alerts: their deliveries are left untouched. An
+unreadable console does not resolve the active warning either; the observation
+error is kept, as for the server capacity probe. `ameesh alerts`, which lists
+every other alert from the database, still needs a working connection. A host
+without a local pool, or whose DSN does not use it yet, adds no probe; the
+warning is local to the host that runs the notifier.
 
 Rollback, by bureau:
 

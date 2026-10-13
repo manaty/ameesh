@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Local PgBouncer pool sizing and saturation warning (#532)."""
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -18,6 +20,23 @@ def recipe_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def fake_console(pools, lists=None, config=None):
+    """A minimal admin console: SHOW POOLS, SHOW LISTS, SHOW CONFIG."""
+    answers = {'SHOW POOLS': pools, 'SHOW LISTS': lists or [], 'SHOW CONFIG': config or []}
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql):
+            return types.SimpleNamespace(fetchall=lambda: answers[sql])
+
+    return Conn()
 
 
 class RecipePoolSizing(unittest.TestCase):
@@ -126,20 +145,6 @@ class ReadPool(unittest.TestCase):
         except ImportError:
             self.skipTest('requires psycopg')
 
-    def console(self, pools, lists):
-        class Conn:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def execute(self, sql):
-                rows = pools if sql == 'SHOW POOLS' else lists
-                return types.SimpleNamespace(fetchall=lambda: rows)
-
-        return Conn()
-
     def test_aggregates_pools_and_ignores_the_console_pool(self):
         pools = [
             dict(database='ameesh', cl_active=40, cl_waiting=0, sv_active=38,
@@ -150,11 +155,14 @@ class ReadPool(unittest.TestCase):
                  sv_idle=0, maxwait=0),
         ]
         lists = [dict(list='used_clients', items=45), dict(list='free_clients', items=205)]
-        with mock.patch('psycopg.connect', return_value=self.console(pools, lists)):
+        config = [dict(key='max_client_conn', value='250')]
+        with mock.patch('psycopg.connect', return_value=fake_console(pools, lists, config)):
             reading = pgbouncer_local.read('host=/private/socket dbname=pgbouncer')
+        # N1 : `free_clients` (objets clients en cache) n'entre pas dans la
+        # lecture ; le plafond est celui de SHOW CONFIG.
         self.assertEqual(reading, dict(waiting=3, maxwait_s=7, clients_active=42,
                                        servers_active=39, servers_idle=6,
-                                       clients_used=45, clients_free=205))
+                                       clients_used=45, clients_max=250))
 
     def test_unreadable_console_is_not_a_healthy_pool(self):
         with mock.patch('psycopg.connect', side_effect=RuntimeError('refused')):
@@ -164,7 +172,7 @@ class ReadPool(unittest.TestCase):
     def test_ill_typed_console_answer_is_not_a_reading(self):
         pools = [dict(database='ameesh', cl_active=0, cl_waiting='many', sv_active=0,
                       sv_idle=0, maxwait=0)]
-        with mock.patch('psycopg.connect', return_value=self.console(pools, [])):
+        with mock.patch('psycopg.connect', return_value=fake_console(pools)):
             with self.assertRaises(db_mod.Unavailable):
                 pgbouncer_local.read('host=/private/socket dbname=pgbouncer')
 
@@ -172,7 +180,7 @@ class ReadPool(unittest.TestCase):
 class Pressured(unittest.TestCase):
     def test_a_real_queue_is_required(self):
         reading = dict(waiting=0, maxwait_s=0, clients_active=0, servers_active=0,
-                       servers_idle=0, clients_used=None, clients_free=None)
+                       servers_idle=0, clients_used=None, clients_max=None)
         for waiting, maxwait, expected in ((0, 0, False), (0, 9, False),
                                            (1, 0, False), (1, 1, True),
                                            (3, 30, True)):
@@ -184,17 +192,25 @@ class Pressured(unittest.TestCase):
     def test_line_names_the_queue_and_the_unknown_slots(self):
         text = pgbouncer_local.line(dict(waiting=60, maxwait_s=30, clients_active=40,
                                          servers_active=40, servers_idle=0,
-                                         clients_used=None, clients_free=None))
+                                         clients_used=None, clients_max=None))
         self.assertIn('60 client(s) waiting', text)
         self.assertIn('oldest 30s', text)
         self.assertIn('client slots unknown', text)
+
+    def test_line_reads_the_real_client_ceiling(self):
+        # N1 : des clients utilisés sur le plafond de SHOW CONFIG, pas un
+        # prétendu ratio avec les objets clients libres.
+        text = pgbouncer_local.line(dict(waiting=60, maxwait_s=30, clients_active=40,
+                                         servers_active=40, servers_idle=0,
+                                         clients_used=100, clients_max=250))
+        self.assertIn('100/250 client slots used', text)
 
 
 class PoolAlerts(unittest.TestCase):
     cfg = types.SimpleNamespace(dsn='host=/private/socket dbname=ameesh', backend='pg',
                                 host='pc-smichea')
     saturated = dict(waiting=60, maxwait_s=30, clients_active=40, servers_active=40,
-                     servers_idle=0, clients_used=100, clients_free=0)
+                     servers_idle=0, clients_used=100, clients_max=250)
 
     def db(self):
         return types.SimpleNamespace(cfg=self.cfg)
@@ -221,8 +237,16 @@ class PoolAlerts(unittest.TestCase):
         self.assertEqual(exploitation.alert_key(alert),
                          exploitation.alert_key(dict(alert, value=61, detail='other')))
 
+    def test_probe_reads_from_the_configuration_alone(self):
+        # B1 : le repli sans base lit la même console depuis `cfg` seule.
+        with mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
+                mock.patch.object(pgbouncer_local, 'read',
+                                  return_value=dict(self.saturated)):
+            alerts = pgbouncer_local.probe(self.cfg)
+        self.assertEqual([a['type'] for a in alerts], ['pgbouncer_pool_waiting'])
+
     def test_a_healthy_pool_raises_nothing(self):
-        healthy = dict(self.saturated, waiting=0, maxwait_s=0, clients_free=150)
+        healthy = dict(self.saturated, waiting=0, maxwait_s=0)
         with mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
                 mock.patch.object(pgbouncer_local, 'read', return_value=healthy):
             self.assertEqual(pgbouncer_local.alerts(self.db()), [])
@@ -235,11 +259,138 @@ class PoolAlerts(unittest.TestCase):
                 pgbouncer_local.alerts(self.db())
 
 
+class RecordingSender:
+    def __init__(self, sent):
+        self.sent = sent
+
+    def send(self, channel, message):
+        self.sent.append((channel.name, message.title, message.body))
+
+
+class LocalFallback(unittest.TestCase):
+    """B1 (#532) : l'alerte survit au refus qu'elle signale. La console se lit
+    depuis `cfg` seule, puis l'alerte est routée et poussée alors que la
+    connexion ordinaire — celle qui passe par ce même pool — échoue."""
+
+    def setUp(self):
+        try:
+            import psycopg  # noqa: F401
+        except ImportError:
+            self.skipTest('requires psycopg')
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state_dir = directory.name
+        self.sent = []
+        self.logs = []
+
+    def cfg(self):
+        return types.SimpleNamespace(dsn='host=/private/socket dbname=ameesh',
+                                     backend='pg', host='pc-smichea', canon=None,
+                                     state_dir=self.state_dir)
+
+    def ncfg(self):
+        return notify.parse_config({'default': ['desktop'],
+                                    'default_human': 'human:proprio'})
+
+    def console(self, waiting=60, maxwait=30, used=100, cap=250):
+        pools = [dict(database='ameesh', cl_active=40, cl_waiting=waiting,
+                      sv_active=40, sv_idle=0, maxwait=maxwait)]
+        return fake_console(pools, [dict(list='used_clients', items=used)],
+                            [dict(key='max_client_conn', value=str(cap))])
+
+    def state_path(self):
+        return os.path.join(self.state_dir, 'notify', 'state.json')
+
+    def notifier(self):
+        return notify.Notifier(self.cfg(), self.ncfg(),
+                               sender=RecordingSender(self.sent),
+                               log=self.logs.append, clock=lambda: 100.0)
+
+    def queued(self):
+        return mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
+            mock.patch('psycopg.connect', return_value=self.console())
+
+    def test_the_real_notify_path_pushes_while_the_database_is_refused(self):
+        args = notify.build_parser().parse_args(['--once'])
+        refused = db_mod.Unavailable('no more connections allowed (max_client_conn)')
+        admin, connect = self.queued()
+        with admin, connect, \
+                mock.patch.object(notify.db_mod, 'connect', side_effect=refused), \
+                mock.patch.object(notify, 'Sender',
+                                  lambda **kw: RecordingSender(self.sent)):
+            # la base refuse la connexion : la passe ordinaire échoue, comme
+            # lors de l'incident — et l'alerte est déjà partie.
+            with self.assertRaises(db_mod.Unavailable):
+                notify.cmd_notify(self.cfg(), self.ncfg(), args)
+        self.assertEqual(len(self.sent), 1)
+        channel, title, body = self.sent[0]
+        self.assertEqual(channel, 'desktop')
+        self.assertIn('local PgBouncer clients waiting', title)
+        self.assertIn('60 client(s) waiting', body)
+        self.assertIn('100/250 client slots used', body)
+        with open(self.state_path(), encoding='utf-8') as fh:
+            state = json.load(fh)
+        [entry] = list(state['active'].values())
+        self.assertEqual(entry['alert']['type'], 'pgbouncer_pool_waiting')
+        self.assertTrue(all(st['ok'] for st in entry['channels'].values()))
+
+    def test_a_database_outage_never_resolves_the_other_alerts(self):
+        other = {'alert': {'type': 'stopped_with_mail', 'agent': 'ouvrier',
+                           'detail': 'stopped (bail expiré) with 1 unread message(s)'},
+                 'raised_ts': 1.0, 'human': 'human:proprio', 'source': 'agent',
+                 'status': 'envoi',
+                 'channels': {'desktop': {'ok': True, 'attempts': 1, 'error': None}}}
+        state = notify.empty_state()
+        state['active']['stopped_with_mail'] = other
+        notify.save_state(self.state_path(), state)
+        args = notify.build_parser().parse_args(['--once'])
+        admin, connect = self.queued()
+        with admin, connect, \
+                mock.patch.object(notify.db_mod, 'connect',
+                                  side_effect=db_mod.Unavailable('refused')), \
+                mock.patch.object(notify, 'Sender',
+                                  lambda **kw: RecordingSender(self.sent)):
+            with self.assertRaises(db_mod.Unavailable):
+                notify.cmd_notify(self.cfg(), self.ncfg(), args)
+        with open(self.state_path(), encoding='utf-8') as fh:
+            reloaded = json.load(fh)
+        self.assertEqual(reloaded['active']['stopped_with_mail'], other)
+        self.assertEqual([r for r in self.sent if 'stopped' in r[1].lower()], [])
+
+    def test_an_unreadable_console_keeps_the_local_alert(self):
+        notifier = self.notifier()
+        admin, connect = self.queued()
+        with admin, connect:
+            notifier.run_local_pass()
+        self.assertEqual(len(self.sent), 1)
+        with mock.patch.object(pgbouncer_local, 'probe',
+                               side_effect=db_mod.Unavailable('console refused')):
+            records = notifier.run_local_pass()
+        self.assertEqual(records, [])
+        self.assertEqual(len(self.sent), 1)          # aucune résolution
+        self.assertEqual(len(notifier.state['active']), 1)
+
+    def test_a_healthy_console_resolves_and_notifies(self):
+        notifier = self.notifier()
+        admin, connect = self.queued()
+        with admin, connect:
+            notifier.run_local_pass()
+        with mock.patch.object(pgbouncer_local, 'admin_dsn', return_value='admin'), \
+                mock.patch('psycopg.connect',
+                           return_value=self.console(waiting=0, maxwait=0)):
+            records = notifier.run_local_pass()
+        self.assertEqual([r['event'] for r in records], ['resolved'])
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn('resolved', self.sent[1][1])
+        self.assertEqual(notifier.state['active'], {})
+
+
 class AlertWiring(unittest.TestCase):
     def test_type_is_ordered_pushed_and_labelled(self):
         self.assertIn('pgbouncer_pool_waiting', exploitation.ALERT_TYPES)
         self.assertIn('pgbouncer_pool_waiting', notify.DEFAULT_TYPES)
         self.assertIn('pgbouncer_pool_waiting', notify.URGENT_TYPES)
+        self.assertIn('pgbouncer_pool_waiting', notify.LOCAL_TYPES)
         self.assertIn('pgbouncer_pool_waiting', notify.TYPE_LABELS)
 
 

@@ -15,6 +15,12 @@ an installed pool, or one whose clients do not use it yet, gets no probe and
 no alert. An observation failure is not a resolution: it is raised, so the
 notifier keeps an active warning instead of resolving it unobserved — the
 same rule as the server capacity probe (`db_capacity`).
+
+The warning must survive the incident it reports: the mesh database is reached
+through this same pool, so `ameesh notify` cannot open its ordinary connection
+while the pool refuses everyone. `notify` therefore reads this console from
+`cfg` alone (`probe`), before and independently of its database pass: the
+warning is routed and pushed even then.
 """
 from __future__ import annotations
 
@@ -93,7 +99,7 @@ def _number(value) -> int | None:
         return None
 
 
-def _reading(pools, lists) -> dict:
+def _reading(pools, lists, config) -> dict:
     # The console's own pool (`pgbouncer` database) is this probe's session,
     # never a mesh client: it must not count as load.
     rows = [row for row in pools if row.get('database') != 'pgbouncer']
@@ -103,13 +109,16 @@ def _reading(pools, lists) -> dict:
         'clients_active': _total(rows, 'cl_active'),
         'servers_active': _total(rows, 'sv_active'),
         'servers_idle': _total(rows, 'sv_idle'),
+        # `free_clients` counts client objects kept for reuse, not free
+        # capacity: the ceiling of connected clients is `max_client_conn`
+        # (`SHOW CONFIG`), the only honest denominator here.
         'clients_used': _number(lists.get('used_clients')),
-        'clients_free': _number(lists.get('free_clients')),
+        'clients_max': _number(config.get('max_client_conn')),
     }
 
 
 def read(dsn) -> dict:
-    """SHOW POOLS and SHOW LISTS of the local console, aggregated.
+    """SHOW POOLS, SHOW LISTS and SHOW CONFIG of the local console, aggregated.
 
     Raises `db.Unavailable` when the console cannot be read: an unobserved
     pool is not a healthy pool."""
@@ -125,7 +134,9 @@ def read(dsn) -> dict:
             pools = conn.execute('SHOW POOLS').fetchall()
             lists = {str(row['list']): row.get('items')
                      for row in conn.execute('SHOW LISTS').fetchall()}
-        return _reading(pools, lists)
+            config = {str(row['key']): row.get('value')
+                      for row in conn.execute('SHOW CONFIG').fetchall()}
+        return _reading(pools, lists, config)
     except Exception as exc:  # psycopg errors, and an ill-typed console answer
         raise Unavailable('pgbouncer admin console: %s' % _one_line(exc)) from exc
 
@@ -137,8 +148,9 @@ def pressured(reading: dict) -> bool:
 
 
 def line(reading: dict) -> str:
-    slots = ('%s/%s client slots used' % (reading['clients_used'], reading['clients_free'])
-             if reading['clients_used'] is not None and reading['clients_free'] is not None
+    slots = ('%s/%s client slots used'
+             % (reading['clients_used'], reading['clients_max'])
+             if reading['clients_used'] is not None and reading['clients_max'] is not None
              else 'client slots unknown')
     return ('local PgBouncer: %d client(s) waiting, oldest %ds (warning at %ds); '
             '%d active client(s), %d/%d server session(s) busy, %s' % (
@@ -147,10 +159,13 @@ def line(reading: dict) -> str:
                 reading['servers_active'] + reading['servers_idle'], slots))
 
 
-def alerts(db) -> list[dict]:
-    cfg = getattr(db, 'cfg', None)
-    if cfg is None:
-        return []
+def probe(cfg) -> list[dict]:
+    """The local pool warning read from `cfg` alone, at most one.
+
+    No mesh database, no storage read: the console's own DSN is derived from
+    the configuration. Raises `db.Unavailable` when the console cannot be
+    read, so the caller keeps an active warning instead of resolving it
+    unobserved."""
     dsn = admin_dsn(cfg)
     if dsn is None:
         return []
@@ -163,5 +178,12 @@ def alerts(db) -> list[dict]:
                  clients_active=reading['clients_active'],
                  servers_active=reading['servers_active'],
                  servers_idle=reading['servers_idle'],
-                 clients_used=reading['clients_used'], clients_free=reading['clients_free'],
+                 clients_used=reading['clients_used'], clients_max=reading['clients_max'],
                  detail=line(reading))]
+
+
+def alerts(db) -> list[dict]:
+    cfg = getattr(db, 'cfg', None)
+    if cfg is None:
+        return []
+    return probe(cfg)
