@@ -1547,6 +1547,30 @@ def git_contains(repo: str, ancestor: str, descendant: str) -> bool:
     return proc.returncode == 0
 
 
+def git_fast_forward(repo: str, commit: str) -> str:
+    """Avance le checkout de `repo` jusqu'à `commit` (fast-forward seulement).
+
+    Rend '' quand le checkout est déjà à `commit` ou qu'il a pu avancer, sinon
+    le diagnostic du refus (jamais d'exception git). Un checkout divergé, ou
+    des modifications locales que la fusion écraserait, laissent le dépôt
+    intact : git refuse lui-même, rien n'est forcé (L814)."""
+    target = git_commit(repo, commit)
+    if not target:
+        return "unknown commit %s in %s" % ((commit or "")[:12], repo)
+    head = git_commit(repo, "HEAD")
+    if head == target:
+        return ""
+    if head and not git_contains(repo, head, target):
+        return "checkout %s is not a fast-forward of %s" % (head[:12], target[:12])
+    try:
+        proc = _git(repo, "merge", "--ff-only", "--quiet", target)
+    except GitError as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return _git_message(proc).splitlines()[0][:200]
+    return ""
+
+
 def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
     """[(chemin dans le dépôt, sha du blob)] des fichiers ordinaires sous `prefix`."""
     args = ["ls-tree", "-r", "-z", "--full-tree", commit]
