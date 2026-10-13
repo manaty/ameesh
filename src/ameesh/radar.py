@@ -908,17 +908,20 @@ def _full_suite_ids(gh, slug: str, declared) -> dict:
     return out
 
 
-def _run_jobs(gh, run: dict) -> list:
+def _run_jobs(gh, run: dict, slug: str) -> list:
     """L756 (#566): les jobs d'une exécution, pour refuser un vert sans tests.
 
     Rend `[(nom, statut, conclusion)]`. Une lecture impossible, vide ou
     tronquée lève `GithubError` : un job qu'on ne peut pas lire ne vaut jamais
-    vert."""
+    vert. Le dépôt est nommé (`--repo`), jamais déduit du répertoire courant :
+    `Gh.run` ne fixe ni `cwd` ni `GH_REPO`, et `gh run view` sans `--repo`
+    échoue hors d'un clone (« failed to determine base repo ») — R2 de
+    mty-amh-qa-01 sur PR manaty/ameesh#633."""
     from . import plan_github
     run_id = run.get("databaseId")
     if type(run_id) is not int or run_id <= 0:
         raise plan_github.GithubError("gh run view: missing or invalid run id")
-    data = plan_github._json(gh, ["run", "view", str(run_id), "--json", "jobs"])
+    data = plan_github._json(gh, ["run", "view", str(run_id), "--repo", slug, "--json", "jobs"])
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list) or not data["jobs"]:
         raise plan_github.GithubError("gh run view: no readable job for run %s" % run_id)
     if len(data["jobs"]) >= 100:
@@ -1009,7 +1012,7 @@ def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
         if (run.get("conclusion") or "").lower() != "success":
             failed.append(name)
             continue
-        for job_name, status, conclusion in _run_jobs(gh, run):
+        for job_name, status, conclusion in _run_jobs(gh, run, slug):
             if status != "completed":
                 pending.append("%s/%s" % (name, job_name))
             elif conclusion != "success":
