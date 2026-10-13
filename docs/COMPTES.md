@@ -100,14 +100,17 @@ dans le canon :
 ```
 
 * L'ordre départage les égalités de retard et d'échéance (par exemple deux
-  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
-  primaire.
-* `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
-  dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-  hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
-  sont lues au même endroit, par le mécanisme commun : argument >
-  `AMEESH_CODEX_SESSIONS` > `$CODEX_HOME/sessions` > `~/.codex/sessions` ; un
-  compte déclaré lit `<son CODEX_HOME>/sessions`.
+  comptes jamais utilisés, ou les clés d'API sans jauge), et le premier sert
+  de compte actif par défaut (`account_active`) tant qu'aucun choix n'est
+  écrit.
+* `config_dir` sans `path` : le **dossier par défaut du harnais** (`~/.claude`,
+  `~/.codex`, `~/.dsh`), jamais celui que l'environnement de l'exécuteur
+  désigne (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` hérités) : un compte déclaré
+  n'hérite pas du compte ambiant (L1078). Ses jauges Codex sont lues dans
+  `<dossier>/sessions` ; le primaire des relevés Claude — le seul compte à qui
+  appartiennent les flux sans marqueur, sessions d'avant L30 — est le profil
+  dont le dossier est le dossier par défaut du harnais, jamais le premier de
+  la liste : une liste réduite au seul secondaire ne lui prend pas ses relevés.
 * Contrôles : dossier à l'utilisateur, **0700**, identifiants présents
   (`.credentials.json` pour Claude, `auth.json` pour Codex : présence
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte

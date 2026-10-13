@@ -663,11 +663,14 @@ class CostBook:
 
         With `account` (L30), use the marker preceding each turn, including
         markers outside the read tail. Only a stream with no account marker
-        belongs to `primary`. Leading readings before any established marker
-        in a marked stream stay unknown, never primary.
+        belongs to `primary` — the harness's default account (`accounts.
+        primary_of`), and only when one is declared: `primary=None` means no
+        account claims them (L1078), never "the account itself". Leading
+        readings before any established marker in a marked stream stay
+        unknown, never primary.
         """
         if account is not None:
-            return self._claude_gauges_of(account, primary or account)
+            return self._claude_gauges_of(account, primary)
         newest = None
         for agent in self.agents():
             if not self._claude_candidate(agent):
@@ -689,11 +692,13 @@ class CostBook:
                 break
         return newest[1] if newest else []
 
-    def _claude_gauges_of(self, account: str, primary: str) -> list:
+    def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
 
         Compare turn-marker timestamps across agents. Only a stream without
-        any marker uses the primary account and file modification time.
+        any marker uses the `primary` account (the harness's default one,
+        L1078) and file modification time; with `primary` None, no account
+        claims them.
         """
         best = None
         for agent in self.agents():
@@ -722,7 +727,7 @@ class CostBook:
                 self._claude_gauge_cache.pop(path, None)
                 continue
             found = readings.get(account)
-            if found is None and account == primary:
+            if found is None and primary is not None and account == primary:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found

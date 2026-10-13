@@ -411,11 +411,14 @@ class ContinuityCapTest(_AuthBase):
 
     def test_session_leaves_the_primary_above_half(self):
         secondaire = self._codex_comptes()[1]
-        home = os.path.join(self.tmp, "codex-default")
+        # L1078 : le primaire déclaré sans dossier lit `~/.codex`, pas le
+        # CODEX_HOME ambiant — le banc lui donne un HOME à lui
+        maison = os.path.join(self.tmp, "maison")
+        home = os.path.join(maison, ".codex")
         os.makedirs(home, mode=0o700, exist_ok=True)
         items = accounts.parse({"codex": [{"name": "primaire"}, secondaire]})["codex"]
         now = time.time()
-        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+        with mock.patch.dict(os.environ, {"HOME": maison}):
             book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
             _codex_rollout(home, 40, now + 1800)   # under 50 % (and its pace cap, 90 %)
             choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now,
@@ -617,7 +620,9 @@ class ForcedRaceTest(_AuthBase):
 
     def test_forced_primary_above_its_cap_is_not_launched(self):
         secondaire = self._codex_comptes()[1]
-        home = os.path.join(self.tmp, "codex-default")
+        # L1078 : le primaire déclaré sans dossier lit `~/.codex`
+        maison = os.path.join(self.tmp, "maison")
+        home = os.path.join(maison, ".codex")
         os.makedirs(home, mode=0o700, exist_ok=True)
         items = accounts.parse({"codex": [{"name": "primaire"}, secondaire]})["codex"]
         now = time.time()
@@ -630,7 +635,7 @@ class ForcedRaceTest(_AuthBase):
                      reason="forçage manuel", agent=None, forced=True)
             return False
 
-        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+        with mock.patch.dict(os.environ, {"HOME": maison}):
             book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
             _codex_rollout(home, 60, now + 1800)  # above the primary cap (50 %)
             with mock.patch.object(store_type, "switch", switch):
@@ -829,8 +834,9 @@ class LegacySessionTest(_CapsBase):
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}), \
                 mock.patch.object(accounts, "profiles", return_value=items), \
                 mock.patch.object(auth_failure, "failing", return_value=failing or {}), \
-                mock.patch.object(accounts, "gauges_of", side_effect=lambda _b, p, _i: (
-                    gauges or {}).get(p.name, quiet)), \
+                mock.patch.object(accounts, "gauges_of",
+                                  side_effect=lambda _b, p, _i, _e=None: (
+                                      gauges or {}).get(p.name, quiet)), \
                 mock.patch.object(registry, "clear_session", return_value=False):
             account_turn.continuity(worker)
         return worker
@@ -927,7 +933,7 @@ class UnpacedChoiceTest(_AuthBase):
         try:
             worker.rotation_forcee = "test"
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i: self.overage), \
+                                   side_effect=lambda _b, _p, _i, _e=None: self.overage), \
                     mock.patch.object(worker, "current_session", return_value="sess-1"), \
                     mock.patch.object(worker, "run_turn", return_value=False) as tour:
                 self.assertFalse(worker.budget_ok())
@@ -939,7 +945,7 @@ class UnpacedChoiceTest(_AuthBase):
             # out of overage: the guard lets it through, the pause is lifted
             worker.agent = registry.get(self.db, "ovr")  # as `pick` reloads it
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i: self.paced):
+                                   side_effect=lambda _b, _p, _i, _e=None: self.paced):
                 self.assertTrue(worker.budget_ok())
             self.assertEqual(registry.get(self.db, "ovr")["status"], "idle")
         finally:
