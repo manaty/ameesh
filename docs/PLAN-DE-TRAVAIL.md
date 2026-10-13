@@ -102,8 +102,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
 2. **the content**, in a local clone (read-only, no `fetch`):
 
    ```
-   ameesh work sync-merges --git-dir D [--target origin/main] [--repo owner/repo] [--dry-run] [--json]
+   ameesh work sync-merges --git-dir D [--target T] [--repo owner/repo] [--dry-run] [--json]
    ```
+
+   Without `--target`, the target is the lot's (`branch_target`), else the
+   repository's declared `git config ameesh.target`, else its default branch
+   (`origin/HEAD`, then main/master); when nothing is declared and that ref does
+   not carry the freeze, the integration refs (`develop`, `main`, `master`,
+   `release/*`) are tried and the closing names the one that delivered. An
+   explicit `--target` stays alone authoritative (a missing one is an error).
 
    only the lot's **last freeze** is authoritative (most recent `frozen`
    milestone, with its commit): an earlier freeze already merged proves nothing
