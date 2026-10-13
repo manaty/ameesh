@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -23,6 +24,7 @@ from ameesh import dsn as dsn_mod
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "deploy", "mise-a-jour", "poste.sh")
+DSN_PY = os.path.join(ROOT, "src", "ameesh", "dsn.py")
 
 # (DSN, its password, the DSN without it); None: the DSN is kept as is
 CASES = [
@@ -61,12 +63,31 @@ CASES = [
      "Pw-12", "host=h1.invalid,h2.invalid port=5432,5433 target_session_attrs=read-write"),
     ("host=/run/postgresql dbname=ameesh user=ameesh", "", None),
     ("host=h.invalid passfile=/home/u/.pgpass", "", None),
+    # a final newline may be data: an encoded or quoted one in a password, an
+    # escaped one in a value, a URI's database name
+    ("postgresql://u:Pw-lf-18%0A@h.invalid/db", "Pw-lf-18\n", "postgresql://u@h.invalid/db"),
+    ("password='Pw-lf-19\n' host=h.invalid", "Pw-lf-19\n", "host=h.invalid"),
+    ("password=Pw-20 dbname=production\\\n", "Pw-20", "dbname='production\n'"),
+    ("postgresql://u:Pw-21@h.invalid/production\n", "Pw-21",
+     "postgresql://u@h.invalid/production\n"),
+    # an explicit empty password still overrides PGPASSWORD and a service: it stays
+    ("host=h.invalid password='' dbname=db", "", "host=h.invalid dbname=db password=''"),
+    ("postgresql://u@h.invalid/db?password=&sslmode=require", "",
+     "postgresql://u@h.invalid/db?sslmode=require&password="),
+    ("service=prod password=''", "", None),
+    ("service=prod dbname=db", "", None),
     ("ameesh", "", None),
 ]
-# refused, as libpq refuses them; the first one on purpose (fail closed):
-# libpq would take the query's password
-REFUSED = [
+# refused on purpose, though libpq's parser takes them (fail closed): libpq
+# would take the query's password; next to a service, PGPASSWORD would lose
+# to the service file's password
+DELIBERATE = [
     "postgresql://u:Pw-a@h.invalid/db?password=Pw-b",
+    "service=prod password=Pw-svc-22",
+    "postgresql://u:Pw-svc-23@h.invalid/db?service=prod",
+]
+# refused, as libpq refuses them
+REFUSED = [
     "dbname=db password='Pw-unterminated",
     "host=h.invalid password",
     "postgresql://u@h.invalid/db?password",
@@ -97,14 +118,25 @@ class SplitPasswordTest(unittest.TestCase):
     def test_table(self):
         for case in CASES:
             with self.subTest(dsn=case[0]):
-                self.assertEqual(db_mod.split_password(case[0]), expected(case))
+                self.assertEqual(db_mod.split_password(case[0], {}), expected(case))
 
     def test_refused_without_quoting_the_dsn(self):
-        for dsn in REFUSED:
+        for dsn in DELIBERATE + REFUSED:
             with self.subTest(dsn=dsn):
                 with self.assertRaises(dsn_mod.DsnError) as caught:
-                    dsn_mod.split_password(dsn)
+                    dsn_mod.split_password(dsn, {})
                 self.assertNotIn("Pw", str(caught.exception))
+
+    def test_a_service_from_the_environment(self):
+        for case in CASES:
+            with self.subTest(dsn=case[0]):
+                if case[1]:
+                    with self.assertRaises(dsn_mod.DsnError) as caught:
+                        dsn_mod.split_password(case[0], {"PGSERVICE": "prod"})
+                    self.assertNotIn("Pw", str(caught.exception))
+                else:
+                    self.assertEqual(dsn_mod.split_password(case[0], {"PGSERVICE": "prod"}),
+                                     expected(case))
 
     def test_libpq_reads_the_same_connection(self):
         try:
@@ -121,21 +153,48 @@ class SplitPasswordTest(unittest.TestCase):
             with self.subTest(dsn=dsn):
                 password, rest = expected(case)
                 whole = conninfo_to_dict(dsn)
-                self.assertEqual(whole.pop("password", ""), password)
+                self.assertEqual(whole.get("password", ""), password)
+                if password:
+                    del whole["password"]
                 self.assertEqual(conninfo_to_dict(rest), whole)
-        for dsn in REFUSED[1:]:
+        for dsn in REFUSED:
             if blanks_in_uri(dsn) and pq.version() < 160000:
                 continue
             with self.subTest(refused=dsn), self.assertRaises(pg_errors.ProgrammingError):
                 conninfo_to_dict(dsn)
 
 
-# one line per call: tool, PGPASSWORD, then argv, separated by \037 (a POSIX
-# sh, cheap to start on a loaded host); `-At` queries answer 1 (the role
-# exists); pg_dump writes its -f file; ssh drains its standard input
+class CommandLineTest(unittest.TestCase):
+    """`python3 dsn.py password|dsn`, as poste.sh runs it: bytes in, bytes out."""
+
+    def run_dsn(self, part, dsn):
+        env = {k: v for k, v in os.environ.items() if k != "PGSERVICE"}
+        return subprocess.run([sys.executable, DSN_PY, part], input=dsn.encode(),
+                              capture_output=True, env=env, timeout=120)
+
+    def test_table(self):
+        for case in CASES:
+            for part, want in zip(("password", "dsn"), expected(case)):
+                with self.subTest(dsn=case[0], part=part):
+                    proc = self.run_dsn(part, case[0])
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.decode(), want)
+
+    def test_refused_without_quoting_the_dsn(self):
+        for dsn in DELIBERATE[:2] + REFUSED[:1]:
+            with self.subTest(dsn=dsn):
+                proc = self.run_dsn("dsn", dsn)
+                self.assertEqual((proc.returncode, proc.stdout), (1, b""))
+                self.assertNotIn(b"Pw", proc.stderr)
+
+
+# one record per call, ended by \036: tool, PGPASSWORD, then argv, separated by
+# \037, so that newlines survive (a POSIX sh, cheap to start on a loaded host);
+# `-At` queries answer 1 (the role exists); pg_dump writes its -f file; ssh
+# drains its standard input
 FAKE_TOOL = r'''#!/bin/sh
 name=${0##*/}
-{ printf '%s\037' "$name" "${PGPASSWORD-<unset>}" "$@"; printf '\n'; } >> "$FAKE_STATE/calls.log"
+{ printf '%s\037' "$name" "${PGPASSWORD-<unset>}" "$@"; printf '\036'; } >> "$FAKE_STATE/calls.log"
 case $name in
   ssh) cat > /dev/null ;;
   pg_dump) prev=; for a; do [ "$prev" = -f ] && : > "$a"; prev=$a; done ;;
@@ -164,7 +223,7 @@ class PosteDsnTest(unittest.TestCase):
             os.chmod(path, 0o755)
         self.env = dict(os.environ, HOME=home, FAKE_STATE=self.state,
                         PATH=bin_dir + os.pathsep + os.environ["PATH"])
-        for name in ("PGPASSWORD", "BASCULE_ENV", "UNITES_RESTE"):
+        for name in ("PGPASSWORD", "PGSERVICE", "BASCULE_ENV", "UNITES_RESTE"):
             self.env.pop(name, None)
 
     def configure(self, mesh, old=None):
@@ -188,9 +247,9 @@ class PosteDsnTest(unittest.TestCase):
         calls = []
         path = os.path.join(self.state, "calls.log")
         if os.path.exists(path):
-            with open(path, encoding="utf-8") as fh:
-                for line in fh.read().splitlines():
-                    name, password, *argv = line.split("\037")[:-1]
+            with open(path, encoding="utf-8", newline="") as fh:
+                for record in fh.read().split("\036")[:-1]:
+                    name, password, *argv = record.split("\037")[:-1]
                     calls.append({"tool": name, "argv": argv,
                                   "pgpassword": None if password == "<unset>" else password})
         return proc, calls
@@ -215,6 +274,16 @@ class PosteDsnTest(unittest.TestCase):
                 self.assertEqual(dumps[0]["pgpassword"], password or None)
                 self.assert_secret_absent(json.dumps([c["argv"] for c in calls]))
                 self.assert_secret_absent(proc.stdout + proc.stderr)
+
+    def test_trailing_newlines_reach_the_tools(self):
+        for case in (c for c in CASES if c[0].endswith("\n") or c[1].endswith("\n")):
+            with self.subTest(dsn=case[0]):
+                password, rest = expected(case)
+                self.configure(case[0])
+                proc, calls = self.run_step("sauvegarder")
+                dump = [c for c in calls if c["tool"] == "pg_dump"][0]
+                self.assertEqual(dump["argv"][dump["argv"].index("-d") + 1], rest)
+                self.assertEqual(dump["pgpassword"], password)
 
     def test_roles_of_the_old_base(self):
         mesh, old = case("postgresql://ameesh:"), case("dbname=db password=")
@@ -241,14 +310,23 @@ class PosteDsnTest(unittest.TestCase):
                     self.assertIn("mesh     : %s" % expected(mesh)[1], proc.stdout)
                     self.assertIn("ancienne : %s" % expected(old)[1], proc.stdout)
 
-    def test_invalid_dsn_stops_without_quoting_it(self):
-        self.configure(REFUSED[0])
-        proc = subprocess.run(["bash", SCRIPT, "sauvegarder"], env=self.env,
+    def assert_stops(self, env):
+        proc = subprocess.run(["bash", SCRIPT, "sauvegarder"], env=env,
                               capture_output=True, text=True, timeout=300,
                               stdin=subprocess.DEVNULL)
         self.assertNotEqual(proc.returncode, 0)
         self.assert_secret_absent(proc.stdout + proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.state, "calls.log")))
+
+    def test_invalid_dsn_stops_without_quoting_it(self):
+        for dsn in DELIBERATE[:2]:
+            with self.subTest(dsn=dsn):
+                self.configure(dsn)
+                self.assert_stops(self.env)
+
+    def test_a_service_in_the_environment_stops_a_password(self):
+        self.configure(case("postgresql://ameesh:")[0])
+        self.assert_stops(dict(self.env, PGSERVICE="prod"))
 
 
 if __name__ == "__main__":

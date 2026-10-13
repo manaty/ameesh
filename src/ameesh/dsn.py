@@ -19,16 +19,24 @@ describes is the one the whole string described:
   order, quoted as libpq reads them;
 * anything else is a bare database name, with no password.
 
+libpq reads the string first, then a service file, then PGPASSWORD; the
+split keeps that order. An explicit empty password stays in the rest: it is
+no secret, and it still overrides the service and PGPASSWORD. A password next
+to a service (`service` in the string, or PGSERVICE in the client's
+environment) is refused: in PGPASSWORD, the service's password would win.
+
 A string libpq's parser would refuse is refused (`DsnError`), with a message
 that never quotes the string; an unknown keyword or a bad value is left to
 libpq, which refuses it. Standard library only: `deploy/mise-a-jour/poste.sh`
 runs this file with the host's python3 before ameesh is installed
-(`python3 dsn.py password|dsn`, the DSN on standard input).
+(`python3 dsn.py password|dsn`, the DSN on standard input, byte for byte).
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
+from collections.abc import Mapping
 
 #: isspace() in the C locale, as libpq tests it
 _BLANKS = " \t\n\r\f\v"
@@ -40,13 +48,22 @@ class DsnError(ValueError):
     """A connection string libpq would refuse; the message never quotes it."""
 
 
-def split_password(dsn: str) -> tuple[str, str]:
-    """(password, the same connection string without it); ("", dsn) without one."""
+def split_password(dsn: str, environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """(password, the same connection string without it); ("", dsn) without one.
+
+    `environ`: the environment of the client that gets the rest (os.environ by
+    default), for PGSERVICE."""
     if dsn.startswith(_URI_PREFIXES):
-        return _split_uri(dsn)
-    if "=" in dsn:
-        return _split_keywords(dsn)
-    return "", dsn
+        password, rest, service = _split_uri(dsn)
+    elif "=" in dsn:
+        password, rest, service = _split_keywords(dsn)
+    else:
+        return "", dsn
+    if password and (service or "PGSERVICE" in (os.environ if environ is None else environ)):
+        raise DsnError("a password next to a service (service= or PGSERVICE): libpq reads "
+                       "the service file before PGPASSWORD; put the password in the "
+                       "service file or in ~/.pgpass")
+    return password, rest
 
 
 # -- URI ---------------------------------------------------------------------
@@ -75,7 +92,7 @@ def _uri_decode(text: str) -> str:
     return out.decode("utf-8", "surrogateescape")
 
 
-def _split_uri(dsn: str) -> tuple[str, str]:
+def _split_uri(dsn: str) -> tuple[str, str, bool]:
     prefix = next(p for p in _URI_PREFIXES if dsn.startswith(p))
     rest = dsn[len(prefix):]
     in_userinfo = None
@@ -93,6 +110,7 @@ def _split_uri(dsn: str) -> tuple[str, str]:
         rest = rest[end + 1:]
     base, question, query = rest.partition("?")
     in_query = None
+    service = False
     kept = []
     params = query.split("&") if query else []
     if params and not params[-1]:   # libpq accepts one trailing "&"
@@ -101,16 +119,20 @@ def _split_uri(dsn: str) -> tuple[str, str]:
         if param.count("=") != 1:
             raise DsnError("malformed query parameter in the URI")
         key, value = param.split("=")
-        if _uri_decode(key) == "password":
+        key = _uri_decode(key)
+        if key == "password":
             in_query = _uri_decode(value)   # the last one wins
         else:
+            service = service or key == "service"
             kept.append(param)
     if in_userinfo is not None and in_query is not None:
         raise DsnError("a password in both the userinfo and the query of the URI")
-    if question and kept:
-        base += "?" + "&".join(kept)
     password = in_query if in_query is not None else in_userinfo
-    return password or "", prefix + userinfo + base
+    if password == "":   # explicit and empty: it still overrides PGPASSWORD
+        kept.append("password=")
+    if kept:
+        base += "?" + "&".join(kept)
+    return password or "", prefix + userinfo + base, service
 
 
 # -- key/value pairs ----------------------------------------------------------
@@ -174,27 +196,33 @@ def _quote(value: str) -> str:
     return "'%s'" % value if re.search(r"\s", value) else value
 
 
-def _split_keywords(dsn: str) -> tuple[str, str]:
-    password = ""
+def _split_keywords(dsn: str) -> tuple[str, str, bool]:
+    password = None
+    service = False
     kept = []
     for key, value in _tokens(dsn):
         if key == "password":
-            password = value
+            password = value   # the last one wins
         else:
+            service = service or key == "service"
             kept.append("%s=%s" % (key, _quote(value)))
-    return password, " ".join(kept)
+    if password == "":   # explicit and empty: it still overrides PGPASSWORD
+        kept.append("password=''")
+    return password or "", " ".join(kept), service
 
 
 # -- command line (deploy/mise-a-jour/poste.sh) --------------------------------
 
 def main(argv: list[str] | None = None) -> int:
     """`dsn.py password|dsn`, the DSN on standard input: writes the password,
-    or the DSN without it, on standard output. Neither reaches argv."""
+    or the DSN without it, on standard output. Neither reaches argv. Both are
+    read and written byte for byte: a final newline may be data (a URI's
+    database name, an escaped or quoted newline)."""
     argv = sys.argv[1:] if argv is None else argv
     if argv not in (["password"], ["dsn"]):
         print("usage: dsn.py password|dsn < DSN", file=sys.stderr)
         return 2
-    dsn = sys.stdin.read().rstrip("\n")
+    dsn = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
     try:
         password, rest = split_password(dsn)
     except DsnError as exc:

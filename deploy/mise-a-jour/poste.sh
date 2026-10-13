@@ -83,19 +83,26 @@ esac
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
-dsn_de() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
+dsn_de() { python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["dsn"])' "$1"; }
 # #518: a DSN's password never goes on a command line, which every process of
 # the host can read (ps, /proc/<pid>/cmdline), nor in a trace (bash -x) or a
 # display. src/ameesh/dsn.py splits it as libpq reads it, the DSN on its
 # standard input; it is the copy of the commit being deployed (the installed
-# ameesh may be older). `dsn_sans_mdp CONFIG`: the DSN of CONFIG without its
-# password, for argv and display. `avec_mdp CONFIG cmd…`: cmd with that
-# password in PGPASSWORD, which libpq reads, in a subshell without xtrace.
+# ameesh may be older). `dsn_part VAR CONFIG dsn|password`: VAR gets the DSN
+# of CONFIG without its password, or that password, byte for byte (the "."
+# keeps the trailing newlines that $(…) strips). `avec_mdp CONFIG cmd…`: cmd
+# with that password in PGPASSWORD, which libpq reads, in a subshell without
+# xtrace. `dsn_sans_mdp CONFIG`: the DSN without its password, for display.
 DSN_PY="$DEPOT/src/ameesh/dsn.py"
-dsn_sans_mdp() { dsn_de "$1" | python3 "$DSN_PY" dsn; }
+dsn_part() {
+  local _sortie
+  _sortie=$(dsn_de "$2" | python3 "$DSN_PY" "$3" && printf .) || return
+  printf -v "$1" '%s' "${_sortie%.}"
+}
+dsn_sans_mdp() { local d; dsn_part d "$1" dsn && printf '%s\n' "$d"; }
 avec_mdp() {
   ( { set +x; } 2>/dev/null
-    mdp=$(dsn_de "$1" | python3 "$DSN_PY" password) || exit
+    dsn_part mdp "$1" password || exit
     shift
     if [ -n "$mdp" ]; then PGPASSWORD=$mdp exec "$@"; else exec "$@"; fi )
 }
@@ -136,17 +143,17 @@ verifier() {
 }
 
 sauvegarder() {
-  local jour; jour=$(date +%F-%H%M)
+  local jour dsn; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
-  avec_mdp "$CONFIG" pg_dump -Fc -d "$(dsn_sans_mdp "$CONFIG")" \
-    -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  dsn_part dsn "$CONFIG" dsn
+  avec_mdp "$CONFIG" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
   ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
   if ancienne; then
     etape "ancienne base"
-    avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$(dsn_sans_mdp "$CONFIG_RESTE")" \
-      -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    dsn_part dsn "$CONFIG_RESTE" dsn
+    avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
 }
@@ -236,7 +243,7 @@ migrer_base() {
 # The remote administrator switches to the actual migration owner so future
 # migration objects receive the owner's default privileges, not postgres's.
 reapply_executor_role() {
-  local exists
+  local exists dsn
   [[ "$EXECUTOR_ROLE" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "Invalid executor role name" >&2; return 2; }
   exists=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -v ON_ERROR_STOP=1 -v role=$EXECUTOR_ROLE" <<'SQL'
 SELECT 1 FROM pg_roles WHERE rolname = :'role';
@@ -257,13 +264,13 @@ SQL
     echo "Executor role absent: initial provisioning requires a separate owner decision."
   fi
   if ancienne; then
-    avec_mdp "$CONFIG_RESTE" "$DEPOT/deploy/mise-a-jour/role-executor.sh" \
-      "$(dsn_sans_mdp "$CONFIG_RESTE")" "$EXECUTOR_ROLE"
+    dsn_part dsn "$CONFIG_RESTE" dsn
+    avec_mdp "$CONFIG_RESTE" "$DEPOT/deploy/mise-a-jour/role-executor.sh" "$dsn" "$EXECUTOR_ROLE"
   fi
 }
 
 role() {
-  local existe
+  local existe dsn
   reapply_executor_role
   etape "rôle $ROLE, base du mesh (sur le serveur, en superutilisateur)"
   existe=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c \"SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'\"")
@@ -276,11 +283,11 @@ role() {
   fi
   if ancienne; then
     etape "rôle $ROLE, ancienne base"
-    existe=$(avec_mdp "$CONFIG_RESTE" psql -X -At -d "$(dsn_sans_mdp "$CONFIG_RESTE")" \
+    dsn_part dsn "$CONFIG_RESTE" dsn
+    existe=$(avec_mdp "$CONFIG_RESTE" psql -X -At -d "$dsn" \
       -c "SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'")
     if [ "$existe" = 1 ]; then
-      avec_mdp "$CONFIG_RESTE" psql -X -q -d "$(dsn_sans_mdp "$CONFIG_RESTE")" \
-        -v ON_ERROR_STOP=1 -v role="$ROLE" \
+      avec_mdp "$CONFIG_RESTE" psql -X -q -d "$dsn" -v ON_ERROR_STOP=1 -v role="$ROLE" \
         -f "$DEPOT/deploy/sql/role-superviseur.sql"
       echo "rôle réappliqué"
     else
