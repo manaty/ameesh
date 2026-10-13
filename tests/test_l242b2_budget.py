@@ -177,6 +177,25 @@ class PauseDebutDeFenetreTest(_Comptes):
         self.assertAlmostEqual(ev.until, self.now + 0.14 * 5 * HEURE, places=3)
         self.assertIn("10 points kept for critical agents", ev.reason)
 
+    def test_un_plafond_court_ne_se_rattrape_pas_par_l_ecoule(self):
+        # #777 r2 (relecture) : en prod, les comptes claude portent
+        # `short_window_cap` 0,75. Une fenêtre de 5 h à 70 % avec 30 %
+        # d'écoulé est tenue par ce plafond (0,65 sous la réserve) : le rythme
+        # la libérerait à 70 % d'écoulé, où le plafond court tient encore. La
+        # pause doit annoncer la remise à zéro, pas un réveil à vide.
+        self.items = accounts.parse({"codex": [
+            {"name": "primaire"},
+            dict(self.secondaire, short_window_cap=0.75)]})["codex"]
+        self.rollout("secondaire", 70, 0.30)
+        ev = accounts.evaluate(self.book, self.items[1], self.items, self.now, reserve=True)
+        self.assertFalse(ev.ok)
+        self.assertFalse(ev.hard)                     # plafond court, pas fixe
+        self.assertEqual(ev.held, ("codex-300min", 0.70))
+        self.assertAlmostEqual(ev.until, self.now + 0.70 * 5 * HEURE, places=3)
+        # l'écoulé seul annoncerait 2 h (le rythme sous la réserve rejoint
+        # l'usage), où le plafond court bloque encore : la remise est plus tard
+        self.assertGreater(ev.until, self.now + 2 * HEURE)
+
     def test_un_plafond_fixe_libre_a_la_remise_a_zero(self):
         # le plafond implicite de 50 % du compte par défaut ne bouge pas avec
         # l'écoulé : rien ne le rattrape, la pause annonce la remise à zéro

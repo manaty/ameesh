@@ -654,20 +654,31 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     return out
 
 
-def _release(depasses, hard, now: float, cut: float) -> tuple[float | None, object | None]:
+def _release(profile: Profile, depasses, hard, now: float,
+             cut: float) -> tuple[float | None, object | None]:
     """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
 
-    Une fenêtre tenue par un plafond fixe (`hard`) ne se libère qu'à sa remise
-    à zéro : rien ne la rattrape. Une fenêtre tenue par le rythme se libère
-    quand l'écoulé rejoint l'usage (`Gauge.free_at`, #777), pas à la remise à
-    zéro. `(None, None)` si l'une des fenêtres qui bloquent n'est pas datée :
-    aucune heure annoncée (#373 r2).
+    Ne se rattrapent pas par l'écoulé, et attendent donc leur remise à zéro :
+    un plafond fixe (`hard`), et le plafond court du compte
+    (`short_window_cap`, abaissé de `cut` comme dans `limits`). Une fenêtre
+    tenue par le rythme seul se libère quand l'écoulé rejoint l'usage
+    (`Gauge.free_at`, #777). `(None, None)` si l'une des fenêtres qui bloquent
+    n'est pas datée : aucune heure annoncée (#373 r2).
+
+    Le plafond court se teste sur l'usage, pas sur le libellé de `limits` :
+    sous réserve, le plafond de rythme est souvent le plus bas à l'instant du
+    relevé (il porte alors le libellé « pace cap »), mais il ne rattrape
+    jamais un usage au-dessus du plafond court — voir #777 r2, un compte
+    `short_window_cap` 0,75 à 70 % d'usage avec 30 % d'écoulé.
     """
     dated = []
     for gauge in depasses:
         if not gauge.resets_at:
             return None, None
-        if any(gauge is held for held, _ in hard):
+        short = (profile.short_window_cap is not None
+                 and gauge.window_s <= SHORT_WINDOW_S)
+        if any(gauge is held for held, _ in hard) or (
+                short and gauge.used_at(now) >= max(0.0, profile.short_window_cap - cut)):
             free = float(gauge.resets_at)
         else:
             free = gauge.free_at(now, cut)
@@ -733,7 +744,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
         # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
         # plus longtemps ; #777 : à l'heure où elle libère vraiment.
-        result.until, late = _release(depasses, hard, now, RESERVE if reserve else 0.0)
+        result.until, late = _release(profile, depasses, hard, now,
+                                      RESERVE if reserve else 0.0)
         if late is not None:
             result.held = (late.key, late.used)
         return result
