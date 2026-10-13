@@ -360,13 +360,15 @@ def order(entries: list[dict], pairs: dict) -> list[dict]:
 # stacked replay in the radar's clone
 # --------------------------------------------------------------------------
 
-def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dict:
+def stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *, generated=()) -> dict:
     """Replays the queue stacked: from `target_head`, merges each lot of
     `lots` (`{work_item, tip}`, in order) with `rerere` primed by the
     resolutions (`rows`) of this lot with the lots already stacked. A lot
     that leaves a conflict is skipped. Returns `{lot: {state: clean|
-    replayed|conflict, files}}`."""
-    from . import resolutions
+    replayed|conflict|generated, files}}`. Generated conflicts are excluded
+    before rerere; each trial tree is regenerated and checked."""
+    from . import land, resolutions
+    paths = {g.path for g in generated}
     latest: dict = {}
     for row in rows:
         latest.setdefault(frozenset((int(row["work_item_id"]), int(row["other_item_id"]))), row)
@@ -395,24 +397,38 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dic
                         and row["commit_sha"] in replayer.trained():
                     shutil.copytree(replayer._store(row["commit_sha"]), replayer._rr_cache(),
                                     dirs_exist_ok=True)
-            merge = run(path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+            merge = run(path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                         "merge", "--no-ff", "--no-commit", "--quiet", one["tip"])
             state, files = "clean", []
             if merge.returncode != 0:
                 files = resolutions.unmerged(path)
-                remaining = resolutions.rerere_remaining(path) if files else []
-                left = sorted(set(remaining) | set(resolutions.with_markers(path, files)))
+                resolutions.exclude_generated(path, files, paths)
+                resolutions._check(run(path, "-c", "rerere.enabled=true", "-c",
+                                       "rerere.autoUpdate=false", "rerere"), "rerere")
+                others = [f for f in files if f not in paths]
+                remaining = [f for f in resolutions.rerere_remaining(path) if f not in paths] \
+                    if others else []
+                left = sorted(set(remaining) | set(resolutions.with_markers(path, others)))
                 if not files or left:
                     run(path, "merge", "--abort")
                     run(path, "reset", "-q", "--hard", base)
                     out[lot] = {"state": "conflict", "files": left or files,
                                 "error": "" if files else resolutions._err(merge)[:300]}
                     continue
-                resolutions._check(run(path, "add", "--", *files), "add")
-                state = "replayed"
+                if others:
+                    resolutions._check(run(path, "add", "--", *others), "add")
+                    state = "replayed"
+            if paths:
+                made = land._regenerate(path, generated, paths)
+                if not made["ok"]:
+                    run(path, "merge", "--abort")
+                    run(path, "reset", "-q", "--hard", base)
+                    out[lot] = {"state": "generated", "files": [made["file"]],
+                                "output": made["output"]}
+                    continue
             resolutions._check(run(path, "-c", "rerere.enabled=false", "commit", "--quiet",
                                    "--no-verify", "-m", "queue: #%d" % lot), "commit")
-            out[lot] = {"state": state, "files": files}
+            out[lot] = {"state": state, "files": [f for f in files if f not in paths]}
             stacked.append(lot)
     finally:
         run(path, "reset", "-q", "--hard")
@@ -577,21 +593,23 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         # the radar tried the target its checkout had: only a conflict with
         # the target fetched now ejects; otherwise the stacked trial below,
         # on that target, decides
-        if clash and clash.get("target") == row["target"] \
+        ordinary = [f for f in (clash or {}).get("files", ())
+                    if f not in {g.path for g in getattr(project, "generated", ())}]
+        if clash and ordinary and clash.get("target") == row["target"] \
                 and _same(clash.get("tip"), row["frozen_sha"]) \
                 and _same(clash.get("target_head"), head):
             # no resolution is prepared against the target: the agent integrates it
             reason = "conflict with %s on %s" % (row["target"], ", ".join(
-                clash["files"][:6] or ["?"]))
+                ordinary[:6]))
             out["mail"].append(_eject(db, row, reason, (
                 "Merge queue of %s, lot #%d « %s »: out of the queue, its frozen commit "
                 "conflicts with %s on %s. Integrate %s into %s, freeze again, have it "
                 "reviewed, then ameesh work queue add %d."
                 % (row["target"], lot, row.get("title") or "", row["target"],
-                   ", ".join(clash["files"][:6]), row["target"], row.get("branch") or "?",
+                   ", ".join(ordinary[:6]), row["target"], row.get("branch") or "?",
                    lot)),
                 {"project": project.name, "target": row["target"], "kind": "ejected",
-                 "files": clash["files"]}))
+                 "files": ordinary}))
             ejected.add(lot)
             continue
         # stacked on the target as origin has it now, not the agents' cached one
@@ -629,11 +647,14 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                        for r in landing.get(target) or ()] + \
                 [{"work_item": o["work_item"], "tip": rows_by_id[o["work_item"]]["tip"]}
                  for o in ranked]
-            key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits)
+            generated = tuple(getattr(project, "generated", ()))
+            key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits,
+                   generated)
             if key not in stacks:
                 try:
                     replayer.ensure()
-                    stacks[key] = stack(replayer, key[0], stacked, resolution_rows)
+                    stacks[key] = stack(replayer, key[0], stacked, resolution_rows,
+                                        generated=generated)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
             result = stacks[key]
@@ -644,6 +665,17 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             row = rows_by_id[one["work_item"]]
             trial = result.get(one["work_item"]) if isinstance(result, dict) else None
             state = "queued"
+            if trial and trial["state"] == "generated":
+                lot = one["work_item"]
+                reason = "stacked trial: generated file %s: regeneration or check failed" % trial["files"][0]
+                out["mail"].append(_eject(db, row, reason, (
+                    "Merge queue of %s, lot #%d: out of the queue. %s.\n%s\n"
+                    "Fix the generator or its inputs, freeze again, then ameesh work queue add %d."
+                    % (target, lot, reason, trial["output"], lot)),
+                    {"project": project.name, "target": target, "kind": "ejected",
+                     "files": trial["files"]}))
+                state = "ejected"
+                ejected.add(lot)
             if trial and trial["state"] == "conflict":
                 lot = one["work_item"]
                 reason = "stacked trial: conflict not covered on %s" % ", ".join(
@@ -739,10 +771,17 @@ def radar_project(cfg, repo: str):
     except radar.SettingsError as exc:
         raise QueueError("cannot read repository landing conditions: %s" % exc) from exc
     real = os.path.realpath(repo)
-    exact = [p for p in projects if os.path.realpath(p.repo) == real]
-    slug = migrations.origin_repo(repo)
-    matching = exact or [p for p in projects if slug and migrations.repo_key(
-        p.github or migrations.origin_repo(p.repo)) == slug]
+    identities = {p.name: {migrations.repo_key(p.github),
+                           migrations.repo_key(migrations.origin_repo(p.repo))} - {""}
+                  for p in projects}
+    slugs = {migrations.repo_key(migrations.origin_repo(repo))} - {""}
+    # A checkout without origin still has its configured repository identity.
+    # An exact path contributes matches; it never suppresses another project's.
+    for p in projects:
+        if os.path.realpath(p.repo) == real:
+            slugs.update(identities[p.name])
+    matching = [p for p in projects if os.path.realpath(p.repo) == real or
+                slugs & identities[p.name]]
     if len(matching) > 1:
         raise QueueError("multiple radar projects match this repository; landing conditions are ambiguous")
     return matching[0] if matching else None

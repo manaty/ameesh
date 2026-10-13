@@ -47,6 +47,8 @@ tree**, including when a lot only changes an input. Paths must be distinct
 repository-relative files. Generated conflicts are removed from the unmerged
 index before rerere runs; cached resolutions never supply their content.
 The generator's output is staged before its check and the merge commit.
+The queue stack applies the same exclusion, regeneration and check rules before
+ranking a trial as mergeable. Its cache includes the generated-file configuration.
 A failed regeneration or check ejects the lot and leaves the target untouched.
 Ordinary conflicts still use the prepared resolution cache.
 
@@ -57,10 +59,17 @@ slash, so a gate may run more often than its GitHub workflow. List an
 unconditional gate when every merge needs a minimum check.
 
 `ci_required: true` reads GitHub Actions runs for the **frozen SHA** before
-queue admission. The latest run of every returned workflow must be completed
-and successful, neutral or skipped; at least one run must exist. Missing,
-running, failed, unreadable or potentially truncated results refuse admission.
+queue admission and again during local landing, including immediately before
+the target push after the merged-tree gates. Workflows are grouped by their
+GitHub database ID, so identical display names cannot hide a failure. Missing
+identities or invalid timestamps refuse certification. The latest run of every
+returned workflow must be completed and successful, neutral or skipped; at
+least one run must exist. Missing,
+running, failed, unreadable or potentially truncated results refuse admission
+and eject a queued lot during local landing.
 The branch's current green CI cannot vouch for a different frozen commit.
+Ambiguous project configurations for the same repository are refused even from
+an exact configured checkout, including one without an origin URL.
 Authentication uses the host's existing `gh` setup. The local gates then run
 on the actual merged tree before the target push. Trial-ref workflows are a
 separate future option; this configuration uses local gates plus frozen CI.

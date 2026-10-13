@@ -532,6 +532,16 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     if row["state"] == "landing" and project.land == "pr":
         return _follow_pr(landing, slug, gh=gh, replayer=replayer)
+
+    def required_ci():
+        if project.land == "local" and getattr(project, "ci_required", False):
+            try:
+                merge_queue._required_ci(project, row["frozen_sha"])
+            except merge_queue.QueueError as exc:
+                return landing.eject(str(exc), "Restore green CI on the frozen commit, then "
+                                     "ameesh work queue add %d." % lot)
+        return None
+
     replayer.ensure()
     url = _origin(project) or project.repo
     branch = _branch_of(row["target"])
@@ -577,6 +587,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             base).returncode == 0:
         # #194 r4: another executor (an earlier epoch) already pushed it
         return landing.landed({"sha": base, "state": "already", "files": []}, base)
+    refused = required_ci()
+    if refused is not None:
+        return refused
     merged = merge(replayer, base, row, landing.ops.resolutions([lot]),
                    generated=getattr(project, "generated", ()))
     if merged["state"] == "generated":
@@ -597,6 +610,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
                              "ameesh work queue add %d." % (checked["output"], lot),
                              output=checked["output"])
     if project.land == "local":
+        refused = required_ci()
+        if refused is not None:
+            return refused
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
         # #194 r6: one atomic push, two compare-and-swaps that the server

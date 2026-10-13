@@ -732,10 +732,11 @@ CI_PASSING = ("success", "skipped", "neutral")
 
 def commit_ci(project: Project, sha: str, gh=None) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
-    (`gh run list --commit`), the latest run of each workflow: `{runs,
+    (`gh run list --commit`), the latest run of each workflow database ID: `{runs,
     green, pending: [workflows], failed: [workflows]}`; green needs at least
     one run, all concluded and passing. Raises `plan_github.GithubError`
     when it cannot be read (never taken for « no CI »)."""
+    from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
     if not slug:
@@ -743,7 +744,7 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     gh = gh or plan_github.Gh()
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowName,name,status,conclusion,createdAt,headSha"]) or []
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,headSha"]) or []
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
     if len(rows) >= 100:
@@ -751,11 +752,27 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     if any(r.get("headSha") != sha for r in rows):
         raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
     latest: dict = {}
-    for run in sorted((r for r in rows if isinstance(r, dict)),
-                      key=lambda r: r.get("createdAt") or "", reverse=True):
-        latest.setdefault(run.get("workflowName") or run.get("name") or "?", run)
-    pending = sorted(n for n, r in latest.items() if (r.get("status") or "") != "completed")
-    failed = sorted(n for n, r in latest.items() if (r.get("status") or "") == "completed"
+    times: dict = {}
+    for run in rows:
+        identity = run.get("workflowDatabaseId")
+        if type(identity) is not int or identity <= 0:
+            raise plan_github.GithubError("gh run list: missing or invalid workflow identity")
+        try:
+            at = datetime.fromisoformat(run["createdAt"].replace("Z", "+00:00"))
+            if at.utcoffset() is None:
+                raise ValueError("timestamp lacks timezone")
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise plan_github.GithubError("gh run list: missing or invalid run timestamp") from exc
+        if identity in times and at == times[identity] and run != latest[identity]:
+            raise plan_github.GithubError("gh run list: ambiguous latest run for workflow %s" % identity)
+        if identity not in times or at > times[identity]:
+            times[identity], latest[identity] = at, run
+
+    def label(identity, run):
+        return run.get("workflowName") or run.get("name") or str(identity)
+
+    pending = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") != "completed")
+    failed = sorted(label(n, r) for n, r in latest.items() if (r.get("status") or "") == "completed"
                     and (r.get("conclusion") or "").lower() not in CI_PASSING)
     return {"runs": len(latest), "green": bool(latest) and not pending and not failed,
             "pending": pending, "failed": failed}

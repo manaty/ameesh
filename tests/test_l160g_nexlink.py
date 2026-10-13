@@ -16,6 +16,7 @@ from ameesh import land, merge_queue, plan_github, radar, resolutions
 
 from .test_l160b_radar import _git
 from .test_l160e2_land import _Land
+from .test_l160d_resolutions import _manual_resolution
 
 import unittest
 from unittest import mock
@@ -65,6 +66,24 @@ class SettingsTest(unittest.TestCase):
             project = merge_queue.radar_project(cfg, "/another/worktree")
         self.assertTrue(project.ci_required)
         self.assertIn("main", project.protected)
+
+    def test_exact_checkout_cannot_hide_another_project_for_the_same_repository(self):
+        cfg = types.SimpleNamespace(radar={"projects": {
+            "strict": dict(NEXLINK, repo="/strict", github="acme/product"),
+            "permissive": {"repo": "/permissive", "github": "acme/product"}}})
+        with mock.patch("ameesh.migrations.origin_repo", return_value="acme/product"):
+            for checkout in ("/permissive", "/strict", "/another/worktree"):
+                with self.subTest(checkout=checkout):
+                    with self.assertRaisesRegex(merge_queue.QueueError, "ambiguous"):
+                        merge_queue.radar_project(cfg, checkout)
+
+    def test_exact_checkout_without_origin_still_checks_configured_repository_ambiguity(self):
+        cfg = types.SimpleNamespace(radar={"projects": {
+            "strict": dict(NEXLINK, repo="/strict", github="acme/product"),
+            "permissive": {"repo": "/permissive", "github": "acme/product"}}})
+        with mock.patch("ameesh.migrations.origin_repo", return_value=None):
+            with self.assertRaisesRegex(merge_queue.QueueError, "ambiguous"):
+                merge_queue.radar_project(cfg, "/permissive")
 
     def test_invalid_or_ambiguous_settings_refuse_queue_conditions(self):
         cfg = types.SimpleNamespace(radar={"projects": {"n": dict(NEXLINK, ci_required="yes")}})
@@ -139,7 +158,8 @@ class _Gh:
 
 def _run(name, status="completed", conclusion="success", at="2026-10-12T20:00:00Z"):
     return {"workflowName": name, "name": name, "status": status, "conclusion": conclusion,
-            "createdAt": at, "headSha": "a" * 40}
+            "createdAt": at, "headSha": "a" * 40,
+            "workflowDatabaseId": sum(map(ord, name))}
 
 
 class CommitCiTest(unittest.TestCase):
@@ -164,6 +184,32 @@ class CommitCiTest(unittest.TestCase):
         rows.reverse()
         rows[0]["createdAt"], rows[1]["createdAt"] = rows[1]["createdAt"], rows[0]["createdAt"]
         self.assertFalse(radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))["green"])
+
+    def test_distinct_workflows_with_the_same_name_do_not_hide_failure(self):
+        rows = [dict(_run("CI", conclusion="failure"), workflowDatabaseId=1),
+                dict(_run("CI", at="2026-10-12T21:00:00Z"), workflowDatabaseId=2)]
+        out = radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))
+        self.assertEqual(out["runs"], 2)
+        self.assertFalse(out["green"])
+        self.assertTrue(out["failed"])
+
+    def test_missing_or_invalid_workflow_identity_or_time_is_refused(self):
+        for key, value in (("workflowDatabaseId", None), ("workflowDatabaseId", ""),
+                           ("workflowDatabaseId", True), ("createdAt", None),
+                           ("createdAt", ""), ("createdAt", "yesterday"),
+                           ("createdAt", "2026-10-12T21:00:00")):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(plan_github.GithubError):
+                    radar.commit_ci(self.project, "a" * 40,
+                                    gh=_Gh([dict(_run("ci"), **{key: value})]))
+
+    def test_workflow_order_uses_instants_and_refuses_ambiguous_latest_time(self):
+        rows = [_run("ci", conclusion="failure", at="2026-10-12T20:00:00+02:00"),
+                _run("ci", at="2026-10-12T19:00:00Z")]
+        self.assertTrue(radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))["green"])
+        rows[0]["createdAt"] = "2026-10-12T21:00:00+02:00"
+        with self.assertRaises(plan_github.GithubError):
+            radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))
 
     def test_unreadable_raises(self):
         with self.assertRaises(plan_github.GithubError):
@@ -227,6 +273,163 @@ class RequiredCiQueueTest(_Land):
                 with self.assertRaisesRegex(merge_queue.QueueError, why):
                     self.enter_with(runs, error)
                 self.assertNotIn(4, self.fake.queue_rows)
+
+
+class RequiredCiLandTest(_Land):
+    GREEN = {"runs": 1, "green": True, "pending": [], "failed": []}
+    RED = {"runs": 1, "green": False, "pending": [], "failed": ["ci"]}
+
+    def test_failed_rerun_after_green_admission_does_not_land(self):
+        self.ready(4)
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+        merge_queue.enter(None, 4, repo=self.repo, ci=None, project=self.project,
+                          clone=clone, commit_ci=lambda sha: self.GREEN)
+        self.fake.queue_rows[4]["rank"] = 1
+        before = _git(self.origin, "rev-parse", "main")
+        with mock.patch.object(radar, "commit_ci", return_value=self.RED) as ci:
+            out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        ci.assert_called_once_with(self.project, self.tip(4))
+        self.assertIn("is red", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_ci_enabled_after_queue_admission_requires_frozen_ci(self):
+        self.queued(4)
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        before = _git(self.origin, "rev-parse", "main")
+        with mock.patch.object(radar, "commit_ci", return_value={
+                "runs": 0, "green": False, "pending": [], "failed": []}) as ci:
+            out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        ci.assert_called_once_with(self.project, self.tip(4))
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_ci_is_checked_again_after_merged_tree_gates(self):
+        self.queued(4)
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        before = _git(self.origin, "rev-parse", "main")
+        with mock.patch.object(radar, "commit_ci", side_effect=[self.GREEN, self.RED]) as ci:
+            out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertEqual(ci.call_args_list, [mock.call(self.project, self.tip(4))] * 2)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_already_pushed_commit_remains_a_fact_after_ci_turns_red(self):
+        self.queued(4)
+        _git(self.origin, "update-ref", "refs/heads/main", self.tip(4))
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        with mock.patch.object(radar, "commit_ci", return_value=self.RED):
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_green_frozen_ci_is_rechecked_before_successful_push(self):
+        self.queued(4)
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        with mock.patch.object(radar, "commit_ci", return_value=self.GREEN) as ci:
+            out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(ci.call_args_list, [mock.call(self.project, self.tip(4))] * 2)
+
+    def test_unreadable_frozen_ci_does_not_land(self):
+        self.queued(4)
+        self.project = dataclasses.replace(self.project, ci_required=True)
+        before = _git(self.origin, "rev-parse", "main")
+        with mock.patch.object(radar, "commit_ci", side_effect=plan_github.GithubError("HTTP502")):
+            out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("unreadable", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+
+class GeneratedQueueTest(_Land):
+    def prepare(self, check="grep -qx gen other.py"):
+        self.queued(4)
+        _git(self.repo, "checkout", "-q", "main")
+        with open(os.path.join(self.repo, "other.py"), "w") as fh:
+            fh.write("target version\n")
+        _git(self.repo, "commit", "-qam", "target changed")
+        _git(self.repo, "push", "-q", "origin", "main")
+        self.project = dataclasses.replace(self.project, generated=(radar.Generated(
+            "other.py", "printf 'gen\\n' > other.py", check),))
+
+    def run_queue(self, cache=None):
+        report = {"against_target": [{"work_item": 4, "state": "conflict", "target": "main",
+                  "tip": self.tip(4), "target_head": _git(self.origin, "rev-parse", "main"),
+                  "files": ["other.py"]}]}
+        return merge_queue.run_pass(self.cfg, None, self.project, report, cache=cache)
+
+    def test_generated_only_conflict_is_regenerated_in_the_stack(self):
+        self.prepare()
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.run_queue()
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued", out)
+        self.assertEqual(out["targets"]["main"][0]["stack"]["state"], "clean")
+        path = radar.clone_dir(self.cfg, "p")
+        self.assertEqual(_git(path, "show", "HEAD:other.py"), "gen")
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+    def test_generated_conflicts_are_excluded_before_stack_rerere(self):
+        self.prepare()
+        original = resolutions._run
+        seen = []
+
+        def watch(path, *args, **kwargs):
+            proc = original(path, *args, **kwargs)
+            if args[-1] == "rerere" or ("merge" in args and "rerere.enabled=true" in args):
+                seen.append(resolutions._text(original(
+                    path, "diff", "--name-only", "--diff-filter=U")))
+            return proc
+
+        # No early target-conflict report: the stack must detect it itself.
+        with mock.patch.object(resolutions, "_run", side_effect=watch):
+            out = merge_queue.run_pass(self.cfg, None, self.project, {})
+        self.assertTrue(seen, out)
+        self.assertTrue(all("other.py" not in paths for paths in seen), seen)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued", out)
+
+    def test_prepared_generated_resolution_never_supplies_stack_output(self):
+        sha = _manual_resolution(self.repo, "lot/2-b", "lot/1-a")
+        clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+        clone.ensure()
+        original = resolutions._run
+        seen = []
+
+        def watch(path, *args, **kwargs):
+            if args[-1] == "rerere":
+                seen.append(resolutions._text(original(
+                    path, "diff", "--name-only", "--diff-filter=U")))
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(resolutions, "_run", side_effect=watch):
+            out = merge_queue.stack(clone, _git(self.repo, "rev-parse", "main"),
+                [{"work_item": n, "tip": self.tip(n)} for n in (1, 2)],
+                [{"work_item_id": 2, "other_item_id": 1, "commit_sha": sha}],
+                generated=(radar.Generated("shared.py", "printf 'gen\\n' > shared.py",
+                                           "grep -qx gen shared.py"),))
+        self.assertEqual(out[2], {"state": "clean", "files": []})
+        self.assertEqual(_git(clone.path, "show", "HEAD:shared.py"), "gen")
+        # Training may itself run rerere. Only the stack's final call matters.
+        self.assertTrue(seen)
+        self.assertNotIn("shared.py", seen[-1])
+
+    def test_generator_failure_ejects_during_stacking(self):
+        self.prepare(check="echo bad generated output; exit 3")
+        out = self.run_queue()
+        self.assertEqual(self.fake.queue_rows[4]["state"], "ejected", out)
+        self.assertIn("generated", self.fake.queue_rows[4]["reason"])
+        self.assertIn("bad generated output", self.sent[-1][1])
+
+    def test_changed_generated_configuration_invalidates_stack_cache(self):
+        self.prepare()
+        cache = radar.Cache()
+        self.run_queue(cache)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.project = dataclasses.replace(self.project, generated=(radar.Generated(
+            "other.py", "printf 'new\\n' > other.py", "grep -qx new other.py"),))
+        self.run_queue(cache)
+        self.assertEqual(_git(radar.clone_dir(self.cfg, "p"), "show", "HEAD:other.py"), "new")
 
 
 class PathGatesLandTest(_Land):
