@@ -296,6 +296,10 @@ class Agents(interface.Agents):
               AND mode = 'execute'
               AND (lease_owner IS NULL OR lease_expires_at < clock_timestamp())
               AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())
+              -- #254 : un hôte en pause ne prend aucun bail
+              AND NOT EXISTS (SELECT 1 FROM host_holds hh
+                               WHERE hh.host = agent_registry.host
+                                 AND hh.until > clock_timestamp())
               AND %s
         """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry"))
         if require_responsible:
@@ -474,6 +478,12 @@ class Leases(interface.Leases):
                AND (r.lease_owner IS NULL OR r.lease_owner = %s
                     OR r.lease_expires_at < clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+               -- #254 : sur un hôte en pause, aucun nouveau bail (le sien,
+               -- encore vivant, se renouvelle)
+               AND ((r.lease_owner = %s AND r.lease_expires_at >= clock_timestamp())
+                    OR NOT EXISTS (SELECT 1 FROM host_holds hh
+                                    WHERE hh.host = r.host
+                                      AND hh.until > clock_timestamp()))
                __RESPONSABLE__
                AND NOT r.handoff_fenced
                AND __CANON__
@@ -483,7 +493,7 @@ class Leases(interface.Leases):
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
-        rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner))
+        rows = self.db.query(sql, (name, owner, ttl_seconds, owner, owner, owner, owner))
         return rows[0] if rows else None
 
     def attach_claim(self, name, owner, ttl_seconds, *, require_responsible) -> dict | None:
@@ -515,6 +525,12 @@ class Leases(interface.Leases):
                AND NOT (r.status = 'running' AND r.lease_owner IS NOT NULL
                         AND r.lease_expires_at > clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+               -- #254 : sur un hôte en pause, aucun nouveau bail, interactif
+               -- compris (le sien, encore vivant, se reprend)
+               AND ((r.lease_owner = %s AND r.lease_expires_at >= clock_timestamp())
+                    OR NOT EXISTS (SELECT 1 FROM host_holds hh
+                                    WHERE hh.host = r.host
+                                      AND hh.until > clock_timestamp()))
                __RESPONSABLE__
                AND NOT r.handoff_fenced
                AND __CANON__
@@ -524,7 +540,7 @@ class Leases(interface.Leases):
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
-        rows = self.db.query(sql, (name, owner, ttl_seconds))
+        rows = self.db.query(sql, (name, owner, ttl_seconds, owner))
         return rows[0] if rows else None
 
     def state(self, name) -> dict | None:

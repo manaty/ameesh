@@ -188,6 +188,8 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    # #254: not pushed by default (add it to `notify.types`)
+    "host_hold": "host on hold",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

@@ -2385,12 +2385,36 @@ class HostLifecycle(Domain):
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
 
+    #254 : la pause d'un hôte voulue par le propriétaire (`host_holds`, 0392).
+
     Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
     1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
     tours en cours ; L159d: PSI, application and guest shares, lendable
     capacity. Les mesures illisibles sont NULL : on ne devine pas.
     Instants rendus en secondes epoch (`sampled_ts`).
     """
+
+    @abc.abstractmethod
+    def holds(self) -> list[dict]:
+        """#254 : les pauses en cours (`until` pas encore passé, heure de la
+        base) : host, reason, author, created_ts, until_ts."""
+
+    @abc.abstractmethod
+    def hold(self, host: str, *, reason: str, author: str, seconds: float | None = None,
+             until_ts: float | None = None) -> dict | None:
+        """#254 : pose (ou remplace) la pause de `host`, pour `seconds` ou
+        jusqu'à `until_ts`, bornée à l'heure de la base (après maintenant,
+        24 h au plus) ; None hors de ces bornes. L'historique
+        (`host_hold_events`) est écrit dans la même transaction."""
+
+    @abc.abstractmethod
+    def release(self, host: str, *, author: str) -> bool:
+        """#254 : lève la pause de `host` (historique compris) ; faux s'il
+        n'y en avait pas."""
+
+    @abc.abstractmethod
+    def hold_events(self, host: str | None = None) -> list[dict]:
+        """#254 : l'historique des pauses et levées, dans l'ordre."""
 
     @abc.abstractmethod
     def gate_guard(self, host: str):

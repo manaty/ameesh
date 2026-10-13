@@ -102,6 +102,10 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh hosts HOST --hold --until 2h --reason R | --release
+                                        the owner holds a host on purpose: its
+                                        agents' alerts stay quiet (#254);
   ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
         durable withdrawal, return and lost-host recovery (L232e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION

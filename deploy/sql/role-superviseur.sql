@@ -426,6 +426,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('account_holds', ARRAY[
         'host', 'harness', 'account', 'until_ts', 'reason', 'created_at'
     ]),
+    -- #254 (0392) : pause d'un hôte voulue par le propriétaire
+    ('host_holds', ARRAY[
+        'host', 'reason', 'author', 'created_at', 'until'
+    ]),
+    ('host_hold_events', ARRAY[
+        'id', 'host', 'action', 'author', 'reason', 'until', 'at'
+    ]),
     ('account_switches', ARRAY[
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
