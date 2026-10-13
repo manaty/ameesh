@@ -61,13 +61,19 @@ class JobReapingTest(unittest.TestCase):
                 self.assertEqual(entry.jobs[pid].code, None if mismatch else -signal.SIGKILL)
                 if mismatch:
                     reap.assert_not_called()
-                    tracker._reap_strays(platform.process_table(), [])
+                    # Only this test's child: earlier modules of the same shard
+                    # leave zombies of the test process (#417 CI).
+                    tracker._reap_strays(
+                        [p for p in platform.process_table() if p["pid"] == pid], [])
                     self.assertEqual(tracker.unknown_zombies, 1)
                     self.assertIsNotNone(os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT))
                 else:
                     reap.assert_called_once_with(pid)
                     self.assertNotIn(pid, [p["pid"] for p in snapshot])
-                    tracker._reap_strays(snapshot, [])
+                    # Our child is reaped: the shard's inherited zombies stay
+                    # out of the count, as in the mismatch case above.
+                    tracker._reap_strays(
+                        [p for p in platform.process_table() if p["pid"] == pid], [])
                     self.assertEqual(tracker.unknown_zombies, 0)
                     with self.assertRaises(ChildProcessError):
                         os.waitpid(pid, os.WNOHANG)
