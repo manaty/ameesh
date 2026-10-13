@@ -1,0 +1,134 @@
+# Secret store, reference delivery and rotation (L232c)
+
+`deploy/mise-a-jour/coffre-release.py` turns the mesh's existing protected
+directory (`/etc/ameesh`, `0750 root:ameesh`, environment files `0640`) into a
+reference-addressed store. It is source only: it is not installed, it opens no
+SSH connection, and its tests need neither root nor a real store.
+
+The inventory of the existing store (2026-10-13) is in
+`docs/design/etudes/l232-autonomous-host-provisioning.md`: no vault, no
+delivery API, and a `~/.config/ameesh/config.json` observed at `0664` with a
+live database password. Nothing here widens that: the bridge validates the
+modes it depends on instead of inheriting them.
+
+## References and policy
+
+A reference is `<file>#<KEY>` (`harnais.env#DEEPSEEK_API_KEY`): a plain file
+name in the store directory and an environment key. Never a path, a glob, a
+command or a value.
+
+The mesh side reads one exact-key private document
+(`/etc/ameesh-secrets/policy.json`, root-owned, `0600`/`0640`):
+
+```json
+{"version": 1, "host": "ameesh-agents-2",
+ "store": {"root": "/etc/ameesh", "max_bytes": 65536},
+ "references": {"harnais.env#DEEPSEEK_API_KEY": {"destinations": [
+   {"host": "ameesh-agents-2", "account": "deepseek1", "kind": "account_file",
+    "path": "/home/deepseek1/.config/ameesh/deepseek.key", "owner": "deepseek1",
+    "group": "deepseek1", "mode": "0600", "dir_mode": "0700",
+    "keep_previous": 1, "health": "account_read"}]}}}
+```
+
+A reference absent from the policy is refused (`reference_unknown`); a
+reference is only delivered to the exact `(host, account)` pair the policy
+names. The store file itself must be a regular file, owned by root or the
+caller, mode `0600` or `0640`, within `max_bytes`, and its ancestors must not
+be writable by another user (a group-writable ancestor owned by root or the
+caller is admitted: the shared Unix group is the study's trust model).
+
+## Framing and the destination helper
+
+`frame(request, value)` writes one JSON request line, then the raw value. The
+destination helper reads its stdin; `unframe` checks the declared byte count
+before the helper touches anything. The value never appears in the JSON, in
+argv, in the receipt, in the journal or in an error: every failure carries a
+stable category (`frame`, `reference`, `destination_unknown`, `file_mode`,
+`unmanaged_file`, `health_unavailable`, `health`, `replay_mismatch`,
+`write`, `transport`, `receipt`…), never a value or a digest.
+
+The host side is enrolled by `/etc/ameesh-secrets/helper.json` (root-owned,
+exact keys), which lists the only destinations admitted on that host. A
+request whose destination does not match its enrollment exactly is refused
+before any effect.
+
+Two destination kinds:
+
+- `account_file` — the bridge: `0600`, owned by the account, in a `0700`
+  directory of that account. This is what `accounts.py` expects for a
+  `key_file`.
+- `env_file` — the system store: `0640 root:<group>` in a `0750` directory.
+
+## Atomic install, replay and rotation
+
+An install writes a temporary file in the destination directory
+(`O_CREAT|O_EXCL|O_NOFOLLOW`, mode set on the descriptor), `fsync`s it, reads
+it back **in memory** and compares the bytes, `os.replace`s it onto the
+destination and `fsync`s the directory. The read-back comparison is never
+persisted: no digest of a secret reaches the journal, a receipt or an error.
+
+A request replayed after a lost reply (same version id, identical content)
+returns `replayed: true` without rewriting. The same version id with
+different content raises (`replay_mismatch`) instead of silently overwriting.
+An existing destination file with no version record is never adopted or
+replaced (`unmanaged_file`).
+
+Rotation keeps the replaced version privately in `<path>.previous` until the
+policy's `keep_previous` confirms it may be dropped; the version record
+(`<path>.version`, `0600`, version ids only) drives reconciliation.
+`revoke <version>` removes the retained previous version only and refuses the
+current one (`current_version`); the current credential is never removed by a
+revocation.
+
+Health: an `account_file` install requires an injected health check,
+`read_as(account, path)`. The default implementation runs a bounded
+`runuser -u <account> -- /bin/cat <path>` (root only); without root or an
+injected check the install is refused **before any effect**
+(`health_unavailable`). If the check fails, the previous version is restored
+(or a first install is removed) and the receipt is `ok: false, category:
+health`: the account is never declared served on a guess.
+`env_file` uses a root read-back.
+
+## Journal
+
+`/var/lib/ameesh-secrets/rotations.jsonl` (`0700` directory, `0600` file,
+`fsync`ed) records the timestamp, reference, host, account, operation, random
+version id and category (`intent`, `installed`, `health`, `transport`,
+`revoked`…). Version ids are random and never derived from the value; the
+journal carries no value, no digest and no connection string.
+
+## What remains before a host pilot
+
+- **Transport**: wire `Livraison` to L232b's `transport-release.py` exchange
+  and to the root host dispatcher (the `helper-*.py` pattern) that calls
+  `Installeur.handle` on its stdin. The enrollment documents must be installed
+  as root at their fixed paths.
+- **Turn boundary**: `Livraison` requires an injected `boundary(host, account)`
+  for a rotation and refuses (`boundary_unavailable`, `busy`) without one; the
+  live implementation must come from the account/turn state so no key changes
+  under a running turn.
+- **Account preflight**: after the bridge, run `accounts.py`'s preflight for
+  the account and hold the account on a missing, revoked or unhealthy
+  credential rather than falling back to paid API usage.
+- **Systemd credentials**: remained an alternative to the `0600` bridge; test
+  actual runner access before adopting either.
+- **New enrolment**: a new reference or a broader destination needs a scoped
+  owner decision (study L232c); routine delivery inside an approved policy
+  does not.
+- **Canary evidence**: the tests inject a synthetic value and assert it is
+  absent from stdout, stderr, receipts, the journal and exception text. Mail,
+  Git and retained artifacts carried no value in the inventory; the pilot
+  must re-run that check on the real host.
+
+## Tests
+
+`tests/test_l232c_coffre.py` (36 cases, no database, no root, no network):
+
+    PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre
+
+It covers reference grammar, environment parsing, store permissions and
+symlinks, policy/enrollment exact keys, the bridge modes, atomic install,
+replay without rewrite, replay divergence, unmanaged files, health refusal
+before effect, health rollback to the previous version, rotation and
+revocation, transport failure and inconsistent receipts, and a subprocess
+canary through the helper entry point.

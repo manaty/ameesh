@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Magasin de secrets protégé : livraison par référence et rotation (L232c).
+
+Le mesh n'a pas de coffre ni d'API de livraison : son magasin est un
+répertoire protégé (`/etc/ameesh`, `0750 root:ameesh`) de fichiers
+d'environnement `0640`. Ce module en fait un magasin à références :
+
+- la référence est un nom de fichier simple et un nom de clé
+  (`harnais.env#DEEPSEEK_API_KEY`), jamais un chemin, un motif ou un extrait
+  de valeur ;
+- une politique privée (`/etc/ameesh-secrets/policy.json`, propriété root,
+  clés exactes) dit quelles références peuvent aller vers quels couples
+  hôte/compte, avec le genre de destination, le mode, le propriétaire et le
+  nombre de versions conservées ;
+- la livraison passe par un transport injecté (SSH de L232b) : la valeur est
+  encadrée à destination du helper d'installation, qui la lit sur son stdin.
+  Rien de la valeur ne va dans argv, stdout/stderr, les reçus, le journal ou
+  les erreurs : les erreurs ne portent qu'une catégorie stable ;
+- l'installation est atomique (fichier temporaire dans le même répertoire,
+  `fsync`, `os.replace`, `fsync` du répertoire) et refaite à l'identique
+  (rejeu d'un reçu perdu) sans réécrire ; la version précédente reste privée
+  jusqu'à la confirmation, puis se révoque ;
+- le pont vers un compte de runner écrit un fichier `0600` au nom du compte
+  dans son répertoire de configuration `0700`, puis exige un contrôle de
+  santé injecté (lecture par le compte : l'ouverture réelle, pas une
+  supposition). Sans contrôle de santé enrôlé, l'installation d'un
+  `account_file` est refusée avant tout effet : on ne simule pas un backend
+  absent.
+
+Ce module est de la source seule : il n'est pas installé, n'ouvre aucune
+connexion SSH, ne touche à aucun magasin réel et n'exige pas root. Les tests
+l'exercent sur des racines jetables avec des transports et des contrôles de
+santé simulés.
+"""
+from __future__ import annotations
+
+import grp
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import time
+
+#: protocole de la trame d'installation (une ligne JSON puis la valeur brute)
+PROTOCOL = 'ameesh-secret/1'
+#: documents enrôlés, propriété root, privés
+ENROLLMENT_ROOT = Path('/etc/ameesh-secrets')
+POLICY_PATH = ENROLLMENT_ROOT / 'policy.json'
+HELPER_PATH = ENROLLMENT_ROOT / 'helper.json'
+#: journal de rotation (identifiants de version et catégories, jamais de valeur)
+JOURNAL_ROOT = Path('/var/lib/ameesh-secrets')
+MAX_BYTES = 65536
+#: une référence : nom de fichier simple (sans chemin) et clé d'environnement
+REFERENCE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}#[A-Za-z_][A-Za-z0-9_]{0,63}\Z')
+KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,63}\Z')
+VERSION = re.compile(r'^[0-9a-f]{32}\Z')
+_OPERATIONS = ('install', 'rotate', 'revoke')
+_HEALTH = {'account_file': ('account_read',), 'env_file': ('root_read',)}
+_KEYS = {
+    'destination': frozenset(('host', 'account', 'kind', 'path', 'owner', 'group',
+                              'mode', 'dir_mode', 'keep_previous', 'health')),
+    'policy': frozenset(('version', 'host', 'store', 'references')),
+    'store': frozenset(('root', 'max_bytes')),
+    'reference': frozenset(('destinations',)),
+    'helper': frozenset(('version', 'host', 'max_bytes', 'destinations')),
+    'request': frozenset(('protocol', 'operation', 'reference', 'version', 'bytes',
+                          'destination')),
+    'receipt': frozenset(('protocol', 'operation', 'reference', 'version', 'ok',
+                          'category', 'replayed', 'destination', 'previous')),
+    'journal': frozenset(('ts', 'reference', 'host', 'account', 'operation',
+                          'version', 'category')),
+}
+
+
+class SecretError(ValueError):
+    """Erreur de catégorie stable ; le message ne porte jamais de valeur."""
+
+    def __init__(self, category: str, message: str = ''):
+        super().__init__(message or category)
+        self.category = category
+
+
+class Refused(SecretError):
+    """Refus définitif : aucun effet, aucune réconciliation nécessaire."""
+
+
+class Uncertain(SecretError):
+    """Effet possible : l'appelant réconcilie avec le même identifiant."""
+
+
+def _exact(value, keys, what):
+    if not isinstance(value, dict):
+        raise Refused('%s_document' % what)
+    if keys - set(value) or set(value) - keys:
+        raise Refused('%s_keys' % what)
+
+
+def parse_reference(text: str) -> tuple[str, str]:
+    """`fichier.env#CLE` -> (nom, clé). Aucun chemin, aucun motif."""
+    if not isinstance(text, str) or not REFERENCE.match(text):
+        raise Refused('reference')
+    name, key = text.split('#', 1)
+    if name in ('.', '..') or '/' in name:
+        raise Refused('reference')
+    return name, key
+
+
+def parse_mode(text: str, allowed: tuple) -> int:
+    if not isinstance(text, str) or text not in tuple('0%o' % value for value in allowed):
+        raise Refused('mode')
+    return int(text, 8)
+
+
+def _ancestors_trusted(path: Path, uid: int, what: str) -> None:
+    """Chaîne d'ancêtres : pas de lien, pas d'écriture par un autre.
+
+    Le groupe est le modèle de confiance du mesh (étude L232 : « un membre du
+    groupe Unix partagé peut lire ces secrets ») : un ancêtre inscriptible par
+    le groupe n'est admis que s'il appartient à root ou à l'appelant. Le
+    parent immédiat, lui, est contrôlé au mode exact par l'appelant.
+    """
+    for ancestor in path.parents:
+        try:
+            up = ancestor.lstat()
+        except OSError:
+            raise Refused(what) from None
+        if stat.S_ISLNK(up.st_mode):
+            raise Refused(what)
+        if up.st_mode & 0o002 and not up.st_mode & stat.S_ISVTX:
+            raise Refused(what)
+        if up.st_mode & 0o020 and up.st_uid not in (0, uid):
+            raise Refused(what)
+
+
+def _trusted_dir(path: Path, *, owner: int, mode: int) -> None:
+    """Répertoire absolu, du bon propriétaire, au mode exact."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise Refused('directory_path')
+    try:
+        info = path.lstat()
+    except OSError:
+        raise Refused('directory_missing') from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise Refused('directory_type')
+    if info.st_uid != owner or stat.S_IMODE(info.st_mode) != mode:
+        raise Refused('directory_mode')
+    _ancestors_trusted(path, owner, 'directory_ancestor')
+
+
+def _trusted_store(path: Path, *, uid: int) -> None:
+    """Racine du magasin : propriétaire (root ou appelant), non inscriptible par d'autres."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise Refused('store_path')
+    try:
+        info = path.lstat()
+    except OSError:
+        raise Refused('store_missing') from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise Refused('store_type')
+    if info.st_uid not in (0, uid) or info.st_mode & 0o022:
+        raise Refused('store_mode')
+    _ancestors_trusted(path, uid, 'store_ancestor')
+
+
+def _protected_regular(path: Path, *, owners: tuple, modes: tuple) -> os.stat_result:
+    """Fichier régulier, sans lien, propriétaire et mode exacts."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise Refused('file_missing') from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise Refused('file_type')
+    if info.st_uid not in owners or stat.S_IMODE(info.st_mode) not in modes:
+        raise Refused('file_mode')
+    return info
+
+
+def _read_private(path: Path, *, owners: tuple, modes: tuple, limit: int) -> bytes:
+    info = _protected_regular(path, owners=owners, modes=modes)
+    if info.st_size <= 0 or info.st_size > limit:
+        raise Refused('file_size')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        with os.fdopen(fd, 'rb') as stream:
+            opened = os.fstat(stream.fileno())
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise Refused('file_changed')
+            data = stream.read(limit + 1)
+    except OSError:
+        raise Refused('file_unreadable') from None
+    if len(data) > limit:
+        raise Refused('file_size')
+    return data
+
+
+def env_value(data: bytes, key: str) -> bytes:
+    """Valeur de `CLE=` dans un fichier d'environnement, sans shell ni guillemets."""
+    found = None
+    for line in data.split(b'\n'):
+        line = line.rstrip(b'\r')
+        if not line or line.startswith(b'#'):
+            continue
+        name, separator, value = line.partition(b'=')
+        try:
+            label = name.decode('ascii')
+        except UnicodeDecodeError:
+            raise Refused('env_format') from None
+        if not separator or not KEY.match(label):
+            raise Refused('env_format')
+        if label == key:
+            if found is not None:
+                raise Refused('env_duplicate')
+            found = value
+    if found is None:
+        raise Refused('env_missing')
+    if not found or b'\x00' in found:
+        raise Refused('env_value')
+    return found
+
+
+def frame(request: dict, value: bytes) -> bytes:
+    """Une ligne JSON exacte, puis la valeur brute : rien de la valeur en JSON."""
+    _exact(request, _KEYS['request'], 'request')
+    if request.get('operation') not in _OPERATIONS:
+        raise Refused('operation')
+    if request['bytes'] != len(value) or (not value and request['operation'] != 'revoke'):
+        raise Refused('frame_length')
+    line = json.dumps(request, sort_keys=True, separators=(',', ':')).encode()
+    if b'\n' in line or len(line) > 4096:
+        raise Refused('frame_request')
+    return line + b'\n' + value
+
+
+def unframe(payload: bytes) -> tuple[dict, bytes]:
+    line, separator, value = payload.partition(b'\n')
+    if not separator or len(line) > 4096:
+        raise Refused('frame')
+    try:
+        request = json.loads(line)
+    except ValueError:
+        raise Refused('frame_request') from None
+    _exact(request, _KEYS['request'], 'request')
+    if request.get('protocol') != PROTOCOL:
+        raise Refused('protocol')
+    if request.get('operation') not in _OPERATIONS:
+        raise Refused('operation')
+    if not isinstance(request.get('bytes'), int) or request['bytes'] != len(value):
+        raise Refused('frame_length')
+    return request, value
+
+
+class Destination:
+    """Destination enrôlée : couple hôte/compte, genre, chemin et mode exacts."""
+
+    def __init__(self, document: dict):
+        _exact(document, _KEYS['destination'], 'destination')
+        self.host = document['host']
+        self.account = document['account']
+        self.kind = document['kind']
+        self.path = Path(document['path'])
+        self.owner = document['owner']
+        self.group = document['group']
+        self.keep_previous = document['keep_previous']
+        self.health = document['health']
+        for name, value in (('host', self.host), ('account', self.account),
+                            ('owner', self.owner), ('group', self.group)):
+            if not isinstance(value, str) or not value:
+                raise Refused('destination_%s' % name)
+        if self.kind not in _HEALTH:
+            raise Refused('destination_kind')
+        self.mode = parse_mode(document['mode'], (0o600, 0o640))
+        self.dir_mode = parse_mode(document['dir_mode'], (0o700, 0o750))
+        if self.kind == 'account_file':
+            if self.mode != 0o600 or self.dir_mode != 0o700 or self.owner != self.account:
+                raise Refused('destination_bridge')
+        elif self.mode != 0o640 or self.dir_mode != 0o750 or self.owner != 'root':
+            raise Refused('destination_system')
+        if self.health not in _HEALTH[self.kind]:
+            raise Refused('destination_health')
+        if type(self.keep_previous) is not int or self.keep_previous not in (0, 1):
+            raise Refused('destination_keep')
+        if not self.path.is_absolute() or '..' in self.path.parts:
+            raise Refused('destination_path')
+        if not self.path.name or self.path.name.startswith('.'):
+            raise Refused('destination_path')
+
+    def document(self) -> dict:
+        return {'host': self.host, 'account': self.account, 'kind': self.kind,
+                'path': str(self.path), 'owner': self.owner, 'group': self.group,
+                'mode': '0%o' % self.mode, 'dir_mode': '0%o' % self.dir_mode,
+                'keep_previous': self.keep_previous, 'health': self.health}
+
+
+class Politique:
+    """Politique du magasin (côté mesh) : références -> destinations enrôlées."""
+
+    def __init__(self, document: dict):
+        _exact(document, _KEYS['policy'], 'policy')
+        if document['version'] != 1:
+            raise Refused('policy_version')
+        self.host = document['host']
+        if not isinstance(self.host, str) or not self.host:
+            raise Refused('policy_host')
+        _exact(document['store'], _KEYS['store'], 'store')
+        self.store_root = Path(document['store']['root'])
+        self.max_bytes = document['store']['max_bytes']
+        if type(self.max_bytes) is not int or not 0 < self.max_bytes <= MAX_BYTES:
+            raise Refused('policy_bytes')
+        if not self.store_root.is_absolute() or '..' in self.store_root.parts:
+            raise Refused('policy_store')
+        if not isinstance(document['references'], dict) or not document['references']:
+            raise Refused('policy_references')
+        self.references = {}
+        for reference, entry in document['references'].items():
+            parse_reference(reference)
+            _exact(entry, _KEYS['reference'], 'reference')
+            if not isinstance(entry['destinations'], list) or not entry['destinations']:
+                raise Refused('reference_destinations')
+            self.references[reference] = [Destination(item)
+                                          for item in entry['destinations']]
+
+    def destination(self, reference: str, host: str, account: str) -> Destination:
+        for destination in self.references.get(reference, ()):
+            if destination.host == host and destination.account == account:
+                return destination
+        raise Refused('destination_unknown')
+
+
+class Lecteur:
+    """Lecteur étroit du magasin : référence allowlistée, fichier protégé."""
+
+    def __init__(self, politique: Politique, *, uid: int | None = None):
+        self.politique = politique
+        self.uid = os.geteuid() if uid is None else uid
+        _trusted_store(politique.store_root, uid=self.uid)
+
+    def read(self, reference: str) -> bytes:
+        name, key = parse_reference(reference)
+        if reference not in self.politique.references:
+            raise Refused('reference_unknown')
+        path = self.politique.store_root / name
+        data = _read_private(path, owners=(0, self.uid), modes=(0o600, 0o640),
+                             limit=self.politique.max_bytes)
+        return env_value(data, key)
+
+
+class Installeur:
+    """Côté hôte : installation atomique, pont `0600`, rotation et révocation.
+
+    Le document d'enrôlement (`helper.json`) liste les seules destinations
+    admises sur cet hôte. Toute demande qui ne s'y superpose pas exactement
+    est refusée avant le moindre effet.
+    """
+
+    def __init__(self, document: dict, *, read_as=None, now=time.time,
+                 uid: int | None = None, gid: int | None = None):
+        _exact(document, _KEYS['helper'], 'helper')
+        if document['version'] != 1:
+            raise Refused('helper_version')
+        if not isinstance(document['host'], str) or not document['host']:
+            raise Refused('helper_host')
+        if (type(document['max_bytes']) is not int
+                or not 0 < document['max_bytes'] <= MAX_BYTES):
+            raise Refused('helper_bytes')
+        self.host = document['host']
+        self.max_bytes = document['max_bytes']
+        self.uid = os.geteuid() if uid is None else uid
+        self.gid = os.getegid() if gid is None else gid
+        self.read_as = read_as
+        self.now = now
+        self.destinations = {}
+        for item in document['destinations'] or ():
+            destination = Destination(item)
+            if destination.host != self.host:
+                raise Refused('helper_destination_host')
+            self.destinations[(destination.kind, str(destination.path))] = destination
+
+    # -- point d'entrée du helper -----------------------------------------
+    def handle(self, payload: bytes) -> bytes:
+        """Traite une trame et rend une ligne de reçu (un refus est un reçu `ok:false`)."""
+        request, value = unframe(payload)
+        try:
+            destination = self.find(request)
+            receipt = self.perform(request, destination, value)
+        except Refused as exc:
+            receipt = self._refusal(request, exc.category)
+        return json.dumps(receipt, sort_keys=True,
+                          separators=(',', ':')).encode() + b'\n'
+
+    def _refusal(self, request: dict, category: str) -> dict:
+        destination = request.get('destination')
+        return {'protocol': PROTOCOL, 'operation': request.get('operation', ''),
+                'reference': request.get('reference', ''),
+                'version': request.get('version', ''), 'ok': False,
+                'category': category, 'replayed': False,
+                'destination': destination if isinstance(destination, dict) else {},
+                'previous': None}
+
+    def find(self, request: dict) -> Destination:
+        parse_reference(request.get('reference', ''))
+        if not isinstance(request.get('version'), str) or not VERSION.match(request['version']):
+            raise Refused('version')
+        _exact(request['destination'], _KEYS['destination'], 'destination')
+        wanted = Destination(request['destination'])
+        if wanted.host != self.host:
+            raise Refused('destination_host')
+        enrolled = self.destinations.get((wanted.kind, str(wanted.path)))
+        if enrolled is None or enrolled.document() != wanted.document():
+            raise Refused('destination_unknown')
+        return enrolled
+
+    def perform(self, request: dict, destination: Destination, value: bytes) -> dict:
+        if request['operation'] == 'revoke':
+            if value:
+                # une révocation ne transporte aucune valeur.
+                raise Refused('value_unexpected')
+            return self.revoke(destination, request)
+        if len(value) > self.max_bytes:
+            raise Refused('value_size')
+        return self.install(destination, request, value)
+
+    def _owner_ids(self, destination: Destination) -> tuple[int, int]:
+        try:
+            owner = pwd.getpwnam(destination.owner).pw_uid
+            group = grp.getgrnam(destination.group).gr_gid
+        except KeyError:
+            raise Refused('account_unknown') from None
+        if self.uid and owner != self.uid:
+            raise Refused('owner_not_caller')
+        return owner, group
+
+    def _prepare_parent(self, destination: Destination) -> int:
+        owner, group = self._owner_ids(destination)
+        expected = owner if destination.kind == 'account_file' else 0
+        if self.uid and expected != self.uid:
+            raise Refused('owner_not_caller')
+        _trusted_dir(destination.path.parent, owner=expected,
+                     mode=destination.dir_mode)
+        return owner
+
+    def _sidecar_path(self, destination: Destination) -> Path:
+        return destination.path.with_name(destination.path.name + '.version')
+
+    def _sidecar(self, destination: Destination, owner: int) -> dict:
+        path = self._sidecar_path(destination)
+        if not path.exists():
+            return {}
+        try:
+            data = _read_private(path, owners=(owner, 0), modes=(0o600, 0o640),
+                                 limit=4096)
+            record = json.loads(data)
+        except (Refused, ValueError):
+            raise Refused('version_record') from None
+        if not isinstance(record, dict) or set(record) - {'version', 'previous'}:
+            raise Refused('version_record')
+        for item in record.values():
+            if not isinstance(item, str) or not VERSION.match(item):
+                raise Refused('version_record')
+        return record
+
+    def _write_sidecar(self, destination: Destination, record: dict,
+                       owner: int, group: int) -> None:
+        data = json.dumps(record, sort_keys=True, separators=(',', ':')).encode()
+        self._atomic_write(self._sidecar_path(destination), data, destination,
+                           mode=0o600, owner=owner, group=group)
+
+    def _atomic_write(self, path: Path, data: bytes, destination: Destination, *,
+                      mode: int, owner: int, group: int) -> None:
+        parent = path.parent
+        temporary = parent / ('.%s.tmp-%s' % (path.name, secrets.token_hex(8)))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        fd = os.open(temporary, flags, mode)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+                if self.uid == 0:
+                    os.fchown(stream.fileno(), owner, group)
+                os.fchmod(stream.fileno(), mode)
+            readback = _read_private(temporary, owners=(owner, 0), modes=(mode,),
+                                     limit=len(data) + 1)
+            if readback != data:
+                raise Uncertain('write_verify')
+            os.replace(temporary, path)
+            directory = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except SecretError:
+            raise
+        except OSError:
+            raise Uncertain('write') from None
+        finally:
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    def install(self, destination: Destination, request: dict, value: bytes) -> dict:
+        if destination.health == 'account_read' and self.read_as is None:
+            # pas de contrôle enrôlé : refus avant tout effet, jamais de pont
+            # déclaré sain sans que le compte l'ait ouvert.
+            raise Refused('health_unavailable')
+        owner = self._prepare_parent(destination)
+        _, group = self._owner_ids(destination)
+        version = request['version']
+        path = destination.path
+        record = self._sidecar(destination, owner)
+        if path.exists():
+            _protected_regular(path, owners=(owner, 0), modes=(destination.mode,))
+            if not record:
+                # fichier non géré : on ne l'adopte pas et on ne l'écrase pas.
+                raise Refused('unmanaged_file')
+        if record.get('version') == version:
+            # rejeu d'un reçu perdu : contenu comparé en mémoire, jamais
+            # journalisé ni haché ; rien n'est réécrit.
+            if path.exists() and _read_private(path, owners=(owner, 0),
+                                               modes=(destination.mode,),
+                                               limit=self.max_bytes) == value:
+                return self._receipt(request, destination,
+                                     record.get('previous'), replayed=True)
+            raise Uncertain('replay_mismatch')
+        previous = record.get('version')
+        kept = path.with_name(path.name + '.previous')
+        if path.exists():
+            # la version précédente reste disponible pour le retour arrière,
+            # même quand la politique ne demande pas de la conserver ensuite.
+            self._atomic_write(kept, _read_private(path, owners=(owner, 0),
+                                                   modes=(destination.mode,),
+                                                   limit=self.max_bytes),
+                               destination, mode=destination.mode, owner=owner,
+                               group=group)
+        self._atomic_write(path, value, destination, mode=destination.mode,
+                           owner=owner, group=group)
+        if not self._health(destination):
+            if previous is not None:
+                self._atomic_write(path, _read_private(kept, owners=(owner, 0),
+                                                       modes=(destination.mode,),
+                                                       limit=self.max_bytes),
+                                   destination, mode=destination.mode,
+                                   owner=owner, group=group)
+                self._write_sidecar(destination, {'version': previous}, owner, group)
+            else:
+                path.unlink()
+                sidecar = self._sidecar_path(destination)
+                if sidecar.exists():
+                    sidecar.unlink()
+            return {'protocol': PROTOCOL, 'operation': request['operation'],
+                    'reference': request['reference'], 'version': version,
+                    'ok': False, 'category': 'health', 'replayed': False,
+                    'destination': destination.document(),
+                    'previous': previous}
+        record = {'version': version}
+        if previous is not None and destination.keep_previous:
+            record['previous'] = previous
+        elif kept.exists():
+            kept.unlink()
+        self._write_sidecar(destination, record, owner, group)
+        return self._receipt(request, destination, previous)
+
+    def revoke(self, destination: Destination, request: dict) -> dict:
+        owner = self._prepare_parent(destination)
+        record = self._sidecar(destination, owner)
+        version = request['version']
+        current = record.get('version')
+        previous = record.get('previous')
+        if version == current:
+            raise Refused('current_version')
+        if version != previous:
+            raise Refused('version_unknown')
+        stale = destination.path.with_name(destination.path.name + '.previous')
+        if stale.exists():
+            stale.unlink()
+        self._write_sidecar(destination, {'version': current}, owner,
+                            self._owner_ids(destination)[1])
+        return {'protocol': PROTOCOL, 'operation': 'revoke',
+                'reference': request['reference'], 'version': version,
+                'ok': True, 'category': 'revoked', 'replayed': False,
+                'destination': destination.document(), 'previous': current}
+
+    def _health(self, destination: Destination) -> bool:
+        if destination.health == 'root_read':
+            try:
+                _read_private(destination.path, owners=(0, self.uid),
+                              modes=(destination.mode,), limit=self.max_bytes)
+            except Refused:
+                return False
+            return True
+        try:
+            return bool(self.read_as(destination.account, destination.path))
+        except SecretError:
+            raise
+        except Exception:
+            return False
+
+    def _receipt(self, request: dict, destination: Destination,
+                 previous: str | None, replayed: bool = False) -> dict:
+        return {'protocol': PROTOCOL, 'operation': request['operation'],
+                'reference': request['reference'], 'version': request['version'],
+                'ok': True, 'category': 'installed', 'replayed': replayed,
+                'destination': destination.document(), 'previous': previous}
+
+
+class Journal:
+    """Journal de rotation : versions et catégories, jamais de valeur ni d'empreinte."""
+
+    def __init__(self, root: Path, *, uid: int | None = None, now=time.time):
+        self.root = Path(root)
+        self.uid = os.geteuid() if uid is None else uid
+        self.now = now
+
+    def _ensure(self) -> Path:
+        if not self.root.exists():
+            self.root.mkdir(mode=0o700, parents=True)
+        try:
+            info = self.root.lstat()
+        except OSError:
+            raise Refused('journal_root') from None
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != self.uid or stat.S_IMODE(info.st_mode) & 0o077):
+            raise Refused('journal_root')
+        return self.root / 'rotations.jsonl'
+
+    def record(self, *, reference: str, host: str, account: str, operation: str,
+               version: str, category: str, now=None) -> None:
+        parse_reference(reference)
+        if not VERSION.match(version) or operation not in _OPERATIONS:
+            raise Refused('journal_fields')
+        entry = {'ts': round(float(self.now() if now is None else now), 3),
+                 'reference': reference, 'host': host, 'account': account,
+                 'operation': operation, 'version': version, 'category': category}
+        _exact(entry, _KEYS['journal'], 'journal')
+        path = self._ensure()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError:
+            raise Uncertain('journal') from None
+        try:
+            with os.fdopen(fd, 'ab') as stream:
+                stream.write(json.dumps(entry, sort_keys=True,
+                                        separators=(',', ':')).encode() + b'\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError:
+            raise Uncertain('journal') from None
+
+
+class Livraison:
+    """Côté mesh : résout une référence allowlistée et la livre par transport.
+
+    Le transport (SSH de L232b) reçoit la trame complète et rend le reçu du
+    helper. La rotation exige une frontière de tour injectée : on ne change
+    pas la clé d'un compte sous un tour vivant.
+    """
+
+    def __init__(self, politique: Politique, transport, journal: Journal, *,
+                 lecteur: Lecteur | None = None, boundary=None, timeout: float = 30.0):
+        self.politique = politique
+        self.transport = transport
+        self.journal = journal
+        self.lecteur = lecteur or Lecteur(politique)
+        self.boundary = boundary
+        self.timeout = timeout
+
+    def deliver(self, reference: str, host: str, account: str, *,
+                operation: str = 'install') -> dict:
+        if operation not in ('install', 'rotate'):
+            raise Refused('operation')
+        destination = self.politique.destination(reference, host, account)
+        if operation == 'rotate':
+            if self.boundary is None:
+                raise Refused('boundary_unavailable')
+            if not self.boundary(host, account):
+                raise Refused('busy')
+        value = self.lecteur.read(reference)
+        version = secrets.token_hex(16)
+        request = {'protocol': PROTOCOL, 'operation': operation,
+                   'reference': reference, 'version': version, 'bytes': len(value),
+                   'destination': destination.document()}
+        payload = frame(request, value)
+        self.journal.record(reference=reference, host=host, account=account,
+                            operation=operation, version=version, category='intent')
+        try:
+            answer = self.transport.exchange(payload, self.timeout)
+        except SecretError:
+            raise
+        except Exception:
+            self.journal.record(reference=reference, host=host, account=account,
+                                operation=operation, version=version,
+                                category='transport')
+            raise Uncertain('transport') from None
+        receipt = self._receipt(answer, request)
+        self.journal.record(reference=reference, host=host, account=account,
+                            operation=operation, version=version,
+                            category=receipt['category'])
+        return receipt
+
+    def _receipt(self, answer, request: dict) -> dict:
+        if not isinstance(answer, (bytes, bytearray)) or len(answer) > 65536:
+            raise Uncertain('receipt')
+        try:
+            receipt = json.loads(bytes(answer))
+        except ValueError:
+            raise Uncertain('receipt') from None
+        try:
+            _exact(receipt, _KEYS['receipt'], 'receipt')
+        except Refused:
+            # un reçu illisible est ambigu : l'effet a peut-être eu lieu.
+            raise Uncertain('receipt') from None
+        if receipt.get('protocol') != PROTOCOL:
+            raise Uncertain('receipt')
+        for field in ('operation', 'reference', 'version'):
+            if receipt.get(field) != request[field]:
+                raise Uncertain('receipt')
+        if receipt.get('ok') not in (True, False) or not isinstance(receipt.get('replayed'), bool):
+            raise Uncertain('receipt')
+        if receipt.get('destination') != request['destination']:
+            raise Uncertain('mismatch')
+        return receipt
+
+
+def handle(payload: bytes, enrollment: dict, *, read_as=None) -> bytes:
+    """Point d'entrée du helper d'installation : une trame, un reçu."""
+    return Installeur(enrollment, read_as=read_as).handle(payload)
+
+
+def default_read_as(account: str, path: Path) -> bool:
+    """Lecture bornée par le compte lui-même (root seulement).
+
+    C'est le vrai contrôle du pont : le fichier est ouvert par l'utilisateur
+    qui devra s'en servir, pas par root. Hors root, le contrôle n'est pas
+    disponible et l'installation est refusée.
+    """
+    if os.geteuid() != 0:
+        raise Refused('health_unavailable')
+    for tool in ('/usr/sbin/runuser', '/sbin/runuser'):
+        if os.path.exists(tool):
+            break
+    else:
+        raise Refused('health_unavailable')
+    try:
+        done = subprocess.run([tool, '-u', account, '--', '/bin/cat', str(path)],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=5,
+                              env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'})
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def helper_main(enrollment_path: Path | None = None, *, stdin=None, stdout=None,
+                stderr=None) -> int:
+    """Entrée du helper root : document enrôlé fixe, trame sur stdin, reçu sur stdout.
+
+    Aucun chemin, aucune valeur et aucun identifiant ne vient de la ligne de
+    commande ; seul le document enrôlé (ou le chemin injecté par un test) est lu.
+    """
+    stream_in = getattr(sys.stdin, 'buffer', sys.stdin)
+    stream_out = getattr(sys.stdout, 'buffer', sys.stdout)
+    stream_err = sys.stderr
+    fin = stream_in if stdin is None else stdin
+    fout = stream_out if stdout is None else stdout
+    ferr = stream_err if stderr is None else stderr
+    path = Path(HELPER_PATH if enrollment_path is None else enrollment_path)
+    try:
+        document = json.loads(_read_private(path, owners=(0, os.geteuid()),
+                                            modes=(0o600, 0o640), limit=MAX_BYTES))
+    except Refused as exc:
+        ferr.write('refused: %s\n' % exc.category)
+        return 2
+    except (OSError, ValueError):
+        ferr.write('refused: enrollment\n')
+        return 2
+    try:
+        payload = fin.read(MAX_BYTES + 4096)
+        fout.write(Installeur(document, read_as=default_read_as).handle(payload))
+        fout.flush()
+        return 0
+    except Refused as exc:
+        ferr.write('refused: %s\n' % exc.category)
+        return 2
+    except Uncertain as exc:
+        ferr.write('uncertain: %s\n' % exc.category)
+        return 3
+    except (OSError, ValueError):
+        ferr.write('refused: request\n')
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(helper_main())
