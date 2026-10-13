@@ -1394,6 +1394,45 @@ def _git_message(proc: subprocess.CompletedProcess) -> str:
     return text or ("code %d" % proc.returncode)
 
 
+def _diff_name_status(repo: str, base: str, head: str | None = None) -> set[str]:
+    """Les chemins de `git diff --name-status --find-renames base [head]`.
+
+    Un renommage compte pour ses **deux** chemins, l'ancien et le nouveau,
+    parce que la politique de revue les couvre tous les deux. `head` absent :
+    l'arbre de travail. Toute erreur git lève [`GitError`].
+    """
+    args = ["diff", "--name-status", "-z", "--find-renames", base]
+    if head is not None:
+        args.append(head)
+    proc = _git(repo, *args)
+    if proc.returncode != 0:
+        raise GitError("git diff %s: %s" % (base, _git_message(proc)))
+    return _name_status_paths(proc.stdout)
+
+
+def _name_status_paths(raw: bytes) -> set[str]:
+    """Chemins d'une sortie `git diff --name-status -z` (renommages : les deux)."""
+    paths: set[str] = set()
+    fields = raw.decode("utf-8", "replace").split("\0")
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        if not status:
+            break
+        if status[0] in ("R", "C"):
+            if index + 2 >= len(fields):
+                break
+            paths.add(fields[index + 1])
+            paths.add(fields[index + 2])
+            index += 3
+        else:
+            if index + 1 >= len(fields):
+                break
+            paths.add(fields[index + 1])
+            index += 2
+    return paths
+
+
 def git_changed_paths(repo: str, ref: str = "") -> list[str]:
     """Les chemins d'un changement, relatifs à la racine du dépôt (L10).
 
@@ -1421,38 +1460,12 @@ def git_changed_paths(repo: str, ref: str = "") -> list[str]:
             base = proc.stdout.decode("utf-8", "replace").strip()
         else:
             base = verified
-    proc = _git(repo, "diff", "--name-status", "-z", "--find-renames", base)
-    if proc.returncode != 0:
-        raise GitError("git diff %s: %s" % (base, _git_message(proc)))
-    paths.update(_name_status_paths(proc.stdout))
+    paths.update(_diff_name_status(repo, base))
     proc = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
     if proc.returncode != 0:
         raise GitError("git ls-files: %s" % _git_message(proc))
     paths.update(name for name in proc.stdout.decode("utf-8", "replace").split("\0") if name)
     return sorted(paths)
-
-
-def _name_status_paths(raw: bytes) -> set[str]:
-    """Chemins d'une sortie `git diff --name-status -z` (renommages : les deux)."""
-    paths: set[str] = set()
-    fields = raw.decode("utf-8", "replace").split("\0")
-    index = 0
-    while index < len(fields):
-        status = fields[index]
-        if not status:
-            break
-        if status[0] in ("R", "C"):
-            if index + 2 >= len(fields):
-                break
-            paths.add(fields[index + 1])
-            paths.add(fields[index + 2])
-            index += 3
-        else:
-            if index + 1 >= len(fields):
-                break
-            paths.add(fields[index + 1])
-            index += 2
-    return paths
 
 
 def git_changed_paths_between(repo: str, base: str, tip: str) -> list[str]:
@@ -1476,6 +1489,28 @@ def git_changed_paths_between(repo: str, base: str, tip: str) -> list[str]:
     if proc.returncode != 0:
         raise GitError("git diff %s %s: %s" % (base, tip, _git_message(proc)))
     return sorted(_name_status_paths(proc.stdout))
+
+
+def git_range_paths(repo: str, base: str, head: str) -> list[str]:
+    """Les chemins changés entre `base` et `head` (renommage : les deux).
+
+    `base` est ramené à son **merge-base avec `head`** : c'est le diff qu'un lot
+    gelé emporte depuis sa cible, donc ce que sa classe de revue couvre (canon
+    §1). Toute erreur git — référence inconnue, dépôt illisible — lève
+    [`GitError`] : jamais une liste vide qui se lirait « rien à relire ».
+    """
+    verified_base = git_commit(repo, base)
+    if verified_base is None:
+        raise GitError("unknown git reference: %s" % base)
+    verified_head = git_commit(repo, head)
+    if verified_head is None:
+        raise GitError("unknown git reference: %s" % head)
+    proc = _git(repo, "merge-base", verified_base, verified_head)
+    if proc.returncode == 0 and proc.stdout.strip():
+        start = proc.stdout.decode("utf-8", "replace").strip()
+    else:
+        start = verified_base
+    return sorted(_diff_name_status(repo, start, verified_head))
 
 
 def git_toplevel(directory: str) -> str | None:

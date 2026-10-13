@@ -2,9 +2,10 @@
 """Politique de revue par classe de risque : portées, classes, refus (R19)."""
 from __future__ import annotations
 
+import types
 import unittest
 
-from ameesh import review
+from ameesh import lot_class, review
 
 
 def policy(**over):
@@ -274,6 +275,63 @@ class ScopedPoliciesTest(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(policy.default, "light")
         self.assertEqual(review.classify(policy, ["a/x"])["class"], "sensitive")
+
+
+class LotClassTest(unittest.TestCase):
+    """La classe d'un LOT (L539) : axe release, portée par projet, et le doute
+    qui rend `sensitive` — jamais une classe rassurante par défaut."""
+
+    def canon(self, risk, root="canon"):
+        return types.SimpleNamespace(
+            root=root, sources=[],
+            federation={"review_policies": {"risk_classes": risk}})
+
+    def test_axe_release(self):
+        self.assertEqual(lot_class.release_reason({"branch_target": "release/v1.10.0"}),
+                         "target release/v1.10.0")
+        self.assertEqual(lot_class.release_reason({"type": "release"}), "lot type release")
+        self.assertEqual(lot_class.release_reason({"branch_target": "main", "type": "bug"}), "")
+
+    def test_un_canon_qui_ne_declare_pas_le_projet_ne_dit_rien(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "light"}}}),
+                  self.canon({"projects": {"nexlink": {
+                      "default": "sensitive",
+                      "rules": [{"paths": ["**"], "class": "sensitive"}]}}}, root="nexlink")]
+        result = lot_class.class_of_paths(canons, "ameesh", ["src/ameesh/x.py"])
+        self.assertEqual(result["class"], "light")
+
+    def test_aucun_canon_ne_declare_le_projet_est_un_doute(self):
+        canons = [self.canon({"projects": {"nexlink": {"default": "normal"}}})]
+        result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
+        self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertIn("not declared", result["why"])
+
+    def test_le_repli_declare_s_applique(self):
+        canons = [self.canon({"projects": {"nexlink": {"default": "light"}},
+                              "default": "normal"})]
+        result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
+        self.assertEqual(result["class"], "normal")
+
+    def test_la_plus_haute_des_lectures_l_emporte(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "light"}}}),
+                  self.canon({"projects": {"ameesh": {
+                      "default": "light",
+                      "rules": [{"paths": ["**/*.sql"], "class": "sensitive"}]}}},
+                      root="strict")]
+        result = lot_class.class_of_paths(canons, "ameesh", ["db/a.sql"])
+        self.assertEqual(result["class"], "sensitive")
+
+    def test_politique_illisible_rend_sensible(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "urgent"}}})]
+        result = lot_class.class_of_paths(canons, "ameesh", ["a.py"])
+        self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertIn("unreadable", result["why"])
+
+    def test_chemins_vides_rendent_un_doute(self):
+        canons = [self.canon({"projects": {"ameesh": {"default": "light"}}})]
+        result = lot_class.class_of_paths(canons, "ameesh", [])
+        self.assertEqual(result["class"], lot_class.SENSITIVE)
+        self.assertIn("cannot classify", result["why"])
 
 
 if __name__ == "__main__":
