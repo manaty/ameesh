@@ -355,6 +355,10 @@ class RoadmapPgTest(PgTestCase):
         """Le lot #65 réel : une date écrite seulement dans le corps."""
         lot = self._lot(body="Prévu le lundi 2026-10-12 (dit en conversation).",
                         assignee=None)
+        # created on the test clock, not the real one: from_task drops body dates
+        # earlier than the creation day (the date in the body went stale on 2026-10-13)
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(%s) WHERE id = %s",
+                        (NOW, lot["id"]))
         view = roadmap_propose.propose(self.db, canon=False, now=NOW)
         props = [p for p in view["proposals"] if p["lot"] == lot["id"]]
         self.assertEqual([p["due"] for p in props], ["2026-10-12"])

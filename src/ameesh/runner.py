@@ -5818,11 +5818,17 @@ class Runner:
         try:
             if getattr(self, "_radar_cache", None) is None:
                 self._radar_cache = radar.Cache()
-            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache):
+            owner = getattr(self, "runner_id", None) or None
+            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache, owner=owner):
                 if line.get("mail"):
                     log_async("radar %s: %d mail(s), including %d wake-up(s)" % (
                         line["project"], len(line["mail"]),
                         sum(1 for m in line["mail"] if m["level"] == "blocking")))
+                for one in line.get("land") or ():
+                    if one.get("result") != "busy":
+                        log_async("fusion %s #%s : %s%s" % (
+                            line["project"], one.get("lot") or "—", one["result"],
+                            " (%s)" % one["error"] if one.get("error") else ""))
                 if line["changes"] or line.get("error"):
                     log_async("radar %s: %s" % (line["project"], line.get("error") or (
                         "%d change(s), %d conflicting pair(s) (%.1f s)" % (

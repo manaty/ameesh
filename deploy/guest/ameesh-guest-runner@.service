@@ -42,6 +42,10 @@ Environment=TMPDIR=/srv/ameesh-guest/tmp
 Environment=PATH=/srv/ameesh-guest/home/.local/share/mise/shims:/srv/ameesh-guest/home/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-/etc/ameesh/guest.env
 EnvironmentFile=-/etc/ameesh/guest-%i.env
+# git's traces keep their redaction (a GIT_TRACE_REDACT=0 from the files
+# above dropped: systemd applies it last), the credential helper's token
+# included (mesh-design #457 r5)
+UnsetEnvironment=GIT_TRACE_REDACT
 # gate (study §1.5): read-only state, writable acknowledgement
 Environment=AMEESH_HOST_GATE=file
 Environment=AMEESH_HOST_GATE_PATH=/run/ameesh-gate/state/state.json
