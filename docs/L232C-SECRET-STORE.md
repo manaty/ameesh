@@ -44,8 +44,10 @@ destination helper reads its stdin; `unframe` checks the declared byte count
 before the helper touches anything. The value never appears in the JSON, in
 argv, in the receipt, in the journal or in an error: every failure carries a
 stable category (`frame`, `reference`, `destination_unknown`, `file_mode`,
-`unmanaged_file`, `health_unavailable`, `health`, `replay_mismatch`,
-`write`, `transport`, `receipt`…), never a value or a digest.
+`unmanaged_file`, `rotation_required`, `managed_missing`, `health_unavailable`,
+`health`, `replay_mismatch`, `lock`, `busy`, `pending_record`,
+`rollback_missing`, `write`, `transport`, `receipt`…), never a value or a
+digest.
 
 The host side is enrolled by `/etc/ameesh-secrets/helper.json` (root-owned,
 exact keys), which lists the only destinations admitted on that host. A
@@ -72,6 +74,42 @@ returns `replayed: true` without rewriting. The same version id with
 different content raises (`replay_mismatch`) instead of silently overwriting.
 An existing destination file with no version record is never adopted or
 replaced (`unmanaged_file`).
+
+### Durable transaction
+
+Replacing the value and the version record are two separate atomic writes;
+they are tied by a durable intent so that an interruption at any boundary is
+decidable without a digest:
+
+- `<path>.rollback` (same mode as the destination) holds the value being
+  replaced, when there is one;
+- `<path>.pending` (`0600`) holds the intent: target version, previous
+  version, whether a rollback copy exists, the `keep_previous` policy and the
+  exact version record to restore;
+- the value is written atomically, health is checked, then the version record
+  (`<path>.version`) is written — the commit point — and the intent is cleared;
+- on the next operation for that destination, under the lock, a pending intent
+  is either finished (the record already carries the target: the rollback copy
+  becomes `.previous`, or is dropped; the intent is cleared) or undone (the
+  value, the retained previous version and the record are restored exactly as
+  before the intent). A missing rollback copy freezes the destination
+  (`rollback_missing`) instead of guessing.
+
+An `install` never replaces a managed value: on a destination that has a
+version record, an `install` with a different version id is refused before any
+effect (`rotation_required`). Replacing a value goes through `rotate`, which
+the mesh side only sends after the injected turn boundary allows it
+(`boundary_unavailable`, `busy`): the helper enforces the state, the boundary
+remains a mesh-side authorisation and not a label chosen by the caller.
+
+### Exclusion per destination
+
+Every operation (`install`, replay, `rotate`, `revoke`, recovery) holds a
+`flock` on `<path>.lock` (`0600`, in the destination directory) for the whole
+transaction — record read, health check, publication and rollback. The lock
+dies with the process and waiting is bounded (ten seconds, then `busy`), so
+two helper processes cannot interleave a value, a version and a `.previous`.
+A leftover private temporary from a hard stop is swept under the lock.
 
 Rotation keeps the replaced version privately in `<path>.previous` until the
 policy's `keep_previous` confirms it may be dropped; the version record
@@ -122,7 +160,7 @@ journal carries no value, no digest and no connection string.
 
 ## Tests
 
-`tests/test_l232c_coffre.py` (36 cases, no database, no root, no network):
+`tests/test_l232c_coffre.py` (46 cases, no database, no root, no network):
 
     PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre
 
@@ -130,5 +168,9 @@ It covers reference grammar, environment parsing, store permissions and
 symlinks, policy/enrollment exact keys, the bridge modes, atomic install,
 replay without rewrite, replay divergence, unmanaged files, health refusal
 before effect, health rollback to the previous version, rotation and
-revocation, transport failure and inconsistent receipts, and a subprocess
-canary through the helper entry point.
+revocation, transport failure and inconsistent receipts, the refusal of an
+`install` on a managed destination (and the `rotate` authority), recovery
+after an interruption at each transaction boundary (value written without
+commit, intent without value, commit without cleanup, orphan temporary),
+concurrent rotations and rotate/revoke, an inter-process `flock` holder, and
+a subprocess canary through the helper entry point.

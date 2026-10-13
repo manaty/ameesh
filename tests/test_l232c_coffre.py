@@ -17,6 +17,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -260,7 +262,7 @@ class InstalleurTest(Materiel):
         _, premier = self.handle()
         installeur = coffre.Installeur(self.helper_document,
                                         read_as=lambda account, path: False)
-        payload, _ = self.trame(version=os.urandom(16).hex())
+        payload, _ = self.trame(version=os.urandom(16).hex(), operation="rotate")
         receipt = json.loads(installeur.handle(payload))
         self.assertFalse(receipt["ok"])
         self.assertEqual(receipt["category"], "health")
@@ -281,7 +283,8 @@ class InstalleurTest(Materiel):
 
     def test_rotation_et_revocation(self):
         _, premier = self.handle()
-        deuxieme, request = self.handle(value=b"sk-canary-version-2")
+        deuxieme, request = self.handle(value=b"sk-canary-version-2",
+                                        operation="rotate")
         self.assertEqual(deuxieme["previous"], premier["version"])
         gardee = self.key.with_name(self.key.name + ".previous")
         self.assertEqual(gardee.read_bytes(), CANARY)
@@ -312,13 +315,236 @@ class InstalleurTest(Materiel):
         installeur = coffre.Installeur(document, read_as=self.sante)
         premier = json.loads(installeur.handle(self.trame(destination=cible)[0]))
         deuxieme = json.loads(installeur.handle(
-            self.trame(value=b"v2", destination=cible)[0]))
+            self.trame(value=b"v2", destination=cible, operation="rotate")[0]))
         self.assertTrue(premier["ok"], premier)
         self.assertTrue(deuxieme["ok"], deuxieme)
         self.assertEqual(deuxieme["previous"], premier["version"])
         self.assertFalse(self.key.with_name(self.key.name + ".previous").exists())
         sidecar = json.loads(self.key.with_name(self.key.name + ".version").read_bytes())
         self.assertEqual(sidecar, {"version": deuxieme["version"]})
+
+    def test_install_sur_destination_geree_refuse_avant_effet(self):
+        _, premier = self.handle()
+        avant = self.key.read_bytes()
+        receipt, request = self.handle(value=b"sk-canary-autre", operation="install")
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "rotation_required")
+        self.assertEqual(request["operation"], "install")
+        self.assertEqual(self.key.read_bytes(), avant)
+        sidecar = json.loads(self.key.with_name(self.key.name + ".version").read_bytes())
+        self.assertEqual(sidecar, {"version": premier["version"]})
+        self.assertFalse(self.key.with_name(self.key.name + ".previous").exists())
+
+    def test_rotate_sur_destination_non_geree_installe(self):
+        # une rotation sur une destination non gérée ne remplace aucune valeur :
+        # la frontière de tour reste tenue par le chemin rotate côté mesh.
+        receipt, _ = self.handle(operation="rotate")
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(self.key.read_bytes(), CANARY)
+
+    def test_reprise_apres_crash_entre_valeur_et_commit(self):
+        class Arret(Exception):
+            pass
+
+        _, premier = self.handle()
+        etat = {"casse": True}
+
+        def sante(destination):
+            if etat["casse"]:
+                raise Arret()
+            return True
+
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        installeur._health = sante
+        payload, request = self.trame(value=b"sk-canary-v2", operation="rotate")
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        sidecar = self.key.with_name(self.key.name + ".version")
+        pending = self.key.with_name(self.key.name + ".pending")
+        rollback = self.key.with_name(self.key.name + ".rollback")
+        # la valeur non commitée est sur le disque, l'état lu reste l'ancien.
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()), {"version": premier["version"]})
+        self.assertTrue(pending.exists() and rollback.exists())
+        # reprise sous la même identité : l'intention se défait, puis se refait.
+        etat["casse"] = False
+        receipt = json.loads(installeur.handle(payload))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(receipt["version"], request["version"])
+        self.assertFalse(receipt["replayed"])
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": request["version"], "previous": premier["version"]})
+        self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(), CANARY)
+        self.assertFalse(pending.exists() or rollback.exists())
+
+    def test_reprise_apres_crash_entre_intention_et_valeur(self):
+        class Arret(Exception):
+            pass
+
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        original = installeur._atomic_write
+
+        def ecriture(path, data, destination, *, mode, owner, group):
+            if path == self.key:
+                raise Arret()
+            return original(path, data, destination, mode=mode, owner=owner,
+                            group=group)
+
+        installeur._atomic_write = ecriture
+        payload, request = self.trame()
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        pending = self.key.with_name(self.key.name + ".pending")
+        self.assertTrue(pending.exists())
+        self.assertFalse(self.key.exists())
+        # reprise : l'intention sans effet se défait, puis le même install passe.
+        installeur._atomic_write = original
+        receipt = json.loads(installeur.handle(payload))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(self.key.read_bytes(), CANARY)
+        sidecar = json.loads(self.key.with_name(self.key.name + ".version").read_bytes())
+        self.assertEqual(sidecar, {"version": request["version"]})
+        self.assertFalse(pending.exists())
+
+    def test_reprise_apres_commit_sans_menage(self):
+        class Arret(Exception):
+            pass
+
+        _, premier = self.handle()
+        installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+        menage = installeur._finish
+
+        def finish(destination, keep):
+            raise Arret()
+
+        installeur._finish = finish
+        payload, request = self.trame(value=b"sk-canary-v2", operation="rotate")
+        with self.assertRaises(Arret):
+            installeur.handle(payload)
+        sidecar = self.key.with_name(self.key.name + ".version")
+        pending = self.key.with_name(self.key.name + ".pending")
+        rollback = self.key.with_name(self.key.name + ".rollback")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": request["version"], "previous": premier["version"]})
+        self.assertTrue(pending.exists() and rollback.exists())
+        # reprise : le commit est constaté, le ménage se termine sans réécriture.
+        installeur._finish = menage
+        receipt = json.loads(installeur.handle(payload))
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertTrue(receipt["replayed"])
+        self.assertFalse(pending.exists() or rollback.exists())
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v2")
+        self.assertEqual(json.loads(sidecar.read_bytes()),
+                         {"version": request["version"], "previous": premier["version"]})
+        self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(), CANARY)
+
+    def test_temporaires_orphelins_retires(self):
+        reste = self.key.with_name("." + self.key.name + ".tmp-abcdef")
+        reste.write_bytes(b"reste d'un arret brutal")
+        os.chmod(reste, 0o600)
+        receipt, _ = self.handle()
+        self.assertTrue(receipt["ok"])
+        self.assertFalse(reste.exists())
+
+    def test_rotations_concurrentes_serialisees(self):
+        self.handle()
+        depart = threading.Barrier(2, timeout=15)
+        resultats = []
+
+        def tour(value, version):
+            payload, _ = self.trame(value=value, operation="rotate", version=version)
+            installeur = coffre.Installeur(self.helper_document, read_as=self.sante)
+            depart.wait()
+            receipt = json.loads(installeur.handle(payload))
+            resultats.append((receipt, value, version))
+
+        threads = [threading.Thread(target=tour, args=(b"valeur-A", "a" * 32)),
+                   threading.Thread(target=tour, args=(b"valeur-B", "b" * 32))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(len(resultats), 2)
+        self.assertTrue(all(receipt["ok"] for receipt, _, _ in resultats), resultats)
+        sidecar = json.loads(self.key.with_name(self.key.name + ".version").read_bytes())
+        valeurs = {version: value for _, value, version in resultats}
+        self.assertIn(sidecar["version"], valeurs)
+        self.assertEqual(self.key.read_bytes(), valeurs[sidecar["version"]])
+        autre = [version for version in valeurs if version != sidecar["version"]]
+        self.assertEqual(len(autre), 1)
+        self.assertEqual(sidecar["previous"], autre[0])
+        self.assertEqual(self.key.with_name(self.key.name + ".previous").read_bytes(),
+                         valeurs[autre[0]])
+        self.assertFalse(self.key.with_name(self.key.name + ".pending").exists())
+        self.assertFalse(self.key.with_name(self.key.name + ".rollback").exists())
+
+    def test_rotation_et_revocation_concurrentes(self):
+        _, premier = self.handle()
+        depart = threading.Barrier(2, timeout=15)
+        resultats = {}
+
+        def rotation():
+            payload, _ = self.trame(value=b"sk-canary-v1", operation="rotate",
+                                    version="c" * 32)
+            depart.wait()
+            resultats["rotation"] = json.loads(
+                coffre.Installeur(self.helper_document, read_as=self.sante).handle(payload))
+
+        def revocation():
+            payload, _ = self.trame(b"", operation="revoke", version=premier["version"])
+            depart.wait()
+            resultats["revocation"] = json.loads(
+                coffre.Installeur(self.helper_document, read_as=self.sante).handle(payload))
+
+        threads = [threading.Thread(target=rotation),
+                   threading.Thread(target=revocation)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertTrue(resultats["rotation"]["ok"], resultats["rotation"])
+        self.assertEqual(self.key.read_bytes(), b"sk-canary-v1")
+        sidecar = json.loads(self.key.with_name(self.key.name + ".version").read_bytes())
+        self.assertEqual(sidecar["version"], "c" * 32)
+        gardee = self.key.with_name(self.key.name + ".previous")
+        if resultats["revocation"]["ok"]:
+            # la rotation a précédé la révocation : la précédente est révoquée.
+            self.assertEqual(sidecar, {"version": "c" * 32})
+            self.assertFalse(gardee.exists())
+        else:
+            # la révocation a précédé la rotation : elle vise la version
+            # courante, refusée sans effet, et la rotation garde la précédente.
+            self.assertEqual(resultats["revocation"]["category"], "current_version")
+            self.assertEqual(sidecar,
+                             {"version": "c" * 32, "previous": premier["version"]})
+            self.assertEqual(gardee.read_bytes(), CANARY)
+
+    def test_verrou_inter_processus(self):
+        import fcntl
+
+        self.handle()
+        verrou = self.key.with_name(self.key.name + ".lock")
+        programme = (
+            "import fcntl, os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "print('tenu', flush=True)\n"
+            "time.sleep(1.5)\n")
+        detenteur = subprocess.Popen([sys.executable, "-c", programme, str(verrou)],
+                                     stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(detenteur.stdout.readline().strip(), b"tenu")
+            debut = time.monotonic()
+            receipt, _ = self.handle(value=b"valeur-v2", operation="rotate")
+            duree = time.monotonic() - debut
+        finally:
+            detenteur.wait(10)
+        self.assertTrue(receipt["ok"], receipt)
+        # le helper a attendu le detenteur : le verrou traverse les processus.
+        self.assertGreaterEqual(duree, 1.0)
+        self.assertEqual(self.key.read_bytes(), b"valeur-v2")
 
     def test_destination_non_enrolee(self):
         autre = self.destination_document(path=str(self.account_dir / "autre.key"))
@@ -410,6 +636,21 @@ class LivraisonTest(Materiel):
                                      boundary=lambda host, account: True)
         receipt = livraison.deliver(REFERENCE, HOST, UTILISATEUR, operation="rotate")
         self.assertTrue(receipt["ok"])
+
+    def test_deliver_install_ne_contourne_pas_la_frontiere(self):
+        premier = self.livraison.deliver(REFERENCE, HOST, UTILISATEUR)
+        self.assertTrue(premier["ok"])
+        avant = self.key.read_bytes()
+        receipt = self.livraison.deliver(REFERENCE, HOST, UTILISATEUR)
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "rotation_required")
+        self.assertEqual(self.key.read_bytes(), avant)
+        self.assertEqual(self.journal_lignes()[-1]["category"], "rotation_required")
+        # rotate sans frontière reste refusé avant tout effet.
+        with self.assertRaises(coffre.Refused) as caught:
+            self.livraison.deliver(REFERENCE, HOST, UTILISATEUR, operation="rotate")
+        self.assertEqual(caught.exception.category, "boundary_unavailable")
+        self.assertEqual(self.key.read_bytes(), avant)
 
     def test_recu_incoherent(self):
         class RecuFaux:

@@ -21,6 +21,12 @@ d'environnement `0640`. Ce module en fait un magasin à références :
   `fsync`, `os.replace`, `fsync` du répertoire) et refaite à l'identique
   (rejeu d'un reçu perdu) sans réécrire ; la version précédente reste privée
   jusqu'à la confirmation, puis se révoque ;
+- l'ensemble valeur + version est transactionnel : une intention durable
+  (`.pending`) et une copie de retour (`.rollback`) rendent toute interruption
+  décidable sans condensat, et un verrou par destination (`flock`) sérialise
+  installations, rejeux, rotations et révocations entre processus ;
+- `install` ne remplace jamais une valeur gérée : une mutation passe par
+  `rotate`, donc par la frontière de tour tenue côté mesh ;
 - le pont vers un compte de runner écrit un fichier `0600` au nom du compte
   dans son répertoire de configuration `0700`, puis exige un contrôle de
   santé injecté (lecture par le compte : l'ouverture réelle, pas une
@@ -35,6 +41,8 @@ santé simulés.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import grp
 import json
 import os
@@ -75,6 +83,7 @@ _KEYS = {
                           'category', 'replayed', 'destination', 'previous')),
     'journal': frozenset(('ts', 'reference', 'host', 'account', 'operation',
                           'version', 'category')),
+    'pending': frozenset(('version', 'previous', 'backup', 'keep', 'restore')),
 }
 
 
@@ -418,14 +427,206 @@ class Installeur:
         return enrolled
 
     def perform(self, request: dict, destination: Destination, value: bytes) -> dict:
+        """Une opération, sous verrou par destination, réconciliation incluse.
+
+        Le verrou couvre la lecture du record, la santé, la publication et le
+        retour arrière : deux processus du helper ne peuvent pas entrelacer la
+        valeur, la version et la précédente d'une même destination.
+        """
         if request['operation'] == 'revoke':
             if value:
                 # une révocation ne transporte aucune valeur.
                 raise Refused('value_unexpected')
-            return self.revoke(destination, request)
+            with self._locked(destination):
+                return self.revoke(destination, request)
         if len(value) > self.max_bytes:
             raise Refused('value_size')
-        return self.install(destination, request, value)
+        with self._locked(destination):
+            return self.install(destination, request, value)
+
+    # -- transaction d'une destination ------------------------------------
+    def _backup_path(self, destination: Destination) -> Path:
+        return destination.path.with_name(destination.path.name + '.previous')
+
+    def _pending_path(self, destination: Destination) -> Path:
+        return destination.path.with_name(destination.path.name + '.pending')
+
+    def _rollback_path(self, destination: Destination) -> Path:
+        return destination.path.with_name(destination.path.name + '.rollback')
+
+    def _lock_path(self, destination: Destination) -> Path:
+        return destination.path.with_name(destination.path.name + '.lock')
+
+    def _lock(self, destination: Destination, owner: int, group: int) -> int:
+        """Verrou exclusif inter-processus sur la destination.
+
+        `flock` sur un fichier privé du répertoire de la destination : le
+        verrou tombe avec le processus, l'attente est bornée (dix secondes) et
+        un fichier de verrou étranger est refusé.
+        """
+        path = self._lock_path(destination)
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError:
+            raise Refused('lock') from None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (owner, 0)
+                    or stat.S_IMODE(info.st_mode) & 0o077):
+                raise Refused('lock_mode')
+            if self.uid == 0 and (info.st_uid, info.st_gid) != (owner, group):
+                os.fchown(fd, owner, group)
+            os.fchmod(fd, 0o600)
+            deadline = time.monotonic() + 10.0
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise Refused('busy') from None
+                    time.sleep(0.05)
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @contextlib.contextmanager
+    def _locked(self, destination: Destination):
+        owner = self._prepare_parent(destination)
+        _, group = self._owner_ids(destination)
+        fd = self._lock(destination, owner, group)
+        try:
+            self._sweep_temporaries(destination, owner)
+            yield
+        finally:
+            os.close(fd)
+
+    def _sweep_temporaries(self, destination: Destination, owner: int) -> None:
+        """Retire les fichiers temporaires laissés par un arrêt brutal.
+
+        `_atomic_write` nettoie son temporaire sur erreur, pas sur mort du
+        processus : sous le verrou, les temporaires de cette destination (et de
+        ses sidecars) sont des restes sans propriétaire.
+        """
+        parent = destination.path.parent
+        prefixes = tuple('.' + destination.path.name + suffix + '.tmp-'
+                         for suffix in ('', '.version', '.previous',
+                                        '.rollback', '.pending'))
+        try:
+            entries = list(parent.iterdir())
+        except OSError:
+            raise Refused('directory_missing') from None
+        for entry in entries:
+            if not entry.name.startswith(prefixes):
+                continue
+            try:
+                info = entry.lstat()
+            except OSError:
+                continue
+            if (stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                    and info.st_uid in (owner, 0)):
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+
+    def _pending(self, destination: Destination, owner: int) -> dict | None:
+        """Intention d'installation en cours, ou None."""
+        path = self._pending_path(destination)
+        if not path.exists():
+            return None
+        try:
+            data = _read_private(path, owners=(owner, 0), modes=(0o600,),
+                                 limit=4096)
+            record = json.loads(data)
+        except (Refused, ValueError):
+            raise Refused('pending_record') from None
+        if not isinstance(record, dict) or set(record) != _KEYS['pending']:
+            raise Refused('pending_record')
+        if not isinstance(record['version'], str) or not VERSION.match(record['version']):
+            raise Refused('pending_record')
+        if record['previous'] is not None and (not isinstance(record['previous'], str)
+                                               or not VERSION.match(record['previous'])):
+            raise Refused('pending_record')
+        if type(record['backup']) is not bool or type(record['keep']) is not bool:
+            raise Refused('pending_record')
+        restore = record['restore']
+        if not isinstance(restore, dict) or set(restore) - {'version', 'previous'}:
+            raise Refused('pending_record')
+        for item in restore.values():
+            if not isinstance(item, str) or not VERSION.match(item):
+                raise Refused('pending_record')
+        if restore and (restore.get('version') != record['previous']):
+            # l'état à restaurer doit être celui d'avant l'intention.
+            raise Refused('pending_record')
+        return record
+
+    def _finish(self, destination: Destination, keep: bool) -> None:
+        """Après commit : la copie de retour devient la précédente, ou part."""
+        rollback = self._rollback_path(destination)
+        if not rollback.exists():
+            return
+        if keep:
+            os.replace(rollback, self._backup_path(destination))
+        else:
+            rollback.unlink()
+
+    def _unlink_pending(self, destination: Destination) -> None:
+        try:
+            self._pending_path(destination).unlink()
+        except FileNotFoundError:
+            pass
+
+    def _recover(self, destination: Destination, owner: int, group: int) -> None:
+        """Termine ou défait une installation interrompue.
+
+        L'intention (`.pending`) et la copie de retour (`.rollback`) rendent la
+        reprise décidable sans condensat : si le sidecar porte déjà l'état
+        visé, le commit a eu lieu et on termine le ménage ; sinon l'état
+        d'avant est restauré à l'identique (valeur, précédente, sidecar) avant
+        tout nouvel effet.
+        """
+        pending = self._pending(destination, owner)
+        if pending is None:
+            return
+        version, previous = pending['version'], pending['previous']
+        keep = pending['keep']
+        target = {'version': version}
+        if keep and previous is not None:
+            target['previous'] = previous
+        current = self._sidecar(destination, owner)
+        rollback = self._rollback_path(destination)
+        if current == target:
+            self._finish(destination, keep and previous is not None)
+            self._unlink_pending(destination)
+            return
+        if pending['backup']:
+            if not rollback.exists():
+                # la copie de retour manque : on ne devine pas, l'état reste
+                # gelé sous intention tant qu'un opérateur n'a pas tranché.
+                raise Refused('rollback_missing')
+            preserved = _read_private(rollback, owners=(owner, 0),
+                                      modes=(destination.mode,),
+                                      limit=self.max_bytes)
+            self._atomic_write(destination.path, preserved, destination,
+                               mode=destination.mode, owner=owner, group=group)
+            rollback.unlink()
+        else:
+            path = destination.path
+            if path.exists():
+                _protected_regular(path, owners=(owner, 0),
+                                   modes=(destination.mode,))
+                path.unlink()
+            if rollback.exists():
+                rollback.unlink()
+        if pending['restore']:
+            self._write_sidecar(destination, pending['restore'], owner, group)
+        else:
+            sidecar = self._sidecar_path(destination)
+            if sidecar.exists():
+                sidecar.unlink()
+        self._unlink_pending(destination)
 
     def _owner_ids(self, destination: Destination) -> tuple[int, int]:
         try:
@@ -516,6 +717,9 @@ class Installeur:
         _, group = self._owner_ids(destination)
         version = request['version']
         path = destination.path
+        # une intention non commitée se défait (ou se termine) avant tout
+        # nouvel effet : l'état lu est un état stable.
+        self._recover(destination, owner, group)
         record = self._sidecar(destination, owner)
         if path.exists():
             _protected_regular(path, owners=(owner, 0), modes=(destination.mode,))
@@ -532,45 +736,52 @@ class Installeur:
                                      record.get('previous'), replayed=True)
             raise Uncertain('replay_mismatch')
         previous = record.get('version')
-        kept = path.with_name(path.name + '.previous')
-        if path.exists():
-            # la version précédente reste disponible pour le retour arrière,
-            # même quand la politique ne demande pas de la conserver ensuite.
-            self._atomic_write(kept, _read_private(path, owners=(owner, 0),
-                                                   modes=(destination.mode,),
-                                                   limit=self.max_bytes),
-                               destination, mode=destination.mode, owner=owner,
-                               group=group)
+        if previous is not None and request['operation'] != 'rotate':
+            # `install` n'a pas autorité pour remplacer une valeur gérée : le
+            # nom d'opération choisi par l'appelant ne contourne pas la
+            # frontière de tour, tenue par le chemin `rotate` côté mesh.
+            raise Refused('rotation_required')
+        if previous is not None and not path.exists():
+            raise Refused('managed_missing')
+        # transaction durable : copie de retour, intention, valeur, contrôle de
+        # santé, puis commit du sidecar. Chaque frontière est décidable après
+        # un arrêt (voir _recover) ; aucun condensat n'est écrit.
+        rollback = self._rollback_path(destination)
+        backup = path.exists()
+        if backup:
+            preserved = _read_private(path, owners=(owner, 0),
+                                      modes=(destination.mode,),
+                                      limit=self.max_bytes)
+            self._atomic_write(rollback, preserved, destination,
+                               mode=destination.mode, owner=owner, group=group)
+        pending = {'version': version, 'previous': previous, 'backup': backup,
+                   'keep': bool(destination.keep_previous), 'restore': record}
+        self._atomic_write(self._pending_path(destination),
+                           json.dumps(pending, sort_keys=True,
+                                      separators=(',', ':')).encode(),
+                           destination, mode=0o600, owner=owner, group=group)
         self._atomic_write(path, value, destination, mode=destination.mode,
                            owner=owner, group=group)
         if not self._health(destination):
-            if previous is not None:
-                self._atomic_write(path, _read_private(kept, owners=(owner, 0),
-                                                       modes=(destination.mode,),
-                                                       limit=self.max_bytes),
-                                   destination, mode=destination.mode,
-                                   owner=owner, group=group)
-                self._write_sidecar(destination, {'version': previous}, owner, group)
-            else:
-                path.unlink()
-                sidecar = self._sidecar_path(destination)
-                if sidecar.exists():
-                    sidecar.unlink()
+            self._recover(destination, owner, group)
             return {'protocol': PROTOCOL, 'operation': request['operation'],
                     'reference': request['reference'], 'version': version,
                     'ok': False, 'category': 'health', 'replayed': False,
                     'destination': destination.document(),
                     'previous': previous}
-        record = {'version': version}
+        committed = {'version': version}
         if previous is not None and destination.keep_previous:
-            record['previous'] = previous
-        elif kept.exists():
-            kept.unlink()
-        self._write_sidecar(destination, record, owner, group)
+            committed['previous'] = previous
+        self._write_sidecar(destination, committed, owner, group)
+        self._finish(destination, bool(destination.keep_previous)
+                     and previous is not None)
+        self._unlink_pending(destination)
         return self._receipt(request, destination, previous)
 
     def revoke(self, destination: Destination, request: dict) -> dict:
         owner = self._prepare_parent(destination)
+        group = self._owner_ids(destination)[1]
+        self._recover(destination, owner, group)
         record = self._sidecar(destination, owner)
         version = request['version']
         current = record.get('version')
@@ -579,11 +790,10 @@ class Installeur:
             raise Refused('current_version')
         if version != previous:
             raise Refused('version_unknown')
-        stale = destination.path.with_name(destination.path.name + '.previous')
+        stale = self._backup_path(destination)
         if stale.exists():
             stale.unlink()
-        self._write_sidecar(destination, {'version': current}, owner,
-                            self._owner_ids(destination)[1])
+        self._write_sidecar(destination, {'version': current}, owner, group)
         return {'protocol': PROTOCOL, 'operation': 'revoke',
                 'reference': request['reference'], 'version': version,
                 'ok': True, 'category': 'revoked', 'replayed': False,
@@ -662,7 +872,9 @@ class Livraison:
 
     Le transport (SSH de L232b) reçoit la trame complète et rend le reçu du
     helper. La rotation exige une frontière de tour injectée : on ne change
-    pas la clé d'un compte sous un tour vivant.
+    pas la clé d'un compte sous un tour vivant. Le helper refuse par ailleurs
+    tout `install` qui remplacerait une valeur déjà gérée
+    (`rotation_required`) : le nom d'opération ne contourne pas la frontière.
     """
 
     def __init__(self, politique: Politique, transport, journal: Journal, *,
