@@ -3815,7 +3815,7 @@
   }
  ],
  "refused": {
-  "interface_total": 380,
+  "interface_total": 384,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4001,8 +4001,12 @@
     "gate_guard",
     "harness_versions",
     "history",
+    "hold",
+    "hold_events",
+    "holds",
     "lend_basis",
     "record_harness_version",
+    "release",
     "since",
     "usage"
    ],

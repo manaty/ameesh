@@ -381,6 +381,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         return []
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
+    # #254 : un hôte en pause ne prend pas de travail, ni ses agents
+    from . import host_holds
+    holds = host_holds.live(db)
+    blocked |= set(holds)
+    held = host_holds.held_agents(listing, holds)
     balance_low = any(a.get("type") == "balance_low" for a in alerts)
     if paid is None:
         paid = sous_utilisation.paid_harnesses(getattr(cfg, "host", None))
@@ -398,8 +403,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
                                                 waiting_free=waiting_free):
-            if row["name"] in skip or _awaited(row, waiting_free=waiting_free) \
-                    or row.get("host") in blocked:
+            if row["name"] in skip or row["name"] in held \
+                    or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue
             if is_paid(row) and (not allow_paid or balance_low):
                 continue

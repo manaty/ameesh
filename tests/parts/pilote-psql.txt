@@ -16,6 +16,7 @@
 
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
+test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
@@ -33,6 +34,7 @@ test_l157c_dates_mesures  # storage: phase measures (numeric, upsert with coales
 test_l160d_resolutions  # stockage : résolutions préparées (text[] passé en jsonb, upsert, journal dans la même transaction) (L160d)
 test_l160e2_land  # stockage : bail de fusion par cible (upsert conditionnel, intervalle lié en secondes, époque) (L160e2)
 test_l160e_merge_queue  # stockage : file de fusion (upsert, rang NULL à l'éjection, booléen lié, jointure work_items) (L160e)
+test_l160g_migration_reservations  # L160g: atomic legacy imports and repository-scoped radar
 test_l162_tmpfs  # stockage : signalements de /tmp filtrés par `kind` (housekeeping.recent, L162)
 test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS sur décisions et jalons (booléens) (L165)
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
