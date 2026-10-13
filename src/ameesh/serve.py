@@ -599,8 +599,16 @@ class Hub:
             db = listener = None
             try:
                 if self.listen:
-                    db = db_mod.connect(self.cfg)
-                    listener = db_mod.listener(db, [events.CHANNEL])
+                    try:
+                        db = db_mod.connect(self.cfg)
+                        listener = db_mod.listener(db, [events.CHANNEL])
+                    except Exception as exc:  # R2 auditeur P2-3
+                        # LISTEN refuse (veille chaude, coupure entre la
+                        # connexion et le LISTEN), ou erreur non traduite par
+                        # le pilote : on sonde, et on retente l'ecoute dans
+                        # une minute. Sans cela le fil du hub mourait et les
+                        # flux ne recevaient plus rien.
+                        log.warning("event listener refused: %s", type(exc).__name__)
                 self.listening = listener is not None
                 self.wake()   # (re)connected: what came meanwhile is reread
                 started = time.monotonic()
@@ -620,6 +628,8 @@ class Hub:
                         break
                     self.wake()
             except (db_mod.DbError, OSError) as exc:
+                log.warning("event listener: %s", type(exc).__name__)
+            except Exception as exc:  # R2 auditeur P2-3: never kill the hub
                 log.warning("event listener: %s", type(exc).__name__)
             finally:
                 self.listening = False

@@ -26,26 +26,44 @@ class Events(interface.Events):
             (int(after_id), int(limit)))
 
     def readable(self, position, limit) -> tuple:
-        # ONE statement, so ONE snapshot: the rows and `waiting` agree (with
-        # two snapshots, a transaction ending in between hid both)
+        # ONE statement, so ONE snapshot: the rows and the bounds agree (with
+        # two snapshots, a transaction ending in between hid both).
+        # R2 auditeur P1: qualify the sort, `tx` alone resolves to the text
+        # output column (`tx::text as tx`), so a limited read sorted the
+        # positions as text and crossed a power of ten backwards.
+        # R2 auditeur P2-1: read `limit + 1` rows in (tx, id) order and
+        # decide `waiting` from that prefix, instead of probing the log with
+        # correlated `exists`: a bound taken from the snapshot is not an
+        # index scan key, so the probe rescanned the whole table at every
+        # poll and every replay batch. Sorted by `tx`, the deliverable rows
+        # (tx < xmin) come first: the first row at or above xmin is the
+        # block; at or above xmax it is another cluster (logical restore).
         tx, last_id = position
         pos = (str(int(tx)), int(last_id))
         rows = self.db.query(
             "with s as materialized (select pg_snapshot_xmin(pg_current_snapshot()) as x,"
-            "   pg_snapshot_xmax(pg_current_snapshot()) as m),"
-            " r as (select " + _COLUMNS + ", tx::text as tx from ameesh_events, s"
-            "   where (tx, id) > (%s::text::xid8, %s) and tx < s.x order by tx, id limit %s)"
-            " select w.waiting, r.* from (select case"
-            "   when not exists (select 1 from ameesh_events, s"
-            "     where (tx, id) > (%s::text::xid8, %s) and tx >= s.x) then null"
-            # a `tx` this cluster has not assigned yet: rows of another one
-            # (logical restore), not an open transaction
-            "   when exists (select 1 from ameesh_events, s where tx >= s.m) then 'restore'"
-            "   else 'xmin' end as waiting) w"
-            " left join r on true order by r.tx::xid8, r.id", pos + (int(limit),) + pos)
-        waiting = rows[0]["waiting"] if rows else None
-        return ([{k: v for k, v in row.items() if k != "waiting"}
-                 for row in rows if row["id"] is not None], waiting)
+            "   pg_snapshot_xmax(pg_current_snapshot()) as m)"
+            " select (select x from s)::text as xmin, (select m from s)::text as xmax, r.*"
+            " from (values (true)) w(one) left join (select " + _COLUMNS
+            + ", tx::text as tx from ameesh_events"
+            "   where (tx, id) > (%s::text::xid8, %s)"
+            "   order by ameesh_events.tx, ameesh_events.id limit %s) r on true"
+            " order by r.tx::xid8, r.id",
+            pos + (int(limit) + 1,))
+        if not rows:
+            return [], None
+        xmin, xmax, waiting = int(rows[0]["xmin"]), int(rows[0]["xmax"]), None
+        kept = []
+        for row in rows:
+            if row["id"] is None:            # the left join's only row: empty log
+                continue
+            value = int(row["tx"])
+            if value >= xmin:
+                waiting = "restore" if value >= xmax else "xmin"
+                break
+            kept.append(row)
+        return ([{k: v for k, v in row.items() if k not in ("xmin", "xmax")}
+                 for row in kept[:int(limit)]], waiting)
 
     def bounds(self) -> dict:
         row = self.db.query(

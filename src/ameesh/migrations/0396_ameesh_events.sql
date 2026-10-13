@@ -281,3 +281,49 @@ drop trigger if exists ameesh_events_approval on mesh_approvals;
 create trigger ameesh_events_approval
     after insert on mesh_approvals
     for each row execute function ameesh_events_approval();
+
+-- R2 auditeur P2-2: the triggers above write `ameesh_events` with the
+-- rights of the writer. On a protected deployment the isolated writers are
+-- granted table by table (deploy/sql/role-module-writers.sql) and the
+-- executor role relies on ALTER DEFAULT PRIVILEGES taken before the
+-- migration: a role that may journal a change but was granted before this
+-- table existed would fail with 'permission denied for table
+-- ameesh_events', refusing the change it describes (canon sync could no
+-- longer register or stop an agent). Copy the INSERT right of every table
+-- the triggers watch (and the use of the log's sequence) to the roles that
+-- hold it; the migration owner keeps its own right, and re-running the
+-- function only ever adds what the source tables already allow.
+create or replace function ameesh_events_grant_writers() returns void
+language plpgsql as $$
+declare
+    grantee oid;
+    writer text;
+begin
+    for grantee in
+        select distinct a.grantee
+          from pg_class c
+          cross join lateral aclexplode(
+              coalesce(c.relacl, acldefault('r', c.relowner))) a
+         where c.oid in ('work_item_events'::regclass, 'agent_registry'::regclass,
+                         'turn_costs'::regclass, 'thread_index'::regclass,
+                         'actions'::regclass, 'mesh_approvals'::regclass)
+           and a.privilege_type = 'INSERT'
+           and a.grantee <> c.relowner
+    loop
+        if grantee = 0 then
+            execute 'grant insert on ameesh_events to public';
+            execute 'grant usage, select on sequence ameesh_events_id_seq to public';
+        else
+            select rolname into writer from pg_roles where oid = grantee;
+            if writer is not null then
+                execute format('grant insert on ameesh_events to %I', writer);
+                execute format('grant usage, select on sequence ameesh_events_id_seq to %I',
+                               writer);
+            end if;
+        end if;
+    end loop;
+end $$;
+
+-- The owner alone may hand out the log's rights.
+revoke execute on function ameesh_events_grant_writers() from public;
+select ameesh_events_grant_writers();

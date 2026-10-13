@@ -71,6 +71,34 @@ class RetentionSettingTest(unittest.TestCase):
         self.assertEqual(enum, list(events.TYPES))
 
 
+class ListenerErrorTest(unittest.TestCase):
+    """R2 auditeur P2-3: a LISTEN the base refuses (hot standby) or that the
+    driver does not translate makes the listener unavailable, it never kills
+    the hub thread."""
+
+    def driver(self, connect):
+        driver = object.__new__(db_mod.PsycopgDriver)
+        patcher = mock.patch.object(driver, "_connect", **connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return driver
+
+    def test_an_untranslated_error_becomes_a_db_error(self):
+        conn = mock.Mock()
+        conn.execute.side_effect = RuntimeError("cannot execute LISTEN during recovery")
+        driver = self.driver({"return_value": conn})
+        with self.assertRaises(db_mod.DbError):
+            driver.listen([events.CHANNEL])
+        # and the hub's constructor sees no listener: it polls
+        self.assertIsNone(db_mod.listener(driver, [events.CHANNEL]))
+
+    def test_the_missing_listen_support_keeps_its_message(self):
+        driver = self.driver({"side_effect": AttributeError("psycopg 2")})
+        with self.assertRaises(db_mod.Unavailable) as caught:
+            driver.listen([events.CHANNEL])
+        self.assertIn("psycopg without LISTEN support", str(caught.exception))
+
+
 class RunnerPruneTest(unittest.TestCase):
     """The runner prunes at most once an hour, never in dry run."""
 
@@ -374,6 +402,29 @@ class EventLogPgTest(PgTestCase):
         rows, waiting = store.readable(position, 100)        # A over, no event of its own
         self.assertEqual(([r["object"] for r in rows], waiting), (["alert:b"], None))
 
+    def test_a_limited_read_orders_the_position_as_a_number(self):
+        """R2 auditeur P1: the CTE selects `tx::text as tx`, and a bare
+        `order by tx` reads that output column: the sort was textual, so a
+        read smaller than the backlog across a power of ten returned the
+        recent first and the cursor skipped the older events for good."""
+        self._empty()
+        self.db.execute(
+            "INSERT INTO ameesh_events (type, object, tx) VALUES"
+            " ('alert.raised', 'alert:nine', '9'::xid8),"
+            " ('alert.raised', 'alert:ten', '10'::xid8),"
+            " ('alert.raised', 'alert:eleven', '11'::xid8)")
+        store = storage.of(self.db).events
+        self.assertEqual([r["object"] for r in store.readable((0, 0), 1)[0]],
+                         ["alert:nine"])
+        rows, waiting = store.readable((0, 0), 10)
+        self.assertEqual([r["object"] for r in rows],
+                         ["alert:nine", "alert:ten", "alert:eleven"])
+        self.assertIsNone(waiting)
+        # the cursor follows the same numeric order, batch after batch
+        first = store.readable((0, 0), 1)[0][0]
+        following, _ = store.readable((int(first["tx"]), int(first["id"])), 1)
+        self.assertEqual([r["object"] for r in following], ["alert:ten"])
+
     def test_notify_carries_the_id_alone(self):
         listener = db_mod.listener(self.db, [events.CHANNEL])
         if listener is None:
@@ -563,6 +614,28 @@ class StreamPgTest(ServerMixin, PgTestCase):
         events.record(self.db, "alert.raised", "alert:polled")
         got = self.read_messages(resp, 1, kind="alert.raised")
         self.assertEqual(json.loads(got[0]["data"])["object"], "alert:polled")
+
+    def test_hub_survives_an_untranslated_listen_error(self):
+        """R2 auditeur P2-3: an error the driver did not translate (a hot
+        standby refusing LISTEN, a cut between the connection and LISTEN)
+        must not kill the hub thread: it falls back to polling, and the
+        streams keep receiving."""
+        events.record(self.db, "alert.raised", "alert:before-hub")
+        hub = serve.Hub(self.ro, self.read, poll_s=0.1, listen=True)
+        with mock.patch.object(db_mod, "listener", side_effect=RuntimeError("refused")):
+            hub.start()
+            self.addCleanup(hub.stop)
+            deadline = time.monotonic() + 5
+            while hub.generation < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)          # the refusal's wake, then a poll
+            self.assertTrue(hub._thread.is_alive())
+            self.assertFalse(hub.listening)
+            before = hub.generation
+            events.record(self.db, "alert.raised", "alert:after-hub")
+            deadline = time.monotonic() + 5
+            while hub.generation == before and time.monotonic() < deadline:
+                time.sleep(0.05)
+        self.assertGreater(hub.generation, before)
 
     def test_reset_when_events_were_lost(self):
         self.serve()

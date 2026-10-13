@@ -184,6 +184,42 @@ class RoleExecutorTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
 
+    def test_event_log_grant_reaches_an_isolated_writer(self):
+        """R2 auditeur P2-2: migration 0396's triggers write `ameesh_events`
+        with the writer's rights. An isolated writer granted table by table
+        before the migration (role-module-writers.sql, no ALTER DEFAULT
+        PRIVILEGES) gets 'permission denied for table ameesh_events' and can
+        no longer journal; the migration hands it the log's INSERT right."""
+        q = db_mod.quote_ident
+        role = "t_events_writer_" + uuid.uuid4().hex[:8]
+        self.db.execute("CREATE ROLE %s" % q(role))
+        self.addCleanup(self.db.execute, "DROP ROLE %s" % q(role))
+        self.addCleanup(self.db.execute, "DROP OWNED BY %s" % q(role))
+        self.db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(role)))
+        self.db.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s"
+                        " TO %s" % (q(self.schema), q(role)))
+        self.db.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s"
+                        % (q(self.schema), q(role)))
+        # the grant a protected deployment took before migration 0396 existed
+        self.db.execute("REVOKE ALL ON ameesh_events FROM %s" % q(role))
+        self.db.execute("REVOKE ALL ON SEQUENCE ameesh_events_id_seq FROM %s" % q(role))
+        lot = work.add(self.db, title="journal", app="demo")["id"]
+        insert = ("INSERT INTO work_item_events (work_item_id, state, actor)"
+                  " VALUES (%d, 'build', 'writer')" % lot)
+        with self.assertRaises(db_mod.DbError) as refused, self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            tx.execute(insert)
+        self.assertIn("permission denied for table ameesh_events", str(refused.exception))
+        self.db.execute("SELECT ameesh_events_grant_writers()")
+        before = self.db.query("SELECT count(*) AS n FROM ameesh_events"
+                               " WHERE object = 'lot:%d'" % lot)[0]["n"]
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            tx.execute(insert)
+        self.assertEqual(
+            self.db.query("SELECT count(*) AS n FROM ameesh_events"
+                          " WHERE object = 'lot:%d'" % lot)[0]["n"], before + 1)
+
     def test_module_writer_role_contract_and_executor_separation(self):
         q = db_mod.quote_ident
         names = ("ameesh_canon_sync", "ameesh_it_proof")
