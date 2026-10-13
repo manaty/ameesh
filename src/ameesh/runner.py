@@ -6826,20 +6826,171 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
     log_async("[%s] harness stopped (%s)" % (name or "?", reason))
 
 
-def _attach_permission_mode(cfg: Config, name: str) -> str:
-    """L223: the permission mode set for the agent (`ameesh set <agent>
+#: L223/L685 : nom du fichier d'état local du mode de permission interactif.
+#: Son contenu est un objet JSON `{"harness": …, "incarnation": …, "mode": …}` :
+#: l'autorisation est liée au harnais **et** à l'enregistrement de l'agent qui
+#: l'ont reçue (voir `_attach_permission_mode`).
+PERMISSION_MODE_SETTING = "permission_mode"
+
+#: L685 r2 : contenu inerte écrit à la place du fichier quand il ne peut pas
+#: être supprimé (dossier non inscriptible) — le lecteur le refuse (harnais et
+#: incarnation vides) et le traite comme une absence de réglage.
+_PERMISSION_MODE_REVOKED = '{"harness": "", "incarnation": "", "mode": ""}\n'
+
+
+class PermissionModeWriteError(RuntimeError):
+    """L685 r2 (P2) : le réglage local `permission_mode` n'a pas pu être écrit
+    ou révoqué — `ameesh set` doit le dire et échouer, jamais réussir en
+    silence pendant qu'un mode reste actif."""
+
+
+def agent_incarnation(agent: dict) -> str:
+    """L685 r2 (P1) : identité de l'enregistrement de l'agent — l'instant de
+    création de sa ligne `agent_registry`, qui change quand l'agent est supprimé
+    puis recréé sous le même nom (le nom seul ne distingue donc pas deux
+    incarnations qui partagent le dossier d'état local). '' si la ligne ne la
+    porte pas : l'appelant refuse le réglage (fail-closed)."""
+    value = agent.get("created_ts")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return ""
+    return "%.6f" % float(value)
+
+
+def _incarnation_text(value: str) -> str:
+    """Rend une incarnation lisible (date locale) dans les avertissements."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return value or "?"
+
+
+def _neutralise_permission_mode(path: str, first: OSError) -> str:
+    """Unlink refusé : neutralise le fichier sur place (contenu inerte ; tout
+    état partiel — fichier tronqué — est déjà refusé par le lecteur, qui exige
+    un harnais et une incarnation non vides). Renvoie '' si la neutralisation a
+    réussi, sinon le message d'échec : dans les deux cas l'appelant échoue de
+    façon visible, la révocation ne doit jamais être silencieuse."""
+    try:
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(_PERMISSION_MODE_REVOKED)
+    except OSError as exc:
+        return ("cannot remove %s (%s) and cannot neutralise it (%s): the previous "
+                "mode may still be active" % (path, first, exc))
+    return ""
+
+
+def write_attach_permission_mode(cfg: Config, name: str, harness: str,
+                                 incarnation: str, mode: str) -> None:
+    """L685: enregistre le mode de permission avec le harnais et l'incarnation
+    de l'agent qui l'autorisent (mode vide : révoque le réglage). Écriture
+    atomique — `attach` ne lit jamais un fichier à moitié écrit.
+
+    L685 r2 (P2) : une révocation qui ne peut pas retirer le fichier échoue de
+    façon visible (`PermissionModeWriteError`) après l'avoir neutralisé sur
+    place : un succès ne doit jamais laisser un mode actif derrière lui."""
+    path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
+    if not mode:
+        first: OSError | None = None
+        failure = ""
+        try:
+            os.unlink(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            first = exc
+            failure = _neutralise_permission_mode(path, first)
+        if failure:
+            raise PermissionModeWriteError(failure)
+        raise PermissionModeWriteError(
+            "cannot remove %s (%s); the setting was neutralised in place — attach no "
+            "longer applies it, but the file remains (fix the permissions of %s)"
+            % (path, first, cfg.agent_dir(name)))
+    try:
+        os.makedirs(cfg.agent_dir(name), mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"harness": harness, "incarnation": incarnation, "mode": mode}, fh)
+                fh.write("\n")
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        raise PermissionModeWriteError("cannot write %s (%s)" % (path, exc)) from exc
+
+
+def _attach_permission_mode(cfg: Config, name: str, harness: str,
+                            incarnation: str) -> str:
+    """L223/L685: the permission mode set for the agent (`ameesh set <agent>
     permission_mode=…`, local state of its host), '' when unset; an unreadable
-    setting (permissions, invalid bytes) is ignored with a warning."""
-    path = os.path.join(cfg.agent_dir(name), "permission_mode")
+    setting (permissions, invalid bytes) is ignored with a warning.
+
+    L685 (review r1 P1): the setting is bound to the harness that received it.
+    A mode set under Claude (`bypassPermissions`) is never applied after the
+    agent moves to Codex: a mismatch is ignored with a warning, so the codex
+    bypass flag cannot appear without a fresh `ameesh set` under Codex.
+
+    L685 (review r2 P1): it is also bound to the agent's *registration*
+    (`created_ts`): deleting the agent and recreating it under the same name,
+    with its state directory kept, does not inherit the previous authorization.
+    A legacy plain-text file (written before L685) carries neither and is
+    refused (fail-closed), with the same warning."""
+    path = os.path.join(cfg.agent_dir(name), PERMISSION_MODE_SETTING)
     try:
         with open(path, encoding="utf-8") as fh:
-            return fh.read().strip()
+            raw = fh.read()
     except FileNotFoundError:
         return ""
     except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError
         print("ameesh attach: unreadable permission_mode setting (%s: %s), ignored"
               % (path, exc), file=sys.stderr)
         return ""
+    try:
+        document = json.loads(raw)
+    except ValueError:
+        document = None
+    if document is None:
+        print("ameesh attach: permission_mode setting is not bound to a harness "
+              "(legacy format): ignored; re-run `ameesh set %s permission_mode=…` "
+              "to authorize a mode" % name, file=sys.stderr)
+        return ""
+    if not isinstance(document, dict):
+        print("ameesh attach: malformed permission_mode setting (%s), ignored" % path,
+              file=sys.stderr)
+        return ""
+    stored = document.get("harness")
+    stored_inc = document.get("incarnation")
+    mode = document.get("mode")
+    if stored == "" and stored_inc == "" and mode == "":
+        # neutralisé par une révocation qui n'a pas pu supprimer le fichier
+        return ""
+    if not (isinstance(stored, str) and stored
+            and isinstance(stored_inc, str) and stored_inc
+            and isinstance(mode, str)):
+        print("ameesh attach: malformed permission_mode setting (%s), ignored" % path,
+              file=sys.stderr)
+        return ""
+    if stored != harness:
+        print("ameesh attach: permission_mode %r was set for harness %r, ignored under "
+              "%r (re-run `ameesh set %s permission_mode=…` to authorize this harness)"
+              % (mode, stored or "?", harness or "?", name), file=sys.stderr)
+        return ""
+    if stored_inc != incarnation or not incarnation:
+        print("ameesh attach: permission_mode %r was set for another registration of %s "
+              "(created %s), ignored; re-run `ameesh set %s permission_mode=…` to "
+              "authorize this one"
+              % (mode, name, _incarnation_text(stored_inc), name), file=sys.stderr)
+        return ""
+    return mode.strip()
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
@@ -6962,8 +7113,10 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         # slow `claude --help`) still releases the lease
         thread.start()
         veille.start()
-        argv = adapter.interactive_command(agent.get("session_id"),
-                                           permission_mode=_attach_permission_mode(cfg, name))
+        argv = adapter.interactive_command(
+            agent.get("session_id"),
+            permission_mode=_attach_permission_mode(
+                cfg, name, agent.get("harness") or "", agent_incarnation(agent)))
         env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
         env.update(adapter.env())
         env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"

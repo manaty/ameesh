@@ -1833,7 +1833,7 @@ def cmd_set(cfg: Config, args) -> int:
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
     """
-    from . import adapters, harnesses
+    from . import adapters, harnesses, runner
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
@@ -1843,6 +1843,8 @@ def cmd_set(cfg: Config, args) -> int:
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
             return 1
+        harness = agent.get("harness") or ""
+        incarnation = runner.agent_incarnation(agent)
         valeurs: dict = {}
         for couple in args.values:
             cle, sep, valeur = couple.partition("=")
@@ -1907,7 +1909,6 @@ def cmd_set(cfg: Config, args) -> int:
                     return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
-                harness = agent.get("harness") or ""
                 descriptor = harnesses.get(harness)
                 rule = descriptor.interactive_permission if descriptor else {}
                 if not rule:
@@ -1921,9 +1922,27 @@ def cmd_set(cfg: Config, args) -> int:
                           % (valeur, " | ".join(allowed) or "e.g. auto, acceptEdits"),
                           file=sys.stderr)
                     return 2
+                if not incarnation:
+                    # L685 r2 (P1): sans l'identité d'enregistrement le mode ne
+                    # peut pas être lié à l'incarnation de l'agent : refusé
+                    # plutôt que d'écrire une autorisation au nom seul
+                    print("permission_mode: cannot bind the mode to the registration "
+                          "of %s (creation date unreadable)" % args.agent,
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):
+            if cle == "permission_mode":
+                # L685: le mode est enregistré avec le harnais et l'incarnation
+                # de l'agent qui l'autorisent ; `attach` refuse de l'appliquer
+                # ensuite (autre harnais, ou agent supprimé puis recréé).
+                try:
+                    runner.write_attach_permission_mode(
+                        cfg, args.agent, harness, incarnation, valeur)
+                except runner.PermissionModeWriteError as exc:
+                    print("permission_mode: %s" % exc, file=sys.stderr)
+                    return 2
+            elif cle in ("model", "effort", "tier", "mail_batch"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
