@@ -25,7 +25,10 @@
 attestation the enrolled producer refreshes for that exact restore target) and
 an optional `remote` object naming the object host and the two private
 credential files. Credential values never enter arguments, receipts, errors or
-logs; the enrolled document holds references only.
+logs; the enrolled document holds references only. The attestation path and
+every parent must be owned by root or the controller and unwritable by a third
+party: its bytes decide an admission, so it is opened without following links
+and the descriptor actually read is checked.
 
 This module is source only: it is not installed, no service is enabled and no
 root, SSH, systemd, PostgreSQL migration or production effect is executed by
@@ -143,6 +146,44 @@ def private_directory(path, what):
             or info.st_uid != os.geteuid() or info.st_mode & 0o077 or resolved != path):
         raise RecoveryError('private owned ' + what + ' required')
     return path
+
+
+def protected_document(path, *, limit=65536):
+    """Read one enrolled JSON document whose bytes decide an admission.
+
+    The whole parent chain must be real directories owned by root or this
+    process and unwritable by a third party, and the descriptor actually read
+    is checked again (`fstat`, bounded read): a substitution between the path
+    check and the open cannot decide the admitted bytes, and no link is ever
+    followed. An absent, linked or unsafe document reads as None, which callers
+    treat as a refusal.
+    """
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        return None
+    try:
+        for ancestor in path.parents:
+            info = ancestor.lstat()
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022):
+                return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(descriptor, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid not in (0, os.geteuid())
+                or before.st_nlink != 1 or before.st_mode & 0o022 or before.st_size > limit):
+            return None
+        data = stream.read(limit + 1)
+        after = os.fstat(stream.fileno())
+        if len(data) > limit or (before.st_dev, before.st_ino, before.st_size) != (
+                after.st_dev, after.st_ino, after.st_size):
+            return None
+    try:
+        return json.loads(data)
+    except ValueError:
+        return None
 
 
 class RecoverySet:
@@ -319,22 +360,13 @@ class RecoverySet:
 
         `restore_capacity` is an enrolled reference, not a value: the enrolled
         producer refreshes a private protected file (exact keys) at each
-        backup/restore step. Missing, unsafe, stale, future-dated beyond the
-        allowed skew or differently bound documents are unusable, so the
-        restore refuses before creating anything.
+        backup/restore step. Missing, linked, third-party-writable, stale,
+        future-dated beyond the allowed skew or differently bound documents are
+        unusable, so the restore refuses before creating anything. The whole
+        path is protected and the descriptor actually read is checked, so a
+        substitution cannot decide the admitted bytes.
         """
-        path = Path(self.config['restore_capacity'])
-        try:
-            info = path.lstat()
-        except OSError:
-            return None
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
-                or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022):
-            return None
-        try:
-            value = json.loads(path.read_text())
-        except (OSError, ValueError):
-            return None
+        value = protected_document(self.config['restore_capacity'])
         if not isinstance(value, dict) or set(value) != CAPACITY_FIELDS:
             return None
         free, checked, target = value.get('free_bytes'), value.get('checked_at'), value.get('target_sha256')

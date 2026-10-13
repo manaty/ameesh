@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -30,6 +31,20 @@ class RecoverySetTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='ameesh-release-recovery-')
         self.addCleanup(self.temp.cleanup)
         base = Path(self.temp.name)
+        # The enrolled capacity attestation is only usable under a parent chain
+        # no third party can rewrite. The disposable root itself is private; its
+        # shared ancestors (/tmp and below) are made to look owned and unwritable
+        # exactly as the other private-file fixtures do.
+        original = Path.lstat
+        ancestors = set(Path(self.temp.name).parents)
+        def fixture_ancestors(path):
+            info = original(path)
+            if path in ancestors and stat.S_ISDIR(info.st_mode):
+                fields = list(info); fields[0] &= ~0o022; fields[4] = os.geteuid()
+                return os.stat_result(fields)
+            return info
+        patch = mock.patch.object(Path, 'lstat', fixture_ancestors)
+        patch.start(); self.addCleanup(patch.stop)
         self.root = base / 'state'
         self.retention = base / 'retention'
         self.store = base / 'store'
@@ -435,6 +450,47 @@ class RecoverySetTest(unittest.TestCase):
                                  config={key: value for key, value in self.config.items()
                                          if key != 'restore_capacity'},
                                  clock=self.clock)
+
+    def forged_capacity(self, *, free_bytes=10 ** 12):
+        path = self.capacity_path.with_name('forged-capacity.json')
+        path.write_text(json.dumps(dict(free_bytes=free_bytes, checked_at=int(self.clock()),
+                                        target_sha256=hashlib.sha256(
+                                            self.config['restore_dsn'].encode()).hexdigest()),
+                                   sort_keys=True))
+        path.chmod(0o600)
+        return path
+
+    def test_capacity_refuses_an_attestation_under_a_third_party_writable_parent(self):
+        # A correctly shaped document proves nothing when a third party can
+        # rewrite its parent: it could be replaced between the path check and
+        # the read. The restore refuses before any copy.
+        self.write_capacity(free_bytes=0)
+        self.capacity_path.parent.chmod(0o777)
+        self.addCleanup(self.capacity_path.parent.chmod, 0o700)
+        self.assertIsNone(self.value._capacity())
+        self.refused_restore()
+
+    def test_capacity_refuses_a_link_substituted_before_the_open(self):
+        # The forged document below carries the same target and date but a huge
+        # free space. Substituting it as a link once the parent chain has been
+        # checked must not decide the admitted bytes: the file is opened without
+        # following links and the descriptor read is checked again.
+        self.write_capacity(free_bytes=0)
+        forged = self.forged_capacity()
+        real_open = recovery.os.open
+
+        def substituted(path, flags, *args, **kwargs):
+            if Path(path) == self.capacity_path:
+                self.capacity_path.unlink()
+                self.capacity_path.symlink_to(forged)
+            return real_open(path, flags, *args, **kwargs)
+        with mock.patch.object(recovery.os, 'open', side_effect=substituted):
+            self.assertIsNone(self.value._capacity())
+
+    def test_capacity_refuses_a_hardlinked_attestation(self):
+        self.write_capacity(free_bytes=0)
+        os.link(self.capacity_path, self.capacity_path.with_name('capacity-link.json'))
+        self.assertIsNone(self.value._capacity())
 
     def test_remote_verification_refuses_when_staging_has_no_room(self):
         upload_credentials, restore_credentials = self.credential_files()
