@@ -171,7 +171,10 @@ def send(title: str, body: str, *, urgency: str = "normal",
     if not binary:
         raise NotifyError(problem or "no desktop backend on this system", permanent=True)
     if backend == "notify-send":
-        _run([binary, "--app-name=ameesh", "--urgency=%s" % urgency,
+        # « -- » separe les options des positionnels : un titre ou un corps
+        # venu d'un agent et commencant par « - » resterait sinon lu comme
+        # une option par notify-send (L66, N1 de la relecture de #391).
+        _run([binary, "--app-name=ameesh", "--urgency=%s" % urgency, "--",
               str(title), str(body)], env, timeout, "notify-send")
     elif backend == "osascript":
         _run([binary, "-e", _applescript(title, body, urgency)],

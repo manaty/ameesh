@@ -68,6 +68,16 @@ class _Banc(unittest.TestCase):
 
 
 class PlatformNotifyTest(_Banc):
+    def test_linux_notify_send_garde_les_tirets(self):
+        """N1 de #391 : sans « -- », un texte commencant par « - » serait lu
+        comme une option par notify-send."""
+        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        backend = pnotify.send("--help", "-corps", env=env, system="linux", wsl=False)
+        self.assertEqual(backend, "notify-send")
+        self.assertEqual(self.entries()[0]["argv"],
+                         ["--app-name=ameesh", "--urgency=normal", "--",
+                          "--help", "-corps"])
+
     def test_macos_osascript(self):
         env = dict(self.env, AMEESH_OSASCRIPT_BIN=self.fake("osascript"))
         backend = pnotify.send('Titre "x"', "corps\nligne", urgency="critical",
@@ -197,6 +207,14 @@ class CanalDesktopTest(_Banc):
         notify.Sender(env=env).send(notify.Channel("desktop", "desktop"),
                                     notify.Message("titre", "corps", urgent=True))
         self.assertIn("--urgency=critical", self.entries()[0]["argv"])
+
+    def test_le_canal_desktop_garde_les_textes_a_tiret(self):
+        """Le canal reste vert avec un titre et un corps commencant par « - »."""
+        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        notify.Sender(env=env).send(notify.Channel("desktop", "desktop"),
+                                    notify.Message("--titre", "-corps"))
+        argv = self.entries()[0]["argv"]
+        self.assertEqual(argv[-3:], ["--", "--titre", "-corps"])
 
     def test_erreur_permanente_du_backend(self):
         env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=os.path.join(self.tmp, "absent"))
