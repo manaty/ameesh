@@ -86,6 +86,19 @@ class FullSuiteReaderTest(unittest.TestCase):
             radar.full_suite_ci(self.project, "a" * 40,
                                 gh=_gh([_row()], jobs={"911": [{"name": "tests"}]}))
 
+    def test_the_job_read_names_the_repository(self):
+        # R2 de mty-amh-qa-01 (PR manaty/ameesh#633) : `gh run view` sans
+        # `--repo` résout le dépôt par le répertoire courant (`Gh.run` ne fixe
+        # ni `cwd` ni `GH_REPO`) et échoue hors d'un clone (« failed to
+        # determine base repo »). Le faux `_Gh` ignore les arguments en trop :
+        # le témoin exige donc le slug sur l'appel.
+        gh = _gh([_row()])
+        self.assertTrue(radar.full_suite_ci(self.project, "a" * 40, gh=gh)["green"])
+        views = [argv for argv in gh.calls if argv[:2] == ["run", "view"]]
+        self.assertEqual(len(views), 1)
+        self.assertIn("--repo", views[0])
+        self.assertEqual(views[0][views[0].index("--repo") + 1], "o/ameesh")
+
     def test_a_missing_declared_suite_is_never_green(self):
         project = radar.Project("a", "/r", github="o/ameesh", full_suite=(WF, OTHER))
         out = radar.full_suite_ci(project, "a" * 40,
