@@ -2,15 +2,17 @@
 """L243b step 1: alternate spellings never duplicate identity or authority."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import unittest
 from unittest import mock
 
-from ameesh import agent_names, authority, canon, canon_sync, identity, mail, placement
-from ameesh import registry, runner, session_bindings, work
+from ameesh import agent_names, authority, canon, canon_sync, exploitation, identity, mail, placement
+from ameesh import registry, reprise, runner, session_bindings, work
 from .support import PgTestCase
 from .test_canon import _TmpMixin, codes, fiche, write
+from .test_l39_adoption_reprise import SID, _dossier, _rollout
 
 
 class AgentAliasTest(PgTestCase):
@@ -235,6 +237,132 @@ class AgentAliasTest(PgTestCase):
         })
         self.assertFalse(_lit_etat(self.cfg, 'old-worker', runner.PERMISSION_MODE_SETTING))
         self.assertTrue(self.db.query("SELECT 1 FROM agent_name_resolutions WHERE operation='settings.permission_mode'"))
+
+
+class SessionCommandAliasTest(PgTestCase):
+    """B1 de la R2 : `adopt`, `resume` et `restart` reçus sous un alias
+    écrivent sous le primaire (bail, NOTIFY, oubli local, marqueur), sans
+    créer d'identité parallèle, et gardent les refus de bail existants."""
+
+    def setUp(self):
+        super().setUp()
+        self.travail = os.path.join(self.tmp, "travail")
+        os.makedirs(self.travail, exist_ok=True)
+        self.register("worker", "codex", cwd=self.travail)
+        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-worker', 'another-name'] "
+                        "WHERE name = 'worker'")
+
+    def _codex(self) -> dict:
+        return {"codex": [
+            {"name": "primaire",
+             "path": _dossier(os.path.join(self.tmp, "comptes", "codex-1"), creds="auth.json")},
+            {"name": "secondaire",
+             "path": _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")},
+        ]}
+
+    def _cfg(self, comptes: dict | None = None):
+        return dataclasses.replace(self.cfg, accounts=comptes or {})
+
+    def _arrete(self, session: str, compte: str | None = None) -> None:
+        registry.set_session(self.db, "worker", session, compte)
+        proc = self.runner("stop", "worker")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _ligne(self) -> dict:
+        rows = self.db.query("SELECT * FROM agent_registry")
+        self.assertEqual([r["name"] for r in rows], ["worker"])
+        return rows[0]
+
+    def test_adopt_by_alias_writes_under_primary(self):
+        comptes = self._codex()
+        chemin = _rollout(comptes["codex"][1]["path"], SID, self.travail)
+        registry.upsert(self.db, "coord", harness="codex", host=self.cfg.host, mode="externe")
+        self.db.execute("UPDATE agent_registry SET aliases = ARRAY['old-coord'], "
+                        "responsible = 'human:proprio' WHERE name = 'coord'")
+        os.makedirs(self.cfg.agent_dir("coord"), exist_ok=True)
+        with open(os.path.join(self.cfg.agent_dir("coord"), "session"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("sess-externe\n")
+        # bail vivant sur le primaire : le refus existant vaut aussi par alias
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-test', lease_epoch = 1, "
+                        "lease_expires_at = now() + interval '1 hour' WHERE name = 'coord'")
+        with self.assertRaises(reprise.RepriseError) as ctx:
+            reprise.adopt(self._cfg(comptes), self.db, "old-coord", session_id=SID, harness="codex")
+        self.assertIn("live lease", str(ctx.exception))
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE name = 'coord'")
+        out = reprise.adopt(self._cfg(comptes), self.db, "old-coord", session_id=SID, harness="codex")
+        self.assertEqual((out["account"], out["path"]), ("secondaire", chemin))
+        row = self.db.query("SELECT name, mode, status, session_id, session_account, cwd "
+                            "FROM agent_registry WHERE name = 'coord'")[0]
+        self.assertEqual((row["name"], row["mode"], row["status"], row["session_id"],
+                          row["session_account"], row["cwd"]),
+                         ("coord", "execute", "queued", SID, "secondaire", self.travail))
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.agent_dir("coord"), "session")))
+        self.assertTrue(self.db.query(
+            "SELECT 1 FROM agent_name_resolutions WHERE supplied_name = 'old-coord' "
+            "AND primary_name = 'coord' AND operation = 'reprise.adopt'"))
+
+    def test_resume_by_alias_covers_same_session_and_fresh(self):
+        comptes = self._codex()
+        self._arrete("sess-a", "primaire")
+        # arrêté sous un bail vivant : le refus existant vaut aussi par alias
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-test', lease_epoch = 1, "
+                        "lease_expires_at = now() + interval '1 hour' WHERE name = 'worker'")
+        with self.assertRaises(reprise.RepriseError) as ctx:
+            reprise.resume(self._cfg(comptes), self.db, "old-worker")
+        self.assertIn("lease is still live", str(ctx.exception))
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE name = 'worker'")
+        out = reprise.resume(self._cfg(comptes), self.db, "another-name")
+        self.assertTrue(out["kept"])
+        row = self._ligne()
+        self.assertEqual((row["status"], row["session_id"]), ("queued", "sess-a"))
+        self.assertTrue(self.db.query(
+            "SELECT 1 FROM agent_name_resolutions WHERE supplied_name = 'another-name' "
+            "AND primary_name = 'worker' AND operation = 'reprise.resume'"))
+        # reprise fraîche sous l'autre alias : la session locale du primaire part
+        proc = self.runner("stop", "worker")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        os.makedirs(self.cfg.agent_dir("worker"), exist_ok=True)
+        with open(os.path.join(self.cfg.agent_dir("worker"), "session"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("sess-a\n")
+        out = reprise.resume(self.cfg, self.db, "old-worker", fresh=True)
+        self.assertEqual(out["forgotten_session"], "sess-a")
+        row = self._ligne()
+        self.assertEqual((row["status"], row["session_id"]), ("queued", None))
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.agent_dir("worker"), "session")))
+
+    def test_restart_by_alias_requests_on_primary(self):
+        registry.set_session(self.db, "worker", "vieille")
+        # bail vivant : la demande vise le primaire et l'exécuteur est réveillé
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-test', lease_epoch = 1, "
+                        "lease_expires_at = now() + interval '1 hour' WHERE name = 'worker'")
+        out = exploitation.restart(self.cfg, self.db, "old-worker", "Brief neuf.")
+        self.assertFalse(out["applied"])
+        self.assertTrue(out["notified"])
+        row = self._ligne()
+        self.assertEqual((row["restart_brief"], row["session_id"]), ("Brief neuf.", "vieille"))
+        self.assertIsNotNone(row["restart_requested_at"])
+        # sans bail vivant : l'oubli local porte sur le primaire, pas sur l'alias
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+                        "WHERE name = 'worker'")
+        os.makedirs(self.cfg.agent_dir("worker"), exist_ok=True)
+        with open(os.path.join(self.cfg.agent_dir("worker"), "session"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("vieille\n")
+        out = exploitation.restart(self.cfg, self.db, "another-name", "Brief deux.")
+        self.assertTrue(out["applied"])
+        self.assertEqual(out["forgotten_session"], "vieille")
+        row = self._ligne()
+        self.assertTrue(row["pending_prompt"].startswith("Brief deux."))
+        self.assertIsNone(row["session_id"])
+        self.assertIsNone(row["restart_requested_at"])
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.agent_dir("worker"), "session")))
+        self.assertTrue(self.db.query(
+            "SELECT 1 FROM agent_name_resolutions WHERE supplied_name = 'another-name' "
+            "AND primary_name = 'worker' AND operation = 'exploitation.restart'"))
 
 
 class CanonAliasTest(_TmpMixin, unittest.TestCase):
