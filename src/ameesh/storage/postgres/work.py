@@ -544,11 +544,12 @@ class WorkItems(interface.WorkItems):
                 return None
             # relu APRÈS le verrou, dans une instruction suivante : en READ
             # COMMITTED elle voit l'issue posée par un exécuteur concurrent
+            with_reviewer = has_reviewer(self.db)
             rows = tx.query(
-                "SELECT %s, %s AS worked, w.title, w.state, w.assignee"
+                "SELECT %s, %s AS worked, w.title, w.state, w.assignee%s"
                 "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
                 " WHERE d.id = %%s AND d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
-                % (_DELEGATION_COLUMNS, _WORKED),
+                % (_DELEGATION_COLUMNS, _WORKED, ", w.reviewer" if with_reviewer else ""),
                 (int(delegation_id), float(now_ts)))
             if not rows:
                 return None
@@ -569,11 +570,22 @@ class WorkItems(interface.WorkItems):
             if not done:
                 return None
             if outcome == "rendue":
+                # #705 : le délégant a pu être désigné relecteur pendant la
+                # délégation (il n'était plus l'assigné) ; le lot lui revient,
+                # la désignation tombe dans la même écriture.
+                reviewer_set = ""
+                params: list = [row["delegated_by"]]
+                if with_reviewer:
+                    reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
+                                    " ELSE reviewer END")
+                    params.append(row["delegated_by"])
                 item = tx.query(
-                    "UPDATE work_items SET assignee = %%s, delegated_by = NULL,"
-                    "       delegated_at = NULL, due_at = NULL, updated_at = now()"
-                    " WHERE id = %%s RETURNING %s" % item_columns(self.db),
-                    (row["delegated_by"], item_id))
+                    ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL,"
+                     "       updated_at = now()"
+                     " WHERE id = %s RETURNING __COLUMNS__"
+                     ).replace("__COLUMNS__", item_columns(self.db)),
+                    tuple(params + [item_id]))
             elif outcome == "annulee":
                 # L46 : lot fermé OU réassigné hors `work assign` — la
                 # délégation annulée ne laisse ni délégant ni date
@@ -586,6 +598,10 @@ class WorkItems(interface.WorkItems):
                     "UPDATE work_items SET due_at = NULL WHERE id = %%s RETURNING %s"
                     % item_columns(self.db), (item_id,))
             text = describe(outcome, row) if describe else None
+            if outcome == "rendue" and row.get("reviewer") \
+                    and row["reviewer"] == row["delegated_by"]:
+                text = "%s; reviewer %s cleared (they now hold the lot)" % (
+                    text or "delegation expired", row["reviewer"])
             if text:
                 WorkItems(tx)._event(item_id, item[0]["state"], text, actor)
             return dict(row, outcome=outcome, item=item[0])

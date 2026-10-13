@@ -14,6 +14,7 @@ d'en désigner un.
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from unittest import mock
 
@@ -399,6 +400,28 @@ class ReviewerDesignationTest(PgTestCase):
         self.assertEqual((item["assignee"], item["reviewer"]), ("relecteur", ""))
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("reviewer relecteur cleared (they now hold the lot)" in n
+                            for n in notes), notes)
+
+    def test_retour_de_delegation_au_relecteur_retire_la_designation(self):
+        """#705 (second avis) : le délégant désigné relecteur pendant la
+        délégation (il n'était plus l'assigné) ne le reste pas quand le lot
+        lui revient à l'échéance (`rendue`) ; le journal le dit."""
+        self.register("delegue", "codex", cwd=self.tmp)
+        lot = self._lot()
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "delegate", str(lot["id"]), "delegue",
+                         "--within", "30m", "--actor", "auteur", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "auteur",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        done = work.expire_delegations(self.db, now=time.time() + 3600)
+        self.assertEqual([d["outcome"] for d in done], ["rendue"])
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["assignee"], item["reviewer"]), ("auteur", ""))
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("reviewer auteur cleared (they now hold the lot)" in n
                             for n in notes), notes)
 
     # -- #705 r2 (N1, N2) : la désignation dans la foulée du move ------------
