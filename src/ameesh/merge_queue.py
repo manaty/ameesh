@@ -102,6 +102,13 @@ _DEFAULT_PORTS = {"ssh": 22, "git+ssh": 22, "ssh+git": 22, "git": 9418, "http": 
                   "https": 443}
 
 
+def normalize_source(source: str) -> str:
+    """Normalize a stored queue source, retaining server ports and fork identity."""
+    if source.partition("/")[0].split(":")[0].lower() == "github.com":
+        return source.lower()
+    return source
+
+
 def source_of(repo: str) -> str:
     """The repository a lot is queued from, as a radar pass compares it: its
     origin as `host/path` (`git@github.com:o/r.git` and
@@ -125,7 +132,7 @@ def source_of(repo: str) -> str:
         return os.path.realpath(os.path.join(repo, local))
     path = path.strip("/")
     path = path[:-len(".git")] if path.endswith(".git") else path
-    return "%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path)
+    return normalize_source("%s%s/%s" % (host.lower(), ":%d" % int(port) if port else "", path))
 
 
 def fetch_fresh(repo: str, names, clone=None) -> tuple[dict, str]:
@@ -185,16 +192,26 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
-def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
+def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
+              commit_ci=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr}`; QueueError says what is missing. Commit ids are resolved to full
     ones before being compared; `ci` (`radar.github_ci(..., strict=True)`)
     must report the PR green on the frozen commit itself, and an error
-    reading it refuses the lot."""
-    from . import plan_github
+    reading it refuses the lot. A project with `ci_required` (L160g) also
+    needs GitHub's CI green on the frozen commit itself, PR or not
+    (`commit_ci`, `radar.commit_ci` by default)."""
+    from . import plan_github, radar
     row = work.get(db, lot)
     if row is None:
         raise QueueError("lot #%d not found" % lot)
+    target = row.get("branch_target") or getattr(project, "target", "") or plan_git.default_target(repo)
+    glob = radar.protected_target(project, target)
+    if glob:
+        # L160g (#473): main, release branches and tags stay an orchestrator's gesture
+        raise QueueError("%s is a protected target of project %s (%s): the merge queue "
+                         "never merges there; it is the orchestrator's gesture"
+                         % (target, project.name, glob))
     if row.get("state") in work.MERGED_STATES or row.get("state") == "closed":
         raise QueueError("lot #%d is %s: nothing to merge" % (lot, row["state"]))
     if not row.get("branch"):
@@ -239,17 +256,41 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-    target = row.get("branch_target") or plan_git.default_target(repo)
+    if project is not None and getattr(project, "ci_required", False):
+        _required_ci(project, tip, commit_ci)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"], "pr": (status or {}).get("number")}
 
 
+def _required_ci(project, sha: str, commit_ci=None) -> None:
+    """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
+    `sha` itself; QueueError otherwise (no run, running, red, unreadable)."""
+    from . import plan_github, radar
+    try:
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+    except plan_github.GithubError as exc:
+        raise QueueError("project %s requires CI on the frozen commit (ci_required), "
+                         "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
+    if not runs["runs"]:
+        raise QueueError("project %s requires CI on the frozen commit (ci_required): no run "
+                         "on %s yet (push it, let the workflows run)" % (project.name, sha[:12]))
+    if runs["pending"]:
+        raise QueueError("the CI on the frozen commit %s is still running (%s)"
+                         % (sha[:12], ", ".join(runs["pending"])))
+    if runs["failed"]:
+        raise QueueError("the CI on the frozen commit %s is red (%s)"
+                         % (sha[:12], ", ".join(runs["failed"])))
+    if not runs.get("green"):
+        raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
+
+
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None) -> dict:
+          clone=None, commit_ci=None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes."""
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
-    ready = readiness(db, lot, repo, ci=ci, clone=clone)
+    ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project,
+                      commit_ci=commit_ci)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
         source=source_of(repo), note="merge queue of %s: queued at %s%s" % (
@@ -326,13 +367,15 @@ def order(entries: list[dict], pairs: dict) -> list[dict]:
 # stacked replay in the radar's clone
 # --------------------------------------------------------------------------
 
-def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dict:
+def stack(replayer, target_head: str, lots: list[dict], rows: list[dict], *, generated=()) -> dict:
     """Replays the queue stacked: from `target_head`, merges each lot of
     `lots` (`{work_item, tip}`, in order) with `rerere` primed by the
     resolutions (`rows`) of this lot with the lots already stacked. A lot
     that leaves a conflict is skipped. Returns `{lot: {state: clean|
-    replayed|conflict, files}}`."""
-    from . import resolutions
+    replayed|conflict|generated, files}}`. Generated conflicts are excluded
+    before rerere; each trial tree is regenerated and checked."""
+    from . import land, resolutions
+    paths = {g.path for g in generated}
     latest: dict = {}
     for row in rows:
         latest.setdefault(frozenset((int(row["work_item_id"]), int(row["other_item_id"]))), row)
@@ -361,24 +404,38 @@ def stack(replayer, target_head: str, lots: list[dict], rows: list[dict]) -> dic
                         and row["commit_sha"] in replayer.trained():
                     shutil.copytree(replayer._store(row["commit_sha"]), replayer._rr_cache(),
                                     dirs_exist_ok=True)
-            merge = run(path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+            merge = run(path, "-c", "rerere.enabled=false", "-c", "rerere.autoUpdate=false",
                         "merge", "--no-ff", "--no-commit", "--quiet", one["tip"])
             state, files = "clean", []
             if merge.returncode != 0:
                 files = resolutions.unmerged(path)
-                remaining = resolutions.rerere_remaining(path) if files else []
-                left = sorted(set(remaining) | set(resolutions.with_markers(path, files)))
+                resolutions.exclude_generated(path, files, paths)
+                resolutions._check(run(path, "-c", "rerere.enabled=true", "-c",
+                                       "rerere.autoUpdate=false", "rerere"), "rerere")
+                others = [f for f in files if f not in paths]
+                remaining = [f for f in resolutions.rerere_remaining(path) if f not in paths] \
+                    if others else []
+                left = sorted(set(remaining) | set(resolutions.with_markers(path, others)))
                 if not files or left:
                     run(path, "merge", "--abort")
                     run(path, "reset", "-q", "--hard", base)
                     out[lot] = {"state": "conflict", "files": left or files,
                                 "error": "" if files else resolutions._err(merge)[:300]}
                     continue
-                resolutions._check(run(path, "add", "--", *files), "add")
-                state = "replayed"
+                if others:
+                    resolutions._check(run(path, "add", "--", *others), "add")
+                    state = "replayed"
+            if paths:
+                made = land._regenerate(path, generated, paths)
+                if not made["ok"]:
+                    run(path, "merge", "--abort")
+                    run(path, "reset", "-q", "--hard", base)
+                    out[lot] = {"state": "generated", "files": [made["file"]],
+                                "output": made["output"]}
+                    continue
             resolutions._check(run(path, "-c", "rerere.enabled=false", "commit", "--quiet",
                                    "--no-verify", "-m", "queue: #%d" % lot), "commit")
-            out[lot] = {"state": state, "files": files}
+            out[lot] = {"state": state, "files": [f for f in files if f not in paths]}
             stacked.append(lot)
     finally:
         run(path, "reset", "-q", "--hard")
@@ -460,7 +517,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         scan decide it; only a row with no source, if any, falls back on the
         scan."""
         if row.get("source"):
-            return row["source"] == source
+            return normalize_source(row["source"]) == source
         return int(row["work_item_id"]) in branches
 
     mine = [r for r in rows if r["state"] in ("queued", "landing") and ours(r)]
@@ -543,21 +600,23 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         # the radar tried the target its checkout had: only a conflict with
         # the target fetched now ejects; otherwise the stacked trial below,
         # on that target, decides
-        if clash and clash.get("target") == row["target"] \
+        ordinary = [f for f in (clash or {}).get("files", ())
+                    if f not in {g.path for g in getattr(project, "generated", ())}]
+        if clash and ordinary and clash.get("target") == row["target"] \
                 and _same(clash.get("tip"), row["frozen_sha"]) \
                 and _same(clash.get("target_head"), head):
             # no resolution is prepared against the target: the agent integrates it
             reason = "conflict with %s on %s" % (row["target"], ", ".join(
-                clash["files"][:6] or ["?"]))
+                ordinary[:6]))
             out["mail"].append(_eject(db, row, reason, (
                 "Merge queue of %s, lot #%d « %s »: out of the queue, its frozen commit "
                 "conflicts with %s on %s. Integrate %s into %s, freeze again, have it "
                 "reviewed, then ameesh work queue add %d."
                 % (row["target"], lot, row.get("title") or "", row["target"],
-                   ", ".join(clash["files"][:6]), row["target"], row.get("branch") or "?",
+                   ", ".join(ordinary[:6]), row["target"], row.get("branch") or "?",
                    lot)),
                 {"project": project.name, "target": row["target"], "kind": "ejected",
-                 "files": clash["files"]}))
+                 "files": ordinary}))
             ejected.add(lot)
             continue
         # stacked on the target as origin has it now, not the agents' cached one
@@ -595,11 +654,14 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                        for r in landing.get(target) or ()] + \
                 [{"work_item": o["work_item"], "tip": rows_by_id[o["work_item"]]["tip"]}
                  for o in ranked]
-            key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits)
+            generated = tuple(getattr(project, "generated", ()))
+            key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits,
+                   generated)
             if key not in stacks:
                 try:
                     replayer.ensure()
-                    stacks[key] = stack(replayer, key[0], stacked, resolution_rows)
+                    stacks[key] = stack(replayer, key[0], stacked, resolution_rows,
+                                        generated=generated)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
             result = stacks[key]
@@ -610,6 +672,17 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
             row = rows_by_id[one["work_item"]]
             trial = result.get(one["work_item"]) if isinstance(result, dict) else None
             state = "queued"
+            if trial and trial["state"] == "generated":
+                lot = one["work_item"]
+                reason = "stacked trial: generated file %s: regeneration or check failed" % trial["files"][0]
+                out["mail"].append(_eject(db, row, reason, (
+                    "Merge queue of %s, lot #%d: out of the queue. %s.\n%s\n"
+                    "Fix the generator or its inputs, freeze again, then ameesh work queue add %d."
+                    % (target, lot, reason, trial["output"], lot)),
+                    {"project": project.name, "target": target, "kind": "ejected",
+                     "files": trial["files"]}))
+                state = "ejected"
+                ejected.add(lot)
             if trial and trial["state"] == "conflict":
                 lot = one["work_item"]
                 reason = "stacked trial: conflict not covered on %s" % ", ".join(
@@ -699,13 +772,26 @@ def show_lines(rows: list[dict]) -> list[str]:
 def radar_project(cfg, repo: str):
     """The radar project (`radar.projects`) of the repository `repo`, if any:
     its private clone receives the fetches of `readiness`."""
-    from . import radar
+    from . import radar, migrations
     try:
-        projects = radar.settings_of(cfg).projects.values()
-    except radar.SettingsError:
-        return None
+        projects = list(radar.settings_of(cfg).projects.values())
+    except radar.SettingsError as exc:
+        raise QueueError("cannot read repository landing conditions: %s" % exc) from exc
     real = os.path.realpath(repo)
-    return next((p for p in projects if os.path.realpath(p.repo) == real), None)
+    identities = {p.name: {migrations.repo_key(p.github),
+                           migrations.repo_key(migrations.origin_repo(p.repo))} - {""}
+                  for p in projects}
+    slugs = {migrations.repo_key(migrations.origin_repo(repo))} - {""}
+    # A checkout without origin still has its configured repository identity.
+    # An exact path contributes matches; it never suppresses another project's.
+    for p in projects:
+        if os.path.realpath(p.repo) == real:
+            slugs.update(identities[p.name])
+    matching = [p for p in projects if os.path.realpath(p.repo) == real or
+                slugs & identities[p.name]]
+    if len(matching) > 1:
+        raise QueueError("multiple radar projects match this repository; landing conditions are ambiguous")
+    return matching[0] if matching else None
 
 
 def run(cfg, db, args) -> int:
