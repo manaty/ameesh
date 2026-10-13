@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L118c: mail-created lots keep their project and corrections are guarded."""
+"""L118c: mail-created lots keep their project and corrections are guarded;
+a lot-linked message is filed in the project thread of its lot (#515)."""
+import os
 from types import SimpleNamespace
 from unittest import mock
 
@@ -25,7 +27,7 @@ class MailProjectTests(_Base):
     def test_explicit_project_overrides_both_agents(self):
         self.project("orch", team="sender")
         self.project("dev1", team="recipient")
-        proc = self.send_new("--app", " explicit ")
+        proc = self.send_new("--app", " explicit ", "--new-project")   # #506: nobody declares it
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lot = work.list_items(self.db)[0]
         self.assertEqual(lot["app"], "explicit")
@@ -50,6 +52,61 @@ class MailProjectTests(_Base):
         proc = self.send_new()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "recipient")
+
+    # -- #515 : le fil d'un message lié à un lot est celui du projet du lot ---
+
+    def thread_path(self, project, lot):
+        return os.path.join(self.cfg.threads_root, project, "%s.md" % lot)
+
+    def lot_message(self, lot, dest="dev1"):
+        return self.cli("send", dest, "Message lié au lot.", "--from", "orch",
+                        "--lot", str(lot), env=self.env(AMEESH_ALERT_ORCHESTRATORS="orch"))
+
+    def test_lot_message_is_filed_in_the_lot_project_thread(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        lot = work.add(self.db, title="Fil du lot", app="B")
+        proc = self.lot_message(lot["id"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.thread_path("B", lot["id"]), encoding="utf-8") as fh:
+            self.assertIn("Message lié au lot.", fh.read())
+        self.assertFalse(os.path.exists(self.thread_path("A", lot["id"])))
+        [row] = self.db.query("SELECT project, lot FROM thread_index WHERE lot = %s",
+                              (str(lot["id"]),))
+        self.assertEqual((row["project"], row["lot"]), ("B", str(lot["id"])))
+
+    def test_lot_without_project_keeps_the_sender_thread(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        lot = work.add(self.db, title="Sans projet")
+        proc = self.lot_message(lot["id"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(self.thread_path("A", lot["id"])))
+        self.assertFalse(os.path.exists(self.thread_path("B", lot["id"])))
+
+    def test_free_label_keeps_the_sender_thread_without_warning(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        proc = self.lot_message("SUJET-LIBRE")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("project unreadable", proc.stderr)
+        with open(self.thread_path("A", "SUJET-LIBRE"), encoding="utf-8") as fh:
+            self.assertIn("Message lié au lot.", fh.read())
+        self.assertFalse(os.path.exists(self.thread_path("B", "SUJET-LIBRE")))
+
+    def test_all_broadcast_of_a_lot_is_grouped_in_the_lot_project(self):
+        self.project("orch", team="", chantier="")
+        self.project("dev1", chantier="A")
+        self.project("dev2", chantier="C")
+        lot = work.add(self.db, title="Diffusion", app="B")
+        proc = self.lot_message(lot["id"], dest="all")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.thread_path("B", lot["id"]), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("agent:dev1", text)
+        self.assertIn("agent:dev2", text)
+        for project in ("A", "C"):
+            self.assertFalse(os.path.exists(self.thread_path(project, lot["id"])))
 
     def test_no_project_refuses_without_lot_or_mail(self):
         proc = self.send_new()
@@ -103,9 +160,82 @@ class MailProjectTests(_Base):
         self.assertIn("empty project", proc.stderr)
         self.assertEqual(len(work.list_items(self.db)), 1)
         proc = self.mesh("work", "add", "--title", "Override", "--estimate", "1h",
-                         "--app", "explicit", env=env)
+                         "--app", "explicit", "--new-project", env=env)   # #506: undeclared
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.list_items(self.db)[0]["app"], "explicit")
+
+    # #506: an explicit project must be known on the three creation paths
+    def create(self, path, project, *options):
+        if path == "work add":
+            return self.mesh("work", "add", "--title", "W %s" % project, "--estimate", "1h",
+                             "--app", project, *options,
+                             env=self.env(AGENT_MAIL_NAME="dev1"))
+        if path == "mail":
+            return self.send_new("--app", project, *options)
+        return self.mesh("work", "backlog", "add", "--title", "B %s" % project,
+                         "--value", "kept", "--score", "30", "--app", project, *options,
+                         env=self.env(AGENT_MAIL_NAME="dev1"))
+
+    def test_unknown_explicit_project_is_refused_with_close_names(self):
+        work.add(self.db, title="Known", app="ameesh")
+        for path in ("work add", "mail", "backlog"):
+            with self.subTest(path=path):
+                proc = self.create(path, "ameeshh")
+                self.assertNotEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("unknown project 'ameeshh'", proc.stderr)
+                self.assertIn("close names: ameesh (1 letter apart)", proc.stderr)
+                self.assertIn("--new-project", proc.stderr)
+                proc = self.create(path, "zzz-nowhere")
+                self.assertNotEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("no close name", proc.stderr)
+        self.assertEqual([i["title"] for i in work.list_items(self.db)], ["Known"])
+        self.assertEqual(self.unread("dev1"), [])
+        with self.assertRaisesRegex(work.WorkError, "unknown project"):
+            work_projects.creation_project(self.cfg, self.db, "dev1", "ameeshh")
+        with self.assertRaisesRegex(work.WorkError, "unknown project"):
+            work_projects.mail_project(self.cfg, self.db, "orch", "dev1", "ameeshh")
+        for path in ("work add", "mail", "backlog"):
+            with self.subTest(path=path, project="known"):
+                proc = self.create(path, " ameesh ")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(work.list_items(self.db)[0]["app"], "ameesh")
+
+    def test_new_project_introduces_it_and_journals_who_did(self):
+        for path, project, actor in (("work add", "alpha", "dev1"), ("mail", "beta", "orch"),
+                                     ("backlog", "gamma", "dev1")):
+            with self.subTest(path=path):
+                proc = self.create(path, project, "--new-project")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                lot = work.list_items(self.db)[0]
+                self.assertEqual(lot["app"], project)
+                notes = " | ".join(e["note"] or "" for e in work.events(self.db, lot["id"]))
+                self.assertIn("project '%s' introduced by %s (--new-project)"
+                              % (project, actor), notes)
+                # known from now on: no flag needed, and no second introduction
+                proc = self.create(path, project)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                proc = self.create(path, project, "--new-project")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                again = work.list_items(self.db)[0]
+                self.assertNotIn("introduced", " ".join(
+                    e["note"] or "" for e in work.events(self.db, again["id"])))
+        self.assertEqual(len(self.unread("dev1")), 3)
+
+    def test_new_project_goes_with_an_explicit_project(self):
+        procs = {
+            "work add": self.mesh("work", "add", "--title", "W", "--estimate", "1h",
+                                  "--new-project", env=self.env(AGENT_MAIL_NAME="dev1")),
+            "mail": self.send_new("--new-project"),
+            "backlog": self.mesh("work", "backlog", "add", "--title", "B", "--value", "kept",
+                                 "--score", "30", "--new-project",
+                                 env=self.env(AGENT_MAIL_NAME="dev1")),
+        }
+        for path, proc in procs.items():
+            with self.subTest(path=path):
+                self.assertNotEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("--new-project goes with", proc.stderr)
+        self.assertEqual(work.list_items(self.db), [])
+        self.assertEqual(self.unread("dev1"), [])
 
     def test_work_add_uses_bound_creator_even_with_an_explicit_actor(self):
         self.project("dev1", team="bound")

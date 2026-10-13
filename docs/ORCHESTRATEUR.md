@@ -101,6 +101,10 @@ le numéro du lot.**
   `--new-lot "titre" --estimate 2h` confie en un seul geste, et rattache le
   courrier (qui porte la phrase de l'humain) au lot créé, mais sans priorité :
   `work add` reste préférable.
+* **Projet** : sans `--app`, le lot prend le projet de son créateur. Un
+  `--app` explicite doit nommer un projet connu (#506) ; une faute de frappe
+  est refusée avec les noms proches. Le premier lot d'un vrai nouveau projet
+  passe `--app <projet> --new-project`, et l'historique du lot l'inscrit.
 * **Répondre** en citant le lot : « Enregistré : lot #142, priorité haute,
   estimation 2 h. »
 * Une demande refusée ou remise à plus tard s'enregistre aussi : le lot se

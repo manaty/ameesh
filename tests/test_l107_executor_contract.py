@@ -139,6 +139,7 @@ class TableTest(unittest.TestCase):
         self.assertEqual(sorted(o for o in self.c.operations if o.startswith("actions.")),
                          ["actions.get", "actions.propose"])
         for refused in ("agents.upsert_unleased", "keys.register", "keys.revoke",
+                        "keys.register_human", "keys.owner_registrations", "keys.confirm",
                         "operations.listing", "leases.attach_claim"):
             with self.assertRaises(C.NotSupportedRemotely):
                 self.c.get(refused)

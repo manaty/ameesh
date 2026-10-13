@@ -131,13 +131,14 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         priority: int = DEFAULT_PRIORITY, source: str = "", team: str | None = None,
         required_capabilities=None, body: str = "", package: str | None = None,
         actor: str = "", app: str | None = None, creator: str | None = None,
-        cfg=None) -> dict:
+        cfg=None, new_project: bool = False) -> dict:
     """Ajoute un élément à la file. La valeur attendue est obligatoire : la
     file ne reçoit pas de travail pour occuper.
 
     `app` (L118c, #495): the item's project. Omitted, it is inherited from
     `creator` (default `actor`) as `work add` does; given, it must be a known
-    project (`work_projects.known_projects`)."""
+    project (`work_projects.known_projects`), unless `new_project` (#506)
+    introduces it, which the item's history records."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -155,13 +156,16 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         raise BacklogError("priority 1 (high), 2 (normal) or 3 (low): %r" % priority)
     from . import work, work_projects
     cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if new_project and app is None:
+        raise BacklogError("--new-project goes with --app <project>")
+    introduced = ""
     try:
-        project = work_projects.creation_project(cfg, db, creator or actor, app)
+        project = work_projects.creation_project(cfg, db, creator or actor, app,
+                                                 new_project=new_project)
         if app is not None and not project:
             raise BacklogError("--app: empty project")
-        if app is not None and project not in work_projects.known_projects(cfg, db):
-            raise BacklogError("unknown project %r (--app): neither a configured canon's "
-                               "nor `github.projects` nor a lot's project" % project)
+        if new_project:   # read before the item exists (it makes its project known)
+            introduced = work_projects.introduction(cfg, db, project, creator or actor)
     except work.WorkError as exc:
         raise BacklogError(str(exc)) from None
     fiche = None
@@ -173,7 +177,8 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         required_capabilities=_capabilities(required_capabilities) or None,
         package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        note="improvement backlog (value %d): %s" % (value_score, expected_value),
+        note="improvement backlog (value %d): %s%s" % (
+            value_score, expected_value, "; %s" % introduced if introduced else ""),
         actor=actor, app=project)
 
 
@@ -539,6 +544,9 @@ def add_parsers(work_sub, func) -> None:
     p_add.add_argument("--actor", default="")
     p_add.add_argument("--app", default=None,
                        help="its project (L118c); default: the creator's project")
+    p_add.add_argument("--new-project", action="store_true",
+                       help="#506: accept an --app project nobody declares yet "
+                            "(journaled on the item); refused otherwise")
     p_add.add_argument("--json", action="store_true")
     p_add.set_defaults(func=func)
     p_list = sub.add_parser("list", help="the backlog, in take order")
@@ -579,7 +587,8 @@ def run(db: Db, args, cfg=None) -> int:
                        package=args.package, actor=args.actor,
                        app=getattr(args, "app", None),
                        creator=binding.name if binding is not None and binding.ok
-                       else args.actor, cfg=cfg)
+                       else args.actor, cfg=cfg,
+                       new_project=getattr(args, "new_project", False))
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
