@@ -133,6 +133,24 @@ class MailLinksLotsTest(_Base):
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
         self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
 
+    def test_assigneur_historique_sans_lot_garde_l_avertissement(self):
+        # #1006 (N1 de la R1 codex3 sur #964) : la détection « a confié des
+        # lots récemment » ne sert plus à attribuer, mais l'avertissement L118
+        # reste dû quand l'assigneur historique écrit SANS option à un agent
+        # sans lot ouvert — le retour anticipé de #964 l'avait fait taire.
+        deja = work.add(self.db, title="déjà confié")
+        work.assign(self.db, deja["id"], "orch", actor="dev2")
+        self.assertTrue(assignments.is_orchestrator(self.cfg, self.db, "dev2"))
+        self.assertFalse(assignments.is_orchestrator(self.cfg, self.db, "dev2",
+                                                     history=False))
+        proc = self.send("dev1", "Une question sur ta revue.", "--from", "dev2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("dev1 has no open lot", proc.stderr)
+        self.assertEqual(len(self.unread("dev1")), 1)   # le message part quand même
+        # un expéditeur sans historique reste sans avertissement (inchangé)
+        proc = self.send("dev2", "Une question sur ta revue.", "--from", "dev1")
+        self.assertNotIn("has no open lot", proc.stderr)
+
     def test_assign_explicite_attribue(self):
         # le geste explicite `--assign` remplace la détection d'historique
         deja = work.add(self.db, title="déjà confié")

@@ -27,6 +27,9 @@ Correctif du 2026-10-13 (#964) : deux incidents (#688, #619) où le
 que l'expéditeur avait confié des lots dans les 30 derniers jours. Le
 `--lot` ne vaut plus détection d'assigneur récent ; l'attribution par
 courrier demande `--assign` ou un rôle d'orchestrateur déclaré.
+Correctif du 2026-10-13 (#1006) : la détection HISTORIQUE garde son
+avertissement L118 (un assigneur historique qui écrit sans option à un
+agent sans lot ouvert est averti) ; elle ne sert plus à attribuer.
 """
 from __future__ import annotations
 
@@ -148,6 +151,15 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                     item = None
                 if item is not None:
                     out.update(lot=item, work_item_id=str(item["id"]))
+                return out
+            # #1006 (N1 de la R1 codex3 sur #964) : la détection HISTORIQUE
+            # ne sert plus à attribuer, mais elle garde l'avertissement L118 —
+            # un assigneur historique qui écrit sans option à un agent sans
+            # lot ouvert doit toujours être averti (le retour anticipé de
+            # #964 l'avait fait taire). `has_open` est faux ici : le cas vrai
+            # est retourné juste au-dessus.
+            if is_orchestrator(cfg, db, sender):
+                _warn_no_open_lot(db, out, recipient, has_open)
             return out
         out["orchestrator"] = declared or is_orchestrator(cfg, db, sender)
     else:
@@ -207,12 +219,21 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         raise AssignmentError(str(exc)) from exc
     if item is not None:
         out.update(lot=item, work_item_id=str(item["id"]))
+    _warn_no_open_lot(db, out, recipient, has_open)
+    return out
+
+
+def _warn_no_open_lot(db, out: dict, recipient: str, has_open: bool) -> None:
+    """L118 : l'expéditeur est averti que le travail confié n'apparaîtra ni
+    dans `ameesh projects` ni dans les alertes, faute de lot ouvert chez le
+    destinataire. #1006 : ce chemin sert aussi au retour anticipé d'un
+    assigneur historique (la détection historique garde l'avertissement,
+    même si l'attribution, elle, exige désormais un rôle déclaré)."""
     if not has_open and not out["assigned"] and not _is_chat(db, recipient):
         out["warnings"].append(
             "%s has no open lot: this work will show up neither in ameesh projects "
             "nor in alerts — link it (--lot <id|ref>) or create it "
             "(--new-lot \"title\")" % recipient)
-    return out
 
 
 def _is_chat(db, name: str) -> bool:
