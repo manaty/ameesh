@@ -145,6 +145,28 @@ class ReleaseVerificationTest(unittest.TestCase):
         self.system.overrides[self.runner]['DropInPaths']='/etc/systemd/system/other.service.d/x.conf'
         with self.assertRaisesRegex(verification.VerificationError,'drop-in'): self.perform()
 
+    def test_template_and_instance_dropins_are_admitted(self):
+        # docs/EXPLOITATION.md installs the runner cap as the template drop-in
+        # ameesh-runner@.service.d/10-plafonds.conf; systemd merges it into every
+        # instance, alongside the instance's own drop-ins.
+        self.published()
+        paths=('/etc/systemd/system/ameesh-runner-agent@.service.d/10-plafonds.conf',
+               '/etc/systemd/system/'+self.runner+'.d/20-persona.conf')
+        for logical in paths:
+            dropin=self.root/logical.lstrip('/')
+            dropin.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+            dropin.write_text('[Service]\n'); dropin.chmod(0o644)
+        self.system.overrides[self.runner]['DropInPaths']=' '.join(paths)
+        receipt=self.perform()
+        self.assertEqual(receipt['units'],1)
+
+    def test_another_template_dropin_directory_is_refused(self):
+        self.published()
+        dropin=self.root/'etc/systemd/system/other@.service.d/x.conf'
+        dropin.parent.mkdir(mode=0o700,parents=True); dropin.write_text('[Service]\n'); dropin.chmod(0o644)
+        self.system.overrides[self.runner]['DropInPaths']='/etc/systemd/system/other@.service.d/x.conf'
+        with self.assertRaisesRegex(verification.VerificationError,'drop-in'): self.perform()
+
     def test_declared_capability_mismatch_is_refused(self):
         self.published()
         self.system.overrides[self.runner]['CapabilityBoundingSet']='CAP_SYS_ADMIN'

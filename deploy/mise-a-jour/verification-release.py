@@ -186,6 +186,24 @@ class HostConfiguration:
             candidate='/etc/systemd/system/'+unit
         return candidate if candidate in self.files.destinations.values() else None
 
+    @staticmethod
+    def _dropin_directories(unit):
+        """Every `.d` directory systemd reads for this unit, and no other.
+
+        For an instantiated unit, systemd merges the instance directory
+        (`foo@bar.service.d`) and the template directory (`foo@.service.d`);
+        the documented VM layout installs the runner cap as a template drop-in.
+        """
+        names=[unit]
+        if '@' in unit:
+            prefix=unit.split('@',1)[0]
+            kind=next((value for value in UNIT_SUFFIX if unit.endswith(value)),None)
+            if kind is not None:
+                names.append(prefix+'@'+kind)
+        return {root+name+'.d'
+                for root in ('/etc/systemd/system/','/usr/lib/systemd/system/','/run/systemd/system/')
+                for name in names}
+
     def _effective(self,unit,info):
         declared=self.card['properties'].get(unit,{})
         if not isinstance(info,dict) or set(info)!=set(BASE)|set(declared):
@@ -200,8 +218,7 @@ class HostConfiguration:
         expected=self._expected_fragment(unit)
         if expected is not None and info.get('FragmentPath')!=expected:
             raise VerificationError('enrolled unit is not the effective fragment')
-        directories={'/etc/systemd/system/'+unit+'.d','/usr/lib/systemd/system/'+unit+'.d',
-                     '/run/systemd/system/'+unit+'.d'}
+        directories=self._dropin_directories(unit)
         for drop in str(info.get('DropInPaths','')).split():
             path=self._safe(drop)
             if str(Path(path).parent) not in directories:
