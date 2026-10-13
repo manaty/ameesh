@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #987 — relance d'un job hébergé annulé faute de runner.
+#
+# GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
+# tentatives (« The job was not acquired by Runner of type hosted », contrainte
+# de capacité macOS arm64 : run 38428931108, job 115427733668, 13/10/2026). Le
+# job `platform-macos` de « tests » conclut alors `cancelled` sans qu'une seule
+# étape tourne ; l'agrégat requis `tests` le refuse (needs.platform-macos.result
+# == success), donc le check requis rougit sans défaut de code. L'API refuse de
+# rejouer le job tant que l'exécution tourne : la reprise doit venir d'ici,
+# APRÈS la conclusion — d'où le déclencheur `workflow_run`, et non une étape de
+# « tests ».
+#
+# La garde relit les jobs de l'exécution terminée (scripts/ci-relance-hosted.py)
+# et, si les seuls jobs en échec sont des jobs hébergés annulés avant leur
+# premier pas, rejoue les jobs en échec et leurs dépendants
+# (`rerun-failed-jobs`), une seule fois : la tentative suivante prouve si la
+# capacité est revenue. Un échec réel, une deuxième annulation ou une tentative
+# déjà relancée ne sont jamais masqués — le check reste rouge, un humain
+# tranche.
+#
+# Ce workflow s'exécute depuis la branche par défaut (le fichier doit y être
+# pour que `workflow_run` se déclenche) ; `actions/checkout` y prend donc le
+# code de la branche par défaut, jamais celui de la PR : le jeton `actions:
+# write` n'exécute que du code de confiance. Il tourne sur `ubuntu-latest`,
+# pas sur la flotte auto-hébergée saturée (#824) ni sur les runners macOS dont
+# la capacité manque.
+name: relance hosted
+
+on:
+  workflow_run:
+    workflows: ["tests"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  relance:
+    name: relance des jobs annulés faute de runner
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read   # actions/checkout, branche par défaut
+      actions: write   # rerun-failed-jobs
+    steps:
+      - uses: actions/checkout@v4
+      - name: décision et relance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci-relance-hosted.py
+          --run-id "${{ github.event.workflow_run.id }}"
+          --tentative "${{ github.event.workflow_run.run_attempt }}"
+          --conclusion "${{ github.event.workflow_run.conclusion }}"
+          --apply
