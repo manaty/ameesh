@@ -229,8 +229,11 @@ class AgentAliasTest(PgTestCase):
         p = self.mesh('set', 'old-worker', 'permission_mode=auto')
         self.assertEqual(p.returncode, 0, p.stderr)
         from ameesh.mesh_cli import _lit_etat
-        self.assertEqual(_lit_etat(self.cfg, 'worker', 'permission_mode'), 'auto')
-        self.assertFalse(_lit_etat(self.cfg, 'old-worker', 'permission_mode'))
+        self.assertEqual(json.loads(_lit_etat(self.cfg, 'worker', runner.PERMISSION_MODE_SETTING)), {
+            'harness': 'claude', 'incarnation': runner.agent_incarnation(registry.get(self.db, 'worker')),
+            'mode': 'auto',
+        })
+        self.assertFalse(_lit_etat(self.cfg, 'old-worker', runner.PERMISSION_MODE_SETTING))
         self.assertTrue(self.db.query("SELECT 1 FROM agent_name_resolutions WHERE operation='settings.permission_mode'"))
 
 
