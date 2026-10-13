@@ -14,6 +14,7 @@
 # une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
 # deux endroits différents du fichier, sans conflit.
 
+test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit

@@ -1482,6 +1482,16 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 0
+    from . import db_capacity
+    try:
+        capacity = db_capacity.read(db)
+        if capacity is not None:
+            print("connections: %s" % db_capacity.line(capacity))
+            if db_capacity.pressured(capacity):
+                verdict = 1
+    except db_mod.DbError:
+        print("connections: unavailable")
+        verdict = 1
     if notify_test:
         channel = "ameesh_doctor"
         listener = storage.of(db).wakeups.subscribe([channel])

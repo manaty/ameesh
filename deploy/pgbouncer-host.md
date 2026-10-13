@@ -1,0 +1,103 @@
+# Per-host session pooling (#653)
+
+This recipe is for **bureau**, after review, on `agents-1` and `agents-2`,
+under the Unix user running Ameesh. Agents prepare the files and tests;
+they do not install, switch configuration or restart services on these VMs.
+
+Use the Python from the installed Ameesh environment (with psycopg and psutil).
+The commands below assume it is `~/.local/share/ameesh/venv/bin/python3`.
+Unset DSN/config overrides before running them. Keep each host's output with
+the lot; the script prints no DSN, password or SQL statement text.
+
+Prerequisites: user systemd, a compiler, make, pkg-config, libevent and OpenSSL
+development files; Python 3.12+ (tar extraction filter); an on-disk private
+`TMPDIR`; a direct, TLS-enabled upstream DSN in `~/.config/ameesh/config.json`.
+If a dependency is missing, bureau handles its installation. No sudo appears
+in the recipe. A custom TLS certificate configuration needs explicit review.
+
+```sh
+mkdir -p "$HOME/.local/state/pgbouncer-build"
+chmod 700 "$HOME/.local/state/pgbouncer-build"
+export TMPDIR="$HOME/.local/state/pgbouncer-build"
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py measure --label before
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py install
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py verify
+```
+
+Installation refuses an existing configuration/service and does not overwrite
+an existing binary. Version 1.26.0 is compiled under `ameesh heavy --` from the
+[official archive](https://www.pgbouncer.org/downloads/files/1.26.0/pgbouncer-1.26.0.tar.gz),
+with pinned SHA256 `afd25dd61ee6775d37b40629b87ce08736b3e6955f3057bb212e410fbf21c71d`.
+The source download is capped at 32 MiB; the temporary build is removed.
+The service is started, **not enabled**. The binary lives in `~/.local/bin`,
+configuration in `~/.config/pgbouncer`, and private sockets/data in
+`~/.local/state/pgbouncer`. The password is loaded through libpq (including
+`.pgpass`) and written only to a 0600 userlist file. Local trust is restricted
+by the 0700 socket directory and 0600 Unix socket. There is no TCP listener.
+
+The [PgBouncer configuration reference](https://www.pgbouncer.org/config.html)
+defines session mode: a server session remains assigned until its client
+disconnects. This preserves LISTEN/NOTIFY and explicit transactions. Therefore
+pooling does **not** reduce the runner's two persistent sessions to one.
+The third and fourth connections observed on the PC belonged to auxiliary
+passes: their session lifetime spans external work even though each pass
+eventually closes its driver. `ScopedDb` releases these sessions between SQL
+operations; explicit transactions and independent gate/controller locks retain
+their sessions until completion. No transaction is shared across threads.
+
+The VM pool permits 32 ordinary server sessions and eight reserve sessions,
+with a total ceiling of 40. Clients have a ceiling of 200. Idle *unassigned*
+server sessions are closed after 30 seconds. These limits accommodate the
+present VM runner counts; bureau checks `2 × runner_count + burst headroom < 40`
+before switching. Increasing agent count beyond this capacity requires review.
+
+After the corrected runner release is available and installation verification
+passes, bureau switches and drains/restarts the runner units it manages:
+
+```sh
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py switch
+# Bureau drains/restarts the identified runner units, preserving active turns.
+# Wait for restart completion and at least 30 seconds of idle pool time.
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py measure --label after
+ameesh doctor --notify-test
+```
+
+The config backup is exclusive and 0600:
+`~/.config/ameesh/config.json.before-pgbouncer-653`. Switch/rollback write the
+configuration atomically with mode 0600. A running process keeps its original
+DSN until restart. No runner is restarted by the script.
+
+Before/after JSON records contain server-wide client count, `max_connections`,
+counts by client IP and state, local runner count and direct TCP connections
+per runner. When the pool is running, `SHOW CLIENTS` Unix peer PIDs identify
+pooled sessions per runner, and `SHOW SERVERS` distinguishes unassigned server
+sessions. They include the measurement connection, which closes immediately.
+Counts cover every database on the server. Distinguish child CLI traffic and
+unassigned idle pool sessions from resting runner sessions: after the idle
+timeout, a quiet host should have **at most two sessions per runner**. Capture
+an additional observation if a gate transaction or a child CLI was active.
+Retain the exact runner version and count, and the observation's timestamp,
+with the host result. The production before/after verdict is delivered only
+after bureau runs these commands; unit tests are not production measurements.
+
+`ameesh alerts` warns at **70%** of the server's configured max_connections,
+including equality (210 of 300). It is a default urgent notification;
+`doctor` prints used/max/idle and returns KO at that threshold. Explicit custom
+notification type filters still apply. Mediated clients do not run SQL probes.
+
+Rollback, by bureau:
+
+```sh
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py rollback
+# Drain/restart runner units so every process uses the restored direct DSN.
+# Then, and only then:
+systemctl --user stop ameesh-pgbouncer.service
+~/.local/share/ameesh/venv/bin/python3 deploy/pgbouncer-host.py measure --label rollback
+```
+
+Rollback retains the exclusive backup and installation for diagnosis. If the
+installation failed before switch, the Ameesh config is untouched: stop the
+service, then bureau may remove only files created by this recipe after checking
+that no client uses its socket. Never delete an existing #532 installation.
+Build errors are suppressed to keep operator logs secret-free; rerun configure
+and `make -j2 pgbouncer` privately to diagnose missing build dependencies.

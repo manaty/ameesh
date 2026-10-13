@@ -5325,7 +5325,8 @@ class Runner:
         db = None
         ok = True
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             db_mod.require_schema(db)
             # L42 (0031) : chaque canon configuré est relu et synchronisé à chaque
             # passe, le canon par défaut d'abord ; une erreur dans l'un n'empêche
@@ -5480,7 +5481,8 @@ class Runner:
         db = None
         releves = 0
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             for source, compte in paires:
                 try:
                     releves += len(balance_mod.record(db, source, compte,
@@ -5537,7 +5539,8 @@ class Runner:
                 return None
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             gate = self.host_gate
             reading = resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
                                             gate=gate.snapshot() if gate is not None else None)
@@ -5677,7 +5680,8 @@ class Runner:
         from . import resources as resources_mod
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             en_tour = self.agents_in_turn()
             try:
                 busy = bool(en_tour) or storage.of(db).hosts.turns_in_progress(self.host) > 0
@@ -5730,7 +5734,8 @@ class Runner:
         from . import plan_git
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             report = plan_git.sync_branches(
                 db, host=self.host, agents=set(self.agents_filter) if self.agents_filter
                 else None, dry_run=self.dry_run, actor="runner %s" % self.runner_id)
@@ -6230,7 +6235,8 @@ class Runner:
         self._versions_due = now + versions_mod.PROBE_INTERVAL_S
         db = None
         try:
-            db = db_mod.connect(self.cfg)
+            from .scoped_db import ScopedDb
+            db = ScopedDb(self.cfg)
             served = {r.get("harness") for r in self.served_rows(db)} - {None, ""}
             return versions_mod.probe_and_record(db, self.host, served)
         except Exception as exc:  # never fatal for the runner
