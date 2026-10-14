@@ -8,9 +8,14 @@
 **Le balayage** (`sweep`, servi par `ameesh work wip`) rend à la file
 d'équipe les lots d'un agent au-delà du plafond, en commençant par les MOINS
 RÉCEMMENT ACTIFS (`last_activity_ts` : ligne du lot, journal, jalons, actions,
-courrier lié). Il est **idempotent** : un second passage ne trouve plus rien,
-n'écrit rien et n'envoie pas de courrier. `--apply` écrit ; sans lui, c'est un
-`--dry-run` qui montre ce qui serait rendu, sans mutation.
+courrier lié). Il lit les lots en `build` par une requête dédiée
+(`build_lots_activity`), sans plafond global de lots ouverts. Chaque retour est
+revalidé sous le verrou de l'agent (`unassign_surplus`) : lot encore en
+`build`, encore assigné, sans exception pilote, et surplus encore réel — deux
+balayages concurrents ne rendent donc jamais plus que le surplus. Il est
+**idempotent** : un second passage ne trouve plus rien, n'écrit rien et
+n'envoie pas de courrier. `--apply` écrit ; sans lui, c'est un `--dry-run` qui
+montre ce qui serait rendu, sans mutation.
 
 Le balayage est branché sur `ameesh notify` (`--wip-max-returns N`, ou
 `AMEESH_WIP_MAX_RETURNS`) mais **coupé par défaut** (0) : l'activation du
@@ -20,7 +25,8 @@ stade. Sans `--wip-apply`, un passage de notify est un `--dry-run` (il ne rend
 rien) ; le `--dry-run` global de notify le force aussi. Le geste explicite
 `ameesh work wip --apply` reste le seul balayage mutant disponible ici.
 
-Le retour est une **restitution CAS** (`work.unassign`) : le lot doit encore
+Le retour est une **restitution CAS** (`work.unassign`, `states=RETURN_STATES`
+pour le geste manuel ; `unassign_surplus` pour le balayage) : le lot doit encore
 porter l'assigné lu, sinon rien n'est écrit ; le journal du lot dit qui rend,
 pourquoi et l'état de l'agent. Branche, tête de branche, gels et avis
 (jalons) restent : le lot garde son état `build`, donc un agent libre le
@@ -32,8 +38,12 @@ sont pas touchés, un humain n'est pas un agent.
 <agent> --wip-exception "raison"` (humain ou orchestrateur/agent de
 conception, `work.is_pilot`) écrit le marqueur `work.WIP_EXCEPTION_MARK` dans
 la dernière attribution ; le balayage laisse alors ce lot en place. Une
-réassignation postérieure sans marqueur l'efface. Jamais d'exemption
-silencieuse de qui a assigné le lot.
+attribution postérieure sans marqueur l'efface — toutes en font partie
+(attribution, délégation, prises automatiques, reprise budget,
+`storage.interface.ASSIGN_NOTE_PREFIXES`). Jamais d'exemption silencieuse de
+qui a assigné le lot. `work assign` sur le MÊME assigné avec une branche ne
+réattribue pas : seule la branche est posée, la délégation en cours et
+l'exception restent.
 """
 from __future__ import annotations
 
@@ -47,8 +57,6 @@ from .db import Db
 SENDER = "ameesh"
 #: lots rendus au plus par passage (borne le courrier et les écritures)
 DEFAULT_MAX_RETURNS = 10
-#: lots ouverts lus par le balayage (les plus anciennement actifs d'abord)
-OPEN_LIMIT = 1000
 #: début de la note de journal d'une restitution (un lot `build` ainsi rendu
 #: redevient prenable : `storage.interface.RETURNED_NOTE`)
 RETURN_NOTE = work.RETURN_NOTE
@@ -84,8 +92,16 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
 
     Les agents sont parcourus dans l'ordre des noms, leurs lots en surplus du
     moins récemment actif au plus récent ; `limit` borne les retours d'un
-    passage (0 : aucun). Un lot déjà rendu (ou repris entre-temps) ne compte
-    pas."""
+    passage (0 : aucun). La lecture est dédiée aux lots en `build`
+    (`build_lots_activity`) : aucun plafond global de lots ouverts ne peut
+    masquer le surplus d'un agent.
+
+    Chaque retour est REVALIDÉ sous le verrou de l'agent (`unassign_surplus`) :
+    état `build`, assigné inchangé, aucune exception pilote, et l'agent dépasse
+    encore le plafond en lots sans exception. Un lot qui a bougé, une exception
+    posée entre la lecture et l'écriture ou un agent redescendu au plafond par
+    un balayage concurrent ne rendent donc rien ; un lot déjà rendu (ou repris
+    entre-temps) ne compte pas."""
     from . import mail
 
     out: list = []
@@ -93,10 +109,9 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
         return out
     st = storage.of(db)
     builds: dict = {}
-    for row in st.operations.open_lots_activity(OPEN_LIMIT):
+    for row in st.operations.build_lots_activity(None):
         assignee = (row.get("assignee") or "").strip()
-        if (row.get("state") != "build" or not assignee
-                or assignee.startswith(work.HUMAN_PREFIX)):
+        if not assignee or assignee.startswith(work.HUMAN_PREFIX):
             continue                    # un humain n'est pas un agent
         builds.setdefault(assignee, []).append(row)
     for agent in sorted(builds):
@@ -110,23 +125,32 @@ def sweep(cfg, db: Db, *, dry_run: bool = False, limit: int = DEFAULT_MAX_RETURN
         if excess <= 0:
             continue
         free.sort(key=lambda l: (_activity(l), int(l["id"])))
+        rendus = 0
         for row in free:
-            if excess <= 0 or (limit is not None and len(out) >= int(limit)):
+            if limit is not None and len(out) >= int(limit):
+                break
+            if rendus >= excess:        # le surplus lu est rendu pour ce passage
                 break
             item = work.get(db, int(row["id"]))
             if item is None:            # fermé entre la lecture et le retour
                 continue
             if dry_run:
-                excess -= 1
+                rendus += 1
                 out.append({"item": item, "agent": agent, "message_id": None,
                             "dry_run": True, "activity_ts": _activity(row)})
                 continue
             note = ("%s by %s (§4: %d lots in build, at most %d kept) — least recently "
                     "active" % (RETURN_NOTE, actor, len(lots), work.BUILD_LIMIT))
-            done = st.work.unassign(int(item["id"]), current=agent, note=note, actor=actor)
-            if done is None:            # le lot a bougé : rien écrit, on réessaiera
+            done = st.work.unassign_surplus(int(item["id"]), current=agent,
+                                            marker=work.WIP_EXCEPTION_MARK,
+                                            prefixes=work.ASSIGN_NOTES,
+                                            max_build=work.BUILD_LIMIT,
+                                            note=note, actor=actor)
+            if done is None:            # lot bougé, exception, ou plus de surplus
+                if st.work.count_builds(agent) <= work.BUILD_LIMIT:
+                    break               # l'agent est redescendu au plafond
                 continue
-            excess -= 1
+            rendus += 1
             message_id = mail.send(
                 db, SENDER, agent, return_message(done, len(lots)), kind="event",
                 work_item_id=str(done["id"]),
@@ -167,8 +191,9 @@ def add_parsers(work_sub, func) -> None:
                    help="default: the session's bound identity (AGENT_MAIL_NAME)")
     p.set_defaults(func=func)
     p_ret = work_sub.add_parser(
-        "return", help="return a lot to the team queue (§4): assignment removed, "
-                       "branch/SHA/reviews kept, a free agent can take it again")
+        "return", help="return an intake or build lot to the team queue (§4): "
+                       "assignment removed, branch/SHA/reviews kept, a free agent "
+                       "can take it again")
     p_ret.add_argument("id", type=int)
     p_ret.add_argument("--reason", default="",
                        help="why it is handed back (journaled)")
