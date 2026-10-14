@@ -101,6 +101,8 @@ ARGS = {  # op: (args, kwargs, résultat)
  "turn_resources.close_turn": (["turn-77"], {"orphan": False}, None),
  "turn_resources.running_started_before": ([HOST, 1791640000.0], {"after_id": 0, "limit": 200}, []),
  # Subscription is rendered below as GET /events, never as an /op case.
+ # The entry is kept for completeness of the table (one row per contract
+ # op): the loop below skips the "events" transport and never consumes it.
  "wakeups.subscribe": ([list(E.CHANNELS)], {}, None),
  "hosts.record": ([READING], {}, dict(READING_ROW)),
  "hosts.latest": ([HOST], {}, dict(READING_ROW)),
@@ -168,6 +170,9 @@ for name, op in c.operations.items():
                       C.OpResult(value, TS).to_json(), route=route, token=token, key=key))
     if name == "threads.index":
         uncounted = C.OpRequest(name, tuple(args), {**kwargs, "count": False}, fence)
+        # Historical literal Idempotency-Key of threads.index/not-counted,
+        # already frozen in threads.json: kept verbatim, never recomputed,
+        # so the golden JSON does not change.
         cases.append(case(name + "/not-counted", name, uncounted.to_json(), 200,
                           C.OpResult(value, TS).to_json(), route=route, token=token,
                           key="1e3e18c3-da1e-5396-8b24-aa2548f1dc06"))
