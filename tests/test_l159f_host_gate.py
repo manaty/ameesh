@@ -22,7 +22,7 @@ from ameesh import background, capacity_guard, config as config_mod, host_gate, 
 from ameesh import relocation, storage
 from ameesh.runner import AgentWorker
 
-from .support import REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase
 
 GOLDEN = os.path.join(REPO, "tests", "dore", "capacity_guard")
 
@@ -119,7 +119,7 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(capacity_guard.ACK_PATH, "/run/ameesh-gate/ack/ack.json")
 
     def test_environment(self):
-        env = {"AMEESH_CONFIG": "/nulle-part.json", "AMEESH_HOST_GATE": "File",
+        env = {"AMEESH_CONFIG": EMPTY_CONFIG, "AMEESH_HOST_GATE": "File",
                "AMEESH_HOST_GATE_FALLBACK": "stopped", "AMEESH_HOST_GATE_DRAIN": "45",
                "AMEESH_HOST_GATE_PATH": "/g/state/state.json"}
         cfg = config_mod.load(env=env)
