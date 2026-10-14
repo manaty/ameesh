@@ -14,17 +14,27 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `docs/design/decisions/0018-vitesse-des-agents.md`.
 - **Tests** : la suite tourne sur un vrai Postgres avec les deux pilotes ;
   `scripts/test.sh` en local (ou `scripts/test-parallele.sh -n 4`, en parts
-  parallèles), l'intégration continue sur chaque PR : psycopg complet et psql
-  sur les modules de `tests/parts/pilote-psql.txt`, en 3 parts pour rester sous
-  le plafond de 30 min des hôtes auto-hébergés mutualisés (#947) ; le psql
-  complet tourne sur `main` et `release/*`. Un module de test qui touche la
-  couche base ou un comportement propre à un pilote s'ajoute à cette liste. Une PR qui ne change
+  parallèles), l'intégration continue sur chaque PR : les tests impactés et le
+  contrat (`tests/parts/toujours.txt` : droits, rôles, migrations), en une à
+  quatre parts psycopg et une à trois parts psql pour rester sous les plafonds
+  des hôtes auto-hébergés mutualisés (#947, L1211) ; la suite complète tourne
+  sur `main`, `release/*` et `integration/*`, et remplace la sélection dès
+  qu'elle ne peut pas décider. Une **PR de release** — source ou cible sous
+  `release/*` ou `integration/*` — garde la suite complète, les deux pilotes,
+  sans voie version seule ni documentation seule ni liste pilote psql, y
+  compris dans le plan de repli (canon §3) ; le plan reçoit pour cela les
+  branches source et cible (`--base-ref`, `--head-ref`). Un module de test qui
+  touche la couche base ou un comportement propre à un pilote s'ajoute à
+  `tests/parts/pilote-psql.txt` ;
+  un test de contrat (droits, rôles, migrations, objet global du cluster)
+  s'ajoute à `tests/parts/toujours.txt`. Une PR de lot qui ne change
   **que le numéro de version** (`pyproject.toml` seul, la seule ligne
   `version = "…"`) ne relance pas la suite : `main` l'a déjà validée pour ce
   contenu ; le contrôle « tests » reste vert (`scripts/version-only.py`, L157).
 - **PR de documentation seule** (L161a) : si chaque fichier changé est sous
   `docs/` ou `site/`, ou un `*.md` hors de `src/`, `tests/`, `.github/` et
-  `examples/`, la CI ne passe que les tests qui lisent la documentation,
+  `examples/`, la CI d'une PR de lot ne passe que les tests qui lisent la
+  documentation,
   sans base (« lecteurs de la doc », moins d'une minute). Un test qui ouvre
   un fichier de `docs/` ou `site/` se déclare dans
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
