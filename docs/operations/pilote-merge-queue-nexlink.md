@@ -396,15 +396,15 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    du profil ; le socle court proposé le 14/10 06:05Z n'existait pas) :
 
    ```bash
-   ameesh --version                              # attendu : 1.10.0
+   ameesh --version                              # attendu : 1.10.0 (aucun tag v1.10.0 dans le dépôt : le build se pinçe par l'import ci-dessous)
    node --version                                # attendu : 26.8.1
    gh auth status                                # lecture CI + fusion des PR manaty/nexlink
    git -C "$REPO" rev-parse --show-toplevel      # attendu : /home/smichea/development/manaty/nexlink
    git -C "$REPO" rev-parse --is-bare-repository # attendu : false
    git -C "$REPO" remote get-url origin          # attendu : git@github.com:manaty/nexlink.git
    git -C "$REPO" fetch --prune origin           # prouve l'accès du compte au dépôt
-   "$AMEESH_PY" -c "from ameesh import radar; print('land' in radar.PROJECT_KEYS, 'generated' in radar.PROJECT_KEYS)"
-   # attendu : True True
+   "$AMEESH_PY" -c "from ameesh import radar, land, merge_queue; print(radar.LAND_MODES, 'land' in radar.PROJECT_KEYS, 'generated' in radar.PROJECT_KEYS)"
+   # attendu : ('off', 'local', 'pr') True True  (les modules d'atterrissage et de file doivent s'importer)
    test -f "$SRC"                                # le socle doit exister
    test -n "$ZZ" || echo "zz introuvable : NE RIEN ÉCRIRE, stratégie à revoir"
    echo "drop-in porteur : $DROPIN"              # même répertoire que zz, nom post-zz
