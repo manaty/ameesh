@@ -1,0 +1,58 @@
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index 20f9bb83..a4f738b9 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -3241,6 +3241,35 @@ comment la fusion a été constatée (« fusion constatée par le relevé des
+ fusions, commit de fusion de origin/develop qui porte « ameesh-work: 93 »
+ (« … ») (commit …) »).
+ 
++**Cible réelle du projet** (#746). Ni le lot (`branch_target`) ni le dépôt
++(`git config ameesh.target`) ne déclarent de cible, et `origin/HEAD` — figé
++à la création du clone — dit `main` alors que l'équipe fusionne sur
++`develop` : le relevé essaie ensuite les refs d'intégration du remote
++`origin`, dans cet ordre : `develop`, `main`, `master`, puis `release/*` de
++la plus récente à la plus ancienne (au plus 8). Liste blanche fermée : ni
++une branche de travail (`agent/`, `lot/`, `review/`, `pr/`, `docs/`, `fix/`,
++`integrate/`…, où une fusion n'est qu'un empilement), ni un autre remote,
++aucun `fetch`.
++
++La fermeture hors cible demande une **citation** : trailer
++`ameesh-work: <id>` (ou `#<id>` si le dépôt l'active), ou citation à nom
++entier de la branche du lot, dans un commit de fusion postérieur à la
++création du lot, jamais une fusion partielle (`ameesh-work-partial`) ni une
++PR dont le corps est illisible. Un lot à **branche enregistrée** n'est cité
++que par une fusion qui a réellement fusionné cette branche (deuxième parent
++= sa pointe). Le compte rendu (`--json`) porte la ref trouvée et
++`off_target` (la cible par défaut qui ne la portait pas) ; la note du lot
++dit quoi déclarer :
++
++```
++git config ameesh.target origin/develop
++```
++
++Une cible **déclarée** reste seule à foi : une citation trouvée sur une
++autre ref d'intégration ne ferme pas le lot — elle pose une note au lot et
++un message à l'assigné (une fois par observation), comme une ref
++d'intégration illisible. Le résidu n'est jamais silencieux.
++
+ **Déclarer une fusion à la main** (correctif du 2026-10-11) :
+ 
+ ```
+diff --git a/docs/ORCHESTRATEUR.md b/docs/ORCHESTRATEUR.md
+index c99f574e..2f7c6987 100644
+--- a/docs/ORCHESTRATEUR.md
++++ b/docs/ORCHESTRATEUR.md
+@@ -301,7 +301,12 @@ git merge --no-ff agent/claude1-veille -m "Merge #93 COMPUTE-IDLE" -m "ameesh-wo
+   ameesh.target origin/develop` (fusions poussées puis récupérées) ou
+   `develop` (fusions faites dans ce clone) quand l'équipe n'intègre pas sur
+   la branche par défaut. Une cible introuvable est une erreur du relevé,
+-  visible dans `ameesh work sync-branches`.
++  visible dans `ameesh work sync-branches`. Sans cible déclarée, le relevé
++  suit la cible réelle du projet (#746) : `develop`, `main`, `master` puis
++  `release/*` sont essayés, et une fusion citante y ferme le lot, la note
++  disant la ref trouvée. Une cible déclarée reste seule à foi : une fusion
++  constatée ailleurs n'est que signalée (note au lot, message à
++  l'assigné), jamais fermée.
+ 
+ Le relevé passe toutes les 5 min dans le dossier de travail de l'assigné :
+ le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le

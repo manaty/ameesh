@@ -1,0 +1,4 @@
+$ git diff --stat 54ef68d20e8b2f59f108c8b7a0462e82f91049e4 7e92f805265393f4e8071425179919e131bb1637 -- docs/EXPLOITATION.md docs/ORCHESTRATEUR.md
+ docs/EXPLOITATION.md  | 29 +++++++++++++++++++++++++++++
+ docs/ORCHESTRATEUR.md |  7 ++++++-
+ 2 files changed, 35 insertions(+), 1 deletion(-)
