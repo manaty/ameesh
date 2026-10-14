@@ -33,7 +33,9 @@ MODE=
 APPROVE_PID=
 
 export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
-export AMEESH_CONFIG="$WORK/absent.json" AGENT_MESH_CONFIG="$WORK/absent.json"
+# fichier VIDE mais existant : un chemin explicite absent est refusé (#1127)
+printf '{}\n' > "$WORK/config-vide.json"
+export AMEESH_CONFIG="$WORK/config-vide.json" AGENT_MESH_CONFIG="$WORK/config-vide.json"
 export AMEESH_APPROVE_CONFIG="$WORK/absent.json"
 export AMEESH_STATE="$WORK/etat" AGENT_MAIL_STATE="$WORK/v0" AGENT_MAIL_CONFIG="$WORK/conf"
 export AMEESH_BIN_DIR="$REPO/tests/fakebin" AMEESH_TEST_LOG="$WORK/tours.jsonl"

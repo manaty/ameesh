@@ -1270,9 +1270,10 @@ class Notifier:
     def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
         orchestrateurs et à l'auditeur, avec l'action attendue
-        (`alert_briefs`). Une fois à la levée, une relance si l'alerte dure
-        `REMIND_AFTER_S` ; indépendant de `notify.types` (qui ne règle que
-        l'humain). Jamais fatal au passage."""
+        (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 : il le lit
+        à sa passe, `ameesh alerts --json`). Une fois à la levée, une relance
+        si l'alerte dure `REMIND_AFTER_S` ; indépendant de `notify.types` (qui
+        ne règle que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
         alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
         for key in list(sent):

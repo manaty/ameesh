@@ -346,16 +346,22 @@ section « Base distante ».
 Install (or upgrade an existing install, which also pulls psycopg):
 
 ```bash
-python3 -m venv ~/.local/share/ameesh/venv
-~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>
+uv tool install "git+https://github.com/manaty/ameesh@main"   # or a pinned tag/commit
 ameesh doctor          # driver, schema, and — for a remote database — latency
 ```
+
+The older venv route still works:
+`python3 -m venv ~/.local/share/ameesh/venv && ~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>`.
+Platform state and upgrades: [`site/docs/guides/install.md`](site/docs/guides/install.md).
 
 ## Tests
 
 ```bash
 scripts/test.sh                      # starts the container, runs the suite twice
 scripts/test.sh tests.test_runner    # one module
+scripts/test.sh tests.test_runner tests.test_mail   # several modules
+scripts/test.sh -p 'test_runner*.py'  # discovery by filename
+scripts/test.sh -k 'test_stop'        # discovery filtered by test name
 scripts/test.sh tests.test_bout_en_bout   # the v1 end-to-end test (spec §13)
 scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwaway Postgres container each
 ```
@@ -363,9 +369,10 @@ scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwawa
 CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
 on the measured durations of `tests/parts/durees.json`): on a pull request,
 `psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
-`tests/parts/pilote-psql.txt`; the full `psql` suite (6 parts) runs on pushes
-to `main` and `release/*`. The `tests` job aggregates the parts. Each part
-streams its results, one JSON line per test (`--flow`, schema
+`tests/parts/pilote-psql.txt`, in 3 parts so that each one stays under the
+30-minute job cap on the shared self-hosted hosts (#947); the full `psql` suite
+(6 parts) runs on pushes to `main` and `release/*`. The `tests` job aggregates
+the parts. Each part streams its results, one JSON line per test (`--flow`, schema
 `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
 the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
 test → code map once per run (`scripts/test-plan.py`, L161f) and every part

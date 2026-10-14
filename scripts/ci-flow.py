@@ -47,6 +47,23 @@ s'arrête à la ligne `fin`. `close` (étape `if: always()`) le termine dans
 tous les cas, et le crée s'il n'existe pas encore. Sans jeton, ou si GitHub
 refuse (PR d'une fourche : jeton en lecture seule), rien n'est publié et
 l'étape reste verte : la publication n'est jamais une cause d'échec.
+
+#899 — le plafond du job reste borné (canon §3), mais la part qui grandit
+avec la suite doit prévenir avant de l'atteindre : `publish --plafond-min N
+--debut T` (le plafond du job, égal à son `timeout-minutes`, et son début en
+epoch, écrit par l'étape « début du job ») publie **une fois** une alerte à
+`ALERTE_SEUIL` (80 %) du plafond, en tête du titre et du résumé du check run
+et en ligne JSON `type: alerte`. L'alerte ne change jamais la conclusion de
+la part, et une valeur absente ou illisible ne publie rien. `summary` affiche
+en plus, sur chaque part, la part du plafond consommée à la fin du job
+(« Plafond du job : … sur N min (P %) »), avec un ⚠ au-delà du seuil : c'est
+la mesure qui montre la croissance de la suite d'une exécution à l'autre.
+
+#1044 — un nombre non fini (NaN, ±infini, ou un débordement de conversion)
+n'est jamais un nombre : il est refusé comme illisible, avant tout calcul et
+toute écriture. Et quand la part n'a pas de durée finale attestée (interrompue
+sans ligne `fin`), `summary` donne la durée « au moment de l'alerte » et le
+dit, au lieu de la présenter comme une durée de fin de part.
 """
 from __future__ import annotations
 
@@ -54,6 +71,7 @@ import argparse
 import collections
 import datetime
 import json
+import math
 import os
 import pathlib
 import sys
@@ -65,6 +83,11 @@ SCHEMA = "ameesh-test-event/1"
 FAILURES = ("echec", "erreur")
 #: tests listés au plus dans le résumé, par catégorie
 LIMIT = 20
+#: #899 : part du plafond du job où l'alerte est publiée (80 %)
+ALERTE_SEUIL = 0.80
+#: #899 : plafond du job (minutes, = timeout-minutes) et début du job (epoch)
+ENV_PLAFOND = "AMEESH_PLAFOND_MIN"
+ENV_DEBUT = "AMEESH_JOB_DEBUT"
 
 
 def read(chemin: str | pathlib.Path) -> tuple[list[dict], int]:
@@ -96,6 +119,81 @@ def _duration(s: float) -> str:
     return f"{s:.1f} s" if s < 60 else f"{int(s // 60)} min {int(s % 60):02d} s"
 
 
+def _nombre(valeur) -> float | None:
+    """Un nombre fini d'option, d'environnement ou d'état, ou None s'il est
+    absent, illisible ou non fini (#1044 : NaN, ±infini et débordement)."""
+    try:
+        nombre = float(valeur)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return nombre if math.isfinite(nombre) else None
+
+
+def _minutes(valeur) -> str:
+    return "%g" % float(valeur)
+
+
+def _horodatage(ts: float) -> str:
+    """Un epoch en `ts` de flux (UTC, millisecondes), comme `test-parts.py`."""
+    return (datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+
+
+def alerte_plafond(debut, plafond_min, maintenant: float,
+                   contexte: dict | None = None) -> dict | None:
+    """#899 — l'alerte à `ALERTE_SEUIL` du plafond du job, ou None avant le seuil.
+
+    `debut` (epoch, début du job) et `plafond_min` (le `timeout-minutes` du
+    job) viennent du workflow ; absents ou illisibles, il n'y a pas d'alerte
+    (jamais d'échec pour autant)."""
+    debut, plafond = _nombre(debut), _nombre(plafond_min)
+    if not debut or not plafond or plafond <= 0:
+        return None
+    ecoule = maintenant - debut
+    if ecoule < ALERTE_SEUIL * plafond * 60.0:
+        return None
+    alerte = {"v": 1, "schema": SCHEMA, "type": "alerte", "seuil": ALERTE_SEUIL,
+              "ecoule_s": round(ecoule, 1), "plafond_min": plafond,
+              "ts": _horodatage(maintenant)}
+    alerte.update(contexte or {})
+    return alerte
+
+
+def contexte_de(events: list[dict]) -> dict:
+    """Le contexte de la part (depot, tete, execution, part), porté par l'alerte."""
+    debut = next((e for e in events if e.get("type") == "debut"), {})
+    return {cle: debut[cle] for cle in
+            ("depot", "tete", "fusion", "execution", "part", "pilote") if debut.get(cle)}
+
+
+def seuil_pourcent(alerte: dict) -> int:
+    """Le seuil de l'alerte en pourcentage entier (80 par défaut)."""
+    return round((_nombre(alerte.get("seuil")) or ALERTE_SEUIL) * 100)
+
+
+def texte_alerte(alerte: dict) -> str:
+    """Le texte lisible de l'alerte (résumé du check run, résumé du job)."""
+    return ("⚠ %d %% du plafond du job atteint : %s écoulées sur %s min."
+            % (seuil_pourcent(alerte),
+               _duration(_nombre(alerte.get("ecoule_s")) or 0.0),
+               _minutes(_nombre(alerte.get("plafond_min")) or 0)))
+
+
+def etat_publication(chemin) -> dict:
+    """L'état écrit par `publish` à côté du flux (`F.jsonl.check`), ou {}."""
+    try:
+        etat = json.loads(pathlib.Path(str(chemin) + ".check").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return etat if isinstance(etat, dict) else {}
+
+
+def alerte_de(etat: dict) -> dict | None:
+    """L'alerte de plafond portée par un état de publication, si c'en est une."""
+    alerte = (etat or {}).get("alerte")
+    return alerte if isinstance(alerte, dict) else None
+
+
 def summary(chemins: list[str]) -> str:
     """Résumé Markdown d'un ou plusieurs fichiers de flux."""
     check_output: list[str] = []
@@ -120,6 +218,33 @@ def summary(chemins: list[str]) -> str:
         if illisibles:
             check_output[-1] += f" ; {illisibles} ligne(s) illisible(s)"
         check_output.append("")
+        # #899 : la part du plafond consommée, mesure de la croissance de la suite
+        publication = etat_publication(chemin)
+        plafond = _nombre(publication.get("plafond_min"))
+        alerte = alerte_de(publication)
+        fin_ecoule = _nombre(publication.get("fin_ecoule_s"))
+        ecoule_alerte = _nombre(alerte.get("ecoule_s")) if alerte else None
+        if plafond and fin_ecoule is not None:
+            part_du_plafond = fin_ecoule / (plafond * 60.0)
+            ligne = ("%sPlafond du job : %s à la fin de la part sur %s min (%.0f %%)"
+                     % ("⚠ " if alerte or part_du_plafond >= ALERTE_SEUIL else "",
+                        _duration(fin_ecoule), _minutes(plafond), 100 * part_du_plafond))
+            if alerte:
+                ligne += " — alerte à %d %% publiée dans le check run." % seuil_pourcent(alerte)
+            elif part_du_plafond >= ALERTE_SEUIL:
+                ligne += " — seuil de %d %% atteint." % round(ALERTE_SEUIL * 100)
+            else:
+                ligne += "."
+            check_output.append(ligne + "\n")
+        elif plafond and ecoule_alerte is not None:
+            # #1044 : sans `fin_ecoule_s`, la durée de l'alerte n'atteste pas la
+            # fin de la part (interruption, annulation) : ne pas la présenter
+            # comme telle.
+            part_du_plafond = ecoule_alerte / (plafond * 60.0)
+            check_output.append(
+                "⚠ Plafond du job : %s écoulées au moment de l'alerte sur %s min (%.0f %%)"
+                " — durée finale non attestée (part sans ligne de fin).\n"
+                % (_duration(ecoule_alerte), _minutes(plafond), 100 * part_du_plafond))
         classes = debut.get("classes", {})
         touches = [m for m in debut.get("modules", []) if classes.get(m, "P3") != "P3"]
         impacted = next((e for e in events if e.get("type") == "impacted"), None)
@@ -187,11 +312,15 @@ def _failure_line(ev: dict, lignes: int | None, attempt: int) -> str:
     return json.dumps(ev, ensure_ascii=False)
 
 
-def check_output(events: list[dict], attempt: int = 1) -> dict:
+def check_output(events: list[dict], attempt: int = 1,
+                 alerte: dict | None = None) -> dict:
     """`output` du check run : titre, résumé, et le bloc des échecs.
 
     `attempt` est l'attempt GitHub de la part (défaut 1) : il est porté par
-    chaque ligne d'échec publiée (#901)."""
+    chaque ligne d'échec publiée (#901).
+    `alerte` (#899) : l'alerte de plafond, une fois publiée ; elle se voit dans
+    le titre et le résumé, et voyage en ligne JSON `type: alerte` du bloc, que
+    `ameesh.ci.events_of` ignore (seuls les échecs de test le concernent)."""
     attempt = int(attempt or 1)
     debut = next((e for e in events if e.get("type") == "debut"), {})
     fin = next((e for e in events if e.get("type") == "fin"), None)
@@ -201,7 +330,11 @@ def check_output(events: list[dict], attempt: int = 1) -> dict:
     etat = "en cours" if fin is None else {"succes": "verte", "echec": "rouge"}.get(
         fin.get("statut"), fin.get("statut") or "?")
     titre = "%d échec(s), %d test(s) passé(s), %s" % (len(echecs), len(tests), etat)
+    if alerte:
+        titre = "⚠ %d %% du plafond — %s" % (seuil_pourcent(alerte), titre)
     resume_ = ["Part %s : %s." % (debut.get("part") or "?", etat)]
+    if alerte:
+        resume_.append(texte_alerte(alerte))
     if attendus:
         resume_.append("%d module(s) dans cette part." % attendus)
     if echecs:
@@ -210,6 +343,10 @@ def check_output(events: list[dict], attempt: int = 1) -> dict:
         if len(echecs) > LIMIT:
             resume_.append("- … et %d autre(s)" % (len(echecs) - LIMIT))
     lignes, taille, omis = [MARKER, "```jsonl"], len(MARKER) + 20, 0
+    if alerte:
+        ligne = json.dumps(alerte, ensure_ascii=False)
+        lignes.append(ligne)
+        taille += len(ligne) + 1
     for i, e in enumerate(echecs):
         for garde in ((None if i < FULL_EXCERPTS else FOLLOWING_LINES), 0):
             ligne = _failure_line(e, garde, attempt)
@@ -307,10 +444,11 @@ class Publication:
     def events(self) -> list[dict]:
         return read(self.flux)[0] if self.flux.is_file() else []
 
-    def push(self, events: list[dict], conclusion: str | None = None) -> bool:
+    def push(self, events: list[dict], conclusion: str | None = None,
+             alerte: dict | None = None) -> bool:
         """Crée ou met à jour le check run ; False si GitHub refuse."""
         attempt = int(getattr(self.gh, "attempt", 1) or 1)
-        output = check_output(events, attempt)
+        output = check_output(events, attempt=attempt, alerte=alerte)
         echecs = [e for e in events if e.get("type") == "test"
                   and e.get("statut") in FAILURES]
         vus = set(self.etat.get("annotes") or ())
@@ -321,7 +459,9 @@ class Publication:
             if not self.etat.get("id"):
                 self.etat["id"] = self.gh.create(self.nom, output)
                 if conclusion:
-                    self.gh.update(self.etat["id"], check_output(events, attempt), conclusion)
+                    self.gh.update(self.etat["id"],
+                                   check_output(events, attempt=attempt, alerte=alerte),
+                                   conclusion)
             else:
                 self.gh.update(int(self.etat["id"]), output, conclusion)
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
@@ -329,6 +469,8 @@ class Publication:
             return False
         self.etat["annotes"] = sorted(vus | {e.get("test") for e in nouveaux})
         self.etat["echecs"] = len(echecs)
+        if alerte:
+            self.etat["alerte"] = alerte
         if conclusion:
             self.etat["conclusion"] = conclusion
         self._keep()
@@ -340,31 +482,58 @@ def conclusion_of(events: list[dict], defaut: str = "cancelled") -> str | None:
     return CONCLUSIONS.get(fin.get("statut"), "failure") if fin else defaut
 
 
-def publish(args, gh: GitHub | None = None, dormir=time.sleep, horloge=time.monotonic) -> int:
-    """Suit le flux et tient le check run jusqu'à la ligne `fin`."""
+def publish(args, gh: GitHub | None = None, dormir=time.sleep, horloge=time.monotonic,
+            maintenant=time.time) -> int:
+    """Suit le flux et tient le check run jusqu'à la ligne `fin`.
+
+    #899 : avec le plafond du job (`--plafond-min`, défaut `AMEESH_PLAFOND_MIN`)
+    et son début (`--debut`, défaut `AMEESH_JOB_DEBUT`), publie une fois
+    l'alerte à `ALERTE_SEUIL` du plafond ; sans eux, rien ne change."""
     gh = gh or GitHub()
     if not gh.ready():
         print("ci-flow : pas de jeton, de dépôt ou de tête : rien n'est publié", file=sys.stderr)
         return 0
+    plafond = _nombre(getattr(args, "plafond_min", None))
+    debut = _nombre(getattr(args, "debut", None))
+    if plafond is None:
+        plafond = _nombre(os.environ.get(ENV_PLAFOND))
+    if debut is None:
+        debut = _nombre(os.environ.get(ENV_DEBUT))
     pub = Publication(args.file, args.name, gh)
+    if plafond:
+        pub.etat.setdefault("plafond_min", plafond)
+    if debut:
+        pub.etat.setdefault("debut", debut)
+    alerte = alerte_de(pub.etat)
     limite = horloge() + args.max_duration
-    if not pub.push([]):
+    if not pub.push([], alerte=alerte):
         return 0  # refus (jeton en lecture seule) : on n'insiste pas
-    publies, dernier = (0, 0), horloge()
+    publies, dernier, alerte_publiee = (0, 0), horloge(), False
     while horloge() < limite:
         if pub.etat_chemin.with_suffix(".stop").exists():
             return 0
         events = pub.events()
         tests = [e for e in events if e.get("type") == "test"]
         echecs = sum(1 for e in tests if e.get("statut") in FAILURES)
+        if alerte is None and debut and plafond:
+            alerte = alerte_plafond(debut, plafond, maintenant(), contexte_de(events))
+            if alerte:
+                # le log est relu par l'étape `fermer` (cat) : l'annotation
+                # apparaît dans le job, en plus du résumé du check run
+                pub.log("::warning title=plafond du job à %d %%::%s"
+                        % (seuil_pourcent(alerte), texte_alerte(alerte)))
         fin = conclusion_of(events, defaut=None)
         if fin:
-            pub.push(events, fin)
+            if debut:
+                pub.etat["fin_ecoule_s"] = round(maintenant() - debut, 1)
+            pub.push(events, fin, alerte=alerte)
             return 0
-        # le check run change à chaque échec ; sinon, toutes les minutes au
-        # plus (avancement), pour ménager le quota de l'API
-        if echecs != publies[0] or (len(tests) != publies[1] and horloge() - dernier > 60):
-            if pub.push(events):
+        # le check run change à chaque échec et à la première alerte de plafond ;
+        # sinon, toutes les minutes au plus (avancement), pour ménager le quota
+        if (alerte is not None and not alerte_publiee) or echecs != publies[0] \
+                or (len(tests) != publies[1] and horloge() - dernier > 60):
+            if pub.push(events, alerte=alerte):
+                alerte_publiee = alerte_publiee or alerte is not None
                 publies, dernier = (echecs, len(tests)), horloge()
         dormir(args.interval)
     return 0
@@ -383,7 +552,7 @@ def close(args, gh: GitHub | None = None) -> int:
     if pub.etat.get("conclusion"):
         return 0
     events = pub.events()
-    pub.push(events, conclusion_of(events))
+    pub.push(events, conclusion_of(events), alerte=alerte_de(pub.etat))
     return 0
 
 
@@ -402,6 +571,11 @@ def main(argv: list[str] | None = None) -> int:
                            help="secondes entre deux lectures du flux (défaut 5)")
             p.add_argument("--max-duration", type=float, default=3600.0,
                            help="arrêt de sûreté (secondes, défaut 3600)")
+            p.add_argument("--plafond-min", type=_nombre, default=None,
+                           help="plafond du job en minutes (= timeout-minutes ; "
+                                "défaut : %s)" % ENV_PLAFOND)
+            p.add_argument("--debut", type=_nombre, default=None,
+                           help="début du job, epoch en secondes (défaut : %s)" % ENV_DEBUT)
     args = ap.parse_args(argv)
     if args.commande == "publish":
         return publish(args)
