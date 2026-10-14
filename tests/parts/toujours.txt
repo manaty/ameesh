@@ -8,10 +8,13 @@
 # what only one driver can see must not wait for the full suite of main.
 #
 # L1211 (canon §3) : ce sont les tests de contrat. Sur une branche de lot, le
-# sélecteur les exécute tous, déclenchés ou non : droits, rôles et migrations
-# cassent un schéma réel avant que la suite complète de main ne le voie. Le
-# sélecteur se replie sur la suite complète si la liste est illisible ou si la
-# sélection n'est pas sûre (scripts/test-plan.py, lot_selection).
+# sélecteur les exécute tous avec psycopg, déclenchés ou non : droits, rôles et
+# migrations cassent un schéma réel avant que la suite complète de main ne le
+# voie. Sous psql, les quatre modules hors liste pilote (test_339_orphan_settle,
+# test_cluster, test_l31_orphans, test_l50_group_orphan_work_items) ne tournent
+# que si la liste est déclenchée (#749). Le sélecteur se replie sur la suite
+# complète si la liste est illisible ou si la sélection n'est pas sûre
+# (scripts/test-plan.py, lot_selection).
 #
 # Additive list (L160a): one module per line, its reason in a comment on the
 # same line, alphabetical order, no duplicate (scripts/test-parts.py refuses

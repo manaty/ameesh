@@ -142,10 +142,16 @@ jobs:
           restore-keys: carte-
       - id: plan
         name: plan of the run
+        # #1237 (N1 of #1211): a branch name travels through the environment,
+        # never interpolated into the script — the merge gate does not run a
+        # `$(…)` written in a ref.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
             --event "${{ github.event_name }}" \
-            --base-ref "${{ github.base_ref }}" --head-ref "${{ github.head_ref }}" \
+            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
             --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - uses: actions/upload-artifact@v4

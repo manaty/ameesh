@@ -1101,6 +1101,35 @@ class LeaksTest(unittest.TestCase):
         self.assertEqual(out["not_counted"], 1)
 
 
+def _run_bodies(text: str) -> list[str]:
+    """Le texte de chaque bloc `run:` de tests.yml (inline ou littéral)."""
+    bodies: list[str] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if not stripped.startswith("run:"):
+            i += 1
+            continue
+        inline = stripped[len("run:"):].strip()
+        if inline and inline not in ("|", ">", "|-", ">-", "|+", ">+"):
+            bodies.append(inline)
+            i += 1
+            continue
+        body, j = [], i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= indent:
+                break
+            body.append(nxt)
+            j += 1
+        bodies.append("\n".join(body))
+        i = j
+    return bodies
+
+
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.text = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
@@ -1135,9 +1164,16 @@ class WorkflowTest(unittest.TestCase):
     def test_plan_job_passes_the_branch_context(self):
         # R1 Codex (B1) : le plan qualifie les PR de release sur leurs
         # branches source et cible (« release/** » ou « integration/** ») ;
-        # le workflow les lui transmet (L1211).
-        self.assertIn('--base-ref "${{ github.base_ref }}"', self.text)
-        self.assertIn('--head-ref "${{ github.head_ref }}"', self.text)
+        # le workflow les lui transmet (L1211). #1237 (N1) : un nom de branche
+        # est choisi par l'auteur de la PR ; il passe par l'environnement et
+        # reste cité dans le script, jamais interpolé dans un `run:`.
+        self.assertIn("BASE_REF: ${{ github.base_ref }}", self.text)
+        self.assertIn("HEAD_REF: ${{ github.head_ref }}", self.text)
+        self.assertIn('--base-ref "$BASE_REF"', self.text)
+        self.assertIn('--head-ref "$HEAD_REF"', self.text)
+        for body in _run_bodies(self.text):
+            self.assertNotIn("github.base_ref", body)
+            self.assertNotIn("github.head_ref", body)
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
