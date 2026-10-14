@@ -1,0 +1,20 @@
+$ git show 5bc2c5de:docs/EXPLOITATION.md > base.md   # base commune main/lot
+$ git show 7e92f805265393f4e8071425179919e131bb1637:docs/EXPLOITATION.md > ours.md   # lot (candidat 7e92)
+$ git show a3e245cfc10e5fda7000fe7b9c61a7540a51e778:docs/EXPLOITATION.md > theirs.md   # main+#1211 (merge-ref)
+$ git merge-file -p ours.md base.md theirs.md > merged.md
+rc=0
+
+$ git hash-object merged.md
+rc=0
+b6a8ece55c9e9b9f181e5bd24c369722d4d43f31
+
+$ git rev-parse d9cd3373768c1e5f4371402449d7bd92fbb988e5:docs/EXPLOITATION.md
+b6a8ece55c9e9b9f181e5bd24c369722d4d43f31
+
+blobs du fichier :
+  base 5bc2c5de : e400b2d1443e26e94299af21598c248982acfdd5
+  gel aaad7117  : 88c7e1ad2bb88ab2d8115c58e4461e6b5b437ec6
+  main 537f4b96 : 76a7853f6e3c1477317265ce52cf5c6254100830
+  1211 (a3e245) : 98f5010863fc166b8a14c6a4aefabcf4bcfb4166
+  cand 7e92f805 : a4f738b9e7bd397360e21588137e5600161536f4
+  union d9cd3373: b6a8ece55c9e9b9f181e5bd24c369722d4d43f31

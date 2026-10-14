@@ -1,0 +1,12 @@
+ .github/workflows/tests.yml                 | 110 ++++++---
+ CONTRIBUTING.md                             |  22 +-
+ README.md                                   |  28 ++-
+ docs/EXPLOITATION.md                        |  57 ++++-
+ docs/design/etudes/l161-tests-par-impact.md |  25 +-
+ scripts/test-parts.py                       |  14 +-
+ scripts/test-plan.py                        | 250 +++++++++++++++++---
+ tests/parts/pilote-psql.txt                 |  16 +-
+ tests/parts/toujours.txt                    |  10 +
+ tests/test_l161f_plan.py                    | 354 +++++++++++++++++++++++++++-
+ tests/test_l932_ci_venv_cache.py            |  51 ++++
+ 11 files changed, 831 insertions(+), 106 deletions(-)

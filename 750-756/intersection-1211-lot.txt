@@ -1,0 +1,36 @@
+$ git merge-base 537f4b964a9fcbc41814cad4e88ca918ce78549d 3668d4b6b75f833d15418d45157096204d71e4f0
+ec0b4a70e194503a894fede76a5607e69de9f62e
+
+$ git diff --name-only ec0b4a70e194503a894fede76a5607e69de9f62e..3668d4b6b75f833d15418d45157096204d71e4f0   # delta PROPRE de #1211 (11 fichiers)
+.github/workflows/tests.yml
+CONTRIBUTING.md
+README.md
+docs/EXPLOITATION.md
+docs/design/etudes/l161-tests-par-impact.md
+scripts/test-parts.py
+scripts/test-plan.py
+tests/parts/pilote-psql.txt
+tests/parts/toujours.txt
+tests/test_l161f_plan.py
+tests/test_l932_ci_venv_cache.py
+count=11
+
+$ git diff --name-only 5bc2c5de..aaad71177d523f9c7cb7797451529d5fc475cd15   # 14 fichiers du lot
+docs/EXPLOITATION.md
+docs/ORCHESTRATEUR.md
+site/docs/reference/cli.md
+src/ameesh/main.py
+src/ameesh/merge_queue.py
+src/ameesh/mesh_cli.py
+src/ameesh/radar.py
+src/ameesh/release.py
+tests/fixtures/l756-run-38350245246-jobs.txt
+tests/test_l160b_radar.py
+tests/test_l160e_merge_queue.py
+tests/test_l160g_nexlink.py
+tests/test_l750_release.py
+tests/test_l756_full_suite.py
+count=14
+
+$ comm -12 <(delta #1211) <(fichiers du lot)   # intersection
+docs/EXPLOITATION.md

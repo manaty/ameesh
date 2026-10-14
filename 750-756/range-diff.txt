@@ -1,0 +1,4 @@
+1:  7a97be62 = 1:  ee383e92 feat(release): L750/L756 (#561/#566) — le périmètre d'une release se fige, et sa porte exige la suite complète
+2:  28f6adef = 2:  a1d555c4 fix(release): L750/L756 (#561/#566) — R1 B1/B2 fermés : suite complète déclarée, tête fraîche certifiée
+3:  a7522407 = 3:  ec03dbbf fix(release): L750/L756 (#561/#566) — R2 B1 fermé : gh run view nomme le dépôt (--repo <slug>)
+4:  7e92f805 = 4:  d9cd3373 fix(release): L750/L756 (#561/#566) — B3 fermé : la suite déclare ses jobs requis (R2 auditeur, binôme)
