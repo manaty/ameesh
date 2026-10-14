@@ -260,3 +260,33 @@ Titre : `#1204 vague suivante — 6 lots (287, 419, 857, 1019, 1038, 1048), pré
 Corps : résumé du §2, renvoi à ce manifeste, mention explicite « préparation, ne pas
 fusionner avant le go du pilote et la CI complète unique (dispatch, seul run valable) »,
 liste des exclusions (#748, #963, #775) et des points de suivi (§5).
+
+## 10. Addendum du 14/10 13:2xZ — union sur main fraîche, activation #1211 acquise
+
+- **Activation #1211** : PR #923 fusionnée le 14/10 13:15:41Z, merge
+  `acd8a0f09637824bbe3c974d28540aff7d897a9d` (parents `537f4b964a9f` + `3668d4b6b75f`,
+  arbre `57a3b14ab82f668a23b5539d2426d7e76dee3fc3`). La porte du mandat (« landing après
+  1211 actif ») est levée.
+- **Union rejouée sur cette main** : commit `dc29109abd2eaafd5b1818adae9593e8113cd0ec`,
+  arbre `7fff9faae0fcb14307333b7c36609d9a89cb9b7e`, parents `acd8a0f09` + `39df7c316`.
+  Conflit unique `docs/design/etudes/index.md` (base `f6a95515`, main `fd5f0982`, gel
+  `0b3e711e`) résolu en union L243 puis L244 → blob `fb7635f979e8` (0 marqueur ;
+  reproduction `git merge-file --union` identique). `docs/EXPLOITATION.md` auto-fusionné
+  → blob `c81035c8a5e2`, **+18/-0** vs main, patch-id `5dde7542` = patch #1048 du gel.
+- **Constance** : delta union vs main = exactement les 11 fichiers de la vague ; 9/11
+  blobs identiques au gel `39df7c316` (EXECUTEUR `a906548c`, l243 `15b721dc`, manifeste
+  `904b748b`, hermeticity-lint `f3ea2d0e`, chat `69e638a9`, lecteurs-doc `88d67794`,
+  test_hermeticity `ee1bc3f1`, l107 `f7bdee0f`, l79 `5fd448e9`) ; les 2 autres sont les
+  unions attendues (index `fb7635f9`, EXPLOITATION `c81035c8`). Patch-ids `-U0` :
+  10/11 identiques au gel (index.md excepté : union des deux côtés).
+- **Témoins ciblés sur l'arbre d'union** (`AMEESH_REQUIRE_DB=0`, Postgres injoignable) :
+  **200 OK / 5 sautés** — lecteurs de la doc + garde L161a 146 OK/4 sautés, l107 20/20,
+  hermeticity 18/18, l79 16 OK/1 sauté. Lint d'herméticité `--diff acd8a0f09` :
+  0 constat / 3 fichiers, rc=0.
+- **Gel** : le commit qui porte cet addendum (documentation seule ; les 10 blobs des lots
+  sont revérifiés constants après ce commit, §6) est le SHA gelé candidat. Après
+  qualification du pilote, la poussée de `integration/vague-suivante-1204` sur ce SHA
+  déclenche la suite complète unique (#1211 : suite complète sur `integration/**`, 4 parts
+  psycopg + 6 parts psql, sans dispatch manuel). Le vert `39df7c316`
+  (run `38504851830`) reste la preuve historique du contenu des lots : aucun transfert au
+  nouvel arbre (§5, canon §12).
