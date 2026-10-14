@@ -465,6 +465,44 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_un_fichier_local_non_retire_ne_ressuscite_pas_la_session(self):
+        """P2 bloquant (contrôle bureau + R1 Codex du 14/10) : si le fichier
+        local ne peut pas être retiré (`unlink` refuse, PermissionError),
+        l'oubli reste durable. `clear_session` pose `session_reset_at` dans la
+        même écriture fencée par le bail ; le fichier, antérieur au reset, est
+        périmé — sur ce worker comme sur un worker recréé qui relit le
+        registre. Avant le correctif, la méthode rendait True et
+        `current_session` relisait « sess-A »."""
+        worker = self._worker("w12")
+        try:
+            a = work.add(self.db, title="A", assignee="w12")["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            chemin = worker._path("session")
+            self.assertTrue(os.path.exists(chemin))
+            work.close(self.db, a, abandoned=True, actor="test")
+            with mock.patch("ameesh.runner.os.unlink",
+                            side_effect=PermissionError("read-only")):
+                self.assertTrue(worker._close_finished_lot_session(str(a)),
+                                "l'oubli est durable, il ne dépend pas de l'unlink")
+                self.assertTrue(os.path.exists(chemin),
+                                "le fichier est resté : c'est le cas PermissionError")
+                self.assertIsNone(worker.current_session(),
+                                  "le fichier périmé ne ressuscite pas la session")
+                agent = registry.get(self.db, "w12")
+                self.assertIsNotNone(agent["session_reset_ts"],
+                                     "l'oubli a posé un reset fencé par le bail")
+                # worker recréé (redémarrage du service) : le registre suffit.
+                recree = AgentWorker(Runner(self.cfg, self.db, once=True),
+                                     registry.get(self.db, "w12"),
+                                     {"lease_epoch": worker.epoch})
+                self.assertIsNone(recree.current_session(),
+                                  "même sur un worker neuf, le fichier reste périmé")
+                self.assertTrue(os.path.exists(chemin),
+                                "aucune reprise ne dépend de la disparition du fichier")
+        finally:
+            worker.watchdog_stop.set()
+
     def test_les_politiques_jamais_et_taille_gardent_la_session(self):
         """B1b : hors politique `par-lot`, un lot fini ne ferme pas la session
         longue (`jamais`, `taille`)."""
