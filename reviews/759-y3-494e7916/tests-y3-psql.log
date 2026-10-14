@@ -1,0 +1,244 @@
+tete=494e7916007ded9be406af65c54728967e684af7
+debut=2026-10-14T18:30:32Z
+test_chaque_litteral_est_declare (tests.test_1060_alert_types.AlertTypesDeclaredTest.test_chaque_litteral_est_declare)
+Garde qui aurait attrape #1060 (tmp_unremovable/tmp_unscanned). ... ok
+test_les_types_du_menage_sont_declares (tests.test_1060_alert_types.AlertTypesDeclaredTest.test_les_types_du_menage_sont_declares) ... ok
+test_alerts_rend_la_liste_avec_un_type_inconnu (tests.test_1060_alert_types.AlerteInconnueDansAlertsTest.test_alerts_rend_la_liste_avec_un_type_inconnu) ... ok
+test_affichage_signale_le_type_inconnu (tests.test_1060_alert_types.TriTypeInconnuTest.test_affichage_signale_le_type_inconnu) ... ok
+test_cle_totale_meme_sans_type (tests.test_1060_alert_types.TriTypeInconnuTest.test_cle_totale_meme_sans_type) ... ok
+test_type_inconnu_en_fin_sans_exception (tests.test_1060_alert_types.TriTypeInconnuTest.test_type_inconnu_en_fin_sans_exception) ... ok
+test_worker_closes_resource_after_tracker_finds_no_survivors (tests.test_472_zombie_turn_close.RealZombieResourceTest.test_worker_closes_resource_after_tracker_finds_no_survivors) ... ok
+test_worktree_whose_gitdir_is_gone_is_evictable (tests.test_500_eviction_irremovable.EvictionTest.test_worktree_whose_gitdir_is_gone_is_evictable) ... ok
+test_work_note_et_move (tests.test_l109_mediated_mode.SessionTest.test_work_note_et_move) ... ok
+test_work_add_inherits_creator_and_rejects_explicit_blank (tests.test_l118c_mail_projects.MailProjectTests.test_work_add_inherits_creator_and_rejects_explicit_blank) ... ok
+test_work_add_uses_bound_creator_even_with_an_explicit_actor (tests.test_l118c_mail_projects.MailProjectTests.test_work_add_uses_bound_creator_even_with_an_explicit_actor) ... ok
+test_erreurs (tests.test_l126_issues.CliTest.test_erreurs) ... ok
+test_rattrapage_essai_puis_reel (tests.test_l126_issues.CliTest.test_rattrapage_essai_puis_reel) ... ok
+test_ce_qu_un_depot_public_ne_recoit_jamais (tests.test_l126_issues.GuardTest.test_ce_qu_un_depot_public_ne_recoit_jamais) ... ok
+test_secrets_refuses_partout_sans_etre_recopies (tests.test_l126_issues.GuardTest.test_secrets_refuses_partout_sans_etre_recopies) ... ok
+test_termes_exclus_entiers_sans_casse (tests.test_l126_issues.GuardTest.test_termes_exclus_entiers_sans_casse) ... ok
+test_creations_bornees_par_passage (tests.test_l126_issues.LotIssuesTest.test_creations_bornees_par_passage) ... ok
+test_doublon_d_un_projecteur_concurrent_ferme (tests.test_l126_issues.LotIssuesTest.test_doublon_d_un_projecteur_concurrent_ferme) ... ok
+test_erreur_de_github_notee_sans_lever (tests.test_l126_issues.LotIssuesTest.test_erreur_de_github_notee_sans_lever) ... ok
+test_fermeture_avec_un_commentaire_qui_dit_pourquoi (tests.test_l126_issues.LotIssuesTest.test_fermeture_avec_un_commentaire_qui_dit_pourquoi) ... ok
+test_issue_designee_adoptee (tests.test_l126_issues.LotIssuesTest.test_issue_designee_adoptee) ... ok
+test_issue_retrouvee_par_son_marqueur_et_issue_ref_etrangere (tests.test_l126_issues.LotIssuesTest.test_issue_retrouvee_par_son_marqueur_et_issue_ref_etrangere) ... ok
+test_modification_humaine_gardee_tant_que_le_lot_ne_change_pas (tests.test_l126_issues.LotIssuesTest.test_modification_humaine_gardee_tant_que_le_lot_ne_change_pas) ... ok
+test_projet_par_l_equipe_de_l_assigne_et_issue_ref_ailleurs (tests.test_l126_issues.LotIssuesTest.test_projet_par_l_equipe_de_l_assigne_et_issue_ref_ailleurs) ... ok
+test_titre_etat_assigne_priorite_suivis (tests.test_l126_issues.LotIssuesTest.test_titre_etat_assigne_priorite_suivis) ... ok
+test_titre_refuse_rien_n_est_publie (tests.test_l126_issues.LotIssuesTest.test_titre_refuse_rien_n_est_publie) ... ok
+test_une_issue_par_lot_ouvert_puis_rien (tests.test_l126_issues.LotIssuesTest.test_une_issue_par_lot_ouvert_puis_rien) ... ok
+test_visibilite_en_cache_et_depot_illisible_traite_en_public (tests.test_l126_issues.LotIssuesTest.test_visibilite_en_cache_et_depot_illisible_traite_en_public) ... ok
+test_depot_prive_corps_publie_sans_secret (tests.test_l126_issues.LotViewTest.test_depot_prive_corps_publie_sans_secret) ... ok
+test_depot_public_titre_et_resume_seulement (tests.test_l126_issues.LotViewTest.test_depot_public_titre_et_resume_seulement) ... ok
+test_etats_et_commentaire_de_fermeture (tests.test_l126_issues.LotViewTest.test_etats_et_commentaire_de_fermeture) ... ok
+test_pr_vers_issues (tests.test_l126_issues.LotViewTest.test_pr_vers_issues) ... ok
+test_projet_d_un_lot (tests.test_l126_issues.LotViewTest.test_projet_d_un_lot) ... ok
+test_refus_et_retenues (tests.test_l126_issues.LotViewTest.test_refus_et_retenues) ... ok
+test_cadence_et_lots_nouveaux_des_le_passage_suivant (tests.test_l126_issues.ProjectorTest.test_cadence_et_lots_nouveaux_des_le_passage_suivant) ... ok
+test_dans_le_passage_de_notify (tests.test_l126_issues.ProjectorTest.test_dans_le_passage_de_notify) ... ok
+test_hote_designe_seulement (tests.test_l126_issues.ProjectorTest.test_hote_designe_seulement) ... ok
+test_panne_de_github_sans_effet_et_attente (tests.test_l126_issues.ProjectorTest.test_panne_de_github_sans_effet_et_attente) ... ok
+test_refus_dit_une_fois_et_sans_passage_rapide (tests.test_l126_issues.ProjectorTest.test_refus_dit_une_fois_et_sans_passage_rapide) ... ok
+test_lecture (tests.test_l126_issues.SettingsTest.test_lecture) ... ok
+test_refus (tests.test_l126_issues.SettingsTest.test_refus) ... ok
+test_closes_ferme_le_lot_de_l_issue (tests.test_l126_issues.SyncGithubCloseTest.test_closes_ferme_le_lot_de_l_issue) ... ok
+test_work_add_priorite (tests.test_l130_demandes_sans_lot.UnrecordedTest.test_work_add_priorite) ... ok
+test_plan_underused (tests.test_l132_alert_briefs.BriefsTest.test_plan_underused) ... ok
+test_workflows_call_the_new_paths (tests.test_l148_stage2b_scripts.CallersTest.test_workflows_call_the_new_paths) ... ok
+test_workstream_gagne_sur_chantier (tests.test_l148_stage3b_workstream_readers.AgentProjectTest.test_workstream_gagne_sur_chantier) ... ok
+test_workstream_selects_the_orchestrator (tests.test_l148_stage3c_workstream_free_files.ModuleDeviationBriefTest.test_workstream_selects_the_orchestrator) ... ok
+test_workstream_wins_over_chantier (tests.test_l148_stage3c_workstream_free_files.ModuleDeviationBriefTest.test_workstream_wins_over_chantier) ... ok
+test_plan_weights_read_the_english_key (tests.test_l148_stage6_json_keys.CardKeysTest.test_plan_weights_read_the_english_key) ... ok
+test_plan_estimate_et_revision (tests.test_l157_estimations.EstimatesPgTest.test_plan_estimate_et_revision) ... ok
+test_workflow (tests.test_l157_estimations.VersionOnlyTest.test_workflow) ... ok
+test_workers_from_before_the_gate_hold_their_slot_at_once (tests.test_l159f_host_gate.SlotPoolTest.test_workers_from_before_the_gate_hold_their_slot_at_once) ... ok
+test_work_show_falls_back (tests.test_l160d_resolutions.ResolutionsWithoutTableDbTest.test_work_show_falls_back) ... ok
+test_workflow_order_uses_instants_and_refuses_ambiguous_latest_time (tests.test_l160g_nexlink.CommitCiTest.test_workflow_order_uses_instants_and_refuses_ambiguous_latest_time) ... ok
+test_plan_job_passes_the_branch_context (tests.test_l161f_plan.WorkflowTest.test_plan_job_passes_the_branch_context) ... ok
+test_plan_job_passes_the_pushed_range (tests.test_l161f_plan.WorkflowTest.test_plan_job_passes_the_pushed_range) ... ok
+test_plan_job_reads_the_map (tests.test_l161f_plan.WorkflowTest.test_plan_job_reads_the_map) ... ok
+test_worktree_de_relecture_propre_supprime_et_elague (tests.test_l162_tmpfs.AbandonDbTest.test_worktree_de_relecture_propre_supprime_et_elague) ... ok
+test_plan_account_never_replaced_by_an_api_key (tests.test_l226b_auth_failure.HealthyCandidatesTest.test_plan_account_never_replaced_by_an_api_key) ... ok
+test_worker_capacity_defers_next_handoff_without_effect_and_recovers (tests.test_l232a_handoffs.HandoffTest.test_worker_capacity_defers_next_handoff_without_effect_and_recovers) ... ok
+test_worker_reserves_then_stops_only_when_source_fenced (tests.test_l232a_handoffs.HandoffTest.test_worker_reserves_then_stops_only_when_source_fenced) ... 18:34:03 [dev] host handoff 6b9d394b16984ff6ae70a29e6235b909 reserved to target; waits for host preparation and lot boundary
+ok
+test_worktree_du_lot_detache (tests.test_l233b_budget_handoff.LotGitTest.test_worktree_du_lot_detache) ... ok
+test_worktree_suivi_du_lot (tests.test_l233b_budget_handoff.LotGitTest.test_worktree_suivi_du_lot) ... ok
+test_worker (tests.test_l242b_critical_accounts.IdentiteTest.test_worker) ... ok
+test_work_move_and_raw_storage_cannot_bypass_gate (tests.test_l317_project_modules.LifecycleGateTest.test_work_move_and_raw_storage_cannot_bypass_gate) ... ok
+test_worker_has_no_parent_environment_credentials_or_groups (tests.test_l317_proof_helper.ProofHelperTest.test_worker_has_no_parent_environment_credentials_or_groups) ... ok
+test_work_add_and_show (tests.test_l317c_deep_analysis.CliTest.test_work_add_and_show) ... ok
+test_work_add_by_an_agent_says_nothing (tests.test_l317c_deep_analysis.CliTest.test_work_add_by_an_agent_says_nothing) ... ok
+test_work_dirs_agent_inconnu_averti (tests.test_l35_dossier_de_travail.PolitiqueTest.test_work_dirs_agent_inconnu_averti) ... ok
+test_work_dirs_prioritaire (tests.test_l35_dossier_de_travail.PolitiqueTest.test_work_dirs_prioritaire) ... ok
+test_work_dirs_et_gabarit_dans_le_registre (tests.test_l35_dossier_de_travail.SyncTest.test_work_dirs_et_gabarit_dans_le_registre) ... ok
+test_planted_temporary_names_are_never_written_through (tests.test_l361_thread_expiry.MediatedHostTest.test_planted_temporary_names_are_never_written_through)
+r2 P1: a symlink or a HARD LINK at a temporary name is only unlinked. ... ok
+test_planted_temporary_names_are_never_written_through (tests.test_l361_thread_expiry.TransportTest.test_planted_temporary_names_are_never_written_through)
+r2 P1: a symlink or a HARD LINK at a temporary name is only unlinked. ... ok
+test_planned_start_in_alert_work_and_progress_and_limit_after_filter (tests.test_l368_planned_waits.PgTest.test_planned_start_in_alert_work_and_progress_and_limit_after_filter) ... ok
+test_plan_dependency_inherits_through_ancestor_and_resolves_package (tests.test_l368_planned_waits.UnitTest.test_plan_dependency_inherits_through_ancestor_and_resolves_package) ... ok
+test_plan_start_inherits_and_explicit_lot_start_overrides_it (tests.test_l368_planned_waits.UnitTest.test_plan_start_inherits_and_explicit_lot_start_overrides_it) ... ok
+test_work_add_refuse_accepte_et_externe (tests.test_l37_mode_et_alertes.AttributionGardeeTest.test_work_add_refuse_accepte_et_externe) ... ok
+test_work_assign (tests.test_l37_mode_et_alertes.AttributionGardeeTest.test_work_assign) ... ok
+test_work_list_et_show (tests.test_l40_delegation.AffichageTest.test_work_list_et_show) ... ok
+test_work_list (tests.test_l61_allers_retours.TestAllersRetours.test_work_list) ... ok
+test_work_show (tests.test_l61_allers_retours.TestAllersRetours.test_work_show) ... ok
+test_adopt_refuse_puis_force_journalise (tests.test_l63_platform.AdoptFailClosedTest.test_adopt_refuse_puis_force_journalise) ... ok
+test_l_os_ne_se_lit_que_dans_la_couche_plateforme (tests.test_l63_platform.LintTest.test_l_os_ne_se_lit_que_dans_la_couche_plateforme) ... ok
+test_la_liste_d_exceptions_ne_peut_que_diminuer (tests.test_l63_platform.LintTest.test_la_liste_d_exceptions_ne_peut_que_diminuer) ... ok
+test_le_lint_voit_ce_qu_il_doit_voir (tests.test_l63_platform.LintTest.test_le_lint_voit_ce_qu_il_doit_voir) ... ok
+test_alimentation_psutil_hors_linux (tests.test_l63_platform.PlatformTest.test_alimentation_psutil_hors_linux) ... skipped 'psutil absent'
+test_ascendance (tests.test_l63_platform.PlatformTest.test_ascendance) ... ok
+test_conversion_des_tops (tests.test_l63_platform.PlatformTest.test_conversion_des_tops) ... ok
+test_detenteurs_d_un_dossier (tests.test_l63_platform.PlatformTest.test_detenteurs_d_un_dossier) ... ok
+test_detenteurs_fichier_ouvert_et_ligne_de_commande (tests.test_l63_platform.PlatformTest.test_detenteurs_fichier_ouvert_et_ligne_de_commande) ... ok
+test_detenteurs_illisibles_pour_soi_meme (tests.test_l63_platform.PlatformTest.test_detenteurs_illisibles_pour_soi_meme) ... skipped 'psutil absent'
+test_heure_de_demarrage_en_secondes_epoch (tests.test_l63_platform.PlatformTest.test_heure_de_demarrage_en_secondes_epoch) ... ok
+test_les_deux_voies_concordent (tests.test_l63_platform.PlatformTest.test_les_deux_voies_concordent) ... skipped 'une seule voie disponible'
+test_mesures_de_l_hote (tests.test_l63_platform.PlatformTest.test_mesures_de_l_hote) ... ok
+test_os_muet_leve_not_available (tests.test_l63_platform.PlatformTest.test_os_muet_leve_not_available)
+Ni psutil ni /proc : jamais de liste vide, jamais de None muet. ... ok
+test_point_de_montage_et_alimentation_depuis_des_fichiers (tests.test_l63_platform.PlatformTest.test_point_de_montage_et_alimentation_depuis_des_fichiers) ... ok
+test_systeme_connu (tests.test_l63_platform.PlatformTest.test_systeme_connu) ... ok
+test_vivant (tests.test_l63_platform.PlatformTest.test_vivant) ... ok
+test_worktree_d_un_autre_agent_survit_a_la_fin_du_lot_du_tour (tests.test_l73_housekeeping.MenageDbTest.test_worktree_d_un_autre_agent_survit_a_la_fin_du_lot_du_tour)
+L73b, cas réel : un agent crée un worktree de relecture PENDANT le ... ok
+test_worker_au_repos_reveille_une_fois (tests.test_l790_outdated_restart.StaleRestartIdleTest.test_worker_au_repos_reveille_une_fois)
+Un worker au repos attend son propre événement, pas `wake_all` : ... ok
+test_workers_morts_rendent_vrai (tests.test_l790_outdated_restart.StaleRestartIdleTest.test_workers_morts_rendent_vrai) ... ok
+test_worker_au_repos_sort_sans_tour_et_rend_le_bail (tests.test_l790_outdated_restart.WorkerStaleExitTest.test_worker_au_repos_sort_sans_tour_et_rend_le_bail) ... 18:36:46 host gate selected: none (classic host default)
+18:36:46 [perime] outdated runner: no new turn, lease released
+ok
+test_plan_d_une_tache_et_d_une_fiche (tests.test_l96_roadmap.RoadmapPgTest.test_plan_d_une_tache_et_d_une_fiche) ... ok
+test_identite_liee_puis_inconnu (tests.test_merged_work_item_tracking.ActorTest.test_identite_liee_puis_inconnu) ... ok
+test_resolve_actor (tests.test_merged_work_item_tracking.ActorTest.test_resolve_actor) ... ok
+test_759_merged_a_tort_revient_en_build (tests.test_merged_work_item_tracking.CorrectionTest.test_759_merged_a_tort_revient_en_build) ... ok
+test_humain_qui_se_nomme (tests.test_merged_work_item_tracking.CorrectionTest.test_humain_qui_se_nomme) ... ok
+test_orchestrateur (tests.test_merged_work_item_tracking.CorrectionTest.test_orchestrateur) ... ok
+test_refus (tests.test_merged_work_item_tracking.CorrectionTest.test_refus) ... ok
+test_role_de_conception_au_canon (tests.test_merged_work_item_tracking.CorrectionTest.test_role_de_conception_au_canon) ... ok
+test_sans_correct_la_transition_reste_refusee_avec_la_marche_a_suivre (tests.test_merged_work_item_tracking.CorrectionTest.test_sans_correct_la_transition_reste_refusee_avec_la_marche_a_suivre) ... ok
+test_ameesh_list_sans_lot_de_session_ferme (tests.test_merged_work_item_tracking.CurrentLotTest.test_ameesh_list_sans_lot_de_session_ferme) ... ok
+test_etiquettes_resolues_dans_la_vue (tests.test_merged_work_item_tracking.CurrentLotTest.test_etiquettes_resolues_dans_la_vue) ... ok
+test_lot_cite_par_l_agent_puis_jamais_un_lot_ferme (tests.test_merged_work_item_tracking.CurrentLotTest.test_lot_cite_par_l_agent_puis_jamais_un_lot_ferme) ... ok
+test_403_dry_run_deuxieme_fusion_partielle (tests.test_merged_work_item_tracking.MergeSweepTest.test_403_dry_run_deuxieme_fusion_partielle) ... ok
+test_branche_implicite_en_avance_rapide (tests.test_merged_work_item_tracking.MergeSweepTest.test_branche_implicite_en_avance_rapide) ... ok
+test_cible_configuree_introuvable (tests.test_merged_work_item_tracking.MergeSweepTest.test_cible_configuree_introuvable) ... ok
+test_cited_lots (tests.test_merged_work_item_tracking.MergeSweepTest.test_cited_lots) ... ok
+test_cli_sync_branches (tests.test_merged_work_item_tracking.MergeSweepTest.test_cli_sync_branches) ... ok
+test_corps_illisible_aucune_fermeture (tests.test_merged_work_item_tracking.MergeSweepTest.test_corps_illisible_aucune_fermeture) ... ok
+test_diese_seulement_si_le_depot_l_active (tests.test_merged_work_item_tracking.MergeSweepTest.test_diese_seulement_si_le_depot_l_active) ... ok
+test_formes_lot_branch (tests.test_merged_work_item_tracking.MergeSweepTest.test_formes_lot_branch) ... ok
+test_formes_voisines_et_corps_ignores (tests.test_merged_work_item_tracking.MergeSweepTest.test_formes_voisines_et_corps_ignores) ... ok
+test_fusion_anterieure_au_lot_ignoree (tests.test_merged_work_item_tracking.MergeSweepTest.test_fusion_anterieure_au_lot_ignoree) ... ok
+test_fusion_github_d_une_branche_lot_ferme_le_lot (tests.test_merged_work_item_tracking.MergeSweepTest.test_fusion_github_d_une_branche_lot_ferme_le_lot) ... ok
+test_fusion_locale_d_une_branche_lot (tests.test_merged_work_item_tracking.MergeSweepTest.test_fusion_locale_d_une_branche_lot) ... ok
+test_l118d_avance_jusqu_a_la_cible_sans_travail_nouveau (tests.test_merged_work_item_tracking.MergeSweepTest.test_l118d_avance_jusqu_a_la_cible_sans_travail_nouveau) ... ok
+test_l118d_r1_erreur_git_garde_le_lot_ouvert (tests.test_merged_work_item_tracking.MergeSweepTest.test_l118d_r1_erreur_git_garde_le_lot_ouvert) ... ok
+test_l118d_r1_pointe_vue_avant_la_fusion_partielle (tests.test_merged_work_item_tracking.MergeSweepTest.test_l118d_r1_pointe_vue_avant_la_fusion_partielle) ... ok
+test_l118d_r2_fusion_partielle_antidatee (tests.test_merged_work_item_tracking.MergeSweepTest.test_l118d_r2_fusion_partielle_antidatee) ... ok
+test_l118d_r2_pointe_inchangee_relevee_apres_la_fusion (tests.test_merged_work_item_tracking.MergeSweepTest.test_l118d_r2_pointe_inchangee_relevee_apres_la_fusion) ... ok
+test_ligne_ameesh_work_dans_le_commit_de_fusion (tests.test_merged_work_item_tracking.MergeSweepTest.test_ligne_ameesh_work_dans_le_commit_de_fusion) ... ok
+test_pr_partielle_le_lot_reste_ouvert_jusqu_a_la_derniere (tests.test_merged_work_item_tracking.MergeSweepTest.test_pr_partielle_le_lot_reste_ouvert_jusqu_a_la_derniere) ... ok
+test_r1_branche_enregistree_seule_compte (tests.test_merged_work_item_tracking.MergeSweepTest.test_r1_branche_enregistree_seule_compte) ... ok
+test_r1_corps_illisible_puis_pr_complete_lisible (tests.test_merged_work_item_tracking.MergeSweepTest.test_r1_corps_illisible_puis_pr_complete_lisible) ... ok
+test_r1_fusion_locale_partielle_retient_la_branche_implicite (tests.test_merged_work_item_tracking.MergeSweepTest.test_r1_fusion_locale_partielle_retient_la_branche_implicite) ... ok
+test_r1_recul_et_plafond_des_lectures_de_gh (tests.test_merged_work_item_tracking.MergeSweepTest.test_r1_recul_et_plafond_des_lectures_de_gh) ... ok
+test_r2_corps_lus_gardes_pas_de_famine (tests.test_merged_work_item_tracking.MergeSweepTest.test_r2_corps_lus_gardes_pas_de_famine) ... ok
+test_r2_seule_la_derniere_fusion_partielle_compte (tests.test_merged_work_item_tracking.MergeSweepTest.test_r2_seule_la_derniere_fusion_partielle_compte) ... ok
+test_stale_lot_dit_l_action_puis_se_tait_apres_le_releve (tests.test_merged_work_item_tracking.MergeSweepTest.test_stale_lot_dit_l_action_puis_se_tait_apres_le_releve) ... ok
+test_cli_acteur_lie_par_defaut (tests.test_merged_work_item_tracking.MergedCommandTest.test_cli_acteur_lie_par_defaut) ... ok
+test_idempotent_et_jamais_de_reouverture (tests.test_merged_work_item_tracking.MergedCommandTest.test_idempotent_et_jamais_de_reouverture) ... ok
+test_tout_etat_ouvert_passe_merged_en_une_fois (tests.test_merged_work_item_tracking.MergedCommandTest.test_tout_etat_ouvert_passe_merged_en_une_fois) ... ok
+test_746_branche_enregistree_avec_deuxieme_parent_ferme (tests.test_merged_work_item_tracking.RealTargetTest.test_746_branche_enregistree_avec_deuxieme_parent_ferme) ... ok
+test_746_branche_enregistree_sans_deuxieme_parent_ne_ferme_pas (tests.test_merged_work_item_tracking.RealTargetTest.test_746_branche_enregistree_sans_deuxieme_parent_ne_ferme_pas) ... ok
+test_746_cible_declaree_citation_develop_note_sans_fermeture (tests.test_merged_work_item_tracking.RealTargetTest.test_746_cible_declaree_citation_develop_note_sans_fermeture) ... ok
+test_746_citation_sur_develop_ferme_le_lot (tests.test_merged_work_item_tracking.RealTargetTest.test_746_citation_sur_develop_ferme_le_lot) ... ok
+test_746_citation_sur_une_branche_de_travail_ne_ferme_pas (tests.test_merged_work_item_tracking.RealTargetTest.test_746_citation_sur_une_branche_de_travail_ne_ferme_pas) ... ok
+test_746_fusion_partielle_sur_develop_ne_ferme_pas (tests.test_merged_work_item_tracking.RealTargetTest.test_746_fusion_partielle_sur_develop_ne_ferme_pas) ... ok
+test_746_liste_blanche_et_ordre_des_candidats (tests.test_merged_work_item_tracking.RealTargetTest.test_746_liste_blanche_et_ordre_des_candidats) ... ok
+test_746_ref_illisible_signalee_sans_fermeture (tests.test_merged_work_item_tracking.RealTargetTest.test_746_ref_illisible_signalee_sans_fermeture) ... ok
+test_990_cache_des_candidats_par_cible_et_non_par_depot (tests.test_merged_work_item_tracking.RealTargetTest.test_990_cache_des_candidats_par_cible_et_non_par_depot)
+#990 (P2 de la relecture de #746) : la liste des candidats dépend de ... ok
+test_work_cycle_cli (tests.test_mesh_cli.DelaysCliTest.test_work_cycle_cli) ... ok
+test_work_etat_inconnu (tests.test_mesh_cli.DelaysCliTest.test_work_etat_inconnu) ... ok
+test_work_cycle_cli (tests.test_mesh_cli.MeshCliTest.test_work_cycle_cli) ... ok
+test_work_etat_inconnu (tests.test_mesh_cli.MeshCliTest.test_work_etat_inconnu) ... ok
+test_abandon_et_remplacement (tests.test_plan.CloseTest.test_abandon_et_remplacement) ... ok
+test_fusion_constatee_idempotente_sans_reouverture (tests.test_plan.CloseTest.test_fusion_constatee_idempotente_sans_reouverture) ... ok
+test_bloque_corrige_puis_fusionne_sous_un_autre_sha (tests.test_plan.ContentMergeTest.test_bloque_corrige_puis_fusionne_sous_un_autre_sha) ... ok
+test_cli_contenu_puis_pr (tests.test_plan.ContentMergeTest.test_cli_contenu_puis_pr) ... ok
+test_gel_valide_pendant_que_la_fermeture_attend_le_verrou (tests.test_plan.ContentMergeTest.test_gel_valide_pendant_que_la_fermeture_attend_le_verrou)
+Sonde codex1 (afcfb21) : connexion A tient la ligne du lot ; la ... ok
+test_nom_change_mais_gel_ancetre_de_la_cible (tests.test_plan.ContentMergeTest.test_nom_change_mais_gel_ancetre_de_la_cible) ... ok
+test_nouveau_gel_concurrent_empeche_la_fermeture (tests.test_plan.ContentMergeTest.test_nouveau_gel_concurrent_empeche_la_fermeture)
+La fermeture est conditionnée au gel examiné (P2-1, course). ... ok
+test_patch_id_exact_sans_normaliser_les_espaces (tests.test_plan.ContentMergeTest.test_patch_id_exact_sans_normaliser_les_espaces)
+P2-2 : `"a b"` et `"ab"` ne sont pas le même contenu. ... ok
+test_rebase_cherry_pick_et_squash_par_patch_id (tests.test_plan.ContentMergeTest.test_rebase_cherry_pick_et_squash_par_patch_id) ... ok
+test_sans_commit_ni_cible (tests.test_plan.ContentMergeTest.test_sans_commit_ni_cible) ... ok
+test_seul_le_dernier_gel_compte (tests.test_plan.ContentMergeTest.test_seul_le_dernier_gel_compte)
+P2-1 : un gel antérieur déjà fusionné ne ferme pas un lot regelé ... ok
+test_un_gel_attend_la_fermeture_en_cours (tests.test_plan.ContentMergeTest.test_un_gel_attend_la_fermeture_en_cours)
+Ordre inverse : tant qu'une transaction tient la ligne du lot (comme ... ok
+test_fusion_apres_reconciliation_et_lot_ferme_jamais_rouvert (tests.test_plan.GateMergeCloseTest.test_fusion_apres_reconciliation_et_lot_ferme_jamais_rouvert) ... ameesh fil: work item #2: lot closed (abandoned): merge seen (o/r#20), not reopened
+ok
+test_fusion_confirmee_ferme_le_lot (tests.test_plan.GateMergeCloseTest.test_fusion_confirmee_ferme_le_lot) ... ok
+test_759_branche_declaree_autre_etape_retient_le_lot (tests.test_plan.GithubTest.test_759_branche_declaree_autre_etape_retient_le_lot) ... ok
+test_759_pr_finale_d_une_branche_differente_ferme_aussi (tests.test_plan.GithubTest.test_759_pr_finale_d_une_branche_differente_ferme_aussi) ... ok
+test_759_pr_finale_ferme_malgre_une_pr_ouverte (tests.test_plan.GithubTest.test_759_pr_finale_ferme_malgre_une_pr_ouverte) ... ok
+test_759_pr_ouverte_au_dela_du_plafond_retient_le_lot (tests.test_plan.GithubTest.test_759_pr_ouverte_au_dela_du_plafond_retient_le_lot) ... ok
+test_759_pr_partielle_ne_ferme_pas_meme_declaree_finale (tests.test_plan.GithubTest.test_759_pr_partielle_ne_ferme_pas_meme_declaree_finale) ... ok
+test_759_pr_partielle_ouverte_retient_le_lot (tests.test_plan.GithubTest.test_759_pr_partielle_ouverte_retient_le_lot) ... ok
+test_label_de_base_retire_ni_doublon_ni_silence (tests.test_plan.GithubTest.test_label_de_base_retire_ni_doublon_ni_silence)
+P2-3 : l'issue se retrouve par son marqueur, même sans le label ... ok
+test_modification_dans_github_signalee_jamais_reimportee (tests.test_plan.GithubTest.test_modification_dans_github_signalee_jamais_reimportee) ... ok
+test_projection_creee_puis_idempotente (tests.test_plan.GithubTest.test_projection_creee_puis_idempotente) ... ok
+test_refus_de_gh_et_depot_invalide (tests.test_plan.GithubTest.test_refus_de_gh_et_depot_invalide) ... ok
+test_sans_api_sub_issues_liste_de_taches (tests.test_plan.GithubTest.test_sans_api_sub_issues_liste_de_taches) ... ok
+test_sync_github_branche_lot_d_un_fork_ou_d_une_autre_branche (tests.test_plan.GithubTest.test_sync_github_branche_lot_d_un_fork_ou_d_une_autre_branche) ... ok
+test_sync_github_branche_lot_numero_et_pr_partielle (tests.test_plan.GithubTest.test_sync_github_branche_lot_numero_et_pr_partielle) ... ok
+test_sync_github_ferme_les_lots_fusionnes (tests.test_plan.GithubTest.test_sync_github_ferme_les_lots_fusionnes) ... ok
+test_lier_et_delier (tests.test_plan.PackageSyncTest.test_lier_et_delier) ... ok
+test_retrait_parent_change_et_fiche_en_erreur (tests.test_plan.PackageSyncTest.test_retrait_parent_change_et_fiche_en_erreur) ... ok
+test_sync_recopie_les_fiches (tests.test_plan.PackageSyncTest.test_sync_recopie_les_fiches) ... ok
+test_cycle (tests.test_plan.PackageValidationTest.test_cycle) ... ok
+test_erreurs_du_plan (tests.test_plan.PackageValidationTest.test_erreurs_du_plan) ... ok
+test_exemple_valide_et_lu (tests.test_plan.PackageValidationTest.test_exemple_valide_et_lu) ... ok
+test_une_erreur_du_plan_ne_bloque_aucun_agent (tests.test_plan.PackageValidationTest.test_une_erreur_du_plan_ne_bloque_aucun_agent) ... ok
+test_cli_du_plan (tests.test_plan.PlanCliTest.test_cli_du_plan) ... ok
+test_attentes (tests.test_plan.PlanUnitTest.test_attentes) ... ok
+test_epic_et_progression (tests.test_plan.PlanUnitTest.test_epic_et_progression) ... ok
+test_lien_vers_la_fiche (tests.test_plan.PlanUnitTest.test_lien_vers_la_fiche) ... ok
+test_pr_vers_fiches (tests.test_plan.PlanUnitTest.test_pr_vers_fiches) ... ok
+test_stagnation (tests.test_plan.PlanUnitTest.test_stagnation) ... ok
+test_statut_d_une_fiche_lot (tests.test_plan.PlanUnitTest.test_statut_d_une_fiche_lot) ... ok
+test_instantane_avec_le_plan (tests.test_plan.ProgressPlanTest.test_instantane_avec_le_plan) ... ok
+test_message_lie_et_lot_ferme (tests.test_plan.StagnationUnifiedTest.test_message_lie_et_lot_ferme) ... ok
+test_regles_reprises_de_l26 (tests.test_plan.StagnationUnifiedTest.test_regles_reprises_de_l26) ... ok
+test_delais_restreints_a_des_lots (tests.test_work.DelaysTest.test_delais_restreints_a_des_lots)
+`ids` borne le balayage aux lots demandés (B3, revue codex2). ... ok
+test_etapes_absentes_valent_null (tests.test_work.DelaysTest.test_etapes_absentes_valent_null) ... ok
+test_jalon_courant_gel_puis_revue (tests.test_work.DelaysTest.test_jalon_courant_gel_puis_revue) ... ok
+test_jalons_automatiques_et_declares (tests.test_work.DelaysTest.test_jalons_automatiques_et_declares) ... ok
+test_jalons_manuels_refuses (tests.test_work.DelaysTest.test_jalons_manuels_refuses) ... ok
+test_liste_des_delais_et_ordre (tests.test_work.DelaysTest.test_liste_des_delais_et_ordre) ... ok
+test_assignation_et_budget (tests.test_work.WorkTest.test_assignation_et_budget) ... ok
+test_boucle_qa_bornee (tests.test_work.WorkTest.test_boucle_qa_bornee) ... ok
+test_cycle_complet (tests.test_work.WorkTest.test_cycle_complet) ... ok
+test_deplacement_concurrent_un_seul_gagnant (tests.test_work.WorkTest.test_deplacement_concurrent_un_seul_gagnant)
+Deux `move` partis du MÊME état : le CAS n'en garde qu'un. ... ok
+test_deux_moves_sequentiels_reussissent (tests.test_work.WorkTest.test_deux_moves_sequentiels_reussissent)
+Le CAS garde la transition lue, il n'interdit pas l'enchaînement. ... ok
+test_journal_des_transitions (tests.test_work.WorkTest.test_journal_des_transitions) ... ok
+test_notify_sur_changement_d_etat (tests.test_work.WorkTest.test_notify_sur_changement_d_etat) ... ok
+test_transitions_refusees (tests.test_work.WorkTest.test_transitions_refusees) ... ok
+test_validations (tests.test_work.WorkTest.test_validations) ... ok
+
+----------------------------------------------------------------------
+Ran 216 tests in 846.899s
+
+OK (skipped=3)
+fin=2026-10-14T18:44:40Z rc=0
