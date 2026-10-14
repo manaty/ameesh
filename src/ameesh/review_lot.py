@@ -81,7 +81,12 @@ def reviewer_family(harness: Optional[str]) -> str:
 
 
 def _author(db, name: str) -> dict:
-    """Le harnais de l'auteur du lot, si le registre le connaît."""
+    """Le harnais de l'auteur du lot, si le registre le connaît.
+
+    #1037 : c'est celui de sa session VIVANTE (`registry.live_harness`), pas
+    seulement son harnais déclaré — L242b fait tourner un agent sous un
+    harnais emprunté, et la relecture doit venir d'une autre famille que
+    celle qui a réellement produit le travail."""
     name = (name or "").strip()
     if not name:
         return {"name": "", "harness": ""}
@@ -90,7 +95,7 @@ def _author(db, name: str) -> dict:
         row = registry.get(db, name) or {}
     except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
         return {"name": name, "harness": ""}
-    return {"name": name, "harness": str(row.get("harness") or "")}
+    return {"name": name, "harness": registry.live_harness(row)}
 
 
 def _repo_of_agent(db, name: str) -> str:
