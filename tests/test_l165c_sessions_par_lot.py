@@ -8,6 +8,7 @@ Postgres réel (les deux pilotes, AMEESH_DRIVER) ; faux harnais du banc."""
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from unittest import mock
 
@@ -439,6 +440,119 @@ class RoutageTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
+    def test_le_lot_fini_ferme_la_session_au_tour_suivant(self):
+        """B1 (revue Claude du 14/10) : la session active d'un lot FINI est
+        fermée par son agent, sous son bail, avant le tour suivant sur ce même
+        lot ; le tour ouvre alors une session neuve sur le brief du lot."""
+        worker = self._worker("w8")
+        try:
+            a = work.add(self.db, title="A", assignee="w8")["id"]
+            work.move(self.db, a, "build")
+            self.tour(worker, a, "commence A", session="sess-A")
+            self.assertEqual(registry.get(self.db, "w8")["session_id"], "sess-A")
+            work.close(self.db, a, abandoned=True, actor="test")
+            spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite de A",
+                                          "ids": [], "lot": str(a)})
+            self.assertEqual(spec["lot"], str(a))
+            agent = registry.get(self.db, "w8")
+            self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                             (None, None), "la session du lot fini est fermée")
+            self.assertIsNone(worker.read_session_file(),
+                              "le fichier local ne ressuscite pas la session")
+            self.assertIsNone(worker.current_session())
+            self.assertIn("dedicated to lot #%d" % a, worker.resume_summary or "",
+                          "le tour suivant ouvre sur le brief du lot")
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_les_politiques_jamais_et_taille_gardent_la_session(self):
+        """B1b : hors politique `par-lot`, un lot fini ne ferme pas la session
+        longue (`jamais`, `taille`)."""
+        for i, politique in enumerate(("jamais", "taille")):
+            name = "w9%d" % i
+            with self.subTest(politique=politique):
+                worker = self._worker(name)
+                try:
+                    storage.of(self.db).operations.set_settings(
+                        name, {"session_policy": politique})
+                    worker.agent = registry.get(self.db, name)
+                    a = work.add(self.db, title="A", assignee=name)["id"]
+                    work.move(self.db, a, "build")
+                    self.tour(worker, a, "commence A", session="sess-A")
+                    work.close(self.db, a, abandoned=True, actor="test")
+                    self.assertFalse(worker._close_finished_lot_session(str(a)))
+                    worker.rotate_for_lot({"kind": "prompt", "prompt": "veille",
+                                           "ids": []})
+                    agent = registry.get(self.db, name)
+                    self.assertEqual(agent["session_id"], "sess-A")
+                    self.assertEqual(agent["session_work_item"], str(a))
+                finally:
+                    worker.watchdog_stop.set()
+
+    def test_pas_de_fermeture_pendant_un_tour(self):
+        """B1c : jamais pendant un tour — la garde `proc` laisse la session et
+        son fichier local intacts, même pour un lot fini."""
+        worker = self._worker("w10")
+        proc = subprocess.Popen(["sleep", "60"])
+        try:
+            a = work.add(self.db, title="A", assignee="w10")["id"]
+            work.move(self.db, a, "build")
+            storage.of(self.db).operations.set_session_work_item(
+                "w10", worker.runner.runner_id, worker.epoch, str(a))
+            registry.set_session(self.db, "w10", "sess-A", None, harness="claude",
+                                 cwd=self._cwd("w10"))
+            worker.agent = registry.get(self.db, "w10")
+            worker.proc = proc
+            work.close(self.db, a, abandoned=True, actor="test")
+            self.assertFalse(worker._close_finished_lot_session(str(a)))
+            spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "suite",
+                                          "ids": [], "lot": str(a)})
+            self.assertEqual(spec["lot"], str(a))
+            agent = registry.get(self.db, "w10")
+            self.assertEqual(agent["session_id"], "sess-A")
+        finally:
+            worker.proc = None
+            proc.kill()
+            proc.wait()
+            worker.watchdog_stop.set()
+
+    def test_rotation_de_taille_sur_le_meme_lot_garde_le_resume(self):
+        """N1 (revue Claude du 14/10) : après une rotation de taille, le tour
+        suivant sur le MÊME lot ne jette pas le résumé payé : il ouvre la
+        session neuve (complété par la fiche du lot), en mémoire et sur disque
+        (`RESUME_PENDING`), au lieu du brief de lot seul."""
+        worker = self._worker("w11")
+        try:
+            a = work.add(self.db, title="A", assignee="w11")["id"]
+            work.move(self.db, a, "build")
+            mail.send(self.db, "orch", "w11", "commence A", work_item_id=str(a))
+            with mock.patch.dict(os.environ, {
+                    "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                    "AMEESH_SESSION_STORE_CHECK": "0",
+                    "AMEESH_TEST_NEW_SESSION": "sess-A",
+                    "AMEESH_TEST_RESULT": "RESUME-PAYE"}):
+                spec = worker.rotate_for_lot(worker.pick())
+                self.assertTrue(worker.run_turn(spec))
+                worker.rotation_forcee = "banc"        # rotation de taille due
+                self.assertTrue(worker.maybe_rotate())
+            self.assertIsNone(registry.get(self.db, "w11")["session_id"])
+            self.assertEqual(worker.resume_origin, "agent")
+            self.assertIn("RESUME-PAYE", worker.resume_summary)
+            # le tour suivant porte le MÊME lot : le résumé ne doit pas être écrasé
+            mail.send(self.db, "orch", "w11", "suite de A", work_item_id=str(a))
+            spec = worker.rotate_for_lot(worker.pick())
+            self.assertEqual(spec["lot"], str(a))
+            self.assertEqual(worker.resume_origin, "agent")
+            self.assertIn("RESUME-PAYE", worker.resume_summary)
+            self.assertIn("dedicated to lot #%d" % a, worker.resume_summary,
+                          "la fiche du lot complète le résumé")
+            chemin = os.path.join(worker.state_dir, "resume-pending.json")
+            with open(chemin, encoding="utf-8") as fh:
+                self.assertIn("RESUME-PAYE", fh.read(),
+                              "le disque garde le même résumé que la mémoire")
+        finally:
+            worker.watchdog_stop.set()
+
 
 class BriefDeLotTest(_Base):
     """#794 : le brief d'une session dédiée à un lot est MINIMAL — canon,
@@ -495,6 +609,16 @@ class BriefDeLotTest(_Base):
         self.assertNotIn("un message pour un autre lot", text)
         self.assertNotIn("Previous session", text)
         self.assertNotIn("Work items assigned to you", text)
+
+    def test_branche_qui_commence_par_un_tiret_n_est_pas_une_option_git(self):
+        """N2 (revue Claude du 14/10) : `branch`/`branch_target` viennent de la
+        base (`work.set_branch` les valide, mais la colonne peut être écrite
+        autrement) : jamais passés à git comme des options."""
+        from ameesh import reprise
+        lignes = reprise._lot_diff(
+            {"branch": "--output=/tmp/prise", "branch_target": "--output=/tmp/autre"},
+            self.tmp)
+        self.assertIn("refused", "\n".join(lignes))
 
 
 class ReveilTest(_Base):
@@ -597,41 +721,61 @@ class PurgeTest(_Base):
         self.assertEqual([r["work_item_id"] for r in purges], [a])
         self.assertEqual([r["work_item_id"] for r in self.st.listing("p1")], [b])
 
-    def test_la_purge_oublie_la_session_active_du_lot_fini(self):
-        """#794 : fermer = oublier la session harnais. La session ACTIVE d'un
-        lot purgé est oubliée au registre et son fichier local retiré ; celle
-        d'un autre lot, ou d'un agent passé à un autre lot, reste."""
+    def test_la_purge_ne_ferme_jamais_la_session_active(self):
+        """B1 (revue Claude du 14/10) : le relevé des branches n'a pas le bail
+        de l'agent et peut tomber en plein tour : il ne touche plus au registre.
+        La session ACTIVE d'un lot fini est laissée à l'agent, qui la ferme à
+        son tour suivant."""
         runner, lease = self.bail("p2")
         a = work.add(self.db, title="A", assignee="p2")["id"]
         storage.of(self.db).operations.set_session_work_item(
             "p2", runner.runner_id, lease["lease_epoch"], str(a))
         registry.set_session(self.db, "p2", "sess-A", None, harness="claude",
                              cwd=self._cwd("p2"))
-        chemin = os.path.join(self.cfg.agent_dir("p2"), "session")
-        os.makedirs(os.path.dirname(chemin), exist_ok=True)
-        with open(chemin, "w", encoding="utf-8") as fh:
-            fh.write("sess-A\n")
-        work.close(self.db, a, abandoned=True, actor="test")
-        purges = runner.lot_sessions_purge(self.db)
-        self.assertEqual([r["forgotten_session"] for r in purges], ["sess-A"])
-        agent = registry.get(self.db, "p2")
-        self.assertEqual((agent["session_id"], agent["session_work_item"]), (None, None))
-        self.assertFalse(os.path.exists(chemin), "le fichier local ne ressuscite pas")
-
-    def test_la_purge_ne_touche_pas_un_agent_passe_a_un_autre_lot(self):
-        runner, lease = self.bail("p3")
-        a = work.add(self.db, title="A", assignee="p3")["id"]
-        b = work.add(self.db, title="B", assignee="p3")["id"]
-        storage.of(self.db).operations.set_session_work_item(
-            "p3", runner.runner_id, lease["lease_epoch"], str(b))
-        registry.set_session(self.db, "p3", "sess-B", None, harness="claude",
-                             cwd=self._cwd("p3"))
-        self.st.note_wake("p3", a, time.time())
+        self.st.note_wake("p2", a, time.time())
         work.close(self.db, a, abandoned=True, actor="test")
         purges = runner.lot_sessions_purge(self.db)
         self.assertEqual([r["work_item_id"] for r in purges], [a])
-        self.assertEqual([r["forgotten_session"] for r in purges], [None])
+        agent = registry.get(self.db, "p2")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                         ("sess-A", str(a)), "le balayage ne ferme aucune session")
+
+    def test_un_lot_non_assigne_ne_ferme_pas_la_session(self):
+        """B1a : un relecteur, le pilote ou l'auditeur qui travaille sur un lot
+        dont il n'est pas l'assigné garde sa session, même sans changer de lot
+        (elle n'est fermée que par un lot FINI, jamais par une réassignation)."""
+        runner, lease = self.bail("p3")
+        worker = AgentWorker(runner, registry.get(self.db, "p3"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        a = work.add(self.db, title="A", assignee="p3")["id"]
+        work.assign(self.db, a, "human:quelqu-un")        # relecture par un autre
+        storage.of(self.db).operations.set_session_work_item(
+            "p3", runner.runner_id, lease["lease_epoch"], str(a))
+        registry.set_session(self.db, "p3", "sess-relecture", None, harness="claude",
+                             cwd=self._cwd("p3"))
+        worker.agent = registry.get(self.db, "p3")
+        self.assertEqual(runner.lot_sessions_purge(self.db), [])
+        self.assertFalse(worker._close_finished_lot_session(str(a)))
+        spec = worker.rotate_for_lot({"kind": "prompt", "prompt": "relecture",
+                                      "ids": [], "lot": str(a)})
+        self.assertEqual(spec["lot"], str(a))
         agent = registry.get(self.db, "p3")
+        self.assertEqual((agent["session_id"], agent["session_work_item"]),
+                         ("sess-relecture", str(a)))
+
+    def test_la_purge_ne_touche_pas_un_agent_passe_a_un_autre_lot(self):
+        runner, lease = self.bail("p4")
+        a = work.add(self.db, title="A", assignee="p4")["id"]
+        b = work.add(self.db, title="B", assignee="p4")["id"]
+        storage.of(self.db).operations.set_session_work_item(
+            "p4", runner.runner_id, lease["lease_epoch"], str(b))
+        registry.set_session(self.db, "p4", "sess-B", None, harness="claude",
+                             cwd=self._cwd("p4"))
+        self.st.note_wake("p4", a, time.time())
+        work.close(self.db, a, abandoned=True, actor="test")
+        purges = runner.lot_sessions_purge(self.db)
+        self.assertEqual([r["work_item_id"] for r in purges], [a])
+        agent = registry.get(self.db, "p4")
         self.assertEqual((agent["session_id"], agent["session_work_item"]),
                          ("sess-B", str(b)))
 

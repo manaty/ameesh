@@ -660,23 +660,31 @@ def _lot_diff(item: dict, cwd: str) -> list[str]:
     """Le diff de la branche du lot (stat et derniers commits), borné.
 
     Jamais fatal : sans branche, sans dépôt, sans git ou sans merge-base, la
-    section le dit et la session neuve sait où reprendre."""
+    section le dit et la session neuve sait où reprendre. N2 (revue Claude du
+    2026-10-14) : `branch` et `branch_target` viennent de `work.set_branch` et
+    ne sont jamais passés à git comme des options — un nom qui commence par
+    `-` est refusé, et `--end-of-options` précède toute référence."""
     section = ["## Diff of the lot's branch"]
     branche = (item.get("branch") or "").strip()
     if not branche:
         return section + ["- no branch yet: the agent opens the lot's worktree and "
                           "branch in the first turns."]
+    if branche.startswith("-"):
+        return section + ["- branch name %r refused (starts with '-')" % branche]
     if not cwd or not os.path.isdir(cwd):
         return section + ["- branch %s (diff unreadable: no working directory)"
                           % branche]
-    tete, err = _git(cwd, ["rev-parse", "--verify", "--quiet", branche + "^{commit}"])
+    tete, err = _git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options",
+                           branche + "^{commit}"])
     if not tete:
         return section + ["- branch %s (diff unreadable: %s)" % (branche, err or "unknown ref")]
     tete = tete.strip()
     cible = (item.get("branch_target") or "").strip()
+    if cible.startswith("-"):
+        cible = ""
     racine = base_nom = None
     for candidat in ([cible] if cible else list(LOT_DIFF_BASES)):
-        sortie, _ = _git(cwd, ["merge-base", candidat, branche])
+        sortie, _ = _git(cwd, ["merge-base", "--end-of-options", candidat, branche])
         if sortie and sortie.strip():
             racine, base_nom = sortie.strip(), candidat
             break
@@ -684,13 +692,14 @@ def _lot_diff(item: dict, cwd: str) -> list[str]:
         return section + ["- branch %s, head %s (no merge-base with %s: diff unreadable)"
                           % (branche, tete[:12], cible or "/".join(LOT_DIFF_BASES))]
     out = ["- %s: base %s (%s) → head %s" % (branche, base_nom, racine[:12], tete[:12])]
-    stat, _ = _git(cwd, ["diff", "--stat", "--no-color", racine, branche])
+    stat, _ = _git(cwd, ["diff", "--stat", "--no-color", "--end-of-options",
+                         racine, branche])
     if stat:
         stat_lignes = [l for l in stat.splitlines() if l.strip()][:LOT_DIFF_MAX_LINES]
         out += ["  - " + fil.excerpt(l, 300) for l in stat_lignes]
         out = _clip_lines(out, LOT_DIFF_MAX_BYTES)
     journal, _ = _git(cwd, ["log", "--oneline", "--no-decorate", "-5",
-                            "%s..%s" % (racine, branche)])
+                            "--end-of-options", "%s..%s" % (racine, branche)])
     if journal:
         out.append("  - last commits:")
         out += ["    - " + fil.excerpt(l, 200) for l in journal.splitlines()[:5]]
