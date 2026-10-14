@@ -19,9 +19,11 @@ from . import support  # isolate the host's agent environment
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "test.sh"
 # #1207 : chaque temoin lance de vrais interpretes Python sous le script. La
-# borne de 15 s tenait au repos mais pas sous charge CI (N non bloquant de la
-# R1 #1170). Elle reste un garde-fou anti-blocage, choisie tres au-dessus du
-# besoin reel (~1 s) et tres en dessous du budget du job (plafond psql 45 min).
+# R1 #1170 a signale le litteral de 15 s comme fragile sous charge CI, sans
+# aucun echec constate. Il reste un garde-fou anti-blocage, mais nomme et
+# mesure : 0,2 a 0,4 s par temoin au repos (module 10/10 en 2,2 s psycopg et
+# 3,9 s psql, #1207), donc 120 s gardent une marge >250x tout en restant tres
+# en dessous du plafond du job ou le module tourne (45 min psql, 30 min psycopg).
 WITNESS_TIMEOUT_S = 120
 
 
