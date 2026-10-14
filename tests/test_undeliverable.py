@@ -214,7 +214,7 @@ class EnvoiRefuseTest(_Base):
         proc = self.send("claude2", "Relecture demandée sur ce lot.",
                          AGENT_MAIL_NAME="claude1")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("dropped for: claude2", proc.stdout)
+        self.assertIn("delivered to claude2", proc.stdout)
         self.assertIn("warning: claude2 is not wakeable right now", proc.stderr)
         self.assertIn("profile diverged", proc.stderr)
         self.assertEqual(self.pending("claude2"), ["Relecture demandée sur ce lot."])
