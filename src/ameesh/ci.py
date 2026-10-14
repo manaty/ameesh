@@ -72,30 +72,36 @@ EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
-#: #845 : le relevé « runner busy sans job » coûte un appel par exécution non
-#: conclue (en plus de la liste des runners) : il est mené au plus toutes les
-#: `GUARD_SCAN_S` secondes, jamais à chaque passage. La fenêtre est écrite
-#: dans la base avant le premier appel HTTP (`ci_guard_scan`) : deux
-#: `notify --once` concurrents, ou deux hôtes, ne la mènent pas deux fois.
-GUARD_SCAN_S = 300.0
-#: #845 : au-delà de ce nombre d'exécutions non conclues, le relevé est trop
-#: large : la comparaison runners/jobs est sautée et journalisée, plutôt que
-#: de risquer une fausse panne (leçon de la mesure du 13/10, #828)
-GUARD_SCAN_MAX_RUNS = 120
+#: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
+#: coûte un appel par exécution non conclue (en plus des deux listes et de
+#: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
+#: jamais à chaque passage. La fenêtre est écrite dans la base avant le premier
+#: appel HTTP (`ci_guard_scan`) : deux `notify --once` concurrents, ou deux
+#: hôtes, ne la mènent pas deux fois. À 600 s et 63 appels au plus par relevé,
+#: cette garde seule consomme au plus 378 appels/h et par dépôt (hors appels du
+#: suivi des échecs) ; la durée d'un relevé n'est pas bornée globalement, donc
+#: aucune détection en « <= 10 min » n'est promise.
+GUARD_SCAN_S = 600.0
+#: #845 (arbitrage A) : au-delà de ce nombre d'exécutions non conclues, le
+#: relevé est trop large : rien n'est publié et l'incomplétude est journalisée
+#: (`too_many_runs`), plutôt que de risquer une fausse panne (leçon de la mesure
+#: du 13/10, #828) ou de dépasser le budget d'appels.
+GUARD_SCAN_MAX_RUNS = 60
 #: #845 : taille de page des listes du relevé (runners et jobs) ; les
 #: exécutions sont listées par le relevé lui-même, sans le filtre de workflow
 #: ni la page de 50 du suivi des échecs (un runner peut tenir un job de
 #: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
 GUARD_PER_PAGE = 100
-#: #845 (revue N/P2 2328) : budget d'appels GitHub d'un relevé de la garde —
-#: les deux listes d'exécutions, un appel par exécution non conclue (chacune est
-#: relue : un run resté `queued` peut porter un job déjà `in_progress`, R1 cx3
-#: B1), et la liste des runners. Au-delà, le relevé est déclaré incomplet et
-#: RIEN n'est publié : un relevé partiel ne vaut pas un relevé complet, et les
-#: relevés précédents vieillissent jusqu'à ce que la fraîcheur
-#: (`exploitation.CI_GUARD_FRESH_S`) les clôt. Le nombre d'appels réellement
-#: consommés est journalisé dans `ci_guard_scan`.
-GUARD_SCAN_MAX_CALLS = 12
+#: #845 (revue N/P2 2328 ; arbitrage A) : budget d'appels GitHub d'un relevé de
+#: la garde — les deux listes d'exécutions, un appel par exécution non conclue
+#: (chacune est relue : un run resté `queued` peut porter un job déjà
+#: `in_progress`, R1 cx3 B1), et la liste des runners. Le plafond couvre
+#: exactement `GUARD_SCAN_MAX_RUNS` exécutions : 2 + 60 + 1 = 63. Au-delà, le
+#: relevé est déclaré incomplet et RIEN n'est publié : un relevé partiel ne vaut
+#: pas un relevé complet, et les relevés précédents vieillissent jusqu'à ce que
+#: la fraîcheur (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre
+#: d'appels réellement consommés est journalisé dans `ci_guard_scan`.
+GUARD_SCAN_MAX_CALLS = 63
 
 
 class _GuardBudget(RuntimeError):
@@ -381,16 +387,18 @@ class Watcher:
         garde la date du run, un run `in_progress` peut encore porter un job en
         file).
 
-        Le relevé est borné (revue N/P2 2328) : la fenêtre est écrite dans la
-        base avant le premier appel (`ci_guard_scan`, atomique par dépôt), et un
-        budget d'appels (`GUARD_SCAN_MAX_CALLS`) arrête un relevé qui ne peut pas
-        couvrir toutes les exécutions. Chaque exécution non conclue est relue :
-        un run resté `queued` peut porter un job déjà `in_progress` quand un
-        autre attend (mesure fondatrice #828), donc aucun instantané de jobs
-        ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3, B1).
-        Un relevé incomplet ne publie **rien** : il est journalisé et daté dans
-        `ci_guard_scan`, les relevés précédents vieillissent et la fraîcheur les
-        clôt — jamais une mesure partielle publiée comme complète.
+        Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
+        la fenêtre de 600 s est écrite dans la base avant le premier appel
+        (`ci_guard_scan`, atomique par dépôt), chaque exécution non conclue est
+        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 63 appels
+        (2 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
+        relue : un run resté `queued` peut porter un job déjà `in_progress`
+        quand un autre attend (mesure fondatrice #828), donc aucun instantané de
+        jobs ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3,
+        B1). Un relevé incomplet ne publie **rien** : il est journalisé et daté
+        dans `ci_guard_scan`, l'état complet précédent reste en place et fonde
+        encore ses alertes jusqu'à la fraîcheur (1800 s) — jamais une mesure
+        partielle publiée comme complète.
 
         Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
         journalisée et n'empêche ni les échecs, ni les verdicts.
