@@ -58,8 +58,9 @@ L'ordre inverse (`--union` avec main en premier) donne L244 puis L243, blob
 ## 4. Delta et constance
 
 Delta F vs main = **exactement 11 fichiers** (`union-vs-main.patch`, 83 359 o).
-10/11 blobs sont identiques au gel `39df7c316c` ; les 2 fichiers partagés sont des
-unions propres :
+9/11 blobs sont identiques au gel `39df7c316c` ; les 2 fichiers partagés sont des
+unions propres (compte corrigé le 14/10/2026 ~09:2xZ après revue indépendante
+mesh-design : la première version du colis écrivait « 10/11 ») :
 
 | fichier | blob dans F | vs gel `39df` |
 |---|---|---|
