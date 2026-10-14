@@ -93,6 +93,7 @@ import time
 
 from . import storage
 from .db import Db
+from .storage import interface
 
 ITEM_TYPE = "improvement"
 PRIORITIES = (1, 2, 3)
@@ -100,13 +101,16 @@ DEFAULT_PRIORITY = 2
 #: prise automatique : au repos depuis 30 min, au plus 2 prises par heure
 DEFAULT_TAKE_IDLE_S = 1800.0
 DEFAULT_TAKE_MAX_PER_HOUR = 2
-#: préfixe de la note de journal d'une prise automatique (compte du débit)
-AUTO_TAKE_NOTE = "prise automatique"
+#: préfixe de la note de journal d'une prise automatique (compte du débit) —
+#: texte défini dans `storage.interface.ASSIGN_NOTE_PREFIXES`, avec tous les
+#: débuts de note d'une attribution (une prise postérieure efface une exception
+#: pilote §4 antérieure)
+AUTO_TAKE_NOTE = interface.AUTO_TAKE_NOTE
 #: L165 : un lot non assigné de l'équipe est pris après 15 min de repos, au
 #: plus 6 par heure pour tout le mesh ; débit compté à part de la file
 DEFAULT_LOT_IDLE_S = 900.0
 DEFAULT_LOT_MAX_PER_HOUR = 6
-LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+LOT_TAKE_NOTE = interface.LOT_TAKE_NOTE
 #: âge minimal d'un lot pris : l'orchestrateur qui vient de le créer le confie
 LOT_MIN_AGE_S = 300.0
 #: capacités exigées qui réservent un lot à une attribution explicite
@@ -413,6 +417,19 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if teams[name] == team] or known)
 
 
+def _still_free(st, item_id) -> bool:
+    """Le lot est-il encore prenable (sans assigné, dans un état de prise) ?
+
+    `assign_capped` rend None pour deux refus distincts — le plafond §4 atteint
+    (le lot n'a pas bougé : le garder pour un autre preneur) ou une prise
+    concurrente (le lot a bougé : le retirer) : cette relecture les distingue."""
+    item = st.work.get(int(item_id))
+    if item is None:
+        return False
+    return (not (item.get("assignee") or "").strip()
+            and item.get("state") in ("intake", "build"))
+
+
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
               max_per_hour: int = DEFAULT_TAKE_MAX_PER_HOUR,
               alerts: list | None = None, listing: list | None = None, paid=None,
@@ -549,9 +566,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                              note="%s par %s, au repos" % (LOT_TAKE_NOTE,
                                                                            check["assignee"]),
                                              actor=SENDER, max_build=work.BUILD_LIMIT)
-                lots.remove(item)
                 if done is None:
-                    continue                # pris entre-temps : lot suivant
+                    # plafond §4 atteint (rien n'a bougé : le lot reste à
+                    # prendre par un autre agent) ou pris entre-temps
+                    if _still_free(st, item["id"]):
+                        break           # agent au plafond : au suivant
+                    lots.remove(item)
+                    continue            # pris entre-temps : lot suivant
+                lots.remove(item)
                 done = dict(done, lot_team=item["lot_team"])
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
                                         "team": item["lot_team"]}}
@@ -606,9 +628,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             done = st.work.assign_capped(int(item["id"]), check["assignee"], current=None,
                                          note=note, actor=SENDER,
                                          max_build=work.BUILD_LIMIT)
-            queue.remove(item)
             if done is None:
+                # idem lots d'équipe : plafond (garder) ou prise concurrente
+                if _still_free(st, item["id"]):
+                    break                   # agent au plafond : au suivant
+                queue.remove(item)
                 continue                    # pris entre-temps : élément suivant
+            queue.remove(item)
             message_id = mail.send(db, SENDER, check["assignee"], take_message(done),
                                    kind="event", work_item_id=str(done["id"]),
                                    payload={"backlog": {"lot": int(done["id"]),
