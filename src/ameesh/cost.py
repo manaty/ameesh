@@ -695,7 +695,7 @@ class CostBook:
                 continue
             if newest is None or _reading_rank(found) >= _reading_rank(newest):
                 newest = found
-        return list(newest[2]) if newest else []
+        return newest[2] if newest else []
 
     def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
@@ -2004,28 +2004,31 @@ def _replayed(gauges: list, produced: float | None) -> bool:
 
 
 def _last_claude_reading(events: list, agent: str, mtime: float):
-    """Dernier `rate_limit_event` d'un flux, daté par son marqueur (#1132).
+    """Le MEILLEUR `rate_limit_event` d'un flux, daté par son marqueur (#1132).
 
     Rend `(estampille, production, Gauges)` : `production` est le ts du dernier
     marqueur de compte vu avant l'événement (None pour un flux sans marqueur),
     `estampille` le mtime du fichier quand il n'y a pas de marqueur — il ne
-    sert qu'à départager deux flux non datés.
+    sert qu'à départager deux mesures non datées. Les mesures du flux sont
+    classées par `_reading_rank`, jamais par leur ordre de lecture : un rejeu
+    publié APRÈS une mesure fraîche du même journal ne masque plus celle-ci.
     """
-    produced, found = None, None
+    produced, best = None, None
     for event in events:
         if _is_claude_marker(event):
             produced = _marker_ts(event)
         elif event.get("type") == "rate_limit_event":
             gauges = _claude_windows(event)
-            if gauges is not None:
-                found = (produced, gauges, _claude_overage(event))
-    if found is None:
-        return None
-    produced, gauges, overage = found
-    if _replayed(gauges, produced):
-        produced = None
-    stamp = produced if produced is not None else mtime
-    return (stamp, produced, _stamp_gauges(gauges, produced, agent, overage))
+            if gauges is None:
+                continue
+            at = produced
+            if _replayed(gauges, at):
+                at = None                 # rejeu : jamais daté
+            found = (at if at is not None else mtime, at,
+                     _stamp_gauges(gauges, at, agent, _claude_overage(event)))
+            if best is None or _reading_rank(found) >= _reading_rank(best):
+                best = found
+    return best
 
 
 def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dict:
@@ -2035,7 +2038,9 @@ def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dic
     marqueur du tour qui l'a publiée — jamais le mtime du fichier, qui ne sert
     qu'à départager deux flux sans marqueur (non datés). Une mesure dont une
     fenêtre était déjà close au début du tour est un rejeu : elle est rendue
-    NON datée, pour ne pas remplacer une mesure fraîche.
+    NON datée, pour ne pas remplacer une mesure fraîche. Un rejeu publié après
+    une mesure fraîche du même compte ne la remplace pas non plus : le compte
+    garde la meilleure mesure du flux (`_reading_rank`).
     """
     marked = any(_is_claude_marker(e) for e in events)
     current, stamp, produced = None, (0.0 if marked else mtime), None
@@ -2047,13 +2052,16 @@ def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dic
             stamp = produced if produced is not None else 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
             gauges = _claude_windows(event)
-            if gauges is not None:
-                at = produced
-                if _replayed(gauges, at):
-                    at = None             # rejeu : jamais daté
-                readings[current] = (stamp, at,
-                                     _stamp_gauges(gauges, at, agent,
-                                                   _claude_overage(event)))
+            if gauges is None:
+                continue
+            at = produced
+            if _replayed(gauges, at):
+                at = None             # rejeu : jamais daté
+            found = (stamp, at, _stamp_gauges(gauges, at, agent,
+                                              _claude_overage(event)))
+            old = readings.get(current)
+            if old is None or _reading_rank(found) >= _reading_rank(old):
+                readings[current] = found
     return readings
 
 

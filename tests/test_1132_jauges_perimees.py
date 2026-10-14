@@ -115,6 +115,43 @@ class RejeuMarqueurRecentTest(Sandbox, unittest.TestCase):
         gauges = self.book(db=None).claude_gauges(account="secondaire", primary="primaire")
         self.assertIsNotNone(gauges[0].produced_at)
 
+    def test_un_rejeu_posterieur_ne_masque_pas_la_mesure_fraiche_du_meme_journal(self):
+        # B1 : la mesure fraîche d'abord, puis un rejeu sous un marqueur plus
+        # récent — l'ordre de lecture ne doit pas faire gagner le rejeu.
+        self.agent("mixte", "claude")
+        self.events("mixte", marked("secondaire", self.now - 3600),
+                    windows(five_hour=(0.20, self.now + 2 * 3600),
+                            seven_day=(0.87, self.now + 3 * 86400)),
+                    marked("secondaire", self.now - 600),
+                    windows(five_hour=(0.75, self.now - 25 * 3600),
+                            seven_day=(0.67, self.now + 3 * 86400)))
+        gauges = {g.key: g for g in
+                  self.book(db=None).claude_gauges(account="secondaire", primary="primaire")}
+        self.assertAlmostEqual(gauges["five_hour"].used, 0.20)
+        self.assertAlmostEqual(gauges["seven_day"].used, 0.87)
+        self.assertAlmostEqual(gauges["seven_day"].produced_at, self.now - 3600, places=0)
+
+    def test_sans_compte_un_rejeu_posterieur_ne_masque_pas_la_mesure_fraiche(self):
+        self.agent("mixte", "claude")
+        self.events("mixte", marked("secondaire", self.now - 3600),
+                    windows(seven_day=(0.87, self.now + 3 * 86400)),
+                    marked("secondaire", self.now - 600),
+                    windows(five_hour=(0.75, self.now - 25 * 3600),
+                            seven_day=(0.67, self.now + 3 * 86400)))
+        gauges = {g.key: g for g in self.book(db=None).claude_gauges()}
+        self.assertAlmostEqual(gauges["seven_day"].used, 0.87)
+        self.assertAlmostEqual(gauges["seven_day"].produced_at, self.now - 3600, places=0)
+
+    def test_sans_compte_les_drapeaux_overage_suivent_la_lecture(self):
+        # N1 : la lecture sans compte rend un `Gauges`, drapeaux d'overage inclus.
+        self.agent("a", "claude")
+        event = windows(seven_day=(0.87, self.now + 3 * 86400))
+        event["rate_limit_info"].update(overageStatus="allowed", isUsingOverage=True)
+        self.events("a", marked("primaire", self.now - 10), event)
+        gauges = self.book(db=None).claude_gauges()
+        self.assertIsInstance(gauges, cost.Gauges)
+        self.assertTrue(gauges.in_overage(self.now))
+
 
 class _JaugesBase(Sandbox, PgTestCase):
     """Schéma jetable et table des jauges vide : chaque témoin part de zéro."""
@@ -156,6 +193,59 @@ class HistoriqueProvenanceTest(_JaugesBase):
                                 source="ag")])
         self.assertEqual(ops.gauge_latest(harness="claude", account="primaire"), [])
         self.assertEqual(ops.gauge_latest(harness="codex", account="secondaire"), [])
+
+    def test_une_production_plus_recente_a_valeur_egale_est_gardee(self):
+        # B2 : A(87 @ -7200), B(87 @ -3600) puis C(67 @ -5400). La dédup ne doit
+        # pas perdre B (valeur égale) et laisser C devenir « le dernier ».
+        ops = storage.of(self.db).operations
+        fenetre = self.now + 3 * 86400
+        for used, produced, source in ((0.87, self.now - 7200, "ag-a"),
+                                       (0.87, self.now - 3600, "ag-b"),
+                                       (0.67, self.now - 5400, "ag-c")):
+            ops.record_gauges([line("claude", "seven_day", used, fenetre,
+                                    account="secondaire", produced_at=produced,
+                                    source=source)])
+        latest = ops.gauge_latest(harness="claude", account="secondaire")
+        self.assertEqual(len(latest), 1)
+        self.assertAlmostEqual(latest[0]["used"], 0.87)
+        self.assertAlmostEqual(latest[0]["produced_ts"], self.now - 3600, places=0)
+        self.assertEqual(latest[0]["source"], "ag-b")
+
+    def test_une_production_datee_remplace_une_ligne_non_datee(self):
+        # B2 : une ligne non datée ne bloque pas l'écriture de la même mesure,
+        # datée (NULL -> daté).
+        ops = storage.of(self.db).operations
+        fenetre = self.now + 3 * 86400
+        ops.record_gauges([line("claude", "seven_day", 0.67, fenetre,
+                                account="secondaire", produced_at=None,
+                                source="ag-legacy")])
+        ops.record_gauges([line("claude", "seven_day", 0.67, fenetre,
+                                account="secondaire", produced_at=self.now - 60,
+                                source="ag-date")])
+        latest = ops.gauge_latest(harness="claude", account="secondaire")
+        self.assertEqual(len(latest), 1)
+        self.assertAlmostEqual(latest[0]["produced_ts"], self.now - 60, places=0)
+        self.assertEqual(latest[0]["source"], "ag-date")
+
+    def test_une_repetition_identique_ne_se_reinsere_pas(self):
+        # B2 (suite) : la dédup reste bornée. Un rejeu identique répété n'écrit
+        # pas une ligne de plus, même quand une production plus fraîche (autre
+        # valeur) existe : la comparaison porte sur la production, jamais sur la
+        # seule dernière insertion.
+        ops = storage.of(self.db).operations
+        fenetre = self.now + 3 * 86400
+        ops.record_gauges([line("claude", "seven_day", 0.67, fenetre,
+                                account="secondaire", produced_at=self.now - 3600,
+                                source="ag-frais")])
+        for _ in range(3):
+            ops.record_gauges([line("claude", "seven_day", 0.87, fenetre,
+                                    account="secondaire", produced_at=self.now - 7200,
+                                    source="ag-fige")])
+        hist = ops.gauge_history(since_s=3600, harness="claude", account="secondaire")
+        self.assertEqual(sorted(r["source"] for r in hist), ["ag-fige", "ag-frais"])
+        latest = ops.gauge_latest(harness="claude", account="secondaire")
+        self.assertEqual(len(latest), 1)
+        self.assertAlmostEqual(latest[0]["used"], 0.67)
 
 
 class ReconciliationTest(_JaugesBase):

@@ -358,6 +358,13 @@ class Operations(interface.Operations):
             # L30 (0028) : une jauge de COMPTE porte son nom ; NULL = sans comptes.
             # #1132 (0434) : `produced_at` (instant de production, NULL quand le
             # flux ne le date pas) et `source` (journal d'origine) : la provenance.
+            # La dédup ne regarde plus la SEULE dernière insertion : elle n'écarte
+            # un relevé identique (mêmes used/reset) que si un relevé RÉCENT de la
+            # même jauge porte déjà une production au moins aussi fraîche
+            # (`produced_at`). Une production plus récente à valeur égale est donc
+            # conservée, et un relevé périmé réinséré ne devient jamais « le
+            # dernier » : `latest_gauges`/`gauge_latest` ordonnent par production
+            # (NULL en dernier), pas par insertion.
             account = g.get("account")
             produced = g.get("produced_at")
             rows = self.db.query(
@@ -367,20 +374,21 @@ class Operations(interface.Operations):
                 SELECT %s, %s, %s, to_timestamp(%s), %s, %s,
                        to_timestamp(%s::double precision), %s
                  WHERE NOT EXISTS (
-                     SELECT 1 FROM (
-                         SELECT used, resets_at, observed_at FROM quota_gauge_readings
-                          WHERE harness = %s AND gauge_key = %s
-                            AND account IS NOT DISTINCT FROM %s
-                          ORDER BY observed_at DESC, id DESC LIMIT 1) d
-                      WHERE d.used = %s
-                        AND d.resets_at IS NOT DISTINCT FROM to_timestamp(%s)
-                        AND d.observed_at > now() - interval '10 minutes')
+                     SELECT 1 FROM quota_gauge_readings r
+                      WHERE r.harness = %s AND r.gauge_key = %s
+                        AND r.account IS NOT DISTINCT FROM %s
+                        AND r.used = %s
+                        AND r.resets_at IS NOT DISTINCT FROM to_timestamp(%s)
+                        AND r.observed_at > now() - interval '10 minutes'
+                        AND (%s::double precision IS NULL
+                             OR (r.produced_at IS NOT NULL
+                                 AND r.produced_at >= to_timestamp(%s::double precision))))
                 RETURNING id
                 """,
                 (g["harness"], g["key"], float(g["used"]), g.get("resets_at"),
                  float(g["window_s"]), account, produced, g.get("source"),
                  g["harness"], g["key"], account,
-                 float(g["used"]), g.get("resets_at")),
+                 float(g["used"]), g.get("resets_at"), produced, produced),
             )
             inserted += len(rows)
         return inserted

@@ -14,6 +14,7 @@
 # une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
 # deux endroits différents du fichier, sans conflit.
 
+test_1132_jauges_perimees  # stockage : provenance des relevés (production, source), dédup par fraîcheur, gauge_latest (#1132)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
