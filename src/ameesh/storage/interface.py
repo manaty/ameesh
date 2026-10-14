@@ -1017,7 +1017,8 @@ class WorkItems(Domain):
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
             estimate_source: str | None = None, change_size: str | None = None,
-            mark_item_id: int | None = None, mark_note: str = "") -> dict:
+            mark_item_id: int | None = None, mark_note: str = "",
+            parent_lot: int | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1031,7 +1032,12 @@ class WorkItems(Domain):
         `{lot}` y est remplacé par l'identifiant du lot créé. La ligne
         `mark_item_id` est verrouillée avant l'insertion et `issue_ref` y est
         relue sous ce verrou : deux créations concurrentes de la même
-        référence ne peuvent pas aboutir toutes les deux (revue #544 r2)."""
+        référence ne peuvent pas aboutir toutes les deux (revue #544 r2).
+
+        `parent_lot` (#1193): the explicit parent of a suite lot, linked in the
+        **same** transaction — a blocking edge if the parent is still open, a
+        journal trace if it is already finished, everything rolled back if it
+        is unknown."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1419,7 +1425,9 @@ class WorkItems(Domain):
         ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et
-        `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+        `decision_milestone` (un jalon de décision ouvert y est rattaché).
+        #1193: a lot whose explicit prerequisite is not finished is excluded —
+        the ready intake never offers a lot that cannot be started."""
 
     @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
