@@ -1,0 +1,19 @@
+# 1343 — temoins cibles, candidat 3ce572f7b6e5d8b83e6964243371b6fc95168727
+## A. tests.test_l161g_ci_gel (gel/etiquette)
+----------------------------------------------------------------------
+Ran 71 tests in 0.059s
+
+OK
+l161g-exit:0
+## B. tests.test_l161f_plan + test_l744_ci_entrypoint + test_l161a_ci_sans_code + test_hermeticity_lint
+----------------------------------------------------------------------
+Ran 146 tests in 41.026s
+
+OK
+voisins-exit:0
+## C. tests.test_l161b_flow + test_l161c_failures_realtime
+----------------------------------------------------------------------
+Ran 34 tests in 88.399s
+
+OK
+l161bc-exit:0
