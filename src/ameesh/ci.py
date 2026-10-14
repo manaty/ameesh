@@ -54,7 +54,10 @@ Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas enco
 """
 from __future__ import annotations
 
+import datetime
 import json
+import re
+import secrets
 import time
 
 from . import storage
@@ -587,6 +590,15 @@ EXCEPTIONS = ("incident", "unblock")
 OPEN_STATUSES = ("queued", "in_progress", "requested", "waiting", "pending")
 #: nombre d'avis que `--avis` accepte (léger, sensible, SQL/sécurité/prod)
 MAX_AVIS = 2
+#: durée pendant laquelle un dispatch réussi mais pas encore visible dans
+#: l'API GitHub tient la clé : au-delà, un nouvel essai est permis (le run ne
+#: viendra plus, ou GitHub l'a perdu).
+RESERVE_TTL_S = 15 * 60
+#: la marque de dispatch dans le journal du lot : `reserve` prend le verrou de
+#: la ligne, `dispatched` la referme sur un run parti, `released` sur un refus.
+DISPATCH_RE = re.compile(
+    r"^ci-dispatch (reserve|dispatched|released) sha=([0-9a-f]{40}) "
+    r"mode=(lot|full) token=([0-9a-f]{16})\b")
 
 
 class GelError(CiError):
@@ -629,17 +641,19 @@ def frozen_of(db, item_id: int) -> dict | None:
                  if m["kind"] == "frozen"), None)
 
 
-def independent_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
-    """Les verdicts `ok` posés sur `sha` par des acteurs distincts, hors assigné.
+def latest_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Le dernier verdict de chaque acteur sur `sha`, du plus récent au plus ancien.
 
-    Le canon §3 demande des avis *indépendants* : un verdict rendu par l'auteur
-    du lot, ou deux verdicts du même acteur, ne comptent pas.
+    Un verdict `ok` ancien ne survit jamais au `blocked` plus récent du même
+    acteur sur la même tête (P1 R1) : c'est le dernier mot de chaque relecteur
+    qui vaut, pas le meilleur. L'assigné ne compte pas : son verdict n'est pas
+    un avis indépendant.
     """
     from . import work
     who = (assignee or "").strip().casefold()
     out, seen = [], set()
-    for m in work.milestones(db, int(item_id)):
-        if m["kind"] != "verdict" or (m.get("verdict") or "") != "ok":
+    for m in work.milestones(db, int(item_id)):      # du plus récent au plus ancien
+        if m["kind"] != "verdict":
             continue
         if (m.get("sha") or "").strip().casefold() != (sha or "").casefold():
             continue
@@ -650,6 +664,18 @@ def independent_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict
         seen.add(key)
         out.append(m)
     return out
+
+
+def independent_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Les verdicts `ok` retenus : le dernier de chaque acteur, hors assigné."""
+    return [m for m in latest_verdicts(db, item_id, sha, assignee)
+            if (m.get("verdict") or "") == "ok"]
+
+
+def blocked_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Les têtes refusées : le dernier verdict de l'acteur est `blocked`."""
+    return [m for m in latest_verdicts(db, item_id, sha, assignee)
+            if (m.get("verdict") or "") == "blocked"]
 
 
 def _head_of(api, repo: str, branch: str) -> str:
@@ -696,9 +722,98 @@ def _carries_gel(api, repo: str, sha: str) -> bool:
 
 
 def _short_run(row: dict) -> dict:
-    return {"id": row.get("id"), "status": row.get("status"),
-            "conclusion": row.get("conclusion"), "event": row.get("event"),
-            "url": row.get("html_url")}
+    run = {"id": row.get("id"), "status": row.get("status"),
+           "conclusion": row.get("conclusion"), "event": row.get("event"),
+           "url": row.get("html_url")}
+    if row:
+        run["mode"] = _run_mode(row)
+    return run
+
+
+def _run_mode(row: dict) -> str:
+    """Le mode d'une exécution de `tests.yml` : `lot`, `full`, ou "" si douteux.
+
+    Le titre du run (`run-name`, #1343) porte le mode d'un dispatch ; une
+    poussée garde la suite complète ; une PR ne la garde que si sa cible est
+    `release/**` ou `integration/**`. Tout ce qui n'est pas lisible (ancien
+    dispatch sans titre, PR de lot d'avant #1343) ne vaut jamais « déjà vert » :
+    le doute ne verdit pas un check requis.
+    """
+    event = (row.get("event") or "").strip()
+    if event == "workflow_dispatch":
+        for text in (row.get("display_title"), row.get("name")):
+            parts = str(text or "").split()
+            if len(parts) >= 2 and parts[0] == "tests" and parts[1] in ("lot", "full"):
+                return parts[1]
+        return ""
+    if event == "push":
+        return "full"
+    if event == "pull_request":
+        prs = row.get("pull_requests") or []
+        base = ((prs[0].get("base") or {}).get("ref") or "") if prs else ""
+        return "full" if base.startswith(("release/", "integration/")) else ""
+    return ""
+
+
+def _covers(have: str, want: str) -> bool:
+    """`have` couvre-t-il la CI demandée ? La suite complète couvre le lot."""
+    return have == want or (want == "lot" and have == "full")
+
+
+def _relevant_runs(runs: list[dict], mode: str) -> list[dict]:
+    """Les exécutions qui comptent pour la CI demandée (P1 R1)."""
+    return [r for r in runs if _covers(_run_mode(r), mode)]
+
+
+def _dispatch_note(state: str, sha: str, mode: str, token: str, text: str = "") -> str:
+    marker = "ci-dispatch %s sha=%s mode=%s token=%s" % (state, sha, mode, token)
+    return "%s: %s" % (marker, text.strip()) if text.strip() else marker
+
+
+def dispatch_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
+    """Les marques de dispatch du lot, de la plus ancienne à la plus récente."""
+    from . import work
+    out = []
+    for ev in work.events(db, int(item_id), limit=limit):
+        m = DISPATCH_RE.match((ev.get("note") or "").strip())
+        if not m:
+            continue
+        out.append({"id": int(ev.get("id") or 0), "state": m.group(1),
+                    "sha": m.group(2), "mode": m.group(3), "token": m.group(4),
+                    "ts": float(ev.get("created_ts") or 0.0)})
+    return sorted(out, key=lambda e: e["id"])
+
+
+def _run_ts(row: dict) -> float:
+    """L'instant de création d'une exécution (epoch), 0.0 s'il est illisible."""
+    raw = str(row.get("created_at") or row.get("run_started_at") or "")
+    try:
+        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def reservation_holder(events: list[dict], sha: str, mode: str, token: str, *,
+                       now: float, ttl: float = RESERVE_TTL_S,
+                       after: float = 0.0) -> dict | None:
+    """La marque `dispatched` fraîche d'un autre porteur, ou None (P2 R1).
+
+    Un dispatch réussi mais pas encore visible dans l'API GitHub tient la clé
+    le temps du `ttl` ; `released` (dispatch refusé), les marques périmées et
+    celles qui précèdent l'exécution visible (`after`) ne tiennent pas — une
+    exécution visible matérialise le dispatch. Appelé sous le verrou de la
+    ligne du lot, il lit les marques commitées des autres processus ; le
+    porteur courant est exclu (`token`).
+    """
+    key = [e for e in events
+           if e["sha"] == sha and e["mode"] == mode
+           and e["state"] == "dispatched" and e["token"] != token]
+    if not key:
+        return None
+    last = key[-1]
+    if now - last["ts"] >= ttl or last["ts"] < after:
+        return None
+    return last
 
 
 def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
@@ -757,36 +872,63 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
                        % (branch, head[:12], "--sha" if exempt else "the freeze",
                           tested[:12]))
     frozen_sha = tested
-    reviews = independent_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
-    if not (exception or full) and len(reviews) < avis:
-        raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
-                       "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
-                       "an incident or a CI unblock uses --exception incident|unblock "
-                       "--reason …" % (item_id, len(reviews), frozen_sha[:12], avis,
-                                       item_id, frozen_sha[:12]))
+    mode = "full" if full else "lot"
+    verdicts = latest_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
+    reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
+    blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
+    if not (exception or full):
+        # un `blocked` est le dernier mot d'un relecteur sur cette tête : la
+        # corriger demande une nouvelle tête, donc un nouveau gel (P1 R1).
+        if blocked:
+            raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer): "
+                           "fix the head, refreeze and re-review; nothing dispatched"
+                           % (item_id, blocked[0].get("actor") or "a reviewer",
+                              frozen_sha[:12]))
+        if len(reviews) < avis:
+            raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
+                           "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
+                           "an incident or a CI unblock uses --exception incident|unblock "
+                           "--reason …" % (item_id, len(reviews), frozen_sha[:12], avis,
+                                           item_id, frozen_sha[:12]))
     runs = _runs_of(api, name, sha=frozen_sha)
-    green = [r for r in runs if (r.get("conclusion") or "") == "success"]
-    live = [r for r in runs if (r.get("status") or "") in OPEN_STATUSES]
+    #: P1 R1 : le mode compte — un run `lot` vert ne prouve pas la suite
+    #: complète qu'un `--full` demande, et un ancien run sans mode lisible ne
+    #: prouve rien.
+    relevant = _relevant_runs(runs, mode)
+    green = [r for r in relevant if (r.get("conclusion") or "") == "success"]
+    live = [r for r in relevant if (r.get("status") or "") in OPEN_STATUSES]
     decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
                 "branch": branch, "target": target, "sha": frozen_sha,
-                "mode": "full" if full else "lot", "exception": exception,
+                "mode": mode, "exception": exception,
                 "reason": reason.strip(), "avis": avis,
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
                 "frozen": bool(freeze), "runs": len(runs)}
-    if not force:
-        if green:
-            return {**decision, "action": "green", "why": "already green on the frozen "
-                    "commit: nothing dispatched", "run": _short_run(green[-1])}
-        if live:
-            return {**decision, "action": "running", "why": "a run of the frozen commit "
-                    "is already in flight: nothing dispatched", "run": _short_run(live[0])}
-        if runs:
-            raise GelError("lot #%s: %d run(s) already seen on %s, none green (%s): "
-                           "--force to dispatch again (a correction needs a new freeze "
-                           "and a new review)" % (item_id, len(runs), frozen_sha[:12],
-                                                  ", ".join(sorted({(r.get("conclusion") or
-                                                                     r.get("status") or "?")
-                                                                    for r in runs}))))
+    #: P2 R1 : `--force` ne rejoue ni un vert ni un run en vol — il ne lève que
+    #: le refus d'un run déjà vu sans vert (rouge, annulé).
+    if green:
+        return {**decision, "action": "green", "why": "already green on the frozen "
+                "commit (mode %s): nothing dispatched" % mode,
+                "run": _short_run(green[-1])}
+    if live:
+        return {**decision, "action": "running", "why": "a run of the frozen commit "
+                "(mode %s) is already in flight: nothing dispatched" % mode,
+                "run": _short_run(live[0])}
+    if not relevant:
+        #: P2 R1 : GitHub ne montre pas un run aussitôt ; un dispatch déjà
+        #: réservé par un autre processus est dit, jamais rejoué.
+        held = reservation_holder(dispatch_events(db, item_id), frozen_sha, mode, "",
+                                  now=time.time())
+        if held:
+            return {**decision, "action": "running",
+                    "why": "a dispatch of this commit was already reserved "
+                           "(token %s): nothing dispatched" % held["token"]}
+    if relevant and not force:
+        raise GelError("lot #%s: %d run(s) already seen on %s, none green (%s): "
+                       "--force to dispatch again (a correction needs a new freeze "
+                       "and a new review)" % (item_id, len(relevant), frozen_sha[:12],
+                                              ", ".join(sorted({(r.get("conclusion") or
+                                                                 r.get("status") or "?")
+                                                                for r in relevant}))))
     base = _merge_base_of(api, name, target, frozen_sha)
     if not _sha_ok(base):
         raise GelError("merge-base %s...%s not found in %s: the freeze is not on the "
@@ -864,9 +1006,92 @@ def _render_gel(decision: dict) -> list[str]:
     return lines
 
 
+def _dispatch_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> dict:
+    """Le dispatch, sous le verrou de la ligne du lot (#1343, P2 R1).
+
+    `work.note` (marque `reserve`) prend le verrou `FOR NO KEY UPDATE` de
+    `work_items` dans la transaction : deux `ci run` concurrents, même
+    d'hôtes différents, se sérialisent ; le second relit les exécutions et les
+    marques et recule si un run est visible ou si un dispatch est déjà parti
+    sans être encore visible. Le verrou ne survit pas au processus tué
+    (ROLLBACK) : le suivant reprend, sans attente ni marque périmée.
+
+    Rend `{dispatched, action, why?, run?}` ; `action` vaut `dispatch` quand
+    l'appel est parti, sinon `green`, `running` ou `refuse`.
+    """
+    from . import storage, work
+    token = secrets.token_hex(8)
+    sha, mode = decision["sha"], decision["mode"]
+
+    def critical(tx) -> dict:
+        work.note(tx, int(item_id),
+                  _dispatch_note("reserve", sha, mode, token, "dispatch requested"))
+        visible = _relevant_runs(_runs_of(api, decision["repo"], sha=sha), mode)
+        green = [r for r in visible if (r.get("conclusion") or "") == "success"]
+        live = [r for r in visible if (r.get("status") or "") in OPEN_STATUSES]
+        if green:
+            return {"dispatched": False, "action": "green",
+                    "why": "a green run of mode %s is visible: nothing dispatched" % mode,
+                    "run": _short_run(green[-1])}
+        if live:
+            return {"dispatched": False, "action": "running",
+                    "why": "a run of mode %s is already in flight: nothing dispatched"
+                           % mode, "run": _short_run(live[0])}
+        if visible and not force:
+            return {"dispatched": False, "action": "refuse",
+                    "why": "a run of mode %s appeared on %s, none green: --force to "
+                           "dispatch again" % (mode, sha[:12])}
+        held = reservation_holder(dispatch_events(tx, item_id), sha, mode, token,
+                                  now=time.time(),
+                                  after=max((_run_ts(r) for r in visible), default=0.0))
+        if held:
+            work.note(tx, int(item_id),
+                      _dispatch_note("released", sha, mode, token,
+                                     "another dispatch (token %s) already holds this "
+                                     "commit" % held["token"]))
+            return {"dispatched": False, "action": "running",
+                    "why": "a dispatch of this commit is already reserved (token %s): "
+                           "nothing dispatched" % held["token"]}
+        argv = ["workflow", "run", "tests.yml", "--repo", decision["repo"],
+                "--ref", decision["branch"],
+                "-f", "mode=%s" % mode,
+                "-f", "sha=%s" % sha,
+                "-f", "base=%s" % decision["base"],
+                "-f", "lot=%d" % decision["work_item"]]
+        if decision["exception"]:
+            argv += ["-f", "exception=%s" % decision["exception"]]
+        code, out, err = gh.run(argv)
+        if code != 0:
+            why = "dispatch refused: %s" % " ".join((err or out or "failed").split())[:300]
+            work.note(tx, int(item_id), _dispatch_note("released", sha, mode, token, why))
+            return {"dispatched": False, "action": "refuse", "why": why}
+        runs = _runs_of(api, decision["repo"], sha=sha)
+        run = next((r for r in runs if (r.get("event") or "") == "workflow_dispatch"), None)
+        url = (run or {}).get("html_url") or ""
+        note = ("%s dispatched on %s (mode %s%s)%s"
+                % ("full suite" if mode == "full" else "impacted + contract", sha, mode,
+                   ", exception %s: %s" % (decision["exception"], decision["reason"])
+                   if decision["exception"] else "",
+                   " — %s" % url if url else ""))
+        result = {"dispatched": True, "action": "dispatch", "run": _short_run(run or {})}
+        try:
+            work.note(tx, int(item_id),
+                      _dispatch_note("dispatched", sha, mode, token, note))
+        except Exception as exc:  # noqa: BLE001 - le dispatch est parti, on le dit
+            result["note_error"] = str(exc)
+        return result
+
+    if storage.is_remote(db):
+        # connexion d'exécuteur médié : ni transaction ni verrou de ligne ; la
+        # marque reste et le second recule devant elle, sans atomicité d'hôte.
+        return critical(db)
+    with db.transaction() as tx:
+        return critical(tx)
+
+
 def cmd_ci_run(cfg, args) -> int:
     """`ameesh ci run <lot>` : vérifie le gel et dispatche la CI une fois."""
-    from . import plan_github, work
+    from . import plan_github
     from .db import open_db
     db = open_db(cfg)
     gh = plan_github.Gh()
@@ -899,41 +1124,35 @@ def cmd_ci_run(cfg, args) -> int:
     if stale and not args.dry_run:
         _cancel_runs(gh, decision["repo"], stale,
                      say=lambda text: print("  %s" % text))
-    argv = ["workflow", "run", "tests.yml", "--repo", decision["repo"],
-            "--ref", decision["branch"],
-            "-f", "mode=%s" % decision["mode"],
-            "-f", "sha=%s" % decision["sha"],
-            "-f", "base=%s" % decision["base"],
-            "-f", "lot=%d" % decision["work_item"]]
-    if decision["exception"]:
-        argv += ["-f", "exception=%s" % decision["exception"]]
-    code, out, err = gh.run(argv)
-    if code != 0:
-        # l'erreur du dispatch est dite, et le lot la garde
-        why = "dispatch refused: %s" % " ".join((err or out or "failed").split())[:300]
-        try:
-            work.note(db, args.id, "ci: %s (sha %s, mode %s)"
-                      % (why, decision["sha"][:12], decision["mode"]))
-        except Exception:  # noqa: BLE001 - la note ne masque pas l'échec
-            pass
-        print("ameesh ci run: %s" % why)
-        return 1
-    runs = _runs_of(api, decision["repo"], sha=decision["sha"])
-    run = next((r for r in runs if (r.get("event") or "") == "workflow_dispatch"), None)
-    url = (run or {}).get("html_url") or ""
-    note = ("ci: %s dispatched on %s (mode %s%s)%s"
-            % ("full suite" if decision["mode"] == "full" else "impacted + contract",
-               decision["sha"], decision["mode"],
-               ", exception %s: %s" % (decision["exception"], decision["reason"])
-               if decision["exception"] else "",
-               " — %s" % url if url else ""))
     try:
-        work.note(db, args.id, note)
-    except Exception as exc:  # noqa: BLE001 - le dispatch est parti, on le dit
-        print("ameesh ci run: dispatched, but the lot note failed (%s)" % exc)
+        result = _dispatch_once(db, args.id, decision, api=api, gh=gh, force=args.force)
+    except (GelError, plan_github.GithubError) as exc:
+        print("ameesh ci run: %s" % exc)
+        return 1
+    if not result["dispatched"]:
+        if result["action"] == "refuse":
+            if args.json:
+                print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                                  "action": "refuse", "why": result["why"]},
+                                 ensure_ascii=False, indent=1))
+            else:
+                print("ameesh ci run: %s" % result["why"])
+            return 1
+        decision = {**decision, "action": result["action"], "why": result["why"],
+                    "run": result.get("run")}
+        if args.json:
+            print(json.dumps({**decision, "ok": True, "dispatched": False},
+                             ensure_ascii=False, indent=1))
+        else:
+            print("\n".join(_render_gel(decision)))
+        return 0
+    if result.get("note_error"):
+        print("ameesh ci run: dispatched, but the lot note failed (%s)"
+              % result["note_error"])
+    url = (result.get("run") or {}).get("url") or ""
     if args.json:
         print(json.dumps({**decision, "ok": True, "dispatched": True,
-                          "run": _short_run(run or {})}, ensure_ascii=False, indent=1))
+                          "run": result.get("run") or {}}, ensure_ascii=False, indent=1))
     else:
         print("\n".join(_render_gel(decision)))
         print("  dispatched: %s" % (url or "run queued, it will appear shortly"))
