@@ -125,7 +125,7 @@ jobs:
         with:
           name: plan
           path: plan.json
-          retention-days: 14
+          retention-days: 3
 
   psycopg:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
@@ -230,7 +230,7 @@ jobs:
           name: flux-psycopg-${{ matrix.part }}
           path: ${{ runner.temp }}/flux.jsonl
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
 
   psql:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
@@ -293,7 +293,7 @@ jobs:
           name: flux-psql-${{ matrix.part }}
           path: ${{ runner.temp }}/flux.jsonl
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
 
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
@@ -362,7 +362,7 @@ jobs:
         with:
           name: leaks
           path: leaks.json
-          retention-days: 90
+          retention-days: 15  # the two-week tally (L161i)
 
   # L158: a PR that changes the version number carries the number its content
   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
