@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1252 — `vm.sh agents installer|retour`: install and roll back the frozen code
 on an agent VM, in the account's own layout (~/.local/share/ameesh: clone,
-snapshots src-<sha7>, previous-sha, venv).
+snapshots src-<sha7>, previous-sha, recovery journal, venv).
 
 The host layout is a temporary directory. `ssh`, `scp`, `runuser`, `systemctl`,
 `systemd-run`, `ameesh` and the venv's `pip` are fake; `git` is real, on a real
@@ -81,6 +81,9 @@ with (state / 'systemctl.log').open('a') as f:
 if 'restart' in args:
     name = unit.split('@')[1].removesuffix('.service')
     (state / ('restart-' + name)).touch()
+    # un runner redémarré reprend son bail à une époque supérieure
+    epoch = state / ('lease-epoch-' + name)
+    epoch.write_text(str(int(epoch.read_text()) + 2 if epoch.exists() else 9))
 elif 'show' in args:
     if 'MainPID' in args:
         print('123')
@@ -123,8 +126,9 @@ elif sys.argv[1] == 'show':
     row = dict(next(a for a in agents if a['name'] == name),
                lease_owner='runner-%s@host-agents' % name, lease_epoch=7,
                lease_expires_ts=time.time() + 3600)
-    if (state / ('restart-' + name)).exists():
-        row['lease_epoch'] = 9
+    epoch = state / ('lease-epoch-' + name)
+    if epoch.exists():
+        row['lease_epoch'] = int(epoch.read_text())
     print(json.dumps(row))
 elif sys.argv[1] == 'doctor':
     print('doctor ok')
@@ -140,10 +144,15 @@ with (state / 'python.log').open('a') as f:
     f.write(' '.join(sys.argv[1:]).replace('\n', ' ') + '\n')
 assert sys.argv[1] == '-c', sys.argv
 code = sys.argv[2]
+scenario = (state / 'scenario').read_text().strip()
 if 'schema_migrations' in code:
     print((state / 'versions.txt').read_text().strip())
 elif 'clock_timestamp' in code:
     print(time.time())
+elif 'config.load().host' in code:
+    if scenario == 'identity-error':
+        sys.exit('installed package is broken (test)')
+    print(os.environ.get('AMEESH_HOST') or '')
 elif 'import psycopg' in code:
     print('psycopg 3.2.0 (fake)')
 else:
@@ -176,7 +185,8 @@ class VmAgentsHarness(unittest.TestCase):
         (self.state / 'agents.json').write_text(json.dumps([
             dict(name='dev9', host='host-agents', mode='execute', status='idle')]))
         (self.state / 'expected-env.json').write_text(json.dumps(
-            dict(AMEESH_DSN='postgresql://test@invalid/mesh', AMEESH_SCHEMA='test')))
+            dict(AMEESH_DSN='postgresql://test@invalid/mesh', AMEESH_SCHEMA='test',
+                 AMEESH_HOST='host-agents')))
         self.vm = self.root / 'vm'
         self.vmhome = self.vm / 'home/ameesh'
         self.vmtmp = self.vm / 'tmp'
@@ -286,6 +296,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
             self.assertIn('src-' + self.target[:7], call)
         backup = self.vmhome / '.local/state/ameesh/mise-a-jour' / ('env-' + self.target[:7])
         self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
         self.assertIn('installé depuis src-', p.stdout)
         self.assertIn('redemarrer', p.stdout)
 
@@ -322,30 +333,151 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
         self.assertEqual(self.pip_calls(), [])
 
-    def test_install_never_overwrites_an_existing_snapshot(self):
-        old_snapshot = self.parts / ('src-' + self.old[:7])
-        shutil.copytree(self.src, old_snapshot)
-        (old_snapshot / 'MARKER').write_text('keep')
-        target_snapshot = self.parts / ('src-' + self.target[:7])
-        subprocess.run(['git', 'clone', '-q', '--shared', '--no-checkout',
-                        str(ROOT), str(target_snapshot)], check=True, timeout=300)
-        subprocess.run(['git', '-C', str(target_snapshot), 'checkout', '-q',
-                        '--detach', self.target], check=True, timeout=120)
-        (target_snapshot / 'MARKER').write_text('keep')
+    def test_install_refuses_when_the_runner_identity_is_unreadable(self):
+        (self.vmhome / '.config/ameesh/env').unlink()
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('identité', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_install_refuses_when_the_runner_host_is_not_hote_agents(self):
+        (self.state / 'expected-env.json').write_text(json.dumps(
+            dict(AMEESH_DSN='postgresql://test@invalid/mesh', AMEESH_SCHEMA='test',
+                 AMEESH_HOST='wrong-host')))
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('wrong-host', p.stderr)
+        self.assertIn('HOTE_AGENTS', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
+        self.assertEqual(self.pip_calls(), [])
+        self.assertNotIn('fetch', (self.state / 'ssh.log').read_text())
+        self.assertNotIn('checkout', (self.state / 'ssh.log').read_text())
+
+    def test_install_refuses_when_bascule_env_names_another_host(self):
+        # Même cas vu du fichier de paramètres : la VM dit host-agents.
+        (self.root / 'bascule.env').write_text(
+            'AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=wrong-host\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('host-agents', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_install_from_a_dirty_clone_still_snapshots_the_commit(self):
+        # Un clone sale ne doit pas entrer dans l'instantané du code quitté.
+        (self.src / 'src/ameesh/__init__.py').write_text('# modifié localement\n')
         p = self.run_vm('installer', self.target)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual((old_snapshot / 'MARKER').read_text(), 'keep')
-        self.assertEqual((target_snapshot / 'MARKER').read_text(), 'keep')
-        self.assertEqual(self.head(target_snapshot), self.target)
+        old_snapshot = self.parts / ('src-' + self.old[:7])
+        self.assertEqual(self.head(old_snapshot), self.old)
+        self.assertEqual(self.git(old_snapshot, 'status', '--porcelain', '-uall',
+                                  '--ignored'), '')
 
-    def test_failed_install_keeps_previous_sha_so_retour_stays_possible(self):
-        (self.parts / 'previous-sha').write_text(self.git(ROOT, 'rev-parse', 'HEAD~2') + '\n')
+    def test_identity_is_read_from_the_runner_environment_file(self):
+        # Le paquet installé ne s'importe plus (installation inachevée) : le
+        # repli lit le même EnvironmentFile et l'identité reste contrôlée.
+        (self.state / 'scenario').write_text('identity-error\n')
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.head(self.src), self.target)
+
+    def _pristine_snapshot(self, sha):
+        """An unmodified src-<sha7> clone, as a previous run would leave one."""
+        snapshot = self.parts / ('src-' + sha[:7])
+        subprocess.run(['git', 'clone', '-q', '--shared', '--no-checkout',
+                        str(ROOT), str(snapshot)], check=True, timeout=300)
+        subprocess.run(['git', '-C', str(snapshot), 'checkout', '-q',
+                        '--detach', sha], check=True, timeout=120)
+        return snapshot
+
+    def test_install_reuses_a_pristine_existing_snapshot_without_overwriting_it(self):
+        target_snapshot = self._pristine_snapshot(self.target)
+        inode = target_snapshot.stat().st_ino
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(target_snapshot.stat().st_ino, inode)
+        self.assertEqual(self.head(target_snapshot), self.target)
+        for call in self.pip_calls():
+            self.assertIn('src-' + self.target[:7], call)
+
+    def test_install_refuses_an_altered_existing_snapshot_before_any_pip(self):
+        target_snapshot = self._pristine_snapshot(self.target)
+        (target_snapshot / 'src/ameesh/__init__.py').write_text('# altéré\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('instantané', p.stderr)
+        self.assertIn('contenu modifié', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
+        self.assertEqual(self.pip_calls(), [])
+        self.assertEqual((target_snapshot / 'src/ameesh/__init__.py').read_text(),
+                         '# altéré\n')
+
+    def test_install_refuses_an_added_file_in_an_existing_snapshot(self):
+        target_snapshot = self._pristine_snapshot(self.target)
+        (target_snapshot / 'sitecustomize.py').write_text('# ajouté\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('contenu modifié', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_install_normalizes_ignored_build_artifacts_before_reusing_a_snapshot(self):
+        # `build/` est ignoré par le dépôt mais consommé par le build suivant :
+        # l'instantané est nettoyé avant réutilisation, rien d'ajouté n'entre.
+        target_snapshot = self._pristine_snapshot(self.target)
+        planted = target_snapshot / 'build/lib/ameesh/evil.py'
+        planted.parent.mkdir(parents=True)
+        planted.write_text('# ajouté\n')
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(planted.exists())
+        self.assertEqual(self.head(target_snapshot), self.target)
+        for call in self.pip_calls():
+            self.assertIn('src-' + self.target[:7], call)
+
+    def test_failed_install_keeps_previous_sha_and_retour_returns_to_the_left_code(self):
+        plus_ancien = self.git(ROOT, 'rev-parse', 'HEAD~2')
+        (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
         (self.state / 'pip-fail-at').write_text('2\n')
         p = self.run_vm('installer', self.target)
         self.assertNotEqual(p.returncode, 0)
-        self.assertEqual((self.parts / 'previous-sha').read_text().strip(),
-                         self.git(ROOT, 'rev-parse', 'HEAD~2'))
+        self.assertIn('journal', p.stderr)
+        self.assertEqual((self.parts / 'previous-sha').read_text().strip(), plus_ancien)
+        journal = (self.parts / 'installation-en-cours').read_text()
+        self.assertIn('sha=' + self.old, journal)
         self.assertEqual(self.head(self.src), self.target)
+        self.assertEqual(len(self.pip_calls()), 2)
+        # Le retour suit le journal (code quitté = old), pas previous-sha.
+        (self.state / 'pip-fail-at').unlink()
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
+        self.assertIn('dev9 : redémarré', r.stdout)
+        self.assertIn('contrôles verts', r.stdout)
+        for call in self.pip_calls()[2:]:
+            self.assertIn('src-' + self.old[:7], call)
+            self.assertNotIn('src-' + plus_ancien[:7], call)
+
+    def test_failed_first_install_leaves_a_journal_and_retour_returns_to_the_left_code(self):
+        # Première utilisation : aucun previous-sha, le journal seul permet le retour.
+        (self.parts / 'previous-sha').unlink()
+        (self.state / 'pip-fail-at').write_text('2\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('sha=' + self.old, (self.parts / 'installation-en-cours').read_text())
+        self.assertFalse((self.parts / 'previous-sha').exists())
+        (self.state / 'pip-fail-at').unlink()
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
     # -- rollback -----------------------------------------------------------
     def test_retour_refuses_without_previous_sha(self):
@@ -369,24 +501,53 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertIn("retour impossible d'ici", p.stderr)
         self.assertEqual(self.head(self.src), self.old)
 
+    def test_retour_refuses_when_the_runner_host_is_not_hote_agents(self):
+        (self.state / 'expected-env.json').write_text(json.dumps(
+            dict(AMEESH_DSN='postgresql://test@invalid/mesh', AMEESH_SCHEMA='test',
+                 AMEESH_HOST='wrong-host')))
+        p = self.run_vm('retour')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('HOTE_AGENTS', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_retour_refuses_an_altered_snapshot_before_any_pip(self):
+        (self.parts / 'previous-sha').write_text(self.old + '\n')
+        old_snapshot = self._pristine_snapshot(self.old)
+        (old_snapshot / 'src/ameesh/__init__.py').write_text('# altéré\n')
+        p = self.run_vm('retour')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('contenu modifié', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_retour_refuses_an_invalid_journal(self):
+        (self.parts / 'installation-en-cours').write_text('sha=pas-un-sha\n')
+        p = self.run_vm('retour')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('journal de récupération invalide', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual(self.pip_calls(), [])
+
     def test_retour_reinstalls_the_previous_code_then_restarts_and_controls(self):
         self._clone_at_old(self.target)
         self._write_direct_url(self.target)
         (self.parts / 'previous-sha').write_text(self.old + '\n')
-        old_snapshot = self.parts / ('src-' + self.old[:7])
-        subprocess.run(['git', 'clone', '-q', '--shared', '--no-checkout',
-                        str(ROOT), str(old_snapshot)], check=True, timeout=300)
-        subprocess.run(['git', '-C', str(old_snapshot), 'checkout', '-q',
-                        '--detach', self.old], check=True, timeout=120)
         p = self.run_vm('retour')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.head(self.src), self.old)
+        snapshot = self.parts / ('src-' + self.old[:7])
+        self.assertEqual(self.head(snapshot), self.old)
         for call in self.pip_calls():
             self.assertIn('src-' + self.old[:7], call)
         self.assertIn('restart ameesh-runner-agent@dev9.service',
                       (self.state / 'systemctl.log').read_text())
         self.assertIn('dev9 : redémarré', p.stdout)
         self.assertIn('contrôles verts', p.stdout)
+        # second retour : idempotent, la cible est le code installé
+        q = self.run_vm('retour')
+        self.assertEqual(q.returncode, 0, q.stderr)
+        self.assertEqual(self.head(self.src), self.old)
 
     def test_control_reports_the_installed_code_without_restarting(self):
         p = self.run_vm('controler')
@@ -418,6 +579,12 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
         (self.depot / 'src/ameesh/migrations/0002_next.sql').write_text('-- test\n')
         subprocess.run(['git', '-C', str(self.depot), 'add', '.'], check=True)
         subprocess.run(['git', '-C', str(self.depot), '-c', 'user.email=t@invalid',
+                        '-c', 'user.name=test', 'commit', '-q', '-m', 'mid'],
+                       check=True)
+        self.mid = self.git(self.depot, 'rev-parse', 'HEAD')
+        (self.depot / 'src/ameesh/migrations/0003_target.sql').write_text('-- test\n')
+        subprocess.run(['git', '-C', str(self.depot), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.depot), '-c', 'user.email=t@invalid',
                         '-c', 'user.name=test', 'commit', '-q', '-m', 'target'],
                        check=True)
         self.target = self.git(self.depot, 'rev-parse', 'HEAD')
@@ -430,12 +597,17 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
                        check=True)
         self._write_direct_url(self.old)
         (self.parts / 'previous-sha').write_text(self.old + '\n')
-        (self.state / 'versions.txt').write_text('1\n2\n')
+        (self.state / 'versions.txt').write_text('1\n2\n3\n')
 
     def run_vm(self, action, *args):
         return subprocess.run(['bash', str(self.depot / 'deploy/mise-a-jour/vm.sh'),
                                'agents', action, *args], env=self.env,
                               capture_output=True, text=True, timeout=300)
+
+    def _origin_main(self):
+        """The workstation's origin/main, the base the old bundle excluded."""
+        subprocess.run(['git', '-C', str(self.depot), 'update-ref',
+                        'refs/remotes/origin/main', self.target], check=True)
 
     def test_install_sends_a_git_bundle_when_the_vm_lacks_the_commit(self):
         p = self.run_vm('installer', self.target)
@@ -446,6 +618,26 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.parts / ('src-' + self.target[:7])), self.target)
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
         self.assertFalse((self.vmtmp / 'ameesh.bundle').exists())
+
+    def test_install_sends_a_bundle_for_a_target_already_merged_into_main(self):
+        # Cible déjà fusionnée : l'ancien ^origin/main rendait le paquet vide.
+        self._origin_main()
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('ameesh.bundle', (self.state / 'scp.log').read_text())
+        self.assertEqual(self.head(self.src), self.target)
+        self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
+
+    def test_retour_sends_a_bundle_for_an_ancestor_of_main_missing_on_the_vm(self):
+        # Ancêtre de main visé pour le retour, absent de la VM : même cas vide.
+        self._origin_main()
+        (self.parts / 'previous-sha').write_text(self.mid + '\n')
+        p = self.run_vm('retour')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('ameesh.bundle', (self.state / 'scp.log').read_text())
+        self.assertEqual(self.head(self.src), self.mid)
+        for call in self.pip_calls():
+            self.assertIn('src-' + self.mid[:7], call)
 
 
 if __name__ == '__main__':

@@ -69,7 +69,8 @@ commande indique l’unité et la commande `journalctl --user` à lancer sous
 
 Le mode agents travaille dans le layout du compte `ameesh`
 (`~/.local/share/ameesh` : clone `src`, instantanés `src-<sha7>`, venv,
-`previous-sha`). Un `BASCULE_ENV` par VM porte `AGENTS_SSH` et `HOTE_AGENTS`.
+`previous-sha`, journal `installation-en-cours`). Un `BASCULE_ENV` par VM porte
+`AGENTS_SSH` et `HOTE_AGENTS`.
 
 ```sh
 deploy/mise-a-jour/vm.sh agents verifier
@@ -79,22 +80,45 @@ deploy/mise-a-jour/vm.sh agents controler
 deploy/mise-a-jour/vm.sh agents retour
 ```
 
-`installer` refuse tant que les migrations du commit visé manquent de la base
-commune du mesh (`poste.sh migrer` d’abord), et refuse un code d’avant non
-traçable (`direct_url.json` du venv ou HEAD du clone). Il ne redémarre
-personne. Il sauvegarde l’état (env et unités, 0600, sous
-`~/.local/state/ameesh/mise-a-jour`), crée l’instantané immuable
-`src-<sha7>` s’il manque (jamais écrasé, HEAD vérifié), met le clone en
-détaché sur le SHA visé, réinstalle depuis l’instantané
-(`pip --force-reinstall --no-deps` puis les dépendances) et n’écrit
-`previous-sha` qu’après une installation réussie. Si la VM n’a pas le commit,
-il est envoyé en paquet git par SSH depuis le poste.
+`installer` et `retour` refusent d’abord si l’identité effective du compte
+runner — `AMEESH_HOST` de son `EnvironmentFile`, lue dans l’environnement de
+l’unité — n’est pas `HOTE_AGENTS` : un `BASCULE_ENV` qui vise une autre VM
+n’écrit rien. La lecture passe par le paquet installé, avec un repli qui lit le
+même fichier sans lui (une installation inachevée peut l’avoir cassé) ; toute
+lecture impossible ferme la commande.
 
-Une erreur partielle ferme la commande sans écrire `previous-sha` : le retour
-reste possible. `retour` réinstalle le commit de `previous-sha` depuis son
-instantané (même chemin, `previous-sha` inchangé : idempotent), puis enchaîne
-`redemarrer` et `controler`. Il refuse si `previous-sha` est absent, invalide
-ou introuvable dans le clone de la VM comme dans le dépôt du poste.
+`installer` refuse ensuite tant que les migrations du commit visé manquent de
+la base commune du mesh (`poste.sh migrer` d’abord), et refuse un code d’avant
+non traçable (`direct_url.json` du venv ou HEAD du clone). Il ne redémarre
+personne. Il sauvegarde l’état (env et unités, 0600, sous
+`~/.local/state/ameesh/mise-a-jour`), vérifie ou crée les instantanés exacts
+`src-<sha7>` du code quitté et du commit visé, puis écrit un **journal de
+récupération** (`installation-en-cours`) avant de mettre le clone en détaché
+sur le SHA visé et de réinstaller depuis l’instantané
+(`pip --force-reinstall --no-deps` puis les dépendances). Un instantané est un
+worktree détaché du commit : son arbre est celui du commit, jamais une copie
+d’un clone sale. Avant réutilisation, les artefacts de construction ignorés
+(`build/`, `*.egg-info`, `__pycache__`) en sont retirés, puis l’instantané doit
+correspondre exactement au commit, fichiers suivis comme ignorés ; sinon
+l’opération refuse de l’utiliser et ne l’écrase jamais — le retirer à la main
+pour le reconstruire.
+
+`previous-sha` n’est publié qu’après une installation réussie, et le journal
+est alors effacé. Si l’installation échoue (même après un premier `pip` qui a
+déjà remplacé le paquet), la commande ferme en conservant le journal :
+`retour` ramène au code quitté qu’il désigne, et non à un `previous-sha` plus
+ancien — y compris à la première utilisation, sans `previous-sha`. `retour`
+réinstalle ce commit depuis son instantané puis enchaîne `redemarrer` et
+`controler` ; après réussite il laisse `previous-sha` sur le code installé,
+donc un second `retour` est idempotent. Il refuse si la cible (journal ou
+`previous-sha`) est absente, invalide ou introuvable dans le clone de la VM
+comme dans le dépôt du poste.
+
+Si la VM n’a pas le commit visé, il est envoyé en paquet git par SSH depuis le
+poste. Le paquet exclut le HEAD du clone de la VM, dont la présence est prouvée
+avant l’envoi ; sans base lisible, ou si l’exclusion vide le paquet, il est
+autonome — une cible déjà fusionnée dans `origin/main` passe donc, comme le
+retour vers un ancêtre absent de la VM.
 
 Les migrations de la base commune doivent être appliquées avant l’installation
 du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
