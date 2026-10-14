@@ -1,0 +1,101 @@
+{
+  "observed_at": "2026-10-14T02:56:59.491566+00:00",
+  "candidate_review_sha": "142805d278338d96a9d00293f2c875d13dabdd83",
+  "executed": "read-only inventory only",
+  "config_file": "/home/smichea/.local/state/ameesh/1155-bascule-recette.env",
+  "config_mode": "0600",
+  "hosts": [
+    {
+      "host": "ameesh-agents-1",
+      "ssh": "root@78.232.56.22",
+      "installed": "afa32932e72c459bf1d23314912647b23b306b73",
+      "saved_rollback": "b85777c1e3e757b9ba0caa8cef49b0db1558b251"
+    },
+    {
+      "host": "ameesh-agents-2",
+      "ssh": "root@78.232.60.1",
+      "installed": "afa32932e72c459bf1d23314912647b23b306b73",
+      "saved_rollback": "b85777c1e3e757b9ba0caa8cef49b0db1558b251"
+    },
+    {
+      "host": "manaty-mesh-1",
+      "ssh": "root@10.77.0.1",
+      "installed": "1accf7d3e648e16b4a9881975a4bb5f045941c1f",
+      "saved_rollback": "13fc7addefc4341bcf98026cf599fa0905aeb764",
+      "postgresql": "active",
+      "version": "1.9.0",
+      "registered_active_agents": 0
+    },
+    {
+      "host": "pc-smichea",
+      "installed": "afa3293",
+      "installed_link": "src-afa3293",
+      "saved_rollback": "src-b85777c"
+    }
+  ],
+  "plan_prepared_at": "2026-10-14T02:58:57.115949+00:00",
+  "deployment_authorized_now": false,
+  "gates": [
+    "Avis R1 Codex et R2 Claude réels sur le gel final (actuellement 142805d278338d96a9d00293f2c875d13dabdd83)",
+    "CI exacte entière verte, aucune part annulée ou non exécutée",
+    "Feu final mesh-design avec cible et commit de retour",
+    "Cible de déploiement SHA complet depuis main, constance/delta du gel qualifiés",
+    "Scénario de panne qualifié par auteur et pilote"
+  ],
+  "fault_test": {
+    "host": "ameesh-agents-1",
+    "proposal": "copy of private BASCULE_ENV with SONDE_AMEESH_AGENTS_1=recette-1155-invalide; select only this VM",
+    "failure": "choose() rejects the absent persona during health stage, after real install/restart/control",
+    "expected_rollback": "afa32932e72c459bf1d23314912647b23b306b73",
+    "expected_order": [
+      "installer",
+      "redemarrer",
+      "controler",
+      "sante ko",
+      "retour automatique",
+      "controle-retour ok",
+      "notification pilote",
+      "exit nonzero"
+    ],
+    "other_hosts": "installed SHA and process startup times remain unchanged",
+    "scope_limit": "tests real VM rollback on deliberately invalid health configuration; does not simulate OS, database or network outage",
+    "status": "proposal pending technical qualification; not executed"
+  },
+  "healthy_sequence": {
+    "order": [
+      "ameesh-agents-1",
+      "ameesh-agents-2",
+      "manaty-mesh-1",
+      "pc-smichea"
+    ],
+    "configuration": "normal private configuration without invalid probe",
+    "before_install": [
+      "read-only verifier on all four hosts",
+      "database backup with restore evidence",
+      "additive migrations only on shared database"
+    ],
+    "each_host": [
+      "record current SHA as actual future rollback",
+      "installer exact target",
+      "graceful restart outside turns",
+      "units and lease owner/epoch/liveness checks",
+      "doctor",
+      "mail probe delivered_ts and recipient identity"
+    ],
+    "stop_rule": "first failure restores that host and stops sequence before later hosts",
+    "proofs": [
+      "JSONL events with target and previous SHA",
+      "exit codes",
+      "live process start times",
+      "lease owner/epoch/expiry",
+      "doctor logs",
+      "mail message id and delivery timestamp"
+    ]
+  },
+  "open_points": [
+    "Server has zero active registered agents: sans-sonde must not be reported as actual mail delivery; author/pilot to qualify server mail-health evidence",
+    "1195: confirm ignored inherited AGENT_MESH_CONFIG and *_DATABASE_URL aliases in read-only preflight using invalid synthetic values, without printing private configuration",
+    "All stored rollback references must still resolve before any host mutation",
+    "Initial local configuration lacks HOTES_STAGING and contains stale PERSONAS_VM; private separate configuration prepared, original unchanged"
+  ]
+}
