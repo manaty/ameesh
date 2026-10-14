@@ -455,21 +455,54 @@ update) leaves a helper that no longer exists. Every HTTPS GitHub operation
 then fails on the credential lookup while `gh auth status` stays healthy —
 the sentinel probes `gh`, not `git`, so it sees nothing (incident #1063).
 
-Repair on the host itself, after backing up the global file that carries the
-faulty entry (`~/.gitconfig` or `~/.config/git/config`, shown by the first
-command); the empty line is what clears a helper inherited from another scope:
+Repair on the host itself. `git config --global` reads and writes a single
+file: `GIT_CONFIG_GLOBAL` when it is set, otherwise the first existing of
+`~/.gitconfig` and the XDG file (`$XDG_CONFIG_HOME/git/config`, default
+`~/.config/git/config`), otherwise `~/.gitconfig`, which the first write
+creates. `--global` reads that file alone and does not follow `include.*`
+directives unless `--includes` is given, so the faulty entry can live in a
+file the repair never writes (the shadowed global file, an included file): the
+first command below lists every entry with its file and scope, and the repair
+saves the file it writes plus every global file that carries a credential
+entry. It runs in a subshell with `set -e`, so a failed copy stops it before
+the first modification; the empty value is what clears a helper inherited from
+another scope:
 
 ```sh
-# locate the scope and file holding the frozen helper (global, XDG, system)
+# locate every credential entry, with file and scope (global, XDG, included)
 git config --show-origin --show-scope --get-regexp '^credential\.'
-cfg=$(git config --global --show-origin --get-regexp '^credential\.' |
-      awk -F'\t' 'sub(/^file:/,"",$1) {print $1; exit}')
-[ -n "$cfg" ] && cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M)"
+
+# repair, in a subshell with `set -e`: a failed backup stops the procedure
+(
+set -e
+
+# file `git config --global` reads and writes, i.e. the file repaired
+if [ -n "${GIT_CONFIG_GLOBAL+x}" ]; then
+  target=$GIT_CONFIG_GLOBAL
+elif [ -f "$HOME/.gitconfig" ]; then
+  target=$HOME/.gitconfig
+elif [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/git/config" ]; then
+  target=${XDG_CONFIG_HOME:-$HOME/.config}/git/config
+else
+  target=$HOME/.gitconfig
+fi
+
+# save the repaired file and every global file carrying a credential entry
+stamp=$(date +%Y%m%d-%H%M%S)
+{ printf '%s\n' "$target"
+  git config --show-origin --show-scope --get-regexp '^credential\.' |
+    awk -F'\t' '$1 == "global" && $2 ~ /^file:/ {sub(/^file:/,"",$2); print $2}'
+} | sort -u | while IFS= read -r f; do
+  [ -e "$f" ] || continue
+  cp -p -- "$f" "$f.bak-$stamp"
+done
+
 for url in https://github.com https://gist.github.com; do
   git config --global --replace-all "credential.$url.helper" ""
   git config --global --add "credential.$url.helper" '!gh auth git-credential'
 done
 GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/<org>/<private-repo> HEAD >/dev/null && echo ok
+)
 ```
 
 The value is single-quoted on purpose: pasted into an interactive shell, a
