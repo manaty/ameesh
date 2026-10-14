@@ -104,7 +104,7 @@ def resolve_lot(db, ref: str) -> dict | None:
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
-                 assign: bool = False) -> dict:
+                 assign: bool = False, parent_lot: int | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
@@ -119,11 +119,16 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
-    déposé), un avertissement pour un humain."""
+    déposé), un avertissement pour un humain.
+    #1193: `parent_lot` is the explicit parent of the suite lot created by
+    `new_lot` — the blocking edge is written together with the creation
+    (refused without `new_lot`)."""
     out = {"lot": None, "work_item_id": lot, "assigned": False, "created": False,
            "branch": None, "warnings": [], "orchestrator": False}
     if recipient == "all" or ":" in recipient:
         return out
+    if parent_lot is not None and new_lot is None:
+        raise AssignmentError("--parent-lot goes with --new-lot (the parent of the suite)")
     if new_lot is None:
         # le cas courant (aucune option, destinataire déjà sur un lot) ne lit
         # rien d'autre : la détection d'un orchestrateur peut lire le canon
@@ -171,7 +176,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                           if new_project and app is not None else "")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg, branch=branch,
-                                estimate=minutes, note=introduced)
+                                estimate=minutes, note=introduced, parent_lot=parent_lot)
             out.update(created=True, assigned=True, branch=item.get("branch"))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
