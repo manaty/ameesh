@@ -117,7 +117,31 @@ arrêt est sûr : un hôte déjà au commit visé n’est pas réinstallé et so
 
 Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
 `sha`, `precedent`, `detail`) dans
-`~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`.
+`~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`. Le `detail` de
+l’étape `sante` porte la preuve de la sonde (destinataire, délai, message).
+
+## Signal « staging actif » (#1323)
+
+Une séquence **complète et saine** — les quatre hôtes, `installer`,
+`redemarrer`, `controler` et sonde de courrier réellement remise — écrit une
+attestation durable sous
+`~/.local/state/ameesh/mise-a-jour/actif-<commit>.json` et réveille les
+rapporteurs déclarés avec `--lots "917 988"` et
+`--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
+`BASCULE_ENV`).
+
+Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
+séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
+concernés. Il est borné et idempotent : un seul courrier par rapporteur et par
+commit, même si la séquence est relancée ; l’attestation est réécrite en
+place. Un échec, un retour automatique, une séquence partielle (`--hotes`) ou
+une santé sans sonde de remise réelle (`--sans-sonde`) n’émettent **aucun
+signal de réussite**, et aucune clôture de lot n’est automatique : le
+rapporteur reprend lui-même sa vérification après déploiement.
+
+Si le courrier ne part pas (base indisponible), l’attestation reste écrite et
+`staging.sh` le signale : le relais opérateur transmet alors le journal et
+l’attestation à la main.
 
 `HOTES_STAGING` (BASCULE_ENV) déclare la topologie, une entrée par hôte, dans
 l’ordre canonique ; `SONDE_<HOTE>` (majuscules, `-` et `.` remplacés par `_`)
@@ -127,6 +151,7 @@ normalisés — un seul exemplaire par hôte, séparateurs espace, tabulation ou
 nouvelle ligne ; un sous-ensemble qui contient `pc-smichea` est refusé — le
 poste ne s’installe que dans la séquence complète des quatre hôtes, VM saines
 d’abord),
+`--lots "n …"` et `--rapporteurs "agent …"` (signal « staging actif »),
 `--sans-sonde` (santé sans sonde de courrier),
 `--sans-sauvegarde`. Le script exige que `VM` soit l’adresse de
 `manaty-mesh-1` ; `PERSONAS_VM` peut rester vide.
