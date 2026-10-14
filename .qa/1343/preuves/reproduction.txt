@@ -1,0 +1,9 @@
+# 1343 — reproduction P2-3 (revue cx2) sur le candidat 866764dc5d85d2b8009610fa492126703b966b5f
+## la marque et le run dans la meme seconde ; --force repart
+test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde (tests.test_l161g_ci_gel.RequestTest.test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+OK
+reproduction-exit:0

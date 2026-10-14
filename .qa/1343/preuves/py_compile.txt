@@ -1,0 +1,2 @@
+# 1343 — compilation, candidat 866764dc5d85d2b8009610fa492126703b966b5f
+py_compile-exit:0

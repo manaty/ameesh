@@ -1,0 +1,15 @@
+# 1343 — diffstat candidat vs base main 2458ec053123d3f33644fef1e092fc84cc2773d9
+ .github/workflows/tests.yml      |  186 +++++-
+ docs/EXPLOITATION.md             |   54 ++
+ scripts/test-plan.py             |  131 +++-
+ src/ameesh/ci.py                 | 1042 ++++++++++++++++++++++++++++++++
+ src/ameesh/mesh_cli.py           |   42 ++
+ tests/test_l161a_ci_sans_code.py |    7 +-
+ tests/test_l161f_plan.py         |  202 ++++++-
+ tests/test_l161g_ci_gel.py       | 1218 ++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 2819 insertions(+), 63 deletions(-)
+## delta depuis la tete examinee d1d875c89
+ src/ameesh/ci.py           | 105 ++++++++++++++++++++++++------------
+ tests/test_l161g_ci_gel.py | 131 +++++++++++++++++++++++++++++++++++----------
+ 2 files changed, 175 insertions(+), 61 deletions(-)
+diffstat-exit:0

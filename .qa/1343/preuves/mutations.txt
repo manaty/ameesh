@@ -1,0 +1,21 @@
+# 1343 — temoins de discrimination : chaque garde P2-3 mutee fait rougir son temoin
+# candidat : 866764dc5d85d2b8009610fa492126703b966b5f
+temoin initial : 1df75941613177d9
+initial : OK
+
+== P2-3 materialisation neutralisee (toute marque fraiche tient)
+   exit=1
+   rouges: test_la_meme_seconde_ne_decide_pas, test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde, test_une_execution_superieure_materialise_la_marque, test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas
+== P2-3 liberation par toute execution visible (garde inversee)
+   exit=1
+   rouges: test_la_meme_seconde_ne_decide_pas, test_la_reservation_full_couvre_la_demande_lot, test_une_demande_deja_reservee_recule, test_une_execution_superieure_materialise_la_marque, test_une_marque_concurrente_sous_le_verrou_recule, test_une_marque_posterieure_au_run_visible_tient_la_cle, test_une_marque_sans_watermark_tient_jusqu_au_ttl, test_une_marque_sans_watermark_tient_la_cle, test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas, test_une_reservation_fraiche_ne_repose_pas, test_une_reservation_full_couvre_la_demande_lot
+== watermark non enregistre dans la marque applied
+   exit=1
+   rouges: test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde, test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas
+== watermark toujours nul (pas de lecture avant pose)
+   exit=1
+   rouges: test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde, test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas
+
+mutations: 4/4 detectees
+restauration : sha=1df75941613177d9 exit=0 rouges=—
+mutations-exit:0

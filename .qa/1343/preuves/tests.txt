@@ -1,0 +1,26 @@
+# 1343 — temoins cibles, candidat 866764dc5d85d2b8009610fa492126703b966b5f
+## A. tests.test_l161g_ci_gel (gel/etiquette + P2-3 marque/run)
+......................................................................................
+----------------------------------------------------------------------
+Ran 86 tests in 0.062s
+
+OK
+l161g-exit:0
+## B. tests.test_l161f_plan + test_l744_ci_entrypoint + test_l161a_ci_sans_code + test_hermeticity_lint
+...........................................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmpa3bgadiv/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmpdmolx_8c/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+.............................................
+----------------------------------------------------------------------
+Ran 146 tests in 38.081s
+
+OK
+voisins-exit:0
+## C. tests.test_l161b_flow + test_l161c_failures_realtime
+...ordre : diff depuis ref-qui-n-existe-pas illisible (Command '['git', 'diff', '--name-only', '--no-renames', 'ref-qui-n-existe-pas', 'HEAD']' returned non-zero exit status 1.) ; ordre alphabétique
+...............................
+----------------------------------------------------------------------
+Ran 34 tests in 83.247s
+
+OK
+flux-exit:0
