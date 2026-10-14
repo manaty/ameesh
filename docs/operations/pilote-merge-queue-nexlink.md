@@ -198,6 +198,52 @@ Deux choix reviennent au bureau avant l'application :
   Avant recharge, vérifier qu'une seule unité référence le profil dédié et que
   les autres n'ont pas la clé `radar` (§4, étape 4).
 
+### 3bis. Proposition dev3 (14/10 06:05Z) — pièces exactes, à valider
+
+Préparée pour la validation du bureau demandée le 14/10 05:57Z (courrier
+bureau → dev3), avant le créneau proposé du 14/10 08:30 CEST. Aucun geste
+appliqué : rien n'existe sur `pc-smichea` de ce qui suit.
+
+| pièce | valeur |
+|---|---|
+| unité existante désignée | `ameesh-runner-agent@orchestrateur.service` |
+| profil source (comptes) | `/home/smichea/runner-profiles/critiques-2.json` |
+| profil dédié | `/home/smichea/runner-profiles/radar-nexlink.json` |
+| drop-in | `~/.config/systemd/user/ameesh-runner-agent@orchestrateur.service.d/10-radar-nexlink.conf` |
+| rechargement | `systemctl --user daemon-reload && systemctl --user restart ameesh-runner-agent@orchestrateur.service` |
+
+Pourquoi l'orchestrateur : c'est le rôle qui tient la file et le jour de
+pilote (§5) ; l'auditeur est en lecture seule et `mesh-design` ne lance ni
+l'application ni le jour de pilote (§7.4). Le choix reste au bureau : les trois
+unités lisent le même `critiques-2.json`, changer d'unité ne change que le nom
+d'instance du drop-in.
+
+**Diff exact** (aucune autre modification ; le profil partagé
+`critiques-2.json`, la section `accounts` et les deux autres unités ne sont pas
+touchés) :
+
+1. `cp -a "$SRC" "$CFG"` puis sauvegarde `cp -a "$CFG" "$CFG.bak-<date>"` ;
+2. insertion du seul bloc `radar.projects.nexlink` de §2 dans `$CFG` ;
+3. création du drop-in, contenu exact :
+
+   ```ini
+   [Service]
+   Environment=AMEESH_CONFIG=/home/smichea/runner-profiles/radar-nexlink.json
+   ```
+
+**Recharge** : §4 étapes 3 à 5 (validation du schéma, contrôle d'unicité
+`systemctl --user show -p Environment` + `systemctl --user cat`, contrôle à
+blanc). **Retour** : §6 (retirer le drop-in, `rm` du profil dédié, recharger
+cette seule unité). Un seul effet de bord : le redémarrage de l'unité coupe le
+runner de l'orchestrateur le temps de la reprise — c'est le geste du bureau
+(§7.4).
+
+L'instance exacte du drop-in se contrôle sur l'hôte avant de l'écrire :
+`systemctl --user list-units 'ameesh-runner-agent@*'` et le bail du registre
+donnent le nom d'instance (`runner-orchestrateur@laptop` → `orchestrateur`) ;
+depuis `ameesh-agents-1` je n'ai ni DNS ni accès à `pc-smichea`, la
+correspondance n'est donc pas re-vérifiée ici.
+
 Hôte et clone, confirmés de première main le 13/10 :
 
 * `pc-smichea` : ameesh **1.10.0**, Node **26.8.1**, `gh` authentifié
@@ -214,13 +260,15 @@ Le schéma et l'existence du dépôt sont deux contrôles distincts :
 
 ## 4. Runbook d'application (sur décision du bureau)
 
-**Profil dédié** retenu par le bureau (§3) — pas le `critiques-2.json` partagé.
-`SRC` est le profil de comptes d'origine (sa section `accounts` est reprise
-telle quelle), `CFG` le nouveau fichier dédié :
+**Profil dédié** (§3, §3bis) — pas le `critiques-2.json` partagé. `SRC` est le
+profil de comptes d'origine (sa section `accounts` est reprise telle quelle),
+`CFG` le nouveau fichier dédié, `UNIT` l'unité existante désignée :
 
 ```bash
-SRC=~/runner-profiles/critiques-2.json     # profil de comptes d'origine (chemin réel de l'unité)
-CFG=~/runner-profiles/radar-nexlink.json   # nouveau profil dédié, une seule unité
+SRC=/home/smichea/runner-profiles/critiques-2.json  # profil de comptes d'origine
+CFG=/home/smichea/runner-profiles/radar-nexlink.json # nouveau profil dédié
+UNIT=ameesh-runner-agent@orchestrateur.service      # unité existante désignée (§3bis)
+DROPIN=~/.config/systemd/user/$UNIT.d/10-radar-nexlink.conf
 REPO=~/development/manaty/nexlink
 AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
 ```
@@ -270,11 +318,12 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
 
 4. **Faire pointer une seule unité sur le profil dédié, puis la recharger** —
    drop-in `Environment=AMEESH_CONFIG=<chemin absolu de $CFG>` sur l'unité
-   désignée ; les autres unités restent sur `critiques-2.json`. Contrôler
-   `systemctl --user show -p Environment <unité>` (+ les drop-ins) : une seule
-   unité référence `$CFG`, aucune autre n'a la clé `radar`. Puis
-   `systemctl --user restart <unité>` ; l'exécuteur ne relit pas la
-   configuration à chaud.
+   désignée (`$DROPIN`, contenu exact en §3bis) ; les autres unités restent sur
+   `critiques-2.json`. Contrôler `systemctl --user show -p Environment $UNIT`
+   et `systemctl --user cat $UNIT` (drop-ins) : une seule unité référence
+   `$CFG`, aucune autre n'a la clé `radar`. Puis
+   `systemctl --user daemon-reload && systemctl --user restart $UNIT` ;
+   l'exécuteur ne relit pas la configuration à chaud.
 
 5. **Contrôle à blanc** (lecture seule) :
 
@@ -314,8 +363,9 @@ plus de commit** : pour repousser, `ameesh work queue remove <lot>` d'abord.
   retirer l'entrée `nexlink`), recharger l'exécuteur : la file continue
   d'ordonner, l'orchestrateur fusionne le rang 1 à la main.
 * **Configuration** : restaurer la sauvegarde de l'étape 1 (ou supprimer le
-  profil dédié et retirer le drop-in `AMEESH_CONFIG` de l'unité, qui reprend
-  `critiques-2.json`), puis recharger **cette seule unité**.
+  profil dédié et retirer le drop-in `AMEESH_CONFIG` de `$UNIT`, qui reprend
+  `critiques-2.json`), puis `systemctl --user daemon-reload && systemctl --user
+  restart $UNIT` — **cette seule unité**.
 
 ## 7. Décisions et points ouverts
 
@@ -339,7 +389,13 @@ Tranché le 13/10 :
    `pc-smichea` ; `critiques-2.json` reste partagé par les trois unités, sans
    clé `radar` ; la recharge est le redémarrage de cette seule unité (§3, §4).
    `mesh-design` (13/10 23:21) confirme : ne pas ajouter `radar` au profil
-   partagé, sinon les trois unités s'arment à leurs reprises.
+   partagé, sinon les trois unités s'arment à leurs reprises. **Proposition
+   dev3 (14/10 06:05Z, §3bis)** : unité existante
+   `ameesh-runner-agent@orchestrateur.service`, profil
+   `/home/smichea/runner-profiles/radar-nexlink.json` dérivé de
+   `/home/smichea/runner-profiles/critiques-2.json`, drop-in
+   `10-radar-nexlink.conf`, recharge `daemon-reload` + `restart` de cette
+   unité ; à valider par le bureau avant le créneau.
 6. **Créneau du 14/10** — après REL-11 ; la **liste initiale des PR** est
    fixée au démarrage par l'orchestrateur Nexlink, hors sensibles `915`, `695`
    et `943` en vol.
