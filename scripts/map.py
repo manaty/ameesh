@@ -450,6 +450,60 @@ def parts_incompletes(dossiers: list[str], attendus: list[str]) -> list[str]:
     return problemes
 
 
+def couverture_incomplete(dossiers: list[str], plan: dict) -> list[str]:
+    """#1341 R1 — la couverture *effective* de la mesure, part par part.
+
+    Le plan de mesure est calculé une seule fois par run (job `plan-mesure`)
+    et lu par toutes les parts (`test-parts.py run --plan`). `merge` vérifie
+    ici que chaque part a mesuré exactement les modules que le plan lui
+    assigne : un module mesuré dans deux parts (doublon), mesuré hors de sa
+    part, ou un module du plan jamais mesuré, refuse la publication. Sans ce
+    contrôle, un cache changé entre deux jobs peut produire des parts
+    disjointes et une carte incomplète avec une matrice verte (témoin K1/K2
+    de la R1). `plan` est le JSON écrit par `scripts/test-parts.py plan`.
+    """
+    mesures: dict[str, set[str]] = {}
+    for dossier in dossiers:
+        nom = os.path.basename(os.path.normpath(dossier))
+        modules: set[str] = set()
+        for chemin in sorted(glob.glob(os.path.join(dossier, "durees*.json"))):
+            try:
+                donnees = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue  # parts_incompletes a déjà refusé cette part
+            if isinstance(donnees, dict):
+                for durees in donnees.values():
+                    if isinstance(durees, dict):
+                        modules |= set(durees)
+        mesures[nom] = mesures.get(nom, set()) | modules
+    problemes = []
+    connues = {f"mesure-{pilote}-{entree.get('part')}"
+               for pilote, parts in plan.get("parts", {}).items() for entree in parts}
+    for dossier in dossiers:
+        nom = os.path.basename(os.path.normpath(dossier))
+        if nom.startswith("mesure-") and nom not in connues:
+            problemes.append(f"{nom} : part mesurée absente du plan")
+    for pilote, parts in sorted(plan.get("parts", {}).items()):
+        attendues = {f"mesure-{pilote}-{entree.get('part')}":
+                     set(entree.get("modules") or ())
+                     for entree in parts}
+        par_module: dict[str, list[str]] = collections.defaultdict(list)
+        for nom in attendues:
+            for module in mesures.get(nom, set()):
+                par_module[module].append(nom)
+        for module, noms in sorted(par_module.items()):
+            if len(noms) > 1:
+                problemes.append(f"{module} : mesuré dans plusieurs parts "
+                                 f"({', '.join(sorted(noms))})")
+        for nom, attendus in sorted(attendues.items()):
+            mesures_part = mesures.get(nom, set())
+            for module in sorted(attendus - mesures_part):
+                problemes.append(f"{nom} : module du plan non mesuré : {module}")
+            for module in sorted(mesures_part - attendus):
+                problemes.append(f"{nom} : module mesuré hors de sa part : {module}")
+    return problemes
+
+
 def write(carte: dict, chemin: str) -> None:
     texte = json.dumps(carte, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
     with gzip.open(chemin, "wt", encoding="utf-8") as f:
@@ -535,6 +589,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--attendu", help="parts de mesure attendues (noms d'artefacts, "
                    "séparés par des espaces ou des virgules) : la fusion refuse de "
                    "publier une carte si l'une manque ou n'a pas de durées (#1341 D)")
+    p.add_argument("--plan", help="plan.json du run (#1341 R1) : la fusion vérifie "
+                   "que chaque part a mesuré exactement les modules que le plan lui "
+                   "assigne — aucun module omis, doublé ou hors de sa part")
     p.add_argument("directories", nargs="+")
     p = sous.add_parser("show", help="lire une carte")
     p.add_argument("map")
@@ -553,6 +610,22 @@ def main(argv: list[str] | None = None) -> int:
             print("carte non publiée : une part attendue manque ou n'a pas de durées",
                   file=sys.stderr)
             return 2
+        if args.plan:
+            try:
+                plan = json.loads(pathlib.Path(args.plan).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                print(f"::error::plan {args.plan} illisible ({exc})")
+                print("carte non publiée : le plan de mesure du run est illisible",
+                      file=sys.stderr)
+                return 2
+            problemes = couverture_incomplete(args.directories, plan)
+            if problemes:
+                for probleme in problemes:
+                    print(f"::error::couverture incomplète : {probleme}")
+                print("carte non publiée : la couverture effective du plan est "
+                      "incomplète (module omis, doublé ou hors de sa part)",
+                      file=sys.stderr)
+                return 2
         precedente = None
         if args.previous and os.path.exists(args.previous):
             try:
