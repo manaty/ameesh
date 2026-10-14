@@ -380,7 +380,7 @@ class MapTest(unittest.TestCase):
         self.assertTrue(out["sure"])
         self.assertEqual(out["uncovered"], ["src/ameesh/code.py"])
         self.assertFalse(out["phase2_safe"])
-        self.assertIn("no test imports: src/ameesh/code.py", out["phase2_why"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/code.py", out["phase2_why"])
         self.assertEqual(out["classes"]["test_a"], ["P3", ""])
 
     def test_new_file_is_covered_by_the_test_that_imports_it(self):
@@ -394,6 +394,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("src/ameesh/new.py::thing", impact.unknown_blocks)
         self.assertEqual(impact.uncovered, [])
         self.assertEqual(impact.importers, {"src/ameesh/new.py": ["test_new"]})
+        self.assertEqual(impact.certified, {"src/ameesh/new.py": ["test_new"]})
         self.assertEqual(impact.p1["test_new"], "src/ameesh/new.py (imported)")
 
     def test_new_file_no_test_imports_keeps_the_doubt(self):
@@ -405,6 +406,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("src/ameesh/orphan.py::thing", impact.unknown_blocks)
         self.assertEqual(impact.uncovered, ["src/ameesh/orphan.py"])
         self.assertEqual(impact.importers, {})
+        self.assertEqual(impact.certified, {})
 
     def test_new_file_certified_by_type_checking_only_keeps_the_doubt(self):
         # #1339, relecture Codex (B2) : le corps d'un `if TYPE_CHECKING:` ne
@@ -430,9 +432,45 @@ class MapTest(unittest.TestCase):
         self.assertIn("src/ameesh/new.py::<module>", impact.unknown_blocks)
         self.assertEqual(impact.uncovered, ["src/ameesh/new.py"])
         self.assertEqual(impact.importers, {})
+        self.assertEqual(impact.certified, {})
         out = self._classify_with(card, mods)
         self.assertFalse(out["phase2_safe"])
-        self.assertIn("no test imports: src/ameesh/new.py", out["phase2_why"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new.py", out["phase2_why"])
+
+    def test_new_file_with_only_a_lazy_importer_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2, résidu) : un import paresseux dans une
+        # fonction jamais appelée ne charge rien. Il garde son test dans la
+        # sélection (il peut l'appeler), mais ne prouve pas la couverture : le
+        # test qui charge réellement le fichier par importlib reste P3, donc
+        # la suite complète est conservée au lieu d'omettre le test rouge.
+        self.repo.write("tests/test_static.py",
+                        "def unused_loader():\n"
+                        "    from ameesh import new_feature\n\n"
+                        "test_unrelated = True\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\n\n"
+                        "def test_value():\n"
+                        "    mod = importlib.import_module('ameesh.new_feature')\n"
+                        "    assert mod.VALUE == -1\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new_feature.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py", out["phase2_why"])
+        # le test paresseux reste sélectionné, le test dynamique reste P3
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+        self.assertEqual(out["certified"], {})
 
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
@@ -751,6 +789,39 @@ class ImportGraphTest(unittest.TestCase):
                    "if not TYPE_CHECKING:\n    import ameesh.db\n")
         self.assertEqual(plan._imported_files(negated, "tests/test_a.py", known),
                          {"src/ameesh/db.py"})
+
+    def test_guaranteed_edges_only_the_module_body_itself(self):
+        # #1339, relecture Codex (B2 résiduel) : seul un import que le corps du
+        # module exécute à l'import prouve le chargement. Un import paresseux,
+        # conditionnel, sous `try` ou dans une boucle reste une arête possible
+        # (il peut tourner : sélection), jamais une preuve.
+        known = {"src/ameesh/db.py"}
+        guarantees = {
+            "direct": "import ameesh.db\n",
+            "corps de classe": "class C:\n    import ameesh.db\n",
+            "else d'un garde mort": "if False:\n    import ameesh.missing\n"
+                                    "else:\n    import ameesh.db\n",
+        }
+        for why, source in guarantees.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True),
+                                 {"src/ameesh/db.py"}, why)
+        candidates = {
+            "paresseux": "def loader():\n    import ameesh.db\n",
+            "conditionnel": "import sys\nif sys.version_info:\n    import ameesh.db\n",
+            "try": "try:\n    import ameesh.db\nexcept ImportError:\n    pass\n",
+            "boucle": "for _ in ():\n    import ameesh.db\n",
+            "TYPE_CHECKING": "from typing import TYPE_CHECKING\n"
+                             "if TYPE_CHECKING:\n    import ameesh.db\n",
+        }
+        for why, source in candidates.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
+                    self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                     {"src/ameesh/db.py"}, why)
 
     def test_import_graph_reaches_the_test_through_the_changed_module(self):
         self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
@@ -1475,6 +1546,21 @@ class LotBranchTest(unittest.TestCase):
         text = plan.summary(full)
         self.assertIn("full suite", text)
         self.assertIn("changed block(s) without a test", text)
+
+    def test_summary_separates_proven_importers_from_candidates(self):
+        # #1339, B2 résiduel : seuls les importateurs qui prouvent le
+        # chargement sont annoncés couverts ; un candidat paresseux à côté d'un
+        # fichier non couvert est nommé, sans faire passer le plan pour sûr.
+        p = self._plan(importers={"src/ameesh/x.py": [self.mods[0]]},
+                       certified={"src/ameesh/x.py": [self.mods[0]]})
+        text = plan.summary(p)
+        self.assertIn("unmeasured blocks covered by their importers", text)
+        unknown = self._plan(phase2_safe=False, phase2_why="selection unsafe",
+                             importers={"src/ameesh/y.py": [self.mods[0]]},
+                             uncovered=["src/ameesh/y.py"])
+        text = plan.summary(unknown)
+        self.assertIn("no test is guaranteed to load", text)
+        self.assertIn(f"candidates: `{self.mods[0]}`", text)
 
     def test_parts_shrink_to_the_estimate(self):
         def card(seconds):

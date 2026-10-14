@@ -78,19 +78,21 @@ computed name, a config read by the code).
 
 **A block without a measure does not force the full suite** (#1339). A new
 block (a file the map does not know, a function or a class it has never
-seen) and a changed block no test executes are covered as soon as one test
-loads their file: the modules the map measured on it, or — when none has
-executed it — the tests the import graph reaches (`src/ameesh/**` and
-`tests/**` at HEAD; a test that imports a changed module which imports the
-new file counts, through that module's measured importers). Those tests all
-join the impacted ones: a new block has no measured caller, and a test can
-reach it by a computed name (`dir()` then `getattr`) as soon as it has
-loaded the file. The selection falls back to the full suite only when no
-test loads such a file: its blocks are then neither measured nor imported
-(`phase2_why` names it). A dynamic import (`importlib.import_module`) leaves
-no static edge, and an import under `if TYPE_CHECKING:` never runs at
-runtime: neither certifies that a test loads a new file, so the full suite
-stays.
+seen) and a changed block no test executes are covered as soon as a test is
+*proven* to load their file: the modules the map measured on it, or — when
+none has executed it — the tests the *guaranteed* import graph reaches
+(`src/ameesh/**` and `tests/**` at HEAD; a test that imports a changed
+module which imports the new file counts, through that module's measured
+importers; only the imports the module body executes itself count). Every
+test that *may* load the file joins the selection too, the complete import
+graph's lazy and conditional imports included: a new block has no measured
+caller, and a test can reach it by a computed name (`dir()` then `getattr`)
+as soon as it has loaded the file. The selection falls back to the full
+suite when no test is proven to load such a file: a dynamic import
+(`importlib.import_module`) leaves no static edge, an import under `if
+TYPE_CHECKING:` never runs at runtime, and a lazy or conditional import is
+only a candidate — none certifies that a test loads the file, so the full
+suite stays (`phase2_why` names it).
 
 Any error while reading the map gives the fallback plan, never a failure.
 
@@ -330,35 +332,75 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
 
 
 class _RuntimeImports(ast.NodeVisitor):
-    """The import statements that may run. The body of `if TYPE_CHECKING:` — and
-    of any other guard that never runs, `if False:` — loads nothing and is left
-    out; everything else stays, lazy imports included: they may run."""
+    """The import statements that may run, and those the module certainly runs
+    when it is imported.
+
+    The body of `if TYPE_CHECKING:` — and of any other guard that never runs,
+    `if False:` — loads nothing and is left out; everything else stays, lazy
+    imports included: they may run. `guaranteed` keeps only the imports the
+    module body executes itself: at the top level (a class body runs at
+    import, a function body does not), outside any condition, loop or `try`.
+    A lazy or conditional import alone is a possible load, never a proof
+    (relecture Codex, B2 résiduel)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
         self.imports: list[ast.stmt] = []
+        self.guaranteed: list[ast.stmt] = []
+        self._deferred = 0  # inside a function or lambda body: not run at import
+        self._guarded = 0   # inside a condition, a loop or a try: may not run
+
+    def _visit_function(self, node: ast.AST) -> None:
+        self._deferred += 1
+        self.generic_visit(node)
+        self._deferred -= 1
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+    visit_Lambda = _visit_function
+
+    def _visit_guarded(self, node: ast.AST) -> None:
+        self._guarded += 1
+        self.generic_visit(node)
+        self._guarded -= 1
+
+    visit_For = _visit_guarded
+    visit_AsyncFor = _visit_guarded
+    visit_While = _visit_guarded
+    visit_Try = _visit_guarded
+    visit_TryStar = _visit_guarded
+    visit_Match = _visit_guarded
 
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
+            # the guard never runs: only its `else` does (at module level)
             for child in node.orelse:
                 self.visit(child)
             return
-        self.generic_visit(node)
+        self._visit_guarded(node)
+
+    def _record(self, node: ast.stmt) -> None:
+        self.imports.append(node)
+        if not self._deferred and not self._guarded:
+            self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
-        self.imports.append(node)
+        self._record(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        self.imports.append(node)
+        self._record(node)
 
 
-def _imported_files(source: str, path: str, known: set[str]) -> set[str]:
+def _imported_files(source: str, path: str, known: set[str], *,
+                    guaranteed: bool = False) -> set[str]:
     """The repository files `source` may load at runtime: any depth, a lazy
     import included (it may run). An import under `if TYPE_CHECKING:` runs
     never — the flag is false at runtime — so it leaves no edge and never
-    certifies that a test loads a new file (relecture Codex, B2). Only
-    `ameesh.*` and `tests.*` names are resolved; a syntax error leaves no
-    edge."""
+    certifies that a test loads a new file (relecture Codex, B2). With
+    `guaranteed`, only the imports executed by the module body itself are
+    kept: a lazy or conditional import may load the file, it does not prove
+    that importing `source` loads it (B2 résiduel). Only `ameesh.*` and
+    `tests.*` names are resolved; a syntax error leaves no edge."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -371,7 +413,7 @@ def _imported_files(source: str, path: str, known: set[str]) -> set[str]:
     names: set[str] = set()
     collector = _RuntimeImports(_type_checking_names(tree))
     collector.visit(tree)
-    for node in collector.imports:
+    for node in (collector.guaranteed if guaranteed else collector.imports):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -433,15 +475,19 @@ def _tree_sources(head: str, paths: list[str], repo: pathlib.Path) -> dict[str, 
     return sources
 
 
-def _import_graph(head: str, repo: pathlib.Path) -> dict[str, set[str]]:
+def _import_graph(head: str, repo: pathlib.Path, *,
+                  guaranteed: bool = False) -> dict[str, set[str]]:
     """Reverse static import graph at `head`: for each file, the files whose
     source imports it. A dynamic import (`importlib.import_module`) leaves no
-    edge: a new file no test imports keeps the full suite (#1339)."""
+    edge: a new file no test imports keeps the full suite (#1339). With
+    `guaranteed`, only the edges the importing module executes itself are
+    kept: importing that module certainly loads the target, while a lazy or
+    conditional import only may."""
     files = _tree_python_files(head, repo)
     known = set(files)
     reverse: dict[str, set[str]] = {}
     for path, source in _tree_sources(head, files, repo).items():
-        for target in _imported_files(source, path, known):
+        for target in _imported_files(source, path, known, guaranteed=guaranteed):
             if target != path:
                 reverse.setdefault(target, set()).add(path)
     return reverse
@@ -511,6 +557,10 @@ class Impact:
         #: #1339 : blocs sans mesure couverts par les tests qui importent leur
         #: fichier (fichier → modules), et fichiers qu'aucun test n'importe
         self.importers: dict[str, list[str]] = {}
+        #: #1339 : sous-ensemble des importateurs qui *prouvent* le chargement
+        #: (mesure, ou import exécuté au niveau module) ; les autres ne sont que
+        #: des candidats de sélection (relecture Codex, B2 résiduel)
+        self.certified: dict[str, list[str]] = {}
         self.uncovered: list[str] = []
 
     def hit(self, modules, reason: str) -> None:
@@ -538,7 +588,8 @@ def _reaching_tests(card: dict, path: str, modules: list[str],
     """Tests that load `path` at HEAD: those that reach it through the static
     import graph, plus, for every file of that closure, the tests the map
     measured on it — a test that imports a changed module which imports the
-    new one (#1339)."""
+    new one (#1339). The graph given decides the strength: the complete one
+    selects every possible importer, the guaranteed one proves the load."""
     reached = _reverse_closure(reverse, path)
     found = {m for m in modules if f"tests/{m}.py" in reached}
     for source in reached:
@@ -551,13 +602,20 @@ def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
     """#1339 : un bloc nouveau ou modifié sans couverture mesurée ne force plus
     la suite complète dès qu'un test charge son fichier.
 
-    Le doute se lève si les tests qui chargent le fichier — les modules que la
-    carte a mesurés dessus, ou, si aucun ne l'a exécuté, ceux du graphe
-    d'import — ne sont pas vides. Ils rejoignent tous les impactés : un bloc
-    nouveau n'a par définition aucun appelant mesuré, et un test peut
-    l'atteindre par un nom calculé (`dir()` puis `getattr`), donc chaque test
-    qui a chargé le fichier peut l'exécuter (relecture Codex, B1). Sans aucun
-    test importateur, le doute reste et `uncovered` porte le fichier.
+    Deux ensembles se séparent (relecture Codex, B2 résiduel) :
+
+    - la **sélection** : tous les tests qui peuvent charger le fichier — les
+      modules mesurés dessus, et ceux du graphe d'import complet (imports
+      paresseux et conditionnels compris) — rejoignent les impactés. Un bloc
+      nouveau n'a par définition aucun appelant mesuré, et un test peut
+      l'atteindre par un nom calculé (`dir()` puis `getattr`), donc chaque
+      test qui a chargé le fichier peut l'exécuter (B1) ; élargir ne nuit pas.
+    - la **preuve** : la mesure, ou un chargement garanti au niveau module (le
+      graphe des imports que le corps du fichier exécute à l'import). Un test
+      n'est certifié que par une preuve : un import paresseux ou conditionnel
+      seul ne lève pas le doute, `uncovered` porte le fichier et la suite
+      complète reste — au lieu de certifier une couverture qu'un test
+      dynamique (`importlib`) assurerait sans être sélectionné (B2).
     """
     unknown_files = {b.split("::", 1)[0] for b in impact.unknown_blocks}
     untested_files = {u["file"] for u in impact.untested}
@@ -565,18 +623,28 @@ def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
     if not targets:
         return
     reverse: dict[str, set[str]] | None = None
+    proven_reverse: dict[str, set[str]] | None = None
     for path in targets:
-        found = _measured_importers(card, path, modules)
-        if not found:
-            if reverse is None:
-                reverse = _import_graph(head, repo)
-            found = _reaching_tests(card, path, modules, reverse)
-        if not found:
+        measured = _measured_importers(card, path, modules)
+        if reverse is None:
+            reverse = _import_graph(head, repo)
+        #: sélection : les importateurs mesurés, plus tous ceux qui *peuvent*
+        #: charger le fichier (le graphe complet : paresseux et conditionnels)
+        potential = measured | _reaching_tests(card, path, modules, reverse)
+        if measured:
+            proven = measured
+        else:
+            if proven_reverse is None:
+                proven_reverse = _import_graph(head, repo, guaranteed=True)
+            proven = _reaching_tests(card, path, modules, proven_reverse)
+        if potential:
+            for m in sorted(potential):
+                impact.p1.setdefault(m, f"{path} (imported)")
+            impact.importers[path] = sorted(potential)
+        if not proven:
             impact.uncovered.append(path)
             continue
-        for m in sorted(found):
-            impact.p1.setdefault(m, f"{path} (imported)")
-        impact.importers[path] = sorted(found)
+        impact.certified[path] = sorted(proven)
 
 
 def _db_modules(card: dict) -> set[str]:
@@ -784,7 +852,8 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         else:
             _data(card, impact, status, path, repo)
     #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
-    #: leur fichier, pas par la suite complète.
+    #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
+    #: exécuté au niveau module (relecture Codex, B2 résiduel).
     _resolve_unmeasured(card, impact, modules, head, repo)
     return impact
 
@@ -858,9 +927,10 @@ def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
         return "selection unsure"
     if impact.uncovered:
         # #1339 : le bloc sans mesure ne force plus la suite complète dès
-        # qu'un test importe son fichier ; sans importateur, si.
+        # qu'un test charge son fichier ; sans importateur *prouvé*, si — un
+        # import paresseux ou conditionnel ne prouve rien (Codex, B2 résiduel).
         return (f"{len(impact.uncovered)} file(s) with unmeasured blocks no test "
-                f"imports: {impact.uncovered[0]}")
+                f"is guaranteed to load: {impact.uncovered[0]}")
     if impact.foundation:
         return f"test infrastructure changed: {impact.foundation[0]}"
     return "selection unsafe"
@@ -875,7 +945,7 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
            "unsure": [], "contract": list(always),
            "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
-           "importers": {}, "uncovered": [], "changed": 0}
+           "importers": {}, "certified": {}, "uncovered": [], "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
@@ -940,7 +1010,8 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
         out.update(unsure=impact.unsure, untested=impact.untested,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
                    removed=impact.removed, importers=impact.importers,
-                   uncovered=impact.uncovered, sure=not impact.unsure)
+                   certified=impact.certified, uncovered=impact.uncovered,
+                   sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
                               and not impact.uncovered and not impact.foundation
                               and not impact.removed)
@@ -1026,8 +1097,9 @@ def lot_selection(event: str, state: dict, modules: list[str],
     `None` means the full suite: an event other than a pull request, a
     release pull request (`release`, `release_pr`), or any doubt the plan
     cannot decide through — no usable map, a selection that is not safe
-    (stale map, unmeasured blocks no test imports, test infrastructure, a
-    removed file), an empty contract list. The reason goes to the summary.
+    (stale map, unmeasured blocks no test is guaranteed to load, test
+    infrastructure, a removed file), an empty contract list. The reason goes
+    to the summary.
     """
     if event != "pull_request":
         return None, "main, release/** and the integration branch run the full suite"
@@ -1227,7 +1299,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
             "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
-            "importers": {}, "uncovered": [],
+            "importers": {}, "certified": {}, "uncovered": [],
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
@@ -1312,12 +1384,17 @@ def summary(plan: dict) -> str:
     if plan["unknown_blocks"]:
         lines.append("* new blocks, unknown to the map: " + _listing(
             [f"`{b}`" for b in plan["unknown_blocks"]]))
-    if plan.get("importers"):
+    if plan.get("certified"):
         lines.append("* unmeasured blocks covered by their importers: " + _listing(
-            [f"`{f}` ({len(ms)} module(s))" for f, ms in sorted(plan["importers"].items())]))
+            [f"`{f}` ({len(ms)} module(s))" for f, ms in sorted(plan["certified"].items())]))
     if plan.get("uncovered"):
-        lines.append("* **unmeasured blocks no test imports**: " + _listing(
-            [f"`{f}`" for f in plan["uncovered"]]))
+        files = []
+        for f in plan["uncovered"]:
+            candidates = plan.get("importers", {}).get(f, [])
+            files.append(f"`{f}`" + (f" (candidates: {', '.join(f'`{m}`' for m in candidates)})"
+                                     if candidates else ""))
+        lines.append("* **unmeasured blocks no test is guaranteed to load** (full suite): "
+                     + _listing(files))
     return "\n".join(lines) + "\n"
 
 
