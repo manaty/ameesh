@@ -248,16 +248,22 @@ def _json_lines(motif: str):
                     continue  # ligne coupée (processus tué en écrivant)
 
 
-def _couverture_illisible(fichier: str) -> str | None:
-    """Raison pour laquelle un fichier de données coverage est inutilisable,
-    ou None s'il paraît sain.
+def _entete_sqlite(fichier: str) -> str | None:
+    """Diagnostic de l'en-tête d'un fichier de données coverage, ou None s'il
+    paraît sain.
+
+    Il ne sert qu'à *nommer* la panne : un fichier n'est jamais écarté sur ce
+    diagnostic, mais sur l'échec réel de sa lecture (`_coverage`). Le champ de
+    taille de page vaut 1 pour 65536 octets (format sqlite, « page_size ») :
+    le lire comme 1 rejetterait à tort les bases légitimes en 64 Kio (R1 #1257).
+    Le compteur de pages ne vaut que si le compteur de changement et
+    « version-valid-for » concordent (format sqlite, « database size in
+    pages ») ; sinon seul l'alignement de la taille est contrôlé.
 
     Un processus tué pendant l'écriture de sa couverture laisse un fichier
-    tronqué : l'en-tête sqlite annonce N pages, N−1 sont écrites (incident
-    #1257 : `.coverage.ameesh-ci-1.pid3824966.X0pSducx`, 12 pages annoncées,
-    11 écrites, « database disk image is malformed » à la fusion). Le contrôle
-    de l'en-tête écarte ce cas avant coverage ; les corruptions plus profondes
-    sont rattrapées par l'appelant."""
+    tronqué : l'en-tête annonce N pages, N−1 sont écrites (incident #1257 :
+    `.coverage.ameesh-ci-1.pid3824966.X0pSducx`, 12 pages annoncées, 11
+    écrites, « database disk image is malformed » à la fusion)."""
     try:
         taille = os.path.getsize(fichier)
         with open(fichier, "rb") as fh:
@@ -266,10 +272,16 @@ def _couverture_illisible(fichier: str) -> str | None:
         return f"illisible ({exc.strerror or exc})"
     if len(entete) < 100 or entete[:16] != b"SQLite format 3\x00":
         return "en-tête sqlite absent"
-    page = int.from_bytes(entete[16:18], "big") or 65536
+    brut = int.from_bytes(entete[16:18], "big")
+    page = 65536 if brut == 1 else brut
+    if page < 512 or page > 65536 or page & (page - 1):
+        return f"taille de page sqlite invalide ({brut})"
     pages = int.from_bytes(entete[28:32], "big")
-    if page < 512 or pages * page != taille:
-        return f"tronqué ({pages} pages annoncées, {taille // max(page, 1)} écrites)"
+    if entete[24:28] == entete[92:96] and pages and pages * page != taille:
+        return f"tronqué ({pages} pages annoncées, {taille // page} écrites)"
+    if taille % page:
+        return (f"tronqué (dernière page incomplète : {taille} octets, "
+                f"pages de {page})")
     return None
 
 
@@ -281,41 +293,53 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
 
     Une couverture perdue est nommée, jamais silencieuse, et ne fait pas
     échouer la carte entière : un artefact corrompu ne rougit plus un check
-    (#1257), mais la part fautive reste visible dans la carte et le résumé."""
+    (#1257), mais la part fautive reste visible dans la carte et le résumé.
+    La lecture *et* l'exploitation du fichier sont sous le même garde-fou :
+    une panne après `read()` (measured_contexts, measured_files,
+    contexts_by_lineno) écarte le fichier au lieu de tuer la fusion, et sa
+    contribution, construite à part, n'est versée qu'une fois le fichier
+    entièrement exploité (aucune ligne partielle d'un fichier corrompu)."""
     lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
     ignorees: list[dict] = []
     for dossier in dossiers:
         part = os.path.basename(os.path.normpath(dossier)) or dossier
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
-            raison = _couverture_illisible(fichier)
-            if raison is None:
-                import sqlite3
+            import sqlite3
 
-                from coverage import CoverageData
-                from coverage.exceptions import DataError
+            from coverage import CoverageData
+            from coverage.exceptions import DataError
 
-                try:
-                    donnees = CoverageData(basename=fichier)
-                    donnees.read()
-                except (DataError, sqlite3.DatabaseError, OSError) as exc:
-                    raison = f"{type(exc).__name__}: {exc}"
-            if raison is not None:
+            diagnostic = _entete_sqlite(fichier)
+            contribution: dict = collections.defaultdict(
+                lambda: collections.defaultdict(set))
+            try:
+                donnees = CoverageData(basename=fichier)
+                donnees.read()
+                contextes = donnees.measured_contexts()
+                sans_attribution = bool(contextes) and not any(
+                    context_module(c) for c in contextes)
+                for mesure in donnees.measured_files():
+                    relatif = relative_path(mesure)
+                    if relatif is None:
+                        continue
+                    for ligne, ctx in donnees.contexts_by_lineno(mesure).items():
+                        modules = {m for m in map(context_module, ctx) if m}
+                        if modules:
+                            contribution[relatif][ligne] |= modules
+            except (DataError, sqlite3.DatabaseError, OSError) as exc:
+                raison = f"{type(exc).__name__}: {exc}"
+                if diagnostic:
+                    raison = f"{raison} ({diagnostic})"
                 ignorees.append({"part": part, "fichier": os.path.basename(fichier),
                                  "raison": raison})
                 continue
             processus += 1
-            contextes = donnees.measured_contexts()
-            if contextes and not any(context_module(c) for c in contextes):
+            if sans_attribution:
                 sans_contexte += 1
-            for mesure in donnees.measured_files():
-                relatif = relative_path(mesure)
-                if relatif is None:
-                    continue
-                for ligne, contextes in donnees.contexts_by_lineno(mesure).items():
-                    modules = {m for m in map(context_module, contextes) if m}
-                    if modules:
-                        lignes[relatif][ligne] |= modules
+            for relatif, par_ligne in contribution.items():
+                for ligne, modules in par_ligne.items():
+                    lignes[relatif][ligne] |= modules
     return lignes, processus, sans_contexte, ignorees
 
 

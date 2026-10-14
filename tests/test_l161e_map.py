@@ -336,14 +336,41 @@ class CouvertureTronqueeTest(unittest.TestCase):
         part = self._part()
         (part / "cov" / ".coverage.pas-sqlite").write_bytes(b"pas du sqlite")
         carte_ = carte.merge([str(part)], "abc")
-        self.assertEqual(carte_["mesure"]["couverture_ignoree"],
-                         [{"part": "mesure-psycopg-1", "fichier": ".coverage.pas-sqlite",
-                           "raison": "en-tête sqlite absent"}])
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["part"], "mesure-psycopg-1")
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.pas-sqlite")
+        # le diagnostic d'en-tête nomme la panne, le message de coverage suit
+        self.assertIn("en-tête sqlite absent", ignorees[0]["raison"])
 
     def test_aucune_couverture_ignoree_sans_corruption(self):
         carte_ = carte.merge([str(self._part())], "abc")
         self.assertEqual(carte_["mesure"]["couverture_ignoree"], [])
         self.assertNotIn("illisible", carte.summary(carte_))
+
+    def _base_page_64k(self) -> pathlib.Path:
+        """Une base sqlite saine en pages de 64 Kio : le champ d'en-tête
+        « page_size » vaut 1 pour 65536 octets (format sqlite)."""
+        import sqlite3
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        chemin = dossier / "base-64k.sqlite"
+        con = sqlite3.connect(chemin)
+        with con:
+            con.execute("create table t (x integer)")
+            con.executemany("insert into t values (?)", [(i,) for i in range(2000)])
+        con.execute("pragma page_size=65536")
+        con.execute("vacuum")
+        self.assertEqual(con.execute("pragma integrity_check").fetchone()[0], "ok")
+        self.assertEqual(con.execute("pragma page_size").fetchone()[0], 65536)
+        con.close()
+        self.assertEqual(int.from_bytes(chemin.read_bytes()[16:18], "big"), 1)
+        return chemin
+
+    def test_base_saine_page_64k_non_rejetee(self):
+        """R1 #1257 : une base légitime en 64 Kio n'est pas un fichier tronqué
+        (l'ancienne lecture du champ 1 la rejetait comme 1 page)."""
+        self.assertIsNone(carte._entete_sqlite(str(self._base_page_64k())))
 
     @unittest.skipUnless(_coverage_disponible(), "coverage requis")
     def test_sqlite_sans_schema_coverage(self):
@@ -384,6 +411,79 @@ class CouvertureTronqueeTest(unittest.TestCase):
         modules = {m for blocs in carte_["blocs"].values()
                    for info in blocs.values() for m in info["modules"]}
         self.assertIn("test_l1", modules)  # la part valide reste mesurée
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_couverture_valide_page_64k_mesuree(self):
+        """R1 #1257 : une couverture légitime en pages de 64 Kio (champ
+        d'en-tête = 1, format sqlite) reste mesurée au lieu d'être écartée."""
+        import sqlite3
+        from coverage import CoverageData
+        chemin = self._base_page_64k()
+        donnees = CoverageData(basename=str(chemin))
+        donnees.set_context("tests.test_l161e.T.test_64k")
+        donnees.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {4}})
+        donnees.write()
+        con = sqlite3.connect(chemin)
+        con.execute("pragma page_size=65536")
+        con.execute("vacuum")
+        con.close()
+        self.assertEqual(int.from_bytes(chemin.read_bytes()[16:18], "big"), 1)
+        part = self._part()
+        shutil.copy(chemin, part / "cov" / ".coverage.64k")
+        carte_ = carte.merge([str(part)], "abc")
+        self.assertEqual(carte_["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(carte_["mesure"]["processus"], 1)
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l161e", modules)
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_panne_apres_lecture_ecarte_sans_partiel(self):
+        """R1 #1257 : une panne après `read()` (ici contexts_by_lineno) écarte
+        le fichier et nomme la panne ; rien de sa contribution partielle n'est
+        versé dans la carte, les autres fichiers restent mesurés."""
+        from coverage import CoverageData
+        from coverage.exceptions import DataError
+
+        part = self._part()
+        casse = CoverageData(basename=str(part / "cov" / ".coverage.casse"))
+        casse.set_context("tests.test_l1.T.test_casse")
+        casse.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1, 2}})
+        casse.write()
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l2.T.test_valide")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {3}})
+        valide.write()
+
+        original = CoverageData.contexts_by_lineno
+
+        def partielle(self, mesure):
+            donnees = original(self, mesure)
+            if ".coverage.casse" not in str(getattr(self, "_basename", "")):
+                return donnees
+
+            class PremiereSeule(dict):
+                def items(self):
+                    for index, element in enumerate(dict.items(self)):
+                        if index:
+                            raise DataError("panne simulée en cours d'exploitation")
+                        yield element
+
+            return PremiereSeule(donnees)
+
+        CoverageData.contexts_by_lineno = partielle
+        self.addCleanup(setattr, CoverageData, "contexts_by_lineno", original)
+
+        carte_ = carte.merge([str(part)], "abc")
+        self.assertEqual(carte_["mesure"]["processus"], 1)  # seule la part valide
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.casse")
+        self.assertIn("DataError", ignorees[0]["raison"])
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l2", modules)
+        self.assertNotIn("test_l1", modules)  # aucune ligne partielle versée
 
 
 def _mesure_possible() -> bool:
