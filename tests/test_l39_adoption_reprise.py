@@ -14,6 +14,7 @@ import json
 import os
 import time
 import unittest
+import uuid
 from unittest import mock
 
 from ameesh import account_turn, accounts, fil, mail, registry, reprise, storage, work
@@ -21,7 +22,14 @@ from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
 
-SID = "00000000-0000-7000-8000-000000000001"
+#: Identifiant de session propre à ce processus de test. `reprise.holders`
+#: (L63) lit la ligne de commande de TOUS les processus de l'hôte — pas
+#: seulement ceux du bac à sable : deux parts de CI d'exécutions différentes
+#: partagent un hôte (8 jobs par hôte), et un identifiant fixe y est vu chez
+#: la part voisine (run 38496855130 : « session … is still open », détenteur
+#: d'un autre runner). Un tirage par processus suffit ; aucun témoin ne
+#: dépend de la valeur.
+SID = str(uuid.uuid4())
 
 
 def _dossier(chemin: str, *, creds: str | None = None) -> str:
