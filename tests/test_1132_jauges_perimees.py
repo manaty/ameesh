@@ -142,6 +142,19 @@ class RejeuMarqueurRecentTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(gauges["seven_day"].used, 0.87)
         self.assertAlmostEqual(gauges["seven_day"].produced_at, self.now - 3600, places=0)
 
+    def test_a_production_egale_le_lecteur_garde_la_derniere_valeur(self):
+        # Delta auditeur : plusieurs `rate_limit_event` du même tour partagent le
+        # ts du marqueur ; à production égale, le lecteur garde le DERNIER.
+        self.agent("mixte", "claude")
+        self.events("mixte", marked("secondaire", self.now - 3600),
+                    windows(seven_day=(0.87, self.now + 3 * 86400)),
+                    windows(seven_day=(0.67, self.now + 3 * 86400)),
+                    windows(seven_day=(0.87, self.now + 3 * 86400)))
+        gauges = {g.key: g for g in
+                  self.book(db=None).claude_gauges(account="secondaire", primary="primaire")}
+        self.assertAlmostEqual(gauges["seven_day"].used, 0.87)
+        self.assertAlmostEqual(gauges["seven_day"].produced_at, self.now - 3600, places=0)
+
     def test_sans_compte_les_drapeaux_overage_suivent_la_lecture(self):
         # N1 : la lecture sans compte rend un `Gauges`, drapeaux d'overage inclus.
         self.agent("a", "claude")
@@ -246,6 +259,45 @@ class HistoriqueProvenanceTest(_JaugesBase):
         latest = ops.gauge_latest(harness="claude", account="secondaire")
         self.assertEqual(len(latest), 1)
         self.assertAlmostEqual(latest[0]["used"], 0.67)
+
+    def test_une_oscillation_a_production_egale_garde_la_derniere_valeur(self):
+        # Delta a66546be (auditeur) : un tour publie plusieurs `rate_limit_event`
+        # sous le MÊME marqueur (`produced_at` égal). La dédup doit comparer à la
+        # DERNIÈRE valeur de ce rang, pas à une ancienne valeur identique : sinon
+        # 87 -> 67 -> 87 est refusé et `gauge_latest` garde 67 quand le journal
+        # garde 87.
+        ops = storage.of(self.db).operations
+        P = self.now - 3600
+        fenetre = self.now + 3 * 86400
+        for used, source in ((0.87, "ag-1"), (0.67, "ag-2"), (0.87, "ag-3")):
+            ops.record_gauges([line("claude", "seven_day", used, fenetre,
+                                    account="secondaire", produced_at=P, source=source)])
+        latest = ops.gauge_latest(harness="claude", account="secondaire")
+        self.assertEqual(len(latest), 1)
+        self.assertAlmostEqual(latest[0]["used"], 0.87)
+        self.assertEqual(latest[0]["source"], "ag-3")
+        self.assertAlmostEqual(latest[0]["produced_ts"], P, places=0)
+        self.assertAlmostEqual(ops.latest_gauges(since_s=3600)[0]["used"], 0.87)
+        # la répétition de la DERNIÈRE valeur de ce rang reste dédupliquée
+        ops.record_gauges([line("claude", "seven_day", 0.87, fenetre,
+                                account="secondaire", produced_at=P, source="ag-4")])
+        hist = ops.gauge_history(since_s=3600, harness="claude", account="secondaire")
+        self.assertEqual([r["source"] for r in hist], ["ag-1", "ag-2", "ag-3"])
+        self.assertAlmostEqual(
+            ops.gauge_latest(harness="claude", account="secondaire")[0]["used"], 0.87)
+
+    def test_une_oscillation_non_datee_garde_la_derniere_valeur(self):
+        # Même défaut sans provenance (Codex, flux sans marqueur) : 67 -> 87 -> 67.
+        ops = storage.of(self.db).operations
+        fenetre = self.now + 3 * 86400
+        for used, source in ((0.67, "ag-1"), (0.87, "ag-2"), (0.67, "ag-3")):
+            ops.record_gauges([line("claude", "seven_day", used, fenetre,
+                                    account="secondaire", produced_at=None, source=source)])
+        latest = ops.gauge_latest(harness="claude", account="secondaire")
+        self.assertEqual(len(latest), 1)
+        self.assertAlmostEqual(latest[0]["used"], 0.67)
+        self.assertEqual(latest[0]["source"], "ag-3")
+        self.assertIsNone(latest[0]["produced_ts"])
 
 
 class ReconciliationTest(_JaugesBase):

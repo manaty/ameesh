@@ -358,37 +358,58 @@ class Operations(interface.Operations):
             # L30 (0028) : une jauge de COMPTE porte son nom ; NULL = sans comptes.
             # #1132 (0434) : `produced_at` (instant de production, NULL quand le
             # flux ne le date pas) et `source` (journal d'origine) : la provenance.
-            # La dédup ne regarde plus la SEULE dernière insertion : elle n'écarte
-            # un relevé identique (mêmes used/reset) que si un relevé RÉCENT de la
-            # même jauge porte déjà une production au moins aussi fraîche
-            # (`produced_at`). Une production plus récente à valeur égale est donc
-            # conservée, et un relevé périmé réinséré ne devient jamais « le
-            # dernier » : `latest_gauges`/`gauge_latest` ordonnent par production
-            # (NULL en dernier), pas par insertion.
+            # La dédup ne regarde plus la SEULE dernière insertion, ni n'importe
+            # quelle ligne identique (delta auditeur, tête a66546be) : une
+            # production STRICTEMENT plus fraîche de la même valeur neutralise une
+            # relecture plus ancienne, mais à production ÉGALE (NULL inclus) c'est
+            # la DERNIÈRE valeur de ce rang qui décide, dans l'ordre de
+            # `gauge_latest` (production, puis insertion). Une oscillation
+            # 87 -> 67 -> 87 sous le même marqueur reste donc lisible, une
+            # production plus récente à valeur égale est conservée, et un relevé
+            # périmé réinséré ne devient jamais « le dernier ».
             account = g.get("account")
             produced = g.get("produced_at")
             rows = self.db.query(
                 """
+                WITH candidat AS (
+                    SELECT %s::text AS harness, %s::text AS gauge_key,
+                           %s::float8 AS used, to_timestamp(%s::float8) AS resets_at,
+                           %s::float8 AS window_s, %s::text AS account,
+                           to_timestamp(%s::float8) AS produced_at, %s::text AS source
+                )
                 INSERT INTO quota_gauge_readings (harness, gauge_key, used, resets_at, window_s,
                                                   account, produced_at, source)
-                SELECT %s, %s, %s, to_timestamp(%s), %s, %s,
-                       to_timestamp(%s::double precision), %s
+                SELECT harness, gauge_key, used, resets_at, window_s, account,
+                       produced_at, source
+                  FROM candidat c
                  WHERE NOT EXISTS (
                      SELECT 1 FROM quota_gauge_readings r
-                      WHERE r.harness = %s AND r.gauge_key = %s
-                        AND r.account IS NOT DISTINCT FROM %s
-                        AND r.used = %s
-                        AND r.resets_at IS NOT DISTINCT FROM to_timestamp(%s)
+                      WHERE r.harness = c.harness AND r.gauge_key = c.gauge_key
+                        AND r.account IS NOT DISTINCT FROM c.account
+                        AND r.used = c.used
+                        AND r.resets_at IS NOT DISTINCT FROM c.resets_at
                         AND r.observed_at > now() - interval '10 minutes'
-                        AND (%s::double precision IS NULL
-                             OR (r.produced_at IS NOT NULL
-                                 AND r.produced_at >= to_timestamp(%s::double precision))))
+                        AND (
+                            (r.produced_at IS NOT NULL
+                             AND (c.produced_at IS NULL
+                                  OR r.produced_at > c.produced_at))
+                            OR
+                            (r.produced_at IS NOT DISTINCT FROM c.produced_at
+                             AND NOT EXISTS (
+                                 SELECT 1 FROM quota_gauge_readings n
+                                  WHERE n.harness = r.harness
+                                    AND n.gauge_key = r.gauge_key
+                                    AND n.account IS NOT DISTINCT FROM r.account
+                                    AND n.produced_at IS NOT DISTINCT FROM r.produced_at
+                                    AND (n.observed_at > r.observed_at
+                                         OR (n.observed_at = r.observed_at
+                                             AND n.id > r.id))))
+                        )
+                )
                 RETURNING id
                 """,
                 (g["harness"], g["key"], float(g["used"]), g.get("resets_at"),
-                 float(g["window_s"]), account, produced, g.get("source"),
-                 g["harness"], g["key"], account,
-                 float(g["used"]), g.get("resets_at"), produced, produced),
+                 float(g["window_s"]), account, produced, g.get("source")),
             )
             inserted += len(rows)
         return inserted
