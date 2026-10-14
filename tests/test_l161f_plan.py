@@ -136,13 +136,18 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(impact.unsure, [])
         self.assertEqual(impact.untested, [])
 
-    def test_changed_lines_without_a_test(self):
+    def test_changed_lines_without_a_test_run_their_importers(self):
+        # #1339 : un bloc modifié qu'aucun test n'exécute ne force plus la
+        # suite complète : les tests qui importent son fichier le couvrent et
+        # rejoignent les impactés ; le bloc reste listé (lignes sans test).
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
         self.repo.commit()
         impact = self.repo.judge()
-        self.assertEqual(impact.p1, {})
+        self.assertEqual(impact.p1, {m: "src/ameesh/code.py (imported)"
+                                     for m in ("test_a", "test_b", "test_c")})
         self.assertEqual(impact.untested, [{"file": "src/ameesh/code.py", "block": "untested",
                                             "lines": [10, 10]}])
+        self.assertEqual(impact.uncovered, [])
 
     def test_module_level_change_impacts_every_importer(self):
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("LIMIT = 3", "LIMIT = 4"))
@@ -155,8 +160,31 @@ class JudgeTest(unittest.TestCase):
         self.repo.write("src/ameesh/code.py", code)
         self.repo.commit()
         impact = self.repo.judge()
-        self.assertEqual(impact.p1, {"test_a": "src/ameesh/code.py::used"})
+        # l'appelant modifié nomme test_a ; les autres tests qui chargent le
+        # fichier restent impactés (relecture Codex B1 : un nom calculé peut
+        # atteindre la fonction nouvelle)
+        self.assertEqual(impact.p1, {"test_a": "src/ameesh/code.py::used",
+                                     "test_b": "src/ameesh/code.py (imported)",
+                                     "test_c": "src/ameesh/code.py (imported)"})
         self.assertEqual(impact.unknown_blocks, ["src/ameesh/code.py::helper"])
+        self.assertEqual(impact.importers,
+                         {"src/ameesh/code.py": ["test_a", "test_b", "test_c"]})
+
+    def test_new_function_keeps_the_importers_of_its_known_file(self):
+        # #1339, relecture Codex (B1) : une fonction publique nouvelle n'a aucun
+        # appelant mesuré ; un test existant qui parcourt le fichier (`dir()`
+        # puis `getattr`) peut l'exécuter, donc tous les tests qui ont chargé le
+        # fichier restent impactés — sinon le plan se déclare sûr et les omet.
+        self.repo.write("src/ameesh/code.py",
+                        CODE_V1 + "\n\ndef added(x):\n    return x - 1\n")
+        self.repo.commit()
+        impact = self.repo.judge()
+        self.assertEqual(impact.unknown_blocks, ["src/ameesh/code.py::added"])
+        self.assertEqual(impact.uncovered, [])
+        self.assertEqual(impact.p1, {m: "src/ameesh/code.py (imported)"
+                                     for m in ("test_a", "test_b", "test_c")})
+        self.assertEqual(impact.importers,
+                         {"src/ameesh/code.py": ["test_a", "test_b", "test_c"]})
 
     def test_new_function_that_counts_for_its_module(self):
         cases = {
@@ -184,21 +212,28 @@ class JudgeTest(unittest.TestCase):
         self.assertIn("test_c", self.repo.judge().p1)
 
     def test_nothing_taken_out_of_a_dynamic_module(self):
-        def judged(line: str) -> dict:
+        def judged(line: str) -> "plan.Impact":
             self.repo.code = CODE_V1 + line + "\n"  # the map knows the line
             self.repo.write("src/ameesh/code.py", self.repo.code)
             self.repo.base = self.repo.commit()
             self.repo.write("src/ameesh/code.py", self.repo.code + "\n\ndef _extra():\n    pass\n")
             self.repo.commit()
-            return self.repo.judge().p1
+            return self.repo.judge()
 
         for why, line in {"getattr with a computed name": "f = getattr(Box, '_' + 'x', None)",
                           "globals()": "g = globals()",
                           "import *": "from os.path import *"}.items():
             with self.subTest(why):
-                self.assertIn("test_c", judged(line), why)
-        # a literal getattr name stays static: the new function is taken out
-        self.assertEqual(judged("f = getattr(Box, 'size')"), {})
+                impact = judged(line)
+                self.assertIn("test_c", impact.p1, why)
+                # le module compte comme modifié : le bloc <module> a changé
+                self.assertEqual(impact.p1["test_c"], "src/ameesh/code.py::<module>", why)
+        # a literal getattr name stays static: the new function is taken out,
+        # so no block of the file changes; its importers stay impacted all the
+        # same (#1339, relecture Codex B1), as "imported" coverage
+        impact = judged("f = getattr(Box, 'size')")
+        self.assertEqual(impact.p1, {m: "src/ameesh/code.py (imported)"
+                                     for m in ("test_a", "test_b", "test_c")})
 
     def test_removed_file_impacts_all_its_tests(self):
         self.repo.remove("src/ameesh/code.py")
@@ -280,23 +315,374 @@ class MapTest(unittest.TestCase):
         with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
             return plan.classify(mods, self.repo.card(), NOW, head="HEAD", repo=self.repo.path)
 
-    def test_phase2_unsafe_with_changed_lines_without_a_test(self):
-        # L161f review (4)
+    def test_phase2_safe_with_changed_lines_without_a_test(self):
+        # L161f review (4), #1339 : le bloc modifié sans test est couvert par
+        # les tests qui importent son fichier (test_a, test_b, test_c) : la
+        # sélection impactés+contrat suffit, le bloc reste listé.
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
         self.repo.commit()
         out = self._classify()
         self.assertTrue(out["sure"])
         self.assertEqual([u["block"] for u in out["untested"]], ["untested"])
-        self.assertFalse(out["phase2_safe"])
+        self.assertTrue(out["phase2_safe"], out["phase2_why"])
+        self.assertEqual(set(out["importers"]["src/ameesh/code.py"]),
+                         {"test_a", "test_b", "test_c"})
+        self.assertTrue(all(out["classes"][m][0] == "P1" for m in ("test_a", "test_b", "test_c")))
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
         self.repo.commit()
         self.assertTrue(self._classify()["phase2_safe"])
+
+    def test_phase2_safe_with_a_new_plain_function(self):
+        # #1339 : une fonction simple nouvelle est couverte par son appelant
+        # modifié (test_a) ; tous les tests qui chargent le fichier restent
+        # impactés eux aussi (relecture Codex B1 : un nom calculé peut
+        # l'atteindre), donc la suite complète n'est pas forcée.
+        code = CODE_V1.replace("    return x + 1\n", "    return helper(x)\n") \
+            + "\n\ndef helper(x):\n    return x + 1\n"
+        self.repo.write("src/ameesh/code.py", code)
+        self.repo.commit()
+        out = self._classify()
+        self.assertIn("src/ameesh/code.py::helper", out["unknown_blocks"])
+        self.assertTrue(out["phase2_safe"], out["phase2_why"])
+        self.assertEqual(out["importers"]["src/ameesh/code.py"],
+                         ["test_a", "test_b", "test_c"])
+        self.assertEqual(out["classes"]["test_a"], ["P1", "src/ameesh/code.py::used"])
+        self.assertTrue(all(out["classes"][m][0] == "P1"
+                            for m in ("test_a", "test_b", "test_c")))
+
+    def test_phase2_safe_with_a_new_function_and_no_caller(self):
+        # #1339, relecture Codex (B1) : la fonction nouvelle n'a aucun appelant
+        # mesuré ; le test réflexif qui parcourt le fichier est pourtant
+        # impacté, donc il doit rester dans la sélection (impactés+contrat)
+        # au lieu d'être omis pendant que le plan se déclare sûr.
+        self.repo.write("src/ameesh/code.py",
+                        CODE_V1 + "\n\ndef added(x):\n    return x - 1\n")
+        self.repo.commit()
+        out = self._classify()
+        self.assertEqual(out["unknown_blocks"], ["src/ameesh/code.py::added"])
+        self.assertEqual(out["uncovered"], [])
+        self.assertTrue(out["phase2_safe"], out["phase2_why"])
+        self.assertEqual(out["importers"]["src/ameesh/code.py"],
+                         ["test_a", "test_b", "test_c"])
+        self.assertTrue(all(out["classes"][m][0] == "P1"
+                            for m in ("test_a", "test_b", "test_c")))
+
+    def test_phase2_unsafe_when_no_test_imports_the_changed_file(self):
+        # #1339 : sans aucun test importateur (la carte n'a mesuré personne sur
+        # ce fichier et le graphe d'import n'en trouve aucun), le doute reste :
+        # suite complète, et le fichier est nommé.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
+        self.repo.commit()
+        card = self.repo.card()
+        for info in card["blocs"]["src/ameesh/code.py"].values():
+            info["modules"] = []
+        out = self._classify_with(card, ["test_a", "test_b", "test_c", "test_db"])
+        self.assertTrue(out["sure"])
+        self.assertEqual(out["uncovered"], ["src/ameesh/code.py"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/code.py", out["phase2_why"])
+        self.assertEqual(out["classes"]["test_a"], ["P3", ""])
+
+    def test_new_file_is_covered_by_the_test_that_imports_it(self):
+        # #1339 : un fichier nouveau, inconnu de la carte, est couvert par le
+        # test du lot qui l'importe (graphe d'import statique) ; la suite
+        # complète n'est plus forcée.
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write("tests/test_new.py", "from ameesh.new import thing\n")
+        self.repo.commit()
+        impact = self.repo.judge(("test_a", "test_b", "test_c", "test_db", "test_new"))
+        self.assertIn("src/ameesh/new.py::thing", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, [])
+        self.assertEqual(impact.importers, {"src/ameesh/new.py": ["test_new"]})
+        self.assertEqual(impact.certified, {"src/ameesh/new.py": ["test_new"]})
+        self.assertEqual(impact.p1["test_new"], "src/ameesh/new.py (imported)")
+
+    def test_new_file_no_test_imports_keeps_the_doubt(self):
+        # #1339 : un fichier nouveau que rien n'importe (import dynamique
+        # compris : aucune arête statique) garde la suite complète.
+        self.repo.write("src/ameesh/orphan.py", "def thing():\n    return 1\n")
+        self.repo.commit()
+        impact = self.repo.judge()
+        self.assertIn("src/ameesh/orphan.py::thing", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/orphan.py"])
+        self.assertEqual(impact.importers, {})
+        self.assertEqual(impact.certified, {})
+
+    def test_new_file_certified_by_type_checking_only_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2) : le corps d'un `if TYPE_CHECKING:` ne
+        # charge rien à l'exécution ; le seul test qui charge réellement le
+        # fichier nouveau passe par importlib (aucune arête statique). Le plan
+        # ne peut donc pas certifier la couverture : suite complète, fichier
+        # nommé — au lieu de sélectionner le test TYPE_CHECKING et d'omettre
+        # le test rouge.
+        self.repo.write("tests/test_static.py",
+                        "from typing import TYPE_CHECKING\n"
+                        "if TYPE_CHECKING:\n    from ameesh.new import VALUE\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\nmod = importlib.import_module('ameesh.new')\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new.py", "VALUE = 1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new.py"])
+        self.assertEqual(impact.importers, {})
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new.py", out["phase2_why"])
+
+    def test_new_file_with_only_a_lazy_importer_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2, résidu) : un import paresseux dans une
+        # fonction jamais appelée ne charge rien. Il garde son test dans la
+        # sélection (il peut l'appeler), mais ne prouve pas la couverture : le
+        # test qui charge réellement le fichier par importlib reste P3, donc
+        # la suite complète est conservée au lieu d'omettre le test rouge.
+        self.repo.write("tests/test_static.py",
+                        "def unused_loader():\n"
+                        "    from ameesh import new_feature\n\n"
+                        "test_unrelated = True\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\n\n"
+                        "def test_value():\n"
+                        "    mod = importlib.import_module('ameesh.new_feature')\n"
+                        "    assert mod.VALUE == -1\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new_feature.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py", out["phase2_why"])
+        # le test paresseux reste sélectionné, le test dynamique reste P3
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+        self.assertEqual(out["certified"], {})
+
+    def test_new_file_shadowed_by_the_package_init_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2 résidu) : `from ameesh import new_feature`
+        # ne charge `src/ameesh/new_feature.py` que si le paquet ne lie pas
+        # déjà le nom ; un `__init__.py` qui le lie (`new_feature = object()`)
+        # laisse l'import du sous-module hors du chargement. Le test statique
+        # reste un candidat de sélection, jamais une preuve : le test qui
+        # charge réellement le fichier par importlib reste P3, donc la suite
+        # complète est conservée au lieu d'omettre le test rouge.
+        self.repo.write("tests/test_static.py", "from ameesh import new_feature\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\n\n"
+                        "def test_value():\n"
+                        "    mod = importlib.import_module('ameesh.new_feature')\n"
+                        "    assert mod.VALUE == -1\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/__init__.py", "new_feature = object()\n")
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new_feature.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        # le paquet, lui, est bien chargé par l'import : sa preuve reste
+        self.assertEqual(impact.certified, {"src/ameesh/__init__.py": ["test_static"]})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py", out["phase2_why"])
+        # le test statique reste sélectionné, le test dynamique reste P3
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
+        self.assertEqual(out["importers"],
+                         {"src/ameesh/__init__.py": ["test_static"],
+                          "src/ameesh/new_feature.py": ["test_static"]})
+
+    def test_new_file_imported_after_a_raise_in_a_with_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2 résidu) : un import placé dans un `with`
+        # après un `raise` absorbé (`contextlib.suppress`) n'est jamais
+        # atteint ; le corps d'un `with` ne prouve pas un chargement. Le test
+        # garde sa place dans la sélection (il peut l'atteindre), le test
+        # dynamique reste P3 et la suite complète est conservée.
+        self.repo.write("tests/test_static.py",
+                        "import contextlib\n"
+                        "with contextlib.suppress(RuntimeError):\n"
+                        "    raise RuntimeError\n"
+                        "    import ameesh.new_feature\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\n\n"
+                        "def test_value():\n"
+                        "    mod = importlib.import_module('ameesh.new_feature')\n"
+                        "    assert mod.VALUE == -1\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new_feature.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py", out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
+    def test_new_file_reached_through_a_changed_importer(self):
+        # #1339 : le graphe relie le fichier nouveau au module modifié qui
+        # l'importe ; les tests que la carte a mesurés sur ce module (ici un
+        # lancement en sous-processus, sans import statique du fichier)
+        # couvrent le bloc, sans import direct dans le test.
+        self.repo.write("src/ameesh/cli.py", "VALUE = 1\n")
+        self.repo.base = self.repo.commit()
+        infos, _ = map_mod.blocks("VALUE = 1\n")
+        card = self.repo.card()
+        card["blocs"]["src/ameesh/cli.py"] = {n: {**i, "modules": ["test_cli"]}
+                                              for n, i in infos.items()}
+        card["modules"]["test_cli"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write("src/ameesh/cli.py", "from ameesh.new import thing\n\nVALUE = thing()\n")
+        self.repo.commit()
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            ["test_a", "test_b", "test_c", "test_db", "test_cli"],
+                            "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new.py::thing", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, [])
+        self.assertEqual(impact.importers, {"src/ameesh/new.py": ["test_cli"]})
+
+    def test_new_file_plan_stays_impacted(self):
+        # #1339, bout en bout : la PR d'un lot qui ajoute un module et son test
+        # ne bascule plus en suite complète pour le seul bloc nouveau ; le test
+        # nouveau (P0) et le contrat suffisent, le fichier est couvert par son
+        # importateur. Noms de modules réels : le découpage lit leurs fichiers.
+        real = sorted(parts.modules())
+        mods, fresh = real[:5], real[0]
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write(f"tests/{fresh}.py", "from ameesh.new import thing\n")
+        self.repo.commit()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)), \
+                mock.patch.object(plan.parts, "modules", lambda *a: list(mods)), \
+                mock.patch.object(plan, "read_list",
+                                  lambda path, *a, **k: [mods[1]]
+                                  if path == plan.ALWAYS_FILE else []):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/x")
+        self.assertTrue(p["phase2_safe"], p["phase2_why"])
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        self.assertEqual(p["classes"][fresh][0], "P0")
+        self.assertEqual(p["importers"], {"src/ameesh/new.py": [fresh]})
 
     def _classify_with(self, card: dict, modules: list[str]) -> dict:
         for m in modules:
             card["modules"].setdefault(m, {"durees": {"psycopg": 1.0}, "echecs": []})
         with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
             return plan.classify(modules, card, NOW, head="HEAD", repo=self.repo.path)
+
+    def test_removed_file_is_a_doubt_and_runs_the_full_suite(self):
+        # R2 bureau (B1) : une suppression hors doc ne levait aucun doute
+        # (_python et _data traitaient D à part) ; un fichier lu par aucun test
+        # mesuré ne lançait que le contrat. Le changement D réel passe par
+        # classify/judge et donne la suite complète.
+        self.repo.remove("deploy/install.sh")
+        self.repo.commit()
+        out = self._classify()
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("file removed: deploy/install.sh", out["phase2_why"])
+        self.assertEqual(out["removed"], ["deploy/install.sh"])
+        # make_plan réel : modules réels (le découpage pèse chaque module),
+        # carte du dépôt jetable pour le diff ; seul `nature` est simulé.
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/x")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("file removed: deploy/install.sh", p["selection"]["why"])
+
+    def test_documentation_removed_stays_in_the_fast_lane(self):
+        # une suppression de documentation ne lève pas ce doute : le doute
+        # « fichier supprimé » est réservé à ce que la carte ne peut pas juger
+        self.repo.remove("docs/guide.md")
+        self.repo.commit()
+        out = self._classify()
+        self.assertEqual(out["removed"], [])
+        self.assertNotIn("file removed", out["unsure"])
+
+    def test_release_pull_request_runs_the_full_suite_with_a_safe_map(self):
+        # R1 Codex (B1) : la carte est fraîche et sûre (le bloc modifié est
+        # mesuré, phase2_safe), donc une PR de lot ne lancerait que les
+        # impactés et le contrat ; une PR de release, par sa source ou sa
+        # cible, lance la suite complète, les deux pilotes, sans liste pilote.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in mods}
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            for base_ref, head_ref in (("main", "release/1.10.0"),
+                                       ("main", "integration/example"),
+                                       ("release/1.10.0", "lot/fix")):
+                with self.subTest(base=base_ref, head=head_ref):
+                    p = plan.make_plan("pull_request", card, NOW, head="HEAD",
+                                       repo=self.repo.path,
+                                       base_ref=base_ref, head_ref=head_ref)
+                    self.assertTrue(p["phase2_safe"], p["phase2_why"])
+                    self.assertEqual(p["selection"]["mode"], "full")
+                    self.assertIn("release/**", p["selection"]["why"])
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+                    self.assertEqual(
+                        sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
+
+    def test_version_only_pull_request_on_release_runs_the_full_suite(self):
+        # R1 Codex : le même diff (la seule ligne `version` de pyproject.toml)
+        # reste sauté sur une PR de lot, mais garde la suite complète sur une
+        # PR de release.
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
+        self.repo.commit()
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.1"\n')
+        self.repo.commit()
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in mods}
+        lot = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                             base_ref="main", head_ref="lot/x")
+        self.assertTrue(lot["version_only"])
+        self.assertEqual(lot["parts"]["psycopg"], [])
+        self.assertEqual(plan.outputs(lot)["code"], "false")
+        release = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                                 base_ref="main", head_ref="release/1.10.0")
+        self.assertFalse(release["version_only"])
+        self.assertIn("release/**", release["selection"]["why"])
+        self.assertNotEqual(release["parts"]["psycopg"], [])
+        self.assertEqual(plan.outputs(release)["code"], "true")
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -374,6 +760,9 @@ class MapTest(unittest.TestCase):
         self.assertEqual(plan.always_hits(changes, ["test_cluster"]),
                          {"test_cluster": "always list (src/ameesh/migrations/0099_x.sql)"})
         self.assertEqual(plan.always_hits([("M", "src/ameesh/work.py")], ["test_cluster"]), {})
+        # #749 : le runner declenche la liste, comme une migration ou le SQL
+        self.assertEqual(plan.always_hits([("M", "src/ameesh/runner.py")], ["test_l31_orphans"]),
+                         {"test_l31_orphans": "always list (src/ameesh/runner.py)"})
         card = {"modules": {
             "test_recent": {"echecs": [{"ts": "2026-10-09T00:00:00+00:00"}]},
             "test_old": {"echecs": [{"ts": "2026-09-30T00:00:00+00:00"}]}}}
@@ -381,7 +770,18 @@ class MapTest(unittest.TestCase):
 
     def test_always_list_sorted_and_known(self):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
-        self.assertEqual(always, ["test_cluster", "test_events_attach", "test_l72_panne_de_base"])
+        self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
+                                  "test_events_attach", "test_l31_orphans",
+                                  "test_l50_group_orphan_work_items",
+                                  "test_l72_panne_de_base", "test_migrations"])
+
+    def test_psql_pr_modules_adds_the_triggered_always_list(self):
+        # #749 : la liste « always » declenchee rejoint le pilote psql d'une PR ;
+        # sans declenchement, la selection reste exactement tests/parts/pilote-psql.txt
+        self.assertEqual(plan.psql_pr_modules(["test_a", "test_cluster"],
+                                              ["test_l31_orphans"]),
+                         ["test_a", "test_cluster", "test_l31_orphans"])
+        self.assertEqual(plan.psql_pr_modules(["test_a"], []), ["test_a"])
 
     def test_new_functions_taken_out_losslessly(self):
         # taking nothing out must give the very fingerprints of the map
@@ -391,6 +791,149 @@ class MapTest(unittest.TestCase):
                 return {k: v["empreinte"] for k, v in blocks.items()}
             self.assertEqual(prints(plan._without_new_functions(source, set())),
                              prints(map_mod.blocks(source)[0]), f)
+
+
+class ImportGraphTest(unittest.TestCase):
+    """#1339 : le graphe d'import statique qui couvre un fichier inconnu de la
+    carte. Résolution des noms, imports relatifs et paresseux compris ; le
+    graphe est lu dans git (tête jugée, pas l'arbre de travail)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def test_dotted_names(self):
+        self.assertEqual(plan._dotted("src/ameesh/db.py"), "ameesh.db")
+        self.assertEqual(plan._dotted("src/ameesh/storage/__init__.py"), "ameesh.storage")
+        self.assertEqual(plan._dotted("tests/test_a.py"), "tests.test_a")
+        self.assertEqual(plan._dotted("scripts/tool.py"), "")
+        self.assertEqual(plan._dotted("docs/guide.md"), "")
+
+    def test_resolution_absolute_relative_and_tests(self):
+        known = {"src/ameesh/db.py", "src/ameesh/__init__.py",
+                 "src/ameesh/storage/__init__.py", "src/ameesh/storage/work.py",
+                 "tests/support.py", "tests/__init__.py"}
+        cases = {
+            "src/ameesh/x.py": ("import ameesh.db\n", "src/ameesh/db.py"),
+            "src/ameesh/y.py": ("from ameesh import db\n", "src/ameesh/db.py"),
+            "src/ameesh/storage/z.py": ("from . import work\n", "src/ameesh/storage/work.py"),
+            "src/ameesh/storage/z2.py": ("from .work import connect\n",
+                                         "src/ameesh/storage/work.py"),
+            "src/ameesh/storage/z3.py": ("from .. import db\n", "src/ameesh/db.py"),
+            "src/ameesh/storage/__init__.py": ("from . import work\n",
+                                               "src/ameesh/storage/work.py"),
+            "tests/test_a.py": ("from tests.support import PgTestCase\n", "tests/support.py"),
+            "tests/test_b.py": ("def f():\n    import ameesh.db\n", "src/ameesh/db.py"),
+            "tests/test_c.py": ("from ameesh.db import *\n", "src/ameesh/db.py"),
+        }
+        for path, (source, target) in cases.items():
+            with self.subTest(path):
+                self.assertIn(target, plan._imported_files(source, path, known))
+        for source in ("import os\nimport json\n", "def broken(:\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_d.py", known), set())
+
+    def test_type_checking_import_is_not_a_runtime_edge(self):
+        # #1339, relecture Codex (B2) : le corps d'un `if TYPE_CHECKING:` ne
+        # charge rien à l'exécution ; il ne peut pas certifier qu'un test
+        # charge un fichier nouveau. Les formes usuelles sont couvertes,
+        # l'import réel du même fichier reste lu.
+        known = {"src/ameesh/db.py"}
+        dead = {
+            "nom importé": "from typing import TYPE_CHECKING\n"
+                           "if TYPE_CHECKING:\n    from ameesh import db\n",
+            "typing pointé": "import typing\n"
+                             "if typing.TYPE_CHECKING:\n    from ameesh import db\n",
+            "alias": "from typing import TYPE_CHECKING as TC\n"
+                     "if TC:\n    from ameesh import db\n",
+            "constante fausse": "if False:\n    from ameesh import db\n",
+        }
+        for why, source in dead.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 set())
+        live = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    import ameesh.missing\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(live, "tests/test_a.py", known),
+                         {"src/ameesh/db.py"})
+        # `not TYPE_CHECKING` est vrai à l'exécution : l'import reste une arête
+        negated = ("from typing import TYPE_CHECKING\n"
+                   "if not TYPE_CHECKING:\n    import ameesh.db\n")
+        self.assertEqual(plan._imported_files(negated, "tests/test_a.py", known),
+                         {"src/ameesh/db.py"})
+
+    def test_guaranteed_edges_only_the_module_body_itself(self):
+        # #1339, relecture Codex (B2 résiduel) : seul un import que le corps du
+        # module exécute à l'import prouve le chargement. Un import paresseux,
+        # conditionnel, sous `try` ou dans une boucle reste une arête possible
+        # (il peut tourner : sélection), jamais une preuve.
+        known = {"src/ameesh/db.py"}
+        guarantees = {
+            "direct": "import ameesh.db\n",
+            "corps de classe": "class C:\n    import ameesh.db\n",
+            "else d'un garde mort": "if False:\n    import ameesh.missing\n"
+                                    "else:\n    import ameesh.db\n",
+        }
+        for why, source in guarantees.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True),
+                                 {"src/ameesh/db.py"}, why)
+        candidates = {
+            "paresseux": "def loader():\n    import ameesh.db\n",
+            "conditionnel": "import sys\nif sys.version_info:\n    import ameesh.db\n",
+            "try": "try:\n    import ameesh.db\nexcept ImportError:\n    pass\n",
+            "boucle": "for _ in ():\n    import ameesh.db\n",
+            "with": "import contextlib\n"
+                    "with contextlib.suppress(RuntimeError):\n    import ameesh.db\n",
+            "TYPE_CHECKING": "from typing import TYPE_CHECKING\n"
+                             "if TYPE_CHECKING:\n    import ameesh.db\n",
+        }
+        for why, source in candidates.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
+                    self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                     {"src/ameesh/db.py"}, why)
+
+    def test_guaranteed_package_import_does_not_prove_the_member(self):
+        # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
+        # prouve pas que `ameesh/db.py` est chargé — le paquet peut lier le nom
+        # dans son `__init__` (`db = object()`) et l'import du sous-module n'a
+        # alors pas lieu. Le module résolu par l'import (le paquet) reste une
+        # preuve, l'alias `module.membre` n'est qu'un candidat de sélection ;
+        # les formes explicites (`import ameesh.db`, `from ameesh.db import x`)
+        # gardent la preuve.
+        known = {"src/ameesh/__init__.py", "src/ameesh/db.py"}
+        source = "from ameesh import db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True),
+                         {"src/ameesh/__init__.py"})
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                         {"src/ameesh/__init__.py", "src/ameesh/db.py"})
+        for why, explicit in {
+            "module importé": "import ameesh.db\n",
+            "module importé aliasé": "import ameesh.db as db\n",
+            "membre du module": "from ameesh.db import connect\n",
+        }.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(explicit, "tests/test_a.py", known,
+                                                      guaranteed=True),
+                                 {"src/ameesh/__init__.py", "src/ameesh/db.py"}, why)
+
+    def test_import_graph_reaches_the_test_through_the_changed_module(self):
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write("src/ameesh/cli.py", "from ameesh.new import thing\n")
+        self.repo.write("tests/test_cli.py", "import ameesh.cli\n")
+        self.repo.write("tests/test_other.py", "import json\n")
+        self.repo.commit()
+        reverse = plan._import_graph("HEAD", self.repo.path)
+        self.assertEqual(plan._reverse_closure(reverse, "src/ameesh/new.py"),
+                         {"src/ameesh/new.py", "src/ameesh/cli.py", "tests/test_cli.py"})
+        self.assertEqual(plan._reverse_closure(reverse, "tests/test_other.py"),
+                         {"tests/test_other.py"})
 
 
 class DocsLaneTest(unittest.TestCase):
@@ -425,7 +968,91 @@ class DocsLaneTest(unittest.TestCase):
                 mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
                 mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
                                   if a and a[0] == plan.PILOT_FILE else []):
-            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path)
+            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path,
+                                  base_ref="main", head_ref="lot/x")
+
+    def _base_with_unmeasured_ci_change(self):
+        self.card["genere"] = (NOW - datetime.timedelta(hours=6.8)).isoformat()
+        self.repo.write(".github/workflows/tests.yml", "name: tests\n")
+        self.repo.write("scripts/test-plan.py", "# CI changed on main after the map\n")
+        return self.repo.commit()
+
+    def _real_plan(self, base):
+        with mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
+                mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
+                                  if a and a[0] == plan.PILOT_FILE else []):
+            return plan.make_plan("pull_request", self.card, NOW, base=base, head="HEAD",
+                                  repo=self.repo.path, base_ref="main", head_ref="lot/x")
+
+    def test_docs_pr_ignores_ci_changes_already_in_its_base(self):
+        base = self._base_with_unmeasured_ci_change()
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_c"]]
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        p = self._real_plan(base)
+        self.assertEqual(p["files"], ["docs/guide.md"])
+        self.assertTrue(p["map"]["used"])
+        self.assertTrue(p["docs_only"], p["why"])
+        self.assertIn(self.name["test_c"], p["doc_readers"])
+        self.assertEqual(p["parts"], {"psycopg": [], "psql": []})
+        self.assertEqual(plan.outputs(p)["code"], "false")
+
+    def test_docs_pr_with_old_base_map_keeps_database_readers(self):
+        base = self._base_with_unmeasured_ci_change()
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        p = self._real_plan(base)
+        self.assertFullSuite(p, self.name["test_db"])
+        self.assertEqual(p["classes"][self.name["test_db"]][0], "P1")
+
+    def test_docs_pr_keeps_a_database_reader_changed_on_its_base(self):
+        self.card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [self.name["test_db"]]
+        self._base_with_unmeasured_ci_change()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace(
+            "return x + 1", "return open('docs/guide.md').read()"))
+        base = self.repo.commit()
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        # The old map did not see this function read the guide. Its recorded
+        # test still has to run when the base changes that function.
+        p = self._real_plan(base)
+        self.assertFullSuite(p, self.name["test_db"])
+
+    def test_docs_pr_keeps_unmeasured_base_code_in_the_full_suite(self):
+        self._base_with_unmeasured_ci_change()
+        self.repo.write("src/ameesh/code.py", CODE_V1 +
+                        "\n\ndef new_reader():\n    return open('docs/guide.md').read()\n")
+        base = self.repo.commit()
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        self.assertFullSuite(self._real_plan(base), "documentation base contains unmeasured code")
+
+    def test_mixed_pr_with_old_base_map_does_not_take_docs_lane(self):
+        base = self._base_with_unmeasured_ci_change()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("return x + 1", "return x + 2"))
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        p = self._real_plan(base)
+        self.assertEqual(sorted(p["files"]), ["docs/guide.md", "src/ameesh/code.py"])
+        self.assertFalse(p["docs_only"], p["why"])
+        self.assertEqual(plan.outputs(p)["code"], "true")
+        self.assertEqual(sorted(m for part in p["parts"]["psycopg"]
+                                for m in part["modules"]), self.MODULES)
+
+    def test_missing_uncertainty_diagnostic_keeps_the_full_suite(self):
+        with mock.patch.object(plan, "read_list", return_value=[]):
+            state = plan.classify(self.MODULES, self.card, NOW, repo=self.repo.path)
+        for metadata, why in ((None, "map unusable"), (state["map"], "selection unsure")):
+            with self.subTest(why=why), mock.patch.object(plan, "classify", return_value={
+                    **state, "map": metadata, "sure": False, "phase2_safe": False,
+                    "unsure": []}):
+                self.assertFullSuite(self._plan(["docs/guide.md"]), why)
 
     def assertFullSuite(self, p: dict, why: str) -> None:
         self.assertFalse(p["docs_only"], p["why"])
@@ -504,6 +1131,176 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
+class InheritedFoundationTest(unittest.TestCase):
+    """#1314 : le socle CI que la cible a déjà changé depuis la carte ne force
+    plus la suite complète d'une branche de lot ; le changement du socle par
+    la branche elle-même la force toujours, et le repli reste conservateur
+    quand le range propre de la branche est illisible (règle du bureau,
+    14/10/2026 : une carte en retard ne déclenche jamais le repli pour un
+    changement déjà dans la cible)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _target_moves_after_the_map(self) -> str:
+        """La cible bouge après la carte : deux fichiers du socle."""
+        self.repo.write(".github/workflows/tests.yml", "name: tests\n")
+        self.repo.write("scripts/test-parts.py", "# CI de la cible\n")
+        return self.repo.commit()
+
+    def _plan(self, base: str = "HEAD^1", card: dict | None = None) -> dict:
+        mods = parts.modules()
+        card = card or self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
+        nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nature)):
+            return plan.make_plan("pull_request", card, NOW, base=base, head="HEAD",
+                                  repo=self.repo.path, base_ref="main", head_ref="lot/x")
+
+    def _ran(self, p: dict) -> list[str]:
+        return sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"])
+
+    def test_socle_herite_ne_force_pas_la_suite_complete(self):
+        target = self._target_moves_after_the_map()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        card = self.repo.card()
+        touched = parts.modules()[0]
+        card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [touched]
+        p = self._plan(base=target, card=card)
+        self.assertTrue(p["map"]["used"])
+        self.assertEqual(p["foundation"], [])
+        self.assertTrue(p["sure"], p["unsure"])
+        self.assertTrue(p["phase2_safe"], p["phase2_why"])
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        self.assertIn(touched, self._ran(p))
+
+    def test_le_lot_qui_change_le_socle_force_la_suite_complete(self):
+        target = self._target_moves_after_the_map()
+        self.repo.write("tests/support.py", "# helper\n")
+        self.repo.commit()
+        p = self._plan(base=target)
+        self.assertFalse(p["phase2_safe"])
+        self.assertEqual(p["foundation"], ["tests/support.py"])
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("test infrastructure changed: tests/support.py",
+                      p["selection"]["why"])
+
+    def test_range_propre_illisible_reste_conservateur(self):
+        self._target_moves_after_the_map()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        p = self._plan(base="range-illisible")
+        self.assertFalse(p["phase2_safe"])
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("test infrastructure changed", p["selection"]["why"])
+
+    def test_head_hors_fusion_refuse_le_range_propre(self):
+        # HEAD^1 n'est la cible que sur le commit de fusion d'une PR ; sur un
+        # commit simple c'est le précédent de la branche : le range propre
+        # serait incomplet, le doute du socle hérité est conservé.
+        self._target_moves_after_the_map()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        p = self._plan()
+        self.assertFalse(p["phase2_safe"])
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("test infrastructure changed", p["selection"]["why"])
+
+    def test_version_seule_du_lot_reste_muette_malgre_la_cible(self):
+        # L157 : l'exemption se juge sur le range propre de la branche ; un
+        # pyproject.toml bougé par la cible après la carte ne la casse plus.
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
+        map_commit = self.repo.commit()
+        self.repo.write("pyproject.toml",
+                        '[project]\nname = "t"\nversion = "1.0.0"\ndependencies = []\n')
+        target = self.repo.commit()  # la cible change pyproject.toml après la carte
+        self.repo.write("pyproject.toml",
+                        '[project]\nname = "t"\nversion = "1.0.1"\ndependencies = []\n')
+        self.repo.commit()  # le lot ne change que la ligne `version`
+        card = self.repo.card()
+        card["commit"] = map_commit
+        p = self._plan(base=target, card=card)
+        self.assertEqual(p["foundation"], [])
+        self.assertTrue(p["sure"], p["unsure"])
+        self.assertTrue(p["phase2_safe"], p["phase2_why"])
+
+
+class PushLaneTest(unittest.TestCase):
+    """nature() on a push: the whole pushed range decides (#833)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _nature(self, base, head="HEAD", ref="refs/heads/main", event="push"):
+        return plan.nature(event, base=base, head=head, repo=self.repo.path, ref=ref)
+
+    def _doc_commit(self, name, text="# Doc\n"):
+        self.repo.write(f"docs/{name}", text)
+        return self.repo.commit()
+
+    def test_multi_commit_documentation_push_takes_the_fast_lane(self):
+        # #833: github.event.before, not HEAD^1, so every pushed commit counts
+        self._doc_commit("a.md")
+        head = self._doc_commit("b.md")
+        out = self._nature(self.repo.base, head)
+        self.assertTrue(out["docs_only"], out["why"])
+        self.assertEqual(sorted(out["files"]), ["docs/a.md", "docs/b.md"])
+
+    def test_code_hidden_behind_a_last_documentation_commit_runs_the_suite(self):
+        # the bug: HEAD^1 alone saw only the last commit, documentation, and
+        # took the fast lane over a push that carried code
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        code = self.repo.commit()
+        head = self._doc_commit("note.md")
+        last_only = self._nature(code, head)
+        self.assertTrue(last_only["docs_only"], last_only["why"])
+        out = self._nature(self.repo.base, head)
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("src/ameesh/code.py", out["files"])
+
+    def test_a_push_to_a_release_branch_always_runs_the_suite(self):
+        head = self._doc_commit("a.md")
+        out = self._nature(self.repo.base, head, ref="refs/heads/release/1.10.0")
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("full suite", out["why"])
+        self.assertIn("release/1.10.0", out["why"])
+
+    def test_created_branch_and_rewritten_history_run_the_suite(self):
+        head = self._doc_commit("a.md")
+        for base in (plan.NULL_SHA, "", "not a sha"):
+            with self.subTest(base or "empty"):
+                out = self._nature(base, head)
+                self.assertFalse(out["docs_only"], out["why"])
+                self.assertIn("pushed range unknown", out["why"])
+        # a rewritten history: the tip before the push is no ancestor anymore
+        _git(self.repo.path, "checkout", "-q", "-b", "side", self.repo.base)
+        side = self._doc_commit("side.md")
+        _git(self.repo.path, "checkout", "-q", "-")
+        out = self._nature(side, head)
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("pushed range unknown", out["why"])
+
+    def test_a_pushed_version_bump_runs_the_suite(self):
+        # L157 is a pull-request rule: a pushed version never takes the lane
+        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.3"\n')
+        base = self.repo.commit()
+        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.4"\n')
+        head = self.repo.commit()
+        out = self._nature(base, head)
+        self.assertFalse(out["version_only"], out["why"])
+        self.assertFalse(out["docs_only"], out["why"])
+
+    def test_a_pull_request_is_unchanged(self):
+        # the reference of the source branch does not matter on a PR
+        head = self._doc_commit("a.md")
+        out = self._nature(self.repo.base, head, ref="refs/heads/lot/833-x",
+                           event="pull_request")
+        self.assertTrue(out["docs_only"], out["why"])
+
+
 class PlanTest(unittest.TestCase):
     def test_fallback_without_a_map(self):
         p = plan.make_plan("push", None, NOW)
@@ -520,7 +1317,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
-        p = plan.make_plan("pull_request", None, NOW)
+        p = plan.make_plan("pull_request", None, NOW, base_ref="main", head_ref="lot/x")
         if p["version_only"] or p["docs_only"]:
             self.skipTest("the checked out commit is a version or documentation change")
         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
@@ -540,6 +1337,36 @@ class PlanTest(unittest.TestCase):
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
         self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+
+    def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
+        # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
+        # declenche la liste « always » (contrat de base, baux et orphelins) ;
+        # ces modules passent alors AUSSI sous psql des la PR, au lieu d'attendre
+        # la suite complete de main ou la CI de release.
+        mods = parts.modules()
+        always = ["test_339_orphan_settle", "test_cluster", "test_l31_orphans"]
+        card = {"schema": map_mod.SCHEMA, "commit": "0" * 40, "genere": NOW.isoformat(),
+                "modules": {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                            for m in mods},
+                "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
+        classes = {m: (["P1", "always list (src/ameesh/runner.py)"]
+                       if m in always else ["P3", ""]) for m in mods}
+        with mock.patch.object(plan, "nature", return_value={
+                "version_only": False, "docs_only": False, "why": "code",
+                "files": ["src/ameesh/runner.py"]}), \
+                mock.patch.object(plan, "classify", return_value={
+                "map": None, "sure": False, "phase2_safe": False, "unsure": [],
+                "untested": [], "unknown_blocks": [], "foundation": [], "changed": 1,
+                "always": always,
+                "classes": {m: list(c) for m, c in classes.items()}}):
+            p = plan.make_plan("pull_request", card, NOW, base_ref="main", head_ref="lot/x")
+        if p["version_only"] or p["docs_only"]:
+            self.skipTest("the checked out commit is a version or documentation change")
+        pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
+        seen = sorted(m for ps in p["parts"]["psql"] for m in ps["modules"])
+        self.assertEqual(seen, sorted(set(pilot) | set(always)))
+        # sans declenchement, la selection reste exactement le pilote
+        self.assertEqual(plan.psql_pr_modules(pilot, []), pilot)
 
     def test_parts_impacted_first(self):
         classes = {"test_canon": ("P3", ""), "test_cluster": ("P1", "x"),
@@ -561,7 +1388,9 @@ class PlanTest(unittest.TestCase):
             "test::f changed and no test executes it (map abcdef123456)"])
 
     def test_fallback_plan_lets_the_parts_split(self):
-        p = plan.fallback_plan("pull_request", "boom")
+        # refs explicites : ne pas lire le GITHUB_* ambiant, où une tête de
+        # paquet integration/** est une PR de release (canon §3)
+        p = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
         f = pathlib.Path(tempfile.mkdtemp()) / "plan.json"
         self.addCleanup(shutil.rmtree, f.parent)
         f.write_text(json.dumps(p), encoding="utf-8")
@@ -582,6 +1411,9 @@ class PlanTest(unittest.TestCase):
                 "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
+        # #749 : une fusion a main passe la suite complete sous les deux pilotes
+        # (psql en 6 parts), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -631,6 +1463,226 @@ class PlanTest(unittest.TestCase):
             sys.stdout = old
         self.assertEqual(code, 0)
         self.assertIn("psycopg=[1, 2, 3, 4]", (d / "out").read_text(encoding="utf-8"))
+
+
+class LotBranchTest(unittest.TestCase):
+    """L1211 (canon §3) : une branche de lot ne lance que les tests impactés,
+    plus toujours les tests de contrat, et se replie sur la suite complète
+    quand la sélection ne peut pas décider.
+
+    Témoins du sélecteur et de la porte, sans base : le plan est bâti sur un
+    état `classify` qui vaut carte fraîche et sûre sur la vraie liste des
+    modules, et le workflow porte les déclencheurs et le check requis.
+    """
+
+    def setUp(self):
+        self.mods = parts.modules()
+        self.contract = plan.read_list(plan.ALWAYS_FILE, self.mods)
+        self.pilot = parts.read_list(plan.PILOT_FILE, self.mods)
+
+    def _classes(self, **impacted):
+        classes = {m: ("P3", "") for m in self.mods}
+        for m, why in impacted.items():
+            classes[m] = ("P1", why)
+        return classes
+
+    def _state(self, classes, **kw):
+        state = {
+            "map": {"commit": "c" * 40, "generated": NOW.isoformat(), "age_h": 0.0,
+                    "used": True, "problem": ""},
+            "sure": True, "phase2_safe": True, "phase2_why": "", "unsure": [],
+            "untested": [], "unknown_blocks": [], "foundation": [], "changed": 2,
+            "always": [], "contract": list(self.contract),
+            "classes": {m: list(c) for m, c in classes.items()},
+        }
+        state.update(kw)
+        return state
+
+    def _plan(self, event="pull_request", classes=None, card=None,
+              base_ref="main", head_ref="lot/1211-ci-impactes-contrat",
+              nature_kw=None, **state_kw):
+        state = self._state(classes if classes is not None else self._classes(), **state_kw)
+        nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        nature.update(nature_kw or {})
+        with mock.patch.object(plan, "classify", return_value=state), \
+                mock.patch.object(plan, "nature", return_value=dict(nature)):
+            return plan.make_plan(event, card if card is not None else {}, NOW,
+                                  base_ref=base_ref, head_ref=head_ref)
+
+    def _ran(self, p, driver="psycopg"):
+        return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
+
+    def test_lot_branch_runs_impacted_and_contract_only(self):
+        impacted = self.mods[0]
+        p = self._plan(classes=self._classes(**{impacted: "src/ameesh/x.py::f"}))
+        sel = p["selection"]
+        self.assertEqual(sel["mode"], "impacted")
+        self.assertEqual(sel["why"], "")
+        self.assertEqual(sel["contract"], len(self.contract))
+        expected = sorted(set(self.contract) | {impacted})
+        self.assertEqual(self._ran(p), expected)
+        self.assertEqual(sel["selected"], len(expected))
+        self.assertEqual(sel["skipped"], len(self.mods) - len(expected))
+        # le contrat garantit une matrice psycopg non vide : le check requis
+        # « tests » ne peut pas verdir sans qu'une part ait tourné
+        self.assertNotEqual(plan.outputs(p)["psycopg"], "[]")
+        self.assertGreaterEqual(int(plan.outputs(p)["psycopg_parts"]), 1)
+
+    def test_contract_runs_even_when_nothing_is_impacted(self):
+        p = self._plan()
+        self.assertEqual(self._ran(p), sorted(self.contract))
+        self.assertEqual(plan.outputs(p)["psycopg_parts"], "1")
+
+    def test_psql_keeps_the_pilot_subset(self):
+        # le pilote psql d'une PR reste un sous-ensemble de la sélection
+        impacted = self.pilot[0]
+        p = self._plan(classes=self._classes(**{impacted: "x"}))
+        expected = sorted((set(self.pilot) | {impacted})
+                          & (set(self.contract) | {impacted}))
+        self.assertEqual(self._ran(p, "psql"), expected)
+
+    def test_psql_runs_a_triggered_always_module_outside_the_pilot(self):
+        # #749 conservé sous le sélecteur : un module « always » déclenché
+        # rejoint le pilote psql même hors tests/parts/pilote-psql.txt
+        extra = self.contract[0]
+        self.assertNotIn(extra, self.pilot)
+        p = self._plan(classes=self._classes(**{extra: "always list (src/ameesh/runner.py)"}),
+                       always=[extra])
+        self.assertIn(extra, self._ran(p, "psql"))
+
+    def test_any_doubt_runs_the_full_suite(self):
+        cases = {
+            "no map": {"map": None},
+            "map unusable": {"map": {"commit": "c" * 40, "generated": NOW.isoformat(),
+                                     "age_h": 0.0, "used": False, "problem": "map unreadable"}},
+            "unsafe selection": {"phase2_safe": False,
+                                 "phase2_why": "3 changed block(s) without a test"},
+            "empty contract": {"contract": []},
+        }
+        for why, state_kw in cases.items():
+            with self.subTest(why):
+                p = self._plan(**state_kw)
+                self.assertEqual(p["selection"]["mode"], "full", why)
+                self.assertTrue(p["selection"]["why"], why)
+                self.assertEqual(self._ran(p), sorted(self.mods), why)
+
+    def test_full_suite_on_main_release_and_integration(self):
+        for event in ("push", "workflow_dispatch"):
+            with self.subTest(event):
+                p = self._plan(event=event)
+                self.assertEqual(p["selection"]["mode"], "full")
+                self.assertIn("integration", p["selection"]["why"])
+                self.assertEqual(self._ran(p), sorted(self.mods))
+
+    def test_release_pull_request_never_takes_the_impacted_selection(self):
+        # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
+        # décidables), mais une PR dont la source ou la cible est release/**
+        # ou integration/** garde la suite complète, les deux pilotes, sans
+        # liste pilote psql (canon §3).
+        cases = {
+            "source release": {"base_ref": "main", "head_ref": "release/1.10.0"},
+            "source integration": {"base_ref": "main", "head_ref": "integration/1.10.0"},
+            "target release": {"base_ref": "release/1.10.0", "head_ref": "lot/fix"},
+        }
+        impacted = self.mods[0]
+        for why, refs in cases.items():
+            with self.subTest(why):
+                p = self._plan(classes=self._classes(**{impacted: "src/ameesh/x.py::f"}),
+                               **refs)
+                self.assertTrue(p["phase2_safe"])
+                self.assertEqual(p["selection"]["mode"], "full", why)
+                self.assertIn("release/**", p["selection"]["why"])
+                self.assertEqual(self._ran(p), sorted(self.mods), why)
+                self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+                self.assertEqual(plan.outputs(p)["code"], "true")
+
+    def test_version_or_documentation_only_release_runs_the_full_suite(self):
+        # R1 Codex : ni la voie version seule ni la voie documentation seule
+        # ne sautent les parts d'une PR de release ; les mêmes PR vers main
+        # (PR de lot) gardent leur voie rapide.
+        for why, nature_kw in (("version", {"version_only": True, "why": "version seule"}),
+                               ("documentation", {"docs_only": True, "why": "doc seule"})):
+            with self.subTest(why):
+                p = self._plan(head_ref="release/1.10.0", nature_kw=nature_kw)
+                self.assertFalse(p["version_only"], why)
+                self.assertFalse(p["docs_only"], why)
+                self.assertIn("release/**", p["why"])
+                self.assertEqual(self._ran(p), sorted(self.mods), why)
+                self.assertEqual(plan.outputs(p)["code"], "true")
+                lot = self._plan(head_ref="lot/x", nature_kw=nature_kw)
+                self.assertEqual(lot["parts"]["psycopg"], [], why)
+                self.assertEqual(plan.outputs(lot)["code"], "false", why)
+
+    def test_fallback_of_a_release_pull_request_keeps_both_pilots_full(self):
+        # R1 Codex : « y compris fallback » — le repli d'une PR de release ne
+        # reprend ni la liste pilote psql ni le découpage d'une PR de lot.
+        p = plan.fallback_plan("pull_request", "boom", base_ref="main",
+                               head_ref="release/1.10.0")
+        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+        self.assertIn("release/**", p["selection"]["why"])
+        lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
+        self.assertEqual(json.loads(plan.outputs(lot)["psql"]), [1, 2, 3])
+        self.assertTrue(any(ps.get("pilot_list") for ps in lot["parts"]["psql"]))
+
+    def test_github_refs_default_to_the_environment(self):
+        # le workflow passe --base-ref/--head-ref ; à défaut (appel direct),
+        # GITHUB_BASE_REF et GITHUB_HEAD_REF portent le contexte (L1211).
+        env = {"GITHUB_BASE_REF": "main", "GITHUB_HEAD_REF": "release/1.10.0"}
+        with mock.patch.dict("os.environ", env):
+            p = self._plan(base_ref=None, head_ref=None)
+        self.assertEqual(p["refs"], {"base": "main", "head": "release/1.10.0"})
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("release/**", p["release"])
+
+    def test_summary_names_the_selection(self):
+        p = self._plan(classes=self._classes(**{self.mods[0]: "src/ameesh/x.py::f"}))
+        text = plan.summary(p)
+        self.assertIn("lot branch (L1211)", text)
+        self.assertIn(f"{len(self.contract)} contract module(s)", text)
+        full = self._plan(phase2_safe=False, phase2_why="changed block(s) without a test")
+        text = plan.summary(full)
+        self.assertIn("full suite", text)
+        self.assertIn("changed block(s) without a test", text)
+
+    def test_summary_separates_proven_importers_from_candidates(self):
+        # #1339, B2 résiduel : seuls les importateurs qui prouvent le
+        # chargement sont annoncés couverts ; un candidat paresseux à côté d'un
+        # fichier non couvert est nommé, sans faire passer le plan pour sûr.
+        p = self._plan(importers={"src/ameesh/x.py": [self.mods[0]]},
+                       certified={"src/ameesh/x.py": [self.mods[0]]})
+        text = plan.summary(p)
+        self.assertIn("unmeasured blocks covered by their importers", text)
+        unknown = self._plan(phase2_safe=False, phase2_why="selection unsafe",
+                             importers={"src/ameesh/y.py": [self.mods[0]]},
+                             uncovered=["src/ameesh/y.py"])
+        text = plan.summary(unknown)
+        self.assertIn("no test is guaranteed to load", text)
+        self.assertIn(f"candidates: `{self.mods[0]}`", text)
+
+    def test_parts_shrink_to_the_estimate(self):
+        def card(seconds):
+            return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
+                                for m in self.mods}}
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
+        # 235 modules × 2 s = 470 s -> deux parts
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
+        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
+
+    def test_selected_matrix_never_exceeds_the_parts_cap(self):
+        # un lot très large (60 s par module) reste dans PARTS : quatre parts
+        # psycopg et trois parts psql au plus, comme la suite complète
+        classes = self._classes(**{m: "x" for m in self.mods})
+        p = self._plan(classes=classes, card={"modules": {
+            m: {"durees": {"psycopg": 60.0, "psql": 60.0}} for m in self.mods}})
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        self.assertEqual({ps["of"] for ps in p["parts"]["psycopg"]}, {4})
+        self.assertEqual({ps["of"] for ps in p["parts"]["psql"]}, {3})
+        self.assertEqual(self._ran(p), sorted(self.mods))
 
 
 def _cases():
@@ -765,6 +1817,35 @@ class LeaksTest(unittest.TestCase):
         self.assertEqual(out["not_counted"], 1)
 
 
+def _run_bodies(text: str) -> list[str]:
+    """Le texte de chaque bloc `run:` de tests.yml (inline ou littéral)."""
+    bodies: list[str] = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        indent = len(line) - len(line.lstrip(" "))
+        if not stripped.startswith("run:"):
+            i += 1
+            continue
+        inline = stripped[len("run:"):].strip()
+        if inline and inline not in ("|", ">", "|-", ">-", "|+", ">+"):
+            bodies.append(inline)
+            i += 1
+            continue
+        body, j = [], i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= indent:
+                break
+            body.append(nxt)
+            j += 1
+        bodies.append("\n".join(body))
+        i = j
+    return bodies
+
+
 class WorkflowTest(unittest.TestCase):
     def setUp(self):
         self.text = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
@@ -775,6 +1856,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("python3 scripts/test-plan.py plan --out plan.json --map "
                       "carte/carte.json.gz", self.text)
         self.assertIn("--annotations", self.text)
+
+    def test_plan_job_passes_the_pushed_range(self):
+        # #833: a push is planned from github.event.before, not HEAD^1 alone
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
+                      "github.event.before || 'HEAD^1' }}", self.text)
+        self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
     def test_dynamic_matrices(self):
         for driver in ("psycopg", "psql"):
@@ -795,6 +1882,31 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("name: leaks", job)
         tests_job = self.text[self.text.index("\n  tests:\n"):]
         self.assertNotIn("bilan", tests_job.split("steps:")[0])
+
+    def test_plan_job_passes_the_branch_context(self):
+        # R1 Codex (B1) : le plan qualifie les PR de release sur leurs
+        # branches source et cible (« release/** » ou « integration/** ») ;
+        # le workflow les lui transmet (L1211). #1237 (N1) : un nom de branche
+        # est choisi par l'auteur de la PR ; il passe par l'environnement et
+        # reste cité dans le script, jamais interpolé dans un `run:`.
+        self.assertIn("BASE_REF: ${{ github.base_ref }}", self.text)
+        self.assertIn("HEAD_REF: ${{ github.head_ref }}", self.text)
+        self.assertIn('--base-ref "$BASE_REF"', self.text)
+        self.assertIn('--head-ref "$HEAD_REF"', self.text)
+        for body in _run_bodies(self.text):
+            self.assertNotIn("github.base_ref", body)
+            self.assertNotIn("github.head_ref", body)
+
+    def test_lot_branch_triggers_and_full_suite_events(self):
+        # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
+        # décide), le push vers la branche d'intégration du paquet, main et
+        # release/** porte la suite complète ; le check requis reste
+        # l'agrégat « tests ».
+        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        self.assertIn("\n  pull_request:\n", self.text)
+        self.assertIn("L1211", self.text)
+        self.assertIn("tests/parts/toujours.txt", self.text)
+        self.assertIn("une PR de release", self.text)
 
 
 if __name__ == "__main__":
