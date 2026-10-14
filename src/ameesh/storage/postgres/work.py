@@ -267,6 +267,27 @@ class WorkItems(interface.WorkItems):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    def items_missing_ref(self, *, states, ref_prefix, limit) -> list[dict]:
+        """L539 (#1104) : les lots dont `ref_prefix + id` n'existe pas encore.
+
+        L'anti-jointure est faite **avant** la borne : `limit` borne les
+        manquants rendus, pas un balayage de lots déjà pourvus (R2 #1104
+        P2-2 : vingt pourvus plus récents ne cachent plus un manquant ancien).
+        Les états forment un seul ensemble ordonné ; `id` départage deux
+        `updated_at` égaux, sans quoi la sélection ne serait pas stable."""
+        wanted = [str(s) for s in (states or ())]
+        if not wanted:
+            return []
+        sql = (
+            "SELECT __COLUMNS__ FROM work_items w"
+            " WHERE w.state IN (__STATES__)"
+            "   AND NOT EXISTS (SELECT 1 FROM work_items r"
+            "                    WHERE r.issue_ref = %s || w.id::text)"
+            " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
+        ).replace("__COLUMNS__", ITEM_COLUMNS).replace(
+            "__STATES__", ", ".join(["%s"] * len(wanted)))
+        return self.db.query(sql, tuple(wanted) + (str(ref_prefix), int(limit)))
+
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien

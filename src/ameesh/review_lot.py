@@ -351,7 +351,7 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         return out
 
 
-#: le nombre de lots fusionnés reparcourus par un rattrapage (borné)
+#: le nombre de relectures **manquantes** examinées par un rattrapage (borné)
 CATCH_UP_LIMIT = 20
 
 
@@ -374,35 +374,33 @@ def catch_up(db, *, repo: str = "", target: str = "",
     Les relevés ne sélectionnent que des lots **ouverts** : un lot déjà `merged`
     dont l'ouverture de relecture a échoué (panne d'écriture, base indisponible)
     ne serait plus jamais revu — la relecture manquerait définitivement (R1
-    #1104 P2-2). Ici les lots fusionnés les plus récents sont reparcourus ;
-    `open_for_merge` (idempotent, best effort, jamais d'exception) ouvre ceux
-    dont la relecture manque.
+    #1104 P2-2). Ici les relectures manquantes sont sélectionnées **comme
+    telles** (`WorkItems.items_missing_ref`) puis `open_for_merge` (idempotent,
+    best effort, jamais d'exception) les ouvre.
 
-    Borné (`limit`) et sans horloge : l'ordre « plus récemment modifié » de
-    `WorkStore.items`. Un lot déjà pourvu — quel que soit l'état du lot de
-    relecture — n'est pas relu. Ne lève jamais ; rend le compte
-    `{examined, missing, opened, failed}`."""
+    R2 #1104 P2-2 : la borne porte sur les **manquants examinés**, pas sur un
+    balayage préalable de lots déjà pourvus — un parent ancien dont
+    l'ouverture a échoué n'est plus caché par `limit` parents plus récents
+    déjà pourvus. `merged` et `promoted` sont un seul ensemble ordonné par
+    récence : un `promoted` manquant n'est pas affamé par des `merged`. Chaque
+    ouverture réussie sort le parent de la sélection, donc les passages
+    successifs la drainent, sans doublon ni réouverture de fusion ; un
+    manquant qui ne peut pas s'ouvrir (classe en doute, lecture impossible)
+    reste sélectionnable et sera réexaminé au passage suivant. Ne lève
+    jamais ; rend le compte `{examined, missing, opened, failed}`."""
     out = {"examined": 0, "missing": 0, "opened": 0, "failed": 0}
     try:
         ops = storage.of(db).work
-        rows: list[dict] = []
-        for state in work.MERGED_STATES:
-            try:
-                rows.extend(ops.items(state=state, assignee=None, limit=int(limit)))
-            except Exception:  # noqa: BLE001 - un état illisible ne bloque pas l'autre
-                continue
+        rows = ops.items_missing_ref(states=work.MERGED_STATES,
+                                     ref_prefix=PREFIX + "#", limit=int(limit))
     except Exception:  # noqa: BLE001 - pas de base : rien à rattraper
         return out
-    seen: set[int] = set()
     for row in rows:
-        if len(seen) >= int(limit):
-            break
         lot = int(row["id"])
-        if lot in seen:
-            continue
-        seen.add(lot)
         out["examined"] += 1
         try:
+            # la sélection a exclu les pourvus ; le recontrôle couvre une
+            # ouverture concurrente entre la sélection et ici
             if _open(ops, ref_of(lot)) is not None:
                 continue
             out["missing"] += 1

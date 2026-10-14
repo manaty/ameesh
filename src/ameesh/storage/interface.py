@@ -1200,6 +1200,19 @@ class WorkItems(Domain):
         """Lots, du plus récemment modifié au plus ancien."""
 
     @abc.abstractmethod
+    def items_missing_ref(self, *, states: Sequence[str], ref_prefix: str,
+                          limit: int) -> list[dict]:
+        """L539 (#1104) : les lots de `states` dont **aucun** lot ne porte la
+        référence `ref_prefix + <id>` (celui qui leur correspond), du plus
+        récemment modifié au plus ancien, `limit` au plus.
+
+        La borne porte sur les lots **manquants rendus**, jamais sur un
+        balayage préalable : un lot ancien encore manquant n'est pas caché par
+        `limit` lots plus récents déjà pourvus (R2 #1104 P2-2). `states` est un
+        seul ensemble ordonné, donc un `promoted` n'est pas affamé par des
+        `merged` plus récents. Lecture pure : ni verrou ni écriture."""
+
+    @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
              actor: str, held: bool = False) -> dict | None:
         """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et

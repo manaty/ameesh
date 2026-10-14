@@ -174,6 +174,48 @@ class _Witness(PgTestCase):
     def review_lots(self, lot):
         return storage.of(self.db).work.by_issue_ref(review_lot.ref_of(lot))
 
+    def merged_lot(self, title="lot fusionne", *, promoted=False, provided=False,
+                   sha="abcdef1234"):
+        """Un lot fusionné (`merged`, ou `promoted`), pourvu ou non de sa
+        relecture. La classe n'est pas l'objet du témoin : le lot est fusionné
+        par la voie déclarée, sans git."""
+        lot = self.lot(title)
+        done = work.merged(self.db, lot, sha=sha, actor="claude1")
+        self.assertEqual(done["result"], "merged", done)
+        if promoted:
+            work.move(self.db, lot, "promoted", note="témoin", actor="claude1")
+        if provided:
+            review_lot.open_after_merge(self.db, lot=lot, klass={"class": "light"},
+                                        merged_sha=sha)
+        return lot
+
+
+class MissingRefSelectionTest(_Witness):
+    """R2 #1104 P2-2 : `items_missing_ref` sélectionne les manquants **avant**
+    la borne — les pourvus ne consomment plus la limite — et `merged` et
+    `promoted` forment un seul ensemble ordonné par récence."""
+
+    def rows(self, limit):
+        return storage.of(self.db).work.items_missing_ref(
+            states=work.MERGED_STATES, ref_prefix=review_lot.PREFIX + "#", limit=limit)
+
+    def test_la_borne_porte_sur_les_manquants_pas_sur_les_pourvus(self):
+        old = self.merged_lot("manquant ancien")
+        for i in range(5):
+            self.merged_lot("fourni %d" % i, provided=True)
+        self.assertEqual([int(r["id"]) for r in self.rows(1)], [old],
+                         "un manquant ancien caché par des pourvus plus récents")
+        recent = self.merged_lot("manquant recent")
+        self.assertEqual([int(r["id"]) for r in self.rows(1)], [recent])
+        self.assertEqual(sorted(int(r["id"]) for r in self.rows(10)), sorted([old, recent]))
+
+    def test_un_promoted_manquant_recent_passe_avant_un_merged_manquant_ancien(self):
+        old = self.merged_lot("manquant fusionne")
+        promoted = self.merged_lot("manquant promu", promoted=True)
+        self.assertEqual([int(r["id"]) for r in self.rows(1)], [promoted],
+                         "le promoted manquant est affamé par le merged")
+        self.assertEqual(sorted(int(r["id"]) for r in self.rows(10)), sorted([old, promoted]))
+
 
 class SweepWitnessTest(_Witness):
     """Le relevé des branches (L118), constat d'une fusion manuelle locale."""
@@ -267,6 +309,50 @@ class CatchUpWitnessTest(_Witness):
         third = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
         self.assertEqual(third["result"], "already")
         self.assertEqual(len(self.review_lots(lot)), 1)
+
+    def test_saturation_vingt_pourvus_ne_cachent_pas_un_manquant_ancien(self):
+        """R2 #1104 P2-2, témoin de saturation 1 : vingt parents **pourvus**
+        plus récents ne cachent plus un parent ancien dont l'ouverture a
+        échoué. L'ancien code consommait sa limite sur les vingt pourvus
+        (`examined=20, missing=0, opened=0` à chaque passage)."""
+        old = self.merged_lot("manquant ancien")
+        for i in range(review_lot.CATCH_UP_LIMIT):
+            self.merged_lot("fourni %d" % i, provided=True)
+        self.assertEqual(self.review_lots(old), [])
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            first = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((first["examined"], first["missing"], first["opened"]), (1, 1, 1),
+                         first)
+        rows = self.review_lots(old)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(work.get(self.db, old)["state"], "merged", "la fusion reste acquise")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((second["examined"], second["opened"]), (0, 0), second)
+        self.assertEqual(len(self.review_lots(old)), 1, "reprise sans duplication")
+
+    def test_saturation_vingt_pourvus_ne_cachent_pas_un_promoted_manquant(self):
+        """R2 #1104 P2-2, témoin de saturation 2 : un `promoted` manquant plus
+        récent n'est plus affamé par vingt `merged` pourvus — les états sont
+        un seul ensemble ordonné, la sélection précède la borne."""
+        for i in range(review_lot.CATCH_UP_LIMIT):
+            self.merged_lot("fourni %d" % i, provided=True)
+        promoted = self.merged_lot("promu manquant", promoted=True)
+        self.assertEqual(self.review_lots(promoted), [])
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            first = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((first["examined"], first["missing"], first["opened"]), (1, 1, 1),
+                         first)
+        self.assertEqual(len(self.review_lots(promoted)), 1)
+        self.assertEqual(work.get(self.db, promoted)["state"], "promoted")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((second["examined"], second["opened"]), (0, 0), second)
+        self.assertEqual(len(self.review_lots(promoted)), 1)
 
 
 class DeclaredMergeWitnessTest(_Witness):
