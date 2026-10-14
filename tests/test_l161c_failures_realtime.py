@@ -304,6 +304,27 @@ class WatcherTest(PgTestCase):
         self.assertEqual([(o["action"], o["to"]) for o in out], [("verdict", "dev-a")])
         self.assertIn(": green.", self.mails("dev-a")[-1]["body"])
 
+    def test_run_obsolete_non_rattache_quand_la_tete_a_avance(self):
+        """#1321 : si le relevé des branches connaît une tête plus récente, un
+        run plus ancien n'est pas rattaché — son verdict porterait sur une tête
+        remplacée, et l'exécution de remplacement peut être `pending`
+        (invisible au veilleur, #1161)."""
+        sha, tete = "3" * 40, "4" * 40
+        self.api.live = [run_view(220, sha, "agent/dev-a-220")]
+        self.watcher.tick(self.db)
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 220)["work_item_id"])
+        lot = work.add(self.db, title="L3 : tête avancée", branch="agent/dev-a-220",
+                       assignee="dev-a")
+        st = storage.of(self.db)
+        # la branche a avancé : la tête du run n'est plus celle de la branche
+        self.assertTrue(st.work.set_branch_head(lot["id"], "agent/dev-a-220", tete))
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertIsNone(st.ci.run(DEPOT, 220)["work_item_id"])
+        # la tête connue redevient celle du run : le rattachement se fait
+        self.assertTrue(st.work.set_branch_head(lot["id"], "agent/dev-a-220", sha))
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(st.ci.run(DEPOT, 220)["work_item_id"], lot["id"])
+
     def test_urgent_puis_ordinaire_puis_verdict(self):
         sha = "c" * 40
         self.api.live = [run_view(201, sha, "lot/1-un")]
