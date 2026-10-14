@@ -859,36 +859,41 @@ class WatcherTest(PgTestCase):
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=now)
                           if a["type"] == "ci_queue_saturated"], [])
 
-    def test_garde_cache_des_executions_queued(self):
-        """#845 (revue N/P2 2328) : une exécution restée `queued` n'a pas
-        commencé, sa liste de jobs ne bouge plus — le relevé suivant la réutilise
-        sans appel et reste complet."""
+    def test_garde_relit_une_execution_queued_dont_un_job_demarre(self):
+        """#845 (R1 finale cx3, B1) : un run reste `queued` tant qu'un de ses
+        jobs attend, même quand un autre job tourne (mesure fondatrice #828) —
+        le relevé suivant ne peut donc PAS réutiliser l'instantané : le job
+        passé `in_progress` et le job neuf resté en file sont relus, pas servis
+        par le cache."""
         horloge = FauxHorloge()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
         self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
-        run = run_view(902, "a1" * 20, "main")
+        run = run_view(906, "a6" * 20, "main")
         run.update({"status": "queued", "created_at": iso(horloge.t - 1000)})
         self.api.queued = [run]
-        self.api.jobs[902] = [job_view("psql 1/1", status="queued", job_id=9021,
+        self.api.jobs[906] = [job_view("psql 1/1", status="queued", job_id=9061,
                                        created_at=iso(horloge.t - 1000))]
         self.watcher.tick(self.db)
-        self.assertEqual(len(self.guard_calls()), 4)  # 2 listes + jobs + runners
+        self.assertEqual(len(self.guard_calls()), 4)
+        # le job 9061 démarre alors que le run reste `queued` (9062 attend) :
+        # l'instantané du premier relevé est périmé.
         horloge.avance(ci.GUARD_SCAN_S)
         self.api.paths.clear()
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1")]
+        self.api.jobs[906] = [
+            job_view("psql 1/1", runner="ameesh-ci-1-1", job_id=9061),
+            job_view("psycopg 1/1", status="queued", job_id=9062,
+                     created_at=iso(horloge.t - 10)),
+        ]
         self.watcher.tick(self.db)
-        self.assertEqual(len(self.guard_calls()), 3, self.guard_calls())
-        self.assertEqual(self.scan_state()[0], True)
-        (row,) = storage.of(self.db).ci.queued_oldest()
-        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9021))
-        # l'exécution démarre : sa liste de jobs peut bouger, elle est relue
-        self.api.queued = []
-        self.api.live = [run_view(902, "a1" * 20, "main")]
-        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 1000)})
-        self.api.jobs[902] = [job_view("psql 1/1", runner="ameesh-ci-1-1", job_id=9021)]
-        horloge.avance(ci.GUARD_SCAN_S)
-        self.api.paths.clear()
-        self.watcher.tick(self.db)
-        self.assertEqual(len(self.guard_calls()), 4, self.guard_calls())
+        st = storage.of(self.db)
+        (row,) = st.ci.queued_oldest()
+        # un seul constat : le relevé doit relire (4 appels), la file ne doit
+        # garder que 9062, et le runner qui tient 9061 ne doit pas être « stuck ».
+        self.assertEqual(
+            (len(self.guard_calls()), int(row["queued"]), int(row["oldest_id"]),
+             [r["name"] for r in st.ci.stuck_runners()]),
+            (4, 1, 9062, []), self.guard_calls())
 
     def test_garde_fenetre_atomique_entre_connexions(self):
         """#845 (revue N/P2 2328) : la revendication de fenêtre est atomique —

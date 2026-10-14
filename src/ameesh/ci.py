@@ -88,9 +88,9 @@ GUARD_SCAN_MAX_RUNS = 120
 #: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
 GUARD_PER_PAGE = 100
 #: #845 (revue N/P2 2328) : budget d'appels GitHub d'un relevé de la garde —
-#: les deux listes d'exécutions, un appel par exécution non conclue dont le
-#: relevé n'est pas réutilisable (restée `queued` : sa liste de jobs ne bouge
-#: plus), et la liste des runners. Au-delà, le relevé est déclaré incomplet et
+#: les deux listes d'exécutions, un appel par exécution non conclue (chacune est
+#: relue : un run resté `queued` peut porter un job déjà `in_progress`, R1 cx3
+#: B1), et la liste des runners. Au-delà, le relevé est déclaré incomplet et
 #: RIEN n'est publié : un relevé partiel ne vaut pas un relevé complet, et les
 #: relevés précédents vieillissent jusqu'à ce que la fraîcheur
 #: (`exploitation.CI_GUARD_FRESH_S`) les clôt. Le nombre d'appels réellement
@@ -382,13 +382,15 @@ class Watcher:
         file).
 
         Le relevé est borné (revue N/P2 2328) : la fenêtre est écrite dans la
-        base avant le premier appel (`ci_guard_scan`, atomique par dépôt), les
-        exécutions restées `queued` sont réutilisées sans appel, et un budget
-        d'appels (`GUARD_SCAN_MAX_CALLS`) arrête un relevé qui ne peut pas
-        couvrir toutes les exécutions. Un relevé incomplet ne publie **rien** :
-        il est journalisé et daté dans `ci_guard_scan`, les relevés précédents
-        vieillissent et la fraîcheur les clôt — jamais une mesure partielle
-        publiée comme complète.
+        base avant le premier appel (`ci_guard_scan`, atomique par dépôt), et un
+        budget d'appels (`GUARD_SCAN_MAX_CALLS`) arrête un relevé qui ne peut pas
+        couvrir toutes les exécutions. Chaque exécution non conclue est relue :
+        un run resté `queued` peut porter un job déjà `in_progress` quand un
+        autre attend (mesure fondatrice #828), donc aucun instantané de jobs
+        ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3, B1).
+        Un relevé incomplet ne publie **rien** : il est journalisé et daté dans
+        `ci_guard_scan`, les relevés précédents vieillissent et la fraîcheur les
+        clôt — jamais une mesure partielle publiée comme complète.
 
         Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
         journalisée et n'empêche ni les échecs, ni les verdicts.
@@ -455,7 +457,6 @@ class Watcher:
                 # né après une annulation de part : aucune inférence ne les
                 # sépare sans masquer une file réelle. Les orphelins se traitent
                 # à la source (`always() && !cancelled()` sur l'agrégat, #876).
-                cached = st.ci.guard_runs(repo)
                 queued: list[tuple[str, int]] = []
                 queued_total = 0
                 holding: dict[str, str] = {}
@@ -463,24 +464,17 @@ class Watcher:
                     run = not_done[run_id]
                     attempt = int(run.get("run_attempt") or 1)
                     status = str(run.get("status") or "")
-                    row = cached.get((run_id, attempt))
-                    if (row is not None and str(row.get("status") or "") == "queued"
-                            and status == "queued"):
-                        # aucun job n'a commencé : la liste de jobs ne bouge
-                        # plus, le cache vaut le relevé et n'ajoute aucun appel.
-                        snap = row
-                    else:
-                        jobs_data = api("repos/%s/actions/runs/%d/jobs?per_page=%d"
-                                        % (repo, run_id, GUARD_PER_PAGE)) or {}
-                        jobs = jobs_data.get("jobs") or ()
-                        if int(jobs_data.get("total_count") or 0) > len(jobs):
-                            reason = "jobs_truncated"
-                            break
-                        snap = _guard_snapshot(run_id, attempt, status, jobs)
-                        st.ci.observe_guard_run(
-                            repo, run_id=run_id, attempt=attempt, status=status,
-                            queued=int(snap["queued"]), oldest_id=snap["oldest_id"],
-                            oldest_at=snap["oldest_at"], runners=snap["runners"])
+                    jobs_data = api("repos/%s/actions/runs/%d/jobs?per_page=%d"
+                                    % (repo, run_id, GUARD_PER_PAGE)) or {}
+                    jobs = jobs_data.get("jobs") or ()
+                    if int(jobs_data.get("total_count") or 0) > len(jobs):
+                        reason = "jobs_truncated"
+                        break
+                    snap = _guard_snapshot(run_id, attempt, status, jobs)
+                    st.ci.observe_guard_run(
+                        repo, run_id=run_id, attempt=attempt, status=status,
+                        queued=int(snap["queued"]), oldest_id=snap["oldest_id"],
+                        oldest_at=snap["oldest_at"], runners=snap["runners"])
                     covered += 1
                     queued_total += int(snap.get("queued") or 0)
                     if int(snap.get("queued") or 0):
