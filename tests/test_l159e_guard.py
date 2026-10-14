@@ -714,6 +714,45 @@ class SignalsTest(unittest.TestCase):
                                               cgroup_root=cg, proc_root=proc), 4)
 
 
+    def test_busy_tasks_unreadable_cmdline_counts_the_unit(self):
+        # #1256 R1 delta B3 : un PID encore listé dont la ligne de commande
+        # n'est pas lisible (permissions, erreur transitoire) n'est pas une
+        # tâche exclue : l'unité compte, comme un cgroup illisible. Un PID
+        # vraiment disparu entre les deux lectures, lui, ne cache rien.
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = os.path.join(tmp, "cg")
+            proc = os.path.join(tmp, "proc")
+            d = os.path.join(cg, "system.slice", "actions.runner.x.service")
+            os.makedirs(d)
+
+            class Proc:
+                def __init__(self, out):
+                    self.returncode, self.stdout = 0, out
+
+            def run(argv, **kw):
+                if argv[:2] == ["systemctl", "list-units"]:
+                    return Proc("actions.runner.x.service loaded active running x\n")
+                if argv[:2] == ["systemctl", "show"]:
+                    return Proc("/system.slice/actions.runner.x.service\n")
+                raise AssertionError(argv)
+
+            # le PID 30 est encore là (son /proc/30 existe) mais sa cmdline
+            # est absente : inconnu -> l'unité compte, jamais zéro
+            with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                fh.write("30\n")
+            os.makedirs(os.path.join(proc, "30"))
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 1)
+
+            # le PID 31 a entièrement disparu entre les deux lectures : la
+            # tâche est terminée, pas cachée -> zéro job
+            with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                fh.write("31\n")
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 0)
+
     def test_disk_of_the_guest_work_path(self):
         # codex #211 r4: the guard measured no disk (sample() without a path),
         # so the lendable disk and caps.disk_mb never appeared

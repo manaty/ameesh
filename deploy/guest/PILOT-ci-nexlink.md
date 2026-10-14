@@ -137,8 +137,10 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
     the guest at `disk_low` under it, so the guest may use ≈ 3.95 GiB.
   * prepare/register floor: `--disk-floor-mib 6144` = the 5 GiB guard
     threshold + 1 GiB install margin (the pinned asset is 227660598 B
-    compressed; the extraction is budgeted at ≤ 1 GiB per runner and is
-    measured at qualification). The 15 GiB default would refuse here.
+    ≈ 217 MiB compressed; the extraction is budgeted at ≤ 1 GiB per runner
+    and is measured at qualification; the digest is verified on a root-private
+    snapshot of the archive — ≈ one extra asset copy under `/var/tmp`, removed
+    on exit, R1 delta B4). The 15 GiB default would refuse here.
   * four persistent `actions.runner.manaty-nexlink.nexlink-ci-3-[1-4]` units
     and one real `Runner.Worker` at the reading (listeners and jobs counted
     apart): `busy_max: 2` warns at two jobs and stops the guest above two, so
@@ -170,7 +172,7 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
 | 2 | The containers are the guest's own | `docker` shim → **rootless Podman** (`--cgroup-manager=cgroupfs`), never `/run/docker.sock` | `podman info` `rootless=true`; host `docker ps` never shows a guest container |
 | 3 | The containers are capped with the guest | `Delegate=yes` on the unit; containers are cgroups **under** the runner, inside `ameesh-guest.slice` | `systemd-cgls ameesh-guest.slice` during a job |
 | 4 | The guest cannot starve the application | slice `CPUWeight=10`/`IOWeight=10`, `CPUQuota`, `MemoryHigh`, `MemoryMax`; `OOMScoreAdjust=500` | `systemctl show ameesh-guest.slice -p …` |
-| 5 | The application's jobs win | guard `reclaim.busy_units: actions.runner.*` **with `busy_tasks: ["Runner.Worker"]`** (a job counts, an idle listener does not), `busy_max`, PSI and memory thresholds; levels 3/4 stop the guest runners; the unit's `ci-runner-gate` stops `run.sh` when the gate closes, disappears or goes stale | `ameesh guard check --json`, `guard.stopped` in the state; witnesses `tests/test_l159e_guard.py` (idle listener vs running job, unreadable cgroup counts) and `tests/test_1256_ci_runners.py` (the wrapper stops on a closed/observed/absent gate and restarts on `available`) |
+| 5 | The application's jobs win | guard `reclaim.busy_units: actions.runner.*` **with `busy_tasks: ["Runner.Worker"]`** (a job counts, an idle listener does not), `busy_max`, PSI and memory thresholds; levels 3/4 stop the guest runners; the unit's `ci-runner-gate` stops `run.sh` when the gate closes, disappears or goes stale | `ameesh guard check --json`, `guard.stopped` in the state; witnesses `tests/test_l159e_guard.py` (idle listener vs running job, unreadable cgroup **and unreadable task cmdline** count) and `tests/test_1256_ci_runners.py` (the wrapper stops on a closed/observed/absent gate and restarts on `available`) |
 | 6 | The application's runners are never touched | the unit matches `ameesh-guest-ci@*` only; no command of the script ever names `actions.runner.*`; the check compares the application's unit count before/after | witness `tests/test_1256_ci_runners.py`; `systemctl list-units 'actions.runner.*'` unchanged |
 | 7 | The workspaces are distinct | `/srv/ameesh-guest/ci/rN` (guest) vs `/home/runner/rN/_work/nexlink` (application); `RequiresMountsFor` keeps the guest on its own root | `ci-runners.sh --check`; `ls -ld` |
 | 8 | The tokens are distinct | registration minted for `manaty/ameesh` only, read from a root-only file, `.credentials` 0600 `ameesh-guest`; the script never sees a Nexlink token | `.runner` `serverUrl`; `gh api repos/manaty/ameesh/actions/runners` |
@@ -186,8 +188,10 @@ token is short-lived, single-command, minted for the ameesh repository
 only); the job signal is the `Runner.Worker` marker read in each matched
 unit's cgroup (R1 #1256) — it follows the runner's implementation, and a
 unit whose cgroup cannot be read counts as busy (the application wins); the
-actions-runner tarball is verified by its digest at every extraction, the
-cache included, so a modified cache cannot be unpacked as root; the gate
+actions-runner tarball is copied to a root-private snapshot (0700/0600), its
+pinned digest is verified there, and the **guest** extracts that snapshot —
+the cache and the destination, both under the guest's `$ROOT`, are never
+unpacked by root (R1 delta B4, #1256); the gate
 wrapper follows the guard's own state TTL (90 s, rewritten every 30 s) and a
 state it cannot read is closed, so a guard that dies or hangs stops the guest
 runners instead of leaving them running.
@@ -249,7 +253,9 @@ sudo deploy/guest/install-pilot.sh --lend offer.json \
 #    free: qualify ONE runner with the floor §3 justifies (5 GiB guard
 #    threshold + 1 GiB install margin), not the 15 GiB default
 sudo deploy/guest/ci-runners.sh --prepare --count 1 --disk-floor-mib 6144
-sudo deploy/guest/ci-runners.sh --register --token-file /root/reg.token
+# --prepare recorded the floor (6144); repeating it on --register is explicit
+# belt and braces, and the recorded value is adopted if it is omitted
+sudo deploy/guest/ci-runners.sh --register --disk-floor-mib 6144 --token-file /root/reg.token
 sudo deploy/guest/ci-runners.sh --check
 du -sh /srv/ameesh-guest/ci; df -Pk /    # record the real install cost
 
@@ -271,7 +277,7 @@ df -Pk /; /opt/ameesh/venv/bin/ameesh guard check --json | grep -E 'disk|level'
 # 7. service: only after 6bis passes; the recorded count (1) is adopted, r1 is
 #    kept, r2 is prepared, registered and enabled
 sudo deploy/guest/ci-runners.sh --prepare --count 2 --disk-floor-mib 6144
-sudo deploy/guest/ci-runners.sh --register --token-file /root/reg.token
+sudo deploy/guest/ci-runners.sh --register --disk-floor-mib 6144 --token-file /root/reg.token
 sudo deploy/guest/ci-runners.sh --enable 2
 ```
 

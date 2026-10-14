@@ -411,18 +411,79 @@ class CiRunnersTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("systemctl enable --now ameesh-guest-ci@1.service", res.stdout)
 
-    def test_the_cached_tarball_is_verified_before_extraction(self):
-        # #1256 R1 : le cache est sous $ROOT/ci, que l'invité peut écrire ;
-        # son digest est vérifié à chaque fois avant l'extraction root
+    def test_the_archive_is_never_extracted_by_root(self):
+        # #1256 R1 delta B4 : le cache et la destination d'extraction sont
+        # sous $ROOT/ci, que l'invité possède. Root vérifie donc le digest sur
+        # un instantané privé (0700/0600), et c'est l'invité qui extrait cet
+        # instantané : jamais root depuis un chemin remplaçable.
         self.write("srv/ameesh-guest/ci/cache/actions-runner-linux-x64-2.338.0.tar.gz",
                    "not the tarball\n")
         res = self.run_script("--prepare", "--host", "ci-3")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("cached tarball reused", res.stdout)
-        self.assertIn("af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32",
-                      res.stdout)
-        self.assertIn("sha256sum -c -", res.stdout)
-        self.assertNotIn("curl -fL", res.stdout)
+        out = res.stdout
+        self.assertIn("cached tarball reused", out)
+        self.assertIn("root-private snapshot", out)
+        self.assertIn("sha256sum -c -", out)          # digest sur l'instantané
+        self.assertIn("runuser -u ameesh-guest -- tar -xzf - -C", out)
+        self.assertNotIn("DRY tar -xzf", out)          # root n'extrait jamais
+        self.assertNotIn("chown -R", out)              # plus de chown root
+        self.assertNotIn("curl -fL", out)
+
+    def test_prepare_refuses_a_symlinked_guest_path(self):
+        # #1256 R1 delta B4 : $ROOT appartient à l'invité ; un lien planté
+        # sous lui ne doit pas rediriger une création ou une écriture root
+        os.symlink(os.path.join(self.host, "srv/ameesh-guest/elsewhere"),
+                   os.path.join(self.host, "srv/ameesh-guest/ci"))
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("symbolic link", res.stderr)
+
+    def test_prepare_refuses_a_symlinked_cache_entry(self):
+        # même raison, sur l'entrée de cache elle-même : le digest root ne
+        # doit pas lire un fichier que l'invité a redirigé
+        self.write("srv/ameesh-guest/elsewhere.tar.gz", "not the tarball\n")
+        os.makedirs(os.path.join(self.host, "srv/ameesh-guest/ci/cache"))
+        os.symlink(os.path.join(self.host, "srv/ameesh-guest/elsewhere.tar.gz"),
+                   os.path.join(self.host,
+                                "srv/ameesh-guest/ci/cache/actions-runner-linux-x64-2.338.0.tar.gz"))
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("symbolic link", res.stderr)
+
+    def test_prepare_refuses_a_symlinked_destination(self):
+        # et sur la destination : l'extraction tourne sous l'invité, mais root
+        # ne doit pas non plus créer un chemin que l'invité a redirigé
+        os.makedirs(os.path.join(self.host, "srv/ameesh-guest/ci/elsewhere"))
+        os.symlink(os.path.join(self.host, "srv/ameesh-guest/ci/elsewhere"),
+                   os.path.join(self.host, "srv/ameesh-guest/ci/r1"))
+        res = self.run_script("--prepare", "--host", "ci-3", "--count", "1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("symbolic link", res.stderr)
+
+    def test_the_recorded_disk_floor_is_adopted_by_the_later_commands(self):
+        # #1256 R1 delta B5 : le plancher qualifié au --prepare est enregistré ;
+        # --register ne retombe pas sur le défaut 15360 qui refuserait la ci-3
+        # mesurée (8.95 GiB libres).
+        self.write("root/reg.token", "ghs_secret\n", mode=0o600)
+        for n in (1, 2):
+            self.write("srv/ameesh-guest/ci/r%d/config.sh" % n,
+                       "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.write("etc/ameesh/ci-runners.state", "host ci-3\ncount 2\nfloor 1\n")
+        res = self.run_script("--register", "--host", "ci-3",
+                              "--token-file", "/root/reg.token")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("--name ameesh-nxl-ci-3-1", res.stdout)
+        # une valeur enregistrée trop haute est reprise telle quelle : refus,
+        # jamais un repli silencieux sur le défaut
+        self.write("etc/ameesh/ci-runners.state", "host ci-3\ncount 2\nfloor 999999\n")
+        res = self.run_script("--register", "--host", "ci-3",
+                              "--token-file", "/root/reg.token")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("999999 MiB floor", res.stderr)
+        # l'option explicite l'emporte sur la valeur enregistrée
+        res = self.run_script("--register", "--host", "ci-3",
+                              "--token-file", "/root/reg.token", "--disk-floor-mib", "1")
+        self.assertEqual(res.returncode, 0, res.stderr)
 
     def test_prepare_installs_the_gate_wrapper(self):
         # #1256 R1 : l'unité ne lance pas run.sh directement ; --prepare pose
@@ -482,6 +543,9 @@ class CiRunnersTest(unittest.TestCase):
         with open(PLAN, encoding="utf-8") as fh:
             plan = fh.read()
         self.assertIn("--prepare --count 1 --disk-floor-mib 6144", plan)
+        # #1256 R1 delta B5 : le register du plan répète le plancher qualifié,
+        # il ne retombe pas sur le défaut 15 GiB
+        self.assertIn("--register --disk-floor-mib 6144", plan)
         self.assertNotIn("disk_max: 30GiB", plan)
 
 

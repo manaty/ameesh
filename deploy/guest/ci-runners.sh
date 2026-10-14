@@ -46,7 +46,10 @@
 #                         directory holds less than N MiB free (default
 #                         15360 = 15 GiB). The Host fiche's reclaim.disk_free_min
 #                         plus the install margin: a guest installed under the
-#                         threshold that stops it would never run (plan §3, §6)
+#                         threshold that stops it would never run (plan §3, §6).
+#                         --prepare records the qualified value in its state
+#                         file; --register and the next --prepare adopt it
+#                         when the option is not repeated (R1 delta B5)
 #   --tarball FILE        use this actions-runner tarball instead of the
 #                         download (offline hosts)
 #   --version V           runner version to download (default 2.338.0, the
@@ -72,6 +75,9 @@
 #     cannot use the application's Docker daemon nor read its images;
 #   * the registration token is read from a root-only file and only ever
 #     passed to `config.sh`; the dry run prints `<token>` instead.
+#   * the runner archive is verified by its pinned digest on a root-private
+#     snapshot, and extracted by the guest: root never extracts a path the
+#     guest can rewrite (R1 delta B4, #1256).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -99,8 +105,10 @@ COUNT_SET=0
 # the prepare/register floor (MiB): the Host fiche's `reclaim.disk_free_min`
 # plus the runner install margin. The preflight revises it on measurement
 # (#1256: 6144 on the measured ci-3, 8.95 GiB free), never below the guard's
-# own stop threshold.
+# own stop threshold. --prepare records it in the state file; the later
+# commands adopt it (R1 delta B5) unless the operator repeats the option.
 DISK_FLOOR_MIB=15360
+FLOOR_SET=0
 TARBALL=""
 WAIT=0
 KEEP=0
@@ -109,6 +117,9 @@ DRY=0
 MODE=""
 TOKEN_FILE=""
 TARGETS=()
+# the root-private snapshot of the runner archive (R1 delta B4): a directory
+# of its own, 0700, removed on exit
+STAGE_DIR=""
 
 die() { echo "ci-runners.sh: $*" >&2; exit 1; }
 say() { echo "== $*"; }
@@ -124,7 +135,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --host) HOST=$2; shift 2 ;;
     --count) COUNT=$2; COUNT_SET=1; shift 2 ;;
-    --disk-floor-mib) DISK_FLOOR_MIB=$2; shift 2 ;;
+    --disk-floor-mib) DISK_FLOOR_MIB=$2; FLOOR_SET=1; shift 2 ;;
     --tarball) TARBALL=$2; shift 2 ;;
     --version) VERSION=$2; shift 2 ;;
     --sha256) SHA256=$2; shift 2 ;;
@@ -178,6 +189,20 @@ if [ "$COUNT_SET" = 0 ] && [ -f "$STATE" ]; then
   recorded_count=$(awk '/^count /{c=$2} END{print c}' "$STATE" 2>/dev/null || true)
   case "$recorded_count" in ''|*[!0-9]*) ;; *) COUNT=$recorded_count ;; esac
 fi
+# The disk floor qualified at --prepare is recorded too (R1 delta B5): on the
+# measured ci-3 the plan prepares with 6144, and --register without the option
+# used to fall back to the 15360 default and refuse the same host. An explicit
+# --disk-floor-mib still wins; a recorded value only counts if it is one this
+# script would have accepted.
+if [ "$FLOOR_SET" = 0 ] && [ -f "$STATE" ]; then
+  recorded_floor=$(awk '/^floor /{f=$2} END{print f}' "$STATE" 2>/dev/null || true)
+  case "$recorded_floor" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$recorded_floor" -ge 1 ] && [ "$recorded_floor" -le 1048576 ]; then
+         DISK_FLOOR_MIB=$recorded_floor
+       fi ;;
+  esac
+fi
 host_says() { [ -z "$HOSTDIR" ] && "$@" || true; }
 run() {
   if [ "$DRY" = 1 ]; then printf 'DRY %s\n' "$*"; else "$@"; fi
@@ -204,9 +229,34 @@ remember() { # remember PATH KIND
 recorded() { # recorded PATH
   [ -f "$STATE" ] && grep -qxF "created $1" "$STATE"
 }
-absent() { # absent PATH : nothing of the host's there, so this script creates it
-  [ ! -e "$(at "$1")" ]
+absent() { # absent PATH : nothing of the host's there, not even a dangling symlink
+  [ ! -e "$(at "$1")" ] && [ ! -L "$(at "$1")" ]
 }
+no_symlink_path() { # SUFFIX (under $ROOT) : no component may be a symlink
+  # $ROOT belongs to the guest: a symlink planted under it could otherwise
+  # redirect a root install/rm outside the loan (R1 delta B4, #1256).
+  local rel=${1#/} cur part
+  cur=$(at "$ROOT")
+  if [ -L "$cur" ]; then
+    die "$ROOT is a symbolic link: refusing (the guest's volume must be a real directory)"
+  fi
+  while [ -n "$rel" ]; do
+    part=${rel%%/*}
+    if [ "$part" = "$rel" ]; then rel=""; else rel=${rel#*/}; fi
+    [ -n "$part" ] || continue
+    cur=$cur/$part
+    if [ -L "$cur" ]; then
+      die "$cur is a symbolic link: refusing (a guest-writable path must not redirect root)"
+    fi
+  done
+}
+stage_cleanup() { # the root-private archive snapshot never outlives the run
+  if [ -n "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi
+}
+snapshot() { # SRC DST : the archive bytes, read by root into its private file
+  cat -- "$1" >"$2"
+}
+trap stage_cleanup EXIT
 restore_howto() {
   cat <<EOF
 next, from a machine with an admin token on $REPO_SLUG (the operator, not the host):
@@ -375,17 +425,24 @@ prepare() {
     tarball_in=$ROOT/ci/cache/actions-runner-linux-x64-$VERSION.tar.gz
   fi
   # only what this script creates is recorded, so --remove gives the host
-  # back the way --prepare found it (an existing tree is left alone)
+  # back the way --prepare found it (an existing tree is left alone). $ROOT
+  # belongs to the guest: a planted symlink is refused before root creates
+  # or writes anything below it (R1 delta B4, #1256).
+  no_symlink_path ci
+  no_symlink_path ci/cache
   if absent "$ROOT/ci"; then
-    run install -d -o "$GUEST" -g "$GUEST" -m 0700 "$ROOT/ci"
+    run install -d -o "$GUEST" -g "$GUEST" -m 0700 "$(at "$ROOT/ci")"
     remember "$ROOT/ci" created
   fi
   if absent "$ROOT/ci/cache"; then
-    run install -d -o "$GUEST" -g "$GUEST" -m 0700 "$ROOT/ci/cache"
+    run install -d -o "$GUEST" -g "$GUEST" -m 0700 "$(at "$ROOT/ci/cache")"
     remember "$ROOT/ci/cache" created
   fi
+  no_symlink_path bin
+  no_symlink_path bin/docker
+  no_symlink_path bin/ci-runner-gate
   if absent "$ROOT/bin"; then
-    run install -d -o root -g root -m 0755 "$ROOT/bin"
+    run install -d -o root -g root -m 0755 "$(at "$ROOT/bin")"
     remember "$ROOT/bin" created
   fi
   if absent "$SHIM"; then shim_new=1; fi
@@ -404,22 +461,44 @@ SHIM
   if absent "$GATE_WRAPPER"; then wrapper_new=1; fi
   put "$GATE_WRAPPER" 0755 root:root <"$HERE/ci-runner-gate.py"
   if [ "$wrapper_new" = 1 ]; then remember "$GATE_WRAPPER" created; fi
-  # #1256 R1 : le tar est vérifié par son digest à CHAQUE fois avant
-  # l'extraction root — y compris depuis le cache, qu'un job précédent a pu
-  # laisser modifiable par l'invité (le cache est sous $ROOT/ci)
+  # #1256 R1 delta B4 : le cache vit sous $ROOT/ci, que l'invité possède, et
+  # la destination d'extraction aussi. Root n'extrait donc plus jamais une
+  # archive depuis un chemin que l'invité peut remplacer entre le digest et
+  # le tar : il recopie les octets dans un instantané privé (dossier 0700,
+  # fichier 0600, sous /var/tmp), y vérifie le digest, et c'est l'invité qui
+  # extrait cet instantané, par le descripteur que root lui ouvre. Le cache
+  # ne sert que de commodité : re-vérifié à chaque prepare, et réécrit par
+  # l'invité lui-même après une extraction réussie (publication sûre).
+  local stage
+  if [ "$DRY" = 1 ]; then
+    stage="${TMPDIR:-/var/tmp}/ameesh-ci-stage.XXXXXX/runner.tar.gz"
+  else
+    STAGE_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/ameesh-ci-stage.XXXXXX") \
+      || die "cannot create the root-private snapshot directory under ${TMPDIR:-/var/tmp}"
+    chmod 0700 "$STAGE_DIR"
+    stage=$STAGE_DIR/runner.tar.gz
+    : >"$stage"
+    chmod 0600 "$stage"
+  fi
   if [ -n "$TARBALL" ]; then
     run test -r "$TARBALL"
-    run sh -c "echo '$SHA256  $TARBALL' | sha256sum -c -"
+    run snapshot "$TARBALL" "$stage"
   elif [ -f "$(at "$tarball_in")" ]; then
-    say "cached tarball reused: $tarball_in (digest verified)"
-    run sh -c "echo '$SHA256  $(at "$tarball_in")' | sha256sum -c -"
+    no_symlink_path "ci/cache/actions-runner-linux-x64-$VERSION.tar.gz"
+    say "cached tarball reused: $tarball_in (root-private snapshot, digest verified)"
+    run snapshot "$(at "$tarball_in")" "$stage"
   else
     run curl -fL --retry 3 --connect-timeout 20 \
-      -o "$tarball_in" "$URL_BASE/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz"
-    run sh -c "echo '$SHA256  $tarball_in' | sha256sum -c -"
+      -o "$stage" "$URL_BASE/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz"
+  fi
+  if [ "$DRY" = 1 ]; then
+    printf 'DRY sha256sum -c - <= "%s  %s"\n' "$SHA256" "$stage"
+  else
+    printf '%s  %s\n' "$SHA256" "$stage" | sha256sum -c -
   fi
   for n in $(seq 1 "$COUNT"); do
     dir=$ROOT/ci/r$n
+    no_symlink_path "ci/r$n"
     if [ -f "$(at "$dir/.runner")" ]; then
       say "r$n is already registered: software kept (re-run --remove first to reinstall)"
       continue
@@ -428,12 +507,27 @@ SHIM
       die "$dir already exists and is not this script's: move it aside first"
     fi
     if absent "$dir"; then
-      run install -d -o "$GUEST" -g "$GUEST" -m 0755 "$dir"
+      run install -d -o "$GUEST" -g "$GUEST" -m 0755 "$(at "$dir")"
       remember "$dir" created
     fi
-    run tar -xzf "$(at "$tarball_in")" -C "$(at "$dir")"
-    run chown -R "$GUEST:$GUEST" "$(at "$dir")"
+    # extraction sous l'invité, depuis l'instantané privé de root : un
+    # remplacement de chemin après le digest ne fait plus écrire root
+    if [ "$DRY" = 1 ]; then
+      printf 'DRY runuser -u %s -- tar -xzf - -C %s < %s (root-private snapshot)\n' \
+        "$GUEST" "$(at "$dir")" "$stage"
+    else
+      runuser -u "$GUEST" -- tar -xzf - -C "$(at "$dir")" <"$stage"
+    fi
   done
+  # publication du cache par l'invité (le cache est sous $ROOT/ci, donc à
+  # lui) : les octets viennent de l'instantané vérifié, et la prochaine
+  # préparation re-vérifie le digest de toute façon
+  if [ "$DRY" = 1 ]; then
+    printf 'DRY runuser -u %s -- sh -c %s < %s (cache publication)\n' \
+      "$GUEST" "'cat >$tarball_in'" "$stage"
+  else
+    runuser -u "$GUEST" -- sh -c 'cat >"$1"' sh "$(at "$tarball_in")" <"$stage"
+  fi
   if absent "/etc/systemd/system/$UNIT"; then unit_new=1; fi
   put "/etc/systemd/system/$UNIT" 0644 root:root <"$SRC_UNIT"
   if [ "$unit_new" = 1 ]; then remember "/etc/systemd/system/$UNIT" created; fi
@@ -442,6 +536,7 @@ SHIM
     {
       printf 'host %s\n' "$HOST"
       printf 'count %s\n' "$COUNT"
+      printf 'floor %s\n' "$DISK_FLOOR_MIB"
       printf 'version %s\n' "$VERSION"
       printf 'sha256 %s\n' "$SHA256"
       printf 'prefix %s\n' "$RUNNER_PREFIX"

@@ -436,8 +436,16 @@ def _unit_jobs(unit: str, tasks: tuple, run: Callable = subprocess.run, *,
         try:
             with open(os.path.join(proc_root, pid, "cmdline"), "rb") as fh:
                 args = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
-        except OSError:
-            continue
+        except OSError as exc:
+            # #1256 R1 delta B3: a task gone between the cgroup listing and
+            # this read leaves no /proc entry behind — nothing was hidden, it
+            # simply ended. A task still listed whose command line cannot be
+            # read (permissions, transient error) is one we cannot rule out:
+            # the unit stays counted, like an unreadable cgroup.
+            if isinstance(exc, FileNotFoundError) \
+                    and not os.path.exists(os.path.join(proc_root, pid)):
+                continue
+            return None
         if any(pattern in args for pattern in tasks):
             return True
     return False
