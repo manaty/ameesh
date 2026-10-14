@@ -369,6 +369,25 @@ class MapTest(unittest.TestCase):
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
 
+    def test_map_problem_partial_measure(self):
+        """#1257 R1 B3 : une carte dont la fusion a écarté des couvertures est
+        partielle ; elle ne juge plus la sélection, même fraîche et ancêtre."""
+        card = self.repo.card()  # carte ancienne : la clé n'existe pas
+        self.assertEqual(plan.ignored_coverages(card), [])
+        self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path)[0], "")
+        vide = dict(card, measure={"couverture_ignoree": []})  # carte neuve sans perte
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path)[0], "")
+        partielle = dict(card, measure={"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]})
+        probleme, age = plan.map_problem(partielle, NOW, "HEAD", self.repo.path)
+        self.assertIn("partial measure", probleme)
+        self.assertIsNone(age)  # le refus ne dépend ni de la date ni du dépôt
+        # la forme ancienne (clé française) est lue aussi
+        ancienne = dict(card, mesure={"couverture_ignoree": [{"part": "m"}]})
+        self.assertIn("partial measure",
+                      plan.map_problem(ancienne, NOW, "HEAD", self.repo.path)[0])
+
     def test_always_and_recent_failures(self):
         changes = [("M", "src/ameesh/work.py"), ("A", "src/ameesh/migrations/0099_x.sql")]
         self.assertEqual(plan.always_hits(changes, ["test_cluster"]),
@@ -489,6 +508,21 @@ class DocsLaneTest(unittest.TestCase):
         self.assertFullSuite(self._plan(["docs/guide.md"]), "map not usable")
         self.assertFullSuite(self._plan_without_map(["docs/guide.md"]), "no map")
 
+    def test_partial_measure_card_runs_the_full_suite(self):
+        """#1257 R1 B3 : une couverture écartée à la fusion rend la carte
+        partielle ; le jugement de sélection est refusé et le repli suite
+        complète s'applique, même carte fraîche et ancêtre."""
+        self.card["measure"] = {"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]}
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        p = self._plan(["docs/guide.md"])
+        self.assertFullSuite(p, "partial measure")
+        self.assertFalse(p["map"]["used"])
+        self.assertFalse(p["sure"])
+
     def _plan_without_map(self, files):
         self.card = None
         return self._plan(files)
@@ -516,6 +550,43 @@ class DocsLaneTest(unittest.TestCase):
         self.repo.commit()
         p = self._plan([], event="push")
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
+
+
+def _coverage_disponible() -> bool:
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class PartialMeasureTest(unittest.TestCase):
+    """#1257 R1 B3 : de la collecte (`scripts/map.py`) à la décision de
+    sélection (`scripts/test-plan.py`)."""
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_partial_card(self):
+        """Une part dont un fichier de couverture est illisible donne une carte
+        partielle ; le plan refuse alors de juger la sélection (repli suite
+        complète) au lieu de croire la mesure complète."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage.tronquee").write_bytes(b"pas du sqlite")
+        # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
+        mesure = dict(card["mesure"], couverture_ignoree=[])
+        saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
 
 
 class PlanTest(unittest.TestCase):

@@ -176,11 +176,34 @@ def existed(path: str, rev: str, repo: pathlib.Path = REPO) -> bool:
 
 # -- the map --------------------------------------------------------------
 
+def ignored_coverages(card: dict) -> list:
+    """Couvertures que la fusion de la carte a écartées (#1257). Une carte
+    antérieure à la clé n'en porte pas : sa mesure est complète par
+    construction (l'ancien code échouait sur un fichier illisible au lieu de
+    l'ignorer)."""
+    mesure = card.get("measure") or card.get("mesure") or {}
+    if not isinstance(mesure, dict):
+        return []
+    ignorees = mesure.get("couverture_ignoree")
+    if not ignorees:
+        return []
+    return ignorees if isinstance(ignorees, list) else [ignorees]
+
+
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
                 repo: pathlib.Path = REPO) -> tuple[str, float | None]:
     """Why the map cannot be used ("" if it can), and its age in hours."""
     if card is None:
         return "no map", None
+    ignorees = ignored_coverages(card)
+    if ignorees:
+        # #1257 (R1 B3) : une couverture écartée à la fusion rend la mesure
+        # partielle — les modules que le processus perdu mesurait manquent, et
+        # les durées connues feraient passer la sélection pour sûre. La carte ne
+        # juge plus la restriction : repli suite complète, jamais une décision
+        # sur une carte partielle.
+        return (f"map measured with {len(ignorees)} ignored coverage file(s) "
+                "(partial measure)"), None
     try:
         generated = datetime.datetime.fromisoformat(card["genere"])
     except (KeyError, TypeError, ValueError):
