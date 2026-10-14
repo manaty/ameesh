@@ -4,7 +4,7 @@
 
     scripts/map.py install
     scripts/test-parts.py run … --measure DIR      (une part sous mesure)
-    scripts/map.py merge --output carte.json.gz [--previous F] DIR [DIR…]
+    scripts/map.py merge --output carte.json.gz [--previous F] [--attendu NOMS] DIR [DIR…]
     scripts/map.py show carte.json.gz [CHEMIN | table:NOM | test_module …]
     scripts/map.py blocks src/ameesh/x.py
 
@@ -49,6 +49,9 @@ de son fichier (il les a importés).
 
 Les noms de modules sont ceux de `tests/` sans préfixe (`test_cluster`).
 La carte n'est jamais bloquante : un échec sous mesure est noté, pas reporté.
+Avec `--attendu` (#1341 D), la fusion refuse au contraire de publier une carte
+quand une part attendue manque ou n'a pas écrit ses durées : une carte
+incomplète ne doit pas remplacer la précédente dans le cache.
 """
 from __future__ import annotations
 
@@ -410,6 +413,43 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
     }
 
 
+def parts_incompletes(dossiers: list[str], attendus: list[str]) -> list[str]:
+    """#1341 D — les parts de mesure attendues absentes ou sans durée.
+
+    Une part annulée (plafond, runner perdu) publie son artefact sans
+    `durees.json` : `merge` la fusionnait alors silencieusement, et la carte
+    publiée perdait les durées de ses modules — la fusion n'hérite pas des
+    durées de la carte précédente, seulement des échecs. `attendus` vient de
+    la matrice du workflow (`jobs.mesure.strategy.matrix.include`), que
+    `tests/test_carte_parts_completes.py` tient en miroir.
+    """
+    presents = {os.path.basename(os.path.normpath(d)): d for d in dossiers}
+    problemes = []
+    for nom in attendus:
+        dossier = presents.get(nom)
+        if dossier is None:
+            problemes.append(f"{nom} : artefact absent")
+            continue
+        fichiers = sorted(glob.glob(os.path.join(dossier, "durees*.json")))
+        if not fichiers:
+            problemes.append(f"{nom} : aucune durée écrite (part annulée ?)")
+            continue
+        total = 0
+        lus = 0
+        for chemin in fichiers:
+            try:
+                donnees = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                problemes.append(f"{nom} : {os.path.basename(chemin)} illisible ({exc})")
+                continue
+            lus += 1
+            if isinstance(donnees, dict):
+                total += sum(len(v) for v in donnees.values() if isinstance(v, dict))
+        if lus and not total:
+            problemes.append(f"{nom} : durées vides")
+    return problemes
+
+
 def write(carte: dict, chemin: str) -> None:
     texte = json.dumps(carte, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
     with gzip.open(chemin, "wt", encoding="utf-8") as f:
@@ -492,6 +532,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--previous", help="carte précédente (historique des échecs)")
     p.add_argument("--commit", help="commit mesuré (défaut : HEAD)")
     p.add_argument("--summary", help="écrit aussi le résumé Markdown dans ce fichier")
+    p.add_argument("--attendu", help="parts de mesure attendues (noms d'artefacts, "
+                   "séparés par des espaces ou des virgules) : la fusion refuse de "
+                   "publier une carte si l'une manque ou n'a pas de durées (#1341 D)")
     p.add_argument("directories", nargs="+")
     p = sous.add_parser("show", help="lire une carte")
     p.add_argument("map")
@@ -502,6 +545,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.commande == "install":
         return install(args)
     if args.commande == "merge":
+        attendus = args.attendu.replace(",", " ").split() if args.attendu else []
+        problemes = parts_incompletes(args.directories, attendus)
+        if problemes:
+            for probleme in problemes:
+                print(f"::error::mesure incomplète : {probleme}")
+            print("carte non publiée : une part attendue manque ou n'a pas de durées",
+                  file=sys.stderr)
+            return 2
         precedente = None
         if args.previous and os.path.exists(args.previous):
             try:

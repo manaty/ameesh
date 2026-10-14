@@ -15,6 +15,22 @@
 #
 # Sur une PR qui touche la mesure elle-même, la carte est produite pour
 # contrôle (artefact seulement, pas de cache).
+#
+# #1341 — répartition et complétude de la mesure :
+#   - A : le découpage des parts sous mesure est pondéré par les durées de la
+#     carte précédente (`--map`), pas par la table statique mesurée sans
+#     couverture : le surcoût de la mesure varie de 1,2× à 9,3× selon les
+#     modules, et la table statique ne couvre que 76 modules sur 250 ;
+#   - B : les modules « pilote » psql sont mesurés en 2 parts (une seule part
+#     de 45 modules pesait 38 min de mur pour un plafond de 40, annulée deux
+#     fois) ;
+#   - D : la fusion refuse de publier une carte si une part attendue manque ou
+#     n'a pas écrit ses `durees.json` (part annulée), ou si la matrice de
+#     mesure n'est pas verte. Une carte incomplète ne remplace pas la
+#     précédente : elle en perdrait les durées (la fusion n'hérite que des
+#     échecs), et le découpage des runs suivants retomberait sur la table
+#     statique. `PARTS_MESURE` est le miroir de la matrice `mesure`, tenu par
+#     tests/test_carte_parts_completes.py.
 name: carte
 
 on:
@@ -71,7 +87,8 @@ jobs:
           - { pilote: psycopg, part: 2, parts: 4 }
           - { pilote: psycopg, part: 3, parts: 4 }
           - { pilote: psycopg, part: 4, parts: 4 }
-          - { pilote: psql, part: 1, parts: 1, liste: tests/parts/pilote-psql.txt }
+          - { pilote: psql, part: 1, parts: 2, liste: tests/parts/pilote-psql.txt }
+          - { pilote: psql, part: 2, parts: 2, liste: tests/parts/pilote-psql.txt }
     services:
       postgres:
         image: postgres:17
@@ -89,6 +106,13 @@ jobs:
       LISTE: ${{ matrix.liste }}
     steps:
       - uses: actions/checkout@v4
+      # #1341 A : la carte précédente donne les durées *sous mesure* qui
+      # pondèrent le découpage ; la table statique reste le repli.
+      - uses: actions/cache/restore@v4
+        with:
+          path: carte/carte.json.gz
+          key: carte-${{ github.sha }}
+          restore-keys: carte-
       - name: port de la base jetable
         run: echo "AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ameesh" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
@@ -122,9 +146,12 @@ jobs:
           M="$RUNNER_TEMP/mesure"
           mkdir -p "$M"
           debut=$(date +%s)
+          CARTE=carte/carte.json.gz
+          [ -f "$CARTE" ] || CARTE=""
           # jamais bloquant : un échec sous mesure est noté dans la carte
           .venv-carte/bin/python scripts/test-parts.py run --parts ${{ matrix.parts }} \
             --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" ${LISTE:+--list "$LISTE"} \
+            ${CARTE:+--map "$CARTE"} \
             --measure "$M" --output-durations "$M/durees.json" --flow "$M/flux.jsonl" \
             || echo "::warning::tests en échec sous mesure (notés dans la carte)"
           echo "durée sous mesure : $(( $(date +%s) - debut )) s" >> "$GITHUB_STEP_SUMMARY"
@@ -143,6 +170,13 @@ jobs:
     if: always()
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
+    env:
+      # #1341 D — miroir de jobs.mesure.strategy.matrix.include : toute part
+      # ajoutée, retirée ou renumérotée là-bas doit l'être ici, et
+      # tests/test_carte_parts_completes.py refuse la divergence.
+      PARTS_MESURE: >-
+        mesure-psycopg-1 mesure-psycopg-2 mesure-psycopg-3 mesure-psycopg-4
+        mesure-psql-1 mesure-psql-2
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -160,11 +194,22 @@ jobs:
           key: carte-${{ github.sha }}
           restore-keys: carte-
       - name: fusion des mesures
+        env:
+          RESULTAT_MESURE: ${{ needs.mesure.result }}
         run: |
+          # #1341 D : aucune carte n'est publiée à partir d'une mesure
+          # incomplète. Le résultat de la matrice attrape la part annulée
+          # (plafond, runner perdu) ; --attendu attrape l'artefact publié sans
+          # durées et la part absente du disque.
+          if [ "$RESULTAT_MESURE" != "success" ]; then
+            echo "::error::mesure $RESULTAT_MESURE : carte non publiée (part en échec ou annulée)"
+            exit 1
+          fi
           if [ -f carte/carte.json.gz ]; then mv carte/carte.json.gz carte/precedente.json.gz; fi
           mkdir -p carte
           python scripts/map.py merge --output carte/carte.json.gz \
-            --previous carte/precedente.json.gz --summary "$GITHUB_STEP_SUMMARY" mesures/*
+            --previous carte/precedente.json.gz --summary "$GITHUB_STEP_SUMMARY" \
+            --attendu "$PARTS_MESURE" mesures/*
           rm -f carte/precedente.json.gz
       - uses: actions/upload-artifact@v4
         with:
