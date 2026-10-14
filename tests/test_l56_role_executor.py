@@ -115,6 +115,42 @@ class RoleExecutorTest(PgTestCase):
         finally:
             db.close()
 
+    def test_host_reads_a_real_cluster_identity(self):
+        """Codex r6: the event stream's position carries the cluster; a host
+        login, read-only like `ameesh serve`, must get a real one, not
+        `none` (every resume a reset). Revoked from PUBLIC (hardened
+        server): the script warns, and the superuser's grant restores it."""
+        from ameesh import storage
+
+        def cluster():
+            cfg = dataclasses.replace(self.cfg, dsn=self.host_dsn(), read_only=True)
+            db = db_mod.connect(cfg)
+            try:
+                return storage.of(db).events.bounds()["cluster"]
+            finally:
+                db.close()
+
+        own = storage.of(self.db).events.bounds()["cluster"]
+        self.assertRegex(own, "^[0-9a-f]{1,16}t[0-9a-f]{8}$")
+        self.assertEqual(cluster(), own)
+        functions = ("pg_control_system(), pg_control_checkpoint(),"
+                     " pg_current_wal_lsn(), pg_walfile_name(pg_lsn)")
+        # pg_catalog is per database: this test's own database only
+        self.addCleanup(self.db.execute,
+                        "GRANT EXECUTE ON FUNCTION %s TO PUBLIC" % functions)
+        self.addCleanup(self.db.execute, "REVOKE EXECUTE ON FUNCTION %s FROM %s" % (
+            functions, db_mod.quote_ident(self.role)))
+        self.db.execute("REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC")
+        self.assertIsNone(cluster())
+        proc = self.run_script(self.role)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("may not execute pg_control_system()", proc.stderr)
+        self.db.execute("GRANT EXECUTE ON FUNCTION %s TO %s" % (
+            functions, db_mod.quote_ident(self.role)))
+        self.assertEqual(cluster(), own)
+        proc = self.run_script(self.role)
+        self.assertNotIn("may not execute", proc.stderr)
+
     def test_executor_cannot_forge_execution_proof_or_rewrite_policy(self):
         import json
         ModuleStore(self.db).replace("", modules.declarations(federation()))
@@ -147,6 +183,42 @@ class RoleExecutorTest(PgTestCase):
         # The trusted policies are unchanged and direct storage still refuses closure.
         with self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
+
+    def test_event_log_grant_reaches_an_isolated_writer(self):
+        """R2 auditeur P2-2: migration 0396's triggers write `ameesh_events`
+        with the writer's rights. An isolated writer granted table by table
+        before the migration (role-module-writers.sql, no ALTER DEFAULT
+        PRIVILEGES) gets 'permission denied for table ameesh_events' and can
+        no longer journal; the migration hands it the log's INSERT right."""
+        q = db_mod.quote_ident
+        role = "t_events_writer_" + uuid.uuid4().hex[:8]
+        self.db.execute("CREATE ROLE %s" % q(role))
+        self.addCleanup(self.db.execute, "DROP ROLE %s" % q(role))
+        self.addCleanup(self.db.execute, "DROP OWNED BY %s" % q(role))
+        self.db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(role)))
+        self.db.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s"
+                        " TO %s" % (q(self.schema), q(role)))
+        self.db.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %s TO %s"
+                        % (q(self.schema), q(role)))
+        # the grant a protected deployment took before migration 0396 existed
+        self.db.execute("REVOKE ALL ON ameesh_events FROM %s" % q(role))
+        self.db.execute("REVOKE ALL ON SEQUENCE ameesh_events_id_seq FROM %s" % q(role))
+        lot = work.add(self.db, title="journal", app="demo")["id"]
+        insert = ("INSERT INTO work_item_events (work_item_id, state, actor)"
+                  " VALUES (%d, 'build', 'writer')" % lot)
+        with self.assertRaises(db_mod.DbError) as refused, self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            tx.execute(insert)
+        self.assertIn("permission denied for table ameesh_events", str(refused.exception))
+        self.db.execute("SELECT ameesh_events_grant_writers()")
+        before = self.db.query("SELECT count(*) AS n FROM ameesh_events"
+                               " WHERE object = 'lot:%d'" % lot)[0]["n"]
+        with self.db.transaction() as tx:
+            tx.execute("SET LOCAL ROLE %s" % q(role))
+            tx.execute(insert)
+        self.assertEqual(
+            self.db.query("SELECT count(*) AS n FROM ameesh_events"
+                          " WHERE object = 'lot:%d'" % lot)[0]["n"], before + 1)
 
     def test_module_writer_role_contract_and_executor_separation(self):
         q = db_mod.quote_ident
