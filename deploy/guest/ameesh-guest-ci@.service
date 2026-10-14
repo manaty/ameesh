@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# One GitHub Actions runner of the ameesh GUEST on a lending host (lot
+# #1256): temporary capacity borrowed from an existing CI VM of another
+# project, never a runner of the host's own application. Installed by
+# deploy/guest/ci-runners.sh, as root, once the L159b (install.sh) and L159g
+# (install-pilot.sh) stack is in place.
+#
+# The unit is deliberately NOT installed by the runner's own `svc.sh`: its
+# units are named `actions.runner.<org>-<repo>.<name>.service`, the pattern
+# the guard counts as the APPLICATION's activity (`busy_units`). A guest
+# runner must never count as the application, nor ever be stopped by a
+# cleanup aimed at `actions.runner.*`.
+[Unit]
+Description=ameesh GitHub Actions runner %i (guest on a lending host)
+Documentation=https://github.com/manaty/ameesh/blob/main/deploy/guest/PILOT-ci-nexlink.md
+After=network-online.target
+Wants=network-online.target
+# a volume in /etc/fstab that did not mount: no start on the root disk
+RequiresMountsFor=/srv/ameesh-guest
+
+[Service]
+Type=simple
+# The guest's own unprivileged user: no password, no sudo, no docker group
+# (install.sh refuses it). Rootless Podman gives the jobs their containers.
+User=ameesh-guest
+Slice=ameesh-guest.slice
+# Rootless Podman creates the containers' cgroups under this unit's cgroup,
+# inside the guest's slice: the slice's CPU/memory caps cover the containers
+# too, and stopping the slice kills them with the runner.
+Delegate=yes
+WorkingDirectory=/srv/ameesh-guest/ci/r%i
+Environment=HOME=/srv/ameesh-guest/home
+# /srv/ameesh-guest/bin holds the `docker` shim that the runner and its
+# service containers use (rootless Podman, never /run/docker.sock)
+Environment=PATH=/srv/ameesh-guest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AMEESH_GUEST=ci
+ExecStart=/srv/ameesh-guest/ci/r%i/run.sh
+Restart=on-failure
+RestartSec=5
+# a job the guard or the operator stops gets its SIGTERM first; the listener
+# forwards it to Runner.Worker and the job ends
+TimeoutStopSec=180
+KillMode=mixed
+# under a whole-host OOM the guest goes before the application
+OOMScoreAdjust=500
+TasksMax=4096
+# Light hardening only: rootless Podman needs newuidmap (a setuid helper),
+# /dev/fuse and its own sysctls in the container namespaces, so the strict
+# profile of the agent unit (NoNewPrivileges, PrivateDevices, ProtectSystem)
+# would break it. The isolation of the guest rests on the user, the slice and
+# the rootless containers, not on these keys.
+PrivateTmp=yes

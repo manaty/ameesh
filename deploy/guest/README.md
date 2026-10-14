@@ -15,6 +15,7 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 | `../../src/ameesh/platform/offload_shell.py` | the VM side, installed as `/usr/local/lib/ameesh-guest/ameesh-offload-shell`; standard library only |
 | `job-postgres.sh` | a throwaway Postgres per job, rootless Podman (`/usr/local/lib/ameesh-guest/job-postgres`) |
 | `profiles/*.json` | what a job gets before its command: dependency cache, variables, hooks (`/etc/ameesh-guest/profiles/`) |
+| `ci-runners.sh`, `ameesh-guest-ci@.service` | lot #1256: GitHub Actions runners of the guest, for a temporary loan of CI capacity from another project's VM; plan and gates in [`PILOT-ci-nexlink.md`](PILOT-ci-nexlink.md) |
 
 ## Owner's steps
 
