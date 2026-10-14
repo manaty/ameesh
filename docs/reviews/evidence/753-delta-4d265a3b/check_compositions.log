@@ -1,0 +1,7 @@
+753: 7/10 blobs unchanged; changed: ['src/ameesh/runner.py', 'src/ameesh/storage/postgres/operations.py', 'tests/parts/pilote-psql.txt']
+753: actual tree = independent merge-tree: bb4916a9db4151c07a0481acf9a1d108add94aff
+753: src/ameesh/runner.py only changed definition: Runner.canon_sync_once = main
+753: src/ameesh/storage/postgres/operations.py only changed definition: Operations.adopt = main
+753: both PostgreSQL test modules present exactly once
+753: contract exact: 63 admitted + 324 refused = 387
+1104: union tree: b4c6fa9ba726af9d9cec153ce2e26b39642ca34b ; only _author changed = main; _repo_of_agent unchanged
