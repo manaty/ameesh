@@ -210,3 +210,28 @@ class ApiTest(ServerMixin, unittest.TestCase):
         for url in ("http://example.org", "https://user:secret@example.org", "file:///tmp/token"):
             with self.assertRaises(ValueError):
                 peek.read_api(url, str(token_path), "worker", 3)
+
+
+from tests.test_l108_executor_server import ServeurExecTest, OWNER
+
+
+class ExecutorTest(ServeurExecTest):
+    FENCE = ("inge-front", OWNER, 42)
+
+    def test_peek_publication_is_scoped_fenced_sanitised_and_not_readable_to_executor(self):
+        name = "operations.publish_peek"
+        payload = {"events": [{"kind": "message", "summary": "Ready TOKEN=PRIVATE"},
+                              {"kind": "thought", "summary": "PRIVATE"}]}
+        result = self.op(name, ["inge-front", OWNER, 42, payload], fence=self.FENCE)
+        self.assertEqual(result.status, 200, result.body)
+        self.assertTrue(result.body["value"])
+        self.assertNotIn("PRIVATE", json.dumps(self.db.query("SELECT payload FROM agent_peek")))
+        self.assertEqual(self.op("operations.read_peek", ["inge-front", "human:owner"]).status, 404)
+        self.assertEqual(self.op(name, ["coord", OWNER, 42, payload],
+                                 fence=("coord", OWNER, 42)).status, 403)
+        self.hold("inge-front", OWNER, 43)
+        stale = self.op(name, ["inge-front", OWNER, 42, payload], fence=self.FENCE)
+        self.assertEqual(stale.status, 200)
+        self.assertFalse(stale.body["value"])
+        self.assertEqual(self.db.query("SELECT lease_epoch FROM agent_peek")[0]["lease_epoch"], 42)
+
