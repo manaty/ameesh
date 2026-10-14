@@ -137,6 +137,29 @@ class PlatformTest(unittest.TestCase):
                     open(autre, "w").close()
                     self.assertEqual(platform.holders(autre, "sid-absent"), [])
 
+    def test_une_session_citee_n_est_pas_un_detenteur(self):
+        """#1283 : un argv qui CITE l'id (brief JSON, message) n'est pas une
+        reprise en cours ; seuls les sélecteurs de session le nomment."""
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin = os.path.join(tmp, "session.jsonl")
+            open(chemin, "w").close()
+            sid = "sid-l63-cite-xyz"
+            pret = {nom: os.path.join(tmp, "pret-" + nom)
+                    for nom in ("citant", "repris", "lie")}
+            code = "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)"
+            citant = self._child(code, pret["citant"], "--json",
+                                 '{"brief": "reprends la session %s"}' % sid)
+            repris = self._child(code, pret["repris"], "--resume", sid)
+            lie = self._child(code, pret["lie"], "--resume=%s" % sid)
+            self._wait(lambda: all(os.path.exists(p) for p in pret.values()))
+            for nom, ctx in self.variants:
+                with self.subTest(nom), ctx():
+                    found = {h["pid"]: h for h in
+                             platform.holders(chemin, sid, session=True)}
+                    self.assertNotIn(citant.pid, found)
+                    self.assertIn(repris.pid, found)
+                    self.assertIn(lie.pid, found)
+
     def test_detenteurs_d_un_dossier(self):
         with tempfile.TemporaryDirectory() as tmp:
             dossier = os.path.join(tmp, "session")
