@@ -23,6 +23,7 @@
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
+test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit

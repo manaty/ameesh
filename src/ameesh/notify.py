@@ -144,6 +144,9 @@ TYPE_LABELS = {
     "long_turn": "long turn",
     "session_too_big": "session too big",
     "stale_lot": "stale lot",
+    # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
+    # humains si le type est dans `notify.types`
+    "slo_breach": "internal deadline (SLO) overdue",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
@@ -838,6 +841,14 @@ class Router:
 
     def resolve(self, alert: dict) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
+        if "owner" in (alert.get("targets") or ()):
+            # #789 t2 (canon §9) : un dépassement critique (P1) escalade au
+            # propriétaire — `notify.default_human`, comme le dit la
+            # documentation de ce module. La cible prime le `responsible` de
+            # l'agent, qui peut être un pilote : un P1 ne s'arrête pas à lui.
+            human = normalize_human(self.ncfg.default_human)
+            if human:
+                return human, "defaut"
         if alert.get("type") == "module_deviation":
             # A project procedure finding belongs to the lot, even when its
             # assignee (or their host/responsible human) belongs elsewhere.
@@ -967,7 +978,10 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
-         "decision", "grouped")
+         "decision", "grouped",
+         # #789 t2 (canon §9) : un P1 garde son niveau et ses cibles dans
+         # l'état — la livraison au propriétaire et la résolution les relisent
+         "critical", "targets")
 
 
 # --------------------------------------------------------------------------
@@ -1012,7 +1026,16 @@ class Notifier:
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
         notifications = group_orphan_lots(current, router.resolve)
-        wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
+        # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
+        # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
+        # perd pas — elle atteint l'humain même si son type a été retiré de
+        # `notify.types` ; c'est le comportement par défaut qui tient le
+        # contrat « un P1 escalade au propriétaire ». Les dépassements
+        # ordinaires restent filtrables : `slo_breach` s'ajoute à
+        # `notify.types` pour les recevoir sur les canaux humains.
+        wanted = {key_of(a): a for a in notifications
+                  if a.get("type") in self.ncfg.types
+                  or "owner" in (a.get("targets") or ())}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
         # Persisted deliveries from an older routing policy must not retry or
@@ -1026,7 +1049,8 @@ class Notifier:
             if key in wanted:
                 continue
             entry = active.pop(key)
-            if entry["alert"].get("type") not in self.ncfg.types:
+            if entry["alert"].get("type") not in self.ncfg.types \
+                    and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
@@ -1325,8 +1349,11 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
-            if kind in URGENT_TYPES:
-                payload["urgent"] = True        # L242b (5) : le point de l'auditeur
+            # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
+            # (un P1) est propagée au courrier d'agent ; le type reste la
+            # règle générale (L242b (5) : le point de l'auditeur).
+            if kind in URGENT_TYPES or alert.get("urgent"):
+                payload["urgent"] = True
             for field_ in ("module", "rule", "project", "declaration_id", "subject",
                            "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):
