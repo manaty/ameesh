@@ -1,0 +1,20 @@
+{
+  "family": "Codex",
+  "base": "35fa99950463029afbbd419216d2f70e749d4093",
+  "head": "30bb9f38961bc11a4a7bfe4ac8af6eb5cf73bd60",
+  "changed_files": [
+    "deploy/sql/role-superviseur.sql"
+  ],
+  "columns_added_to_read_contract": [
+    "produced_at",
+    "source"
+  ],
+  "other_contract_bytes_identical": true,
+  "grant_engine_bytes_identical": true,
+  "source_is_agent_name": true,
+  "write_privileges_added": false,
+  "executed_sql_or_tests": false,
+  "blobs": {
+    "deploy/sql/role-superviseur.sql": "4aa378c4ac5c108ac4d63a50437dc4ed5b2576a4"
+  }
+}
