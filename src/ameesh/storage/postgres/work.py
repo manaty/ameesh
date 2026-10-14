@@ -118,6 +118,36 @@ MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
+#: §4 canon : le verrou consultatif d'un agent sérialise la prise sous la
+#: limite d'en-cours (`assign_capped`) — le schéma entre dans la clé, deux
+#: schémas du même serveur (tests, registres) ne se bloquent pas.
+_WIP_LOCK = ("SELECT pg_advisory_xact_lock("
+             "hashtextextended(current_schema() || %s, 0))")
+_WIP_LOCK_PREFIX = "ameesh-wip:"
+
+
+def requeued_sql(alias: str) -> str:
+    """§4 : le lot `alias` a-t-il été RENDU à la file — un `build` dont le
+    journal porte `interface.RETURNED_NOTE` APRÈS sa dernière attribution
+    (`interface.ASSIGN_NOTE_PREFIXES`). Un lot `build` sans assigné qui n'a pas
+    été rendu (prérequis, travail confié par courrier) n'est donc pas prenable.
+
+    Fragment SQL booléen, jamais dans une chaîne passée à `%` (ses `%s` sont
+    des paramètres) ; il attend les paramètres `REQUEUED_PARAMS`, dans l'ordre
+    du texte : la note de retour, puis un paramètre par préfixe d'attribution
+    (un `unnest(%s::text[])` recevrait un littéral de tableau dépendant du
+    pilote : chaque préfixe est donc son propre `%s`)."""
+    starts = " OR ".join(["starts_with(d.note, %s)"] * len(interface.ASSIGN_NOTE_PREFIXES))
+    return ("EXISTS (SELECT 1 FROM work_item_events r"
+            " WHERE r.work_item_id = {a}.id AND starts_with(r.note, %s)"
+            "   AND r.id > coalesce((SELECT max(d.id) FROM work_item_events d"
+            "                        WHERE d.work_item_id = {a}.id"
+            "                          AND (" + starts + ")), 0))"
+            ).format(a=alias)
+
+
+#: les paramètres du fragment `requeued_sql`, dans l'ordre du texte
+REQUEUED_PARAMS = (interface.RETURNED_NOTE,) + tuple(interface.ASSIGN_NOTE_PREFIXES)
 
 #: #540 : verrou de transaction d'un agent : « a-t-il déjà un lot non démarré ? »
 #: et l'attribution qui suit passent l'une après l'autre
@@ -442,39 +472,61 @@ class WorkItems(interface.WorkItems):
         en cours est effacée (issue `annulee` au registre). #540 :
         `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
-            if ready_only:
-                # Même verrou que les éditions du graphe : une dépendance ne
-                # peut apparaître entre le contrôle et l'attribution. Verrouiller
-                # aussi les amonts empêche leur réouverture pendant la prise.
-                tx.execute(_DEPENDENCIES_LOCK)
-                rows = tx.query(
-                    "SELECT id, state, assignee FROM work_items"
-                    " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
-                    "                         WHERE work_item_id = %s)"
-                    " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
-                item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
-                if current is not None or item is None or item["state"] != "intake" \
-                        or item["assignee"] is not None:
-                    return None
-                if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
-                       for r in rows):
-                    return None
-            behind = None
-            if (queued_note is not None or take) and assignee:
-                lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
-                               " WHERE id = %s FOR UPDATE", (int(item_id),))
-                if lot and lot[0]["fresh"]:
-                    behind = WorkItems(tx)._pending(assignee, int(item_id))
-            if behind is not None and take:
-                raise interface.PendingLot(behind)
-            if behind is not None:
-                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
-                                  else (None, queued_note.format(lot=behind)))
-            row = WorkItems(tx)._reassign(item_id, assignee, current,
-                                          "intake" if ready_only else None, note, actor)
-            if row is not None and behind is not None:
-                row["forced_behind" if forced_note else "queued_behind"] = behind
-            return row
+            return WorkItems(tx)._assign_locked(
+                item_id, assignee, current=current, note=note, actor=actor,
+                queued_note=queued_note, forced_note=forced_note, take=take,
+                ready_only=ready_only)
+
+    def _assign_locked(self, item_id, assignee, *, current, note, actor,
+                       queued_note=None, forced_note=None, take=False,
+                       ready_only=False) -> dict | None:
+        """Corps de `assign`, dans la transaction ouverte (`self.db`) : partagé
+        avec `assign_capped`, qui prend en plus le verrou consultatif de
+        l'agent et compte ses lots en `build` avant d'appeler ce corps. La
+        prise automatique vérifie donc le lot non démarré (#540), les
+        dépendances (L165) et le plafond §4 sous le même verrou.
+
+        `ready_only` accepte un lot `intake` ou un lot `build` RENDU à la file
+        (§4, `requeued_sql`) : ce dernier garde son état à l'attribution."""
+        if ready_only:
+            # Même verrou que les éditions du graphe : une dépendance ne
+            # peut apparaître entre le contrôle et l'attribution. Verrouiller
+            # aussi les amonts empêche leur réouverture pendant la prise.
+            self.db.execute(_DEPENDENCIES_LOCK)
+            rows = self.db.query(
+                "SELECT id, state, assignee,"
+                "       (state = 'build' AND " + requeued_sql("work_items")
+                + ") AS returned_to_queue"
+                "  FROM work_items"
+                " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
+                "                         WHERE work_item_id = %s)"
+                " ORDER BY id FOR UPDATE",
+                REQUEUED_PARAMS + (int(item_id), int(item_id)))
+            item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
+            if current is not None or item is None or item["assignee"] is not None \
+                    or (item["state"] != "intake" and not item["returned_to_queue"]):
+                return None
+            if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
+                   for r in rows):
+                return None
+            ready_state = item["state"]
+        else:
+            ready_state = None
+        behind = None
+        if (queued_note is not None or take) and assignee:
+            lot = self.db.query("SELECT started_at IS NULL AS fresh FROM work_items"
+                                " WHERE id = %s FOR UPDATE", (int(item_id),))
+            if lot and lot[0]["fresh"]:
+                behind = self._pending(assignee, int(item_id))
+        if behind is not None and take:
+            raise interface.PendingLot(behind)
+        if behind is not None:
+            assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                              else (None, queued_note.format(lot=behind)))
+        row = self._reassign(item_id, assignee, current, ready_state, note, actor)
+        if row is not None and behind is not None:
+            row["forced_behind" if forced_note else "queued_behind"] = behind
+        return row
 
     def _pending(self, assignee, item_id) -> int | None:
         """#540, dans la transaction ouverte et sous le verrou de l'agent : son
@@ -533,6 +585,70 @@ class WorkItems(interface.WorkItems):
             (actor or "", int(item_id)))
         self._event(int(item_id), rows[0]["state"], note, actor)
         return rows[0]
+
+    def count_builds(self, assignee) -> int:
+        """§4 canon (owner 14/10/2026) : les lots en `build` de l'agent, tous
+        projets confondus."""
+        rows = self.db.query(
+            "SELECT count(*)::int AS n FROM work_items"
+            " WHERE assignee = %s AND state = 'build'", (str(assignee),))
+        return int(rows[0]["n"]) if rows else 0
+
+    def assign_capped(self, item_id, assignee, *, current, note, actor,
+                      max_build, queued_note=None, forced_note=None, take=False,
+                      ready_only=False) -> dict | None:
+        """`assign` sous la limite d'en-cours (§4), en UNE transaction : le
+        verrou consultatif de l'agent est pris AVANT le compte, puis ses lots
+        en `build` sont comptés et l'assignation n'est écrite que sous le
+        plafond. Deux prises simultanées du même agent ne peuvent donc pas
+        franchir `max_build` ; None si le plafond est atteint ou si le lot a
+        bougé (assigné `current` ou fermé).
+
+        Reprend les options de `assign` (#540 `take`/`queued_note`/
+        `forced_note`, L165 `ready_only`) : le lot non démarré, les dépendances
+        et le plafond §4 sont vérifiés sous le même verrou."""
+        with self.db.transaction() as tx:
+            tx.query(_WIP_LOCK, (_WIP_LOCK_PREFIX + str(assignee),))
+            rows = tx.query(
+                "SELECT count(*)::int AS n FROM work_items"
+                " WHERE assignee = %s AND state = 'build'", (str(assignee),))
+            if rows and int(rows[0]["n"]) >= int(max_build):
+                return None
+            return WorkItems(tx)._assign_locked(
+                item_id, assignee, current=current, note=note, actor=actor,
+                queued_note=queued_note, forced_note=forced_note, take=take,
+                ready_only=ready_only)
+
+    def unassign(self, item_id, *, current, note, actor) -> dict | None:
+        """§4 : rend le lot à la file — l'assignation est retirée s'il a encore
+        l'assigné `current` et n'est ni fusionné ni fermé, et le journal part
+        dans la même transaction ; None sinon. Branche, tête de branche et
+        jalons ne sont pas touchés ; L40 : la délégation en cours est annulée
+        (le délégué n'a plus le lot)."""
+        with self.db.transaction() as tx:
+            return WorkItems(tx)._reassign(item_id, None, current, None, note, actor)
+
+    def wip_exceptions(self, item_ids, marker, prefixes) -> list[int]:
+        """§4 : parmi `item_ids`, ceux dont la DERNIÈRE attribution porte
+        `marker` dans sa note — l'exception pilote explicite à la limite
+        d'en-cours. Une attribution est une note commençant par l'un des
+        `prefixes` ; une réassignation postérieure sans le marqueur retire
+        l'exception."""
+        ids = [int(i) for i in item_ids]
+        prefixes = list(prefixes or ())
+        if not ids or not prefixes:
+            return []
+        marks = ", ".join(["%s"] * len(ids))
+        starts = " OR ".join(["starts_with(note, %s)"] * len(prefixes))
+        rows = self.db.query(
+            "SELECT e.work_item_id AS id FROM work_item_events e"
+            " JOIN (SELECT work_item_id, max(id) AS id FROM work_item_events"
+            "        WHERE work_item_id IN (" + marks + ")"
+            "          AND (" + starts + ")"
+            "        GROUP BY work_item_id) last ON last.id = e.id"
+            " WHERE position(%s in e.note) > 0",
+            tuple(ids) + tuple(prefixes) + (str(marker),))
+        return [int(r["id"]) for r in rows]
 
     def handoff(self, item_id, assignee, *, current, state, paused_prefix, note_prefix,
                 window_s, max_per_window, note, actor) -> dict | None:
@@ -1346,17 +1462,25 @@ class WorkItems(interface.WorkItems):
             return item
 
     def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:
-        where = ("state = 'intake' AND assignee IS NULL" if open_only
-                 else "state NOT IN %s" % _CLOSED)
+        # §4 : un élément `build` RENDU à la file (limite d'en-cours) reste
+        # prenable, comme un lot de l'équipe ; un `build` en cours, non.
+        params: tuple = ()
+        if open_only:
+            where = ("(state = 'intake' OR (state = 'build' AND "
+                     + requeued_sql("work_items") + ")) AND assignee IS NULL")
+            params = REQUEUED_PARAMS
+        else:
+            where = "state NOT IN %s" % _CLOSED
         if ready_only:
             where += (" AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                       "                      JOIN work_items b ON b.id = d.blocker_id"
                       "                     WHERE d.work_item_id = work_items.id"
                       "                       AND b.state NOT IN %s)" % _CLOSED)
-        return self.db.query(
-            "SELECT %s FROM work_items WHERE type = 'improvement' AND %s"
-            " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
-            " LIMIT %%s" % (item_columns(self.db), where), (int(limit),))
+        sql = ("SELECT " + item_columns(self.db) + " FROM work_items"
+               " WHERE type = 'improvement' AND " + where
+               + " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
+               " LIMIT %s")
+        return self.db.query(sql, params + (int(limit),))
 
     def auto_takes_since(self, seconds, note_prefix) -> int:
         rows = self.db.query(
@@ -1366,34 +1490,39 @@ class WorkItems(interface.WorkItems):
         return int(rows[0]["n"]) if rows else 0
 
     def unassigned_lots(self, limit) -> list[dict]:
-        return self.db.query(
-            ("SELECT w.*,"
-            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
-            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
-            "       EXISTS (SELECT 1 FROM agent_mailbox b"
-            "                WHERE b.delivered_at IS NULL AND b.kind = 'request'"
-            "                  AND (b.payload -> 'decision') IS NOT NULL"
-            "                  AND btrim(b.work_item_id) = w.id::text) AS pending_decision,"
-            "       EXISTS (SELECT 1 FROM commitments c"
-            "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
-            "                  AND c.status IN ('proposed', 'open')) AS decision_milestone"
-            "  FROM (SELECT %s,"
-            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
-            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
-            "          FROM work_items"
-            "         WHERE state = 'intake' AND assignee IS NULL"
-            "           AND type <> 'improvement'"
-            "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
-            "                             JOIN work_items b ON b.id = d.blocker_id"
-            "                            WHERE d.work_item_id = work_items.id"
-            "                              AND b.state NOT IN " + _CLOSED + ")) w"
-            "  LEFT JOIN work_packages k ON k.id = w.package_id"
-            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
-            " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
-            "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
-            "          w.created_ts, w.id"
-            " LIMIT %%s") % item_columns(self.db), (int(limit),))
+        sql = ("SELECT w.*,"
+               "       (w.state = 'build' AND " + requeued_sql("w") + ") AS returned_to_queue,"
+               "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+               "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+               "       EXISTS (SELECT 1 FROM agent_mailbox b"
+               "                WHERE b.delivered_at IS NULL AND b.kind = 'request'"
+               "                  AND (b.payload -> 'decision') IS NOT NULL"
+               "                  AND btrim(b.work_item_id) = w.id::text) AS pending_decision,"
+               "       EXISTS (SELECT 1 FROM commitments c"
+               "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
+               "                  AND c.status IN ('proposed', 'open')) AS decision_milestone"
+               "  FROM (SELECT " + item_columns(self.db) + ","
+               "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+               "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+               "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+               "          FROM work_items"
+               "         WHERE (state = 'intake' OR (state = 'build' AND "
+               + requeued_sql("work_items") + "))"
+               "           AND assignee IS NULL"
+               "           AND type <> 'improvement'"
+               "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
+               "                             JOIN work_items b ON b.id = d.blocker_id"
+               "                            WHERE d.work_item_id = work_items.id"
+               "                              AND b.state NOT IN " + _CLOSED + ")) w"
+               "  LEFT JOIN work_packages k ON k.id = w.package_id"
+               "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+               " ORDER BY coalesce(w.priority, 2), (w.state = 'build') DESC,"
+               "          w.planned_start NULLS LAST,"
+               "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
+               "          w.created_ts, w.id"
+               " LIMIT %s")
+        # les deux fragments attendent les mêmes paramètres, dans l'ordre du texte
+        return self.db.query(sql, REQUEUED_PARAMS + REQUEUED_PARAMS + (int(limit),))
 
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(

@@ -39,6 +39,7 @@ from typing import Sequence
 
 from . import storage
 from .db import Db, DbError, is_unique_violation
+from .storage import interface
 from .storage.postgres import work as _pg
 
 STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
@@ -78,6 +79,22 @@ WAITING = {"blocked", "waiting_human"}
 CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
+#: §4 canon (owner 14/10/2026) : au plus 2 lots en développement (`build`) par
+#: agent ; les lots en surplus retournent à la file d'équipe. Règle générique,
+#: pour tous les projets et tous les agents.
+BUILD_LIMIT = 2
+#: §4 : marqueur d'une exception pilote EXPLICITE à la limite d'en-cours,
+#: portée par la note de la dernière attribution du lot (jamais une exemption
+#: silencieuse de qui a assigné le lot).
+WIP_EXCEPTION_MARK = "WIP exception"
+#: préfixes d'une note d'attribution — le journal les relit pour savoir si la
+#: dernière attribution d'un lot porte le marqueur d'exception (`wip_exceptions`)
+#: et si un retour §4 lui est postérieur (`storage.interface.ASSIGN_NOTE_PREFIXES`)
+ASSIGN_NOTES = interface.ASSIGN_NOTE_PREFIXES
+#: §4 : début de la note de journal d'un lot RENDU à la file — un lot `build`
+#: sans assigné n'est prenable par la prise automatique que s'il a été rendu
+#: ainsi (`storage.interface.RETURNED_NOTE`)
+RETURN_NOTE = interface.RETURNED_NOTE
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
 UNKNOWN_ACTOR = "inconnu"
 #: un commit de fusion déclaré (`merged --sha`)
@@ -795,9 +812,31 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
             "warning": "; ".join(warnings) or None}
 
 
+def is_pilot(cfg, db: Db, actor: str) -> bool:
+    """L'acteur a-t-il l'autorité du pilote ? — un humain, ou un orchestrateur
+    ou agent de conception (`assignments.is_orchestrator` avec
+    `CORRECTOR_ROLES`, la même autorité que `work move --correct`). Sert à
+    l'exception EXPLICITE à la limite d'en-cours (§4) : jamais une exemption
+    silencieuse."""
+    from . import assignments
+
+    name = (actor or "").strip()
+    if not name:
+        return False
+    if name.startswith(HUMAN_PREFIX):
+        return True
+    try:
+        return assignments.is_orchestrator(
+            cfg if cfg is not None else getattr(db, "cfg", None), db, name,
+            roles=CORRECTOR_ROLES)
+    except Exception:  # noqa: BLE001 - autorité illisible : pas d'exception
+        return False
+
+
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
-           force: str | None = None) -> dict:
+           force: str | None = None,
+           wip_exception: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -806,7 +845,13 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
     la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
     du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
-    pas son propre travail."""
+    pas son propre travail.
+
+    §4 : `wip_exception` (une raison non vide) pose une exception pilote
+    EXPLICITE à la limite d'en-cours — réservée à un humain ou à un pilote
+    (`is_pilot`), elle est écrite dans la note de la dernière attribution, et
+    le balayage (`ameesh work wip`) laisse alors le lot au-delà du plafond.
+    Elle s'efface à la réassignation suivante sans marqueur."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -814,11 +859,16 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
     _branch_args(branch, branch_target)
+    reason = " ".join(str(wip_exception).split()) if wip_exception is not None else ""
+    if wip_exception is not None and not reason:
+        raise WorkError("--wip-exception: a reason is required (the exception is "
+                        "explicit, never implicit)")
+    if reason and not is_pilot(cfg, db, actor):
+        raise WorkError("WIP exception refused: %s is neither a human nor an "
+                        "orchestrator/design agent; the exception to the §4 limit is "
+                        "explicit and reserved to the pilot" % (actor or "nobody"))
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
-    if previous == check["assignee"]:
-        if branch:
-            row = set_branch(db, item_id, branch, branch_target, actor=actor)
-            return {"item": row, "check": check, "previous": previous}
+    if previous == check["assignee"] and not branch and not reason:
         raise WorkError("lot %s already assigned to %s" % (item_id, previous))
     note = "assigned to %s%s (before: %s)%s" % (
         check["assignee"],
@@ -827,6 +877,8 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # L40 (0030) : la réassignation efface la délégation en cours
         "; delegation from %s cancelled" % item["delegated_by"]
         if item.get("delegated_by") and item.get("due_ts") else "")
+    if reason:
+        note += "; %s (pilot, %s): %s" % (WIP_EXCEPTION_MARK, actor or UNKNOWN_ACTOR, reason)
     queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
                           % (check["assignee"], previous or "nobody"))
     row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
@@ -900,6 +952,43 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
                 if item.get("state") != "intake" else
                 "an idle agent of team %s will take it (L165)" % team if team else
                 "it has no team: it waits for the orchestrator (%s)" % later))
+
+
+def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
+                    reason: str = "") -> dict:
+    """§4 : rend un lot à la file d'équipe — l'assignation est retirée (CAS sur
+    l'assigné lu, journal dans la même transaction) ; branche, tête de branche,
+    gels et avis (jalons) restent. Le lot garde son état, donc un agent libre le
+    reprend avec sa branche (`unassigned_lots`).
+
+    Autorité : l'assigné lui-même, un humain, ou un pilote (`is_pilot`) — un
+    agent ne rend pas le lot d'un autre."""
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] in MERGED_STATES or item["state"] == "closed":
+        raise WorkError("lot %s already %s: nothing to return" % (item_id, item["state"]))
+    current = (item.get("assignee") or "").strip()
+    if not current:
+        raise WorkError("lot %s has no assignee: already in the team queue" % item_id)
+    who = (actor or "").strip()
+    if who != current and not who.startswith(HUMAN_PREFIX) and not is_pilot(cfg, db, who):
+        raise WorkError("return refused: %s is neither the assignee (%s), a human, nor "
+                        "an orchestrator/design agent" % (who or "nobody", current))
+    note = "%s by %s (§4: at most %d lots in build per agent)" % (
+        RETURN_NOTE, who or UNKNOWN_ACTOR, BUILD_LIMIT)
+    if reason.strip():
+        note += ": %s" % " ".join(str(reason).split())
+    row = storage.of(db).work.unassign(item_id, current=current, note=note,
+                                       actor=who or UNKNOWN_ACTOR)
+    if row is None:
+        raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    return row
+
+
+def count_builds(db: Db, assignee: str) -> int:
+    """§4 : les lots en `build` de l'agent (tous projets)."""
+    return storage.of(db).work.count_builds(assignee)
 
 
 # --------------------------------------------------------------------------

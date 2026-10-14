@@ -336,9 +336,15 @@ class Operations(interface.Operations):
         # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
         reviewer = ("w.reviewer" if has_reviewer(self.db)
                     else "''::text AS reviewer")
+        # §4 : `returned_to_queue` distingue un lot `build` RENDU à la file
+        # (limite d'en-cours) d'un lot en cours sans assigné (prérequis,
+        # travail confié par courrier) — voir `work.requeued_sql`.
+        from .work import REQUEUED_PARAMS, requeued_sql
+
         sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, __REVIEWER__,
+                   (w.state = 'build' AND """ + requeued_sql("w") + """) AS returned_to_queue,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
@@ -357,7 +363,7 @@ class Operations(interface.Operations):
              LIMIT %s
             """).replace("__REVIEWER__", reviewer)
         return self.db.query(
-            sql, (int(limit) if limit is not None else None,))
+            sql, REQUEUED_PARAMS + (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:

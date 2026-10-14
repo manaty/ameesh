@@ -135,7 +135,11 @@ class Progress(interface.Progress):
                    p.turn  AS turn_label,
                    p.model AS turn_model,
                    (SELECT count(*) FROM agent_mailbox m
-                     WHERE m.recipient = r.name AND m.delivered_at IS NULL)::bigint AS unread
+                     WHERE m.recipient = r.name AND m.delivered_at IS NULL)::bigint AS unread,
+                   -- §4 (owner 14/10/2026) : l'en-cours de l'agent, tous
+                   -- projets confondus (le plafond est global)
+                   (SELECT count(*) FROM work_items w
+                     WHERE w.assignee = r.name AND w.state = 'build')::int AS builds
               FROM agent_registry r
               LEFT JOIN spend_pending p ON p.agent = r.name
         """

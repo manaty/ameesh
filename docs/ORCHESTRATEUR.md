@@ -59,6 +59,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   attend l'orchestrateur.
 * Ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté. Un orchestrateur ne se sert pas lui-même.
+* En-cours : un agent ne détient pas plus de 2 lots en `build`, tous projets
+  confondus (canon §4). La prise refuse le troisième, `ameesh work wip
+  --apply` rend le surplus à la file (le lot garde sa branche), et une
+  exception pilote est explicite : `ameesh work assign <id> <agent>
+  --wip-exception "raison"`.
 * Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
 * Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
   défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
