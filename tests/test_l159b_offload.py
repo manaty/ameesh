@@ -1397,6 +1397,48 @@ class JobLauncherTest(unittest.TestCase):
         self.assertIn("child %d" % errno.EAFNOSUPPORT, res.stdout)
 
     @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_filter_masks_the_domain_to_the_kernels_int(self):
+        # B3 of the R2 reading: the kernel reads `domain` as a 32-bit int while
+        # libseccomp had compared the whole 64-bit register, so a raw
+        # socket(0x100000001) started a real AF_UNIX socket under SCMP_CMP_EQ.
+        # The masked rule must refuse the widened domain and keep a widened
+        # AF_INET (same high bits, other family) allowed: the mask hides the
+        # bits the kernel ignores, it does not block everything above 32 bits.
+        try:
+            import ctypes
+            ctypes.CDLL(self.launcher.SECCOMP_SO)
+        except OSError:
+            self.skipTest("no %s on this host" % self.launcher.SECCOMP_SO)
+        probe = textwrap.dedent("""\
+            import ctypes, os, socket
+            lib = ctypes.CDLL("libseccomp.so.2")
+            lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+            lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+            nr = lib.seccomp_syscall_resolve_name(b"socket")
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+            def raw(domain):
+                ctypes.set_errno(0)
+                fd = libc.syscall(ctypes.c_long(nr),
+                                  ctypes.c_ulonglong(domain),
+                                  ctypes.c_ulonglong(socket.SOCK_STREAM),
+                                  ctypes.c_ulonglong(0))
+                err = ctypes.get_errno()
+                if fd >= 0:
+                    os.close(fd)
+                    return "fd"
+                return err
+            print("widened-unix", raw(0x100000001))
+            print("widened-inet", raw(0x100000002))
+            """)
+        res = subprocess.run([sys.executable, "-I", self.MODULE, "exec", "--",
+                              sys.executable, "-c", probe],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("widened-unix %d" % errno.EAFNOSUPPORT, res.stdout)
+        self.assertIn("widened-inet fd", res.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
     def test_the_filter_strips_the_manager_address(self):
         probe = ("import os;print(os.environ.get('XDG_RUNTIME_DIR'),"
                  "os.environ.get('DBUS_SESSION_BUS_ADDRESS'))")

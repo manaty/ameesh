@@ -73,9 +73,12 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   the launcher's `exec` installs a seccomp filter (libseccomp) before the
   payload's first instruction, so the job cannot reach its own user manager
   by rebuilding `/run/user/<uid>/bus` and start a unit outside its slice
-  (R1-B3 of #354). `socketpair` stays allowed (asyncio, multiprocessing).
-  The profile's hooks are root-owned install-side code and keep the manager
-  (rootless Podman); an uninstallable filter refuses the job.
+  (R1-B3 of #354). The rule compares the domain masked to the kernel's 32-bit
+  `int` (R2-B3: an equality test on the 64-bit register let
+  `socket(0x100000001)` start an AF_UNIX socket). `socketpair` stays allowed
+  (asyncio, multiprocessing). The profile's hooks are root-owned install-side
+  code and keep the manager (rootless Podman); an uninstallable filter
+  refuses the job.
 * One supervision for every phase: a cancel, the loss of the SSH session,
   the gate or the job's deadline (counted from its slot) end setup, hooks
   and command alike. The `after` hook still runs (teardown, 2 min at most).

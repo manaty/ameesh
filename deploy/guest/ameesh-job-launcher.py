@@ -27,14 +27,16 @@ refuses to run as root, so a misconfigured rule fails closed):
 The client's own code (`command`, `setup`) does not run under this launcher:
 it runs under the internal `exec` verb, inside the scope, which strips the
 manager's address from its environment and installs a seccomp filter denying
-`socket(AF_UNIX)` before the payload's first instruction. Removing the
-variables was not enough (B3 of the R1 review of #354): a same-UID payload
-reconstructed `/run/user/<uid>/bus` and asked the manager for a unit outside
-the job's slice. `socketpair(2)` stays allowed (asyncio, multiprocessing), and
-the filter cannot be removed: it is inherited across fork and exec, so the
-payload cannot reach the manager, not even through this launcher. The profile
-hooks (`before`, `after`) are root-owned install-side code (rootless Podman
-needs the manager) and keep it; they are never the payload's own code.
+`socket(AF_UNIX)` before the payload's first instruction (the rule masks the
+domain to the kernel's 32-bit `int`, so a widened domain is refused too).
+Removing the variables was not enough (B3 of the R1 review of #354): a
+same-UID payload reconstructed `/run/user/<uid>/bus` and asked the manager
+for a unit outside the job's slice. `socketpair(2)` stays allowed (asyncio,
+multiprocessing), and the filter cannot be removed: it is inherited across
+fork and exec, so the payload cannot reach the manager, not even through
+this launcher. The profile hooks (`before`, `after`) are root-owned
+install-side code (rootless Podman needs the manager) and keep it; they are
+never the payload's own code.
 """
 import errno
 import json
@@ -58,12 +60,21 @@ CLIENT_PHASES = ("command", "setup")
 #: the client's code never does
 BUS_ENV = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 #: the filter the payload runs under: `socket(AF_UNIX)` is refused, everything
-#: else (including socketpair) is allowed
+#: else (including socketpair) is allowed. The kernel reads `domain` as an
+#: `int` (32 bits) while libseccomp compares the whole 64-bit register: an
+#: equality test on `AF_UNIX` let `syscall(SYS_socket, 0x100000001, ...)`
+#: through (B3 of the R2 reading), so the rule masks the argument instead.
 SECCOMP_SO = "libseccomp.so.2"
 AF_UNIX = 1
 SCMP_ACT_ALLOW = 0x7FFF0000
 SCMP_ACT_ERRNO = 0x00050000 | (errno.EAFNOSUPPORT & 0xFFFF)
-SCMP_CMP_EQ = 4
+SCMP_CMP_MASKED_EQ = 7
+#: the width of the kernel's `int domain`, i.e. of every 32-bit `socket(2)`
+#: argument: anything above it is invisible to the syscall
+ARG_MASK32 = 0xFFFFFFFF
+#: the widened domain the self-test probes: AF_UNIX in the low word, a
+#: non-zero high word. `SCMP_CMP_EQ` alone let it start a real AF_UNIX socket
+WIDENED_AF_UNIX = 0x100000001
 PR_SET_NO_NEW_PRIVS = 38
 #: the environment of a job, as JSON on stdin: a profile plus the client's
 #: --env, never a secret (the job's own code gets it anyway)
@@ -108,15 +119,19 @@ def systemctl(*args: str) -> subprocess.CompletedProcess:
                           text=True, check=False)
 
 
-def install_socket_filter() -> None:
+def install_socket_filter() -> int:
     """Refuse `socket(AF_UNIX)` to this process and everything it starts.
 
     libseccomp resolves the syscall number for the running architecture; the
     rule only touches the `socket` syscall, `socketpair` is left alone. The
-    filter cannot be removed (seccomp filters stack, and this process sets
-    no_new_privs): a payload that reaches here can never reach the job's
-    user manager, whatever environment it reconstructs. Raises OSError when
-    the filter cannot be installed, so the caller fails closed."""
+    comparison masks the domain to the kernel's `int` width: an equality test
+    on the full 64-bit register was bypassed by `socket(0x100000001)` (B3 of
+    the R2 reading), which the kernel still reads as AF_UNIX. The filter
+    cannot be removed (seccomp filters stack, and this process sets
+    no_new_privs): a payload that reaches here can never reach the job's user
+    manager, whatever environment it reconstructs. Returns the resolved
+    syscall number, for the caller's own probes. Raises OSError when the
+    filter cannot be installed, so the caller fails closed."""
     import ctypes
 
     class ArgCmp(ctypes.Structure):
@@ -146,7 +161,9 @@ def install_socket_filter() -> None:
         nr = lib.seccomp_syscall_resolve_name(b"socket")
         if nr < 0:
             raise OSError(errno.ENOSYS, "libseccomp does not know socket(2)")
-        rule = ArgCmp(0, SCMP_CMP_EQ, AF_UNIX, 0)
+        # datum_a is the mask, datum_b the value (seccomp.h.in, scmp_arg_cmp):
+        # (arg & 0xffffffff) == AF_UNIX is what the kernel's int domain means
+        rule = ArgCmp(0, SCMP_CMP_MASKED_EQ, ARG_MASK32, AF_UNIX)
         rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ERRNO, nr, 1,
                                         ctypes.byref(rule))
         if rc != 0:
@@ -159,20 +176,22 @@ def install_socket_filter() -> None:
             raise OSError(-rc, "seccomp_load: %d" % rc)
     finally:
         lib.seccomp_release(ctx)
+    return nr
 
 
 def filter_selftest() -> int:
     """What the payload will really get, in a child that dies with it: AF_UNIX
-    refused, socketpair (asyncio, multiprocessing) allowed. 0 when the filter
-    works, 1 otherwise: `check` then refuses the job instead of running the
-    client's code unconfined."""
+    refused (plain and widened), socketpair (asyncio, multiprocessing)
+    allowed. 0 when the filter works, 1 otherwise: `check` then refuses the
+    job instead of running the client's code unconfined."""
     pid = os.fork()
     if pid < 0:
         return 1
     if pid == 0:
         code = 1
         try:
-            install_socket_filter()
+            nr = install_socket_filter()
+            import ctypes
             import socket
             try:
                 socket.socket(socket.AF_UNIX)
@@ -181,6 +200,20 @@ def filter_selftest() -> int:
                     raise
             else:
                 raise OSError(0, "AF_UNIX still allowed")
+            # B3 of the R2 reading: the kernel reads `domain` as an int, so a
+            # raw syscall with a non-zero high word is still AF_UNIX. The
+            # masked rule must refuse it; an unmasked one returned a live fd.
+            # Only the fd matters: on an architecture where socket(2) is
+            # multiplexed the raw probe cannot build a socket either way.
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+            fd = libc.syscall(ctypes.c_long(nr),
+                              ctypes.c_ulonglong(WIDENED_AF_UNIX),
+                              ctypes.c_ulonglong(socket.SOCK_STREAM),
+                              ctypes.c_ulonglong(0))
+            if fd >= 0:
+                os.close(fd)
+                raise OSError(0, "a widened AF_UNIX domain still allowed")
             left, right = socket.socketpair()
             left.close()
             right.close()
