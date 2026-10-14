@@ -51,8 +51,9 @@ FAKE_AMEESH = r'''#!/bin/sh
 echo "$0 $*" >> "$FAKE_STATE/argv.log"
 [ "$1 $2" = "show dev9" ] || exit 0
 scenario=$(cat "$FAKE_STATE/scenario")
-owner='"runner-dev9@host"' epoch=7 expires=1300
+owner='"runner-dev9@host"' epoch=7 expires=1300 st=idle
 [ "$scenario" = not-held ] && owner=null
+[ "$scenario" = stopped ] && st=stopped
 if [ -e "$FAKE_STATE/restarted" ]; then
   case $scenario in
     lease) epoch=9 ;;
@@ -61,8 +62,8 @@ if [ -e "$FAKE_STATE/restarted" ]; then
     expired) epoch=9 expires=900 ;;
   esac
 fi
-printf '{"name": "dev9", "status": "idle", "lease_owner": %s, "lease_epoch": %s, "lease_expires_ts": %s}\n' \
-  "$owner" "$epoch" "$expires"
+printf '{"name": "dev9", "status": "%s", "lease_owner": %s, "lease_epoch": %s, "lease_expires_ts": %s}\n' \
+  "$st" "$owner" "$epoch" "$expires"
 '''
 
 
@@ -168,6 +169,22 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dev9 : redémarré", proc.stdout)
         self.assertIn("no lease before the restart", proc.stdout)
+
+    def test_persona_stopped_in_the_registry_is_not_restarted(self):
+        # #1131 : un agent arrêté par le propriétaire (registre `stopped`) ne
+        # doit pas être réactivé par le déploiement (poste.sh comme vm.sh),
+        # même si son unité est encore active ; la persona est nommée et son
+        # unité laissée en place.
+        proc = self.restart("stopped")
+        # le marqueur `restarted` est aussi écrit par le redémarrage de
+        # ameesh-notify : on regarde l'unité de la persona dans le journal.
+        with open(os.path.join(self.state, "argv.log"), encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertNotIn("restart ameesh-runner-agent@dev9.service", log)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("dev9 : arrêté dans le registre", proc.stdout)
+        self.assertIn("ignorée", proc.stdout)
+        self.assertNotIn("dev9 : redémarré", proc.stdout)
 
     def test_active_unit_without_its_lease_fails_the_restart(self):
         for scenario in ("no-lease", "stale-lease", "other-owner", "expired"):

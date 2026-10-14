@@ -325,7 +325,9 @@ proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, e
 
 # Redémarre les unités $2… (base $1 : mesh | ancienne) une par une, chacune
 # au premier instant où sa persona n'est pas en tour. Une persona longue en
-# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout.
+# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout. Une
+# persona arrêtée dans le registre (`stopped`, arrêt du propriétaire) est
+# laissée telle quelle : son unité active n'est pas réactivée (#1131).
 redemarrer_liste() {
   local base=$1; shift
   local restantes=("$@") suivantes debut=$SECONDS u p st avant ligne heure tenu attendu
@@ -335,6 +337,13 @@ redemarrer_liste() {
       p=$(persona_de "$u")
       [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
       st=$(statut "$base" "$p")
+      # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
+      # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
+      # actives malgré le registre `stopped`).
+      if [ "$st" = stopped ]; then
+        echo "$p : arrêté dans le registre — unité $u ignorée, pas de redémarrage (systemctl --user disable --now $u pour la retirer)"
+        continue
+      fi
       if [ "$st" = running ]; then suivantes+=("$u"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \
