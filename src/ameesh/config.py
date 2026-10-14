@@ -239,7 +239,8 @@ class Config:
     critical_fallback_harnesses: tuple[str, ...] = ("codex", "deepseek")
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
-    session_max_turn_seconds: float = 900.0
+    #: #706 : au-dessus du plafond de tour par défaut (1800 s).
+    session_max_turn_seconds: float = 3600.0
     session_min_turns: int = 3
     #: plafond de contexte (L60) : au-delà de ce nombre de jetons d'entrée
     #: relus (cache compris) au dernier tour, la session est tournée avant le
