@@ -1082,10 +1082,12 @@ def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
-#: les jalons d'un lot : `requested` et `merged` sont automatiques (0013),
-#: `frozen` et `verdict` se déclarent par la CLI.
-MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed")
-MANUAL_KINDS = ("frozen", "verdict")
+#: les jalons d'un lot : `requested`, `merged` et `closed` sont automatiques
+#: (0013, 0026), `frozen`, `verdict`, `fire` et `unfire` se déclarent par la
+#: CLI — le feu (`fire`/`unfire`, #1374) par `ameesh work fire` seulement, qui
+#: vérifie qu'il porte sur le gel courant (`ameesh.fire`).
+MILESTONE_KINDS = ("requested", "frozen", "verdict", "fire", "unfire", "merged", "closed")
+MANUAL_KINDS = ("frozen", "verdict", "fire", "unfire")
 VERDICTS = ("ok", "blocked")
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
@@ -1123,10 +1125,14 @@ def milestone(
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
-    `frozen` (la branche est gelée pour la revue) et `verdict` (`ok` ou
-    `blocked`, avec le `sha` relu) sont les deux seuls : `requested` et `merged`
-    sont écrits automatiquement depuis les transitions (0013), les déclarer à la
-    main serait un mensonge sur la frise.
+    `frozen` (la branche est gelée pour la revue), `verdict` (`ok` ou
+    `blocked`, avec le `sha` relu), et `fire`/`unfire` (le feu du pilote et son
+    retrait, #1374) sont les seuls déclarés : `requested`, `merged` et `closed`
+    sont écrits automatiquement depuis les transitions (0013, 0026), les
+    déclarer à la main serait un mensonge sur la frise.
+
+    Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
+    porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))
