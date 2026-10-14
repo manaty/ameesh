@@ -120,6 +120,89 @@ class BacklogError(ValueError):
 
 
 # --------------------------------------------------------------------------
+# la route d'un défaut non bloquant (canon §2, owner du 15/10/2026)
+# --------------------------------------------------------------------------
+
+#: ce qui désigne une suite de relecture : N1/N2, P2, P3, « non bloquant »,
+#: « suite » d'un lot, « suivi »/« follow-up » d'un défaut. Le `N` seul est
+#: cherché en majuscule (`STANDALONE_N`) : le `n'` français n'est pas un N.
+FOLLOWUP_MARKERS = re.compile(
+    r"(?:^|[\s\[(\"«])("
+    r"n[0-9]+\b"                       # N1, N2…
+    r"|p[23]\b"                        # P2, P3
+    r"|non[ -]?bloquant\w*|pas bloquant"
+    # « Suite #956 », « L242c suite (N #414) », « suite de la R1 », « suite du
+    # lot » : la suite doit viser une référence. « suite à la demande de
+    # l'owner », « suite au courrier » sont du français ordinaire, pas une
+    # suite de relecture — la requête humaine garde son lot sans avertissement.
+    r"|suites?\s*(?:#|\(|n[0-9]|n\b|de la r[0-9]|du lot|r[0-9]\b)"
+    r"|suivi\b|follow[ -]?ups?\b"      # « suivi de », « follow-up »
+    r")", re.I)
+#: le « N » seul (majuscule), marqueur du canon pour un défaut non bloquant
+STANDALONE_N = re.compile(r"(?:^|[\s\[(\"«])N\b")
+#: ce qui dit explicitement « non bloquant » : N1/N, P2, P3 — un bloquant
+#: nommé (B1, P1, incident) ne l'emporte que s'il n'est pas démenti
+NON_BLOCKING = re.compile(
+    r"(?:^|[\s\[(\"«])(?:n[0-9]+\b|p[23]\b|non[ -]?bloquant\w*|pas bloquant)", re.I)
+
+#: une suite de **tests** n'est pas une suite de relecture
+TEST_SUITE = re.compile(
+    r"suites? (?:de |des |du )?tests?\b|tests?[ -]?suites?\b|suites? compl[eè]?tes?\b"
+    r"|suites? ci\b", re.I)
+#: un défaut bloquant (B/P1), un incident réel, une panne : le lot est légitime
+BLOCKING_DEFECT = re.compile(
+    r"(?:^|[\s\[(\"«])(?:b[0-9]+\b|bloquant\w*)|(?:^|[\s\[(\"«])p1\b"
+    r"|\bincidents?\b|\bpannes?\b|\bindisponib\w*|\br[eé]gressions?\b", re.I)
+#: « P2 sensible » : sur ameesh seulement, il garde son caractère bloquant
+SENSITIVE_P2 = re.compile(r"p2[^.;\n]{0,30}sensible|sensible[^.;\n]{0,30}p2", re.I)
+#: un lot de relecture après fusion est la règle, pas une suite de relecture
+REVIEW_LOT_TITLE = re.compile(r"^\s*revue\s*#", re.I)
+REVIEW_REF = "review-after-merge:"
+
+
+def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
+                  app: str = "") -> str:
+    """L'avertissement de route, ou "" : ce lot ressemble-t-il à une suite de
+    relecture (N, P2, P3) qui ne doit **pas** être un lot ?
+
+    Canon §2 (owner, 15/10/2026) : « un défaut non bloquant (N, P2, P3) ne
+    bloque jamais. Il ne crée pas de lot : il va au backlog (`ameesh work
+    backlog add`, avec sa valeur et son chantier), regroupé avec les autres
+    défauts mineurs du même chantier ». Sur ameesh, un P2 de la classe sensible
+    bloque encore : « P2 sensible » n'y est pas signalé (`app="ameesh"`), mais
+    l'est sur les autres projets, où la règle générale s'applique.
+
+    L'avertissement est **consultatif** : rien n'est refusé, une demande
+    d'humain et un incident réel passent. On ne signale que ce qui porte un
+    marqueur explicite de suite (N1/N2, P2/P3, « suite #lot », « suivi »,
+    « non bloquant »), jamais une suite de tests, un défaut bloquant (B/P1,
+    incident, panne) ni le lot de relecture après fusion lui-même."""
+    text = " ".join([str(title or ""), str(source or "")]).strip()
+    if not text:
+        return ""
+    if str(issue_ref or "").startswith(REVIEW_REF) \
+            or REVIEW_LOT_TITLE.search(str(title or "")):
+        return ""                       # la relecture après fusion est la règle
+    if TEST_SUITE.search(text):
+        return ""                       # une suite de tests n'est pas une suite
+    if SENSITIVE_P2.search(text) and str(app or "").strip().lower() == "ameesh":
+        return ""                       # ameesh : un P2 sensible bloque encore
+    marker = bool(FOLLOWUP_MARKERS.search(text) or STANDALONE_N.search(text))
+    if not marker:
+        return ""
+    if BLOCKING_DEFECT.search(text) and not (NON_BLOCKING.search(text)
+                                             or STANDALONE_N.search(text)):
+        return ""                       # un bloquant nommé garde son lot
+    where = " --app %s" % app if app else ""
+    short = " ".join(str(title or "").split())[:60]
+    return ("this looks like a non-blocking follow-up (N, P2, P3): canon §2 does not "
+            "create a lot for it — record it in the backlog "
+            "(`ameesh work backlog add --title \"%s\" --value \"<valeur attendue>\" "
+            "--score <1-100>`%s), grouped with the other minor defects of the same "
+            "workstream" % (short, where))
+
+
+# --------------------------------------------------------------------------
 # la file
 # --------------------------------------------------------------------------
 

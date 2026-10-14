@@ -235,7 +235,13 @@ def add(
     edge is written **in the same transaction** as the creation (parent still
     open), traced in the journal if the parent is already finished; an unknown
     parent is refused before any creation. No number is ever guessed from the
-    title or the body."""
+    title or the body.
+
+    Canon §2 (15/10/2026): the returned item carries `route_hint` when the
+    title or the source looks like a non-blocking follow-up (N, P2, P3) — the
+    route to the backlog, to be shown by the caller. Nothing is ever refused:
+    a human request, a blocking defect and the review-after-merge lot pass
+    unchanged."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -286,6 +292,14 @@ def add(
     analysis = deep_analysis.on_lot_created(db, item, actor=actor, cfg=cfg)
     if analysis is not None:
         item["deep_analysis"] = analysis
+    # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne crée pas de
+    # lot, elle va au backlog. L'avertissement est rendu par la création
+    # elle-même (tous les points d'entrée l'obtiennent) ; rien n'est refusé.
+    from . import backlog
+    hint = backlog.followup_hint(title=item.get("title") or title, source=source,
+                                 issue_ref=issue_ref or "", app=app or "")
+    if hint:
+        item["route_hint"] = hint
     return item
 
 

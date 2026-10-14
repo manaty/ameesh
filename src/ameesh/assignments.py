@@ -162,6 +162,11 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             out.update(created=True, assigned=True, branch=item.get("branch"))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
+            # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne
+            # crée pas de lot, elle va au backlog — le courrier l'avertit,
+            # sans rien refuser (`--new-lot` reste possible).
+            if item.get("route_hint"):
+                out["warnings"].append(item["route_hint"])
         elif lot is not None:
             item = resolve_lot(db, lot)
             if item is None:
