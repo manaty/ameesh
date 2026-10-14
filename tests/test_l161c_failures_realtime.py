@@ -282,6 +282,28 @@ class WatcherTest(PgTestCase):
         self.assertEqual(ci.Watcher(cfg, api=self.api).repos(), [])
         self.assertEqual(self.watcher.repos(), [DEPOT])
 
+    def test_run_vu_sans_branche_est_rattache_a_la_pose(self):
+        """#1321 : un run vu avant la pose de la branche du lot (work_item_id
+        NULL) est rattaché à la pose, et son verdict part à l'assigné."""
+        sha = "2" * 40
+        self.api.live = [run_view(210, sha, "agent/dev-a-210")]
+        self.watcher.tick(self.db)
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 210)["work_item_id"])
+        # toujours aucun lot sur cette branche : rien n'est inventé
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 210)["work_item_id"])
+        # la branche du lot est posée après la première vue du run
+        lot = work.add(self.db, title="L2 : branche posée tard",
+                       branch="agent/dev-a-210", assignee="dev-a")
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 210)["work_item_id"], lot["id"])
+        # la fin de l'exécution rend son verdict au lot rattaché
+        self.api.live = []
+        self.api.done[210] = {"status": "completed", "conclusion": "success"}
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("verdict", "dev-a")])
+        self.assertIn(": green.", self.mails("dev-a")[-1]["body"])
+
     def test_urgent_puis_ordinaire_puis_verdict(self):
         sha = "c" * 40
         self.api.live = [run_view(201, sha, "lot/1-un")]

@@ -319,12 +319,28 @@ class Watcher:
         return out
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
-        """Une exécution en cours : enregistrée si nouvelle ; elle remplace
-        les exécutions d'une autre tête sur la même branche (hors base)."""
+        """Une exécution en cours : enregistrée si nouvelle ; une exécution
+        connue sans lot rattaché l'est dès que la branche du lot est posée
+        (#1321) ; elle remplace les exécutions d'une autre tête sur la même
+        branche (hors base)."""
         st = storage.of(db)
         run_id = int(run["id"])
         known = st.ci.run(repo, run_id)
         if known is not None:
+            if known.get("work_item_id") is None:
+                # #1321 : la branche du lot peut être posée après la première
+                # vue du run ; sans ce rattachement, `_conclude` lit
+                # `recipient_of(None)` et le verdict part à personne.
+                # `open_run` est idempotent (coalesce côté stockage) : il ne
+                # remplit que le lien encore vide.
+                lot = lot_of_run(run, lots)
+                if lot is not None:
+                    st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
+                                   branch=run.get("head_branch") or "",
+                                   event=run.get("event") or "", base=base_of(run),
+                                   work_item_id=lot, url=run.get("html_url"))
+                    self.log("CI %s run %s: lot #%s linked (branch set later)"
+                             % (repo, run_id, lot))
             return []
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
