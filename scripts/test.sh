@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Suite de tests agent-mesh contre le conteneur Postgres local.
 #
-#   scripts/test.sh [motif unittest]
+#   scripts/test.sh [noms unittest… | -p motif.py | -k filtre]
 #
 # Deux passes : pilote `psql` (toujours disponible) puis pilote `psycopg` si un
 # venv local peut l'installer — les deux chemins de db.py sont ainsi couverts.
@@ -22,11 +22,32 @@ export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 # aucun réseau dans les tests : ni clé de fournisseur, ni relevé de solde (L26)
 unset DEEPSEEK_API_KEY AMEESH_DEEPSEEK_API_BASE
 export AMEESH_BALANCE_INTERVAL=0
-PATTERN=("$@")
+# Les noms qualifiés se chargent directement : discover les interpréterait
+# comme ses positionnels (start/pattern/top), parfois en lançant toute la suite.
+# Sans nom, conserver discovery, y compris ses filtres -p et -k documentés.
+NAMED=0
+OPTION_VALUE=0
+for ARG in "$@"; do
+  if [ "$OPTION_VALUE" = 1 ]; then
+    OPTION_VALUE=0
+    continue
+  fi
+  case "$ARG" in
+    -p|--pattern|-s|--start-directory|-t|--top-level-directory|-k|--durations)
+      OPTION_VALUE=1 ;;
+    -*) ;;
+    *) NAMED=1 ;;
+  esac
+done
+if [ "$NAMED" = 1 ]; then
+  TEST_ARGS=(-m unittest -v "$@")
+else
+  TEST_ARGS=(-m unittest discover -s tests -t . -v "$@")
+fi
 
 echo
 echo "=== pilote psql ==="
-AMEESH_DRIVER=psql python3 -m unittest discover -s tests -t . -v "${PATTERN[@]}"
+AMEESH_DRIVER=psql python3 "${TEST_ARGS[@]}"
 
 VENV=${AMEESH_TEST_VENV:-.venv}  # L159b : venv en cache sur la VM de déport
 if [ ! -x "$VENV/bin/python" ]; then
@@ -36,13 +57,13 @@ fi
 if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg, yaml" 2>/dev/null; then
   echo
   echo "=== pilote psycopg ==="
-  AMEESH_DRIVER=psycopg "$VENV/bin/python" -m unittest discover -s tests -t . -v "${PATTERN[@]}"
+  AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
 elif [ -x "$VENV/bin/pip" ]; then
   echo "=== installation de psycopg dans $VENV ==="
   if "$VENV/bin/pip" install --quiet 'psycopg[binary]' cryptography pyyaml 2>/dev/null; then
     echo
     echo "=== pilote psycopg ==="
-    AMEESH_DRIVER=psycopg "$VENV/bin/python" -m unittest discover -s tests -t . -v "${PATTERN[@]}"
+    AMEESH_DRIVER=psycopg "$VENV/bin/python" "${TEST_ARGS[@]}"
   else
     echo "psycopg non installé (hors ligne ?) : passe psql seulement"
   fi
