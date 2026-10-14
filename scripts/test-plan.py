@@ -3,6 +3,7 @@
 """Test plan from the measured test → code map (L161f).
 
     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                              [--base SHA] [--ref REF]
                               [--base-ref B] [--head-ref H]
                               [--github-output F] [--summary F] [--annotations]
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
@@ -46,15 +47,24 @@ same holds for the fallback plan, so an unreadable map never narrows a
 release to the pilot list. Only the full suite prepares the merge of a
 release.
 
+**Documentation-only** (L161a): a pull request whose whole diff is
+documentation, and a push to `main` whose whole pushed range (`--base`,
+`github.event.before`, to the new head) is documentation, runs only its
+declared readers (`tests/parts/lecteurs-doc.txt`, plus the impacted ones)
+and skips the parts. A push to any other ref keeps the full suite (release
+branches in particular); so do a branch created by the push, a rewritten
+history and any event but `pull_request` and `push` on `main`. A pushed
+version number never takes the lane: L157 is a pull-request rule.
+
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
 missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--since HEAD^1`) and the
-plan is marked unsure. A file the map cannot judge (Python outside
-`src/ameesh`, a non-documentation file no test reads, a syntax error) uses
-the textual heuristic for that file and marks the plan unsure; test
-infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+default) and the plan is marked unsure. A file the map cannot judge (Python
+outside `src/ameesh`, a non-documentation file no test reads, a syntax
+error) uses the textual heuristic for that file and marks the plan unsure;
+test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
 `.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
 A file removed outside documentation marks it unsure as well: the map knows
 the readers it measured, never the ones it cannot see (an import by a
@@ -688,11 +698,41 @@ def lot_part_count(driver: str, modules: list[str], card: dict | None) -> int:
     return max(1, math.ceil(estimate / PR_TARGET_PART_S))
 
 
+#: the branch whose documentation-only pushes take the fast lane (L161a)
+DOC_PUSH_REF = "main"
+#: git's null object id: `github.event.before` of a branch created by the push
+NULL_SHA = "0" * 40
+
+
+def pushed_range(base: str, head: str, repo: pathlib.Path = REPO) -> bool:
+    """True if `base` is the tip before a push to `head` (fast-forward).
+
+    `github.event.before` on a branch created by the push is the null sha,
+    and a rewritten history leaves a tip that is not an ancestor: both keep
+    the full suite."""
+    if base in ("", NULL_SHA) or not re.fullmatch(r"[0-9a-fA-F]{40}", base):
+        return False
+    return is_ancestor(base, head, repo)
+
+
 def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
-           repo: pathlib.Path = REPO) -> dict:
-    """Version-only or documentation-only pull request (L157, L161a)."""
+           repo: pathlib.Path = REPO, ref: str = "") -> dict:
+    """Version-only pull request (L157), documentation-only change (L161a).
+
+    On a push, `base` is the tip before the push (`github.event.before`), so
+    the diff covers every pushed commit. Only a push to `main` takes the
+    documentation lane: a push to a release branch keeps the full suite, and
+    version-only stays a pull-request rule (a pushed version always runs)."""
     out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
-    if event != "pull_request":
+    if event == "push":
+        if ref.removeprefix("refs/heads/") != DOC_PUSH_REF:
+            out["why"] = f"push to {ref or 'an unknown ref'}: full suite"
+            return out
+        if not pushed_range(base, head, repo):
+            out["why"] = ("pushed range unknown (new branch or rewritten history): "
+                          "full suite")
+            return out
+    elif event != "pull_request":
         return out
     try:
         names = _git(repo, "diff", "--name-only", "--no-renames", base, head).splitlines()
@@ -700,9 +740,11 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     except (OSError, subprocess.CalledProcessError) as exc:
         out["why"] = f"diff unreadable ({exc})"
         return out
-    out["version_only"], why = version_only.version_only(names, patch)
+    version_why = ""
+    if event == "pull_request":
+        out["version_only"], version_why = version_only.version_only(names, patch)
     out["docs_only"], doc_why = version_only.docs_only(names)
-    out["why"] = why if out["version_only"] else doc_why
+    out["why"] = version_why if out["version_only"] else doc_why
     out["files"] = names
     return out
 
@@ -724,6 +766,7 @@ def doc_readers(classes: dict, card: dict,
 
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
               head: str = "HEAD", repo: pathlib.Path = REPO,
+              base: str = "HEAD^1", ref: str = "",
               base_ref: str | None = None, head_ref: str | None = None) -> dict:
     now = now or datetime.datetime.now(datetime.timezone.utc)
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
@@ -734,8 +777,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
             "tested": _rev(head, repo), "release": release,
             "refs": {"base": base_ref, "head": head_ref},
-            **nature(event, head=head, repo=repo)}
-    plan.update(classify(modules, card, now, head=head, repo=repo))
+            **nature(event, base=base, head=head, repo=repo, ref=ref)}
+    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     #: #749 : modules « always » declenches par le diff (contrat de base, baux
     #: et orphelins), a rejoindre au pilote psql sur une PR.
@@ -1028,6 +1071,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
+    p.add_argument("--base", default="HEAD^1",
+                   help="tip before a push (github.event.before); HEAD^1 by default, "
+                        "the first parent of a pull request's merge commit")
+    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                   help="github.ref; a documentation-only push takes the fast lane "
+                        "on main only")
     p.add_argument("--base-ref", default=None,
                    help="target branch of a pull request (default: $GITHUB_BASE_REF)")
     p.add_argument("--head-ref", default=None,
@@ -1050,7 +1099,8 @@ def main(argv: list[str] | None = None) -> int:
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
-            plan = make_plan(args.event, card, base_ref=args.base_ref, head_ref=args.head_ref)
+            plan = make_plan(args.event, card, base=args.base, ref=args.ref,
+                             base_ref=args.base_ref, head_ref=args.head_ref)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
