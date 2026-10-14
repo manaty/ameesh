@@ -875,6 +875,27 @@ class RealTargetTest(_Base):
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
         self.assertTrue(any("origin/develop" in (n or "") for n in notes))
 
+    def test_990_cache_des_candidats_par_cible_et_non_par_depot(self):
+        """#990 (P2 de la relecture de #746) : la liste des candidats dépend de
+        la cible primaire, propre au lot. Un lot à cible déclarée examiné en
+        premier ne doit pas figer la liste pour les lots suivants, sans cible,
+        du même dépôt : ils resteraient ouverts alors qu'une fusion citante les
+        livre sur `origin/develop`."""
+        premier = work.add(self.db, title="cible déclarée en premier",
+                           assignee="claude1", actor="orch", branch="agent/a-990",
+                           branch_target="origin/develop")
+        suivant = self.lot("sans cible, livré sur develop")
+        self.merge("agent/libre",
+                   "merge(desktop): X\n\nameesh-work: %d" % suivant["id"])
+        self.publish("develop")
+        by_id = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(by_id[premier["id"]]["result"], "open")
+        self.assertEqual(by_id[suivant["id"]]["result"], "merged",
+                         "le lot suivant, sans cible, est livré sur develop : "
+                         "la liste des candidats ne doit pas être figée par le "
+                         "lot précédent, qui déclarait origin/develop")
+        self.assertEqual(work.get(self.db, suivant["id"])["state"], "merged")
+
 
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""
