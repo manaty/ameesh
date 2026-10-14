@@ -607,29 +607,64 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
 #: d'option — n'est pas un détenteur (#1283).
 SESSION_SELECTORS = ("resume", "--resume", "-r", "--session-id")
 
-#: Options de reprise SANS valeur : le jeton suivant reste candidat au
-#: positional de session. Toute autre option est supposée prendre une valeur
-#: (la consommer évite de la prendre pour l'id, cas
-#: `codex resume -m gpt-5.1-codex <id>`) ; une valeur liée par `=` tient en un
-#: seul jeton.
-RESUME_FLAGS = frozenset({
-    "--json", "--no-alt-screen", "--include-non-interactive", "--search",
-    "--oss", "--verbose", "--fork-session", "--include-partial-messages",
-    "--strict-mcp-config", "--ide", "--print", "-p", "--continue",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--dangerously-bypass-hook-trust", "--dangerously-skip-permissions",
-    "--full-auto", "--skip-git-repo-check", "-h", "--help", "-V", "--version",
+#: Options de reprise SANS valeur, par binaire (`basename(argv[0])`) : le
+#: jeton suivant reste candidat au positional de session. Toute autre option
+#: est supposée prendre une valeur — la consommer évite de prendre son
+#: argument pour l'id (`codex resume -m gpt-5.1-codex <id>`) ; une valeur liée
+#: par `=` tient en un seul jeton. La grammaire dépend du binaire pour un même
+#: jeton : `-p` = `--print` chez Claude mais `--profile <nom>` chez Codex, `-c`
+#: = `--continue` chez Claude mais `--config <clé=valeur>` chez Codex — les
+#: confondre perd une vraie reprise ou prend un profil pour un id (#1283 R1 cx2,
+#: aide locale Codex : `-p`/`--profile` porte une valeur). Sources : descripteurs
+#: `harness_descriptors/*.json`, `dsh --help` local, revue cx2.
+_CODEX_FLAGS = frozenset({
+    "--json", "--no-alt-screen", "--all", "--ephemeral", "--worktree",
+    "--no-daemon", "--ignore-user-config", "--ignore-rules", "--strict-config",
+    "--include-non-interactive", "--search", "--oss", "--approve-for-me",
+    "--full-auto",
+    "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust", "-h", "--help", "-V", "--version",
 })
+_CLAUDE_FLAGS = frozenset({
+    "-p", "--print", "-c", "--continue", "--verbose", "--fork-session",
+    "--include-partial-messages", "--strict-mcp-config", "--ide",
+    "--replay-user-messages", "--dangerously-skip-permissions",
+    "-h", "--help", "-V", "--version",
+})
+_DSH_FLAGS = frozenset({
+    "--json", "--no-daemon", "--dump-config", "--dump-config-schema",
+    "--dump-default-config", "-h", "--help", "-V", "--version",
+})
+#: Repli d'un binaire inconnu (harnais porté par un script de banc) : les
+#: grammaires dont le `resume` est un sous-commande à positional. Les options
+#: courtes ambiguës (`-p`, `-c`) en sont absentes : supposées à valeur, comme
+#: chez Codex, puisque c'est la grammaire du `resume` nu.
+RESUME_FLAGS = {
+    "codex": _CODEX_FLAGS,
+    "claude": _CLAUDE_FLAGS,
+    "dsh": _DSH_FLAGS,
+    "": _CODEX_FLAGS | _DSH_FLAGS,
+}
 
 #: Options qui désignent « la session la plus récente » : aucun positional
-#: d'id ne suit, un jeton cité après elles est un prompt (#1283 R1 cx2).
-RESUME_LATEST = frozenset({"--last", "--all"})
+#: d'id ne suit, un jeton cité après elles est un prompt. `--all` n'en fait
+#: PAS partie : chez Codex il élargit la recherche (Show all sessions), il ne
+#: désigne pas la dernière — un id le suivant est bien le positional
+#: (#1283 R1 cx2, aide locale).
+RESUME_LATEST = frozenset({"--last"})
 
 
-def _resume_positional(argv: list[str], index: int) -> str | None:
+def _resume_flags(argv: list[str]) -> frozenset[str]:
+    """La grammaire d'options du binaire lancé (repli : binaires connus)."""
+    nom = os.path.basename(argv[0]) if argv else ""
+    return RESUME_FLAGS.get(nom, RESUME_FLAGS[""])
+
+
+def _resume_positional(argv: list[str], index: int,
+                       flags: frozenset[str]) -> str | None:
     """Le positional de session d'une reprise à partir de `index` : options
-    consommées (leur valeur avec), `--` respecté ; None si `--last`/`--all`
-    désigne la plus récente, ou s'il n'y a plus de positional."""
+    consommées (leur valeur avec), `--` respecté ; None si `--last` désigne la
+    plus récente, ou s'il n'y a plus de positional."""
     while index < len(argv):
         arg = argv[index]
         if arg == "--":
@@ -637,31 +672,32 @@ def _resume_positional(argv: list[str], index: int) -> str | None:
         if arg in RESUME_LATEST:
             return None
         if arg.startswith("-"):
-            if arg.partition("=")[1]:
+            index += 1
+            if not arg.partition("=")[1] and arg not in flags \
+                    and index < len(argv) and not argv[index].startswith("-"):
                 index += 1
-            else:
-                index += 1
-                if arg not in RESUME_FLAGS and index < len(argv) \
-                        and not argv[index].startswith("-"):
-                    index += 1
             continue
         return arg
     return None
 
 
 def _session_argument(argv: list[str], needle: str) -> bool:
-    """`needle` est-il nommé par une reprise en cours, et non cité ?"""
-    index = 1
-    while index < len(argv):
-        arg = argv[index]
+    """`needle` est-il nommé par une reprise en cours, et non cité ?
+
+    Tous les sélecteurs de la ligne sont essayés : un mot `resume` du texte
+    (prompt, message) ne masque pas un `--resume <id>` plus loin."""
+    flags = _resume_flags(argv)
+    for index, arg in enumerate(argv[1:], start=1):
         flag, sep, value = arg.partition("=")
         if sep and flag in SESSION_SELECTORS:
-            return value == needle
-        if arg == "resume":
-            return _resume_positional(argv, index + 1) == needle
-        if arg in ("--resume", "-r", "--session-id"):
-            return index + 1 < len(argv) and argv[index + 1] == needle
-        index += 1
+            if value == needle:
+                return True
+        elif arg == "resume":
+            if _resume_positional(argv, index + 1, flags) == needle:
+                return True
+        elif arg in ("--resume", "-r", "--session-id"):
+            if index + 1 < len(argv) and argv[index + 1] == needle:
+                return True
     return False
 
 
