@@ -239,9 +239,16 @@ class Gauge:
             return 1.0
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
-    def pace_cap(self, now: float) -> float:
-        """Le plafond de rythme : min(90 %, part écoulée + 10 points)."""
-        return min(PACE_CEILING, self.elapsed(now) + PACE_MARGIN)
+    def pace_cap(self, now: float, multiplier: float = 1.0) -> float:
+        """Le plafond de rythme : min(90 %, part écoulée × `multiplier` + 10 points).
+
+        `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
+        compte (`accounts`, `pace_multiplier`, défaut 1.0), posé à 2.0 sur le
+        compte principal Codex pour consommer sa réserve de forfait sans
+        remise à zéro. Il ne touche que la part écoulée : l'utilisation
+        relevée, les remises à zéro et les plafonds fixes ne changent pas.
+        """
+        return min(PACE_CEILING, self.elapsed(now) * multiplier + PACE_MARGIN)
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
@@ -253,9 +260,46 @@ class Gauge:
         """
         return 0.0 if self.reset_passed(now) else self.used
 
-    def exceeded(self, now: float, reserve: float = 0.0) -> bool:
-        """Au seuil de rythme ; `reserve` (L242b) l'abaisse d'autant."""
-        return self.used_at(now) >= max(0.0, self.pace_cap(now) - reserve)
+    def held_cap(self, now: float, reserve: float = 0.0,
+                 multiplier: float = 1.0) -> float:
+        """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
+        jamais sous `PACE_MARGIN` quand une réserve s'applique.
+
+        La réserve protège la fin de fenêtre ; elle ne doit pas bloquer son
+        début (#777, décision du propriétaire du 2026-10-13 : « pas de réserve
+        sur une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »).
+        Une fenêtre à 1 % d'écoulé garde donc 10 points, pas 1.
+        """
+        cap = max(0.0, self.pace_cap(now, multiplier) - reserve)
+        return max(cap, PACE_MARGIN) if reserve else cap
+
+    def exceeded(self, now: float, reserve: float = 0.0,
+                 multiplier: float = 1.0) -> bool:
+        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant."""
+        return self.used_at(now) >= self.held_cap(now, reserve, multiplier)
+
+    def free_at(self, now: float, reserve: float = 0.0,
+                multiplier: float = 1.0) -> float | None:
+        """L'heure où la fenêtre cesse de bloquer, ou None si elle ne la dit
+        pas (`resets_at` absent).
+
+        C'est l'heure où la part écoulée rejoint l'usage sous le plafond
+        effectif — quand le rythme rattrape l'avance —, pas la remise à zéro
+        (remarque de l'auditeur, #777 : « l'heure de pause … until doit être
+        celle où l'écoulé dépasse l'usage »). Un usage au-delà du plafond
+        (`PACE_CEILING` moins la réserve) n'est jamais rattrapé : seule la
+        remise à zéro libère la fenêtre, et c'est elle qu'on annonce.
+        """
+        if not self.resets_at:
+            return None
+        used = self.used_at(now)
+        if used >= PACE_CEILING - reserve:
+            return float(self.resets_at)
+        share = used + reserve - PACE_MARGIN
+        if reserve:
+            share = max(share, PACE_MARGIN)
+        share = min(max(share / multiplier, 0.0), 1.0)
+        return float(self.resets_at) - self.window_s * (1.0 - share)
 
     def reset_passed(self, now: float) -> bool:
         """La fenêtre publiée est-elle déjà remise à zéro (`resets_at` passé) ?
@@ -785,7 +829,7 @@ class CostBook:
 
         Le seuil est celui de la décision 0019 §2 :
         `utilisation >= min(90 %, part écoulée de la fenêtre + 10 points)`,
-        moins `reserve` pour un agent non critique (L242b (2)).
+        moins `reserve` pour un agent non critique (L242b (2), `held_cap`).
         """
         now = self.clock()
         held = [gauge for gauge in self.gauges(harness) if gauge.exceeded(now, reserve)]
@@ -794,21 +838,25 @@ class CostBook:
         # L242b (4), #373 r1 : la pause en court d'abord, comme avec des
         # comptes déclarés (`accounts.pause_label`) ; sans compte déclaré,
         # c'est le compte par défaut du harnais. #373 r2 : la pause dure
-        # jusqu'à la remise à zéro la plus tardive des fenêtres qui bloquent
-        # — aucune date si l'une d'elles n'est pas datée.
+        # jusqu'à la libération la plus tardive des fenêtres qui bloquent —
+        # aucune date si l'une d'elles n'est pas datée. #777, #898 : la
+        # libération est l'heure où le rythme rattrape l'usage (`free_at`),
+        # pas la remise à zéro, sauf pour un usage que le rythme ne rattrape
+        # plus.
         head = ""
         if all(gauge.resets_at for gauge in held):
-            gauge = max(held, key=lambda g: float(g.resets_at))
+            free, gauge = max(((float(g.free_at(now, reserve)), g) for g in held),
+                              key=lambda pair: pair[0])
             head = "pause (account %s, %s %.0f %%) until %s; " % (
                 DEFAULT_ACCOUNT_LABEL, gauge.key, gauge.used * 100,
-                until_label(gauge.resets_at, now))
+                until_label(free, now))
         else:
             gauge = held[0]
         return head + ("plan %s %s: %.0f%% used with %.0f%% of the window "
                        "elapsed (pace cap %.0f%%%s)" % (
                            harness, gauge.key, gauge.used * 100,
                            gauge.elapsed(now) * 100,
-                           max(0.0, gauge.pace_cap(now) - reserve) * 100,
+                           gauge.held_cap(now, reserve) * 100,
                            ", %.0f points kept for critical agents" % (reserve * 100)
                            if reserve else ""))
 
