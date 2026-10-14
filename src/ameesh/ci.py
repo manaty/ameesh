@@ -2,6 +2,14 @@
 """Échecs de tests remontés en temps réel au courrier de l'agent du lot (L161c).
 
     ameesh ci status <lot> [--limit N] [--json]
+    ameesh ci run <lot> [--avis N] [--exception incident|unblock --reason …]
+                        [--full --reason …] [--sha S] [--force] [--dry-run] [--json]
+    ameesh ci cancel <lot> [--all] [--dry-run] [--json]
+
+`ci status` lit les exécutions suivies ; `ci run` est le déclencheur du gel
+(#1343, canon §3 : la relecture passe avant la CI) — il vérifie le gel, les
+verdicts requis, l'idempotence du SHA et dispatche `tests.yml` en `mode=lot`
+sur la tête gelée ; `ci cancel` annule les runs périmés d'un lot.
 
 Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
 pendant les tests, chaque part de la CI publie un check run « tests (flux) »
@@ -539,8 +547,437 @@ def render_status(report: dict) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------
+# ameesh ci run / ameesh ci cancel — la CI d'un lot part au gel (#1343)
+# --------------------------------------------------------------------------
+#
+# canon §3 (manaty/home#66, owner 14/10 21:45) : sur ameesh, la relecture passe
+# avant la CI. Une poussée sur une PR de lot ne lance plus rien ; la CI du lot
+# (tests impactés + contrat) ne tourne qu'une fois, sur la tête gelée, quand
+# les verdicts requis sont acquis. `ameesh ci run <lot>` porte ce déclencheur :
+#
+#   * le lot porte un gel (`ameesh work milestone <lot> frozen --sha S`) et sa
+#     branche distante est encore sur S — une tête changée est refusée, jamais
+#     un vert sur une autre tête ;
+#   * `--avis N` verdicts `ok` sur S, d'acteurs distincts et hors de l'assigné
+#     (0 pour un lot léger, 1 pour un lot sensible, 2 pour SQL/sécurité/prod) ;
+#   * aucun run déjà vu sur S : vert ou en cours rend la main sans dispatcher
+#     (idempotence du gel et d'un événement rejoué), un run rouge ou annulé
+#     demande `--force` ;
+#   * `gh workflow run tests.yml --ref <branche> -f mode=lot -f sha=S
+#     -f base=<merge-base> -f lot=<n>` ; le job `plan` revérifie S face à HEAD
+#     et échoue (check requis rouge, rien exécuté) si la branche a bougé.
+#
+# Avant de dispatcher, les runs non conclues de la branche qui ne portent pas S
+# sont annulés (canon §3 : un run lancé sur un lot qui attend encore un verdict
+# ou une correction est annulé) ; un échec d'annulation est dit, jamais fatal.
+#
+# Exceptions (canon §3) : un lot qui débloque la CI ou corrige un incident
+# dispatche en parallèle de sa relecture, `--exception incident|unblock
+# --reason …` ; le run porte la marque et le lot reçoit une note.
+#
+# `ameesh ci cancel <lot>` fait la même annulation seule (`--all` : tout, y
+# compris le SHA gelé).
+
+GEL_SCHEMA = "ameesh-ci-gel/1"
+CANCEL_SCHEMA = "ameesh-ci-cancel/1"
+#: exceptions du canon §3 : la CI part en parallèle de la relecture, marquée
+EXCEPTIONS = ("incident", "unblock")
+#: états GitHub d'un run qui n'a pas conclu (LIVE_STATUSES en est un sous-ensemble)
+OPEN_STATUSES = ("queued", "in_progress", "requested", "waiting", "pending")
+#: nombre d'avis que `--avis` accepte (léger, sensible, SQL/sécurité/prod)
+MAX_AVIS = 2
+
+
+class GelError(CiError):
+    """Déclencheur du gel : refus actionnable, jamais un run silencieux."""
+
+
+def _q(value: str) -> str:
+    """Une valeur de chemin ou de requête GitHub (une branche `lot/x` incluse)."""
+    from urllib.parse import quote
+    return quote(value or "", safe="")
+
+
+def _sha_ok(sha: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[0-9a-f]{40}", sha or ""))
+
+
+def repo_of(cfg, item: dict, *, repo: str = "") -> str:
+    """`owner/repo` du lot : `--repo`, son `issue_ref`, sinon `github.projects`."""
+    from . import plan_github
+    if repo.strip():
+        return repo.strip()
+    parts = plan_github._ref_parts(item.get("issue_ref"))
+    if parts and parts[0]:
+        return parts[0]
+    try:
+        found = plan_github.settings_of(cfg).repo_for(item.get("app"))
+    except plan_github.SettingsError as exc:
+        raise GelError(str(exc)) from exc
+    if found:
+        return found
+    raise GelError("lot #%s: no issue_ref and no github.projects entry for %r: "
+                   "pass --repo owner/name" % (item.get("id"), item.get("app")))
+
+
+def frozen_of(db, item_id: int) -> dict | None:
+    """Le dernier jalon `frozen` du lot, ou None (le lot n'est pas gelé)."""
+    from . import work
+    return next((m for m in work.milestones(db, int(item_id))
+                 if m["kind"] == "frozen"), None)
+
+
+def independent_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
+    """Les verdicts `ok` posés sur `sha` par des acteurs distincts, hors assigné.
+
+    Le canon §3 demande des avis *indépendants* : un verdict rendu par l'auteur
+    du lot, ou deux verdicts du même acteur, ne comptent pas.
+    """
+    from . import work
+    who = (assignee or "").strip().casefold()
+    out, seen = [], set()
+    for m in work.milestones(db, int(item_id)):
+        if m["kind"] != "verdict" or (m.get("verdict") or "") != "ok":
+            continue
+        if (m.get("sha") or "").strip().casefold() != (sha or "").casefold():
+            continue
+        actor = (m.get("actor") or "").strip()
+        key = actor.casefold()
+        if not actor or key == who or key in seen:
+            continue
+        seen.add(key)
+        out.append(m)
+    return out
+
+
+def _head_of(api, repo: str, branch: str) -> str:
+    data = api("repos/%s/branches/%s" % (repo, _q(branch))) or {}
+    sha = ((data.get("commit") or {}).get("sha") or "").strip().lower()
+    if not _sha_ok(sha):
+        raise GelError("branch %s not found in %s" % (branch, repo))
+    return sha
+
+
+def _runs_of(api, repo: str, *, sha: str = "", branch: str = "") -> list[dict]:
+    query = "per_page=50"
+    if sha:
+        query += "&head_sha=%s" % _q(sha)
+    if branch:
+        query += "&branch=%s" % _q(branch)
+    data = api("repos/%s/actions/workflows/tests.yml/runs?%s" % (repo, query)) or {}
+    return list(data.get("workflow_runs") or ())
+
+
+def _merge_base_of(api, repo: str, target: str, sha: str) -> str:
+    data = api("repos/%s/compare/%s...%s" % (repo, _q(target), _q(sha))) or {}
+    return ((data.get("merge_base_commit") or {}).get("sha") or "").strip().lower()
+
+
+def _carries_gel(api, repo: str, sha: str) -> bool:
+    """Le workflow du SHA gelé porte-t-il le déclencheur #1343 ?
+
+    Sans ce contrôle, un lot dont la branche précède la bascule serait refusé
+    par GitHub (« Unexpected inputs ») sans dire quoi faire ; ici le refus est
+    explicite : refusionner la branche sur main avant de dispatcher.
+    """
+    import base64
+    data = api("repos/%s/contents/.github/workflows/tests.yml?ref=%s"
+               % (repo, _q(sha))) or {}
+    content = (data.get("content") or "").replace("\n", "")
+    if not content:
+        return False
+    try:
+        text = base64.b64decode(content).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return False
+    return "#1343" in text
+
+
+def _short_run(row: dict) -> dict:
+    return {"id": row.get("id"), "status": row.get("status"),
+            "conclusion": row.get("conclusion"), "event": row.get("event"),
+            "url": row.get("html_url")}
+
+
+def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
+             exception: str = "", reason: str = "", full: bool = False,
+             force: bool = False, repo: str = "") -> dict:
+    """La décision de `ameesh ci run <lot>`, sans aucune écriture.
+
+    Rend `{schema, action: dispatch|green|running|refuse, …}` : `dispatch` est
+    le seul cas qui écrit (`cmd_ci_run` dispatche). Un refus est une `GelError`
+    dont le message dit le geste à faire (geler, refusionner, relire…).
+    """
+    from . import work
+    item = work.get(db, int(item_id))
+    if item is None:
+        raise GelError("lot #%s unknown" % item_id)
+    if exception and exception not in EXCEPTIONS:
+        raise GelError("--exception: %s (one of %s)" % (exception, ", ".join(EXCEPTIONS)))
+    if exception and not reason.strip():
+        raise GelError("--exception %s requires --reason: the exception is marked "
+                       "(canon §3)" % exception)
+    if full and not reason.strip():
+        raise GelError("--full requires --reason: the full suite is an explicit "
+                       "gesture (release, package, hand dispatch)")
+    if avis < 0 or avis > MAX_AVIS:
+        raise GelError("--avis: 0 (lot léger), 1 (sensible) or 2 (SQL/sécurité/prod)")
+    name = repo_of(cfg, item, repo=repo)
+    branch = (item.get("branch") or "").strip()
+    if not branch:
+        raise GelError("lot #%s has no branch: push the lot first" % item_id)
+    target = (item.get("branch_target") or "main").strip() or "main"
+    freeze = frozen_of(db, item_id)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    asked = (sha or "").strip().lower()
+    exempt = bool(exception or full)
+    if asked and not _sha_ok(asked):
+        raise GelError("--sha: the frozen commit (40 hex), not %r" % sha)
+    if asked and frozen and asked != frozen:
+        raise GelError("--sha %s is not the freeze of lot #%s (%s): refreeze first, "
+                       "a correction needs a new review" % (asked[:12], item_id, frozen[:12]))
+    if not frozen and not exempt:
+        # le gel est un jalon, pas un drapeau : `--sha` seul ne le remplace pas,
+        # sinon un lot jamais gelé obtiendrait sa CI sans trace de gel.
+        raise GelError("lot #%s is not frozen: ameesh work milestone %s frozen --sha <sha>"
+                       % (item_id, item_id))
+    head = _head_of(api, name, branch)
+    #: le commit testé : le gel pour un run normal ; pour une exception ou la
+    #: suite complète, le `--sha` nommé ou la tête de la branche (le correctif
+    #: d'un incident arrive après le gel et n'attend pas un nouveau gel).
+    tested = (asked or head) if exempt else frozen
+    if not _sha_ok(tested):
+        raise GelError("lot #%s: the frozen milestone carries no usable sha (%r): "
+                       "refreeze with --sha" % (item_id, tested))
+    if head != tested:
+        raise GelError("branch %s is on %s, %s is %s: the ref moved — refreeze and "
+                       "re-review, nothing dispatched"
+                       % (branch, head[:12], "--sha" if exempt else "the freeze",
+                          tested[:12]))
+    frozen_sha = tested
+    reviews = independent_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
+    if not (exception or full) and len(reviews) < avis:
+        raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
+                       "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
+                       "an incident or a CI unblock uses --exception incident|unblock "
+                       "--reason …" % (item_id, len(reviews), frozen_sha[:12], avis,
+                                       item_id, frozen_sha[:12]))
+    runs = _runs_of(api, name, sha=frozen_sha)
+    green = [r for r in runs if (r.get("conclusion") or "") == "success"]
+    live = [r for r in runs if (r.get("status") or "") in OPEN_STATUSES]
+    decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
+                "branch": branch, "target": target, "sha": frozen_sha,
+                "mode": "full" if full else "lot", "exception": exception,
+                "reason": reason.strip(), "avis": avis,
+                "verdicts": sorted((m.get("actor") or "") for m in reviews),
+                "frozen": bool(freeze), "runs": len(runs)}
+    if not force:
+        if green:
+            return {**decision, "action": "green", "why": "already green on the frozen "
+                    "commit: nothing dispatched", "run": _short_run(green[-1])}
+        if live:
+            return {**decision, "action": "running", "why": "a run of the frozen commit "
+                    "is already in flight: nothing dispatched", "run": _short_run(live[0])}
+        if runs:
+            raise GelError("lot #%s: %d run(s) already seen on %s, none green (%s): "
+                           "--force to dispatch again (a correction needs a new freeze "
+                           "and a new review)" % (item_id, len(runs), frozen_sha[:12],
+                                                  ", ".join(sorted({(r.get("conclusion") or
+                                                                     r.get("status") or "?")
+                                                                    for r in runs}))))
+    base = _merge_base_of(api, name, target, frozen_sha)
+    if not _sha_ok(base):
+        raise GelError("merge-base %s...%s not found in %s: the freeze is not on the "
+                       "target branch" % (target, frozen_sha[:12], name))
+    if not _carries_gel(api, name, frozen_sha):
+        raise GelError("the workflow at %s does not carry the freeze trigger (#1343): "
+                       "rebase the lot on main before dispatching" % frozen_sha[:12])
+    return {**decision, "action": "dispatch", "base": base,
+            "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
+                    if not (exception or full) else
+                    ("exception %s: %s" % (exception, reason.strip()) if exception
+                     else "full suite: %s" % reason.strip()))}
+
+
+def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
+                repo: str = "") -> dict:
+    """Les runs d'un lot à annuler : non conclues, hors du SHA gelé.
+
+    `all_runs` annule aussi le run du SHA gelé (geste explicite). Un lot non
+    gelé n'a pas de SHA de référence : tous ses runs ouverts sont périmés.
+    """
+    from . import work
+    item = work.get(db, int(item_id))
+    if item is None:
+        raise GelError("lot #%s unknown" % item_id)
+    name = repo_of(cfg, item, repo=repo)
+    branch = (item.get("branch") or "").strip()
+    if not branch:
+        raise GelError("lot #%s has no branch: nothing to cancel" % item_id)
+    freeze = frozen_of(db, item_id)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    rows = [r for r in _runs_of(api, name, branch=branch)
+            if (r.get("status") or "") in OPEN_STATUSES]
+    if frozen and not all_runs:
+        rows = [r for r in rows if (r.get("head_sha") or "").strip().lower() != frozen]
+    return {"schema": CANCEL_SCHEMA, "work_item": int(item_id), "repo": name,
+            "branch": branch, "frozen": frozen, "all": bool(all_runs),
+            "runs": [_short_run(r) for r in rows],
+            "why": ("every open run of the branch" if all_runs or not frozen else
+                    "open runs that do not carry the frozen commit %s" % frozen[:12])}
+
+
+def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print) -> int:
+    """Annule les runs (POST …/cancel) ; rend le nombre d'échecs, jamais fatal."""
+    failed = 0
+    for row in runs:
+        path = "repos/%s/actions/runs/%s/cancel" % (repo, row.get("id"))
+        code, out, err = gh.run(["api", "-X", "POST", path])
+        if code != 0:
+            failed += 1
+            say("cancel run %s: %s" % (row.get("id"),
+                                       " ".join((err or out or "failed").split())[:200]))
+        else:
+            say("cancel run %s (%s) requested" % (row.get("id"),
+                                                  (row.get("url") or "")[:80]))
+    return failed
+
+
+def _render_gel(decision: dict) -> list[str]:
+    lines = ["lot #%d  %s  %s  %s" % (decision["work_item"], decision["repo"],
+                                    decision["branch"], decision["sha"][:12])]
+    lines.append("  %s: %s" % (decision["action"], decision.get("why") or ""))
+    if decision.get("base"):
+        lines.append("  base (merge-base with %s): %s" % (decision["target"],
+                                                          decision["base"][:12]))
+    if decision.get("exception"):
+        lines.append("  exception %s (canon §3): %s" % (decision["exception"],
+                                                        decision["reason"]))
+    if decision.get("verdicts"):
+        lines.append("  verdict(s): %s" % ", ".join(decision["verdicts"]))
+    if decision.get("run"):
+        run = decision["run"]
+        lines.append("  run %s %s %s" % (run.get("id"), run.get("status"),
+                                         run.get("url") or ""))
+    return lines
+
+
+def cmd_ci_run(cfg, args) -> int:
+    """`ameesh ci run <lot>` : vérifie le gel et dispatche la CI une fois."""
+    from . import plan_github, work
+    from .db import open_db
+    db = open_db(cfg)
+    gh = plan_github.Gh()
+
+    def api(path: str):
+        return plan_github._json(gh, ["api", path])
+
+    try:
+        decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
+                            avis=args.avis, exception=args.exception or "",
+                            reason=args.reason or "", full=args.full, force=args.force,
+                            repo=args.repo or "")
+    except (GelError, plan_github.GithubError) as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                              "action": "refuse", "why": str(exc)}, ensure_ascii=False,
+                             indent=1))
+        else:
+            print("ameesh ci run: %s" % exc)
+        return 1
+    if args.dry_run or decision["action"] != "dispatch":
+        if args.json:
+            print(json.dumps({**decision, "ok": True, "dispatched": False},
+                             ensure_ascii=False, indent=1))
+        else:
+            print("\n".join(_render_gel(decision)))
+        return 0
+    # canon §3 : un run de la branche qui ne porte pas le SHA gelé est périmé.
+    stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "")["runs"]
+    if stale and not args.dry_run:
+        _cancel_runs(gh, decision["repo"], stale,
+                     say=lambda text: print("  %s" % text))
+    argv = ["workflow", "run", "tests.yml", "--repo", decision["repo"],
+            "--ref", decision["branch"],
+            "-f", "mode=%s" % decision["mode"],
+            "-f", "sha=%s" % decision["sha"],
+            "-f", "base=%s" % decision["base"],
+            "-f", "lot=%d" % decision["work_item"]]
+    if decision["exception"]:
+        argv += ["-f", "exception=%s" % decision["exception"]]
+    code, out, err = gh.run(argv)
+    if code != 0:
+        # l'erreur du dispatch est dite, et le lot la garde
+        why = "dispatch refused: %s" % " ".join((err or out or "failed").split())[:300]
+        try:
+            work.note(db, args.id, "ci: %s (sha %s, mode %s)"
+                      % (why, decision["sha"][:12], decision["mode"]))
+        except Exception:  # noqa: BLE001 - la note ne masque pas l'échec
+            pass
+        print("ameesh ci run: %s" % why)
+        return 1
+    runs = _runs_of(api, decision["repo"], sha=decision["sha"])
+    run = next((r for r in runs if (r.get("event") or "") == "workflow_dispatch"), None)
+    url = (run or {}).get("html_url") or ""
+    note = ("ci: %s dispatched on %s (mode %s%s)%s"
+            % ("full suite" if decision["mode"] == "full" else "impacted + contract",
+               decision["sha"], decision["mode"],
+               ", exception %s: %s" % (decision["exception"], decision["reason"])
+               if decision["exception"] else "",
+               " — %s" % url if url else ""))
+    try:
+        work.note(db, args.id, note)
+    except Exception as exc:  # noqa: BLE001 - le dispatch est parti, on le dit
+        print("ameesh ci run: dispatched, but the lot note failed (%s)" % exc)
+    if args.json:
+        print(json.dumps({**decision, "ok": True, "dispatched": True,
+                          "run": _short_run(run or {})}, ensure_ascii=False, indent=1))
+    else:
+        print("\n".join(_render_gel(decision)))
+        print("  dispatched: %s" % (url or "run queued, it will appear shortly"))
+    return 0
+
+
+def cmd_ci_cancel(cfg, args) -> int:
+    """`ameesh ci cancel <lot>` : annule les runs périmés de la branche."""
+    from . import plan_github
+    from .db import open_db
+    db = open_db(cfg)
+    gh = plan_github.Gh()
+
+    def api(path: str):
+        return plan_github._json(gh, ["api", path])
+
+    try:
+        report = cancel_plan(db, cfg, args.id, api=api, all_runs=args.all,
+                             repo=args.repo or "")
+    except (GelError, plan_github.GithubError) as exc:
+        print("ameesh ci cancel: %s" % exc)
+        return 1
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=1))
+    else:
+        print("lot #%d  %s  %s" % (report["work_item"], report["repo"], report["branch"]))
+        print("  %s: %d run(s)" % (report["why"], len(report["runs"])))
+    if not report["runs"]:
+        return 0
+    if args.dry_run:
+        for row in report["runs"]:
+            print("  would cancel run %s (%s)" % (row["id"], row["url"] or ""))
+        return 0
+    failed = _cancel_runs(gh, report["repo"], report["runs"])
+    return 1 if failed else 0
+
+
 def cmd_ci(cfg, args) -> int:
     from .db import open_db
+    command = getattr(args, "ci_command", "status")
+    if command == "run":
+        return cmd_ci_run(cfg, args)
+    if command == "cancel":
+        return cmd_ci_cancel(cfg, args)
     db = open_db(cfg)
     try:
         report = status_of(db, args.id, limit=args.limit)

@@ -11,6 +11,7 @@ modules the map did not select. No database needed.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime
 import importlib.util
 import io
@@ -1856,9 +1857,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("--annotations", self.text)
 
     def test_plan_job_passes_the_pushed_range(self):
-        # #833: a push is planned from github.event.before, not HEAD^1 alone
-        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
-                      "github.event.before || 'HEAD^1' }}", self.text)
+        # #833: a push is planned from github.event.before, not HEAD^1 alone ;
+        # #1343 : un dispatch au gel est planifié depuis le SHA de base passé
+        # par le déclencheur (merge-base avec la cible), jamais HEAD^1.
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'workflow_dispatch' && "
+                      "inputs.base || (github.event_name == 'push' && "
+                      "github.event.before || 'HEAD^1') }}", self.text)
         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
     def test_dynamic_matrices(self):
@@ -1905,6 +1909,149 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("L1211", self.text)
         self.assertIn("tests/parts/toujours.txt", self.text)
         self.assertIn("une PR de release", self.text)
+
+    def test_no_lot_push_ci_review_first(self):
+        # #1343 (canon §3, home 66) : une poussée sur une PR de LOT ne lance
+        # plus rien — la CI part au gel, après les verdicts requis. Seules les
+        # PR dont la cible est release/** ou integration/** gardent la CI ici ;
+        # les poussées main/release/integration gardent la suite complète.
+        self.assertIn('  pull_request:\n    branches: ["release/**", "integration/**"]\n',
+                      self.text)
+        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+
+    def test_dispatch_gate_exact_frozen_sha_and_base(self):
+        # #1343 : le dispatch ne teste que le SHA gelé, et le mode lot exige sa
+        # base — un ref bougé ou un SHA sans base rougit le check requis sans
+        # exécuter de tests, jamais un vert sur une autre tête.
+        self.assertIn("workflow_dispatch:\n    inputs:\n", self.text)
+        self.assertIn("options: [lot, full]", self.text)
+        self.assertIn("ref moved: head is", self.text)
+        self.assertIn("mode=lot needs sha", self.text)
+        self.assertIn("mode=lot needs base", self.text)
+        self.assertIn("sha needs base", self.text)
+        self.assertIn('--mode "$AMEESH_CI_MODE"', self.text)
+
+    def test_dispatch_aggregate_refuses_a_green_without_tests(self):
+        # #1343 : sur un dispatch, les voies version seule (L157) et
+        # documentation seule (L161a) sont éteintes ; si le plan en produisait
+        # une, l'agrégat requis rougit au lieu de verdir sans tests.
+        job = self.text[self.text.index("\n  tests:\n"):]
+        self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
+        self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
+
+    def test_dispatch_run_name_marks_the_exception(self):
+        # canon §3 : une exception incident/déblocage est explicitement marquée.
+        self.assertIn("run-name:", self.text)
+        self.assertIn("exception {0}", self.text)
+        self.assertIn("exception:", self.text)
+
+
+class LotFreezePlanTest(unittest.TestCase):
+    """#1343 — la CI d'un lot au gel (canon §3) : impactés + contrat sur la
+    tête gelée, jamais une voie qui saute les tests ; release/**, l'intégration
+    et le dispatch `full` gardent la suite complète."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _card(self) -> dict:
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in mods}
+        return card
+
+    def _code_change(self) -> None:
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+
+    def _plan(self, mode: str, *, ref: str = "refs/heads/lot/1343-ci-au-gel",
+              nature: dict | None = None) -> dict:
+        nat = nature or {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
+            return plan.make_plan("workflow_dispatch", self._card(), NOW, head="HEAD",
+                                  repo=self.repo.path, ref=ref, base="HEAD^1", mode=mode)
+
+    def test_gel_selectionne_impactes_et_contrat(self):
+        self._code_change()
+        touched = parts.modules()[0]
+        card = self._card()
+        card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [touched]
+        nat = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
+            p = plan.make_plan("workflow_dispatch", card, NOW, head="HEAD",
+                               repo=self.repo.path, ref="refs/heads/lot/x",
+                               base="HEAD^1", mode="lot")
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        # la raison du plan est le gel, pas l'événement (`nature` dit « not a
+        # pull request » pour un dispatch) : le plan.json relu le dit.
+        self.assertEqual(p["why"], "lot CI at freeze: impacted + contract")
+        ran = [m for ps in p["parts"]["psycopg"] for m in ps["modules"]]
+        self.assertIn(touched, ran)
+        self.assertTrue(p["contract"])
+        for module in p["contract"]:
+            self.assertIn(module, ran)
+        # le pilote psql est borné à sa liste (3 parts au plus, L1211)
+        self.assertLessEqual(len(p["parts"]["psql"]), 3)
+
+    def test_gel_ne_prend_jamais_les_voies_qui_sautent_les_tests(self):
+        # L157 (version seule) et L161a (documentation seule) sont des voies de
+        # PR : au gel, le contrat tourne, donc un check vert veut dire tests.
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
+        self.repo.commit()
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.1"\n')
+        self.repo.commit()
+        version = self._plan("lot")
+        self.assertFalse(version["version_only"], version["why"])
+        self.assertNotEqual(version["parts"]["psycopg"], [])
+        self.repo.write("docs/x.md", "# x\n")
+        self.repo.commit()
+        doc = self._plan("lot", nature={"version_only": False, "docs_only": True,
+                                        "why": "documentation seule",
+                                        "files": ["docs/x.md"]})
+        self.assertFalse(doc["docs_only"], doc["why"])
+        self.assertEqual(doc["doc_readers"], [])
+        self.assertNotEqual(doc["parts"]["psycopg"], [])
+
+    def test_gel_sur_une_branche_release_garde_la_suite_complete(self):
+        self._code_change()
+        p = self._plan("lot", ref="refs/heads/release/1.10.0")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("release/**", p["selection"]["why"])
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+
+    def test_dispatch_full_garde_la_suite_complete(self):
+        self._code_change()
+        p = self._plan("full")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+
+    def test_repli_d_un_gel_garde_la_forme_du_lot(self):
+        p = plan.fallback_plan("workflow_dispatch", "boom", mode="lot",
+                               ref="refs/heads/lot/x")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3] * 3)
+        self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+
+    def test_repli_d_un_gel_release_garde_la_suite_complete(self):
+        p = plan.fallback_plan("workflow_dispatch", "boom", mode="lot",
+                               ref="refs/heads/release/1.10.0")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+
+    def test_cli_mode_lot_sans_base_refuse(self):
+        # sans la base du gel, la sélection porterait sur HEAD^1 et manquerait
+        # des modules du lot : la CLI refuse plutôt que de deviner.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = plan.main(["plan", "--out", str(self.repo.path / "plan.json"),
+                              "--event", "workflow_dispatch", "--mode", "lot"])
+        self.assertEqual(code, 2)
+        self.assertIn("requires --base", err.getvalue())
+        self.assertFalse((self.repo.path / "plan.json").exists())
 
 
 if __name__ == "__main__":

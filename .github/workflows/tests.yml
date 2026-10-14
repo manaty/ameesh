@@ -33,6 +33,23 @@
 # refusion (a : delta de main disjoint, b : migrations seules) viendront
 # ensuite.
 #
+# #1343 — canon §3 (bureau home 66, owner 14/10 21:45) : sur ameesh, la
+# relecture passe avant la CI. Une poussée sur une PR de lot ne lance plus
+# rien ; la CI d'un lot (impactés + contrat, voie `mode=lot` du plan) ne tourne
+# qu'une fois, sur la tête gelée, quand les verdicts requis sont acquis.
+# `ameesh ci run <lot>` (src/ameesh/ci.py) porte ce déclencheur : gel présent,
+# branche distante et tête de PR au SHA gelé, verdict `ok` sur ce SHA (sauf lot
+# léger), un seul run par SHA, puis `gh workflow run tests.yml --ref <branche>
+# -f mode=lot -f sha=<gelé> -f base=<merge-base> -f lot=<n>`. Le job `plan`
+# revérifie le SHA gelé face à HEAD et échoue (check `tests` rouge, rien
+# exécuté) si la branche a bougé. Le dispatch ne prend jamais les voies
+# version seule ou documentation seule : sur la tête gelée, un check `tests`
+# vert veut dire que des tests ont tourné. Exceptions (canon) : un lot qui
+# débloque la CI ou corrige un incident dispatche en parallèle de sa
+# relecture, avec `-f exception=incident|unblock` et une note au lot. Un run
+# devenu périmé (autre SHA) est annulé par `ameesh ci run` ou `ameesh ci
+# cancel <lot>`, jamais un run vert du SHA gelé.
+#
 # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
 # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
 # déjà validée pour ce contenu. Le job « changements » le détecte
@@ -84,17 +101,57 @@
 # fourche), rien n'est publié et la part n'en est pas affectée.
 name: tests
 
+# #1343 : le titre du run dit ce qui l'a déclenché — mode, SHA testé, exception
+# éventuelle (canon §3 : une exception incident/déblocage est explicitement
+# marquée) ; une poussée garde le nom de sa branche.
+run-name: "tests${{ github.event_name == 'workflow_dispatch' && format(' {0}', inputs.mode) || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.sha != '' && format(' {0}', inputs.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.lot != '' && format(' lot #{0}', inputs.lot) || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.exception != '' && format(' · exception {0}', inputs.exception) || '' }}${{ github.event_name != 'workflow_dispatch' && format(' · {0}', github.ref_name) || '' }}"
+
 on:
   push:
     branches: [main, "release/**", "integration/**"]
+  # #1343 (canon §3, bureau home 66) : une poussée sur une PR de LOT ne lance
+  # plus rien. Seules les PR dont la CIBLE est release/** ou integration/**
+  # gardent ici la suite complète ; une PR de release depuis release/** vers
+  # main est déjà couverte par la poussée sur release/**, qui porte le même
+  # commit. La CI d'un lot part au gel, après les verdicts requis, sur le SHA
+  # gelé : `ameesh ci run <lot>` (workflow_dispatch, mode=lot).
   pull_request:
+    branches: ["release/**", "integration/**"]
   workflow_dispatch:
+    inputs:
+      lot:
+        description: "work item number, for the trace (mode=lot)"
+        required: false
+        type: string
+      sha:
+        description: "frozen commit (full 40-hex); must be the head of the ref"
+        required: false
+        type: string
+      base:
+        description: "commit the freeze is compared to (merge-base with the target)"
+        required: false
+        type: string
+      mode:
+        description: "lot: impacted+contract on a frozen head; full: whole suite"
+        required: true
+        default: full
+        type: choice
+        options: [lot, full]
+      exception:
+        description: "incident|unblock: CI in parallel of the review, marked (#1343)"
+        required: false
+        type: string
 
 # Une PR dépassée est annulée. Les pushes de main partagent un groupe :
 # GitHub garde un run en cours et un seul en attente, remplacé par le suivant.
 # Release et dispatch gardent un groupe par exécution (périmètre gelé).
+# #1343 : un dispatch de lot partage le groupe de sa branche, sans annulation
+# automatique — annuler un run vert du même SHA laisserait des checks annulés
+# dans le rollup de la PR, que `ameesh work merge-pr` refuse (tous les checks
+# doivent être terminés et verts). `ameesh ci run` annule lui-même les runs
+# périmés d'un autre SHA avant de dispatcher.
 concurrency:
-  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'workflow_dispatch' && format('gel-{0}', github.ref_name) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -127,8 +184,16 @@ jobs:
       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
       # La référence distingue main (filtre doc) des branches release (suite
       # complète, quel que soit le contenu).
-      AMEESH_CI_BASE: ${{ github.event_name == 'push' && github.event.before || 'HEAD^1' }}
+      # #1343 : au gel, la base du diff est le SHA passé par le déclencheur
+      # (merge-base avec la cible) ; HEAD^1, le commit précédent de la branche,
+      # ne dit rien du lot.
+      AMEESH_CI_BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || (github.event_name == 'push' && github.event.before || 'HEAD^1') }}
       AMEESH_CI_REF: ${{ github.ref }}
+      # #1343 : la CI d'un lot au gel est impactés+contrat (`lot`) ; un
+      # dispatch manuel garde la suite complète (`full`, le défaut).
+      AMEESH_CI_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}
+      # le SHA gelé, vérifié face à HEAD avant tout plan
+      AMEESH_CI_GEL: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || '' }}
     outputs:
       version_only: ${{ steps.plan.outputs.version_only }}
       docs_only: ${{ steps.plan.outputs.docs_only }}
@@ -142,6 +207,48 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
+      # #1343 : le dispatch ne teste que la tête gelée. Une branche qui a bougé
+      # entre le contrôle du déclencheur et le run est refusée ici (check
+      # requis rouge, aucune part exécutée) — jamais un vert sur une autre tête.
+      # Le mode `lot` (sélection impactés+contrat) exige le SHA gelé *et* la
+      # base du diff : sans eux, la sélection porterait sur HEAD^1 et pourrait
+      # manquer des modules du lot.
+      - name: gel (mode, SHA gelé, base — #1343)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          MODE: ${{ inputs.mode }}
+          GEL: ${{ inputs.sha }}
+          BASE: ${{ inputs.base }}
+          EXCEPTION: ${{ inputs.exception }}
+          LOT: ${{ inputs.lot }}
+        run: |
+          echo "dispatch: mode=$MODE lot=${LOT:-—} sha=${GEL:-—} base=${BASE:-—} exception=${EXCEPTION:-—}"
+          if [ "$MODE" = "lot" ]; then
+            [ -n "$GEL" ] || { echo "::error::mode=lot needs sha (the frozen commit)"; exit 1; }
+            [ -n "$BASE" ] || { echo "::error::mode=lot needs base (the merge-base with the target)"; exit 1; }
+          fi
+          if [ -n "$GEL" ]; then
+            case "$GEL" in
+              *[!0-9a-f]*) echo "::error::invalid frozen sha: '$GEL' (full 40-hex expected)"; exit 1 ;;
+            esac
+            if [ "${#GEL}" != 40 ]; then
+              echo "::error::invalid frozen sha: '$GEL' (${#GEL} characters, full 40-hex expected)"
+              exit 1
+            fi
+            [ -n "$BASE" ] || { echo "::error::sha needs base (the merge-base with the target)"; exit 1; }
+          fi
+          if [ -n "$BASE" ]; then
+            git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null \
+              || { echo "::error::base '$BASE' is not a commit of this repository"; exit 1; }
+          fi
+          if [ -n "$GEL" ]; then
+            tete="$(git rev-parse HEAD)"
+            if [ "$tete" != "$GEL" ]; then
+              echo "::error::ref moved: head is $tete, the freeze is $GEL; nothing run — refreeze and re-dispatch"
+              exit 1
+            fi
+            echo "frozen head confirmed: $tete"
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -163,7 +270,7 @@ jobs:
           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
             --event "${{ github.event_name }}" \
             --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
-            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
+            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" --mode "$AMEESH_CI_MODE" \
             --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - uses: actions/upload-artifact@v4
@@ -436,9 +543,12 @@ jobs:
   # L158: a PR that changes the version number carries the number its content
   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
   # compares it with the content since the last tag. Any other PR: nothing to check.
+  # #1343 : la CI d'un lot gelé (dispatch avec `sha`) vérifie aussi le numéro,
+  # sur la base passée par le déclencheur ; sans ce contrôle, un lot qui change
+  # la version obtiendrait un `tests` vert sans que le numéro soit regardé.
   version:
     name: version number
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.sha != '')
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -446,13 +556,24 @@ jobs:
         with:
           fetch-depth: 0  # the tags, and the range since the last one
       - name: number against content
-        run: python3 scripts/version-level.py pr HEAD^1 HEAD
+        env:
+          VERSION_BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || 'HEAD^1' }}
+          GEL: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || '' }}
+          GEL_BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || '' }}
+        run: |
+          if [ -n "$GEL" ] && [ -z "$GEL_BASE" ]; then
+            echo "::error::frozen CI needs a base commit (merge-base with the target)"
+            exit 1
+          fi
+          python3 scripts/version-level.py pr "$VERSION_BASE" HEAD
 
   # nom de vérification stable : vert seulement si toutes les parts le sont
   # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
   # L161a : ou que de la documentation, et ses lecteurs sont verts ;
   # L161f : une part que le plan n'a pas prévue est sautée ;
-  # L158: on a PR, the version number check must pass)
+  # L158: on a PR, the version number check must pass ;
+  # #1343 : sur une CI dispatchée, jamais de voie qui saute les tests, et le
+  # numéro est vérifié quand la CI porte un gel)
   tests:
     name: tests
     if: always()
@@ -461,6 +582,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: bilan des parts
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_GEL: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || '' }}
         run: |
           echo "plan    : ${{ needs.plan.result }} (version seule : ${{ needs.plan.outputs.version_only }}, doc seule : ${{ needs.plan.outputs.docs_only }})"
           echo "doc     : ${{ needs.doc-readers.result }}"
@@ -469,11 +593,23 @@ jobs:
           echo "macOS   : ${{ needs.platform-macos.result }}"
           echo "version : ${{ needs.version.result }}"
           test "${{ needs.plan.result }}" = success
-          # L158: on a PR, the version number check passes (skipped elsewhere).
-          # #940 : sous `bash -e`, l'échec de la branche gauche du `&&` interne
-          # est exempté et le groupe rend 1 sans faire sortir le script — le job
-          # concluait SUCCESS. Sortie explicite après le repli légitime.
-          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; } || exit 1
+          # L158 + #1343 : la version est vérifiée sur une PR de release et sur
+          # la CI d'un lot gelé (dispatch avec `sha`) ; elle est sautée ailleurs
+          # (push, dispatch sans gel), et ce saut est légitime.
+          # #940 : sous `bash -e`, l'échec de la branche gauche d'un `&&` interne
+          # est exempté et le groupe peut rendre 1 sans faire sortir le script —
+          # d'où la sortie explicite après le seul saut légitime.
+          if [ "$CI_EVENT" = "pull_request" ] \
+             || { [ "$CI_EVENT" = "workflow_dispatch" ] && [ -n "$CI_GEL" ]; }; then
+            test "${{ needs.version.result }}" = success || exit 1
+          fi
+          # #1343 : une CI dispatchée ne prend jamais les voies version seule ou
+          # documentation seule (mode lot) ; si le plan en produisait une, le
+          # check requis rougit au lieu de verdir sans tests.
+          if [ "$CI_EVENT" = "workflow_dispatch" ]; then
+            test "${{ needs.plan.outputs.version_only }}" = "false" || exit 1
+            test "${{ needs.plan.outputs.docs_only }}" = "false" || exit 1
+          fi
           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
             exit 0
