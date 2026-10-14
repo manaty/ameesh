@@ -1,0 +1,26 @@
+test_le_cli_refuse_une_part_manquante (tests.test_carte_parts_completes.MergeRefuseTest.test_le_cli_refuse_une_part_manquante) ... ok
+test_la_fusion_declare_les_parts_attendues (tests.test_carte_parts_completes.MiroirDesPartsTest.test_la_fusion_declare_les_parts_attendues) ... ok
+test_la_fusion_exige_une_matrice_verte (tests.test_carte_parts_completes.MiroirDesPartsTest.test_la_fusion_exige_une_matrice_verte) ... ok
+test_la_mesure_psql_est_decoupee (tests.test_carte_parts_completes.MiroirDesPartsTest.test_la_mesure_psql_est_decoupee) ... ok
+test_le_decoupage_sous_mesure_lit_la_carte (tests.test_carte_parts_completes.MiroirDesPartsTest.test_le_decoupage_sous_mesure_lit_la_carte) ... ok
+test_le_miroir_couvre_la_matrice_de_mesure (tests.test_carte_parts_completes.MiroirDesPartsTest.test_le_miroir_couvre_la_matrice_de_mesure) ... ok
+test_rien_n_est_publie_si_la_fusion_echoue (tests.test_carte_parts_completes.MiroirDesPartsTest.test_rien_n_est_publie_si_la_fusion_echoue) ... ok
+test_durees_illisibles (tests.test_carte_parts_completes.PartsIncompletesTest.test_durees_illisibles) ... ok
+test_durees_vides (tests.test_carte_parts_completes.PartsIncompletesTest.test_durees_vides) ... ok
+test_mesure_complete (tests.test_carte_parts_completes.PartsIncompletesTest.test_mesure_complete) ... ok
+test_part_absente (tests.test_carte_parts_completes.PartsIncompletesTest.test_part_absente) ... ok
+test_part_annulee_artefact_sans_durees (tests.test_carte_parts_completes.PartsIncompletesTest.test_part_annulee_artefact_sans_durees) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.086s
+
+OK
+.....s..carte /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpl1va947g/absente.json.gz illisible ([Errno 2] No such file or directory: '/home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpl1va947g/absente.json.gz') : durées de tests/parts/durees.json
+...............................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpck0msx6n/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmp30l_93sf/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+..................
+----------------------------------------------------------------------
+Ran 115 tests in 44.498s
+
+OK (skipped=1)

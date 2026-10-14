@@ -1,0 +1,20 @@
+base 0532faed4 — 250 modules de test
+vérité psql (6 parts, Σ tests) : 131.7 min
+
+psql 6 parts — max évalué sur les durées réelles (enveloppe / Σ tests) :
+  S0_statique  max= 44.2 /  33.5 min  parts=[28.0, 44.2, 24.3, 23.2, 20.3, 29.3]  (repli 174)
+  C_somme      max= 30.5 /  22.4 min  parts=[27.2, 28.4, 28.1, 27.8, 27.3, 30.5]  (repli 2)
+  C_span       max= 28.4 /  23.5 min  parts=[28.4, 28.0, 27.7, 28.4, 28.4, 28.4]  (repli 2)
+  C couvre 245/250 modules
+
+psycopg 4 parts sous mesure — max évalué sur les durées sous mesure :
+  A0_statique    max= 39.8 /  37.1 min  parts=[39.8, 19.9, 37.0, 15.4]  (repli 174)
+  A1_carte       max= 39.0 /  36.4 min  parts=[24.3, 23.5, 39.0, 25.3]  (repli 61)
+  A1_precedente  max= 34.0 /  32.6 min  parts=[23.0, 34.0, 28.4, 26.7]  (repli 2)
+  A1_plein       max= 28.0 /  27.2 min  parts=[28.0, 28.0, 28.0, 28.0]  (repli 0)
+  poids carte : 189, précédente : 248/250
+
+mesure psql pilote (45 modules) en 2 parts :
+  actuel 1 part = 35.8 enveloppe / 30.8 Σ min
+  B0_statique  max= 19.2 /  16.4 min  parts=[19.2, 16.7]
+  B1_carte     max= 18.1 /  15.4 min  parts=[18.1, 17.7]

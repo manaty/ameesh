@@ -1,0 +1,354 @@
+{
+ "base": "0532faed4",
+ "modules": 250,
+ "verite_psql_6_parts": {
+  "total_somme_s": 7903.5
+ },
+ "psql_6_parts": {
+  "S0_statique": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 41,
+     "poids_s": 707.7,
+     "verite_s": 1681.2,
+     "somme_s": 1321.1
+    },
+    {
+     "part": 2,
+     "modules": 44,
+     "poids_s": 707.6,
+     "verite_s": 2649.7,
+     "somme_s": 2009.1
+    },
+    {
+     "part": 3,
+     "modules": 44,
+     "poids_s": 707.7,
+     "verite_s": 1459.5,
+     "somme_s": 1230.9
+    },
+    {
+     "part": 4,
+     "modules": 40,
+     "poids_s": 707.7,
+     "verite_s": 1389.1,
+     "somme_s": 1052.0
+    },
+    {
+     "part": 5,
+     "modules": 41,
+     "poids_s": 707.7,
+     "verite_s": 1219.5,
+     "somme_s": 902.9
+    },
+    {
+     "part": 6,
+     "modules": 40,
+     "poids_s": 707.9,
+     "verite_s": 1756.8,
+     "somme_s": 1387.5
+    }
+   ],
+   "max_s": 2649.7,
+   "max_somme_s": 2009.1,
+   "repli": 174
+  },
+  "C_somme": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 57,
+     "poids_s": 1343.0,
+     "verite_s": 1630.5,
+     "somme_s": 1322.3
+    },
+    {
+     "part": 2,
+     "modules": 38,
+     "poids_s": 1343.1,
+     "verite_s": 1705.6,
+     "somme_s": 1242.8
+    },
+    {
+     "part": 3,
+     "modules": 39,
+     "poids_s": 1343.1,
+     "verite_s": 1684.7,
+     "somme_s": 1343.0
+    },
+    {
+     "part": 4,
+     "modules": 38,
+     "poids_s": 1343.1,
+     "verite_s": 1668.9,
+     "somme_s": 1309.7
+    },
+    {
+     "part": 5,
+     "modules": 39,
+     "poids_s": 1343.1,
+     "verite_s": 1636.8,
+     "somme_s": 1343.0
+    },
+    {
+     "part": 6,
+     "modules": 39,
+     "poids_s": 1343.1,
+     "verite_s": 1829.3,
+     "somme_s": 1342.8
+    }
+   ],
+   "max_s": 1829.3,
+   "max_somme_s": 1343.0,
+   "repli": 2
+  },
+  "C_span": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 33,
+     "poids_s": 1704.2,
+     "verite_s": 1704.2,
+     "somme_s": 1410.3
+    },
+    {
+     "part": 2,
+     "modules": 37,
+     "poids_s": 1704.2,
+     "verite_s": 1677.1,
+     "somme_s": 1334.8
+    },
+    {
+     "part": 3,
+     "modules": 38,
+     "poids_s": 1704.1,
+     "verite_s": 1662.0,
+     "somme_s": 1372.4
+    },
+    {
+     "part": 4,
+     "modules": 64,
+     "poids_s": 1704.1,
+     "verite_s": 1704.1,
+     "somme_s": 1170.5
+    },
+    {
+     "part": 5,
+     "modules": 39,
+     "poids_s": 1704.2,
+     "verite_s": 1704.2,
+     "somme_s": 1328.2
+    },
+    {
+     "part": 6,
+     "modules": 39,
+     "poids_s": 1704.2,
+     "verite_s": 1704.2,
+     "somme_s": 1287.3
+    }
+   ],
+   "max_s": 1704.2,
+   "max_somme_s": 1410.3,
+   "repli": 2
+  },
+  "couverture_C": {
+   "complets": 245,
+   "total_modules": 250,
+   "poids_reels_s": 10054.1
+  },
+  "S0_reproduit_le_plan": true
+ },
+ "psy_4_parts": {
+  "A0_statique": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 61,
+     "poids_s": 442.6,
+     "verite_s": 2388.1,
+     "somme_s": 2226.8
+    },
+    {
+     "part": 2,
+     "modules": 62,
+     "poids_s": 442.6,
+     "verite_s": 1191.7,
+     "somme_s": 1135.6
+    },
+    {
+     "part": 3,
+     "modules": 66,
+     "poids_s": 442.5,
+     "verite_s": 2220.0,
+     "somme_s": 2152.5
+    },
+    {
+     "part": 4,
+     "modules": 61,
+     "poids_s": 442.6,
+     "verite_s": 924.2,
+     "somme_s": 887.9
+    }
+   ],
+   "max_s": 2388.1,
+   "max_somme_s": 2226.8,
+   "repli": 174
+  },
+  "A1_carte": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 59,
+     "poids_s": 1420.3,
+     "verite_s": 1459.4,
+     "somme_s": 1420.4
+    },
+    {
+     "part": 2,
+     "modules": 69,
+     "poids_s": 1420.2,
+     "verite_s": 1407.5,
+     "somme_s": 1334.4
+    },
+    {
+     "part": 3,
+     "modules": 61,
+     "poids_s": 1420.2,
+     "verite_s": 2340.4,
+     "somme_s": 2183.5
+    },
+    {
+     "part": 4,
+     "modules": 61,
+     "poids_s": 1420.3,
+     "verite_s": 1516.7,
+     "somme_s": 1464.6
+    }
+   ],
+   "max_s": 2340.4,
+   "max_somme_s": 2183.5,
+   "repli": 61
+  },
+  "A1_precedente": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 64,
+     "poids_s": 1347.5,
+     "verite_s": 1379.9,
+     "somme_s": 1357.6
+    },
+    {
+     "part": 2,
+     "modules": 62,
+     "poids_s": 1347.6,
+     "verite_s": 2038.8,
+     "somme_s": 1958.8
+    },
+    {
+     "part": 3,
+     "modules": 62,
+     "poids_s": 1347.6,
+     "verite_s": 1702.6,
+     "somme_s": 1549.6
+    },
+    {
+     "part": 4,
+     "modules": 62,
+     "poids_s": 1347.6,
+     "verite_s": 1602.7,
+     "somme_s": 1536.9
+    }
+   ],
+   "max_s": 2038.8,
+   "max_somme_s": 1958.8,
+   "repli": 2
+  },
+  "A1_plein": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 57,
+     "poids_s": 1681.0,
+     "verite_s": 1681.0,
+     "somme_s": 1631.7
+    },
+    {
+     "part": 2,
+     "modules": 58,
+     "poids_s": 1681.0,
+     "verite_s": 1681.0,
+     "somme_s": 1609.5
+    },
+    {
+     "part": 3,
+     "modules": 59,
+     "poids_s": 1681.0,
+     "verite_s": 1681.0,
+     "somme_s": 1540.4
+    },
+    {
+     "part": 4,
+     "modules": 76,
+     "poids_s": 1681.0,
+     "verite_s": 1681.0,
+     "somme_s": 1621.2
+    }
+   ],
+   "max_s": 1681.0,
+   "max_somme_s": 1631.7,
+   "repli": 0
+  },
+  "modules_poids_carte": 189,
+  "modules_poids_precedente": 248,
+  "A0_reproduit_les_parts": true
+ },
+ "mesure_psql_2_parts": {
+  "modules": 45,
+  "actuel_1_part_s": 2150.4,
+  "actuel_1_part_somme_s": 1848.8,
+  "B0_statique": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 23,
+     "poids_s": 445.9,
+     "verite_s": 1150.0,
+     "somme_s": 981.9
+    },
+    {
+     "part": 2,
+     "modules": 22,
+     "poids_s": 445.6,
+     "verite_s": 1000.4,
+     "somme_s": 866.9
+    }
+   ],
+   "max_s": 1150.0,
+   "max_somme_s": 981.9,
+   "repli": 39
+  },
+  "B1_carte": {
+   "parts": [
+    {
+     "part": 1,
+     "modules": 22,
+     "poids_s": 1153.5,
+     "verite_s": 1086.3,
+     "somme_s": 925.6
+    },
+    {
+     "part": 2,
+     "modules": 23,
+     "poids_s": 1148.3,
+     "verite_s": 1064.1,
+     "somme_s": 923.2
+    }
+   ],
+   "max_s": 1086.3,
+   "max_somme_s": 925.6,
+   "repli": 0
+  }
+ }
+}

@@ -1,5 +1,0 @@
-#!/bin/sh
-# Root-owned fixed sudo entry: no argv, no agent Python path/environment.
-set -eu
-[ "$#" -eq 0 ] || exit 2
-exec /opt/ameesh-it-proof/bin/python3 -I /opt/ameesh-it-proof/bin/ameesh-it-proof

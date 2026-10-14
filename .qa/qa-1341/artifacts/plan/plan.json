@@ -1,0 +1,1649 @@
+{
+ "schema": "ameesh-test-plan/1",
+ "event": "push",
+ "generated": "2026-10-14T18:19:16+00:00",
+ "head": "0532faed4bba6a683073b9c7f5b9deca64abb2bd",
+ "tested": "0532faed4bba6a683073b9c7f5b9deca64abb2bd",
+ "release": "",
+ "refs": {
+  "base": "",
+  "head": ""
+ },
+ "version_only": false,
+ "docs_only": false,
+ "why": "hors documentation : src/ameesh/exploitation.py, tests/parts/pilote-psql.txt, tests/test_1060_alert_types.py",
+ "files": [
+  "src/ameesh/exploitation.py",
+  "tests/parts/pilote-psql.txt",
+  "tests/test_1060_alert_types.py"
+ ],
+ "map": {
+  "commit": "96a795fb2dd30edd81d870a80342081851032b08",
+  "generated": "2026-10-14T17:52:40+00:00",
+  "age_h": 0.4,
+  "used": true,
+  "problem": ""
+ },
+ "sure": true,
+ "phase2_safe": false,
+ "phase2_why": "2 new block(s) unknown to the map",
+ "unsure": [],
+ "contract": [
+  "test_339_orphan_settle",
+  "test_cluster",
+  "test_events_attach",
+  "test_l31_orphans",
+  "test_l50_group_orphan_work_items",
+  "test_l72_panne_de_base",
+  "test_migrations"
+ ],
+ "untested": [],
+ "unknown_blocks": [
+  "src/ameesh/exploitation.py::_alert_rank",
+  "src/ameesh/exploitation.py::_alert_sort_key"
+ ],
+ "foundation": [],
+ "removed": [],
+ "changed": 9,
+ "always": [],
+ "classes": {
+  "test_1003_merge_pr": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_1037_bascule_harnais": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_1060_alert_types": [
+   "P0",
+   "tests/test_1060_alert_types.py"
+  ],
+  "test_1075_pace_multiplier": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_1127_config_explicite": [
+   "P3",
+   ""
+  ],
+  "test_1193_suite_dependency": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_1314_carte_concurrency": [
+   "P0",
+   "tests/test_1314_carte_concurrency.py"
+  ],
+  "test_246_btrfs_guard": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_254_host_hold": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_330_owner_key": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_339_orphan_settle": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_420_qa_role": [
+   "P3",
+   ""
+  ],
+  "test_435_agent_projects": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_453_pause_pression": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_468_agent_naming": [
+   "P3",
+   ""
+  ],
+  "test_472_zombie_turn_close": [
+   "P3",
+   ""
+  ],
+  "test_476_background_signals": [
+   "P3",
+   ""
+  ],
+  "test_476_cleanup_limits": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_476_job_reaping": [
+   "P3",
+   ""
+  ],
+  "test_476_mediated_signals": [
+   "P3",
+   ""
+  ],
+  "test_476_ownership_races": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_500_eviction_irremovable": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_501_native_gate_check": [
+   "P3",
+   ""
+  ],
+  "test_501_native_host_gate": [
+   "P3",
+   ""
+  ],
+  "test_501_unleased_registry": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_502_restart_lease": [
+   "P3",
+   ""
+  ],
+  "test_503_agent_host": [
+   "P2",
+   "failed under measure 2026-10-13"
+  ],
+  "test_518_dsn_argv": [
+   "P3",
+   ""
+  ],
+  "test_530_housekeeping_followups": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_653_db_connections": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_743_exec_only_serve": [
+   "P3",
+   ""
+  ],
+  "test_803_classes_famille": [
+   "P3",
+   ""
+  ],
+  "test_898_pause_rythme": [
+   "P3",
+   ""
+  ],
+  "test_899_alerte_plafond": [
+   "P3",
+   ""
+  ],
+  "test_940_agregat_bash": [
+   "P3",
+   ""
+  ],
+  "test_actions": [
+   "P3",
+   ""
+  ],
+  "test_adapters": [
+   "P3",
+   ""
+  ],
+  "test_approve": [
+   "P3",
+   ""
+  ],
+  "test_approve_equipes": [
+   "P3",
+   ""
+  ],
+  "test_authority": [
+   "P3",
+   ""
+  ],
+  "test_bin_launchers": [
+   "P3",
+   ""
+  ],
+  "test_bout_en_bout": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_canon": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_catalog": [
+   "P3",
+   ""
+  ],
+  "test_catalog_events": [
+   "P3",
+   ""
+  ],
+  "test_catalog_store": [
+   "P3",
+   ""
+  ],
+  "test_cli_compat": [
+   "P3",
+   ""
+  ],
+  "test_cluster": [
+   "P3",
+   ""
+  ],
+  "test_cost": [
+   "P3",
+   ""
+  ],
+  "test_discovery_sources": [
+   "P3",
+   ""
+  ],
+  "test_discovery_transport": [
+   "P3",
+   ""
+  ],
+  "test_events_attach": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_expected_output": [
+   "P3",
+   ""
+  ],
+  "test_fallback": [
+   "P3",
+   ""
+  ],
+  "test_hermeticity_lint": [
+   "P3",
+   ""
+  ],
+  "test_jcs": [
+   "P3",
+   ""
+  ],
+  "test_l105_plafonds_du_tour": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l106_host_cutoff": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l107_executor_contract": [
+   "P3",
+   ""
+  ],
+  "test_l108_executor_server": [
+   "P3",
+   ""
+  ],
+  "test_l109_mediated_mode": [
+   "P3",
+   ""
+  ],
+  "test_l109_remote_client": [
+   "P3",
+   ""
+  ],
+  "test_l110_enrollment": [
+   "P3",
+   ""
+  ],
+  "test_l111_relay": [
+   "P3",
+   ""
+  ],
+  "test_l112_host_gate": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l113_work_repo": [
+   "P3",
+   ""
+  ],
+  "test_l114_executor_image": [
+   "P3",
+   ""
+  ],
+  "test_l116_parts": [
+   "P1",
+   "tests/parts/pilote-psql.txt"
+  ],
+  "test_l1170_test_script_selection": [
+   "P3",
+   ""
+  ],
+  "test_l117_account_spread": [
+   "P3",
+   ""
+  ],
+  "test_l118_assignments": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l118c_mail_projects": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l119_backlog": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l11_speed": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l120_harness_versions": [
+   "P3",
+   ""
+  ],
+  "test_l121_watch": [
+   "P3",
+   ""
+  ],
+  "test_l122_numeros_de_migration": [
+   "P3",
+   ""
+  ],
+  "test_l124_decisions": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l125_courrier_regroupe": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l126_issues": [
+   "P3",
+   ""
+  ],
+  "test_l130_demandes_sans_lot": [
+   "P3",
+   ""
+  ],
+  "test_l131_suites_lourdes": [
+   "P3",
+   ""
+  ],
+  "test_l132_alert_briefs": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l133_subagent_hook": [
+   "P3",
+   ""
+  ],
+  "test_l138_publication": [
+   "P3",
+   ""
+  ],
+  "test_l13_budget": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l142_env_isole": [
+   "P3",
+   ""
+  ],
+  "test_l148_english_identifiers": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage1a1_alias": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_l148_stage1a2_alias": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage2b_scripts": [
+   "P1",
+   ".github/workflows/carte.yml"
+  ],
+  "test_l148_stage2c_renames": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage3_workstream": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage3b_workstream_readers": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage3c_workstream_free_files": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage5b_test_names": [
+   "P3",
+   ""
+  ],
+  "test_l148_stage6_json_keys": [
+   "P3",
+   ""
+  ],
+  "test_l157_estimations": [
+   "P3",
+   ""
+  ],
+  "test_l157b_reference": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l157c_dates_mesures": [
+   "P3",
+   ""
+  ],
+  "test_l158_version_level": [
+   "P3",
+   ""
+  ],
+  "test_l159a_capacity_guard": [
+   "P3",
+   ""
+  ],
+  "test_l159b_offload": [
+   "P3",
+   ""
+  ],
+  "test_l159c_plafonds_memoire": [
+   "P3",
+   ""
+  ],
+  "test_l159d_host_measure": [
+   "P3",
+   ""
+  ],
+  "test_l159e6_guard_restart_alert": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l159e_guard": [
+   "P3",
+   ""
+  ],
+  "test_l159f2_pg_up": [
+   "P3",
+   ""
+  ],
+  "test_l159f_host_gate": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l159g_pilot": [
+   "P3",
+   ""
+  ],
+  "test_l159g_volume": [
+   "P3",
+   ""
+  ],
+  "test_l160b_radar": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_l160c_radar_mail": [
+   "P3",
+   ""
+  ],
+  "test_l160d_resolutions": [
+   "P3",
+   ""
+  ],
+  "test_l160e2_land": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l160e_merge_queue": [
+   "P3",
+   ""
+  ],
+  "test_l160f_versions": [
+   "P3",
+   ""
+  ],
+  "test_l160g_migration_reservations": [
+   "P3",
+   ""
+  ],
+  "test_l160g_nexlink": [
+   "P3",
+   ""
+  ],
+  "test_l161a_ci_sans_code": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_l161b_flow": [
+   "P3",
+   ""
+  ],
+  "test_l161c_failures_realtime": [
+   "P0",
+   "tests/test_l161c_failures_realtime.py"
+  ],
+  "test_l161e_map": [
+   "P3",
+   ""
+  ],
+  "test_l161f_plan": [
+   "P0",
+   "tests/test_l161f_plan.py"
+  ],
+  "test_l162_tmpfs": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l165_prise_lots": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l165b_agents_libres": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l165c_sessions_par_lot": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l166_child_session": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l16_acp": [
+   "P3",
+   ""
+  ],
+  "test_l16_harnais": [
+   "P1",
+   "tests/test_1060_alert_types.py (added to tests)"
+  ],
+  "test_l217_plafond_sous_agents": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l218_resume_rotation_entier": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l219_housekeeping_tmp": [
+   "P3",
+   ""
+  ],
+  "test_l221_cout_result_sans_usage": [
+   "P3",
+   ""
+  ],
+  "test_l223_interactive_permissions": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l224_session_harnais": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l225_prix_claude": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l226a_sentinel": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l226b_auth_failure": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l230_build_artifacts": [
+   "P3",
+   ""
+  ],
+  "test_l231_deps": [
+   "P3",
+   ""
+  ],
+  "test_l232a_handoffs": [
+   "P3",
+   ""
+  ],
+  "test_l232e_drain_handoffs": [
+   "P3",
+   ""
+  ],
+  "test_l232e_host_lifecycle": [
+   "P3",
+   ""
+  ],
+  "test_l232e_loss_recovery": [
+   "P3",
+   ""
+  ],
+  "test_l232e_preflight": [
+   "P3",
+   ""
+  ],
+  "test_l233_decide_only": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l233b_budget_handoff": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l234_auditor": [
+   "P3",
+   ""
+  ],
+  "test_l234a_auditor_canon_guard": [
+   "P3",
+   ""
+  ],
+  "test_l242b2_budget": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l242b3_fallback": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l242b_critical_accounts": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l244_idle_gauge_cache": [
+   "P3",
+   ""
+  ],
+  "test_l248b_deps_packagers": [
+   "P3",
+   ""
+  ],
+  "test_l253_disk_volumes": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l26_exploitation": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l30_accounts": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l317_project_modules": [
+   "P3",
+   ""
+  ],
+  "test_l317_proof_helper": [
+   "P3",
+   ""
+  ],
+  "test_l317_snapshot_limits": [
+   "P3",
+   ""
+  ],
+  "test_l317b_module_audit": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l317c_deep_analysis": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l31_admission": [
+   "P3",
+   ""
+  ],
+  "test_l31_orphans": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l31_pressure": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l31_relocation": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l31_resources": [
+   "P3",
+   ""
+  ],
+  "test_l31_visibility": [
+   "P3",
+   ""
+  ],
+  "test_l33_chatbot": [
+   "P2",
+   "failed under measure 2026-10-11"
+  ],
+  "test_l35_dossier_de_travail": [
+   "P3",
+   ""
+  ],
+  "test_l361_thread_expiry": [
+   "P3",
+   ""
+  ],
+  "test_l368_planned_waits": [
+   "P3",
+   ""
+  ],
+  "test_l36_vivacite": [
+   "P3",
+   ""
+  ],
+  "test_l37_mode_et_alertes": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l385_work_dependencies": [
+   "P3",
+   ""
+  ],
+  "test_l38_notify": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l39_adoption_reprise": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l40_delegation": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l411_docker_storage": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l41_bindings": [
+   "P3",
+   ""
+  ],
+  "test_l42_plusieurs_canons": [
+   "P3",
+   ""
+  ],
+  "test_l43_perimetre_hote": [
+   "P3",
+   ""
+  ],
+  "test_l44_authentificateurs_par_canon": [
+   "P3",
+   ""
+  ],
+  "test_l46_corrections": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l48_fast_failures": [
+   "P3",
+   ""
+  ],
+  "test_l50_group_orphan_work_items": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l51_persona": [
+   "P3",
+   ""
+  ],
+  "test_l52_persona_sessions": [
+   "P3",
+   ""
+  ],
+  "test_l538_process_inject": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l539_review_lot": [
+   "P3",
+   ""
+  ],
+  "test_l53_restore_guard": [
+   "P3",
+   ""
+  ],
+  "test_l53_session_backup": [
+   "P3",
+   ""
+  ],
+  "test_l54_memory_runner": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l54_persona_memory": [
+   "P3",
+   ""
+  ],
+  "test_l56_role_executor": [
+   "P3",
+   ""
+  ],
+  "test_l59_activity": [
+   "P3",
+   ""
+  ],
+  "test_l60_rotation_deepseek": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l61_allers_retours": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l62_projects": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l63_platform": [
+   "P3",
+   ""
+  ],
+  "test_l64_unmeasured": [
+   "P3",
+   ""
+  ],
+  "test_l70_budget": [
+   "P3",
+   ""
+  ],
+  "test_l71_comptabilite": [
+   "P3",
+   ""
+  ],
+  "test_l72_panne_de_base": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l73_housekeeping": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l744_ci_entrypoint": [
+   "P3",
+   ""
+  ],
+  "test_l74_comptes_a_echeance": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l755_workflow_timeouts": [
+   "P1",
+   ".github/workflows/carte.yml"
+  ],
+  "test_l75_resident": [
+   "P3",
+   ""
+  ],
+  "test_l780_outdated_runner": [
+   "P3",
+   ""
+  ],
+  "test_l78_conversations": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l790_outdated_restart": [
+   "P3",
+   ""
+  ],
+  "test_l84_serve": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l88_ui": [
+   "P3",
+   ""
+  ],
+  "test_l932_ci_venv_cache": [
+   "P3",
+   ""
+  ],
+  "test_l94_underuse": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_l95_budget_juste": [
+   "P3",
+   ""
+  ],
+  "test_l96_roadmap": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_mail": [
+   "P3",
+   ""
+  ],
+  "test_mail_instruction": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_merged_work_item_tracking": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_mesh_cli": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_migrations": [
+   "P3",
+   ""
+  ],
+  "test_migrations_additives": [
+   "P3",
+   ""
+  ],
+  "test_models_entrypoint": [
+   "P3",
+   ""
+  ],
+  "test_p256": [
+   "P3",
+   ""
+  ],
+  "test_path_b_assembly": [
+   "P3",
+   ""
+  ],
+  "test_placement": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_plan": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_pressure_orchestrator": [
+   "P3",
+   ""
+  ],
+  "test_progress": [
+   "P3",
+   ""
+  ],
+  "test_progress_serve": [
+   "P3",
+   ""
+  ],
+  "test_receipts": [
+   "P3",
+   ""
+  ],
+  "test_registry_lease": [
+   "P3",
+   ""
+  ],
+  "test_relay_credentials": [
+   "P3",
+   ""
+  ],
+  "test_rename": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_resume_without_authority": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_review": [
+   "P3",
+   ""
+  ],
+  "test_runner": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_runner_drain": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_signing": [
+   "P3",
+   ""
+  ],
+  "test_site_art": [
+   "P3",
+   ""
+  ],
+  "test_thread_log": [
+   "P3",
+   ""
+  ],
+  "test_tube_ferme": [
+   "P3",
+   ""
+  ],
+  "test_turn_grace": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_undeliverable": [
+   "P1",
+   "src/ameesh/exploitation.py::<module>"
+  ],
+  "test_version": [
+   "P3",
+   ""
+  ],
+  "test_work": [
+   "P3",
+   ""
+  ]
+ },
+ "doc_readers": [],
+ "parts": {
+  "psycopg": [
+   {
+    "part": 1,
+    "of": 4,
+    "label": "psycopg 1/4",
+    "modules": [
+     "test_1060_alert_types",
+     "test_1075_pace_multiplier",
+     "test_l755_workflow_timeouts",
+     "test_l116_parts",
+     "test_500_eviction_irremovable",
+     "test_l165b_agents_libres",
+     "test_l162_tmpfs",
+     "test_l31_orphans",
+     "test_l74_comptes_a_echeance",
+     "test_1003_merge_pr",
+     "test_rename",
+     "test_l233_decide_only",
+     "test_l124_decisions",
+     "test_runner_drain",
+     "test_events_attach",
+     "test_l60_rotation_deepseek",
+     "test_undeliverable",
+     "test_l39_adoption_reprise",
+     "test_l223_interactive_permissions",
+     "test_476_cleanup_limits",
+     "test_476_ownership_races",
+     "test_503_agent_host",
+     "test_476_mediated_signals",
+     "test_501_native_gate_check",
+     "test_adapters",
+     "test_catalog",
+     "test_catalog_events",
+     "test_cluster",
+     "test_discovery_transport",
+     "test_hermeticity_lint",
+     "test_jcs",
+     "test_l111_relay",
+     "test_l113_work_repo",
+     "test_l130_demandes_sans_lot",
+     "test_l142_env_isole",
+     "test_l148_stage2c_renames",
+     "test_l148_stage3b_workstream_readers",
+     "test_l148_stage5b_test_names",
+     "test_l159a_capacity_guard",
+     "test_l159e_guard",
+     "test_l159g_volume",
+     "test_l160d_resolutions",
+     "test_l160g_migration_reservations",
+     "test_l160g_nexlink",
+     "test_l219_housekeeping_tmp",
+     "test_l230_build_artifacts",
+     "test_l231_deps",
+     "test_l232e_drain_handoffs",
+     "test_l232e_preflight",
+     "test_l244_idle_gauge_cache",
+     "test_l248b_deps_packagers",
+     "test_l317_proof_helper",
+     "test_l31_visibility",
+     "test_l35_dossier_de_travail",
+     "test_l368_planned_waits",
+     "test_l42_plusieurs_canons",
+     "test_l54_persona_memory",
+     "test_l56_role_executor",
+     "test_l63_platform",
+     "test_l64_unmeasured",
+     "test_l70_budget",
+     "test_l932_ci_venv_cache",
+     "test_registry_lease",
+     "test_version"
+    ],
+    "estimate_s": 1347.5
+   },
+   {
+    "part": 2,
+    "of": 4,
+    "label": "psycopg 2/4",
+    "modules": [
+     "test_l159e6_guard_restart_alert",
+     "test_l50_group_orphan_work_items",
+     "test_l226a_sentinel",
+     "test_1037_bascule_harnais",
+     "test_l317b_module_audit",
+     "test_l225_prix_claude",
+     "test_l119_backlog",
+     "test_l242b_critical_accounts",
+     "test_339_orphan_settle",
+     "test_l31_relocation",
+     "test_l317c_deep_analysis",
+     "test_1193_suite_dependency",
+     "test_l78_conversations",
+     "test_l61_allers_retours",
+     "test_501_unleased_registry",
+     "test_330_owner_key",
+     "test_l217_plafond_sous_agents",
+     "test_placement",
+     "test_l159f_host_gate",
+     "test_l242b3_fallback",
+     "test_l226b_auth_failure",
+     "test_l30_accounts",
+     "test_l160e2_land",
+     "test_l125_courrier_regroupe",
+     "test_l37_mode_et_alertes",
+     "test_l40_delegation",
+     "test_turn_grace",
+     "test_l224_session_harnais",
+     "test_canon",
+     "test_mesh_cli",
+     "test_420_qa_role",
+     "test_476_job_reaping",
+     "test_940_agregat_bash",
+     "test_approve_equipes",
+     "test_bin_launchers",
+     "test_catalog_store",
+     "test_cli_compat",
+     "test_l107_executor_contract",
+     "test_l109_remote_client",
+     "test_l110_enrollment",
+     "test_l114_executor_image",
+     "test_l1170_test_script_selection",
+     "test_l131_suites_lourdes",
+     "test_l159c_plafonds_memoire",
+     "test_l159d_host_measure",
+     "test_l159g_pilot",
+     "test_l16_acp",
+     "test_l232a_handoffs",
+     "test_l234a_auditor_canon_guard",
+     "test_l31_resources",
+     "test_l43_perimetre_hote",
+     "test_l53_restore_guard",
+     "test_l53_session_backup",
+     "test_l59_activity",
+     "test_l75_resident",
+     "test_l88_ui",
+     "test_l95_budget_juste",
+     "test_migrations_additives",
+     "test_p256",
+     "test_progress",
+     "test_signing",
+     "test_work"
+    ],
+    "estimate_s": 1347.6
+   },
+   {
+    "part": 3,
+    "of": 4,
+    "label": "psycopg 3/4",
+    "modules": [
+     "test_l161f_plan",
+     "test_l161a_ci_sans_code",
+     "test_l253_disk_volumes",
+     "test_l165_prise_lots",
+     "test_l233b_budget_handoff",
+     "test_246_btrfs_guard",
+     "test_l31_pressure",
+     "test_l157b_reference",
+     "test_l84_serve",
+     "test_435_agent_projects",
+     "test_l62_projects",
+     "test_453_pause_pression",
+     "test_resume_without_authority",
+     "test_l118_assignments",
+     "test_l46_corrections",
+     "test_l54_memory_runner",
+     "test_merged_work_item_tracking",
+     "test_l106_host_cutoff",
+     "test_l105_plafonds_du_tour",
+     "test_l538_process_inject",
+     "test_l13_budget",
+     "test_mail_instruction",
+     "test_l26_exploitation",
+     "test_l33_chatbot",
+     "test_476_background_signals",
+     "test_501_native_host_gate",
+     "test_502_restart_lease",
+     "test_518_dsn_argv",
+     "test_743_exec_only_serve",
+     "test_803_classes_famille",
+     "test_actions",
+     "test_cost",
+     "test_discovery_sources",
+     "test_fallback",
+     "test_l109_mediated_mode",
+     "test_l117_account_spread",
+     "test_l121_watch",
+     "test_l133_subagent_hook",
+     "test_l138_publication",
+     "test_l148_stage1a2_alias",
+     "test_l148_stage3_workstream",
+     "test_l157_estimations",
+     "test_l157c_dates_mesures",
+     "test_l158_version_level",
+     "test_l159f2_pg_up",
+     "test_l160e_merge_queue",
+     "test_l161b_flow",
+     "test_l161e_map",
+     "test_l221_cout_result_sans_usage",
+     "test_l234_auditor",
+     "test_l31_admission",
+     "test_l44_authentificateurs_par_canon",
+     "test_l51_persona",
+     "test_l52_persona_sessions",
+     "test_l744_ci_entrypoint",
+     "test_l780_outdated_runner",
+     "test_migrations",
+     "test_path_b_assembly",
+     "test_progress_serve",
+     "test_review",
+     "test_site_art",
+     "test_tube_ferme"
+    ],
+    "estimate_s": 1347.6
+   },
+   {
+    "part": 4,
+    "of": 4,
+    "label": "psycopg 4/4",
+    "modules": [
+     "test_1314_carte_concurrency",
+     "test_l161c_failures_realtime",
+     "test_l411_docker_storage",
+     "test_l148_stage1a1_alias",
+     "test_l132_alert_briefs",
+     "test_653_db_connections",
+     "test_530_housekeeping_followups",
+     "test_l148_stage2b_scripts",
+     "test_l160b_radar",
+     "test_l16_harnais",
+     "test_l242b2_budget",
+     "test_l166_child_session",
+     "test_l94_underuse",
+     "test_l218_resume_rotation_entier",
+     "test_254_host_hold",
+     "test_l72_panne_de_base",
+     "test_l38_notify",
+     "test_l73_housekeeping",
+     "test_bout_en_bout",
+     "test_l112_host_gate",
+     "test_plan",
+     "test_l96_roadmap",
+     "test_l165c_sessions_par_lot",
+     "test_l118c_mail_projects",
+     "test_l11_speed",
+     "test_runner",
+     "test_1127_config_explicite",
+     "test_468_agent_naming",
+     "test_472_zombie_turn_close",
+     "test_898_pause_rythme",
+     "test_899_alerte_plafond",
+     "test_approve",
+     "test_authority",
+     "test_expected_output",
+     "test_l108_executor_server",
+     "test_l120_harness_versions",
+     "test_l122_numeros_de_migration",
+     "test_l126_issues",
+     "test_l148_english_identifiers",
+     "test_l148_stage3c_workstream_free_files",
+     "test_l148_stage6_json_keys",
+     "test_l159b_offload",
+     "test_l160c_radar_mail",
+     "test_l160f_versions",
+     "test_l232e_host_lifecycle",
+     "test_l232e_loss_recovery",
+     "test_l317_project_modules",
+     "test_l317_snapshot_limits",
+     "test_l361_thread_expiry",
+     "test_l36_vivacite",
+     "test_l385_work_dependencies",
+     "test_l41_bindings",
+     "test_l48_fast_failures",
+     "test_l539_review_lot",
+     "test_l71_comptabilite",
+     "test_l790_outdated_restart",
+     "test_mail",
+     "test_models_entrypoint",
+     "test_pressure_orchestrator",
+     "test_receipts",
+     "test_relay_credentials",
+     "test_thread_log"
+    ],
+    "estimate_s": 1347.6
+   }
+  ],
+  "psql": [
+   {
+    "part": 1,
+    "of": 6,
+    "label": "psql 1/6",
+    "modules": [
+     "test_501_unleased_registry",
+     "test_l132_alert_briefs",
+     "test_l119_backlog",
+     "test_undeliverable",
+     "test_330_owner_key",
+     "test_l125_courrier_regroupe",
+     "test_l317c_deep_analysis",
+     "test_l39_adoption_reprise",
+     "test_l46_corrections",
+     "test_l37_mode_et_alertes",
+     "test_mesh_cli",
+     "test_l33_chatbot",
+     "test_1127_config_explicite",
+     "test_472_zombie_turn_close",
+     "test_501_native_gate_check",
+     "test_743_exec_only_serve",
+     "test_803_classes_famille",
+     "test_actions",
+     "test_catalog_store",
+     "test_l109_remote_client",
+     "test_l110_enrollment",
+     "test_l120_harness_versions",
+     "test_l159c_plafonds_memoire",
+     "test_l159d_host_measure",
+     "test_l161e_map",
+     "test_l232a_handoffs",
+     "test_l234_auditor",
+     "test_l234a_auditor_canon_guard",
+     "test_l317_proof_helper",
+     "test_l317_snapshot_limits",
+     "test_l31_admission",
+     "test_l36_vivacite",
+     "test_l44_authentificateurs_par_canon",
+     "test_l53_session_backup",
+     "test_l59_activity",
+     "test_l63_platform",
+     "test_path_b_assembly",
+     "test_progress",
+     "test_relay_credentials",
+     "test_review",
+     "test_version"
+    ],
+    "estimate_s": 707.7
+   },
+   {
+    "part": 2,
+    "of": 6,
+    "label": "psql 2/6",
+    "modules": [
+     "test_l16_harnais",
+     "test_rename",
+     "test_435_agent_projects",
+     "test_l31_orphans",
+     "test_l161a_ci_sans_code",
+     "test_l62_projects",
+     "test_l148_stage2b_scripts",
+     "test_l60_rotation_deepseek",
+     "test_453_pause_pression",
+     "test_l74_comptes_a_echeance",
+     "test_l165c_sessions_par_lot",
+     "test_l84_serve",
+     "test_l31_relocation",
+     "test_l233b_budget_handoff",
+     "test_500_eviction_irremovable",
+     "test_l11_speed",
+     "test_events_attach",
+     "test_l223_interactive_permissions",
+     "test_l538_process_inject",
+     "test_1003_merge_pr",
+     "test_plan",
+     "test_476_mediated_signals",
+     "test_518_dsn_argv",
+     "test_authority",
+     "test_catalog",
+     "test_catalog_events",
+     "test_cost",
+     "test_jcs",
+     "test_l108_executor_server",
+     "test_l117_account_spread",
+     "test_l122_numeros_de_migration",
+     "test_l133_subagent_hook",
+     "test_l148_stage3c_workstream_free_files",
+     "test_l160f_versions",
+     "test_l232e_drain_handoffs",
+     "test_l43_perimetre_hote",
+     "test_l780_outdated_runner",
+     "test_l88_ui",
+     "test_l932_ci_venv_cache",
+     "test_l95_budget_juste",
+     "test_progress_serve",
+     "test_receipts",
+     "test_signing",
+     "test_tube_ferme"
+    ],
+    "estimate_s": 707.6
+   },
+   {
+    "part": 3,
+    "of": 6,
+    "label": "psql 3/6",
+    "modules": [
+     "test_1060_alert_types",
+     "test_l161f_plan",
+     "test_l166_child_session",
+     "test_l159e6_guard_restart_alert",
+     "test_l218_resume_rotation_entier",
+     "test_530_housekeeping_followups",
+     "test_l118_assignments",
+     "test_l78_conversations",
+     "test_l106_host_cutoff",
+     "test_l162_tmpfs",
+     "test_246_btrfs_guard",
+     "test_l13_budget",
+     "test_placement",
+     "test_mail_instruction",
+     "test_l159f_host_gate",
+     "test_476_background_signals",
+     "test_502_restart_lease",
+     "test_adapters",
+     "test_approve_equipes",
+     "test_bin_launchers",
+     "test_discovery_transport",
+     "test_expected_output",
+     "test_l1170_test_script_selection",
+     "test_l142_env_isole",
+     "test_l157_estimations",
+     "test_l157c_dates_mesures",
+     "test_l158_version_level",
+     "test_l160g_nexlink",
+     "test_l232e_host_lifecycle",
+     "test_l232e_loss_recovery",
+     "test_l244_idle_gauge_cache",
+     "test_l248b_deps_packagers",
+     "test_l31_resources",
+     "test_l48_fast_failures",
+     "test_l52_persona_sessions",
+     "test_l539_review_lot",
+     "test_l54_persona_memory",
+     "test_l56_role_executor",
+     "test_l71_comptabilite",
+     "test_migrations",
+     "test_migrations_additives",
+     "test_models_entrypoint",
+     "test_pressure_orchestrator",
+     "test_registry_lease"
+    ],
+    "estimate_s": 707.7
+   },
+   {
+    "part": 4,
+    "of": 6,
+    "label": "psql 4/6",
+    "modules": [
+     "test_l161c_failures_realtime",
+     "test_1037_bascule_harnais",
+     "test_runner_drain",
+     "test_l54_memory_runner",
+     "test_l160b_radar",
+     "test_l165b_agents_libres",
+     "test_254_host_hold",
+     "test_l73_housekeeping",
+     "test_l61_allers_retours",
+     "test_bout_en_bout",
+     "test_l317b_module_audit",
+     "test_turn_grace",
+     "test_l105_plafonds_du_tour",
+     "test_l225_prix_claude",
+     "test_l226b_auth_failure",
+     "test_l94_underuse",
+     "test_l40_delegation",
+     "test_canon",
+     "test_476_ownership_races",
+     "test_discovery_sources",
+     "test_fallback",
+     "test_l107_executor_contract",
+     "test_l113_work_repo",
+     "test_l131_suites_lourdes",
+     "test_l148_stage1a2_alias",
+     "test_l148_stage3_workstream",
+     "test_l148_stage5b_test_names",
+     "test_l159b_offload",
+     "test_l159f2_pg_up",
+     "test_l159g_volume",
+     "test_l160d_resolutions",
+     "test_l232e_preflight",
+     "test_l317_project_modules",
+     "test_l31_visibility",
+     "test_l368_planned_waits",
+     "test_l41_bindings",
+     "test_l42_plusieurs_canons",
+     "test_l51_persona",
+     "test_l790_outdated_restart",
+     "test_work"
+    ],
+    "estimate_s": 707.7
+   },
+   {
+    "part": 5,
+    "of": 6,
+    "label": "psql 5/6",
+    "modules": [
+     "test_1314_carte_concurrency",
+     "test_l755_workflow_timeouts",
+     "test_l116_parts",
+     "test_l157b_reference",
+     "test_l31_pressure",
+     "test_l217_plafond_sous_agents",
+     "test_l50_group_orphan_work_items",
+     "test_1193_suite_dependency",
+     "test_l242b3_fallback",
+     "test_339_orphan_settle",
+     "test_l242b_critical_accounts",
+     "test_l96_roadmap",
+     "test_653_db_connections",
+     "test_l38_notify",
+     "test_l242b2_budget",
+     "test_l253_disk_volumes",
+     "test_l112_host_gate",
+     "test_l30_accounts",
+     "test_merged_work_item_tracking",
+     "test_l160e2_land",
+     "test_runner",
+     "test_420_qa_role",
+     "test_501_native_host_gate",
+     "test_899_alerte_plafond",
+     "test_approve",
+     "test_l121_watch",
+     "test_l130_demandes_sans_lot",
+     "test_l138_publication",
+     "test_l148_english_identifiers",
+     "test_l148_stage6_json_keys",
+     "test_l159a_capacity_guard",
+     "test_l159e_guard",
+     "test_l161b_flow",
+     "test_l219_housekeeping_tmp",
+     "test_l221_cout_result_sans_usage",
+     "test_l230_build_artifacts",
+     "test_l64_unmeasured",
+     "test_l70_budget",
+     "test_l744_ci_entrypoint",
+     "test_mail",
+     "test_p256"
+    ],
+    "estimate_s": 707.7
+   },
+   {
+    "part": 6,
+    "of": 6,
+    "label": "psql 6/6",
+    "modules": [
+     "test_l148_stage1a1_alias",
+     "test_resume_without_authority",
+     "test_l411_docker_storage",
+     "test_1075_pace_multiplier",
+     "test_l165_prise_lots",
+     "test_l233_decide_only",
+     "test_l72_panne_de_base",
+     "test_l224_session_harnais",
+     "test_l124_decisions",
+     "test_l226a_sentinel",
+     "test_l118c_mail_projects",
+     "test_l26_exploitation",
+     "test_476_cleanup_limits",
+     "test_503_agent_host",
+     "test_468_agent_naming",
+     "test_476_job_reaping",
+     "test_898_pause_rythme",
+     "test_940_agregat_bash",
+     "test_cli_compat",
+     "test_cluster",
+     "test_hermeticity_lint",
+     "test_l109_mediated_mode",
+     "test_l111_relay",
+     "test_l114_executor_image",
+     "test_l126_issues",
+     "test_l148_stage2c_renames",
+     "test_l148_stage3b_workstream_readers",
+     "test_l159g_pilot",
+     "test_l160c_radar_mail",
+     "test_l160e_merge_queue",
+     "test_l160g_migration_reservations",
+     "test_l16_acp",
+     "test_l231_deps",
+     "test_l35_dossier_de_travail",
+     "test_l361_thread_expiry",
+     "test_l385_work_dependencies",
+     "test_l53_restore_guard",
+     "test_l75_resident",
+     "test_site_art",
+     "test_thread_log"
+    ],
+    "estimate_s": 707.9
+   }
+  ]
+ },
+ "selection": {
+  "mode": "full",
+  "why": "main, release/** and the integration branch run the full suite",
+  "modules": 250,
+  "impacted": 98,
+  "contract": 7,
+  "selected": 250,
+  "skipped": 0,
+  "impacted_estimate_s": 2733.5,
+  "total_estimate_s": 5390.3
+ }
+}

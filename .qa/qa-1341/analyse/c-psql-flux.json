@@ -1,0 +1,2737 @@
+{
+ "couverture": {
+  "absents": [
+   "test_receipts",
+   "test_signing",
+   "test_tube_ferme"
+  ],
+  "complets": 245,
+  "modules_source": 250,
+  "partiels": [
+   "test_l148_stage2b_scripts",
+   "test_progress_serve"
+  ],
+  "somme_totale_s": 10054.1,
+  "vus": 247
+ },
+ "detail": {
+  "test_1003_merge_pr": {
+   "complet": true,
+   "def_test": 50,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 17.9,
+   "span": 17.9,
+   "tests": 50
+  },
+  "test_1037_bascule_harnais": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 1.4,
+   "span": 14.6,
+   "tests": 3
+  },
+  "test_1060_alert_types": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 6.6,
+   "span": 13.4,
+   "tests": 6
+  },
+  "test_1075_pace_multiplier": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 14
+  },
+  "test_1127_config_explicite": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.9,
+   "span": 0.9,
+   "tests": 9
+  },
+  "test_1193_suite_dependency": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 14.6,
+   "span": 21.7,
+   "tests": 9
+  },
+  "test_1314_carte_concurrency": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 3
+  },
+  "test_246_btrfs_guard": {
+   "complet": true,
+   "def_test": 33,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 1.4,
+   "span": 1.4,
+   "tests": 33
+  },
+  "test_254_host_hold": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 75.1,
+   "span": 110.6,
+   "tests": 14
+  },
+  "test_330_owner_key": {
+   "complet": true,
+   "def_test": 22,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 49.0,
+   "span": 55.7,
+   "tests": 22
+  },
+  "test_339_orphan_settle": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 13.8,
+   "span": 21.0,
+   "tests": 15
+  },
+  "test_420_qa_role": {
+   "complet": true,
+   "def_test": 32,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 53.9,
+   "span": 74.9,
+   "tests": 32
+  },
+  "test_435_agent_projects": {
+   "complet": true,
+   "def_test": 5,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 11.6,
+   "span": 20.4,
+   "tests": 5
+  },
+  "test_453_pause_pression": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 13.5,
+   "span": 13.5,
+   "tests": 16
+  },
+  "test_468_agent_naming": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 39.1,
+   "span": 39.4,
+   "tests": 24
+  },
+  "test_472_zombie_turn_close": {
+   "complet": true,
+   "def_test": 23,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 1.0,
+   "span": 8.0,
+   "tests": 23
+  },
+  "test_476_background_signals": {
+   "complet": true,
+   "def_test": 23,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 1.9,
+   "span": 1.9,
+   "tests": 23
+  },
+  "test_476_cleanup_limits": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.9,
+   "span": 0.9,
+   "tests": 7
+  },
+  "test_476_job_reaping": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 1.0,
+   "span": 1.0,
+   "tests": 7
+  },
+  "test_476_mediated_signals": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 11.1,
+   "span": 11.1,
+   "tests": 3
+  },
+  "test_476_ownership_races": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.8,
+   "span": 0.8,
+   "tests": 9
+  },
+  "test_500_eviction_irremovable": {
+   "complet": true,
+   "def_test": 28,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 9.2,
+   "span": 17.5,
+   "tests": 28
+  },
+  "test_501_native_gate_check": {
+   "complet": true,
+   "def_test": 1,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 1
+  },
+  "test_501_native_host_gate": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 24
+  },
+  "test_501_unleased_registry": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 27.0,
+   "span": 27.0,
+   "tests": 6
+  },
+  "test_502_restart_lease": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 23.5,
+   "span": 23.5,
+   "tests": 12
+  },
+  "test_503_agent_host": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 123.8,
+   "span": 123.8,
+   "tests": 25
+  },
+  "test_518_dsn_argv": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 22.0,
+   "span": 22.0,
+   "tests": 13
+  },
+  "test_530_housekeeping_followups": {
+   "complet": true,
+   "def_test": 12,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 10.7,
+   "span": 10.9,
+   "tests": 12
+  },
+  "test_653_db_connections": {
+   "complet": true,
+   "def_test": 20,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 4.7,
+   "span": 12.5,
+   "tests": 20
+  },
+  "test_743_exec_only_serve": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.7,
+   "span": 0.7,
+   "tests": 3
+  },
+  "test_803_classes_famille": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 4.8,
+   "span": 11.8,
+   "tests": 6
+  },
+  "test_898_pause_rythme": {
+   "complet": true,
+   "def_test": 5,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 5.7,
+   "span": 5.7,
+   "tests": 5
+  },
+  "test_899_alerte_plafond": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 25
+  },
+  "test_940_agregat_bash": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 10
+  },
+  "test_actions": {
+   "complet": true,
+   "def_test": 54,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 202.5,
+   "span": 244.4,
+   "tests": 54
+  },
+  "test_adapters": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 10
+  },
+  "test_approve": {
+   "complet": true,
+   "def_test": 51,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 43.7,
+   "span": 85.8,
+   "tests": 51
+  },
+  "test_approve_equipes": {
+   "complet": true,
+   "def_test": 35,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 59.5,
+   "span": 74.7,
+   "tests": 35
+  },
+  "test_authority": {
+   "complet": true,
+   "def_test": 26,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 45.6,
+   "span": 45.6,
+   "tests": 26
+  },
+  "test_bin_launchers": {
+   "complet": true,
+   "def_test": 1,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.9,
+   "span": 0.9,
+   "tests": 1
+  },
+  "test_bout_en_bout": {
+   "complet": true,
+   "def_test": 1,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 37.8,
+   "span": 37.8,
+   "tests": 1
+  },
+  "test_canon": {
+   "complet": true,
+   "def_test": 113,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 119.4,
+   "span": 168.3,
+   "tests": 113
+  },
+  "test_catalog": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 7
+  },
+  "test_catalog_events": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 13
+  },
+  "test_catalog_store": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 1.7,
+   "span": 1.7,
+   "tests": 3
+  },
+  "test_cli_compat": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 43.9,
+   "span": 43.9,
+   "tests": 15
+  },
+  "test_cluster": {
+   "complet": true,
+   "def_test": 33,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 83.0,
+   "span": 108.7,
+   "tests": 33
+  },
+  "test_cost": {
+   "complet": true,
+   "def_test": 53,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 21.4,
+   "span": 45.3,
+   "tests": 53
+  },
+  "test_discovery_sources": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 8
+  },
+  "test_discovery_transport": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.2,
+   "span": 0.2,
+   "tests": 8
+  },
+  "test_events_attach": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 52.7,
+   "span": 61.9,
+   "tests": 16
+  },
+  "test_expected_output": {
+   "complet": true,
+   "def_test": 4,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 4
+  },
+  "test_fallback": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 3.1,
+   "span": 3.1,
+   "tests": 7
+  },
+  "test_hermeticity_lint": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 14
+  },
+  "test_jcs": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 16
+  },
+  "test_l105_plafonds_du_tour": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 42.5,
+   "span": 60.2,
+   "tests": 15
+  },
+  "test_l106_host_cutoff": {
+   "complet": true,
+   "def_test": 48,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 97.9,
+   "span": 113.1,
+   "tests": 48
+  },
+  "test_l107_executor_contract": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 19
+  },
+  "test_l108_executor_server": {
+   "complet": true,
+   "def_test": 45,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 825.3,
+   "span": 911.0,
+   "tests": 45
+  },
+  "test_l109_mediated_mode": {
+   "complet": true,
+   "def_test": 32,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 11.7,
+   "span": 11.7,
+   "tests": 32
+  },
+  "test_l109_remote_client": {
+   "complet": true,
+   "def_test": 32,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 6.8,
+   "span": 6.8,
+   "tests": 32
+  },
+  "test_l110_enrollment": {
+   "complet": true,
+   "def_test": 38,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 22.5,
+   "span": 42.9,
+   "tests": 38
+  },
+  "test_l111_relay": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 32.0,
+   "span": 43.8,
+   "tests": 19
+  },
+  "test_l112_host_gate": {
+   "complet": true,
+   "def_test": 31,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 50.0,
+   "span": 57.2,
+   "tests": 31
+  },
+  "test_l113_work_repo": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 2.8,
+   "span": 2.8,
+   "tests": 7
+  },
+  "test_l114_executor_image": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 1.5,
+   "span": 1.5,
+   "tests": 3
+  },
+  "test_l116_parts": {
+   "complet": true,
+   "def_test": 5,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.5,
+   "span": 0.5,
+   "tests": 5
+  },
+  "test_l1170_test_script_selection": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 2.6,
+   "span": 2.6,
+   "tests": 10
+  },
+  "test_l117_account_spread": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 19.3,
+   "span": 30.3,
+   "tests": 8
+  },
+  "test_l118_assignments": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 36.2,
+   "span": 50.2,
+   "tests": 16
+  },
+  "test_l118c_mail_projects": {
+   "complet": true,
+   "def_test": 39,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 150.9,
+   "span": 150.9,
+   "tests": 39
+  },
+  "test_l119_backlog": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 56.3,
+   "span": 71.6,
+   "tests": 16
+  },
+  "test_l11_speed": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 66.2,
+   "span": 100.2,
+   "tests": 25
+  },
+  "test_l120_harness_versions": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 4.5,
+   "span": 4.7,
+   "tests": 10
+  },
+  "test_l121_watch": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 16.2,
+   "span": 23.1,
+   "tests": 16
+  },
+  "test_l122_numeros_de_migration": {
+   "complet": true,
+   "def_test": 35,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 40.1,
+   "span": 75.7,
+   "tests": 35
+  },
+  "test_l124_decisions": {
+   "complet": true,
+   "def_test": 35,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 111.8,
+   "span": 152.2,
+   "tests": 35
+  },
+  "test_l125_courrier_regroupe": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 99.2,
+   "span": 143.9,
+   "tests": 24
+  },
+  "test_l126_issues": {
+   "complet": true,
+   "def_test": 31,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 40.3,
+   "span": 77.3,
+   "tests": 31
+  },
+  "test_l130_demandes_sans_lot": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 9.0,
+   "span": 15.6,
+   "tests": 8
+  },
+  "test_l131_suites_lourdes": {
+   "complet": true,
+   "def_test": 23,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 3.3,
+   "span": 3.3,
+   "tests": 23
+  },
+  "test_l132_alert_briefs": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 1.6,
+   "span": 8.4,
+   "tests": 9
+  },
+  "test_l133_subagent_hook": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 11.5,
+   "span": 22.4,
+   "tests": 7
+  },
+  "test_l138_publication": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 8.7,
+   "span": 8.7,
+   "tests": 10
+  },
+  "test_l13_budget": {
+   "complet": true,
+   "def_test": 29,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 72.5,
+   "span": 87.1,
+   "tests": 29
+  },
+  "test_l142_env_isole": {
+   "complet": true,
+   "def_test": 1,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.3,
+   "span": 0.3,
+   "tests": 1
+  },
+  "test_l148_english_identifiers": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 19
+  },
+  "test_l148_stage1a1_alias": {
+   "complet": true,
+   "def_test": 4,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.3,
+   "span": 0.3,
+   "tests": 4
+  },
+  "test_l148_stage1a2_alias": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 3
+  },
+  "test_l148_stage2b_scripts": {
+   "complet": false,
+   "def_test": 14,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 1.0,
+   "span": 1.0,
+   "tests": 13
+  },
+  "test_l148_stage2c_renames": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 6
+  },
+  "test_l148_stage3_workstream": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 1.9,
+   "span": 6.8,
+   "tests": 6
+  },
+  "test_l148_stage3b_workstream_readers": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 3.8,
+   "span": 16.2,
+   "tests": 16
+  },
+  "test_l148_stage3c_workstream_free_files": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 9
+  },
+  "test_l148_stage5b_test_names": {
+   "complet": true,
+   "def_test": 5,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 5
+  },
+  "test_l148_stage6_json_keys": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 9
+  },
+  "test_l157_estimations": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 18.4,
+   "span": 18.6,
+   "tests": 19
+  },
+  "test_l157b_reference": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 10.8,
+   "span": 17.9,
+   "tests": 6
+  },
+  "test_l157c_dates_mesures": {
+   "complet": true,
+   "def_test": 32,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 55.7,
+   "span": 97.6,
+   "tests": 32
+  },
+  "test_l158_version_level": {
+   "complet": true,
+   "def_test": 26,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 6.4,
+   "span": 6.4,
+   "tests": 26
+  },
+  "test_l159a_capacity_guard": {
+   "complet": true,
+   "def_test": 34,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 7.9,
+   "span": 8.0,
+   "tests": 34
+  },
+  "test_l159b_offload": {
+   "complet": true,
+   "def_test": 43,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 45.9,
+   "span": 45.9,
+   "tests": 43
+  },
+  "test_l159c_plafonds_memoire": {
+   "complet": true,
+   "def_test": 12,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 12
+  },
+  "test_l159d_host_measure": {
+   "complet": true,
+   "def_test": 31,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 4.1,
+   "span": 11.2,
+   "tests": 31
+  },
+  "test_l159e6_guard_restart_alert": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.2,
+   "span": 0.2,
+   "tests": 8
+  },
+  "test_l159e_guard": {
+   "complet": true,
+   "def_test": 65,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 1.1,
+   "span": 1.1,
+   "tests": 65
+  },
+  "test_l159f2_pg_up": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 3.8,
+   "span": 3.8,
+   "tests": 15
+  },
+  "test_l159f_host_gate": {
+   "complet": true,
+   "def_test": 51,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 39.2,
+   "span": 60.0,
+   "tests": 51
+  },
+  "test_l159g_pilot": {
+   "complet": true,
+   "def_test": 67,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 67.4,
+   "span": 79.1,
+   "tests": 67
+  },
+  "test_l159g_volume": {
+   "complet": true,
+   "def_test": 37,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 9.0,
+   "span": 9.0,
+   "tests": 37
+  },
+  "test_l160b_radar": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 4.1,
+   "span": 11.1,
+   "tests": 8
+  },
+  "test_l160c_radar_mail": {
+   "complet": true,
+   "def_test": 11,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 9.8,
+   "span": 22.7,
+   "tests": 11
+  },
+  "test_l160d_resolutions": {
+   "complet": true,
+   "def_test": 33,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 16.4,
+   "span": 26.6,
+   "tests": 33
+  },
+  "test_l160e2_land": {
+   "complet": true,
+   "def_test": 58,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 42.9,
+   "span": 50.2,
+   "tests": 64
+  },
+  "test_l160e_merge_queue": {
+   "complet": true,
+   "def_test": 45,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 40.1,
+   "span": 51.8,
+   "tests": 45
+  },
+  "test_l160f_versions": {
+   "complet": true,
+   "def_test": 30,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 6.3,
+   "span": 17.5,
+   "tests": 30
+  },
+  "test_l160g_migration_reservations": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 7.9,
+   "span": 19.1,
+   "tests": 8
+  },
+  "test_l160g_nexlink": {
+   "complet": true,
+   "def_test": 59,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 18.9,
+   "span": 18.9,
+   "tests": 59
+  },
+  "test_l161a_ci_sans_code": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 6
+  },
+  "test_l161b_flow": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 8
+  },
+  "test_l161c_failures_realtime": {
+   "complet": true,
+   "def_test": 26,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 56.1,
+   "span": 62.5,
+   "tests": 26
+  },
+  "test_l161e_map": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.3,
+   "span": 15.5,
+   "tests": 19
+  },
+  "test_l161f_plan": {
+   "complet": true,
+   "def_test": 95,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 49.1,
+   "span": 49.1,
+   "tests": 91
+  },
+  "test_l162_tmpfs": {
+   "complet": true,
+   "def_test": 31,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 137.0,
+   "span": 137.2,
+   "tests": 31
+  },
+  "test_l165_prise_lots": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 49.9,
+   "span": 58.7,
+   "tests": 15
+  },
+  "test_l165b_agents_libres": {
+   "complet": true,
+   "def_test": 12,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 34.5,
+   "span": 41.5,
+   "tests": 12
+  },
+  "test_l165c_sessions_par_lot": {
+   "complet": true,
+   "def_test": 23,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 133.6,
+   "span": 165.1,
+   "tests": 23
+  },
+  "test_l166_child_session": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 14.9,
+   "span": 22.5,
+   "tests": 6
+  },
+  "test_l16_acp": {
+   "complet": true,
+   "def_test": 30,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 8.8,
+   "span": 8.8,
+   "tests": 30
+  },
+  "test_l16_harnais": {
+   "complet": true,
+   "def_test": 36,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 6.7,
+   "span": 6.7,
+   "tests": 36
+  },
+  "test_l217_plafond_sous_agents": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 19.0,
+   "span": 25.7,
+   "tests": 7
+  },
+  "test_l218_resume_rotation_entier": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 20.3,
+   "span": 27.5,
+   "tests": 9
+  },
+  "test_l219_housekeeping_tmp": {
+   "complet": true,
+   "def_test": 23,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 15.7,
+   "span": 22.7,
+   "tests": 23
+  },
+  "test_l221_cout_result_sans_usage": {
+   "complet": true,
+   "def_test": 4,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 3.5,
+   "span": 3.5,
+   "tests": 4
+  },
+  "test_l223_interactive_permissions": {
+   "complet": true,
+   "def_test": 37,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 48.8,
+   "span": 49.1,
+   "tests": 37
+  },
+  "test_l224_session_harnais": {
+   "complet": true,
+   "def_test": 27,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 76.3,
+   "span": 138.9,
+   "tests": 27
+  },
+  "test_l225_prix_claude": {
+   "complet": true,
+   "def_test": 32,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 25.6,
+   "span": 46.5,
+   "tests": 32
+  },
+  "test_l226a_sentinel": {
+   "complet": true,
+   "def_test": 37,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.1,
+   "span": 0.2,
+   "tests": 37
+  },
+  "test_l226b_auth_failure": {
+   "complet": true,
+   "def_test": 47,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 55.0,
+   "span": 107.2,
+   "tests": 47
+  },
+  "test_l230_build_artifacts": {
+   "complet": true,
+   "def_test": 37,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 5.2,
+   "span": 5.2,
+   "tests": 37
+  },
+  "test_l231_deps": {
+   "complet": true,
+   "def_test": 49,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 8.8,
+   "span": 8.9,
+   "tests": 49
+  },
+  "test_l232a_handoffs": {
+   "complet": true,
+   "def_test": 44,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 291.0,
+   "span": 291.2,
+   "tests": 44
+  },
+  "test_l232e_drain_handoffs": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 122.4,
+   "span": 122.4,
+   "tests": 8
+  },
+  "test_l232e_host_lifecycle": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 12.5,
+   "span": 12.5,
+   "tests": 14
+  },
+  "test_l232e_loss_recovery": {
+   "complet": true,
+   "def_test": 12,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 183.3,
+   "span": 183.3,
+   "tests": 20
+  },
+  "test_l232e_preflight": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 10
+  },
+  "test_l233_decide_only": {
+   "complet": true,
+   "def_test": 18,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 65.6,
+   "span": 81.3,
+   "tests": 18
+  },
+  "test_l233b_budget_handoff": {
+   "complet": true,
+   "def_test": 26,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 56.4,
+   "span": 64.6,
+   "tests": 26
+  },
+  "test_l234_auditor": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.2,
+   "span": 0.2,
+   "tests": 14
+  },
+  "test_l234a_auditor_canon_guard": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.5,
+   "span": 0.5,
+   "tests": 6
+  },
+  "test_l242b2_budget": {
+   "complet": true,
+   "def_test": 28,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 29.9,
+   "span": 72.8,
+   "tests": 28
+  },
+  "test_l242b3_fallback": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 64.0,
+   "span": 85.2,
+   "tests": 13
+  },
+  "test_l242b_critical_accounts": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 20.7,
+   "span": 34.6,
+   "tests": 15
+  },
+  "test_l244_idle_gauge_cache": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 7
+  },
+  "test_l248b_deps_packagers": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 1.9,
+   "span": 1.9,
+   "tests": 24
+  },
+  "test_l253_disk_volumes": {
+   "complet": true,
+   "def_test": 29,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 2.6,
+   "span": 9.3,
+   "tests": 29
+  },
+  "test_l26_exploitation": {
+   "complet": true,
+   "def_test": 46,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 144.8,
+   "span": 200.0,
+   "tests": 46
+  },
+  "test_l30_accounts": {
+   "complet": true,
+   "def_test": 34,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 94.1,
+   "span": 114.7,
+   "tests": 34
+  },
+  "test_l317_project_modules": {
+   "complet": true,
+   "def_test": 31,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 12.4,
+   "span": 17.4,
+   "tests": 31
+  },
+  "test_l317_proof_helper": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 7
+  },
+  "test_l317_snapshot_limits": {
+   "complet": true,
+   "def_test": 12,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 12
+  },
+  "test_l317b_module_audit": {
+   "complet": true,
+   "def_test": 21,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 15.2,
+   "span": 15.4,
+   "tests": 21
+  },
+  "test_l317c_deep_analysis": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 34.0,
+   "span": 55.7,
+   "tests": 25
+  },
+  "test_l31_admission": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 4.8,
+   "span": 5.0,
+   "tests": 10
+  },
+  "test_l31_orphans": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 14.8,
+   "span": 23.8,
+   "tests": 8
+  },
+  "test_l31_pressure": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 31.4,
+   "span": 38.4,
+   "tests": 14
+  },
+  "test_l31_relocation": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 34.1,
+   "span": 58.0,
+   "tests": 15
+  },
+  "test_l31_resources": {
+   "complet": true,
+   "def_test": 17,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 7.8,
+   "span": 14.6,
+   "tests": 17
+  },
+  "test_l31_visibility": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 7.7,
+   "span": 12.4,
+   "tests": 25
+  },
+  "test_l33_chatbot": {
+   "complet": true,
+   "def_test": 62,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 1.7,
+   "span": 1.7,
+   "tests": 62
+  },
+  "test_l35_dossier_de_travail": {
+   "complet": true,
+   "def_test": 26,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 68.7,
+   "span": 80.5,
+   "tests": 26
+  },
+  "test_l361_thread_expiry": {
+   "complet": true,
+   "def_test": 29,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 22.4,
+   "span": 22.8,
+   "tests": 44
+  },
+  "test_l368_planned_waits": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 9.2,
+   "span": 9.4,
+   "tests": 9
+  },
+  "test_l36_vivacite": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 15.2,
+   "span": 15.3,
+   "tests": 8
+  },
+  "test_l37_mode_et_alertes": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 84.6,
+   "span": 105.5,
+   "tests": 15
+  },
+  "test_l385_work_dependencies": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 35.3,
+   "span": 47.5,
+   "tests": 9
+  },
+  "test_l38_notify": {
+   "complet": true,
+   "def_test": 29,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 40.8,
+   "span": 62.3,
+   "tests": 29
+  },
+  "test_l39_adoption_reprise": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 54.1,
+   "span": 68.2,
+   "tests": 19
+  },
+  "test_l40_delegation": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 84.0,
+   "span": 105.8,
+   "tests": 24
+  },
+  "test_l411_docker_storage": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 7
+  },
+  "test_l41_bindings": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 31.3,
+   "span": 36.2,
+   "tests": 16
+  },
+  "test_l42_plusieurs_canons": {
+   "complet": true,
+   "def_test": 21,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 48.7,
+   "span": 64.9,
+   "tests": 21
+  },
+  "test_l43_perimetre_hote": {
+   "complet": true,
+   "def_test": 26,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 54.1,
+   "span": 80.2,
+   "tests": 26
+  },
+  "test_l44_authentificateurs_par_canon": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 86.4,
+   "span": 125.4,
+   "tests": 16
+  },
+  "test_l46_corrections": {
+   "complet": true,
+   "def_test": 22,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 37.0,
+   "span": 92.9,
+   "tests": 22
+  },
+  "test_l48_fast_failures": {
+   "complet": true,
+   "def_test": 4,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 6.0,
+   "span": 6.0,
+   "tests": 4
+  },
+  "test_l50_group_orphan_work_items": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 8
+  },
+  "test_l51_persona": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 0.6,
+   "span": 0.6,
+   "tests": 14
+  },
+  "test_l52_persona_sessions": {
+   "complet": true,
+   "def_test": 22,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 12.8,
+   "span": 19.4,
+   "tests": 22
+  },
+  "test_l538_process_inject": {
+   "complet": true,
+   "def_test": 40,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 60.0,
+   "span": 89.4,
+   "tests": 40
+  },
+  "test_l539_review_lot": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 7.8,
+   "span": 8.0,
+   "tests": 13
+  },
+  "test_l53_restore_guard": {
+   "complet": true,
+   "def_test": 10,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 8.6,
+   "span": 8.6,
+   "tests": 10
+  },
+  "test_l53_session_backup": {
+   "complet": true,
+   "def_test": 29,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.2,
+   "span": 0.2,
+   "tests": 29
+  },
+  "test_l54_memory_runner": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 17.0,
+   "span": 17.0,
+   "tests": 7
+  },
+  "test_l54_persona_memory": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 9.8,
+   "span": 9.8,
+   "tests": 25
+  },
+  "test_l56_role_executor": {
+   "complet": true,
+   "def_test": 17,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 18.9,
+   "span": 33.8,
+   "tests": 17
+  },
+  "test_l59_activity": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 11.5,
+   "span": 11.7,
+   "tests": 13
+  },
+  "test_l60_rotation_deepseek": {
+   "complet": true,
+   "def_test": 18,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 58.2,
+   "span": 66.4,
+   "tests": 18
+  },
+  "test_l61_allers_retours": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 23.9,
+   "span": 24.0,
+   "tests": 19
+  },
+  "test_l62_projects": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 19.5,
+   "span": 27.3,
+   "tests": 7
+  },
+  "test_l63_platform": {
+   "complet": true,
+   "def_test": 17,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 11.4,
+   "span": 11.6,
+   "tests": 17
+  },
+  "test_l64_unmeasured": {
+   "complet": true,
+   "def_test": 12,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 5.3,
+   "span": 5.5,
+   "tests": 12
+  },
+  "test_l70_budget": {
+   "complet": true,
+   "def_test": 19,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 24.8,
+   "span": 25.0,
+   "tests": 19
+  },
+  "test_l71_comptabilite": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 13.6,
+   "span": 42.4,
+   "tests": 16
+  },
+  "test_l72_panne_de_base": {
+   "complet": true,
+   "def_test": 14,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 26.2,
+   "span": 34.0,
+   "tests": 14
+  },
+  "test_l73_housekeeping": {
+   "complet": true,
+   "def_test": 28,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 40.5,
+   "span": 47.4,
+   "tests": 28
+  },
+  "test_l744_ci_entrypoint": {
+   "complet": true,
+   "def_test": 2,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 1.2,
+   "span": 1.2,
+   "tests": 2
+  },
+  "test_l74_comptes_a_echeance": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 32.5,
+   "span": 48.0,
+   "tests": 13
+  },
+  "test_l755_workflow_timeouts": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 3
+  },
+  "test_l75_resident": {
+   "complet": true,
+   "def_test": 56,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 19.0,
+   "span": 19.0,
+   "tests": 56
+  },
+  "test_l780_outdated_runner": {
+   "complet": true,
+   "def_test": 7,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 8.1,
+   "span": 20.3,
+   "tests": 7
+  },
+  "test_l78_conversations": {
+   "complet": true,
+   "def_test": 20,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 19.0,
+   "span": 19.2,
+   "tests": 20
+  },
+  "test_l790_outdated_restart": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 3.2,
+   "span": 13.0,
+   "tests": 24
+  },
+  "test_l84_serve": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 14.0,
+   "span": 22.4,
+   "tests": 24
+  },
+  "test_l88_ui": {
+   "complet": true,
+   "def_test": 13,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.6,
+   "span": 0.6,
+   "tests": 13
+  },
+  "test_l932_ci_venv_cache": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 3
+  },
+  "test_l94_underuse": {
+   "complet": true,
+   "def_test": 22,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 117.6,
+   "span": 139.3,
+   "tests": 22
+  },
+  "test_l95_budget_juste": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 13.7,
+   "span": 54.0,
+   "tests": 24
+  },
+  "test_l96_roadmap": {
+   "complet": true,
+   "def_test": 16,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 39.2,
+   "span": 45.8,
+   "tests": 16
+  },
+  "test_mail": {
+   "complet": true,
+   "def_test": 5,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 4.8,
+   "span": 4.8,
+   "tests": 5
+  },
+  "test_mail_instruction": {
+   "complet": true,
+   "def_test": 24,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 136.9,
+   "span": 136.9,
+   "tests": 24
+  },
+  "test_merged_work_item_tracking": {
+   "complet": true,
+   "def_test": 48,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 79.7,
+   "span": 115.1,
+   "tests": 48
+  },
+  "test_mesh_cli": {
+   "complet": true,
+   "def_test": 18,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 114.9,
+   "span": 128.5,
+   "tests": 32
+  },
+  "test_migrations": {
+   "complet": true,
+   "def_test": 11,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 22.9,
+   "span": 22.9,
+   "tests": 11
+  },
+  "test_migrations_additives": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 3
+  },
+  "test_models_entrypoint": {
+   "complet": true,
+   "def_test": 3,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 0.3,
+   "span": 0.3,
+   "tests": 3
+  },
+  "test_p256": {
+   "complet": true,
+   "def_test": 11,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 0.2,
+   "span": 0.2,
+   "tests": 11
+  },
+  "test_path_b_assembly": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 15
+  },
+  "test_placement": {
+   "complet": true,
+   "def_test": 23,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 70.1,
+   "span": 90.3,
+   "tests": 23
+  },
+  "test_plan": {
+   "complet": true,
+   "def_test": 39,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 146.5,
+   "span": 227.1,
+   "tests": 39
+  },
+  "test_pressure_orchestrator": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 14.8,
+   "span": 21.8,
+   "tests": 8
+  },
+  "test_progress": {
+   "complet": true,
+   "def_test": 21,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 26.0,
+   "span": 33.1,
+   "tests": 21
+  },
+  "test_progress_serve": {
+   "complet": false,
+   "def_test": 21,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 7
+  },
+  "test_registry_lease": {
+   "complet": true,
+   "def_test": 21,
+   "parts": [
+    "psql-3"
+   ],
+   "somme": 18.0,
+   "span": 18.0,
+   "tests": 21
+  },
+  "test_relay_credentials": {
+   "complet": true,
+   "def_test": 8,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 6.1,
+   "span": 6.1,
+   "tests": 8
+  },
+  "test_rename": {
+   "complet": true,
+   "def_test": 9,
+   "parts": [
+    "psql-2"
+   ],
+   "somme": 10.2,
+   "span": 10.2,
+   "tests": 9
+  },
+  "test_resume_without_authority": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 29.2,
+   "span": 37.8,
+   "tests": 6
+  },
+  "test_review": {
+   "complet": true,
+   "def_test": 38,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 38
+  },
+  "test_runner": {
+   "complet": true,
+   "def_test": 45,
+   "parts": [
+    "psql-5"
+   ],
+   "somme": 142.6,
+   "span": 149.1,
+   "tests": 45
+  },
+  "test_runner_drain": {
+   "complet": true,
+   "def_test": 6,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 31.2,
+   "span": 31.3,
+   "tests": 6
+  },
+  "test_site_art": {
+   "complet": true,
+   "def_test": 4,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 0.1,
+   "span": 0.1,
+   "tests": 4
+  },
+  "test_thread_log": {
+   "complet": true,
+   "def_test": 34,
+   "parts": [
+    "psql-6"
+   ],
+   "somme": 48.7,
+   "span": 59.6,
+   "tests": 34
+  },
+  "test_turn_grace": {
+   "complet": true,
+   "def_test": 25,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 61.0,
+   "span": 77.5,
+   "tests": 25
+  },
+  "test_undeliverable": {
+   "complet": true,
+   "def_test": 21,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 58.6,
+   "span": 72.9,
+   "tests": 21
+  },
+  "test_version": {
+   "complet": true,
+   "def_test": 5,
+   "parts": [
+    "psql-1"
+   ],
+   "somme": 0.0,
+   "span": 0.0,
+   "tests": 5
+  },
+  "test_work": {
+   "complet": true,
+   "def_test": 15,
+   "parts": [
+    "psql-4"
+   ],
+   "somme": 9.9,
+   "span": 15.0,
+   "tests": 15
+  }
+ },
+ "driver": "psql",
+ "durees": {
+  "test_1003_merge_pr": 17.9,
+  "test_1037_bascule_harnais": 14.6,
+  "test_1060_alert_types": 13.4,
+  "test_1075_pace_multiplier": 0.0,
+  "test_1127_config_explicite": 0.9,
+  "test_1193_suite_dependency": 21.7,
+  "test_1314_carte_concurrency": 0.0,
+  "test_246_btrfs_guard": 1.4,
+  "test_254_host_hold": 110.6,
+  "test_330_owner_key": 55.7,
+  "test_339_orphan_settle": 21.0,
+  "test_420_qa_role": 74.9,
+  "test_435_agent_projects": 20.4,
+  "test_453_pause_pression": 13.5,
+  "test_468_agent_naming": 39.4,
+  "test_472_zombie_turn_close": 8.0,
+  "test_476_background_signals": 1.9,
+  "test_476_cleanup_limits": 0.9,
+  "test_476_job_reaping": 1.0,
+  "test_476_mediated_signals": 11.1,
+  "test_476_ownership_races": 0.8,
+  "test_500_eviction_irremovable": 17.5,
+  "test_501_native_gate_check": 0.0,
+  "test_501_native_host_gate": 0.1,
+  "test_501_unleased_registry": 27.0,
+  "test_502_restart_lease": 23.5,
+  "test_503_agent_host": 123.8,
+  "test_518_dsn_argv": 22.0,
+  "test_530_housekeeping_followups": 10.9,
+  "test_653_db_connections": 12.5,
+  "test_743_exec_only_serve": 0.7,
+  "test_803_classes_famille": 11.8,
+  "test_898_pause_rythme": 5.7,
+  "test_899_alerte_plafond": 0.0,
+  "test_940_agregat_bash": 0.1,
+  "test_actions": 244.4,
+  "test_adapters": 0.1,
+  "test_approve": 85.8,
+  "test_approve_equipes": 74.7,
+  "test_authority": 45.6,
+  "test_bin_launchers": 0.9,
+  "test_bout_en_bout": 37.8,
+  "test_canon": 168.3,
+  "test_catalog": 0.0,
+  "test_catalog_events": 0.0,
+  "test_catalog_store": 1.7,
+  "test_cli_compat": 43.9,
+  "test_cluster": 108.7,
+  "test_cost": 45.3,
+  "test_discovery_sources": 0.0,
+  "test_discovery_transport": 0.2,
+  "test_events_attach": 61.9,
+  "test_expected_output": 0.0,
+  "test_fallback": 3.1,
+  "test_hermeticity_lint": 0.0,
+  "test_jcs": 0.0,
+  "test_l105_plafonds_du_tour": 60.2,
+  "test_l106_host_cutoff": 113.1,
+  "test_l107_executor_contract": 0.0,
+  "test_l108_executor_server": 911.0,
+  "test_l109_mediated_mode": 11.7,
+  "test_l109_remote_client": 6.8,
+  "test_l110_enrollment": 42.9,
+  "test_l111_relay": 43.8,
+  "test_l112_host_gate": 57.2,
+  "test_l113_work_repo": 2.8,
+  "test_l114_executor_image": 1.5,
+  "test_l116_parts": 0.5,
+  "test_l1170_test_script_selection": 2.6,
+  "test_l117_account_spread": 30.3,
+  "test_l118_assignments": 50.2,
+  "test_l118c_mail_projects": 150.9,
+  "test_l119_backlog": 71.6,
+  "test_l11_speed": 100.2,
+  "test_l120_harness_versions": 4.7,
+  "test_l121_watch": 23.1,
+  "test_l122_numeros_de_migration": 75.7,
+  "test_l124_decisions": 152.2,
+  "test_l125_courrier_regroupe": 143.9,
+  "test_l126_issues": 77.3,
+  "test_l130_demandes_sans_lot": 15.6,
+  "test_l131_suites_lourdes": 3.3,
+  "test_l132_alert_briefs": 8.4,
+  "test_l133_subagent_hook": 22.4,
+  "test_l138_publication": 8.7,
+  "test_l13_budget": 87.1,
+  "test_l142_env_isole": 0.3,
+  "test_l148_english_identifiers": 0.1,
+  "test_l148_stage1a1_alias": 0.3,
+  "test_l148_stage1a2_alias": 0.1,
+  "test_l148_stage2c_renames": 0.0,
+  "test_l148_stage3_workstream": 6.8,
+  "test_l148_stage3b_workstream_readers": 16.2,
+  "test_l148_stage3c_workstream_free_files": 0.0,
+  "test_l148_stage5b_test_names": 0.0,
+  "test_l148_stage6_json_keys": 0.0,
+  "test_l157_estimations": 18.6,
+  "test_l157b_reference": 17.9,
+  "test_l157c_dates_mesures": 97.6,
+  "test_l158_version_level": 6.4,
+  "test_l159a_capacity_guard": 8.0,
+  "test_l159b_offload": 45.9,
+  "test_l159c_plafonds_memoire": 0.1,
+  "test_l159d_host_measure": 11.2,
+  "test_l159e6_guard_restart_alert": 0.2,
+  "test_l159e_guard": 1.1,
+  "test_l159f2_pg_up": 3.8,
+  "test_l159f_host_gate": 60.0,
+  "test_l159g_pilot": 79.1,
+  "test_l159g_volume": 9.0,
+  "test_l160b_radar": 11.1,
+  "test_l160c_radar_mail": 22.7,
+  "test_l160d_resolutions": 26.6,
+  "test_l160e2_land": 50.2,
+  "test_l160e_merge_queue": 51.8,
+  "test_l160f_versions": 17.5,
+  "test_l160g_migration_reservations": 19.1,
+  "test_l160g_nexlink": 18.9,
+  "test_l161a_ci_sans_code": 0.1,
+  "test_l161b_flow": 0.0,
+  "test_l161c_failures_realtime": 62.5,
+  "test_l161e_map": 15.5,
+  "test_l161f_plan": 49.1,
+  "test_l162_tmpfs": 137.2,
+  "test_l165_prise_lots": 58.7,
+  "test_l165b_agents_libres": 41.5,
+  "test_l165c_sessions_par_lot": 165.1,
+  "test_l166_child_session": 22.5,
+  "test_l16_acp": 8.8,
+  "test_l16_harnais": 6.7,
+  "test_l217_plafond_sous_agents": 25.7,
+  "test_l218_resume_rotation_entier": 27.5,
+  "test_l219_housekeeping_tmp": 22.7,
+  "test_l221_cout_result_sans_usage": 3.5,
+  "test_l223_interactive_permissions": 49.1,
+  "test_l224_session_harnais": 138.9,
+  "test_l225_prix_claude": 46.5,
+  "test_l226a_sentinel": 0.2,
+  "test_l226b_auth_failure": 107.2,
+  "test_l230_build_artifacts": 5.2,
+  "test_l231_deps": 8.9,
+  "test_l232a_handoffs": 291.2,
+  "test_l232e_drain_handoffs": 122.4,
+  "test_l232e_host_lifecycle": 12.5,
+  "test_l232e_loss_recovery": 183.3,
+  "test_l232e_preflight": 0.0,
+  "test_l233_decide_only": 81.3,
+  "test_l233b_budget_handoff": 64.6,
+  "test_l234_auditor": 0.2,
+  "test_l234a_auditor_canon_guard": 0.5,
+  "test_l242b2_budget": 72.8,
+  "test_l242b3_fallback": 85.2,
+  "test_l242b_critical_accounts": 34.6,
+  "test_l244_idle_gauge_cache": 0.0,
+  "test_l248b_deps_packagers": 1.9,
+  "test_l253_disk_volumes": 9.3,
+  "test_l26_exploitation": 200.0,
+  "test_l30_accounts": 114.7,
+  "test_l317_project_modules": 17.4,
+  "test_l317_proof_helper": 0.0,
+  "test_l317_snapshot_limits": 0.1,
+  "test_l317b_module_audit": 15.4,
+  "test_l317c_deep_analysis": 55.7,
+  "test_l31_admission": 5.0,
+  "test_l31_orphans": 23.8,
+  "test_l31_pressure": 38.4,
+  "test_l31_relocation": 58.0,
+  "test_l31_resources": 14.6,
+  "test_l31_visibility": 12.4,
+  "test_l33_chatbot": 1.7,
+  "test_l35_dossier_de_travail": 80.5,
+  "test_l361_thread_expiry": 22.8,
+  "test_l368_planned_waits": 9.4,
+  "test_l36_vivacite": 15.3,
+  "test_l37_mode_et_alertes": 105.5,
+  "test_l385_work_dependencies": 47.5,
+  "test_l38_notify": 62.3,
+  "test_l39_adoption_reprise": 68.2,
+  "test_l40_delegation": 105.8,
+  "test_l411_docker_storage": 0.0,
+  "test_l41_bindings": 36.2,
+  "test_l42_plusieurs_canons": 64.9,
+  "test_l43_perimetre_hote": 80.2,
+  "test_l44_authentificateurs_par_canon": 125.4,
+  "test_l46_corrections": 92.9,
+  "test_l48_fast_failures": 6.0,
+  "test_l50_group_orphan_work_items": 0.0,
+  "test_l51_persona": 0.6,
+  "test_l52_persona_sessions": 19.4,
+  "test_l538_process_inject": 89.4,
+  "test_l539_review_lot": 8.0,
+  "test_l53_restore_guard": 8.6,
+  "test_l53_session_backup": 0.2,
+  "test_l54_memory_runner": 17.0,
+  "test_l54_persona_memory": 9.8,
+  "test_l56_role_executor": 33.8,
+  "test_l59_activity": 11.7,
+  "test_l60_rotation_deepseek": 66.4,
+  "test_l61_allers_retours": 24.0,
+  "test_l62_projects": 27.3,
+  "test_l63_platform": 11.6,
+  "test_l64_unmeasured": 5.5,
+  "test_l70_budget": 25.0,
+  "test_l71_comptabilite": 42.4,
+  "test_l72_panne_de_base": 34.0,
+  "test_l73_housekeeping": 47.4,
+  "test_l744_ci_entrypoint": 1.2,
+  "test_l74_comptes_a_echeance": 48.0,
+  "test_l755_workflow_timeouts": 0.0,
+  "test_l75_resident": 19.0,
+  "test_l780_outdated_runner": 20.3,
+  "test_l78_conversations": 19.2,
+  "test_l790_outdated_restart": 13.0,
+  "test_l84_serve": 22.4,
+  "test_l88_ui": 0.6,
+  "test_l932_ci_venv_cache": 0.0,
+  "test_l94_underuse": 139.3,
+  "test_l95_budget_juste": 54.0,
+  "test_l96_roadmap": 45.8,
+  "test_mail": 4.8,
+  "test_mail_instruction": 136.9,
+  "test_merged_work_item_tracking": 115.1,
+  "test_mesh_cli": 128.5,
+  "test_migrations": 22.9,
+  "test_migrations_additives": 0.1,
+  "test_models_entrypoint": 0.3,
+  "test_p256": 0.2,
+  "test_path_b_assembly": 0.1,
+  "test_placement": 90.3,
+  "test_plan": 227.1,
+  "test_pressure_orchestrator": 21.8,
+  "test_progress": 33.1,
+  "test_registry_lease": 18.0,
+  "test_relay_credentials": 6.1,
+  "test_rename": 10.2,
+  "test_resume_without_authority": 37.8,
+  "test_review": 0.0,
+  "test_runner": 149.1,
+  "test_runner_drain": 31.3,
+  "test_site_art": 0.1,
+  "test_thread_log": 59.6,
+  "test_turn_grace": 77.5,
+  "test_undeliverable": 72.9,
+  "test_version": 0.0,
+  "test_work": 15.0
+ }
+}
