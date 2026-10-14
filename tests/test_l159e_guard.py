@@ -623,6 +623,96 @@ class SignalsTest(unittest.TestCase):
         self.assertIsNone(guard.busy_count(("x",), run=lambda *a, **k: (_ for _ in ()).throw(
             OSError("no systemctl"))))
 
+    def test_busy_tasks_count_jobs_not_idle_listeners(self):
+        # #1256 R1 : quatre écouteurs persistants restent `active` sans job ;
+        # avec `busy_tasks`, une unité ne compte que si une tâche de SON
+        # cgroup correspond (le worker du job). Un cgroup illisible compte :
+        # un job qu'on ne peut pas exclure ne fait pas gagner l'invité.
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = os.path.join(tmp, "cg")
+            proc = os.path.join(tmp, "proc")
+
+            def unit_cgroup(name, pids):
+                d = os.path.join(cg, "system.slice", name)
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                    fh.write("".join("%s\n" % p for p in pids))
+
+            def task(pid, argv):
+                d = os.path.join(proc, str(pid))
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "cmdline"), "wb") as fh:
+                    fh.write(b"\0".join(a.encode() for a in argv) + b"\0")
+
+            unit_cgroup("actions.runner.a.service", [10])          # écouteur idle
+            task(10, ["/opt/actions-runner/bin/Runner.Listener", "run"])
+            unit_cgroup("actions.runner.b.service", [20, 21])      # un job
+            task(20, ["/opt/actions-runner/bin/Runner.Listener", "run"])
+            task(21, ["/opt/actions-runner/bin/Runner.Worker", "spawnclient", "1", "2"])
+            # c : pas de cgroup.procs -> illisible -> compte
+
+            class Proc:
+                def __init__(self, out):
+                    self.returncode, self.stdout = 0, out
+
+            def run(argv, **kw):
+                if argv[:2] == ["systemctl", "list-units"]:
+                    return Proc("actions.runner.a.service loaded active running x\n"
+                                "actions.runner.b.service loaded active running y\n"
+                                "actions.runner.c.service loaded active running z\n")
+                if argv[:2] == ["systemctl", "show"]:
+                    return Proc("/system.slice/%s\n" % argv[2])
+                raise AssertionError(argv)
+
+            # sans motif de tâche : les trois unités actives comptent (l'ancien
+            # comportement, juste quand le job EST l'unité)
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run), 3)
+            # avec : seul b (job) et c (illisible) comptent
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 2)
+
+        # le témoin demandé par la R1 : quatre écouteurs en ligne et au repos
+        # pèsent zéro job ; les mêmes quatre unités avec un worker chacune en
+        # pèsent quatre (c'est le seuil `busy_max` de la fiche d'hôte qui
+        # décide, pas le nombre d'écouteurs)
+        with tempfile.TemporaryDirectory() as tmp:
+            cg = os.path.join(tmp, "cg")
+            proc = os.path.join(tmp, "proc")
+            procs = [100 + n for n in range(1, 5)]
+
+            def run4(argv, **kw):
+                if argv[:2] == ["systemctl", "list-units"]:
+                    return Proc("".join("actions.runner.n%d.service loaded active running x\n" % n
+                                        for n in range(1, 5)))
+                if argv[:2] == ["systemctl", "show"]:
+                    return Proc("/system.slice/%s\n" % argv[2])
+                raise AssertionError(argv)
+
+            for n, pid in zip(range(1, 5), procs):
+                d = os.path.join(cg, "system.slice", "actions.runner.n%d.service" % n)
+                os.makedirs(d)
+                with open(os.path.join(d, "cgroup.procs"), "w") as fh:
+                    fh.write("%s\n" % pid)
+                p = os.path.join(proc, str(pid))
+                os.makedirs(p)
+                with open(os.path.join(p, "cmdline"), "wb") as fh:
+                    fh.write(b"/opt/actions-runner/bin/Runner.Listener\0run\0")
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run4,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 0)
+            for n, pid in zip(range(1, 5), [200 + n for n in range(1, 5)]):
+                p = os.path.join(proc, str(pid))
+                os.makedirs(p)
+                with open(os.path.join(p, "cmdline"), "wb") as fh:
+                    fh.write(b"/opt/actions-runner/bin/Runner.Worker\0spawnclient\0")
+                d = os.path.join(cg, "system.slice", "actions.runner.n%d.service" % n)
+                with open(os.path.join(d, "cgroup.procs"), "a") as fh:
+                    fh.write("%s\n" % pid)
+            self.assertEqual(guard.busy_count(("actions.runner.*",), run=run4,
+                                              tasks=("Runner.Worker",),
+                                              cgroup_root=cg, proc_root=proc), 4)
+
 
     def test_disk_of_the_guest_work_path(self):
         # codex #211 r4: the guard measured no disk (sample() without a path),

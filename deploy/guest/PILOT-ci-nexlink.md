@@ -23,7 +23,9 @@ The application (Nexlink's own CI jobs) always wins: the guest runs in a
 low-weight slice (`CPUWeight=10`, `IOWeight=10`) under hard caps
 (`CPUQuota`, `MemoryHigh`, `MemoryMax`), and the capacity guard (L159e)
 stops the guest runners as soon as the application needs the host
-(`reclaim.busy_units: ["actions.runner.*"]`, PSI and memory thresholds).
+(`reclaim.busy_units: ["actions.runner.*"]` with
+`reclaim.busy_tasks: ["Runner.Worker"]`, so a **job** counts and an idle
+persistent listener does not — R1 #1256; plus PSI and memory thresholds).
 
 ## 2. Roles
 
@@ -65,9 +67,18 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
   new `--agent-units 'ameesh-guest-*.service'` so the guard also stops and
   restarts the CI runners.
 * **New**: `deploy/guest/ameesh-guest-ci@.service` (the runner unit),
+  `deploy/guest/ci-runner-gate.py` (installed as
+  `/srv/ameesh-guest/bin/ci-runner-gate`: the unit's `ExecStart`, it starts
+  `run.sh` only while the guard publishes a fresh `available` state out of
+  `enforce`, and stops it when the state closes, disappears or goes stale —
+  the GitHub runner knows nothing of the gate, R1 #1256),
   `deploy/guest/ci-runners.sh` (prepare/register/enable/check/remove) and
   `tests/test_1256_ci_runners.py`. `deploy/guest/install-pilot.sh` gains
-  `--agent-units PATTERN` (default unchanged).
+  `--agent-units PATTERN` (default unchanged; the pattern must stay in the
+  guest namespace, R1 #1256). The guard's job signal gains
+  `reclaim.busy_tasks` (`src/ameesh/guard.py`, `src/ameesh/capacity_guard.py`,
+  contract `docs/GARDE-DE-CAPACITE.md`): without it, `busy_units` counts four
+  idle persistent listeners as four jobs (R1 #1256).
 * **Host fiche** to merge in `manaty/home` (`hotes/ci-3.md`) — draft:
 
   ```yaml
@@ -89,8 +100,9 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
         cpu_pressure_max: 20%
         memory_pressure_max: 2%
         io_pressure_max: 20%
-        busy_units: ["actions.runner.*"]   # les jobs CI de Nexlink
-        busy_max: 4
+        busy_units: ["actions.runner.*"]   # les unités CI de Nexlink
+        busy_tasks: ["Runner.Worker"]      # un job en cours, pas l'écouteur idle
+        busy_max: 2        # busy >= 2 : avertissement ; busy > 2 : l'invité s'arrête
         disk_free_min: 10GiB
         disk_paths: ["/", "/srv/ameesh-guest"]
       drain_seconds: 90
@@ -100,7 +112,9 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
   ```
 
   The sizes are a starting offer: the preflight (§6 step 0) measures the
-  host and the pilot revises them; `disk_max` is held by the guest
+  host and the pilot revises them; `busy_max: 2` on four runners stops the
+  guest as soon as the application runs three jobs and warns at two, so the
+  loan never takes the last runner; `disk_max` is held by the guest
   directory only (no dedicated volume on this VM), so the guard's
   `disk_free_min`/`disk_paths` watch is the real protection.
 * **Nexlink rules** `AGENTS.md` (a–g, source orchestrateur 2026-10-13):
@@ -116,7 +130,7 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
 | 2 | The containers are the guest's own | `docker` shim → **rootless Podman** (`--cgroup-manager=cgroupfs`), never `/run/docker.sock` | `podman info` `rootless=true`; host `docker ps` never shows a guest container |
 | 3 | The containers are capped with the guest | `Delegate=yes` on the unit; containers are cgroups **under** the runner, inside `ameesh-guest.slice` | `systemd-cgls ameesh-guest.slice` during a job |
 | 4 | The guest cannot starve the application | slice `CPUWeight=10`/`IOWeight=10`, `CPUQuota`, `MemoryHigh`, `MemoryMax`; `OOMScoreAdjust=500` | `systemctl show ameesh-guest.slice -p …` |
-| 5 | The application's jobs win | guard `reclaim.busy_units: actions.runner.*`, `busy_max`, PSI and memory thresholds; levels 3/4 stop the guest runners | `ameesh guard check --json`, `guard.stopped` in the state |
+| 5 | The application's jobs win | guard `reclaim.busy_units: actions.runner.*` **with `busy_tasks: ["Runner.Worker"]`** (a job counts, an idle listener does not), `busy_max`, PSI and memory thresholds; levels 3/4 stop the guest runners; the unit's `ci-runner-gate` stops `run.sh` when the gate closes, disappears or goes stale | `ameesh guard check --json`, `guard.stopped` in the state; witnesses `tests/test_l159e_guard.py` (idle listener vs running job, unreadable cgroup counts) and `tests/test_1256_ci_runners.py` (the wrapper stops on a closed/observed/absent gate and restarts on `available`) |
 | 6 | The application's runners are never touched | the unit matches `ameesh-guest-ci@*` only; no command of the script ever names `actions.runner.*`; the check compares the application's unit count before/after | witness `tests/test_1256_ci_runners.py`; `systemctl list-units 'actions.runner.*'` unchanged |
 | 7 | The workspaces are distinct | `/srv/ameesh-guest/ci/rN` (guest) vs `/home/runner/rN/_work/nexlink` (application); `RequiresMountsFor` keeps the guest on its own root | `ci-runners.sh --check`; `ls -ld` |
 | 8 | The tokens are distinct | registration minted for `manaty/ameesh` only, read from a root-only file, `.credentials` 0600 `ameesh-guest`; the script never sees a Nexlink token | `.runner` `serverUrl`; `gh api repos/manaty/ameesh/actions/runners` |
@@ -129,7 +143,14 @@ retried (GitHub marks it failed); `disk_max` has no volume to hold it here
 (the guard's free-space threshold is the protection); `config.sh` receives
 the registration token in its argument vector for the seconds it runs (the
 token is short-lived, single-command, minted for the ameesh repository
-only).
+only); the job signal is the `Runner.Worker` marker read in each matched
+unit's cgroup (R1 #1256) — it follows the runner's implementation, and a
+unit whose cgroup cannot be read counts as busy (the application wins); the
+actions-runner tarball is verified by its digest at every extraction, the
+cache included, so a modified cache cannot be unpacked as root; the gate
+wrapper follows the guard's own state TTL (90 s, rewritten every 30 s) and a
+state it cannot read is closed, so a guard that dies or hangs stops the guest
+runners instead of leaving them running.
 
 ## 5. Gates (nothing starts before all of them)
 
@@ -144,7 +165,10 @@ only).
    autoscaler drives it, and the loan window.
 5. **Activation go** (`mesh-design`), distinct from the merge fire, after
    the canon Host fiche PR is merged.
-6. **Qualification first**: one real ameesh job on one guest runner, its
+6. **Enforce before the first guest job** (R1 #1256): the guard is switched
+   to `enforce` while the guest runners are still stopped; observation runs
+   with the guests off, and `ci-runners.sh --enable` refuses in `observe`.
+7. **Qualification first**: one real ameesh job on one guest runner, its
    container proven inside the slice, `/home/runner` untouched; only then
    the others are enabled and left in service.
 
@@ -154,6 +178,10 @@ only).
 # 0. read-only preflight: the application's units and resources, the runner
 #    version/digest, the free disk; nothing is changed
 systemctl list-units --all 'actions.runner.*'
+# idle listeners are not jobs: the guard's busy_tasks counts real workers, so
+# the preflight must show both (four listeners online, zero or more workers)
+systemctl list-units --all --plain --no-legend 'actions.runner.*' | wc -l
+ps -eo user=,args= | grep '[R]unner.Worker' | wc -l
 nproc; free -h; df -h /srv
 sudo deploy/guest/ci-runners.sh --dry-run --check
 
@@ -165,26 +193,31 @@ sudo deploy/guest/install.sh --key <owner pubkey> --from <IP>
 sudo deploy/guest/install.sh --check
 
 # 3. the capped slice, the guard and the gate (L159g), in observation, with
-#    the offer of the Host fiche and the widened unit glob
+#    the offer of the Host fiche and the widened unit glob. Observation runs
+#    a day with the guests OFF: an observing guard stops nothing.
 sudo deploy/guest/install-pilot.sh --dry-run --lend offer.json \
   --agent-units 'ameesh-guest-*.service' --allow-rootfs
 sudo deploy/guest/install-pilot.sh --lend offer.json \
   --agent-units 'ameesh-guest-*.service' --allow-rootfs
 
-# 4. the runners (this lot), registered with a token minted by the bureau
+# 4. the runners (this lot), prepared and registered but NOT started; the
+#    guard must already cover them or --prepare refuses
 sudo deploy/guest/ci-runners.sh --prepare --count 2
 sudo deploy/guest/ci-runners.sh --register --token-file /root/reg.token
-sudo deploy/guest/ci-runners.sh --enable 1        # one runner for the qualif
 sudo deploy/guest/ci-runners.sh --check
 
-# 5. qualification: one real ameesh job on the guest runner (dispatch or a
+# 5. enforce, guests still off: --enable refuses while the guard observes
+#    (R1 #1256). The observation day of step 3 is done by now.
+sudo deploy/guest/install-pilot.sh --set-guard-mode enforce
+
+# 6. qualification: one real ameesh job on the guest runner (dispatch or a
 #    small PR); during the job, prove the container is in the slice:
+sudo deploy/guest/ci-runners.sh --enable 1
 systemd-cgls ameesh-guest.slice | grep -E 'Runner.Worker|postgres'
 docker ps                       # no guest container here (host daemon)
 
-# 6. service, then enforcement after a day of observation
+# 7. service
 sudo deploy/guest/ci-runners.sh --enable 2
-sudo deploy/guest/install-pilot.sh --set-guard-mode enforce
 ```
 
 ## 7. Removal — only after terminal jobs
@@ -207,10 +240,11 @@ The order matters; nothing else is touched.
    online; **no Nexlink runner was unregistered** (that repository's list is
    untouched).
 4. **Host side**: `ci-runners.sh --remove` (deregisters the host side,
-   stops and removes the units, the shim and the runner directories it
-   recorded in `/etc/ameesh/ci-runners.state`; `--keep-workspaces` keeps the
-   logs). It never touches `actions.runner.*`, `/home/runner`, the
-   application's Docker daemon, or the other ameesh guest files.
+   stops and removes the units, the shim, the gate wrapper and the runner
+   directories it recorded in `/etc/ameesh/ci-runners.state`;
+   `--keep-workspaces` keeps the logs). It never touches `actions.runner.*`,
+   `/home/runner`, the application's Docker daemon, or the other ameesh
+   guest files.
 5. **Canon**: the pilot merges the Host fiche PR that removes the loan (or
    records its end); the lot notes the final API state.
 

@@ -208,13 +208,21 @@ class InstallPilotTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn('"agent_units": "ameesh-guest-*.service"', res.stdout)
 
-    def test_agent_units_never_match_the_application(self):
-        res = self.dry("--allow-rootfs", "--agent-units", "actions.runner.*.service")
+    def test_agent_units_stay_in_the_guest_namespace(self):
+        # #1256 R1 : `*.service` et `*runner*.service` correspondent aussi aux
+        # unités `actions.runner.*` de l'application, que le garde arrête au
+        # SIGKILL ; le motif doit rester dans le namespace de l'invité
+        for pattern in ("actions.runner.*.service", "*.service", "*runner*.service",
+                        "ameesh-guest-runner@*"):
+            with self.subTest(pattern=pattern):
+                res = self.dry("--allow-rootfs", "--agent-units", pattern)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("guest namespace expected", res.stderr)
+        # un motif du namespace invité qui ne vise aucune unité connue est
+        # refusé aussi : un garde qui ne couvre rien ne protège rien
+        res = self.dry("--allow-rootfs", "--agent-units", "ameesh-guest-nothing@*.service")
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("never match the application", res.stderr)
-        res = self.dry("--allow-rootfs", "--agent-units", "ameesh-guest-runner@*")
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("*.service pattern expected", res.stderr)
+        self.assertIn("matches no guest unit", res.stderr)
 
     def test_a_legacy_offer_the_previous_reader_accepted_installs(self):
         # mesh-design #459 r4c: a refused `disk_paths` and a size the previous

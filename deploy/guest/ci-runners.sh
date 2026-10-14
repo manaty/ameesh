@@ -58,6 +58,10 @@
 # Safety, by construction:
 #   * every systemd unit this script writes matches `ameesh-guest-ci@*`; it
 #     never stops, starts, enables, disables or removes `actions.runner.*`;
+#   * the unit runs `bin/ci-runner-gate` (installed here), not `run.sh`: the
+#     GitHub runner starts only while the guard's gate is a fresh `available`
+#     out of `enforce`, and is stopped when the gate closes, disappears or
+#     goes stale (R1 #1256);
 #   * containers run rootless, under the runner's cgroup, inside
 #     `ameesh-guest.slice`: no `/run/docker.sock`, no `docker` group, so a job
 #     cannot use the application's Docker daemon nor read its images;
@@ -74,6 +78,10 @@ UNIT=ameesh-guest-ci@.service
 SRC_UNIT=$HERE/$UNIT
 STATE=$ETC/ci-runners.state
 SHIM=$ROOT/bin/docker
+# the gate wrapper (R1 #1256): the unit's ExecStart, installed by --prepare
+GATE_WRAPPER=$ROOT/bin/ci-runner-gate
+# the guard's state document (L159f), read by the wrapper
+GATE_STATE=/run/ameesh-gate/state/state.json
 REPO_URL=https://github.com/manaty/ameesh
 REPO_SLUG=manaty/ameesh
 VERSION=2.338.0
@@ -242,6 +250,45 @@ slice_state() { host_says systemctl show ameesh-guest.slice --property="$1" --va
 
 need_root() { [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo)"; }
 
+# the guard (L159g) is what stops the guest runners when the application needs
+# the host. #1256 R1 : sans lui, ou s'il ne couvre pas nos unités, rien ne les
+# arrête — la préparation et le démarrage sont donc refusés, pas avertis.
+guard_config() { echo "$(at "$ETC/guard.json")"; }
+guard_covers() { # the guard's agent_units pattern stops ameesh-guest-ci@*
+  local guard; guard=$(guard_config)
+  [ -f "$guard" ] || return 1
+  python3 -I - "$guard" <<'PY'
+import fnmatch, json, sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:  # noqa: BLE001 - illisible : non couvert
+    sys.exit(1)
+pattern = cfg.get("agent_units") or "ameesh-guest-runner@*.service"
+sys.exit(0 if fnmatch.fnmatch("ameesh-guest-ci@1.service", pattern) else 1)
+PY
+}
+guard_enforcing() { # the guard's installed mode is enforce, not observe
+  local env; env=$(at "$ETC/guard.env")
+  [ -f "$env" ] || return 1   # absent: the unit's default is observe
+  ! grep -q '^AMEESH_GUARD_ARGS=--observe' "$env"
+}
+gate_now() { # the gate state the guest obeys: available, draining, stopped, unknown
+  python3 -I - "$(at "$GATE_STATE")" "$HERE/../../src" <<'PY'
+import json, sys, time
+sys.path.insert(0, sys.argv[2])
+try:
+    from ameesh.capacity_guard import gate_state
+except ImportError:  # pas de contrat lisible : la porte est fermee
+    print("unknown"); sys.exit(0)
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        doc = json.load(fh)
+except (OSError, ValueError):
+    doc = None
+print(gate_state(doc, time.time(), lending=True))
+PY
+}
+
 # --- the L159b/L159g prerequisites ------------------------------------------
 preconditions() {
   need_root
@@ -275,27 +322,35 @@ preconditions() {
     echo "DRY rootless Podman check for $GUEST (test host)"
   fi
   # the guard must count our units as guest units, or it will not stop them
-  local guard; guard=$(at "$ETC/guard.json")
-  if [ -f "$guard" ]; then
-    python3 -I - "$guard" <<'PY' || die "the guard does not cover ameesh-guest-ci@*: re-run install-pilot.sh with --agent-units 'ameesh-guest-*.service'"
-import fnmatch, json, sys
-cfg = json.load(open(sys.argv[1]))
-pattern = cfg.get("agent_units") or "ameesh-guest-runner@*.service"
-sys.exit(0 if fnmatch.fnmatch("ameesh-guest-ci@1.service", pattern) else 1)
-PY
+  # (#1256 R1 : absent, ou sans couverture, il refuse au lieu d'avertir)
+  if ! guard_covers; then
+    if [ -f "$(guard_config)" ]; then
+      die "the guard does not cover ameesh-guest-ci@*: re-run install-pilot.sh with --agent-units 'ameesh-guest-*.service'"
+    fi
+    die "$(guard_config) is absent: the guard is what stops these runners when the application needs the host; run install-pilot.sh first"
+  fi
+  # the unit's wrapper reads the gate with the guest's venv (R1 #1256): a
+  # guest that cannot import the contract is known here, not at the first job
+  if [ -z "$HOSTDIR" ]; then
+    runuser -u "$GUEST" -- /opt/ameesh/venv/bin/python3 -c \
+      'from ameesh.capacity_guard import gate_state' >/dev/null 2>&1 \
+      || die "$GUEST cannot import the gate contract from /opt/ameesh/venv: the gate wrapper would refuse every start"
   else
-    echo "warning: $ETC/guard.json is absent: the guard will not stop these runners" >&2
+    echo "DRY gate contract import check for $GUEST (test host)"
   fi
 }
 
 # --- prepare ----------------------------------------------------------------
 prepare() {
   say "prepare $COUNT runner(s) under $ROOT/ci, user $GUEST, slice ameesh-guest.slice"
-  local n dir tarball_in=$TARBALL shim_new=0 unit_new=0
+  local n dir tarball_in=$TARBALL shim_new=0 wrapper_new=0 unit_new=0
   # never overwrite a file that is not ours: a shim or a unit of this name
   # can only come from this lot, anything else is an anomaly to look at
   if [ -e "$(at "$SHIM")" ] && ! grep -qF "#1256" "$(at "$SHIM")" 2>/dev/null; then
     die "$SHIM exists and is not this script's shim (lot #1256): move it aside first"
+  fi
+  if [ -e "$(at "$GATE_WRAPPER")" ] && ! grep -qF "#1256" "$(at "$GATE_WRAPPER")" 2>/dev/null; then
+    die "$GATE_WRAPPER exists and is not this script's gate wrapper (lot #1256): move it aside first"
   fi
   if [ -e "$(at "/etc/systemd/system/$UNIT")" ] \
      && ! cmp -s "$SRC_UNIT" "$(at "/etc/systemd/system/$UNIT")"; then
@@ -329,11 +384,20 @@ export XDG_RUNTIME_DIR
 exec podman --cgroup-manager=cgroupfs "$@"
 SHIM
   if [ "$shim_new" = 1 ]; then remember "$SHIM" created; fi
+  # the unit's ExecStart (R1 #1256): the GitHub runner obeys the guard's gate
+  # through it, so it starts and stops with the state, not with systemd alone
+  if absent "$GATE_WRAPPER"; then wrapper_new=1; fi
+  put "$GATE_WRAPPER" 0755 root:root <"$HERE/ci-runner-gate.py"
+  if [ "$wrapper_new" = 1 ]; then remember "$GATE_WRAPPER" created; fi
+  # #1256 R1 : le tar est vérifié par son digest à CHAQUE fois avant
+  # l'extraction root — y compris depuis le cache, qu'un job précédent a pu
+  # laisser modifiable par l'invité (le cache est sous $ROOT/ci)
   if [ -n "$TARBALL" ]; then
     run test -r "$TARBALL"
-    run test "$(sha256sum "$TARBALL" | awk '{print $1}')" = "$SHA256"
-  elif [ -f "$(at "$tarball_in")" ] && [ "$DRY" = 0 ]; then
-    say "cached tarball reused: $tarball_in"
+    run sh -c "echo '$SHA256  $TARBALL' | sha256sum -c -"
+  elif [ -f "$(at "$tarball_in")" ]; then
+    say "cached tarball reused: $tarball_in (digest verified)"
+    run sh -c "echo '$SHA256  $(at "$tarball_in")' | sha256sum -c -"
   else
     run curl -fL --retry 3 --connect-timeout 20 \
       -o "$tarball_in" "$URL_BASE/v$VERSION/actions-runner-linux-x64-$VERSION.tar.gz"
@@ -404,6 +468,13 @@ targets() {
 }
 enable() {
   need_root
+  # #1256 R1 : activation fermée par défaut. Le garde doit couvrir nos unités
+  # ET être en enforce avant le premier job : en observation il ne les arrête
+  # pas, donc les invités restent éteints tant qu'il observe (plan §5, §6).
+  guard_covers \
+    || die "the guard does not cover ameesh-guest-ci@*: install-pilot.sh --agent-units 'ameesh-guest-*.service' first"
+  guard_enforcing \
+    || die "the guard is in observation: --enable only in enforce mode (deploy/guest/install-pilot.sh --set-guard-mode enforce), guests off until then"
   local n
   for n in $(targets); do
     case "$n" in ''|*[!0-9]*) die "invalid runner $n" ;; esac
@@ -463,12 +534,13 @@ check() {
   say "shim: $SHIM"
   [ -x "$(at "$SHIM")" ] || ko "$SHIM is missing or not executable"
   say "runners"
-  local n
+  local n active_runners=0
   for n in $(seq 1 "$COUNT"); do
     local dir=$ROOT/ci/r$n
     local state enabled
     state=$(unit_state "$n" ActiveState); enabled=$(unit_state "$n" UnitFileState)
     printf 'r%s: unit=%s/%s dir=%s\n' "$n" "${state:-?}" "${enabled:-?}" "$dir"
+    [ "$state" = active ] && active_runners=$((active_runners + 1)) || true
     if [ -f "$(at "$dir/.runner")" ]; then
       python3 -I - "$(at "$dir/.runner")" <<'PY' || ko "r$n: .runner unreadable"
 import json, sys
@@ -505,6 +577,26 @@ sys.exit(0 if fnmatch.fnmatch("ameesh-guest-ci@1.service", pattern) else 1)
 PY
   else
     ko "$ETC/guard.json is absent: nothing stops the guest when the application needs the host"
+  fi
+  say "gate"
+  local gate; gate=$(gate_now)
+  if [ -f "$(at "$GATE_STATE")" ]; then
+    echo "state: $gate ($GATE_STATE)"
+  else
+    echo "state: $gate (no document yet at $GATE_STATE; normal before install-pilot)"
+  fi
+  if [ -x "$(at "$GATE_WRAPPER")" ]; then
+    echo "wrapper: $GATE_WRAPPER"
+  else
+    echo "wrapper: $GATE_WRAPPER is missing (--prepare installs it; the unit refuses to start)"
+    if [ "$active_runners" != 0 ]; then
+      ko "a guest runner is active without its gate wrapper: nothing obeys the guard"
+    fi
+  fi
+  # the wrapper stops the runner on a closed or stale gate (R1 #1256): an
+  # active unit with a closed gate means the wrapper is absent or broken
+  if [ "$active_runners" != 0 ] && [ "$gate" != available ]; then
+    ko "a guest runner is active while the gate is $gate: the guard is not obeyed"
   fi
   [ "$BAD" = 0 ] || die "$BAD check(s) failed"
   say "check: every line ok"
@@ -544,6 +636,7 @@ remove() {
     recorded "$ROOT/ci" && run rmdir --ignore-fail-on-non-empty "$(at "$ROOT/ci")" || true
   fi
   recorded "$SHIM" && run rm -f "$(at "$SHIM")"
+  recorded "$GATE_WRAPPER" && run rm -f "$(at "$GATE_WRAPPER")"
   if [ "$DRY" = 0 ]; then
     [ "$KEEP" = 1 ] || rm -f "$STATE"
   else
