@@ -12,7 +12,7 @@
 # cleanup aimed at `actions.runner.*`.
 #
 # Gate (L159f, R1 #1256): the GitHub runner knows nothing of the guard's
-# gate, so `ExecStart` is `/srv/ameesh-guest/bin/ci-runner-gate` (installed
+# gate, so `ExecStart` is `/usr/local/lib/ameesh-guest-ci/ci-runner-gate` (installed
 # by ci-runners.sh --prepare), not `run.sh` directly. It starts `run.sh` only
 # while the state is a fresh `available` published by an enforcing guard, and
 # stops it when the state closes, disappears or goes stale: a guest runner
@@ -37,14 +37,14 @@ Slice=ameesh-guest.slice
 Delegate=yes
 WorkingDirectory=/srv/ameesh-guest/ci/r%i
 Environment=HOME=/srv/ameesh-guest/home
-# /srv/ameesh-guest/bin holds the `docker` shim that the runner and its
+# /usr/local/lib/ameesh-guest-ci holds the `docker` shim that the runner and its
 # service containers use (rootless Podman, never /run/docker.sock)
-Environment=PATH=/srv/ameesh-guest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/usr/local/lib/ameesh-guest-ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=AMEESH_GUEST=ci
 # gate (study §1.5): the state document the wrapper reads; read-only for the
 # guest, written by the root guard
 Environment=AMEESH_HOST_GATE_PATH=/run/ameesh-gate/state/state.json
-ExecStart=/srv/ameesh-guest/bin/ci-runner-gate --dir /srv/ameesh-guest/ci/r%i
+ExecStart=/usr/local/lib/ameesh-guest-ci/ci-runner-gate --dir /srv/ameesh-guest/ci/r%i
 Restart=on-failure
 RestartSec=5
 # a job the guard or the operator stops gets its SIGTERM first: the wrapper

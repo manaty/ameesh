@@ -66,7 +66,7 @@
 # Safety, by construction:
 #   * every systemd unit this script writes matches `ameesh-guest-ci@*`; it
 #     never stops, starts, enables, disables or removes `actions.runner.*`;
-#   * the unit runs `bin/ci-runner-gate` (installed here), not `run.sh`: the
+#   * the unit runs `/usr/local/lib/ameesh-guest-ci/ci-runner-gate` (installed here), not `run.sh`: the
 #     GitHub runner starts only while the guard's gate is a fresh `available`
 #     out of `enforce`, and is stopped when the gate closes, disappears or
 #     goes stale (R1 #1256);
@@ -88,9 +88,11 @@ UNITS=/etc/systemd/system
 UNIT=ameesh-guest-ci@.service
 SRC_UNIT=$HERE/$UNIT
 STATE=$ETC/ci-runners.state
-SHIM=$ROOT/bin/docker
+TOOLS=/usr/local/lib/ameesh-guest-ci
+SHIM=$TOOLS/docker
+# root-owned tools live outside the guest-writable root (R1 binome B4)
 # the gate wrapper (R1 #1256): the unit's ExecStart, installed by --prepare
-GATE_WRAPPER=$ROOT/bin/ci-runner-gate
+GATE_WRAPPER=$TOOLS/ci-runner-gate
 # the guard's state document (L159f), read by the wrapper
 GATE_STATE=/run/ameesh-gate/state/state.json
 REPO_URL=https://github.com/manaty/ameesh
@@ -234,7 +236,9 @@ absent() { # absent PATH : nothing of the host's there, not even a dangling syml
 }
 no_symlink_path() { # SUFFIX (under $ROOT) : no component may be a symlink
   # $ROOT belongs to the guest: a symlink planted under it could otherwise
-  # redirect a root install/rm outside the loan (R1 delta B4, #1256).
+  # redirect the guest outside the loan (R1 delta B4, #1256). Directory
+  # mutations run as the guest too, so a rename after this check cannot
+  # redirect a privileged write or removal.
   local rel=${1#/} cur part
   cur=$(at "$ROOT")
   if [ -L "$cur" ]; then
@@ -249,6 +253,38 @@ no_symlink_path() { # SUFFIX (under $ROOT) : no component may be a symlink
       die "$cur is a symbolic link: refusing (a guest-writable path must not redirect root)"
     fi
   done
+}
+root_tools_safe() {
+  # Root writes only below a root-owned, non-writable chain outside $ROOT.
+  # A check on a guest-owned parent cannot prevent a rename after the check.
+  python3 -I - "$(at "$TOOLS")" "$HOSTDIR" <<'PYSAFE'
+import os, stat, sys
+path = sys.argv[1]
+paths = []
+while True:
+    paths.append(path)
+    parent = os.path.dirname(path)
+    if parent == path:
+        break
+    path = parent
+for path in reversed(paths):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if not stat.S_ISDIR(info.st_mode) or (not sys.argv[2]
+                                          and (info.st_uid != 0 or info.st_mode & 0o022)):
+        sys.exit("unsafe root tools directory: " + path)
+for name in ("docker", "ci-runner-gate"):
+    path = os.path.join(sys.argv[1], name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        continue
+    if not stat.S_ISREG(info.st_mode) or (not sys.argv[2]
+                                          and (info.st_uid != 0 or info.st_mode & 0o022)):
+        sys.exit("unsafe root tools file: " + path)
+PYSAFE
 }
 stage_cleanup() { # the root-private archive snapshot never outlives the run
   if [ -n "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi
@@ -408,7 +444,8 @@ preconditions() {
 # --- prepare ----------------------------------------------------------------
 prepare() {
   say "prepare $COUNT runner(s) under $ROOT/ci, user $GUEST, slice ameesh-guest.slice"
-  local n dir tarball_in=$TARBALL shim_new=0 wrapper_new=0 unit_new=0
+  local n dir tarball_in=$ROOT/ci/cache/actions-runner-linux-x64-$VERSION.tar.gz shim_new=0 wrapper_new=0 unit_new=0
+  root_tools_safe || die "unsafe root tools path"
   # never overwrite a file that is not ours: a shim or a unit of this name
   # can only come from this lot, anything else is an anomaly to look at
   if [ -e "$(at "$SHIM")" ] && ! grep -qF "#1256" "$(at "$SHIM")" 2>/dev/null; then
@@ -421,29 +458,24 @@ prepare() {
      && ! cmp -s "$SRC_UNIT" "$(at "/etc/systemd/system/$UNIT")"; then
     die "/etc/systemd/system/$UNIT exists and differs from this checkout's: move it aside first"
   fi
-  if [ -z "$tarball_in" ]; then
-    tarball_in=$ROOT/ci/cache/actions-runner-linux-x64-$VERSION.tar.gz
-  fi
   # only what this script creates is recorded, so --remove gives the host
   # back the way --prepare found it (an existing tree is left alone). $ROOT
-  # belongs to the guest: a planted symlink is refused before root creates
-  # or writes anything below it (R1 delta B4, #1256).
+  # belongs to the guest: even after a symlink check, all directory creation
+  # and removal below it runs as the guest. Root only writes the tools outside
+  # this tree, under a root-owned chain (R1 delta B4, #1256).
   no_symlink_path ci
   no_symlink_path ci/cache
   if absent "$ROOT/ci"; then
-    run install -d -o "$GUEST" -g "$GUEST" -m 0700 "$(at "$ROOT/ci")"
+    run runuser -u "$GUEST" -- install -d -m 0700 "$(at "$ROOT/ci")"
     remember "$ROOT/ci" created
   fi
   if absent "$ROOT/ci/cache"; then
-    run install -d -o "$GUEST" -g "$GUEST" -m 0700 "$(at "$ROOT/ci/cache")"
+    run runuser -u "$GUEST" -- install -d -m 0700 "$(at "$ROOT/ci/cache")"
     remember "$ROOT/ci/cache" created
   fi
-  no_symlink_path bin
-  no_symlink_path bin/docker
-  no_symlink_path bin/ci-runner-gate
-  if absent "$ROOT/bin"; then
-    run install -d -o root -g root -m 0755 "$(at "$ROOT/bin")"
-    remember "$ROOT/bin" created
+  if absent "$TOOLS"; then
+    run install -d -o root -g root -m 0755 "$(at "$TOOLS")"
+    remember "$TOOLS" created
   fi
   if absent "$SHIM"; then shim_new=1; fi
   put "$SHIM" 0755 root:root <<'SHIM'
@@ -507,7 +539,7 @@ SHIM
       die "$dir already exists and is not this script's: move it aside first"
     fi
     if absent "$dir"; then
-      run install -d -o "$GUEST" -g "$GUEST" -m 0755 "$(at "$dir")"
+      run runuser -u "$GUEST" -- install -d -m 0755 "$(at "$dir")"
       remember "$dir" created
     fi
     # extraction sous l'invité, depuis l'instantané privé de root : un
@@ -715,6 +747,7 @@ PY
 # --- remove -----------------------------------------------------------------
 remove() {
   need_root
+  root_tools_safe || die "unsafe root tools path"
   local n kept=()
   for n in $(seq 1 "$COUNT"); do
     if ! wait_terminal "$n"; then
@@ -737,16 +770,17 @@ remove() {
       continue
     fi
     if recorded "$ROOT/ci/r$n"; then
-      run rm -rf "$(at "$ROOT/ci/r$n")"
+      run runuser -u "$GUEST" -- rm -rf "$(at "$ROOT/ci/r$n")"
     fi
   done
   [ "$KEEP" = 1 ] && [ ${#kept[@]} -gt 0 ] && say "kept (--keep-workspaces): ${kept[*]}"
   if [ "$KEEP" = 0 ]; then
-    recorded "$ROOT/ci/cache" && run rm -rf "$(at "$ROOT/ci/cache")"
-    recorded "$ROOT/ci" && run rmdir --ignore-fail-on-non-empty "$(at "$ROOT/ci")" || true
+    recorded "$ROOT/ci/cache" && run runuser -u "$GUEST" -- rm -rf "$(at "$ROOT/ci/cache")"
+    recorded "$ROOT/ci" && run runuser -u "$GUEST" -- rmdir --ignore-fail-on-non-empty "$(at "$ROOT/ci")" || true
   fi
   recorded "$SHIM" && run rm -f "$(at "$SHIM")"
   recorded "$GATE_WRAPPER" && run rm -f "$(at "$GATE_WRAPPER")"
+  recorded "$TOOLS" && run rmdir --ignore-fail-on-non-empty "$(at "$TOOLS")" || true
   if [ "$DRY" = 0 ]; then
     [ "$KEEP" = 1 ] || rm -f "$STATE"
   else
