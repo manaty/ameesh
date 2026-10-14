@@ -528,6 +528,89 @@ class DocsLaneTest(unittest.TestCase):
             return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path,
                                   base_ref="main", head_ref="lot/x")
 
+    def _base_with_unmeasured_ci_change(self):
+        self.card["genere"] = (NOW - datetime.timedelta(hours=6.8)).isoformat()
+        self.repo.write(".github/workflows/tests.yml", "name: tests\n")
+        self.repo.write("scripts/test-plan.py", "# CI changed on main after the map\n")
+        return self.repo.commit()
+
+    def _real_plan(self, base):
+        with mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
+                mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
+                                  if a and a[0] == plan.PILOT_FILE else []):
+            return plan.make_plan("pull_request", self.card, NOW, base=base, head="HEAD",
+                                  repo=self.repo.path, base_ref="main", head_ref="lot/x")
+
+    def test_docs_pr_ignores_ci_changes_already_in_its_base(self):
+        base = self._base_with_unmeasured_ci_change()
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_c"]]
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        p = self._real_plan(base)
+        self.assertEqual(p["files"], ["docs/guide.md"])
+        self.assertTrue(p["map"]["used"])
+        self.assertTrue(p["docs_only"], p["why"])
+        self.assertIn(self.name["test_c"], p["doc_readers"])
+        self.assertEqual(p["parts"], {"psycopg": [], "psql": []})
+        self.assertEqual(plan.outputs(p)["code"], "false")
+
+    def test_docs_pr_with_old_base_map_keeps_database_readers(self):
+        base = self._base_with_unmeasured_ci_change()
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        p = self._real_plan(base)
+        self.assertFullSuite(p, self.name["test_db"])
+        self.assertEqual(p["classes"][self.name["test_db"]][0], "P1")
+
+    def test_docs_pr_keeps_a_database_reader_changed_on_its_base(self):
+        self.card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [self.name["test_db"]]
+        self._base_with_unmeasured_ci_change()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace(
+            "return x + 1", "return open('docs/guide.md').read()"))
+        base = self.repo.commit()
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        # The old map did not see this function read the guide. Its recorded
+        # test still has to run when the base changes that function.
+        p = self._real_plan(base)
+        self.assertFullSuite(p, self.name["test_db"])
+
+    def test_docs_pr_keeps_unmeasured_base_code_in_the_full_suite(self):
+        self._base_with_unmeasured_ci_change()
+        self.repo.write("src/ameesh/code.py", CODE_V1 +
+                        "\n\ndef new_reader():\n    return open('docs/guide.md').read()\n")
+        base = self.repo.commit()
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        self.assertFullSuite(self._real_plan(base), "documentation base contains unmeasured code")
+
+    def test_mixed_pr_with_old_base_map_does_not_take_docs_lane(self):
+        base = self._base_with_unmeasured_ci_change()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("return x + 1", "return x + 2"))
+        self.repo.write("docs/guide.md", "# Updated guide\n")
+        self.repo.commit()
+
+        p = self._real_plan(base)
+        self.assertEqual(sorted(p["files"]), ["docs/guide.md", "src/ameesh/code.py"])
+        self.assertFalse(p["docs_only"], p["why"])
+        self.assertEqual(plan.outputs(p)["code"], "true")
+        self.assertEqual(sorted(m for part in p["parts"]["psycopg"]
+                                for m in part["modules"]), self.MODULES)
+
+    def test_missing_uncertainty_diagnostic_keeps_the_full_suite(self):
+        with mock.patch.object(plan, "read_list", return_value=[]):
+            state = plan.classify(self.MODULES, self.card, NOW, repo=self.repo.path)
+        for metadata, why in ((None, "map unusable"), (state["map"], "selection unsure")):
+            with self.subTest(why=why), mock.patch.object(plan, "classify", return_value={
+                    **state, "map": metadata, "sure": False, "phase2_safe": False,
+                    "unsure": []}):
+                self.assertFullSuite(self._plan(["docs/guide.md"]), why)
+
     def assertFullSuite(self, p: dict, why: str) -> None:
         self.assertFalse(p["docs_only"], p["why"])
         self.assertIn(why, p["why"])
@@ -729,7 +812,10 @@ class PlanTest(unittest.TestCase):
                 "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
         classes = {m: (["P1", "always list (src/ameesh/runner.py)"]
                        if m in always else ["P3", ""]) for m in mods}
-        with mock.patch.object(plan, "classify", return_value={
+        with mock.patch.object(plan, "nature", return_value={
+                "version_only": False, "docs_only": False, "why": "code",
+                "files": ["src/ameesh/runner.py"]}), \
+                mock.patch.object(plan, "classify", return_value={
                 "map": None, "sure": False, "phase2_safe": False, "unsure": [],
                 "untested": [], "unknown_blocks": [], "foundation": [], "changed": 1,
                 "always": always,

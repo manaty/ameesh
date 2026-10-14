@@ -543,7 +543,7 @@ def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
 
 def classify(modules: list[str], card: dict | None, now: datetime.datetime,
              base_fallback: str = "HEAD^1", head: str = "HEAD",
-             repo: pathlib.Path = REPO) -> dict:
+             repo: pathlib.Path = REPO, *, docs_only: bool = False) -> dict:
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
@@ -557,13 +557,35 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                       "used": not problem, "problem": problem}
     impact = None
     if not problem:
-        changes = changed_files(card["commit"], head, repo)
+        # A documentation-only range has already been checked by nature().
+        # CI changes on its base do not belong to that range; use the map to
+        # find readers of its documents, not to rejudge the base's code.
+        diff_base = base_fallback if docs_only else card["commit"]
+        changes = changed_files(diff_base, head, repo)
         if changes is None:
-            problem = f"diff from map commit {card['commit'][:12]} unreadable"
+            kind = "documentation base" if docs_only else "map commit"
+            problem = f"diff from {kind} {diff_base[:12]} unreadable"
             out["map"]["used"], out["map"]["problem"] = False, problem
         else:
             try:
                 impact = judge(card, changes, modules, head, repo)
+                if docs_only:
+                    inherited = changed_files(card["commit"], base_fallback, repo)
+                    if inherited is None:
+                        raise ValueError("documentation base diff unreadable")
+                    baseline = judge(card, inherited, modules, base_fallback, repo)
+                    # Keep readers that changed on the base: the old map may
+                    # not yet record their new documentation dependencies.
+                    impact.p0.update(baseline.p0)
+                    for module, reason in baseline.p1.items():
+                        impact.p1.setdefault(module, reason)
+                    infrastructure = {f"test infrastructure changed: {path}"
+                                      for path in baseline.foundation}
+                    for reason in baseline.unsure:
+                        if reason not in infrastructure:
+                            impact.doubt(reason)
+                    if baseline.unknown_blocks or baseline.untested:
+                        impact.doubt("documentation base contains unmeasured code")
             except Exception as exc:  # any doubt: fallback, never a failed plan
                 problem = f"map unusable ({type(exc).__name__}: {exc})"
                 out["map"]["used"], out["map"]["problem"] = False, problem
@@ -778,20 +800,23 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             "tested": _rev(head, repo), "release": release,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
-    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo))
+    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
+                         docs_only=bool(plan["docs_only"] and not release)))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     #: #749 : modules « always » declenches par le diff (contrat de base, baux
     #: et orphelins), a rejoindre au pilote psql sur une PR.
     always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
     if plan["docs_only"] and not release:
-        # the fast lane needs a map that judged everything: a missing, stale or
-        # unusable map, or an unsure selection, runs the full suite
+        # The fast lane needs a usable map and a sure judgement of the actual
+        # documentation range. Missing readers or a bad map keep the full suite.
         full = None
         if not (plan["map"] and plan["map"]["used"]):
-            full = f"documentation, map not usable ({plan['unsure'][0]}): full suite"
+            reason = next(iter(plan["unsure"]), "map unusable")
+            full = f"documentation, map not usable ({reason}): full suite"
         elif not plan["sure"]:
-            full = f"documentation, selection unsure ({plan['unsure'][0]}): full suite"
+            reason = next(iter(plan["unsure"]), "selection unsure")
+            full = f"documentation, selection unsure ({reason}): full suite"
         else:
             plan["doc_readers"], db_readers = doc_readers(plan["classes"], card, modules)
             if db_readers:  # doc-readers has no Postgres: the full parts run them
