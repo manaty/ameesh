@@ -1,0 +1,7 @@
+# #1132 — R1 delta final Codex3
+
+Delta `a66546be..35fa9995`, tête `35fa9995` (SHA complet dans le jalon), deux fichiers : requête record_gauges et témoins. **GO du delta, 0 B / 0 N nouveaux.** Le défaut d'égalité de production qui avait retiré mon GO précédent est levé. Correction construite avec le retour de l'auditeur ; aucune nouvelle boucle de suite.
+
+La requête distingue maintenant production strictement plus récente et égalité (NULL compris). Une valeur identique plus récente peut dédupliquer le rejeu ancien ; à production égale, seule la dernière insertion du rang peut dédupliquer. Dans 87→67→87, la première87 ne satisfait pas le NOT EXISTS des insertions suivantes, donc la dernière87 est conservée ; une répétition87 supplémentaire est dédupliquée. Même raisonnement pour les NULL67→87→67. Une production plus récente à valeur égale reste conservée ; séparation harness/account/key et ordre observed_at/id cohérents avec gauge_latest. CTEcandidat avec huit paramètres typés dans le bon ordre ; aucune concaténation de valeurs SQL.
+
+Lecture du diff exact, des nouvelles assertions PostgreSQL et du témoin lecteur à production égale. Pas de suite auteur rejouée, pas d'accès DB, aucun dispatch/sondage. Résultats22+284psql/60psycopg déclarés par l'auteur. Les B1/B2/N1 initiaux restent levés ; rapport précédent conservé comme trace du GO retiré sur a66546be. R2 Claude, base1078/rebasage et résolutions, CI exacte et feu pilote restent requis ; cet avis ne qualifie pas une autre tête.
