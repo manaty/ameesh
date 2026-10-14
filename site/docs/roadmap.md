@@ -234,6 +234,10 @@ Migrations 0052 (durations) and 0053 (reserved numbers), additive. Reinstall
 - **housekeeping**: L219 no longer deletes the temporary directory of an agent
   that is in a turn, or of another mesh on the same machine.
 
+Migrations 0054 to 0057 (reference estimates, CI test results, lot measures,
+conflict resolutions), all additive; apply them with `ameesh migrate` before
+installing.
+
 v1.9.1 is a patch on `release/1.9`: `send --new-lot` inherits the sender's
 project, then the recipient's, instead of creating a lot with an empty project,
 and the correction guard rejects invalid runner/session identities before a
@@ -251,9 +255,10 @@ release is published yet. The main lines:
   storage and runner, single-use enrolment and revocation, host gate, model
   relay, server-side work repositories, executor image and signing helper
   (L107–L114);
-- **capacity guard and host gate**: the shared host measure and the guard
-  contract shared with Nexlink Compute (L159a, L159d), the guard observing and
-  enforcing levels 0–4 (L159e), the disk guard on btrfs and every volume
+- **capacity guard and host gate**: the shared host measure (L159d) and the
+  guard contract shared with Nexlink Compute (L159a), the guard observing
+  levels 0–4 and enforcing them through systemd, drain and stop (L159e), the
+  disk guard on btrfs and every volume
   (L229), heavy suites capped per host (L131), host alerts muted for a bounded
   span (L254), fewer runner database sessions (L653);
 - **progress and API**: `ameesh progress --serve`, the page in tabs with a
@@ -274,7 +279,8 @@ release is published yet. The main lines:
   naming from the canon (L243);
 - **planning, lots and decisions**: grouped orphan notifications (L50),
   stale-lot alerts deferred for planned starts and open dependencies (L368),
-  project kept on every creation path (L118c, #495), thread retention (L361),
+  project kept on every creation path (#495) and a message sent with `--lot`
+  filed in the lot's project thread (L118c), thread retention (L361),
   DSN passwords off command lines (L518), fewer CLI round trips (L521),
   migration reservations per repository (L443), owner decisions only through
   `ameesh decide` (L233);

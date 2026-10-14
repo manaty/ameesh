@@ -84,12 +84,16 @@ class Essai:
         self.env = dict(os.environ)
         for k in ("AMEESH_DSN", "AGENT_MESH_DSN", "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID"):
             self.env.pop(k, None)
+        #: fichier VIDE mais existant : un chemin explicite absent est refusé (#1127)
+        self.config_vide = os.path.join(self.dir, "config-vide.json")
+        with open(self.config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         self.env.update({
             "AMEESH_PG_NAME": PG, "AMEESH_PG_PORT": str(PG_PORT),
             "AMEESH_PG_VOLUME": "ameesh-pg-data-" + NOM, "AMEESH_PG_PASSWORD": "banc-" + NOM,
             "PGPASSWORD": "banc-" + NOM,
             "AMEESH_DSN": "postgresql://agent_mesh@127.0.0.1:%d/agent_mesh" % PG_PORT,
-            "AMEESH_CONFIG": os.path.join(self.dir, "config-absente.json"),
+            "AMEESH_CONFIG": self.config_vide,
             "PYTHONPATH": os.path.join(REPO, "src"),
             "AMEESH_BALANCE_INTERVAL": "0", "AMEESH_RESOURCE_INTERVAL": "0",
         })

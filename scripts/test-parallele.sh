@@ -80,7 +80,10 @@ echo "${#CONTENEURS[@]} base(s) prête(s) ; journaux dans $SORTIE"
 
 # --- environnement des tests (comme scripts/test.sh) --------------------------
 export AMEESH_REQUIRE_DB=1
-export AMEESH_CONFIG="$PWD/.config-absente-pour-les-tests.json"
+# fichier VIDE mais existant : un chemin explicite absent est refusé (#1127)
+AMEESH_CONFIG="$(mktemp "${TMPDIR:-/tmp}/ameesh-config-vide-XXXXXX")"
+printf '{}\n' > "$AMEESH_CONFIG"
+export AMEESH_CONFIG
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 unset DEEPSEEK_API_KEY AMEESH_DEEPSEEK_API_BASE AMEESH_DSN AGENT_MESH_DSN
 export AMEESH_BALANCE_INTERVAL=0
