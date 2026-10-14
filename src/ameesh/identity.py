@@ -186,6 +186,27 @@ def workstream_of(name: str, cfg: Config) -> str:
 #: L148 (stage 2c): old spelling kept for the callers not yet renamed.
 chantier_of = workstream_of
 
+#: Domaine des adresses git des agents — jamais routable, le même que celui de
+#: l'agent côté appareil (`mediated_executor/work_repo.py`).
+GIT_EMAIL_DOMAIN = "ameesh.invalid"
+
+
+def git_identity(name: str) -> dict:
+    """L'identité git d'une session (#834) : auteur ET committer.
+
+    Une session la porte par l'**environnement** (`GIT_AUTHOR_*`,
+    `GIT_COMMITTER_*`), jamais par `git config` : les worktrees d'un même
+    dépôt partagent `.git/config`, donc un `user.name` écrit par un agent
+    vaut pour tous les autres (incident du 13/10/2026 : une session reprise
+    sans identité commitait sous le nom d'un autre agent). Les variables
+    d'environnement priment sur la configuration ; la valeur vient du nom
+    d'agent du bail — la même source que `AGENT_MAIL_NAME` — donc aucune
+    configuration git n'est lue.
+    """
+    adresse = "%s@%s" % (name, GIT_EMAIL_DOMAIN)
+    return {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": adresse,
+            "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": adresse}
+
 
 def write_alias(cfg: Config, name: str, directory: str, workstream: str = "") -> str:
     """Ajoute/remplace un alias sans jamais laisser le fichier à moitié écrit."""
