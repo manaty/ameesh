@@ -200,6 +200,22 @@ class InstallPilotTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("`memory_max` required", res.stderr)
 
+    def test_agent_units_widens_the_guard_to_the_ci_units(self):
+        # lot #1256: a host that also lends to GitHub Actions runners passes a
+        # glob that covers both kinds of guest units; the guard stops/starts
+        # them, and the application's own `actions.runner.*` are never matched
+        res = self.dry("--allow-rootfs", "--agent-units", "ameesh-guest-*.service")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('"agent_units": "ameesh-guest-*.service"', res.stdout)
+
+    def test_agent_units_never_match_the_application(self):
+        res = self.dry("--allow-rootfs", "--agent-units", "actions.runner.*.service")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("never match the application", res.stderr)
+        res = self.dry("--allow-rootfs", "--agent-units", "ameesh-guest-runner@*")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("*.service pattern expected", res.stderr)
+
     def test_a_legacy_offer_the_previous_reader_accepted_installs(self):
         # mesh-design #459 r4c: a refused `disk_paths` and a size the previous
         # reader truncated to <= 0 drop the offer; the guard starts closed and
