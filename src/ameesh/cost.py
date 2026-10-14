@@ -267,14 +267,16 @@ class Gauge:
 
         Exactement `min(PACE_CEILING, multiplier × écoulé + PACE_MARGIN) −
         reserve`, plancher `PACE_MARGIN` :
-        * **début de fenêtre** : sous `PACE_MARGIN` d'écoulé, la réserve ne
+        * **début de fenêtre** : tant que `multiplier × écoulé ≤ reserve`
+          (soit `≤ PACE_MARGIN` quand la réserve vaut la marge), la réserve ne
           s'applique pas et le seuil vaut la marge (10 points), pas
-          `écoulé + marge − réserve` — une fenêtre à 1 % d'écoulé garde donc
-          10 points, pas 1. C'est l'énoncé de la décision du propriétaire du
-          2026-10-13 (#777) : « pas de réserve sur une fenêtre écoulée à moins
-          de 10 %, plafond = max(écoulé, marge) », exact pour `multiplier = 1`
-          et `reserve = PACE_MARGIN` tant qu'on reste sous le plafond de fin
-          de fenêtre ;
+          `multiplier × écoulé + marge − réserve` — une fenêtre à 1 % d'écoulé
+          garde donc 10 points, pas 1 ; à 8 % d'écoulé avec `multiplier = 2`
+          le seuil vaut 16 %, pas 10 % (#1028 P3). C'est l'énoncé de la
+          décision du propriétaire du 2026-10-13 (#777) : « pas de réserve sur
+          une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »,
+          exact pour `multiplier = 1` et `reserve = PACE_MARGIN` tant qu'on
+          reste sous le plafond de fin de fenêtre ;
         * **fin de fenêtre** : le seuil plafonne à `PACE_CEILING − reserve`
           (80 % avec la réserve de 10 points) et ne suit plus l'écoulé —
           l'énoncé `max(écoulé, marge)` n'y vaut plus (#1028 N1).

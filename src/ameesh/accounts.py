@@ -662,11 +662,13 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     non-critical agent): the pace cap, or the short window cap that replaces
     it, is lowered by `RESERVE` —
     `max(min(PACE_CEILING, multiplier × elapsed + PACE_MARGIN) − RESERVE,
-    PACE_MARGIN)` — and the fixed caps are not lowered. #777 : sous
-    `PACE_MARGIN` d'écoulé la réserve ne s'applique pas, le plafond de rythme
-    y vaut la marge (10 points) et non `écoulé + marge − RESERVE` ; l'énoncé
-    de la décision du propriétaire (« plafond = max(écoulé, marge) ») décrit
-    ce début de fenêtre. En fin de fenêtre le seuil vaut
+    PACE_MARGIN)` — and the fixed caps are not lowered. #777 : tant que
+    `multiplier × elapsed ≤ RESERVE` (soit `≤ PACE_MARGIN` quand la réserve
+    vaut la marge) la réserve ne s'applique pas, le plafond de rythme y vaut
+    la marge (10 points) et non `multiplier × écoulé + marge − RESERVE` — à
+    8 % d'écoulé avec `multiplier = 2` il vaut 16 % (#1028 P3) ; l'énoncé de
+    la décision du propriétaire (« plafond = max(écoulé, marge) ») décrit ce
+    début de fenêtre. En fin de fenêtre le seuil vaut
     `PACE_CEILING − RESERVE` (80 %), il ne suit plus `max(écoulé, marge)`
     (#1028 N1).
     """
