@@ -346,6 +346,8 @@ class _RuntimeImports(ast.NodeVisitor):
     import, a function body does not), outside any condition, loop, `try` or
     `with` — a `with` body may never run (its `__enter__` may fail, or an
     earlier statement may raise and be suppressed), so it is no proof.
+    An unconditional module-level `raise` or `sys.exit` also leaves every
+    later import without proof, while keeping its possible selection edge.
     A lazy or conditional import alone is a possible load, never a proof
     (relecture Codex, B2 résiduel)."""
 
@@ -355,6 +357,7 @@ class _RuntimeImports(ast.NodeVisitor):
         self.guaranteed: list[ast.stmt] = []
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
+        self._terminated = False  # module execution cannot reach later imports
 
     def _visit_function(self, node: ast.AST) -> None:
         self._deferred += 1
@@ -379,6 +382,19 @@ class _RuntimeImports(ast.NodeVisitor):
     visit_With = _visit_guarded
     visit_AsyncWith = _visit_guarded
 
+    def visit_Raise(self, node: ast.Raise) -> None:
+        self.generic_visit(node)
+        if not self._deferred and not self._guarded:
+            self._terminated = True
+
+    def visit_Call(self, node: ast.Call) -> None:
+        self.generic_visit(node)
+        func = node.func
+        if (not self._deferred and not self._guarded
+                and isinstance(func, ast.Attribute) and func.attr == "exit"
+                and isinstance(func.value, ast.Name) and func.value.id == "sys"):
+            self._terminated = True
+
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
             # the guard never runs: only its `else` does (at module level)
@@ -389,7 +405,7 @@ class _RuntimeImports(ast.NodeVisitor):
 
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
-        if not self._deferred and not self._guarded:
+        if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:

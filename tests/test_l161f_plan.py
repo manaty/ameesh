@@ -545,6 +545,26 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
         self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
 
+    def test_new_file_imported_after_terminal_statement_keeps_the_doubt(self):
+        self.repo.write("tests/test_static.py",
+                        "raise RuntimeError\nimport ameesh.new_feature\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        card["modules"]["test_static"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py",
+                      out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
         # l'importe ; les tests que la carte a mesurés sur ce module (ici un
@@ -897,6 +917,34 @@ class ImportGraphTest(unittest.TestCase):
                 if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
                     self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                      {"src/ameesh/db.py"}, why)
+
+    def test_terminal_statement_prevents_later_import_proof(self):
+        known = {"src/ameesh/db.py"}
+        for terminal in ("raise RuntimeError", "import sys\nsys.exit(1)"):
+            with self.subTest(terminal=terminal):
+                source = terminal + "\nimport ameesh.db\n"
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                # Keep the possible edge for selection, even without proof.
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        # Class bodies execute during the containing module's import too.
+        source = "class C:\n    raise RuntimeError\nimport ameesh.db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True), set())
+
+    def test_terminal_statement_keeps_earlier_and_nonexecuted_proofs(self):
+        known = {"src/ameesh/db.py"}
+        for source in (
+            "import ameesh.db\nraise RuntimeError\n",
+            "import ameesh.db\nimport sys\nsys.exit(1)\n",
+            "def unused():\n    raise RuntimeError\nimport ameesh.db\n",
+            "def unused():\n    import sys\n    sys.exit(1)\nimport ameesh.db\n",
+            "if False:\n    raise RuntimeError\nimport ameesh.db\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
