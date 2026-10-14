@@ -35,6 +35,25 @@ def _proc_ok() -> bool:
     return is_linux() and os.path.isdir(os.path.join(PROC, "self"))
 
 
+def self_cgroup_paths() -> tuple[str, ...]:
+    """Kernel cgroup memberships of this process (Linux only).
+
+    Missing, unreadable or malformed membership raises NotAvailable, never
+    an empty result that could be mistaken for a confirmed native identity.
+    """
+    from . import is_linux
+    if not is_linux():
+        raise NotAvailable("process cgroup membership", "requires Linux")
+    try:
+        with open(os.path.join(PROC, "self", "cgroup"), encoding="utf-8") as stream:
+            rows = [line.rstrip().split(":", 2) for line in stream]
+    except (OSError, UnicodeError) as exc:
+        raise NotAvailable("process cgroup membership", str(exc)) from exc
+    if not rows or any(len(row) != 3 or not row[2].startswith("/") for row in rows):
+        raise NotAvailable("process cgroup membership", "empty or malformed membership")
+    return tuple(row[2] for row in rows)
+
+
 def _stat_fields(pid: int) -> list[str]:
     """Champs de /proc/<pid>/stat à partir du 3e (état). Le nom (champ 2) est
     entre parenthèses et peut en contenir : on coupe à la DERNIÈRE « ) »."""
