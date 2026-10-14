@@ -1,0 +1,28 @@
+commit ce86f6581a7608cdc549d70cf86095b38eba95ac
+Merge: f9d7e43f 68a18f75
+Author: ameesh-dev3 <ameesh-dev3@users.noreply.github.com>
+Date:   Wed Oct 14 04:35:31 2026 +0000
+
+    #1176 : integration de main 68a18f75 (delta #898) — conflit de commentaire accounts.py resolu (les deux formulations gardees)
+
+diff --cc src/ameesh/accounts.py
+index 5c27836b,6e459849..573649b8
+--- a/src/ameesh/accounts.py
++++ b/src/ameesh/accounts.py
+@@@ -971,10 -773,10 +973,12 @@@ def evaluate(book, profile: Profile, it
+          if reserve and not hard:
+              result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
+          # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
+-         # plus longtemps ; #777 : à l'heure où elle libère vraiment ; #1176 :
+-         # le relèvement de fin de fenêtre peut la libérer avant la remise à zéro.
++         # plus longtemps ; #777, #898 : à l'heure où elle libère vraiment —
+ -        # croisement du rythme, ou remise à zéro quand il ne rattrape plus.
+++        # croisement du rythme, ou remise à zéro quand il ne rattrape plus ;
+++        # #1176 : le relèvement de fin de fenêtre peut la libérer avant la
+++        # remise à zéro.
+          result.until, late = _release(profile, depasses, hard, now,
+ -                                      RESERVE if reserve else 0.0)
+ +                                      RESERVE if reserve else 0.0, result.ceilings)
+          if late is not None:
+              result.held = (late.key, late.used)
+          return result
