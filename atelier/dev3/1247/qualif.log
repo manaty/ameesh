@@ -1,0 +1,11 @@
+MAIN 2458ec053123d3f33644fef1e092fc84cc2773d9
+LOT #1247 branche lot/1247-run-bodies-hardening
+HEAD 9f9bd3cf898e5eb7fbef3c98b013b2452be79cd2
+BASE 046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac
+merge-tree rc=0
+e4784041f2f21ca97175881b37517208b38d7357
+
+  tests/test_l161f_plan.py                                   head=854d28b9c4 union=be90a731dc main==base:NON patchid_const=YES
+fichiers=1 migrations=0
+
+mesure 2026-10-14T21:04:12Z ; methode patch-id: git diff -U0 <base> <head> -- <f> vs git diff -U0 2458ec053123 <union> -- <f>
