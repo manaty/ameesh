@@ -1,0 +1,139 @@
+diff --git a/src/ameesh/alert_briefs.py b/src/ameesh/alert_briefs.py
+index 333ef4d7..be690f3f 100644
+--- a/src/ameesh/alert_briefs.py
++++ b/src/ameesh/alert_briefs.py
+@@ -165,8 +165,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
+     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
+ 
+     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
+-    l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
+-    repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
++    l'équipe de l'assigné (sinon celle du lot, #917) ; `plan_underused`, ceux
++    des équipes des agents au repos ; `estimate_bias` (L157b), ceux de
++    l'équipe de l'estimateur, et
+     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
+     rôle explicite et projet, sans repli. Auditeurs : pour tous les types sauf
+     `stale_lot` (L713 : lu à la passe de l'auditeur, sans réveil). Un agent à
+@@ -198,6 +199,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
+         if kind == "stale_lot":
+             text = _stale_lot(alert)
+             teams = {_team(by_name, alert.get("agent"))} - {""}
++            if not teams:
++                # #917 : sans assigné connu, l'équipe du lot — sinon un lot
++                # ameesh réveillerait les orchestrateurs nexlink, et
++                # inversement (une alerte reçue pousse à assigner, ce qui
++                # entretient la liste des orchestrateurs par historique).
++                teams = {(alert.get("lot_team") or "").strip()} - {""}
+         elif kind == "estimate_bias":
+             text = _estimate_bias(alert)
+             teams = {_team(by_name, alert.get("agent"))} - {""}
+diff --git a/src/ameesh/exploitation.py b/src/ameesh/exploitation.py
+index 52bd2f55..0503b6eb 100644
+--- a/src/ameesh/exploitation.py
++++ b/src/ameesh/exploitation.py
+@@ -477,6 +477,7 @@ def alerts(cfg: Config, db, *, long_turn_s: float = DEFAULT_LONG_TURN_S,
+                 lot["id"], lot["state"], lot["idle_s"],
+                 ", waiting for: %s" % lot["waiting_for"] if lot["waiting_for"] else "", action),
+             lot=lot["id"], title=lot["title"], lot_state=lot["state"],
++            lot_team=lot.get("lot_team"),
+             waiting_for=lot["waiting_for"], waiting=lot["waiting"], action=action,
+             orchestrators=list(orchestras)))
+     out += _orphan_lots(db, listing, now, orphan_lot_s, cfg=cfg)
+diff --git a/src/ameesh/stagnation.py b/src/ameesh/stagnation.py
+index bed9836c..ea34a7d7 100644
+--- a/src/ameesh/stagnation.py
++++ b/src/ameesh/stagnation.py
+@@ -328,9 +328,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
+                   now: float | None = None, limit: int = 500) -> list[dict]:
+     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
+ 
+-    Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
+-    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26) et `waiting`
+-    (`{what, who, label}`, L29)."""
++    Une ligne : id, title, state, assignee, `lot_team` (équipe du lot, L917),
++    `last_activity_ts`, `idle_s`, `waiting_for` (un mot de `WAITING_FOR` ou
++    None, forme L26) et `waiting` (`{what, who, label}`, L29)."""
+     from . import sous_utilisation
+     now = time.time() if now is None else float(now)
+     st = storage.of(db)
+@@ -355,6 +355,7 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
+             "title": row.get("title"),
+             "state": row.get("state"),
+             "assignee": row.get("assignee") or None,
++            "lot_team": row.get("lot_team") or None,
+             "last_activity_ts": float(row["last_activity_ts"]),
+             "idle_s": int(now - float(row["last_activity_ts"])),
+             "waiting_for": info["waiting_for"],
+diff --git a/src/ameesh/storage/interface.py b/src/ameesh/storage/interface.py
+index 656ed14b..567b0c92 100644
+--- a/src/ameesh/storage/interface.py
++++ b/src/ameesh/storage/interface.py
+@@ -2295,8 +2295,10 @@ class Operations(Domain):
+         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
+         maximum de la ligne du lot, de ses transitions, jalons, actions et
+         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
+-        assignee. Les plus anciennement actifs d'abord. `limit=None` lit
+-        toute la vérité avant le filtrage des attentes planifiées (L368)."""
++        assignee, `lot_team` (équipe du lot : la sienne, sinon celle de son
++        paquet ou du parent, sinon son `app`). Les plus anciennement actifs
++        d'abord. `limit=None` lit toute la vérité avant le filtrage des
++        attentes planifiées (L368)."""
+ 
+     @abc.abstractmethod
+     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
+diff --git a/src/ameesh/storage/postgres/operations.py b/src/ameesh/storage/postgres/operations.py
+index 276e99f1..2c836da8 100644
+--- a/src/ameesh/storage/postgres/operations.py
++++ b/src/ameesh/storage/postgres/operations.py
+@@ -334,11 +334,15 @@ class Operations(interface.Operations):
+         return self.db.query(
+             """
+             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
++                   coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
++                            nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
+                    extract(epoch from w.updated_at)::float8 AS updated_ts,
+                    extract(epoch from w.created_at)::float8 AS created_ts,
+                    extract(epoch from greatest(
+                        w.updated_at, ev.at, ms.at, ac.at, mb.at))::float8 AS last_activity_ts
+               FROM work_items w
++              LEFT JOIN work_packages k ON k.id = w.package_id
++              LEFT JOIN work_packages kp ON kp.id = w.package_parent
+               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM work_item_events e
+                                   WHERE e.work_item_id = w.id) ev ON true
+               LEFT JOIN LATERAL (SELECT max(at) AS at FROM work_item_milestones m
+diff --git a/tests/test_l132_alert_briefs.py b/tests/test_l132_alert_briefs.py
+index e3d4af8e..7bbd8269 100644
+--- a/tests/test_l132_alert_briefs.py
++++ b/tests/test_l132_alert_briefs.py
+@@ -58,6 +58,19 @@ class BriefsTest(unittest.TestCase):
+         self.assertEqual(sorted(briefs), ["orch", "orch-b"])     # équipe inconnue : tous
+         self.assertIn("ameesh work assign 42 <agent>", briefs["orch"])
+ 
++    def test_stale_lot_sans_assigne_suit_l_equipe_du_lot(self):
++        # #917 : sans assigné, le brief va aux orchestrateurs de l'équipe du lot,
++        # pas à ceux de toutes les équipes. L713 : l'auditeur ne reçoit plus les
++        # stale_lot par courrier, même sans assigné (il les lit à sa passe).
++        alert = dict(STALE, agent=None, lot_team="b")
++        briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
++        self.assertEqual(sorted(briefs), ["orch-b"])
++        alert = dict(STALE, lot_team="b")               # assigné sans équipe : le lot tranche
++        self.assertEqual(sorted(alert_briefs.briefs(alert, _listing(("orch", "a"),
++                                                                    ("orch-b", "b"),
++                                                                    ("dev1", "")))),
++                         ["orch-b"])
++
+     def test_plan_underused(self):
+         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])
+         self.assertEqual(sorted(briefs), ["auditeur", "orch-b"])
+diff --git a/tests/test_l26_exploitation.py b/tests/test_l26_exploitation.py
+index 2c8276ff..0500364d 100644
+--- a/tests/test_l26_exploitation.py
++++ b/tests/test_l26_exploitation.py
+@@ -633,6 +633,7 @@ class AlertesTest(_Base):
+             self.assertTrue({"type", "agent", "since", "value", "threshold"} <= set(alerte))
+         stale = next(a for a in alertes if a["type"] == "stale_lot")
+         self.assertEqual((stale["lot"], stale["waiting_for"]), (lot["id"], "verdict"))
++        self.assertEqual(stale["lot_team"], "p")     # L917 : l'équipe du lot suit l'alerte
+         big = next(a for a in alertes if a["type"] == "session_too_big")
+         self.assertEqual((big["value"], big["threshold"]), (16_000_000, 15_000_000))
+         # seuils réglables

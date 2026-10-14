@@ -1,0 +1,37 @@
+# #917 — constance production/SQL de l'artefact 93613d6b (relevé 2026-10-14T10:59:26Z)
+
+## 1. Le commit lot rebasé EST l'union propre de main et de la tête revue
+$ git merge-tree --write-tree origin/main dd5d6a67886eb3aa5ad2573a7c9d14cb207003b0
+0ddfd1545ea0a3d42b33cfa286460c6d0ae7b904
+$ git rev-parse cad1ce5a67ae88874c06b01819e1453e4f765af6^{tree}
+0ddfd1545ea0a3d42b33cfa286460c6d0ae7b904
+
+## 2. La correction 93613d6b ne touche QUE le témoin
+$ git diff --name-status cad1ce5a67ae88874c06b01819e1453e4f765af6 93613d6bb05fa9e58057596d4a5b9b521060afa5
+M	tests/test_l132_alert_briefs.py
+$ git diff --stat cad1ce5a 93613d6b
+ tests/test_l132_alert_briefs.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+## 3. Delta complet du lot vs main 6eeecc8e (aucun .sql, aucune migration)
+$ git diff --stat origin/main 93613d6b
+ src/ameesh/alert_briefs.py                | 11 +++++++++--
+ src/ameesh/exploitation.py                |  1 +
+ src/ameesh/stagnation.py                  |  7 ++++---
+ src/ameesh/storage/interface.py           |  6 ++++--
+ src/ameesh/storage/postgres/operations.py |  4 ++++
+ tests/test_l132_alert_briefs.py           | 13 +++++++++++++
+ tests/test_l26_exploitation.py            |  1 +
+ 7 files changed, 36 insertions(+), 7 deletions(-)
+$ git diff --name-only origin/main 93613d6b | grep -Ei '\.sql$|migration' ; echo exit=$?
+exit=1
+
+## 4. Fichiers de production touchés par main depuis la base du lot (incorporés par l'union)
+$ git log --oneline $(git merge-base dd5d6a67 origin/main)..origin/main -- src/ameesh/alert_briefs.py src/ameesh/storage/postgres/operations.py
+27df8891 Merge pull request #805 from manaty/lot/1037-registre-harnais
+f11ab669 #713 : l'auditeur ne reçoit plus les stale_lot par courrier
+bf1a0913 #1037: apres une bascule de harnais, la ligne ne garde plus les reglages perimes
+
+## 5. Le seul écart entre l'union et la tête publiée
+$ git diff --name-status 0ddfd1545ea0a3d42b33cfa286460c6d0ae7b904 93613d6b
+M	tests/test_l132_alert_briefs.py
