@@ -374,3 +374,44 @@ liste des exclusions (#748, #963, #775) et des points de suivi (§5).
   (déclenche la suite complète unique sous #1211) et feu fusion canon §12. Toute nouvelle
   avancée de main avant le geste exige un nouveau contrôle de delta (aucun retarget
   automatique).
+
+## 14. Addendum du 14/10 20:0xZ — candidat paquet 1 étendu au lot #786 (union `57a1863e`)
+
+- **Contexte** : changement de plan §12 (mesh-design, courriers 40167/40181 des 14/10
+  19:29:48Z et 19:30:03Z ; canon `home:processus/lots.md@2c4f18b`, PR home#65 fusionnée
+  19:25:36Z) : les lots relus s'intègrent par paquets d'environ 10 lots, une seule CI complète
+  et une seule fusion par paquet ; le plan de reprise individuelle close/reopen est clos et les
+  82 runs PR annulés ne sont pas relancés. Le gel `6cce130f2` (§13) est resté exactement sur
+  `main` `0532faed4` (contrôle 19:4xZ : `origin/main` = `0532faed4`,
+  `origin/integration/vague-suivante-1204` = `276e6ec56`, inchangés).
+- **Lot ajouté** : #786 « un tour DeepSeek reprend sa session » (PR #1016, tête
+  `94c8125378d1`, branche `lot/786-e2e-dsh-resume`).
+  - Classe **légère** (`tests/fakebin/dsh`, `tests/test_l224_session_harnais.py`).
+  - Dépendance #724 satisfaite (fusionnée `e33d365ab`, contenu dans `main`).
+  - Aucun avis préalable exigé pour un lot léger (§2) ; les tests ciblés de l'auteur sont verts
+    sur l'arbre fusionné, la relecture d'après fusion par une autre famille reste due.
+  - Ni défaut bloquant, ni relecture obligatoire manquante (§12).
+- **Union** : commit `57a1863eb33875d92290307e7ddcd1274bfa8587`, arbre
+  `22cd90aeec55cf9af0028dc0595f37bf29e6825e`, parents `6cce130f2` (gel §13) +
+  `94c8125378d1`. `git merge --no-ff` rc=0, aucun conflit.
+- **Constance** : delta union vs gel = exactement les 2 fichiers de #786 ; les 11 fichiers du
+  gel sont inchangés (`git diff --name-only 6cce130f2 HEAD` = ces 2 fichiers). Blob à blob :
+  `tests/fakebin/dsh` `4f92012f` identique à la tête du lot ; `tests/test_l224_session_harnais.py`
+  `cae2b2c2` identique au résultat exact de `merge-tree(main 0532faed4, 94c8125378d1)` (méthode
+  #724 + ajouts #786). Delta vs `main` = 13 fichiers.
+- **Témoins sur l'arbre d'union** (banc Postgres local `127.0.0.1:55432`, `AMEESH_DRIVER=psycopg`,
+  `AMEESH_CONFIG` vide, `PYTHONPATH=src`) : **265 tests OK, 0 sauté, 0 échec en 105 s** — les
+  10 modules du §13 (236 OK/0 sauté sur l'arbre d'union §13) plus
+  `tests.test_l224_session_harnais` (#786, 29 tests). Aucune suite complète ni SQL lancée.
+- **Contrôle des portes au 19:4xZ** (lecture `gh`, aucune action) : les 6 PR du paquet restent
+  OPEN, têtes inchangées et égales au §2/§13 — 672 `a2e3c60de181`, 402 `79ebee0636f6`, 700
+  `c1d3271c82ba`, 791 `9dfcb03e146d`, 806 `5bc72a02e9ad`, 808 `1e7475317f83` ; #1016
+  `94c8125378d1` OPEN/MERGEABLE. Exclusions toujours fondées : #748 (PR 684 `2ec97643b8ca`,
+  #1098 en attente humaine), #963 (PR 740 `e0d9b6553127`, #706/PR632 `4f0bb179d28e` OPEN),
+  #775 (PR 619 `a02928cf6676`, #711/PR548 `e09b5476d7b6` OPEN).
+- **Réfs atelier** : `refs/atelier/1204/union-0532faed-786` = `57a1863e` ; le commit qui porte
+  cet addendum est le gel candidat étendu (tête et arbre relevés dans la note #1204 du
+  14/10 20:0xZ).
+- **Aucun geste distant** : pas de poussée, aucun run, aucune fusion ; PR #1016 laissée
+  OPEN/MERGEABLE à tête constante, aucun close/reopen, aucun `workflow_dispatch`. Le pilote
+  décide de l'inclusion de #786 dans le paquet 1 ; sinon l'union est abandonnée sans reste.
