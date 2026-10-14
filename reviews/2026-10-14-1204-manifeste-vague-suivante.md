@@ -556,3 +556,42 @@ liste des exclusions (#748, #963, #775) et des points de suivi (§5).
   (relectures d'après fusion #419/#1019/#1038/#1048/#786/#1125/#1261 à désigner au moment de
   la fusion) ; CI complète unique sur le gel final, puis fusion du paquet (§12). Le paquet 1
   (#1342) et le présent paquet restent distincts ; aucune CI individuelle n'est relancée.
+
+## 16. Addendum du 14/10 20:4xZ — union rejouée sur `main` `2458ec053` (#1339), candidat du paquet suivant
+
+- **Avancée de `main`** : `0532faed4` → `2458ec053` (PR #1024, lot #1339, fusionnée
+  20:23:12Z). Delta = 3 fichiers : `docs/EXPLOITATION.md`, `scripts/test-plan.py`,
+  `tests/test_l161f_plan.py` (889 insertions / 25 suppressions). Intersection avec les
+  23 fichiers du paquet : `docs/EXPLOITATION.md` seule ; les deux autres fichiers de #1339
+  sont hors paquet et pris tels quels de `main`.
+
+- **Union rejouée** : `merge-tree(gel ab4d76e04, main 2458ec053)` **rc=0**, aucune
+  résolution. Union = `3a29bf9dc2656a05799a4f05d7c2baae944f125e`, arbre
+  `1f6618ead1580250488faac82251cf43f79fe186`, parents `2458ec053` + `ab4d76e04`.
+
+- **Constance** : delta de l'union vs `main` = **exactement les 23 fichiers** du paquet ;
+  delta de l'union vs le candidat `ab4d76e04` = `docs/EXPLOITATION.md` + les 2 fichiers
+  #1339 de `main` ; les 22 autres blobs du paquet sont inchangés, `git diff --check`
+  propre, 0 marqueur de conflit.
+
+- **`docs/EXPLOITATION.md`** : blob d'union
+  `d406c7ae0e7a0c13c500c1c7e59dcc0acae0236c` = `main` `adb7fbaf` + contributions
+  #1048 (18 lignes), #1125 (7 lignes) et #759 (4 lignes / 1 remplacement) ; patch-id
+  `-U0` de la contribution du paquet identique avant (`0532faed4 → ab4d76e04`) et après
+  (`2458ec053 → union`) = `5b2d78b6e5cb273a597b64d17d11dcdba24c8d99` ; le texte #1339
+  (« Blocks without a measure ») est conservé ; 0 marqueur.
+
+- **Gel** : le commit qui porte cet addendum, delta vs l'union = **ce manifeste seul**
+  (§16). L'ancien gel `ab4d76e04` et l'union `79170f49` restent intacts ; le candidat du
+  paquet suivant est désormais ce gel §16, sur `main` `2458ec053`.
+
+- **Aucun geste distant** : aucun push de branche, aucun run, aucun close/reopen, aucune
+  fusion. `origin/integration/vague-suivante-1204` = `276e6ec56` inchangée.
+
+- **Réfs atelier** (publiées après ce commit) : `refs/atelier/1204/union-2458ec05` =
+  `3a29bf9dc2656a05799a4f05d7c2baae944f125e` ; `refs/atelier/1204/gel-2458ec05` = le
+  commit qui porte cet addendum.
+
+- **Suites** : qualification pilote du nouvel arbre/gel ; avis et feu dus au titre du
+  paquet (§12) ; CI complète unique sur le gel final, puis fusion du paquet. Aucune
+  cible auteur déclenchée (composition propre, sans adaptation).
