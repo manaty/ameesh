@@ -1,0 +1,131 @@
+{
+ "source": {
+  "K1": {
+   "a": 8.0,
+   "b": 7.0,
+   "c": 6.0,
+   "d": 5.0
+  },
+  "K2": {
+   "a": 7.0,
+   "b": 8.0,
+   "c": 6.0,
+   "d": 5.0
+  },
+  "part1_K1": [
+   "a",
+   "d"
+  ],
+  "part2_K2": [
+   "a",
+   "c"
+  ],
+  "b_omis": true,
+  "a_double": true,
+  "garde_D_v1_voit_rien": true,
+  "couverture_refuse": [
+   "a : mesuré dans plusieurs parts (mesure-psycopg-1, mesure-psycopg-2)",
+   "mesure-psycopg-2 : module du plan non mesuré : b",
+   "mesure-psycopg-2 : module mesuré hors de sa part : a"
+  ],
+  "plan_unique_couvre_exactement": true
+ },
+ "plan_egale_split": {
+  "code": 0,
+  "parties": {
+   "psql-1": true,
+   "psql-2": true,
+   "psycopg-1": true,
+   "psycopg-2": true,
+   "psycopg-3": true,
+   "psycopg-4": true
+  },
+  "toutes_egales": true
+ },
+ "plan_bloc": {
+  "avec-carte": {
+   "code": 0,
+   "plan_ecrit": true,
+   "source_recopiee": true,
+   "sortie": "## plan de mesure\n* psql : 45 module(s) en 2 parts (poids statique, 39 en repli), max ~446 s\n* psycopg : 251 module(s) en 4 parts (poids carte, 3 en repli), max ~1355 s",
+   "parts": {
+    "psql": 2,
+    "psycopg": 4
+   },
+   "source": {
+    "psql": "statique",
+    "psycopg": "carte"
+   }
+  },
+  "sans-carte": {
+   "code": 0,
+   "plan_ecrit": true,
+   "source_recopiee": false,
+   "sortie": "## plan de mesure\n* psql : 45 module(s) en 2 parts (poids statique, 39 en repli), max ~446 s\n* psycopg : 251 module(s) en 4 parts (poids statique, 175 en repli), max ~445 s",
+   "parts": {
+    "psql": 2,
+    "psycopg": 4
+   },
+   "source": {
+    "psql": "statique",
+    "psycopg": "statique"
+   }
+  },
+  "ok": true
+ },
+ "scenarios": [
+  {
+   "scenario": "complet",
+   "code": 0,
+   "carte_publiee": true,
+   "sortie": "### Carte test → code (9f5bf357d106)\n\n* 6 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test\n* 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées\n* 0 processus mesurés en 6 parts, dont 0 sans contexte de test",
+   "schema": "ameesh-carte/1",
+   "modules_avec_durees": 6
+  },
+  {
+   "scenario": "part-manquante",
+   "code": 2,
+   "carte_publiee": false,
+   "sortie": "::error::mesure incomplète : mesure-psql-2 : artefact absent\ncarte non publiée : une part attendue manque ou n'a pas de durées"
+  },
+  {
+   "scenario": "part-annulee-sans-durees",
+   "code": 2,
+   "carte_publiee": false,
+   "sortie": "::error::mesure incomplète : mesure-psycopg-1 : aucune durée écrite (part annulée ?)\ncarte non publiée : une part attendue manque ou n'a pas de durées"
+  },
+  {
+   "scenario": "avant-correctif-sans-garde",
+   "code": 0,
+   "carte_publiee": true,
+   "sortie": "### Carte test → code (9f5bf357d106)\n\n* 5 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test\n* 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées\n* 0 processus mesurés en 6 parts, dont 0 sans contexte de test",
+   "modules_avec_durees": 5
+  },
+  {
+   "scenario": "durees-vides",
+   "code": 2,
+   "carte_publiee": false,
+   "sortie": "::error::mesure incomplète : mesure-psql-1 : durées vides\ncarte non publiée : une part attendue manque ou n'a pas de durées"
+  },
+  {
+   "scenario": "matrice-non-verte",
+   "code": 1,
+   "carte_publiee": false,
+   "sortie": "::error::mesure cancelled : carte non publiée (part en échec ou annulée)"
+  },
+  {
+   "scenario": "derive-cache-K1K2",
+   "code": 2,
+   "carte_publiee": false,
+   "sortie": "::error::couverture incomplète : a : mesuré dans plusieurs parts (mesure-psycopg-1, mesure-psycopg-2)\n::error::couverture incomplète : mesure-psycopg-2 : module du plan non mesuré : b\n::error::couverture incomplète : mesure-psycopg-2 : module mesuré hors de sa part : a\ncarte non publiée : la couverture effective du plan est incomplète (module omis, doublé ou hors de sa part)"
+  },
+  {
+   "scenario": "plan-unique-K1",
+   "code": 0,
+   "carte_publiee": true,
+   "sortie": "### Carte test → code (9f5bf357d106)\n\n* 4 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test\n* 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées\n* 0 processus mesurés en 2 parts, dont 0 sans contexte de test",
+   "schema": "ameesh-carte/1",
+   "modules_avec_durees": 4
+  }
+ ]
+}

@@ -1,0 +1,9 @@
+lecture_carte: {'psycopg': 248, 'psql': 0, 'identique_simulation': True}
+psy_A0_cli_egale_simulation: True
+psy_A1_cli_egale_simulation: True
+psy_A0_egale_A1: False
+A0_max_s: 2388.1
+A1_precedente_max_s: 2038.8
+psql_B0_cli_egale_simulation: True
+psql_B1_cli_egale_simulation: True
+psql_B0_egale_B1: False

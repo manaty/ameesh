@@ -1,0 +1,41 @@
+test_couverture_complete (tests.test_carte_parts_completes.CouvertureEffectiveTest.test_couverture_complete) ... ok
+test_module_double (tests.test_carte_parts_completes.CouvertureEffectiveTest.test_module_double) ... ok
+test_module_hors_de_sa_part (tests.test_carte_parts_completes.CouvertureEffectiveTest.test_module_hors_de_sa_part) ... ok
+test_module_omis (tests.test_carte_parts_completes.CouvertureEffectiveTest.test_module_omis) ... ok
+test_part_mesuree_absente_du_plan (tests.test_carte_parts_completes.CouvertureEffectiveTest.test_part_mesuree_absente_du_plan) ... ok
+test_le_cli_refuse_une_couverture_incomplete (tests.test_carte_parts_completes.MergeRefuseTest.test_le_cli_refuse_une_couverture_incomplete) ... ok
+test_le_cli_refuse_une_part_manquante (tests.test_carte_parts_completes.MergeRefuseTest.test_le_cli_refuse_une_part_manquante) ... ok
+test_la_fusion_declare_les_parts_attendues (tests.test_carte_parts_completes.MiroirDesPartsTest.test_la_fusion_declare_les_parts_attendues) ... ok
+test_la_fusion_exige_une_matrice_verte (tests.test_carte_parts_completes.MiroirDesPartsTest.test_la_fusion_exige_une_matrice_verte) ... ok
+test_la_mesure_psql_est_decoupee (tests.test_carte_parts_completes.MiroirDesPartsTest.test_la_mesure_psql_est_decoupee) ... ok
+test_le_decoupage_sous_mesure_lit_la_carte (tests.test_carte_parts_completes.MiroirDesPartsTest.test_le_decoupage_sous_mesure_lit_la_carte) ... ok
+test_le_miroir_couvre_la_matrice_de_mesure (tests.test_carte_parts_completes.MiroirDesPartsTest.test_le_miroir_couvre_la_matrice_de_mesure) ... ok
+test_rien_n_est_publie_si_la_fusion_echoue (tests.test_carte_parts_completes.MiroirDesPartsTest.test_rien_n_est_publie_si_la_fusion_echoue) ... ok
+test_durees_illisibles (tests.test_carte_parts_completes.PartsIncompletesTest.test_durees_illisibles) ... ok
+test_durees_vides (tests.test_carte_parts_completes.PartsIncompletesTest.test_durees_vides) ... ok
+test_mesure_complete (tests.test_carte_parts_completes.PartsIncompletesTest.test_mesure_complete) ... ok
+test_part_absente (tests.test_carte_parts_completes.PartsIncompletesTest.test_part_absente) ... ok
+test_part_annulee_artefact_sans_durees (tests.test_carte_parts_completes.PartsIncompletesTest.test_part_annulee_artefact_sans_durees) ... ok
+test_le_plan_partitionne_les_modules (tests.test_carte_parts_completes.PlanMesureTest.test_le_plan_partitionne_les_modules) ... ok
+test_le_plan_psql_suit_la_liste_pilote (tests.test_carte_parts_completes.PlanMesureTest.test_le_plan_psql_suit_la_liste_pilote) ... ok
+test_le_plan_refuse_une_part_inconnue (tests.test_carte_parts_completes.PlanMesureTest.test_le_plan_refuse_une_part_inconnue) ... ok
+test_la_fusion_verifie_la_couverture_du_plan (tests.test_carte_parts_completes.PlanUniqueTest.test_la_fusion_verifie_la_couverture_du_plan) ... ok
+test_le_plan_est_calcule_une_fois_par_run (tests.test_carte_parts_completes.PlanUniqueTest.test_le_plan_est_calcule_une_fois_par_run) ... ok
+test_les_parts_ne_relisent_pas_la_carte (tests.test_carte_parts_completes.PlanUniqueTest.test_les_parts_ne_relisent_pas_la_carte) ... ok
+test_avec_le_plan_unique_la_couverture_est_exacte (tests.test_carte_parts_completes.TemoinCacheChangeTest.test_avec_le_plan_unique_la_couverture_est_exacte) ... ok
+test_le_decoupage_change_avec_la_carte (tests.test_carte_parts_completes.TemoinCacheChangeTest.test_le_decoupage_change_avec_la_carte) ... ok
+test_sans_plan_unique_un_module_est_omis_et_un_double (tests.test_carte_parts_completes.TemoinCacheChangeTest.test_sans_plan_unique_un_module_est_omis_et_un_double) ... ok
+
+----------------------------------------------------------------------
+Ran 27 tests in 0.490s
+
+OK
+.....s..carte /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpv2ihdlwl/absente.json.gz illisible ([Errno 2] No such file or directory: '/home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpv2ihdlwl/absente.json.gz') : durées de tests/parts/durees.json
+...............................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmp4q2u60kf/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpipme3d6s/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+..................
+----------------------------------------------------------------------
+Ran 115 tests in 44.774s
+
+OK (skipped=1)

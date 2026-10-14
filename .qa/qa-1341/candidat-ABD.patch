@@ -1,0 +1,395 @@
+From 9f5bf357d10613296a4396c2bdadce8c38919797 Mon Sep 17 00:00:00 2001
+From: mty-amh-qa-01 <mty-amh-qa-01@ameesh.invalid>
+Date: Wed, 14 Oct 2026 20:04:44 +0000
+Subject: [PATCH] =?UTF-8?q?#1341=20A/B/D=20:=20d=C3=A9coupage=20de=20la=20?=
+ =?UTF-8?q?mesure=20conscient=20du=20surco=C3=BBt,=20psql=20pilote=20en=20?=
+ =?UTF-8?q?2=20parts,=20publication=20conditionn=C3=A9e=20=C3=A0=20une=20m?=
+ =?UTF-8?q?esure=20compl=C3=A8te?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- A (carte.yml) : le découpage sous mesure passe --map avec la carte
+  précédente restaurée du cache ; repli sur la table statique si absente.
+- B : la liste pilote psql est mesurée en 2 parts (une part unique à 38 min de
+  mur pour un plafond de 40 a été annulée deux fois).
+- D (scripts/map.py + carte.yml) : merge --attendu refuse de publier une carte
+  si une part de mesure manque, n'a pas écrit ses durées ou si la matrice de
+  mesure n'est pas verte ; PARTS_MESURE est tenu en miroir par
+  tests/test_carte_parts_completes.py.
+- Témoins, simulations et rapport : .qa/qa-1341/.
+
+Aucun push, aucune CI : préparation locale bornée pour relecture (classe
+sensible CI/porte, deux avis hors auteur DeepSeek).
+---
+ .github/workflows/carte.yml         |  49 ++++++++-
+ scripts/map.py                      |  53 ++++++++-
+ tests/test_carte_parts_completes.py | 162 ++++++++++++++++++++++++++++
+ 3 files changed, 261 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_carte_parts_completes.py
+
+diff --git a/.github/workflows/carte.yml b/.github/workflows/carte.yml
+index df64518f2..13b610754 100644
+--- a/.github/workflows/carte.yml
++++ b/.github/workflows/carte.yml
+@@ -15,6 +15,22 @@
+ #
+ # Sur une PR qui touche la mesure elle-même, la carte est produite pour
+ # contrôle (artefact seulement, pas de cache).
++#
++# #1341 — répartition et complétude de la mesure :
++#   - A : le découpage des parts sous mesure est pondéré par les durées de la
++#     carte précédente (`--map`), pas par la table statique mesurée sans
++#     couverture : le surcoût de la mesure varie de 1,2× à 9,3× selon les
++#     modules, et la table statique ne couvre que 76 modules sur 250 ;
++#   - B : les modules « pilote » psql sont mesurés en 2 parts (une seule part
++#     de 45 modules pesait 38 min de mur pour un plafond de 40, annulée deux
++#     fois) ;
++#   - D : la fusion refuse de publier une carte si une part attendue manque ou
++#     n'a pas écrit ses `durees.json` (part annulée), ou si la matrice de
++#     mesure n'est pas verte. Une carte incomplète ne remplace pas la
++#     précédente : elle en perdrait les durées (la fusion n'hérite que des
++#     échecs), et le découpage des runs suivants retomberait sur la table
++#     statique. `PARTS_MESURE` est le miroir de la matrice `mesure`, tenu par
++#     tests/test_carte_parts_completes.py.
+ name: carte
+ 
+ on:
+@@ -71,7 +87,8 @@ jobs:
+           - { pilote: psycopg, part: 2, parts: 4 }
+           - { pilote: psycopg, part: 3, parts: 4 }
+           - { pilote: psycopg, part: 4, parts: 4 }
+-          - { pilote: psql, part: 1, parts: 1, liste: tests/parts/pilote-psql.txt }
++          - { pilote: psql, part: 1, parts: 2, liste: tests/parts/pilote-psql.txt }
++          - { pilote: psql, part: 2, parts: 2, liste: tests/parts/pilote-psql.txt }
+     services:
+       postgres:
+         image: postgres:17
+@@ -89,6 +106,13 @@ jobs:
+       LISTE: ${{ matrix.liste }}
+     steps:
+       - uses: actions/checkout@v4
++      # #1341 A : la carte précédente donne les durées *sous mesure* qui
++      # pondèrent le découpage ; la table statique reste le repli.
++      - uses: actions/cache/restore@v4
++        with:
++          path: carte/carte.json.gz
++          key: carte-${{ github.sha }}
++          restore-keys: carte-
+       - name: port de la base jetable
+         run: echo "AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ameesh" >> "$GITHUB_ENV"
+       - uses: actions/setup-python@v5
+@@ -122,9 +146,12 @@ jobs:
+           M="$RUNNER_TEMP/mesure"
+           mkdir -p "$M"
+           debut=$(date +%s)
++          CARTE=carte/carte.json.gz
++          [ -f "$CARTE" ] || CARTE=""
+           # jamais bloquant : un échec sous mesure est noté dans la carte
+           .venv-carte/bin/python scripts/test-parts.py run --parts ${{ matrix.parts }} \
+             --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" ${LISTE:+--list "$LISTE"} \
++            ${CARTE:+--map "$CARTE"} \
+             --measure "$M" --output-durations "$M/durees.json" --flow "$M/flux.jsonl" \
+             || echo "::warning::tests en échec sous mesure (notés dans la carte)"
+           echo "durée sous mesure : $(( $(date +%s) - debut )) s" >> "$GITHUB_STEP_SUMMARY"
+@@ -143,6 +170,13 @@ jobs:
+     if: always()
+     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+     timeout-minutes: 15
++    env:
++      # #1341 D — miroir de jobs.mesure.strategy.matrix.include : toute part
++      # ajoutée, retirée ou renumérotée là-bas doit l'être ici, et
++      # tests/test_carte_parts_completes.py refuse la divergence.
++      PARTS_MESURE: >-
++        mesure-psycopg-1 mesure-psycopg-2 mesure-psycopg-3 mesure-psycopg-4
++        mesure-psql-1 mesure-psql-2
+     steps:
+       - uses: actions/checkout@v4
+       - uses: actions/setup-python@v5
+@@ -160,11 +194,22 @@ jobs:
+           key: carte-${{ github.sha }}
+           restore-keys: carte-
+       - name: fusion des mesures
++        env:
++          RESULTAT_MESURE: ${{ needs.mesure.result }}
+         run: |
++          # #1341 D : aucune carte n'est publiée à partir d'une mesure
++          # incomplète. Le résultat de la matrice attrape la part annulée
++          # (plafond, runner perdu) ; --attendu attrape l'artefact publié sans
++          # durées et la part absente du disque.
++          if [ "$RESULTAT_MESURE" != "success" ]; then
++            echo "::error::mesure $RESULTAT_MESURE : carte non publiée (part en échec ou annulée)"
++            exit 1
++          fi
+           if [ -f carte/carte.json.gz ]; then mv carte/carte.json.gz carte/precedente.json.gz; fi
+           mkdir -p carte
+           python scripts/map.py merge --output carte/carte.json.gz \
+-            --previous carte/precedente.json.gz --summary "$GITHUB_STEP_SUMMARY" mesures/*
++            --previous carte/precedente.json.gz --summary "$GITHUB_STEP_SUMMARY" \
++            --attendu "$PARTS_MESURE" mesures/*
+           rm -f carte/precedente.json.gz
+       - uses: actions/upload-artifact@v4
+         with:
+diff --git a/scripts/map.py b/scripts/map.py
+index 12207bd07..4c4a80be2 100644
+--- a/scripts/map.py
++++ b/scripts/map.py
+@@ -4,7 +4,7 @@
+ 
+     scripts/map.py install
+     scripts/test-parts.py run … --measure DIR      (une part sous mesure)
+-    scripts/map.py merge --output carte.json.gz [--previous F] DIR [DIR…]
++    scripts/map.py merge --output carte.json.gz [--previous F] [--attendu NOMS] DIR [DIR…]
+     scripts/map.py show carte.json.gz [CHEMIN | table:NOM | test_module …]
+     scripts/map.py blocks src/ameesh/x.py
+ 
+@@ -49,6 +49,9 @@ de son fichier (il les a importés).
+ 
+ Les noms de modules sont ceux de `tests/` sans préfixe (`test_cluster`).
+ La carte n'est jamais bloquante : un échec sous mesure est noté, pas reporté.
++Avec `--attendu` (#1341 D), la fusion refuse au contraire de publier une carte
++quand une part attendue manque ou n'a pas écrit ses durées : une carte
++incomplète ne doit pas remplacer la précédente dans le cache.
+ """
+ from __future__ import annotations
+ 
+@@ -410,6 +413,43 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
+     }
+ 
+ 
++def parts_incompletes(dossiers: list[str], attendus: list[str]) -> list[str]:
++    """#1341 D — les parts de mesure attendues absentes ou sans durée.
++
++    Une part annulée (plafond, runner perdu) publie son artefact sans
++    `durees.json` : `merge` la fusionnait alors silencieusement, et la carte
++    publiée perdait les durées de ses modules — la fusion n'hérite pas des
++    durées de la carte précédente, seulement des échecs. `attendus` vient de
++    la matrice du workflow (`jobs.mesure.strategy.matrix.include`), que
++    `tests/test_carte_parts_completes.py` tient en miroir.
++    """
++    presents = {os.path.basename(os.path.normpath(d)): d for d in dossiers}
++    problemes = []
++    for nom in attendus:
++        dossier = presents.get(nom)
++        if dossier is None:
++            problemes.append(f"{nom} : artefact absent")
++            continue
++        fichiers = sorted(glob.glob(os.path.join(dossier, "durees*.json")))
++        if not fichiers:
++            problemes.append(f"{nom} : aucune durée écrite (part annulée ?)")
++            continue
++        total = 0
++        lus = 0
++        for chemin in fichiers:
++            try:
++                donnees = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
++            except (OSError, ValueError) as exc:
++                problemes.append(f"{nom} : {os.path.basename(chemin)} illisible ({exc})")
++                continue
++            lus += 1
++            if isinstance(donnees, dict):
++                total += sum(len(v) for v in donnees.values() if isinstance(v, dict))
++        if lus and not total:
++            problemes.append(f"{nom} : durées vides")
++    return problemes
++
++
+ def write(carte: dict, chemin: str) -> None:
+     texte = json.dumps(carte, ensure_ascii=False, indent=1, sort_keys=True) + "\n"
+     with gzip.open(chemin, "wt", encoding="utf-8") as f:
+@@ -492,6 +532,9 @@ def main(argv: list[str] | None = None) -> int:
+     p.add_argument("--previous", help="carte précédente (historique des échecs)")
+     p.add_argument("--commit", help="commit mesuré (défaut : HEAD)")
+     p.add_argument("--summary", help="écrit aussi le résumé Markdown dans ce fichier")
++    p.add_argument("--attendu", help="parts de mesure attendues (noms d'artefacts, "
++                   "séparés par des espaces ou des virgules) : la fusion refuse de "
++                   "publier une carte si l'une manque ou n'a pas de durées (#1341 D)")
+     p.add_argument("directories", nargs="+")
+     p = sous.add_parser("show", help="lire une carte")
+     p.add_argument("map")
+@@ -502,6 +545,14 @@ def main(argv: list[str] | None = None) -> int:
+     if args.commande == "install":
+         return install(args)
+     if args.commande == "merge":
++        attendus = args.attendu.replace(",", " ").split() if args.attendu else []
++        problemes = parts_incompletes(args.directories, attendus)
++        if problemes:
++            for probleme in problemes:
++                print(f"::error::mesure incomplète : {probleme}")
++            print("carte non publiée : une part attendue manque ou n'a pas de durées",
++                  file=sys.stderr)
++            return 2
+         precedente = None
+         if args.previous and os.path.exists(args.previous):
+             try:
+diff --git a/tests/test_carte_parts_completes.py b/tests/test_carte_parts_completes.py
+new file mode 100644
+index 000000000..bd4365c25
+--- /dev/null
++++ b/tests/test_carte_parts_completes.py
+@@ -0,0 +1,162 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#1341 D — la carte n'est publiée que sur une mesure complète.
++
++Une part de mesure annulée (plafond, runner perdu) publie son artefact sans
++`durees.json` : `scripts/map.py merge` la fusionnait silencieusement, et la
++carte publiée perdait les durées de ses modules (la fusion n'hérite des
++cartes précédentes que des échecs, pas des durées — constaté sur la carte
++`96a795fb2`, 248 durées psycopg et 0 psql). Le job `carte` refuse désormais
++de publier : matrice de mesure non verte, part absente, `durees.json` absent
++ou vide. `PARTS_MESURE` est le miroir de la matrice du workflow.
++
++Témoins : part absente, part annulée (artefact sans durées), durées vides,
++mesure complète — plus le refus réel de la ligne de commande.
++
++Sans base : lecture du workflow et de `scripts/map.py`.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import pathlib
++import re
++import subprocess
++import sys
++import tempfile
++import unittest
++
++REPO = pathlib.Path(__file__).resolve().parent.parent
++WORKFLOW = (REPO / ".github" / "workflows" / "carte.yml").read_text(encoding="utf-8")
++INCLUDE = re.compile(r"^\s*-\s*\{\s*pilote:\s*(\w+),\s*part:\s*(\d+),\s*parts:\s*(\d+)", re.M)
++MIROIR = re.compile(r"^(\s*)PARTS_MESURE:\s*>-\s*$\n((?:\1[ \t]+\S.*\n?)+)", re.M)
++
++
++def _charger(nom: str, fichier: str):
++    spec = importlib.util.spec_from_file_location(nom, REPO / "scripts" / fichier)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++carte = _charger("carte_1341", "map.py")
++
++
++class MiroirDesPartsTest(unittest.TestCase):
++    """Le workflow et le garde-fou ne peuvent pas diverger en silence."""
++
++    def test_le_miroir_couvre_la_matrice_de_mesure(self):
++        matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
++        self.assertEqual(len(matrice), 6, "matrice de mesure inattendue")
++        m = MIROIR.search(WORKFLOW)
++        self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
++        miroir = sorted(m.group(2).split())
++        self.assertEqual(matrice, miroir,
++                         "PARTS_MESURE doit être le miroir exact de la matrice mesure")
++
++    def test_la_mesure_psql_est_decoupee(self):
++        # B : une seule part de 45 modules pesait 38 min de mur pour 40 de
++        # plafond, annulée deux fois.
++        psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
++        self.assertEqual(psql, [("psql", "1", "2"), ("psql", "2", "2")])
++
++    def test_le_decoupage_sous_mesure_lit_la_carte(self):
++        # A : le surcoût de la mesure varie de 1,2× à 9,3× selon les modules ;
++        # le découpage sous mesure ne peut pas venir de la table statique.
++        self.assertIn("actions/cache/restore@v4", WORKFLOW)
++        self.assertIn('${CARTE:+--map "$CARTE"}', WORKFLOW)
++
++    def test_la_fusion_exige_une_matrice_verte(self):
++        self.assertIn('if [ "$RESULTAT_MESURE" != "success" ]', WORKFLOW)
++        self.assertIn("RESULTAT_MESURE: ${{ needs.mesure.result }}", WORKFLOW)
++
++    def test_la_fusion_declare_les_parts_attendues(self):
++        self.assertIn('--attendu "$PARTS_MESURE"', WORKFLOW)
++
++    def test_rien_n_est_publie_si_la_fusion_echoue(self):
++        # l'artefact `carte` et le cache ne s'écrivent qu'après une fusion
++        # réussie : aucune étape du job `carte` ne tourne sur échec.
++        section = WORKFLOW.split("\n  carte:\n", 1)[1]
++        etapes = section.split("    steps:\n", 1)[1]
++        self.assertNotIn("if: always()", etapes)
++        self.assertIn("actions/cache/save@v4", etapes)
++
++
++class PartsIncompletesTest(unittest.TestCase):
++    """Les quatre témoins du garde-fou (`map.parts_incompletes`)."""
++
++    def setUp(self):
++        self._tmp = tempfile.TemporaryDirectory()
++        self.racine = pathlib.Path(self._tmp.name)
++
++    def tearDown(self):
++        self._tmp.cleanup()
++
++    def _part(self, nom: str, durees=None, flux: bool = False):
++        dossier = self.racine / nom
++        dossier.mkdir(parents=True, exist_ok=True)
++        if durees is not None:
++            (dossier / "durees.json").write_text(json.dumps(durees), encoding="utf-8")
++        if flux:
++            (dossier / "flux.jsonl").write_text('{"type": "debut"}\n', encoding="utf-8")
++        return str(dossier)
++
++    def _check(self, attendus):
++        dossiers = [str(p) for p in sorted(self.racine.iterdir())]
++        return carte.parts_incompletes(dossiers, attendus)
++
++    def test_mesure_complete(self):
++        self._part("mesure-psycopg-1", {"psycopg": {"test_a": 12.0}})
++        self._part("mesure-psql-1", {"psql": {"test_b": 3.0}})
++        self.assertEqual([], self._check(["mesure-psycopg-1", "mesure-psql-1"]))
++
++    def test_part_absente(self):
++        self._part("mesure-psycopg-1", {"psycopg": {"test_a": 12.0}})
++        problemes = self._check(["mesure-psycopg-1", "mesure-psql-1"])
++        self.assertEqual(len(problemes), 1)
++        self.assertIn("mesure-psql-1 : artefact absent", problemes[0])
++
++    def test_part_annulee_artefact_sans_durees(self):
++        # le cas réel psy1 du run 38610188898 : 18 Mo d'artefact, pas de durees.json
++        self._part("mesure-psycopg-1", None, flux=True)
++        problemes = self._check(["mesure-psycopg-1"])
++        self.assertEqual(len(problemes), 1)
++        self.assertIn("aucune durée écrite", problemes[0])
++
++    def test_durees_vides(self):
++        self._part("mesure-psycopg-1", {})
++        problemes = self._check(["mesure-psycopg-1"])
++        self.assertEqual(len(problemes), 1)
++        self.assertIn("durées vides", problemes[0])
++
++    def test_durees_illisibles(self):
++        dossier = self.racine / "mesure-psycopg-1"
++        dossier.mkdir(parents=True)
++        (dossier / "durees.json").write_text("{", encoding="utf-8")
++        problemes = self._check(["mesure-psycopg-1"])
++        self.assertEqual(len(problemes), 1)
++        self.assertIn("illisible", problemes[0])
++
++
++class MergeRefuseTest(unittest.TestCase):
++    """La ligne de commande refuse et n'écrit aucune carte."""
++
++    def test_le_cli_refuse_une_part_manquante(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            racine = pathlib.Path(tmp)
++            part = racine / "mesure-psycopg-1"
++            part.mkdir()
++            (part / "durees.json").write_text('{"psycopg": {"test_a": 1.0}}', encoding="utf-8")
++            sortie = racine / "carte.json.gz"
++            proc = subprocess.run(
++                [sys.executable, str(REPO / "scripts" / "map.py"), "merge",
++                 "--output", str(sortie), "--attendu", "mesure-psycopg-1 mesure-psql-1",
++                 str(part)],
++                capture_output=True, text=True, cwd=REPO)
++            self.assertEqual(proc.returncode, 2, proc.stderr)
++            self.assertFalse(sortie.exists(), "aucune carte ne doit être publiée")
++            self.assertIn("::error::mesure incomplète : mesure-psql-1", proc.stdout)
++            self.assertIn("artefact absent", proc.stdout)
++
++
++if __name__ == "__main__":  # pragma: no cover
++    unittest.main()
+-- 
+2.43.0
+

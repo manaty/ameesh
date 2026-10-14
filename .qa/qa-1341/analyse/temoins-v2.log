@@ -1,0 +1,47 @@
+== témoin source K1/K2 ==
+  part1(K1)[a,d]=['a', 'd'] part2(K2)=['a', 'c'] : b omis=True, a doublé=True, garde D v1 muette=True
+  couverture : a : mesuré dans plusieurs parts (mesure-psycopg-1, mesure-psycopg-2)
+  couverture : mesure-psycopg-2 : module du plan non mesuré : b
+  couverture : mesure-psycopg-2 : module mesuré hors de sa part : a
+== plan du job plan-mesure == split sur la carte 96a795fb2 ==
+  psql-1: plan == split : True
+  psql-2: plan == split : True
+  psycopg-1: plan == split : True
+  psycopg-2: plan == split : True
+  psycopg-3: plan == split : True
+  psycopg-4: plan == split : True
+  toutes égales : True
+== bloc réel du job plan-mesure ==
+  avec-carte  code=0 plan=True source=True parts={'psql': 2, 'psycopg': 4} poids={'psql': 'statique', 'psycopg': 'carte'}
+  sans-carte  code=0 plan=True source=False parts={'psql': 2, 'psycopg': 4} poids={'psql': 'statique', 'psycopg': 'statique'}
+[OK] complet                      code= 0 carte=True modules_avec_durees=6
+        ### Carte test → code (9f5bf357d106)
+        
+        * 6 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test
+        * 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées
+[OK] part-manquante               code= 2 carte=False
+        ::error::mesure incomplète : mesure-psql-2 : artefact absent
+        carte non publiée : une part attendue manque ou n'a pas de durées
+[OK] part-annulee-sans-durees     code= 2 carte=False
+        ::error::mesure incomplète : mesure-psycopg-1 : aucune durée écrite (part annulée ?)
+        carte non publiée : une part attendue manque ou n'a pas de durées
+[OK] avant-correctif-sans-garde   code= 0 carte=True modules_avec_durees=5
+        ### Carte test → code (9f5bf357d106)
+        
+        * 5 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test
+        * 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées
+[OK] durees-vides                 code= 2 carte=False
+        ::error::mesure incomplète : mesure-psql-1 : durées vides
+        carte non publiée : une part attendue manque ou n'a pas de durées
+[OK] matrice-non-verte            code= 1 carte=False
+        ::error::mesure cancelled : carte non publiée (part en échec ou annulée)
+[OK] derive-cache-K1K2            code= 2 carte=False
+        ::error::couverture incomplète : a : mesuré dans plusieurs parts (mesure-psycopg-1, mesure-psycopg-2)
+        ::error::couverture incomplète : mesure-psycopg-2 : module du plan non mesuré : b
+        ::error::couverture incomplète : mesure-psycopg-2 : module mesuré hors de sa part : a
+        carte non publiée : la couverture effective du plan est incomplète (module omis, doublé ou hors de sa part)
+[OK] plan-unique-K1               code= 0 carte=True modules_avec_durees=4
+        ### Carte test → code (9f5bf357d106)
+        
+        * 4 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test
+        * 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées

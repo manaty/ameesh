@@ -1,0 +1,21 @@
+[OK] complet                      code= 0 carte=True modules_avec_durees=6 (carte publiée)
+        ### Carte test → code (9f5bf357d106)
+        
+        * 6 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test
+        * 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées
+[OK] part-manquante               code= 2 carte=False (refus)
+        ::error::mesure incomplète : mesure-psql-2 : artefact absent
+        carte non publiée : une part attendue manque ou n'a pas de durées
+[OK] part-annulee-sans-durees     code= 2 carte=False (refus)
+        ::error::mesure incomplète : mesure-psycopg-1 : aucune durée écrite (part annulée ?)
+        carte non publiée : une part attendue manque ou n'a pas de durées
+[OK] avant-correctif-sans-garde   code= 0 carte=True modules_avec_durees=5 (carte tronquée publiée (défaut d'origine))
+        ### Carte test → code (9f5bf357d106)
+        
+        * 5 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test
+        * 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées
+[OK] durees-vides                 code= 2 carte=False (refus)
+        ::error::mesure incomplète : mesure-psql-1 : durées vides
+        carte non publiée : une part attendue manque ou n'a pas de durées
+[OK] matrice-non-verte            code= 1 carte=False (refus)
+        ::error::mesure cancelled : carte non publiée (part en échec ou annulée)

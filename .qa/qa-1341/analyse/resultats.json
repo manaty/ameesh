@@ -1,0 +1,41 @@
+[
+ {
+  "scenario": "complet",
+  "code": 0,
+  "carte_publiee": true,
+  "sortie": "### Carte test → code (9f5bf357d106)\n\n* 6 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test\n* 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées\n* 0 processus mesurés en 6 parts, dont 0 sans contexte de test",
+  "schema": "ameesh-carte/1",
+  "modules_avec_durees": 6
+ },
+ {
+  "scenario": "part-manquante",
+  "code": 2,
+  "carte_publiee": false,
+  "sortie": "::error::mesure incomplète : mesure-psql-2 : artefact absent\ncarte non publiée : une part attendue manque ou n'a pas de durées"
+ },
+ {
+  "scenario": "part-annulee-sans-durees",
+  "code": 2,
+  "carte_publiee": false,
+  "sortie": "::error::mesure incomplète : mesure-psycopg-1 : aucune durée écrite (part annulée ?)\ncarte non publiée : une part attendue manque ou n'a pas de durées"
+ },
+ {
+  "scenario": "avant-correctif-sans-garde",
+  "code": 0,
+  "carte_publiee": true,
+  "sortie": "### Carte test → code (9f5bf357d106)\n\n* 5 modules de test, 224 fichiers de code, 6135 blocs, dont 5911 sans test\n* 0 fichiers de données lus, 0 dossiers listés, 0 tables touchées\n* 0 processus mesurés en 6 parts, dont 0 sans contexte de test",
+  "modules_avec_durees": 5
+ },
+ {
+  "scenario": "durees-vides",
+  "code": 2,
+  "carte_publiee": false,
+  "sortie": "::error::mesure incomplète : mesure-psql-1 : durées vides\ncarte non publiée : une part attendue manque ou n'a pas de durées"
+ },
+ {
+  "scenario": "matrice-non-verte",
+  "code": 1,
+  "carte_publiee": false,
+  "sortie": "::error::mesure cancelled : carte non publiée (part en échec ou annulée)"
+ }
+]
