@@ -877,18 +877,32 @@ def _off_target_citations(repo: str, lot: int, row: dict, all_merges: list,
     return citing, partial
 
 
+def _content_ancestor(repo: str, sha: str, target: str) -> bool:
+    """#1005 : le commit gelé est-il ancêtre de la cible ? C'est la preuve par
+    contenu la moins chère (une commande git), celle d'une fusion `--no-ff`
+    (ou d'une avance rapide) poussée sur la branche d'intégration sans citer
+    le lot. Le patch-id exact (rebase, cherry-pick, squash) reste au relevé de
+    contenu (`sync-merges`), dont c'est le travail et le coût assumé."""
+    head = _commit(repo, target)
+    frozen = _commit(repo, sha)
+    if head is None or frozen is None:
+        return False
+    return _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0
+
+
 def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: str, *,
                   st, since_all: float | None, hashes: dict, merges: dict, bodies: dict,
                   sweep: dict, pr_body, dry_run: bool, implicits: dict, tips: dict,
-                  off_target: bool = False) -> dict:
+                  freeze_sha: str | None = None, off_target: bool = False) -> dict:
     """L'examen d'un lot contre UNE cible, extrait de `sync_branches` (#746)
     pour essayer la cible par défaut puis, si elle ne porte pas la fusion,
     les refs d'intégration du dépôt.
 
     `off_target` : la ref n'est ni la cible déclarée ni la cible par défaut ;
     seule une citation prouve alors la livraison, jamais le seul voisinage
-    de la branche. Rend `{found, branch, implicit, row}` ; lève
-    MergeProbeError/GitError comme l'examen d'origine."""
+    de la branche. #1005 : à défaut de branche ou de citation, l'ancêtre du
+    dernier gel (`freeze_sha`) prouve la livraison. Rend `{found, branch,
+    implicit, row}` ; lève MergeProbeError/GitError comme l'examen d'origine."""
     found = None
     implicit = False
     if not branch:
@@ -975,22 +989,38 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
         # a livré la suite (L118d : pas une simple avance jusqu'à la cible)
         partial = None
     held = partial[1] if partial else unreadable
+    # #1005 : ni la branche ni une citation ne prouvent la livraison ; le
+    # dernier gel, ancêtre de la cible, la prouve par le contenu (fusion
+    # --no-ff poussée sur la branche d'intégration, comme #560/#905). Une
+    # fusion partielle ou un corps illisible retient toujours le lot.
+    content = None
+    if freeze_sha and cited is None and not held and not (found and found["merged"]) \
+            and _content_ancestor(repo, freeze_sha, target):
+        content = {"merged": True, "how": "content-ancestor", "ref": freeze_sha,
+                   "tip": None, "ahead": False, "kind": "content",
+                   "detail": "the last freeze %s is an ancestor of %s (content)"
+                             % (freeze_sha[:12], target),
+                   "note": "the last freeze %s entered %s as an ancestor (content)"
+                           % (freeze_sha[:12], target)}
     if held and cited is None and (partial or not proven):
         found = dict(found or {"tip": None, "ahead": False, "ref": None},
                      merged=False, how="partial", detail=held)
-    elif found is None or not found["merged"]:
-        if cited:
-            found = dict(found or {"tip": None, "ahead": False}, merged=True,
-                         how=cited["how"], ref=cited["sha"],
-                         detail=_citation(cited, lot, target),
-                         note=_citation(cited, lot, target, sha=False))
-        elif found is None:
-            found = {"merged": False, "how": None, "ref": None, "tip": None,
-                     "ahead": False,
-                     "detail": "no merge commit of %s names the lot "
-                               "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
-                               % (target, lot, lot, ", nor \"#%d\" in a title" % lot
-                                  if hashes[repo] else "")}
+    elif found is not None and found["merged"]:
+        pass
+    elif cited:
+        found = dict(found or {"tip": None, "ahead": False}, merged=True,
+                     how=cited["how"], ref=cited["sha"],
+                     detail=_citation(cited, lot, target),
+                     note=_citation(cited, lot, target, sha=False))
+    elif content is not None:
+        found = content
+    elif found is None:
+        found = {"merged": False, "how": None, "ref": None, "tip": None,
+                 "ahead": False,
+                 "detail": "no merge commit of %s names the lot "
+                           "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
+                           % (target, lot, lot, ", nor \"#%d\" in a title" % lot
+                              if hashes[repo] else "")}
     return {"found": found, "branch": branch, "implicit": implicit, "row": row}
 
 
@@ -1042,13 +1072,26 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     fusion, les refs d'intégration du remote (`develop`, `main`, `master`,
     `release/*`) sont essayées à leur tour : une fusion citante y ferme le
     lot, avec la ref trouvée dans la note. Aucune autre ref (branche de
-    travail, autre remote), aucun fetch."""
+    travail, autre remote), aucun fetch.
+
+    #1005 : à défaut de branche et de citation, le dernier gel du lot,
+    ancêtre de la ref examinée, prouve la livraison par le contenu (une
+    fusion `--no-ff` poussée sur la branche d'intégration, comme #560/#905,
+    sans citer le lot) : le relevé la ferme, en nommant la ref. Le patch-id
+    exact (rebase, cherry-pick, squash) reste le travail de `sync-merges`."""
     import os
 
     from . import fil, registry
 
     st = storage.of(db)
     rows = st.work.open_for_sweep(limit)
+    # #1005 : le dernier gel de chaque lot, lu une fois (preuve par le contenu
+    # à défaut de branche ou de citation), comme le relevé de contenu
+    marks: dict = {}
+    for ms in st.progress.lot_milestones([int(r["id"]) for r in rows]):
+        marks.setdefault(int(ms["work_item_id"]), []).append(ms)
+    freezes = {lot: ((latest_freeze(items) or {}).get("sha") or "").strip() or None
+               for lot, items in marks.items()}
     # les commits de fusion lus une fois par dépôt et par cible : depuis le
     # lot ouvert le plus ancien, chaque lot ne retient que les siens
     since_all = min((float(r["created_ts"]) - CLOCK_SLACK_S for r in rows
@@ -1130,7 +1173,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                         repo, lot, row, branch, target, st=st, since_all=since_all,
                         hashes=hashes, merges=merges, bodies=bodies, sweep=sweep,
                         pr_body=pr_body, dry_run=dry_run, implicits=implicits,
-                        tips=tips, off_target=off)
+                        tips=tips, freeze_sha=freezes.get(lot), off_target=off)
                 except (MergeProbeError, GitError) as exc:
                     if off:
                         unreadable.append((target, str(exc)))
@@ -1234,12 +1277,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source)
         entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
         if done["result"] == "merged":
+            if found.get("kind") == "content":
+                delivered = "its last freeze %s is an ancestor of %s" % (
+                    (found["ref"] or "?")[:12], target)
+            elif found.get("note"):
+                delivered = "a merge commit of %s names it" % target
+            else:
+                delivered = "branch %s entered %s" % (branch, target)
             text = ("Lot #%d \"%s\" delivered: %s (%s, commit %s). Closed by the runner's "
                     "merge sweep."
-                    % (lot, row.get("title") or "",
-                       "a merge commit of %s names it" % target if found.get("note")
-                       else "branch %s entered %s" % (branch, target),
-                       found["how"], (found["ref"] or "?")[:12]))
+                    % (lot, row.get("title") or "", delivered, found["how"],
+                       (found["ref"] or "?")[:12]))
             if outcome["off"]:
                 text = ("%s Merged into %s, off the default target %s: declare "
                         "`git config %s %s` to make it explicit."
