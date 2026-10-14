@@ -39,6 +39,7 @@ sont donc la même écriture — un tour rejoué après panne ne perd pas son co
 """
 from __future__ import annotations
 
+import datetime as _dt
 import glob
 import json
 import os
@@ -58,7 +59,7 @@ from .gauge_cache import CLAUDE_GAUGES
 DEFAULT_PRICES = {
     # #475: DeepSeek's official peak price, read on 2026-10-12 at
     # https://api-docs.deepseek.com/quick_start/pricing (cache miss, cache hit,
-    # output). Off-peak hours cost half; the peak price is the upper bound.
+    # output). This is the peak price; off-peak hours are in `PRICE_PERIODS`.
     "deepseek-flash": [0.30, 0.006, 1.20],
     "deepseek-pro": [0.55, 0.14, 2.19],
     "gpt-6.1-sol": [1.25, 0.125, 10.0],
@@ -100,6 +101,26 @@ DEFAULT_PRICES = {
 #: chaque requête y est alors aussi).
 PROMPT_TIERS = {
     "claude-haiku-5-5": (100_000, [0.10, 0.01, 0.50]),
+}
+
+#: #513 : heures de pointe DeepSeek, relues le 2026-10-12 sur
+#: https://api-docs.deepseek.com/quick_start/pricing : 01:00-04:00 et
+#: 06:00-10:00 UTC, du lundi au vendredi ; toute autre heure est creuse,
+#: week-ends compris. Les jours fériés chinois, creux eux aussi, ne sont pas
+#: connus ici : ils restent au prix de pointe (majorant).
+DEEPSEEK_PEAK_UTC = ((1, 4), (6, 10))
+#: jours de la semaine des heures de pointe (`datetime.weekday`, lundi = 0)
+DEEPSEEK_PEAK_DAYS = (0, 1, 2, 3, 4)
+
+#: #513 : modèles facturés selon l'HEURE de chaque tour. `DEFAULT_PRICES` porte
+#: le prix de pointe ; `off_peak`, celui des heures creuses (même page, même
+#: date : la moitié du prix de pointe). Un tour entièrement creux paie
+#: `off_peak` ; un tour dont une partie est en pointe, ou dont l'heure est
+#: inconnue, paie la pointe (majorant). Seulement au tarif officiel : un
+#: barème local qui renomme le prix du modèle n'a pas d'heures creuses.
+PRICE_PERIODS = {
+    "deepseek-flash": {"peak_utc": DEEPSEEK_PEAK_UTC, "peak_days": DEEPSEEK_PEAK_DAYS,
+                       "off_peak": [0.15, 0.003, 0.60]},
 }
 
 #: Fenêtres nommées par les jauges, en secondes.
@@ -453,6 +474,45 @@ def prompt_tier(prices: dict, model: str | None) -> tuple | None:
     if tier is None or list(prices[name]) != DEFAULT_PRICES.get(name):
         return None
     return tier
+
+
+def is_peak(period: dict, ts: float) -> bool:
+    """#513 : l'instant `ts` est-il dans les heures de pointe de `period` ?"""
+    moment = _dt.datetime.fromtimestamp(float(ts), _dt.timezone.utc)
+    return moment.weekday() in period["peak_days"] and any(
+        low <= moment.hour < high for low, high in period["peak_utc"])
+
+
+#: #513 : au-delà, un tour n'est jamais creux (horloge déréglée, marqueur
+#: ancien) — la marche heure par heure reste bornée
+PERIOD_MAX_S = 2 * 86400
+
+
+def period_price(prices: dict, model: str | None, started: float | None,
+                 ended: float | None) -> list | None:
+    """#513 : le prix creux d'un tour de `started` à `ended`, ou None (pointe).
+
+    Creux seulement si le modèle a des heures creuses (`PRICE_PERIODS`) au
+    tarif officiel, et si TOUT l'intervalle est hors pointe : les bornes de
+    pointe tombent sur des heures pleines UTC, on vérifie donc chaque heure
+    commencée. Heure inconnue, intervalle à l'envers ou trop long : None."""
+    name = priced_name(prices, model)
+    period = PRICE_PERIODS.get(name or "")
+    if period is None or list(prices[name]) != DEFAULT_PRICES.get(name):
+        return None
+    try:
+        low, high = float(started), float(ended)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(low) and math.isfinite(high)) or high < low \
+            or high - low > PERIOD_MAX_S:
+        return None
+    moment = low
+    while moment <= high:
+        if is_peak(period, moment):
+            return None
+        moment = (math.floor(moment / 3600.0) + 1) * 3600.0
+    return None if is_peak(period, high) else list(period["off_peak"])
 
 
 def price_of(prices: dict, harness: str, model: str | None) -> list:
@@ -947,6 +1007,18 @@ class CostBook:
         session neuve, None sans marqueur (flux d'avant L71 : comportement
         historique, le premier relevé d'une session vaut le tour).
         """
+        marker = self.turn_marker(agent, start)
+        return None if marker is None else str(marker.get("resume") or "")
+
+    def turn_started(self, agent: str, start: int) -> float | None:
+        """#513 : l'heure de début du tour, lue dans son marqueur, ou None."""
+        marker = self.turn_marker(agent, start) or {}
+        value = marker.get("ts")
+        return float(value) if isinstance(value, (int, float)) \
+            and not isinstance(value, bool) else None
+
+    def turn_marker(self, agent: str, start: int) -> dict | None:
+        """Le dernier marqueur de tour (L71) avant la ligne `start`, ou None."""
         path = os.path.join(self.agent_dir(agent), "events.jsonl")
         found = None
         try:
@@ -961,7 +1033,7 @@ class CostBook:
                     except ValueError:
                         continue
                     if isinstance(event, dict) and event.get("type") == TURN_MARKER:
-                        found = str(event.get("resume") or "")
+                        found = event
         except OSError:
             return None
         return found
@@ -1076,13 +1148,17 @@ class CostBook:
         return _last_session(self.events(agent)) or None
 
     def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
-                   model: str | None = None) -> TurnUsage:
+                   model: str | None = None, ended: float | None = None) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
         est lu dans le grand livre : la différence se calcule donc entre deux
         tours, pas entre deux lectures d'un même tour — et un tour sans relevé ne
         l'efface pas.
+
+        #513 : un modèle à heures creuses (`PRICE_PERIODS`) est facturé à
+        l'heure du tour, de son marqueur à `ended` (défaut : maintenant ; un
+        compte rejoué plus tard n'en est que plus souvent en pointe).
         """
         harness = self.tool_of(agent)
         # Le modèle **effectif du lancement** est passé par l'exécuteur ; le
@@ -1104,6 +1180,9 @@ class CostBook:
         # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
         # un tour effectivement compté au barème, avec des jetons.
         triplet, marque = price_for(prices, harness or "deepseek", model)
+        if triplet and not marque:
+            triplet = period_price(prices, model, self.turn_started(agent, start),
+                                   time.time() if ended is None else ended) or triplet
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         tier = prompt_tier(prices, model) if not marque else None
         cum = self.baseline(agent, harness, session)
@@ -1219,7 +1298,7 @@ class CostBook:
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
-               key: str | None = None) -> TurnUsage:
+               key: str | None = None, ended: float | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -1239,7 +1318,7 @@ class CostBook:
         # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
         # l'insertion : la ligne et le repère doivent porter la même session.
         session_id = session or self.session_of(agent)
-        usage = self.turn_usage(agent, start, session=session_id, model=model)
+        usage = self.turn_usage(agent, start, session=session_id, model=model, ended=ended)
         # L30 : le compte du tour est celui du dernier marqueur AVANT le tour.
         account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
@@ -1337,21 +1416,35 @@ class CostBook:
           nommé couvre les lignes qu'aucune série nommée ne couvre.
 
         Soldes ou grand livre illisibles : l'estimation seule."""
-        ledger_hour = self.spent("all", 3600, harnesses=paid)
+        return self.paid_spent(paid, 3600.0)
+
+    def paid_spent(self, paid: Sequence[str], seconds: float = 3600.0,
+                   agent: str = "all") -> float:
+        """#513 : `paid_hour` sur les `seconds` dernières secondes, pour le
+        mesh (`agent="all"`) ou pour un agent. La dépense mesurée (baisse des
+        soldes) fait foi ; l'estimation du grand livre ne sert qu'entre deux
+        relevés, corrigée par le rapport réel/estimé de son compte.
+
+        La fenêtre décide d'abord ce que le mesh compte de chaque baisse
+        (L242b, `paid_hour`) ; un agent reçoit, de ce montant, la part de ses
+        estimations dans celles de son compte **dans la fenêtre**. Une baisse
+        sans estimation dans la fenêtre n'est attribuable à personne : la part
+        de l'agent est nulle (le mesh garde, lui, le repli temporel)."""
+        ledger = self.spent(agent, seconds, harnesses=paid)
         if self.db is None or not paid:
-            return ledger_hour
+            return ledger
         # l'heure réelle, comme les relevés et le grand livre (datés par la
         # base) — pas `self.clock`, l'horloge des jauges
         now = time.time()
-        start = now - 3600.0
         try:
-            return self._paid_hour(list(paid), start, now)
+            return self._paid_spent(list(paid), now - float(seconds), now, agent)
         except Exception:  # noqa: BLE001 - soldes illisibles : l'estimation
-            return ledger_hour
+            return ledger
 
-    def _paid_hour(self, paid: list, start: float, now: float) -> float:
+    def _paid_spent(self, paid: list, start: float, now: float, agent: str) -> float:
         from . import balance
-        rows = storage.of(self.db).operations.balances(provider=None, since_s=3600.0 + 1.0)
+        rows = storage.of(self.db).operations.balances(provider=None,
+                                                       since_s=now - start + 1.0)
         series: dict = {}
         for row in sorted(rows, key=lambda r: float(r["observed_ts"])):
             if row["provider"] in paid and row["currency"] == "USD" \
@@ -1360,14 +1453,18 @@ class CostBook:
         series = {key: points for key, points in series.items() if len(points) >= 2}
         # tout l'intervalle depuis le plus ancien relevé, sans coupure (#373
         # r2) : une estimation écartée ferait paraître toute la baisse dans
-        # l'heure. Il reste borné : `balances` ne rend, avant l'heure, que le
-        # dernier relevé de chaque série.
+        # la fenêtre. Il reste borné : `balances` ne rend, avant la fenêtre,
+        # que le dernier relevé de chaque série.
         oldest = min([float(points[0]["observed_ts"]) for points in series.values()]
                      + [start])
         lines = storage.of(self.db).turn_costs.paid_lines(oldest, harnesses=paid)
 
         def estimated(mine, low, high):
             return sum(float(line["usd"]) for line in mine if low < float(line["ts"]) <= high)
+
+        def counted(mine):
+            return mine if agent == "all" else [line for line in mine
+                                                if line.get("agent") == agent]
 
         total = 0.0
         for harness in paid:
@@ -1379,33 +1476,52 @@ class CostBook:
                 mine = [line for line in spent
                         if (line.get("account") == acct if acct is not None
                             else line.get("account") not in named)]
-                real_all = real_in = 0.0
-                for prev, cur in zip(points, points[1:]):
-                    low, high = float(prev["observed_ts"]), float(cur["observed_ts"])
-                    drop = max(0.0, float(prev["total"]) - float(cur["total"]))
-                    real_all += drop
-                    if high <= start or not drop:
-                        continue
-                    pair = estimated(mine, low, high)
-                    if low >= start:
-                        share = 1.0
-                    elif pair >= balance.GAP_MIN_USD:
-                        share = estimated(mine, start, high) / pair
-                    else:
-                        share = (high - start) / (high - low)
-                    real_in += drop * share
-                first = float(points[0]["observed_ts"])
-                last = float(points[-1]["observed_ts"])
+                ours = counted(mine)
+                pairs = [(float(prev["observed_ts"]), float(cur["observed_ts"]),
+                          max(0.0, float(prev["total"]) - float(cur["total"])))
+                         for prev, cur in zip(points, points[1:])]
+                first, last = pairs[0][0], pairs[-1][1]
                 est_all = estimated(mine, first, last)
                 ratio = 1.0
                 if est_all >= balance.GAP_MIN_USD:
-                    ratio = max(PAID_RATIO_FLOOR, real_all / est_all)
-                outside = estimated(mine, start, min(first, now)) \
-                    + estimated(mine, max(last, start), now)
+                    ratio = max(PAID_RATIO_FLOOR, sum(p[2] for p in pairs) / est_all)
+                real_in = 0.0
+                for low, high, drop in pairs:
+                    if high <= start or not drop:
+                        continue
+                    pair = estimated(mine, low, high)
+                    # la fenêtre décide d'abord ce que le mesh compte de cette
+                    # baisse (L242b, inchangé) : l'intervalle entier, sinon la
+                    # part de l'estimation du compte, sinon le prorata temporel
+                    if low >= start:
+                        share = drop
+                    elif pair >= balance.GAP_MIN_USD:
+                        share = drop * estimated(mine, start, high) / pair
+                    else:
+                        share = drop * (high - start) / (high - low)
+                    if agent == "all":
+                        real_in += share
+                        continue
+                    # #513 r3 (B/P2 de la relecture) : l'agent reçoit une part
+                    # de ce que le mesh compte DÉJÀ sur la fenêtre, répartie
+                    # comme ses propres estimations dans la fenêtre ; `part <=
+                    # window` (mêmes lignes, filtrées), donc sa part est bornée
+                    # par `share`. #513 r2 : dès qu'il y a une estimation
+                    # (`window > 0`), l'ancien repli `part * ratio` (ratio 1,0
+                    # sous le seuil) laissait l'agent sous son plafond quand le
+                    # compte entier restait sous `GAP_MIN_USD` (0,40 $ estimés
+                    # pour 0,80 $ de baisse). Sans estimation dans la fenêtre,
+                    # rien n'est attribuable (`part` est nul, `part * ratio`
+                    # aussi) : le mesh garde le repli temporel de L242b.
+                    window = estimated(mine, max(low, start), high)
+                    part = estimated(ours, max(low, start), high)
+                    real_in += share * part / window if window > 0 else part * ratio
+                outside = estimated(ours, start, min(first, now)) \
+                    + estimated(ours, max(last, start), now)
                 total += real_in + outside * ratio
             # les comptes qu'aucune série ne couvre : leur estimation
             if None not in covered:
-                total += sum(float(line["usd"]) for line in spent
+                total += sum(float(line["usd"]) for line in counted(spent)
                              if float(line["ts"]) > start
                              and line.get("account") not in named)
         return total
@@ -1432,6 +1548,9 @@ class CostBook:
         (`daily_usd`) et pour les plafonds propres à l'agent
         (`agent_limits`, sa seule dépense payée au token). Un plafond nul ou
         absent ne s'applique pas.
+
+        #513 : tous ces plafonds comptent la dépense mesurée sur les soldes
+        (`paid_spent`), l'estimation ne servant qu'entre deux relevés.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
         reason = self.pace_exceeded(harness, reserve) if (harness and pace) else ""
@@ -1446,8 +1565,7 @@ class CostBook:
         # L70 : plafonds du mesh (heure, jour glissant), puis ceux de l'agent
         for window, cap in ((3600, self.hourly_usd), (86400, self.daily_usd)):
             if cap and cap > 0:
-                total = (self.paid_hour(paid) if window == 3600
-                         else self.spent("all", window, harnesses=paid))
+                total = self.paid_spent(paid, window)
                 held = cap * hourly_share if window == 3600 else cap
                 if total >= held:
                     return ("%s budget (pay-per-token): %.2f $ over %s "
@@ -1458,7 +1576,7 @@ class CostBook:
         if agent != "all":
             for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
                 if cap and cap > 0 and window in WINDOW_LABELS:
-                    total = self.spent(agent, window, harnesses=paid)
+                    total = self.paid_spent(paid, window, agent)
                     if total >= cap:
                         return ("%s budget of agent %s (pay-per-token): %.2f $ over %s "
                                 "(cap %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
