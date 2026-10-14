@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -476,6 +477,69 @@ class RunnerTest(PgTestCase):
         # le tour tourne sous le premier bail ; le rendre en sortant incrémente
         # l'epoch en base, donc on compare au bail du moment, pas à l'après.
         self.assertEqual(int(env["AMEESH_LEASE_EPOCH"]), 1)
+
+    def test_identite_git_du_tour_vient_du_bail_pas_du_depot(self):
+        """#834 : auteur ET committer d'une session, repris ou non.
+
+        Deux worktrees du MÊME dépôt partagent `.git/config` : il y porte
+        l'identité d'un autre agent (incident du 13/10/2026, où une session
+        reprise sans identité commitait sous le nom d'un tiers). Le témoin
+        fait committer chaque session elle-même puis relit `%an <%ae>` et
+        `%cn <%ce>` : sans l'environnement du tour, c'est l'autre agent.
+        """
+        autre = "autre-agent"
+        nom1, nom2 = "gitident1", "gitident2"
+        commun = os.path.join(self.tmp, "commun")
+        w1, w2 = self._cwd(nom1), self._cwd(nom2)
+        base = dict(os.environ, GIT_AUTHOR_NAME="essai",
+                    GIT_AUTHOR_EMAIL="essai@ameesh.invalid",
+                    GIT_COMMITTER_NAME="essai",
+                    GIT_COMMITTER_EMAIL="essai@ameesh.invalid")
+        subprocess.run(["git", "init", "-q", commun], check=True)
+        subprocess.run(["git", "-C", commun, "commit", "-q", "--allow-empty",
+                        "-m", "base"], check=True, env=base)
+        subprocess.run(["git", "-C", commun, "config", "user.name", autre], check=True)
+        subprocess.run(["git", "-C", commun, "config", "user.email",
+                        "%s@ameesh.invalid" % autre], check=True)
+        for numero, (nom, dossier) in enumerate(((nom1, w1), (nom2, w2)), start=1):
+            subprocess.run(["git", "-C", commun, "worktree", "add", "-q",
+                            "-b", "b%d" % numero, dossier], check=True)
+        trace = os.path.join(self.tmp, "attribution.txt")
+        # la commande tourne dans le dossier de travail de la session
+        travail = ("git commit -q --allow-empty -m tour && "
+                   "git log -1 --format='%%an <%%ae>|%%cn <%%ce>' >> %s"
+                   % shlex.quote(trace))
+        env = self.env(AMEESH_TEST_RUN=travail)
+        for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                    "GIT_COMMITTER_EMAIL"):
+            env.pop(var, None)  # le lanceur des tests ne prête pas son identité
+        self.register(nom1, "claude", cwd=w1, prompt="premier tour")
+        proc = self.runner("--once", "--agents", nom1, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.register(nom1, "claude", cwd=w1, prompt="deuxième tour")
+        proc = self.runner("--once", "--agents", nom1, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.register(nom2, "claude", cwd=w2, prompt="tour de l'autre agent")
+        proc = self.runner("--once", "--agents", nom2, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        def attendu(nom: str) -> str:
+            return "%s <%s@ameesh.invalid>|%s <%s@ameesh.invalid>" % (nom, nom, nom, nom)
+
+        with open(trace, encoding="utf-8") as fh:
+            lignes = fh.read().splitlines()
+        # le premier agent deux fois (session neuve puis reprise), le second une
+        self.assertEqual(lignes, [attendu(nom1), attendu(nom1), attendu(nom2)])
+        # les quatre variables du contrat sont dans l'environnement du tour
+        env_tour = [t for t in self.turns() if "env" in t][-1]["env"]
+        self.assertEqual((env_tour["GIT_AUTHOR_NAME"], env_tour["GIT_AUTHOR_EMAIL"],
+                          env_tour["GIT_COMMITTER_NAME"], env_tour["GIT_COMMITTER_EMAIL"]),
+                         (nom2, "%s@ameesh.invalid" % nom2,
+                          nom2, "%s@ameesh.invalid" % nom2))
+        # la configuration partagée du dépôt n'a jamais été écrite
+        garde = subprocess.run(["git", "-C", commun, "config", "user.name"],
+                               capture_output=True, text=True, check=True)
+        self.assertEqual(garde.stdout.strip(), autre)
 
     def test_echeance_atteinte_arrete_sans_appeler_la_base(self):
         """Verdict codex3 B5a : plus de budget plancher après l'échéance.

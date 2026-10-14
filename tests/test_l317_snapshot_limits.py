@@ -150,10 +150,12 @@ class SnapshotLimitsTest(unittest.TestCase):
 
     def test_project_limits_are_private_helper_settings_not_request_fields(self):
         payload = dict(project="acme", lot=1, artifact=str(self.artifact), runner=None, arguments=[], timeout=60)
+        db = mock.Mock()
+        db.query.return_value = []
         with mock.patch("ameesh.modules.it.item", return_value={"app": "acme"}), \
                 mock.patch("ameesh.modules.it.prove", return_value={"id": 1}) as prove:
-            produce(mock.Mock(), payload, actor="uid:1000", execution_user="worker", snapshot_limits=self.limits)
+            produce(db, payload, invoker="uid:1000", execution_user="worker", snapshot_limits=self.limits)
         self.assertEqual(prove.call_args.kwargs["snapshot_limits"], self.limits)
         with self.assertRaisesRegex(ValueError, "execution inputs only"):
             produce(mock.Mock(), dict(payload, snapshot_limits={"max_bytes": 9999999999}),
-                    actor="uid:1000", execution_user="worker")
+                    invoker="uid:1000", execution_user="worker")

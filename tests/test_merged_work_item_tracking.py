@@ -722,6 +722,181 @@ class MergeSweepTest(_Base):
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
 
+class RealTargetTest(_Base):
+    """#746 : la cible RÉELLE du dépôt (`develop`) est suivie quand ni le lot
+    ni le dépôt n'en déclarent, et qu'`origin/HEAD` (figé au clone) dit main.
+
+    Liste blanche fermée : `main`, `master`, `develop`, `release/*`, sur le
+    remote `origin` seul. Preuve : une fusion citante (trailer, `#<id>` si le
+    dépôt l'active, ou nom entier de la branche), jamais le seul voisinage ;
+    un lot à branche enregistrée exige que la fusion ait porté SA branche
+    (deuxième parent = sa pointe). Une cible déclarée ne ferme jamais
+    ailleurs : le résidu est signalé, sans fermeture."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "depot746")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        self.commit("socle")
+        _git(self.repo, "checkout", "-q", "-b", "develop")
+        # ni `ameesh.target` ni `origin/HEAD` : la cible par défaut est main
+        _git(self.repo, "update-ref", "refs/remotes/origin/main",
+             _git(self.repo, "rev-parse", "HEAD"))
+        self.agent("claude1", cwd=self.repo)
+        for state in (plan_git._pr_body_backoff, plan_git._pr_body_cache):
+            state.clear()                           # état du processus
+            self.addCleanup(state.clear)
+
+    def commit(self, name):
+        with open(os.path.join(self.repo, name), "w") as fh:
+            fh.write(name + "\n")
+        _git(self.repo, "add", name)
+        _git(self.repo, "commit", "-q", "-m", "ajoute %s" % name)
+
+    def merge(self, branch, message, env=None):
+        """Une branche fusionnée en `--no-ff` sur develop (la cible réelle)."""
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit(branch.replace("/", "-"))
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", message, branch, env=env)
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def publish(self, ref, sha=None):
+        _git(self.repo, "update-ref", "refs/remotes/origin/" + ref,
+             sha or _git(self.repo, "rev-parse", "HEAD"))
+
+    def lot(self, title="lot sans branche"):
+        return work.add(self.db, title=title, assignee="claude1", actor="orch")
+
+    def sync(self, **kw):
+        return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
+
+    def test_746_liste_blanche_et_ordre_des_candidats(self):
+        self.publish("develop")
+        self.publish("lot/12-travail")
+        self.publish("review/12-r1")
+        self.publish("release/1.0")
+        self.assertEqual(plan_git.target_candidates(self.repo, "origin/main"),
+                         ["origin/develop", "origin/release/1.0"])
+
+    def test_746_citation_sur_develop_ferme_le_lot(self):
+        lot = self.lot()
+        sha = self.merge("agent/libre", "merge(desktop): X\n\nameesh-work: %d" % lot["id"])
+        self.publish("develop")
+        report = self.sync()
+        entry = report["results"][0]
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(entry["target"], "origin/develop")
+        self.assertEqual(entry["off_target"], "origin/main")
+        self.assertIn("ameesh.target", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        jalon = self.merged_milestone(lot["id"])
+        self.assertEqual(jalon["sha"], sha)
+        self.assertIn("origin/develop", jalon["note"])
+        self.assertIn("declare `git config ameesh.target", jalon["note"])
+
+    def test_746_citation_sur_une_branche_de_travail_ne_ferme_pas(self):
+        lot = self.lot()
+        base = _git(self.repo, "rev-parse", "develop")
+        sha = self.merge("lot/autre-lot", "Merge branch 'lot/autre-lot' into develop\n\n"
+                         "ameesh-work: %d" % lot["id"])
+        self.publish("develop", base)          # develop n'a pas la fusion
+        self.publish("lot/autre-lot", sha)     # la branche de travail, elle, l'a
+        report = self.sync()
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_746_cible_declaree_citation_develop_note_sans_fermeture(self):
+        lot = self.lot()
+        _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "origin/main")
+        sha = self.merge("agent/libre", "merge(desktop): X\n\nameesh-work: %d" % lot["id"])
+        self.publish("develop")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "off-target")
+        self.assertIn("origin/develop", entry["detail"])
+        self.assertIn("declared target origin/main", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("origin/develop" in n and sha[:12] in n for n in notes), notes)
+        # le relevé suivant ne répète pas le signalement
+        self.sync()
+        self.assertEqual([e["note"] for e in work.events(self.db, lot["id"])], notes)
+
+    def test_746_fusion_partielle_sur_develop_ne_ferme_pas(self):
+        lot = self.lot()
+        n = lot["id"]
+        self.merge("lot/%d-un" % n, "Merge pull request #7 from manaty/lot/%d-un" % n)
+        self.publish("develop")
+        report = self.sync(pr_body=lambda repo, num: "part one\n\nameesh-work-partial: %d" % n)
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertIn("partial", report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_746_branche_enregistree_sans_deuxieme_parent_ne_ferme_pas(self):
+        lot = work.add(self.db, title="lot à branche", assignee="claude1", actor="orch",
+                       branch="agent/x-746")
+        self.merge("agent/x-746", "Merge branch 'agent/x-746' into develop")
+        self.publish("develop")
+        _git(self.repo, "checkout", "-q", "agent/x-746")
+        self.commit("suite")                    # la pointe n'est plus le second parent
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual(report["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_746_branche_enregistree_avec_deuxieme_parent_ferme(self):
+        lot = work.add(self.db, title="lot à branche", assignee="claude1", actor="orch",
+                       branch="agent/x-746")
+        sha = self.merge("agent/x-746", "Merge branch 'agent/x-746' into develop")
+        self.publish("develop")
+        report = self.sync()
+        self.assertEqual(report["results"][0]["result"], "merged")
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
+
+    def test_746_ref_illisible_signalee_sans_fermeture(self):
+        lot = self.lot()
+        self.publish("develop")
+        vrai = plan_git.merge_commits
+
+        def casse(repo, target, since_ts=None, **kw):
+            if plan_git.short_branch(target) == "develop":
+                raise plan_git.MergeProbeError("cannot read origin/develop")
+            return vrai(repo, target, since_ts, **kw)
+
+        with mock.patch.object(plan_git, "merge_commits", side_effect=casse):
+            entry = self.sync()["results"][0]
+            notes = [e["note"] for e in work.events(self.db, lot["id"])]
+            self.sync()                    # le résidu ne se répète pas
+            self.assertEqual([e["note"] for e in work.events(self.db, lot["id"])], notes)
+        self.assertEqual(entry["result"], "off-target")
+        self.assertIn("unreadable integration ref", entry["detail"])
+        self.assertIn("origin/develop", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        self.assertTrue(any("origin/develop" in (n or "") for n in notes))
+
+    def test_990_cache_des_candidats_par_cible_et_non_par_depot(self):
+        """#990 (P2 de la relecture de #746) : la liste des candidats dépend de
+        la cible primaire, propre au lot. Un lot à cible déclarée examiné en
+        premier ne doit pas figer la liste pour les lots suivants, sans cible,
+        du même dépôt : ils resteraient ouverts alors qu'une fusion citante les
+        livre sur `origin/develop`."""
+        premier = work.add(self.db, title="cible déclarée en premier",
+                           assignee="claude1", actor="orch", branch="agent/a-990",
+                           branch_target="origin/develop")
+        suivant = self.lot("sans cible, livré sur develop")
+        self.merge("agent/libre",
+                   "merge(desktop): X\n\nameesh-work: %d" % suivant["id"])
+        self.publish("develop")
+        by_id = {r["work_item"]: r for r in self.sync()["results"]}
+        self.assertEqual(by_id[premier["id"]]["result"], "open")
+        self.assertEqual(by_id[suivant["id"]]["result"], "merged",
+                         "le lot suivant, sans cible, est livré sur develop : "
+                         "la liste des candidats ne doit pas être figée par le "
+                         "lot précédent, qui déclarait origin/develop")
+        self.assertEqual(work.get(self.db, suivant["id"])["state"], "merged")
+
+
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""
 

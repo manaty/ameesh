@@ -111,6 +111,21 @@ def get(db: Db, name: str) -> dict | None:
     return storage.of(db).agents.get(name)
 
 
+def live_harness(row: dict | None) -> str:
+    """#1037 : le harnais de la session VIVANTE d'un agent.
+
+    `session_harness` (0384) est le harnais d'ouverture de la session active,
+    tenu égal à `session_origin` par déclencheur ; `harness`, lui, est
+    DÉCLARÉ (canon, `agent-runner register`, `adopt`) et ne dit pas sous
+    lequel la session tourne (L242b : harnais emprunté). Sans session ouverte
+    — origine inconnue — le harnais déclaré reste le seul connu.
+
+    C'est ce que lit la porte §2 « autre famille de modèle » : la famille de
+    celui qui a réellement produit le travail, pas l'étiquette déclarée."""
+    row = row or {}
+    return str(row.get("session_harness") or row.get("harness") or "")
+
+
 def overview(db: Db) -> list[dict]:
     """Vue d'observabilité (`mesh list --json`).
 
