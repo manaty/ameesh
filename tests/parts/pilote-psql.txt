@@ -22,6 +22,7 @@
 
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
+test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#420, #919)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
