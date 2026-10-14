@@ -1210,37 +1210,59 @@ def _block_body(lines: list[str], i: int, key_col: int) -> tuple[str, int]:
     return "\n".join(body), j
 
 
-def _anchors(lines: list[str]) -> dict[str, str]:
-    """Values declared by an anchor (`key: &name |` or `key: &name value`).
+def _node_properties(token: str) -> tuple[str | None, str]:
+    """Strip the node properties that may precede a `run:` value.
 
-    An inline value keeps its `#`: a quoted `#` belongs to the value, and the
-    gate witness must not lose a `github.base_ref` hidden after it.
+    A plain scalar never starts with `&` or `!`: `&name` anchors the node and
+    `!tag` / `!!tag` types it, in either order. Both must be seen through, so
+    that the block header behind them opens the body and the anchor is
+    registered (#1247).
     """
-    found: dict[str, str] = {}
-    pattern = re.compile(
-        r"^\s*(?:-\s+)?[^\s:#][^:#]*:\s*&(?P<name>[A-Za-z0-9_.-]+)\s*(?P<rest>.*)$")
-    for i, line in enumerate(lines):
-        match = pattern.match(line)
-        if not match:
-            continue
-        rest = match.group("rest").strip()
-        if _block_header(rest):
-            found[match.group("name")] = _block_body(lines, i, _key_column(line))[0]
+    name = None
+    while token[:1] in ("&", "!"):
+        if token[0] == "&":
+            match = re.match(r"^&([A-Za-z0-9_.-]+)\s*", token)
+            if not match:
+                break
+            name = match.group(1)
         else:
-            found[match.group("name")] = rest
-    return found
+            match = re.match(r"^![^\s]*\s*", token)
+            if not match:
+                break
+        token = token[match.end():]
+    return name, token
+
+
+def _declaration(lines: list[str], i: int) -> tuple[str | None, str, int]:
+    """Anchor declared on line `i`: `(name, value, next line)`.
+
+    `(None, "", next)` when the line declares none. A block body is skipped
+    whole, so that shell text inside a scalar is never read as structure and a
+    declaration only reaches the aliases that follow it.
+    """
+    col = _key_column(lines[i])
+    match = re.match(r"^[^\s:#][^:#]*:[ \t]*(?P<rest>.*)$", lines[i][col:])
+    if not match:
+        return None, "", i + 1
+    name, rest = _node_properties(match.group("rest").strip())
+    if _block_header(rest):
+        value, j = _block_body(lines, i, col)
+        return (name, value, j) if name else (None, "", j)
+    return (name, rest, i + 1) if name else (None, "", i + 1)
 
 
 def _run_bodies(text: str) -> list[str]:
     """Text of every `run:` body in tests.yml.
 
     Covers inline scalars, block scalars (`|`, `>`, `|2`, `>-2`, header
-    comment), the list form (`- run:`) and aliases (`run: *anchor`): no body
-    may escape the gate witness that forbids `github.base_ref` /
-    `github.head_ref` inside a `run:` block (#1247).
+    comment), the list form (`- run:`), node properties (`&anchor`, `!tag`)
+    and aliases (`run: *anchor`). An alias is resolved at its point of use:
+    a declaration that follows it never replaces the one it names (#1247).
+    No body may escape the gate witness that forbids `github.base_ref` /
+    `github.head_ref` inside a `run:` block.
     """
     lines = text.splitlines()
-    anchors = _anchors(lines)
+    anchors: dict[str, str] = {}
     bodies: list[str] = []
     i = 0
     while i < len(lines):
@@ -1248,20 +1270,27 @@ def _run_bodies(text: str) -> list[str]:
         col = _key_column(line)
         stripped = line[col:]
         if not stripped.startswith("run:"):
+            name, value, i = _declaration(lines, i)
+            if name:
+                anchors[name] = value
+            continue
+        token = stripped[len("run:"):].strip()
+        name, token = _node_properties(token)
+        if token.startswith("*"):
+            alias = token[1:].split("#", 1)[0].strip()
+            if alias in anchors:
+                bodies.append(anchors[alias])
             i += 1
             continue
-        inline = stripped[len("run:"):].strip()
-        if inline.startswith("*"):
-            name = inline[1:].split("#", 1)[0].strip()
-            if name in anchors:
-                bodies.append(anchors[name])
-            i += 1
-            continue
-        if inline and not _block_header(inline):
-            bodies.append(inline)
+        if token and not _block_header(token):
+            if name:
+                anchors[name] = token
+            bodies.append(token)
             i += 1
             continue
         body, j = _block_body(lines, i, col)
+        if name:
+            anchors[name] = body
         bodies.append(body)
         i = j
     return bodies
@@ -1328,6 +1357,53 @@ class RunBodiesTest(unittest.TestCase):
         bodies = _run_bodies(text)
         self.assertEqual(1, len(bodies))
         self.assertIn("github.base_ref", bodies[0])
+
+    def test_anchor_on_the_run_line_still_opens_the_block(self):
+        # #1247 R1 (P2): `- run: &cmd |` both declares the anchor and opens
+        # the block; the body must not be taken for the inline value `&cmd |`.
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: &cmd |
+                      echo "${{ github.base_ref }}"
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.base_ref", bodies[1])
+
+    def test_tag_before_the_block_header_still_opens_the_block(self):
+        # #1247: a tag is the same class as an anchor (`run: !!str |`).
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: !!str |
+                      echo "${{ github.base_ref }}"
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_alias_resolves_at_its_point_of_use(self):
+        # #1247 R1: an alias names the declaration that precedes it; the last
+        # declaration of the file must not replace it retroactively.
+        text = textwrap.dedent("""\
+            x-first: &cmd |
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            x-last: &cmd |
+              echo benign
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertNotIn("benign", bodies[0])
 
     def test_only_run_keys_are_read(self):
         text = textwrap.dedent("""\
