@@ -86,7 +86,9 @@ class ReviewerBriefsTest(unittest.TestCase):
         self.assertIn("relecteur", briefs)
         self.assertIn("ameesh work milestone 42 verdict ok|blocked", briefs["relecteur"])
         self.assertIn("orch", briefs)          # les orchestrateurs restent prévenus
-        self.assertEqual(briefs["auditeur"], briefs["orch"])
+        # L713 (main, #403) : `stale_lot` ne réveille plus l'auditeur par
+        # courrier — il lit l'alerte à sa passe, même désigné relecteur ailleurs.
+        self.assertNotIn("auditeur", briefs)
 
     def test_sans_relecteur_l_orchestrateur_du_projet_est_prevenu(self):
         briefs = alert_briefs.briefs(self._alert(), self.LISTING)

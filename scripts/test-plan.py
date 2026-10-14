@@ -3,6 +3,8 @@
 """Test plan from the measured test → code map (L161f).
 
     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                              [--base SHA] [--ref REF]
+                              [--base-ref B] [--head-ref H]
                               [--github-output F] [--summary F] [--annotations]
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
@@ -24,21 +26,49 @@ so the split never differs between parts.
 * P2 — failed under measure in the last 7 days (map history);
 * P3 — the rest.
 
-**Phase 1: nothing is skipped.** Every part runs P0, P1 (shortest first),
-P2, then P3 (alphabetical); only the order changes. The plan also says
-whether a phase 2 selection ("impacted only", lot L161i) would have been
-safe for this change; it is recorded, never applied.
+**Lot branches: impacted + contract (L1211, canon §3).** On a pull request
+whose source and target are lot branches, only the impacted modules (P0, P1)
+and the contract list (`tests/parts/toujours.txt`: droits, rôles, migrations,
+objets globaux du cluster) run; any doubt — no map, a stale or unsure
+selection, a changed block without a test, test infrastructure, a removed
+file outside documentation, an empty contract list — gives the full suite
+(`lot_selection`). On `main` every module runs, P0 and
+P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
+driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
+matrix.
+
+**Release pull requests keep the full suite (canon §3).** A pull request
+whose source or target is `release/**` or the package integration branch
+(§12) is a release PR: like the `push` to those branches, it runs the full
+suite under both drivers (`PARTS` in full), with no version-only or
+documentation-only fast lane and without the psql pilot list — the branch
+context comes from the workflow (`--base-ref`, `--head-ref`, L1211). The
+same holds for the fallback plan, so an unreadable map never narrows a
+release to the pilot list. Only the full suite prepares the merge of a
+release.
+
+**Documentation-only** (L161a): a pull request whose whole diff is
+documentation, and a push to `main` whose whole pushed range (`--base`,
+`github.event.before`, to the new head) is documentation, runs only its
+declared readers (`tests/parts/lecteurs-doc.txt`, plus the impacted ones)
+and skips the parts. A push to any other ref keeps the full suite (release
+branches in particular); so do a branch created by the push, a rewritten
+history and any event but `pull_request` and `push` on `main`. A pushed
+version number never takes the lane: L157 is a pull-request rule.
 
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
 missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--since HEAD^1`) and the
-plan is marked unsure. A file the map cannot judge (Python outside
-`src/ameesh`, a non-documentation file no test reads, a syntax error) uses
-the textual heuristic for that file and marks the plan unsure; test
-infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+default) and the plan is marked unsure. A file the map cannot judge (Python
+outside `src/ameesh`, a non-documentation file no test reads, a syntax
+error) uses the textual heuristic for that file and marks the plan unsure;
+test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
 `.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
+A file removed outside documentation marks it unsure as well: the map knows
+the readers it measured, never the ones it cannot see (an import by a
+computed name, a config read by the code).
 Any error while reading the map gives the fallback plan, never a failure.
 
 **Changed lines without a test**: an existing block whose fingerprint
@@ -65,6 +95,7 @@ import collections
 import datetime
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import re
@@ -84,15 +115,35 @@ MAX_AGE_H = 48
 PHASE2_MAX_AGE_H = 24
 #: failures under measure younger than this make a module P2
 RECENT_FAILURE_DAYS = 7
-#: parts per driver (pull request, other events)
-PARTS = {"psycopg": (4, 4), "psql": (1, 6)}
+#: parts per driver (pull request, other events). Le pilote psql d'une PR est
+#: en trois parts depuis #947 : sur les runners auto-hébergés, huit jobs se
+#: partagent un hôte, la part unique pesait 21,7-26,6 min au repos (médiane
+#: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
+#: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
+#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
+#: saturé) ; la suite psql complète reste en six parts.
+#: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
+#: impactés et le contrat : une part par pilote suffit, et une part de plus par
+#: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
+PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+#: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
+#: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
+#: comme dans celui de 45 min de psql.
+PR_TARGET_PART_S = 300
+#: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
+#: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
+#: version/doc ni liste pilote psql.
+RELEASE_PREFIXES = ("release/", "integration/")
 #: entries listed in the job summary, per category
 SUMMARY_LIMIT = 25
 
 MIGRATIONS_DIR = "src/ameesh/migrations/"
 CODE_ROOT = "src/ameesh/"
-#: changes that trigger the "always" list
-ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/")
+#: changes that trigger the "always" list (#749: the runner drives turns,
+#: leases and orphan settlement through objects global to the cluster, which
+#: the per-schema measure of the map cannot see)
+ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/",
+                   "src/ameesh/runner.py")
 #: test infrastructure: the map cannot judge a change there
 FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".github/",
               "scripts/test-parts.py", "scripts/test-plan.py", "scripts/map.py",
@@ -214,6 +265,7 @@ class Impact:
         self.unsure: list[str] = []          # why the map cannot judge everything
         self.textual: list[str] = []         # files left to the L161b heuristic
         self.foundation: list[str] = []
+        self.removed: list[str] = []         # files removed outside documentation
 
     def hit(self, modules, reason: str) -> None:
         for m in modules:
@@ -359,6 +411,8 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
     if status in ("A", "D"):
         listers, where = _dir_listers(card, path, card["commit"], repo)
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
+    # a removal outside documentation is already a doubt, raised by `judge`:
+    # only a removed document stays quiet here (the docs lane)
     if not readers and not listers and not is_doc(path) and status != "D":
         impact.doubt(f"{path}: read by no measured test", path)
 
@@ -372,6 +426,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         if m not in known_modules:
             impact.p0[m] = "unknown to the map"
     for status, path in changes:
+        # a removal has no new blocks to judge, and the map only knows the
+        # readers it measured: an import by a computed name, a config read by
+        # the code, a template — the removal is a doubt, never a silent
+        # selection (R2 bureau, B1). `--no-renames`: a rename is D + A here.
+        if status == "D" and not is_doc(path):
+            impact.removed.append(path)
+            impact.unsure.append(f"file removed: {path}")
         # a file read as data (a .py, a test module, a migration as well): its
         # readers, whatever the kind of file and even when its blocks did not change
         impact.hit(card.get("donnees", {}).get(path, ()), path)
@@ -418,6 +479,15 @@ def always_hits(changes: list[tuple[str, str]], always: list[str]) -> dict[str, 
     return {m: f"always list ({trigger})" for m in always} if trigger else {}
 
 
+def psql_pr_modules(pilot: list[str], always: list[str]) -> list[str]:
+    """#749 : modules du pilote psql d'une PR, augmentes de la liste « always »
+    declenchee par le diff (contrat de base, baux et orphelins). Le pilote psql
+    d'une PR ne voit sinon que `tests/parts/pilote-psql.txt` : une regression
+    qu'il est le seul a voir, dans un module hors liste, attendait la suite
+    complete de main (rouge de release de l'incident #749)."""
+    return sorted(set(pilot) | set(always))
+
+
 def recent_failures(card: dict | None, now: datetime.datetime) -> dict[str, str]:
     if not card:
         return {}
@@ -449,14 +519,38 @@ def textual(modules: list[str], files: list[str]) -> dict[str, str]:
 
 # -- the plan -------------------------------------------------------------
 
+def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
+    """Why the impacted-only selection would not be safe for this change
+    (L1211): the plan then runs the full suite rather than decide on a doubt."""
+    if impact is not None and impact.removed:
+        return f"file removed: {impact.removed[0]}"
+    if not out["sure"]:
+        return out["unsure"][0] if out["unsure"] else "selection unsure"
+    if age is None:
+        return "map without a generation date"
+    if age > PHASE2_MAX_AGE_H:
+        return f"map older than {PHASE2_MAX_AGE_H} h ({age:.0f} h)"
+    if impact is None:
+        return "selection unsure"
+    if impact.unknown_blocks:
+        return f"{len(impact.unknown_blocks)} new block(s) unknown to the map"
+    if impact.foundation:
+        return f"test infrastructure changed: {impact.foundation[0]}"
+    if impact.untested:
+        return f"{len(impact.untested)} changed block(s) without a test"
+    return "selection unsafe"
+
+
 def classify(modules: list[str], card: dict | None, now: datetime.datetime,
              base_fallback: str = "HEAD^1", head: str = "HEAD",
              repo: pathlib.Path = REPO) -> dict:
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
-    out = {"map": None, "sure": False, "phase2_safe": False, "unsure": [],
-           "untested": [], "unknown_blocks": [], "foundation": [], "changed": 0}
+    out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
+           "unsure": [], "contract": list(always),
+           "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
+           "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
@@ -490,13 +584,18 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 classes[m] = ("P1", p1[m])
         out.update(unsure=impact.unsure, untested=impact.untested,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
-                   sure=not impact.unsure)
+                   removed=impact.removed, sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
                               and not impact.unknown_blocks and not impact.foundation
-                              and not impact.untested)
+                              and not impact.untested and not impact.removed)
     changes = changes or []
     out["changed"] = len(changes)
-    for m, r in always_hits(changes, always).items():
+    out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
+    triggered = always_hits(changes, always)
+    #: #749 : la liste declenchee est publiee pour que le pilote psql d'une PR
+    #: la rejoigne (make_plan), au lieu d'attendre la suite complete de main.
+    out["always"] = sorted(triggered)
+    for m, r in triggered.items():
         if classes.get(m, ("P3",))[0] not in ("P0", "P1"):
             classes[m] = ("P1", r)
     for m, r in recent_failures(card, now).items():
@@ -537,11 +636,103 @@ def split(modules: list[str], driver: str, n: int, card: dict | None,
     return result
 
 
-def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
-           repo: pathlib.Path = REPO) -> dict:
-    """Version-only or documentation-only pull request (L157, L161a)."""
-    out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
+def _branch(ref: str | None) -> str:
+    """A branch name, from `GITHUB_BASE_REF`/`GITHUB_HEAD_REF` or `refs/heads/…`."""
+    ref = ref or ""
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
+def _env_ref(name: str, value: str | None) -> str:
+    """The explicit branch ref, or the environment's (`GITHUB_*`)."""
+    return os.environ.get(name, "") if value is None else value
+
+
+def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
+    """Why this pull request is a release one (canon §3), or "".
+
+    A source or target branch under `release/**` or `integration/**` is a
+    release PR: the full suite, both drivers, no version/documentation fast
+    lane and no psql pilot list — the target of a lot PR, `main`, keeps the
+    selection. The reason goes to the plan and the summary.
+    """
+    for role, ref in (("target", _branch(base_ref)), ("source", _branch(head_ref))):
+        if ref.startswith(RELEASE_PREFIXES):
+            return (f"{role} branch {ref}: release/** and integration/** run the "
+                    f"full suite (canon §3)")
+    return ""
+
+
+def lot_selection(event: str, state: dict, modules: list[str],
+                  classes: dict[str, tuple[str, str]],
+                  release: str = "") -> tuple[list[str] | None, str]:
+    """Modules a lot branch runs (L1211): impacted plus contract.
+
+    `None` means the full suite: an event other than a pull request, a
+    release pull request (`release`, `release_pr`), or any doubt the plan
+    cannot decide through — no usable map, a selection that is not safe
+    (stale map, a new block, test infrastructure, changed lines without a
+    test), an empty contract list. The reason goes to the summary.
+    """
     if event != "pull_request":
+        return None, "main, release/** and the integration branch run the full suite"
+    if release:
+        return None, release
+    contract = [m for m in state.get("contract", []) if m in modules]
+    if not contract:
+        return None, "contract list (tests/parts/toujours.txt) empty or unreadable"
+    if not (state.get("map") and state["map"].get("used")):
+        unsure = state.get("unsure") or ["no map"]
+        return None, f"map not usable ({unsure[0]})"
+    if not state.get("phase2_safe"):
+        return None, f"selection unsure ({state.get('phase2_why') or 'no reason'})"
+    return sorted({m for m in modules if classes[m][0] in ("P0", "P1")}
+                  | set(contract)), ""
+
+
+def lot_part_count(driver: str, modules: list[str], card: dict | None) -> int:
+    """Parts of a lot branch for `driver` (L1211): one, plus one per
+    `PR_TARGET_PART_S` of estimate; `make_plan` caps it at `PARTS`."""
+    if not modules:
+        return 1
+    estimate = sum(weights(modules, driver, card).values())
+    return max(1, math.ceil(estimate / PR_TARGET_PART_S))
+
+
+#: the branch whose documentation-only pushes take the fast lane (L161a)
+DOC_PUSH_REF = "main"
+#: git's null object id: `github.event.before` of a branch created by the push
+NULL_SHA = "0" * 40
+
+
+def pushed_range(base: str, head: str, repo: pathlib.Path = REPO) -> bool:
+    """True if `base` is the tip before a push to `head` (fast-forward).
+
+    `github.event.before` on a branch created by the push is the null sha,
+    and a rewritten history leaves a tip that is not an ancestor: both keep
+    the full suite."""
+    if base in ("", NULL_SHA) or not re.fullmatch(r"[0-9a-fA-F]{40}", base):
+        return False
+    return is_ancestor(base, head, repo)
+
+
+def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
+           repo: pathlib.Path = REPO, ref: str = "") -> dict:
+    """Version-only pull request (L157), documentation-only change (L161a).
+
+    On a push, `base` is the tip before the push (`github.event.before`), so
+    the diff covers every pushed commit. Only a push to `main` takes the
+    documentation lane: a push to a release branch keeps the full suite, and
+    version-only stays a pull-request rule (a pushed version always runs)."""
+    out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
+    if event == "push":
+        if ref.removeprefix("refs/heads/") != DOC_PUSH_REF:
+            out["why"] = f"push to {ref or 'an unknown ref'}: full suite"
+            return out
+        if not pushed_range(base, head, repo):
+            out["why"] = ("pushed range unknown (new branch or rewritten history): "
+                          "full suite")
+            return out
+    elif event != "pull_request":
         return out
     try:
         names = _git(repo, "diff", "--name-only", "--no-renames", base, head).splitlines()
@@ -549,9 +740,11 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     except (OSError, subprocess.CalledProcessError) as exc:
         out["why"] = f"diff unreadable ({exc})"
         return out
-    out["version_only"], why = version_only.version_only(names, patch)
+    version_why = ""
+    if event == "pull_request":
+        out["version_only"], version_why = version_only.version_only(names, patch)
     out["docs_only"], doc_why = version_only.docs_only(names)
-    out["why"] = why if out["version_only"] else doc_why
+    out["why"] = version_why if out["version_only"] else doc_why
     out["files"] = names
     return out
 
@@ -572,16 +765,26 @@ def doc_readers(classes: dict, card: dict,
 
 
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
-              head: str = "HEAD", repo: pathlib.Path = REPO) -> dict:
+              head: str = "HEAD", repo: pathlib.Path = REPO,
+              base: str = "HEAD^1", ref: str = "",
+              base_ref: str | None = None, head_ref: str | None = None) -> dict:
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
-            "tested": _rev(head, repo), **nature(event, head=head, repo=repo)}
-    plan.update(classify(modules, card, now, head=head, repo=repo))
+            "tested": _rev(head, repo), "release": release,
+            "refs": {"base": base_ref, "head": head_ref},
+            **nature(event, base=base, head=head, repo=repo, ref=ref)}
+    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+    #: #749 : modules « always » declenches par le diff (contrat de base, baux
+    #: et orphelins), a rejoindre au pilote psql sur une PR.
+    always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
-    if plan["docs_only"]:
+    if plan["docs_only"] and not release:
         # the fast lane needs a map that judged everything: a missing, stale or
         # unusable map, or an unsure selection, runs the full suite
         full = None
@@ -596,21 +799,47 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
                         f"({', '.join(db_readers)}): full suite")
         if full:
             plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
+    if release:
+        #: canon §3 : une PR de release passe la suite complète, les deux
+        #: pilotes, sans voie version seule ni documentation seule.
+        plan["version_only"] = plan["docs_only"] = False
+        plan["doc_readers"] = []
+        plan["why"] = release
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
+    #: L1211 : la sélection impactés+contrat est réservée aux PR de lot ; une
+    #: PR de release garde la suite complète, y compris dans le repli.
+    lot_pr = pr and not release
+    #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
+    #: tout doute rend la suite complète (lot_selection). La sélection se
+    #: contente d'une part par pilote tant que l'estimation le permet.
+    selection, why = ((None, "") if skip
+                      else lot_selection(event, plan, modules, classes, release))
+    chosen_set = None if selection is None else set(selection)
+    contract = [m for m in plan.get("contract", []) if m in modules]
     plan["parts"] = {}
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
-        if driver == "psql" and pr:
-            selected = read_list(PILOT_FILE, modules, required=True)
-        plan["parts"][driver] = [] if skip else split(
-            selected, driver, n_pr if pr else n_other, card, classes)
+        if driver == "psql" and lot_pr:
+            selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
+                                       always)
+        if chosen_set is not None:
+            selected = [m for m in selected if m in chosen_set]
+        n = n_pr if lot_pr else n_other
+        if chosen_set is not None:
+            n = min(n, lot_part_count(driver, selected, card))
+        plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
     every = [m for m in modules]
     weighed = weights(every, "psycopg", card)
     chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
-    plan["selection"] = {"modules": len(every), "impacted": len(chosen),
-                         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
-                         "total_estimate_s": round(sum(weighed.values()), 1)}
+    ran = sorted({m for ps in plan["parts"].values() for p in ps for m in p["modules"]})
+    plan["selection"] = {
+        "mode": "skipped" if skip else ("impacted" if chosen_set is not None else "full"),
+        "why": plan["why"] if skip else why,
+        "modules": len(every), "impacted": len(chosen), "contract": len(contract),
+        "selected": len(ran), "skipped": len(every) - len(ran),
+        "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
+        "total_estimate_s": round(sum(weighed.values()), 1)}
     return plan
 
 
@@ -621,25 +850,36 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
         return ""
 
 
-def fallback_plan(event: str, error: str) -> dict:
+def fallback_plan(event: str, error: str, base_ref: str | None = None,
+                  head_ref: str | None = None) -> dict:
     """The plan when planning itself failed: full suite, alphabetical order."""
-    modules = parts.modules()
+    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     pr = event == "pull_request"
+    #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
+    #: jamais la liste pilote psql d'une PR de lot.
+    lot_pr = pr and not release
+    why = "planning failed" + (f"; {release}" if release else "")
+    modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
-            "version_only": False, "docs_only": False, "why": "planning failed",
-            "map": None, "sure": False, "phase2_safe": False,
+            "version_only": False, "docs_only": False, "why": why,
+            "release": release, "refs": {"base": base_ref, "head": head_ref},
+            "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
-            "unknown_blocks": [], "foundation": [], "changed": 0, "doc_readers": [],
-            "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+            "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
+            "doc_readers": [],
+            "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
-        n = n_pr if pr else n_other
+        n = n_pr if lot_pr else n_other
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
-             "pilot_list": driver == "psql" and pr, "estimate_s": 0}
+             "pilot_list": driver == "psql" and lot_pr, "estimate_s": 0}
             for i in range(1, n + 1)]
-    plan["selection"] = {"modules": len(modules), "impacted": 0, "impacted_estimate_s": 0,
-                         "total_estimate_s": 0}
+    plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
+                         "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
+                         "impacted_estimate_s": 0, "total_estimate_s": 0}
     return plan
 
 
@@ -684,9 +924,19 @@ def summary(plan: dict) -> str:
     lines.append(f"* {plan['changed']} file(s) changed since the "
                  f"{'map commit' if m and m['used'] else 'parent commit'}; impacted (P0, P1): "
                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
-                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg); phase 1: nothing skipped")
-    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; phase 2 safe: "
-                 f"{'yes' if plan['phase2_safe'] else 'no'}")
+                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
+    if sel.get("mode") == "impacted":
+        lines.append(f"* lot branch (L1211): impacted + {sel['contract']} contract module(s), "
+                     f"{sel['selected']} module(s) run, {sel['skipped']} left to main, "
+                     f"release/** and the integration branch")
+    elif sel.get("mode") == "skipped":
+        lines.append("* parts skipped (see above)")
+    else:
+        lines.append(f"* full suite: {sel['selected']} module(s) run"
+                     + (f" ({sel['why']})" if sel.get("why") else ""))
+    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; impacted-only safe: "
+                 f"{'yes' if plan['phase2_safe'] else 'no'}"
+                 + (f" ({plan['phase2_why']})" if plan.get("phase2_why") else ""))
     for reason in plan["unsure"][:SUMMARY_LIMIT]:
         lines.append(f"  * {reason}")
     by_class = collections.defaultdict(list)
@@ -821,6 +1071,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
+    p.add_argument("--base", default="HEAD^1",
+                   help="tip before a push (github.event.before); HEAD^1 by default, "
+                        "the first parent of a pull request's merge commit")
+    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                   help="github.ref; a documentation-only push takes the fast lane "
+                        "on main only")
+    p.add_argument("--base-ref", default=None,
+                   help="target branch of a pull request (default: $GITHUB_BASE_REF)")
+    p.add_argument("--head-ref", default=None,
+                   help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -839,10 +1099,12 @@ def main(argv: list[str] | None = None) -> int:
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
-            plan = make_plan(args.event, card)
+            plan = make_plan(args.event, card, base=args.base, ref=args.ref,
+                             base_ref=args.base_ref, head_ref=args.head_ref)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
-            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}")
+            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
+                                 base_ref=args.base_ref, head_ref=args.head_ref)
         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
                                           + "\n", encoding="utf-8")
         if args.github_output:

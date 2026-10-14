@@ -6,7 +6,9 @@ appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
 
 * aux orchestrateurs (ceux de l'alerte, de l'équipe concernée quand elle est
   connue), qui répartissent le travail ;
-* à l'auditeur interne ([AUDITEUR.md](../../docs/AUDITEUR.md)), qui les suit.
+* à l'auditeur interne ([AUDITEUR.md](../../docs/AUDITEUR.md)), qui les suit
+  — sauf `stale_lot` (L713) : ce courrier ne le réveille plus, il lit les lots
+  stagnants à sa passe (`ameesh alerts --json`).
 
 #705 : pour un lot en `qa`, `stale_lot` va au relecteur DÉSIGNÉ (le verdict
 lui est dû) ; sans relecteur désigné, l'alerte part aux orchestrateurs du
@@ -214,8 +216,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
     relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
-    Auditeurs : toujours pour les autres types. Un agent à la fois
-    orchestrateur et auditeur reçoit un seul texte."""
+    Auditeurs : pour tous les types sauf `stale_lot` (L713 : lu à la passe de
+    l'auditeur, sans réveil). Un agent à la fois orchestrateur et auditeur
+    reçoit un seul texte."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
@@ -275,8 +278,13 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même
         out.update(extra)
         audit_text = text
-    for name in auditor_names or ():
-        out.setdefault(name, audit_text)
+    # L713 : le lot stagnant ne réveille plus l'auditeur par courrier ; il le
+    # lit à sa passe (`ameesh alerts --json`). Les orchestrateurs gardent
+    # l'avis, et un auditeur qui est aussi orchestrateur de l'équipe le reçoit
+    # par cette voie (un seul texte).
+    if kind != "stale_lot":
+        for name in auditor_names or ():
+            out.setdefault(name, audit_text)
     if kind == "critical_budget_pause":
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     return out
