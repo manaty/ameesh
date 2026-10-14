@@ -69,6 +69,13 @@ Le geste, et ses gardes (toutes vérifiées AVANT toute écriture) :
     être celui poussé, la tête de la cible relue doit être ce commit ; le lot
     n'est déclaré fusionné qu'après cette relecture.
 
+An **already `MERGED`** PR is bound by the same link (#1003 N1, P2 blocker):
+its content evidence (`refs/pull/<pr>/head`, ancestor of the target) is not
+enough to declare a lot. `--lot` must carry the freeze of that head, on the
+PR's branch and target; a missing, closed or frozen-elsewhere lot, or one on
+another branch/target, refuses without declaring anything. `--dry-run` never
+declares, `already` included.
+
 Le remote de lecture peut rester celui du jeton (lire un workflow ne demande
 pas le scope) ; seul le push doit être hors jeton. `--dry-run` déroule toutes
 les gardes (y compris la garde fraîche) et construit le commit de fusion sans
@@ -391,6 +398,72 @@ def _ls_remote(owner: str, url: str, target: str) -> str:
     return text.split()[0].lower() if text.split() else ""
 
 
+def _already_lot_links(db, lot: int, head: str, view: dict, target: str, repo: str,
+                       cfg) -> None:
+    """An already-MERGED PR (#1003 N1, P2 blocker): the lot must carry the
+    freeze of this head, on the PR's branch and target, before any declaration.
+
+    A PR merged outside this command never passed the queue admission: linking
+    it by `--lot` alone would close an unrelated lot. Nothing is written here —
+    a missing or different link raises, and `work.merged` is not called. The
+    correct case (lot frozen on the head, same branch, same target) keeps its
+    previous behaviour."""
+    try:
+        row = work.get(db, lot)
+    except Exception as exc:  # noqa: BLE001 - registre illisible : rien n'est déclaré
+        raise MergePrError("lot #%d cannot be read (%s): the merge of an already-MERGED PR "
+                           "is not declared on it" % (lot, type(exc).__name__)) from exc
+    if row is None:
+        raise MergePrError("lot #%d not found: the merge of an already-MERGED PR is not "
+                           "declared on it" % lot)
+    if (row.get("state") or "").strip() == "closed":
+        raise MergePrError("lot #%d is closed (%s): the merge of an already-MERGED PR is not "
+                           "declared on it" % (lot, row.get("close_reason") or "closed"))
+    # N1 review (cx3): the MERGED view must name the frozen head (headRefOid),
+    # not only the fetched ref; a silent view proves nothing.
+    oid = (view.get("headRefOid") or "").strip().lower()
+    if not oid or not _same(oid, head):
+        raise MergePrError("PR #%s head is %s, the freeze is %s: nothing declared"
+                           % (view.get("number") or "?", oid[:12] or "?", head[:12]))
+    try:
+        marks = work.milestones(db, lot)
+    except Exception as exc:  # noqa: BLE001 - registre illisible : rien n'est déclaré
+        raise MergePrError("lot #%d milestones cannot be read (%s): nothing declared"
+                           % (lot, type(exc).__name__)) from exc
+    freeze = plan_git.latest_freeze(marks)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    if not frozen:
+        raise MergePrError("lot #%d has no frozen commit: the merge of an already-MERGED PR "
+                           "is not declared on it" % lot)
+    if not _same(frozen, head):
+        raise MergePrError("lot #%d is frozen on %s, not on the PR head %s: nothing declared "
+                           "(an already-MERGED PR does not close another lot's freeze)"
+                           % (lot, frozen[:12], head[:12]))
+    branch = (view.get("headRefName") or "").strip()
+    lot_branch = (row.get("branch") or "").strip()
+    if not branch or not lot_branch or lot_branch != branch:
+        raise MergePrError("lot #%d is on branch %s, the PR head branch is %s: nothing "
+                           "declared" % (lot, lot_branch or "?", branch or "?"))
+    project = None
+    if cfg is not None:
+        project = _project_of(cfg, repo)
+    app = (row.get("app") or "").strip()
+    if project is not None and app and app != project.name:
+        raise MergePrError("lot #%d is declared on project %s, %s belongs to project %s: "
+                           "nothing declared" % (lot, app, repo, project.name))
+    expected = (row.get("branch_target") or "").strip()
+    if not expected and project is not None:
+        expected = (getattr(project, "target", "") or "").strip()
+    if not expected:
+        try:
+            expected = (plan_git.default_target(repo) or "").strip()
+        except (GitError, OSError):
+            expected = ""
+    if not expected or _branch_name(expected) != _branch_name(target):
+        raise MergePrError("lot #%d targets %s, the PR targets %s: nothing declared"
+                           % (lot, expected or "?", target))
+
+
 def _already(slug: str, pr: int, head: str, view: dict, *, target: str,
              fetch_url: str, owner: str) -> dict:
     """PR déjà MERGED : on vérifie que le gel est bien dans la cible."""
@@ -457,6 +530,9 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
     try:
         state = (view.get("state") or "").upper()
         if state == "MERGED":
+            # N1 (#1003): an already-MERGED PR does not declare a lot without
+            # the lot/freeze/branch/target link; nothing is written otherwise.
+            _already_lot_links(db, lot, head, view, target, repo, cfg)
             return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
                             owner=owner)
         if project is None:
@@ -689,7 +765,9 @@ def run(cfg, db, args) -> int:
         out = direct_merge(slug, args.pr, args.head, lot=args.lot, repo=cwd, db=db, cfg=cfg,
                            target=args.target, fetch_url=fetch_url, push_url=push_url,
                            dry_run=args.dry_run)
-        if out.get("state") in ("merged", "already"):
+        # N1 (#1003): `--dry-run` never declares anything, including on an
+        # already-MERGED PR (the `already` finding is not a write).
+        if out.get("state") in ("merged", "already") and not args.dry_run:
             out["lot"] = args.lot
             sha = out.get("merge") or out.get("tip") or ""
             try:

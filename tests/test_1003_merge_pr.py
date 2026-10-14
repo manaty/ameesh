@@ -111,8 +111,12 @@ class _Base(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def _lot_row(self, db, lot, *a, **kw):
-        return {"id": int(lot), "state": "build", "branch": self.lot_branch,
-                "branch_target": self.lot_target, "title": "le lot", "app": "ameesh"}
+        row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
+               "branch_target": self.lot_target, "title": "le lot", "app": "ameesh"}
+        if getattr(self, "lot_state", None):
+            row["state"] = self.lot_state
+            row["close_reason"] = "abandoned"
+        return row
 
     def ready_marks(self, head=None, *, verdict="ok", sha=None):
         """Le lot gelé sur `head` et son verdict ; `sha` déplace le verdict."""
@@ -390,6 +394,44 @@ class MergeTest(_Base):
         self.assertFalse(out["content_verified"])
         self.assertEqual(self.tip(), self.base)
 
+    def test_an_already_merged_pr_without_a_freeze_on_its_head_is_refused(self):
+        # N1 (#1003): without the lot's freeze on this head nothing is declared
+        # — a wrong `--lot` does not close an unrelated lot.
+        for marks, needle in (
+                ([], "has no frozen commit"),
+                ([{"id": 1, "kind": "frozen", "sha": "d" * 40, "at_ts": 1.0}],
+                 "is frozen on")):
+            with self.subTest(needle=needle):
+                self.lot_marks = marks
+                with self.assertRaises(merge_pr.MergePrError) as caught:
+                    self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+                self.assertIn(needle, str(caught.exception))
+        self.assertEqual(self.tip(), self.base)
+
+    def test_an_already_merged_pr_of_another_lot_is_refused(self):
+        # the lot's branch must be the PR's one: two lots do not share a head
+        # by accident.
+        self.lot_branch = "lot/other"
+        with self.assertRaisesRegex(merge_pr.MergePrError, "on branch"):
+            self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+
+    def test_an_already_merged_pr_on_another_target_is_refused(self):
+        self.lot_target = "release/1"
+        with self.assertRaisesRegex(merge_pr.MergePrError, "targets release/1"):
+            self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+
+    def test_an_already_merged_view_that_does_not_name_the_head_is_refused(self):
+        with self.assertRaisesRegex(merge_pr.MergePrError, "head is"):
+            self.merge(self.gh(state="MERGED", headRefOid="a" * 40,
+                              mergeCommit={"oid": self.head}))
+
+    def test_an_already_merged_pr_on_a_closed_lot_is_refused(self):
+        # a closed lot is never reopened by an already-MERGED PR: the refusal
+        # precedes `work.merged`, which is not called.
+        self.lot_state = "closed"
+        with self.assertRaisesRegex(merge_pr.MergePrError, "is closed"):
+            self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+
     def test_a_closed_pr_is_refused(self):
         with self.assertRaises(merge_pr.MergePrError) as caught:
             self.merge(self.gh(state="CLOSED"))
@@ -539,6 +581,24 @@ class RunTest(unittest.TestCase):
         code, text = self.run_with(out, args=self.args(lot=1003, json=False))
         self.assertEqual(code, 0)
         self.assertIn("WARNING lot not declared", text)
+
+    def test_an_already_merged_pr_is_declared_on_its_lot(self):
+        out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tip": "d" * 40, "target": "main"}
+        with mock.patch.object(merge_pr.work, "merged",
+                               return_value={"result": "merged"}) as recorded:
+            code, _ = self.run_with(out, args=self.args(lot=1003, json=True))
+        self.assertEqual(code, 0)
+        self.assertEqual(recorded.call_args.kwargs["sha"], "b" * 40)
+
+    def test_dry_run_declares_nothing_even_on_an_already_merged_pr(self):
+        # N1 (#1003): `--dry-run` never declares, `already` included.
+        out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tip": "d" * 40, "target": "main"}
+        with mock.patch.object(merge_pr.work, "merged") as recorded:
+            code, _ = self.run_with(out, args=self.args(dry_run=True, json=True))
+        self.assertEqual(code, 0)
+        recorded.assert_not_called()
 
     def test_exit_codes_name_the_uncertainty(self):
         for state, expected in (("pushed-unverified", 2), ("already-unverified", 1)):
