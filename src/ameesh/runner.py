@@ -930,6 +930,23 @@ class AgentWorker(threading.Thread):
             return max(0.0, min(cap, self.lease_deadline - time.time()))
         return cap
 
+    def renew_wait(self, cap: float) -> float:
+        """Attente qui laisse un renouvellement **avant** l'échéance du bail.
+
+        `wait_timeout` borne l'attente à l'échéance même : une reprise plus
+        longue que le bail (#1270, jusqu'à 600 s pour un bail de 300 s)
+        dormait jusqu'à la deadline, puis `renew()` était refusé
+        (`deadline_passed`) — le worker rendait le bail au lieu de reprendre
+        (R1 cx3 B1). On découpe donc au pas du battement de tour (`ttl/3`),
+        sans plancher : la tranche vaut `min(cap, ttl/3)` et ne dépasse jamais
+        l'échéance du bail. Chaque tranche est suivie d'un `renew()` par
+        l'appelant (boucle de reprise, boucle principale).
+        """
+        pas = (self.runner.lease_ttl / 3.0) if self.runner.lease_ttl > 0 else 3.0
+        if self.lease_deadline > 0:
+            pas = min(pas, max(0.0, self.lease_deadline - time.time()))
+        return max(0.0, min(float(cap), pas))
+
     #: réveil maximal du veilleur : il relit l'échéance au moins à ce rythme.
     WATCHDOG_TICK = 0.25
 
@@ -4528,8 +4545,10 @@ class AgentWorker(threading.Thread):
         """Attend l'échéance de reprise sans se laisser court-circuiter.
 
         Les réveils (courrier, reset, budget) sont consommés sans lancer de
-        tour ; le bail est renouvelé à son rythme, et l'arrêt, le drainage ou
-        la fermeture de la porte d'hôte interrompent l'attente (B1 cx3)."""
+        tour ; le bail est renouvelé **avant son échéance**, par tranches de
+        `renew_wait` (B1 cx3 : dormir jusqu'à la deadline faisait refuser le
+        renouvellement au réveil), et l'arrêt, le drainage ou la fermeture de
+        la porte d'hôte interrompent l'attente."""
         fin = time.monotonic() + max(0.0, float(duree))
         while not self.stopping.is_set() and not self.runner.stop.is_set():
             if self.runner.draining.is_set() or self.runner.gate_holds():
@@ -4537,8 +4556,30 @@ class AgentWorker(threading.Thread):
             reste = fin - time.monotonic()
             if reste <= 0:
                 return
-            self.wake.wait(timeout=max(0.02, min(self.wait_timeout(reste), reste)))
+            self.wake.wait(timeout=self.renew_wait(reste))
             self.wake.clear()
+            if not self.renew():
+                return
+
+    def _attendre_apres_echec(self, duree: float) -> None:
+        """Attend `duree` après un échec, bail renouvelé, **sans troncature**.
+
+        Quand la durée tient sous le pas de renouvellement (`renew_wait`),
+        un seul `wake.wait` suffit — écourté par un réveil (courrier) comme
+        avant. Au-delà (#1270 : une reprise cadencée peut dépasser le bail de
+        300 s), l'attente se découpe et le bail est renouvelé entre les
+        tranches : dormir jusqu'à l'échéance faisait refuser `renew()` au
+        réveil et le worker rendait le bail (R1 cx3 B1)."""
+        fin = time.monotonic() + max(0.0, float(duree))
+        while not self.stopping.is_set() and not self.runner.stop.is_set():
+            reste = fin - time.monotonic()
+            if reste <= 0:
+                return
+            tranche = self.renew_wait(reste)
+            reveil = self.wake.wait(timeout=tranche)
+            self.wake.clear()
+            if reveil or tranche >= reste:
+                return
             if not self.renew():
                 return
 
@@ -4749,12 +4790,12 @@ class AgentWorker(threading.Thread):
                 # Un message non remis ou un harnais en échec ne doit pas
                 # produire une boucle serrée : on laisse retomber, de plus en
                 # plus longtemps tant que les échecs rapides se suivent (L48).
-                # L'attente est bornée par l'échéance du bail : le worker
-                # renouvelle son bail au lieu de dormir au-delà (#1270 : la
-                # reprise cadencée peut dépasser le bail, la garde durable du
-                # haut de boucle prend le relais).
-                self.wake.wait(timeout=self.wait_timeout(self.failure_wait()))
-                self.wake.clear()
+                # L'attente est honorée en entier mais découpée au pas du
+                # battement (`_attendre_apres_echec`) : le worker renouvelle son
+                # bail au lieu de dormir jusqu'à l'échéance, sinon `renew()`
+                # refusait au réveil (B1 cx3) — #1270 : la reprise cadencée peut
+                # dépasser le bail.
+                self._attendre_apres_echec(self.failure_wait())
         finally:
             self._mark_power_stop()
             self.release_lease()
