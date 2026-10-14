@@ -173,12 +173,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
+          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}
+      # `coverage` est la dependance des temoins de scripts/map.py : sans elle,
+      # les cas qui lisent un vrai fichier de couverture seraient sautes (le
+      # pilote psql ne l'installe pas, d'ou le saut la-bas). La cle de cache
+      # ci-dessus porte `-cov-` : un venv en cache sans coverage ne doit pas
+      # etre reutilise pour ces temoins (#1257).
       - name: dépendances (pilote psycopg)
         if: steps.venv.outputs.cache-hit != 'true'
         run: |
           python -m venv .venv-ci
-          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10'
       - &base
         name: base jetable (sans fsync) et client psql
         run: |

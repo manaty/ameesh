@@ -318,6 +318,10 @@ class CouvertureTronqueeTest(unittest.TestCase):
         self.assertGreater(len(octets), 4096)
         return octets[:-4096]
 
+    #: la lecture d'un fichier de couverture passe par le paquet `coverage`
+    #: (scripts/map.py, `_coverage`) : sans lui, ces cas sont sautés plutôt que
+    #: rouges — le pilote psql de la suite complète ne l'installe pas.
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
     def test_tronquee_ignoree_et_nommee(self):
         part = self._part()
         (part / "cov" / ".coverage.tronquee").write_bytes(self._sqlite_tronque())
@@ -332,6 +336,7 @@ class CouvertureTronqueeTest(unittest.TestCase):
         self.assertIn("illisible", resume)
         self.assertIn(".coverage.tronquee", resume)
 
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
     def test_entete_absent(self):
         part = self._part()
         (part / "cov" / ".coverage.pas-sqlite").write_bytes(b"pas du sqlite")
