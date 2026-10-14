@@ -1,0 +1,1387 @@
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index ee349bdcc..e42b39b53 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -832,7 +832,8 @@ de `ameesh progress` (texte, page HTML, clé `projects` du JSON).
+ * **Courrier en souffrance** (2026-10-11) : les messages non remis dont le
+   destinataire est arrêté (au projet de cet agent) ou absent du registre (au
+   projet de l'expéditeur) — personne ne les lira ; `ameesh mail forward`
+-  les re-livre (voir « Courrier en souffrance »).
++  les re-livre, et le ménage les expire après `mail_dead_letter_days`
++  (L976, voir « Courrier en souffrance »).
+ * **Projet en cours** (`active`) : au moins un agent non arrêté, un lot
+   ouvert ou du courrier en souffrance. Un projet à l'arrêt n'est listé en
+   texte qu'avec `--all` (une ligne de résumé sinon) ; le JSON le porte
+@@ -2761,7 +2762,9 @@ Une alerte = **un objet JSON par ligne** :
+   équipe, jamais un orchestrateur arrêté ni le destinataire mort) : le
+   courrier en souffrance, l'agent qui a repris le travail s'il est connu,
+   les noms proches d'un nom inconnu, et le geste — `ameesh mail forward
+-  <ancien> <nouveau>`, ou `ameesh resume <agent>`. Pour un arrêt non
++  <ancien> <nouveau>`, ou `ameesh resume <agent>` — ou aucun : le ménage de
++  l'exécuteur re-livre au successeur lié, et expire le reste après
++  `mail_dead_letter_days` (L976, `ameesh mail sweep`). Pour un arrêt non
+   `manuel`, elle accompagne `stopped_with_mail` (qui dit de relancer
+   l'agent) : celle-ci dit que son courrier attend en vain, et prévient les
+   orchestrateurs.
+@@ -3760,7 +3763,7 @@ workflow restent relus par un autre modèle (classe sensible, canon §8) :
+ cette commande ne change pas les exigences de relecture, elle change le geste
+ de fusion.
+ 
+-## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`
++## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`, balayage
+ 
+ Constat du 2026-10-10 sur la base du mesh : 42 messages entre agents jamais
+ livrés, sans qu'aucun expéditeur le sache. 27 étaient adressés à
+@@ -3838,6 +3841,35 @@ ameesh mail forward orchestrator orchestrateur
+ ameesh mail forward claude3 mesh-design   # la boîte de l'agent arrêté
+ ```
+ 
++**Vider une boîte morte sans geste humain** (L976) — `ameesh mail sweep`, que
++le ménage de l'exécuteur passe aussi (au plus une fois par heure) :
++
++```
++ameesh mail sweep [--days N] [--dry-run] [--json]
++```
++
++* un agent arrêté dont le **successeur est connu** (sa dernière session est
++  liée à un agent vivant, `ameesh mail bind`) : son courrier lui est re-livré
++  automatiquement (`forward` ci-dessus, mêmes garanties et même trace) ;
++* sinon — arrêté sans successeur, ou nom absent du registre — le courrier
++  attendu depuis plus de `mail_dead_letter_days` jours (défaut 7 ;
++  `AMEESH_MAIL_DEAD_LETTER_DAYS` ; 0 = jamais) est **expiré** : marqué remis
++  avec `meta.expired` (auteur, date, motif), et le fil du projet porte la
++  trace. Un message en cours de remise (réservation active) est laissé, un
++  destinataire relancé entre-temps garde son courrier, et une demande de
++  décision (L124) n'est jamais expirée.
++* `--days N` surcharge la rétention pour ce passage ; `--dry-run` dit ce qui
++  serait fait, sans rien écrire.
++* la décision « boîte morte » est **relue sous verrou du registre, dans la
++  transaction qui écrit** : une relance de l'arrêté ou un arrêt du successeur
++  concurrent bloque jusqu'au commit, au lieu de se glisser entre la lecture et
++  l'écriture (relecture codex3, B1). Un nom absent n'a pas de ligne à
++  verrouiller : son absence vaut décision dans cette même transaction.
++
++L'alerte `mail_undeliverable` se vide donc d'elle-même : au plus une heure
++après l'arrêt (renvoi au successeur), ou à l'échéance de la rétention
++(expiration) ; l'alerte le dit dans son texte.
++
+ ## Issues GitHub des lots — `ameesh work project-github --app` (L126)
+ 
+ Constat du 2026-10-11 : les lots ne vivaient qu'en base, aucune issue ne les
+diff --git a/docs/V1-MAILBOX-RUNNER.md b/docs/V1-MAILBOX-RUNNER.md
+index 78c48e94f..11cb4b4a4 100644
+--- a/docs/V1-MAILBOX-RUNNER.md
++++ b/docs/V1-MAILBOX-RUNNER.md
+@@ -447,7 +447,11 @@ registers an unknown agent as `externe`.
+ the identity bound to the session, `whoami`); "all" skips stopped agents.
+ Undeliverable mail raises the `mail_undeliverable` alert, and `ameesh
+ mail forward <ancien> <nouveau>` re-delivers a dead mailbox to a live agent,
+-keeping the original sender and date. Details:
++keeping the original sender and date. The executor's cleanup also sweeps dead
++mailboxes (`ameesh mail sweep`, L976): a stopped agent's mail goes to its bound
++successor, and mail nobody can read expires after `mail_dead_letter_days`
++(7 by default), with a thread trace — the alert clears without a human.
++Details:
+ [EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
+ 
+ **Hooks: write first, mark after.** The JSON is written to stdout and
+diff --git a/src/ameesh/cli.py b/src/ameesh/cli.py
+index eef32455d..e98e4073a 100644
+--- a/src/ameesh/cli.py
++++ b/src/ameesh/cli.py
+@@ -26,6 +26,11 @@
+                                                  re-delivers the pending mail of a stopped
+                                                  agent (or one missing from the registry) to a
+                                                  live agent: sender and date kept
++  agent-mail sweep [--days N] [--dry-run] [--json]
++                                                 L976: re-delivers the dead mail of a stopped
++                                                 agent to its successor, expires the rest past
++                                                 `mail_dead_letter_days` (7; 0 = never), with
++                                                 a thread trace; run daily by the runner
+   agent-mail list                                agents, host, lease, unread
+   agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
+   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
+@@ -1233,6 +1238,75 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
+     return 0
+ 
+ 
++_SWEEP_USAGE = "usage: agent-mail sweep [--days N] [--dry-run] [--json]"
++
++
++def _sweep_line(action, kind) -> str:
++    """Une ligne du compte rendu de `ameesh mail sweep`."""
++    ids = action.get("messages") or []
++    suffix = " (#%s)" % ", #".join(str(i) for i in ids) if ids else ""
++    if kind == "forwarded":
++        return ("%s (stopped): %d message(s) %s re-delivered to %s%s"
++                % (action["old"], action["count"],
++                   "would be" if action.get("dry_run") else "were", action["new"], suffix))
++    return ("%s (%s): %d message(s) %s expired%s"
++            % (action["recipient"], "unknown" if action.get("unknown") else "stopped",
++               action["count"], "would be" if action.get("dry_run") else "were", suffix))
++
++
++def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
++    """L976 : re-livre au successeur, ou expire après la rétention, le courrier
++    en souffrance (`undeliverable.sweep`) — le même passage que le ménage de
++    l'exécuteur, à la main."""
++    from . import undeliverable
++    try:
++        opts, positional = _options(rest, ("--days",), ("--dry-run", "--json"))
++    except ValueError as exc:
++        print("%s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
++        return 2
++    if positional:
++        print(_SWEEP_USAGE, file=sys.stderr)
++        return 2
++    days = opts.get("--days")
++    if days is not None:
++        try:
++            days = int(days)
++        except (TypeError, ValueError):
++            print("--days expects a whole number of days\n%s" % _SWEEP_USAGE, file=sys.stderr)
++            return 2
++        if days < 0:
++            print("--days must be >= 0\n%s" % _SWEEP_USAGE, file=sys.stderr)
++            return 2
++    try:
++        result = undeliverable.sweep(cfg, bk.db, days=days, actor=_actor(),
++                                     dry_run=bool(opts.get("--dry-run")))
++    except ValueError as exc:
++        print("sweep refused — %s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
++        return 1
++    if opts.get("--json"):
++        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
++        return 0
++    actions = result["forwarded"] + result["expired"]
++    if not actions:
++        print("no dead letter to sweep (retention %d day(s), 0 = never)"
++              % result["days"])
++        return 0
++    if result["dry_run"]:
++        print("dry run: retention %d day(s); %d recipient(s) to sweep:"
++              % (result["days"], len(actions)))
++    for action in result["forwarded"]:
++        print("  " + _sweep_line(action, "forwarded"))
++    for action in result["expired"]:
++        print("  " + _sweep_line(action, "expired"))
++    for action in result["refused"]:
++        print("  %s: re-delivery to %s refused — %s" % (
++            action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
++    if not result["dry_run"]:
++        print("retention %d day(s); dead mail stays in the mailbox, marked expired"
++              % result["days"])
++    return 0
++
++
+ def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
+     if len(rest) > 1 and rest[0] == "--cwd":
+         # Diagnostic : le dossier ne donne aucune identité.
+@@ -1568,6 +1642,12 @@ def main(argv: list[str] | None = None) -> int:
+                       "registry", file=sys.stderr)
+                 return 1
+             return cmd_forward(bk, cfg, rest)
++        if command == "sweep":
++            if bk.kind != "pg":
++                print("the dead-letter sweep requires the database (AMEESH_DSN): the file "
++                      "fallback has no registry", file=sys.stderr)
++                return 1
++            return cmd_sweep(bk, cfg, rest)
+         if command in ("bind", "unbind", "bindings"):
+             if bk.kind != "pg":
+                 print("session bindings require the database (AMEESH_DSN): "
+diff --git a/src/ameesh/config.py b/src/ameesh/config.py
+index 0791c55b2..013e50ff0 100644
+--- a/src/ameesh/config.py
++++ b/src/ameesh/config.py
+@@ -314,6 +314,11 @@ class Config:
+     #: défaut) : les entrées plus anciennes sont retirées par le ménage de
+     #: l'exécuteur ; 0 = aucune expiration
+     thread_retention_days: int = 365
++    #: rétention du courrier en souffrance, en jours (L976) : le ménage de
++    #: l'exécuteur re-livre au successeur d'un agent arrêté, et expire au-delà
++    #: de ce délai le courrier dont personne ne lit la boîte (arrêté sans
++    #: successeur, nom absent du registre) ; 0 = aucune expiration
++    mail_dead_letter_days: int = 7
+     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
+     #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
+     project: str = ""
+@@ -622,6 +627,8 @@ def load(env: dict | None = None) -> Config:
+         threads_dir=_expand(threads_brut) if threads_brut else "",
+         thread_retention_days=_as_days(pick("AMEESH_THREAD_RETENTION_DAYS"),
+                                         cfg.thread_retention_days),
++        mail_dead_letter_days=_as_days(pick("AMEESH_MAIL_DEAD_LETTER_DAYS"),
++                                       cfg.mail_dead_letter_days),
+         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
+         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
+         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),
+diff --git a/src/ameesh/mediated_executor/contract.json b/src/ameesh/mediated_executor/contract.json
+index d34eafe01..ffdaf7ec1 100644
+--- a/src/ameesh/mediated_executor/contract.json
++++ b/src/ameesh/mediated_executor/contract.json
+@@ -3773,7 +3773,7 @@
+   }
+  ],
+  "refused": {
+-  "interface_total": 385,
++  "interface_total": 386,
+   "reasons": {
+    "accounts": "hors du sous-ensemble de l'exécuteur médié",
+    "action_source": "autorité (0012)",
+@@ -3995,6 +3995,7 @@
+    ],
+    "mailbox": [
+     "dead_letters",
++    "expire_dead_letters",
+     "forward",
+     "history",
+     "human_messages",
+diff --git a/src/ameesh/runner.py b/src/ameesh/runner.py
+index 836433540..5fe4b30ac 100644
+--- a/src/ameesh/runner.py
++++ b/src/ameesh/runner.py
+@@ -162,6 +162,9 @@ BOOT_REVIEW_START = ("running", 0)
+ #: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
+ LIVE_REVIEW_EVERY_S = 300.0
+ LIVE_REVIEW_IDLE_S = 600.0
++#: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
++#: l'alerte `mail_undeliverable` est de 15 min)
++DEAD_LETTER_SWEEP_EVERY_S = 3600.0
+ #: #339 r2: a process of this user whose environment cannot be read keeps a
+ #: row if it started after the row, less this margin (the harness starts
+ #: just before its row is opened; the base's clock may drift from the host's)
+@@ -5821,6 +5824,7 @@ class Runner:
+                 # L230: the worktrees are walked at most every few hours
+                 artifact_scan=build_artifacts.due(time.time()))
+             self.expire_threads_once(db)
++            self.sweep_dead_letters_once(db)
+             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
+             if faits:
+                 log_async("cleanup: %s" % "; ".join(
+@@ -5889,6 +5893,40 @@ class Runner:
+                     "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
+         return reports
+ 
++    def sweep_dead_letters_once(self, db, now: float | None = None,
++                                clock: float | None = None) -> dict | None:
++        """L976 : le courrier en souffrance (destinataire arrêté ou inconnu)
++        est re-livré au successeur déclaré, sinon expiré après
++        `mail_dead_letter_days`, au plus une fois par heure depuis le ménage
++        (le seuil d'alerte est de 15 min) ; l'alerte `mail_undeliverable` se
++        vide donc sans geste humain. Ne lève jamais."""
++        now = time.time() if now is None else now
++        # l'intervalle se compte sur l'horloge monotone (r8), le seuil sur l'horloge murale
++        tick = time.monotonic() if clock is None else clock
++        due = getattr(self, "_dead_letters_next", None)
++        if due is not None and tick < due:
++            return None
++        self._dead_letters_next = tick + DEAD_LETTER_SWEEP_EVERY_S
++        if getattr(self, "mediated", False) or db is None:
++            return None               # exécuteur médié : pas de base, pas de balayage
++        try:
++            from . import undeliverable
++            report = undeliverable.sweep(self.cfg, db, now=now, dry_run=self.dry_run)
++        except Exception as exc:      # jamais fatal pour l'exécuteur
++            log_async("dead-letter sweep failed (%s: %s)" % (type(exc).__name__, exc))
++            return None
++        suffix = " [dry-run]" if self.dry_run else ""
++        for action in report["forwarded"]:
++            log_async("undeliverable mail: %d message(s) for %s re-delivered to %s%s"
++                      % (action["count"], action["old"], action["new"], suffix))
++        for action in report["expired"]:
++            log_async("undeliverable mail: %d message(s) for %s expired after %d day(s)%s"
++                      % (action["count"], action["recipient"], report["days"], suffix))
++        for action in report["refused"]:
++            log_async("undeliverable mail: %s not re-delivered to %s (%s)"
++                      % (action["old"], action["new"], action["reason"].splitlines()[0]))
++        return report
++
+     def branch_sweep_once(self) -> dict | None:
+         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
+         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
+diff --git a/src/ameesh/storage/__init__.py b/src/ameesh/storage/__init__.py
+index ea5551ee6..250be051b 100644
+--- a/src/ameesh/storage/__init__.py
++++ b/src/ameesh/storage/__init__.py
+@@ -35,11 +35,12 @@ la documentation de `storage.interface`.
+ """
+ from __future__ import annotations
+ 
+-from .interface import ReservationContention, Storage
++from .interface import MailboxRefused, ReservationContention, Storage
+ from .postgres import PostgresStorage
+ from .remote.client import RemoteDb
+ 
+-__all__ = ["ReservationContention", "Storage", "PostgresStorage", "of", "is_remote"]
++__all__ = ["MailboxRefused", "ReservationContention", "Storage", "PostgresStorage", "of",
++           "is_remote"]
+ 
+ 
+ def of(db) -> Storage:
+diff --git a/src/ameesh/storage/interface.py b/src/ameesh/storage/interface.py
+index 656ed14b3..31ba09d3b 100644
+--- a/src/ameesh/storage/interface.py
++++ b/src/ameesh/storage/interface.py
+@@ -713,6 +713,13 @@ class Credentials(Domain):
+ # boîte aux lettres (`agent_mailbox`)
+ # --------------------------------------------------------------------------
+ 
++class MailboxRefused(RuntimeError):
++    """L976 : le renvoi d'une boîte morte est refusé par l'état du registre,
++    relu SOUS VERROU dans la transaction qui copie — un destinataire relancé
++    entre la lecture et l'écriture, un successeur arrêté ou un nom absent.
++    L'appelant (`ameesh.undeliverable`) la rend en `Refused` lisible."""
++
++
+ class Mailbox(Domain):
+     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
+ 
+@@ -815,7 +822,39 @@ class Mailbox(Domain):
+         message, auteur du renvoi ; la signature, qui couvre le destinataire,
+         ne suit pas) ; l'original passe remis, renvoi noté (`meta.forwarded`).
+         Rend une ligne par message renvoyé : `original_id`, `new_id`,
+-        `sender`, `kind`, `work_item_id`, `created_ts`."""
++        `sender`, `kind`, `work_item_id`, `created_ts`.
++
++        L976 : la décision est prise DANS cette transaction, sous le verrou
++        advisory par nom (`registry.NAME_LOCK_*`, partagé avec tous les chemins
++        de création d'une ligne du registre) puis sous les lignes du registre
++        de `old` et `new` (`FOR UPDATE`, par ordre de nom), leur statut relu
++        après l'attente éventuelle : `old` relancé, `new` absent ou arrêté
++        lèvent `MailboxRefused`. Une relance, un arrêt ou une INSCRIPTION
++        concurrente de `old` (nom absent : aucune ligne à verrouiller) ne peut
++        plus se glisser entre la lecture et la copie (relectures codex3, B1
++        puis B1 résiduel)."""
++
++    @abc.abstractmethod
++    def expire_dead_letters(self, recipient: str, note: dict, before_ts: float,
++                            dry_run: bool = False) -> list[dict]:
++        """L976 : expire le courrier en souffrance de `recipient` — non remis,
++        reçu avant `before_ts`, sans réservation active, hors demande de
++        décision (L124) — à condition qu'il soit TOUJOURS une boîte morte
++        (absent du registre ou arrêté) : marqué remis, `note` dans
++        `meta.expired`. Un destinataire relancé entre la lecture et l'écriture
++        garde son courrier. Rend une ligne par message expiré : `id`, `sender`,
++        `kind`, `created_ts` ; `dry_run` : ceux qui le seraient, rien n'est
++        écrit.
++
++        L976 : le statut est relu SOUS LE VERROU — verrou advisory par nom
++        (`registry.NAME_LOCK_*`, partagé avec tous les chemins de création)
++        pris dans une instruction à part AVANT la décision, puis verrou de la
++        ligne du registre (`FOR SHARE`) quand elle existe — donc après
++        l'attente éventuelle sur une relance en cours : le courrier d'un vivant
++        n'est jamais expiré. L'inscription concurrente d'un nom ABSENT (aucune
++        ligne à verrouiller) prend le même verrou advisory : elle attend, ou sa
++        ligne est vue par la lecture suivante (relectures codex3, B1 puis B1
++        résiduel). `dry_run` : lecture seule, sans verrou."""
+ 
+     @abc.abstractmethod
+     def human_messages(self, *, since_ts: float, humans: Sequence[str],
+diff --git a/src/ameesh/storage/postgres/canon.py b/src/ameesh/storage/postgres/canon.py
+index 07ebb677c..25bc60d8f 100644
+--- a/src/ameesh/storage/postgres/canon.py
++++ b/src/ameesh/storage/postgres/canon.py
+@@ -13,6 +13,7 @@ import json
+ 
+ from .. import interface
+ from .placement import PROFILE_PARAMS_SQL, profile_params, profile_sql
++from .registry import NAME_LOCK_CTE, name_lock_key
+ 
+ _CAPS_SQL = ("CASE WHEN %s::text IS NULL THEN NULL "
+              "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END")
+@@ -214,6 +215,7 @@ class Canon(interface.Canon):
+         roles = _caps_param(values.get("roles"))
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
+                  credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at,
+@@ -221,9 +223,10 @@ class Canon(interface.Canon):
+                  visibility_ok, visibility_diagnostic,
+                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
+                  projects, roles)
+-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
+-                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
+-                    __PROJECTS__, __ROLES__)
++            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
++                   %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
++                   __PROJECTS__, __ROLES__
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 harness         = excluded.harness,
+                 host            = excluded.host,
+@@ -257,13 +260,15 @@ class Canon(interface.Canon):
+                    OR NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
+                                   AND h.state NOT IN ('verified','cancelled')))
+             RETURNING name
+-            """.replace("__CAPS__", _CAPS_SQL)
++            """.replace("__LOCK__", NAME_LOCK_CTE)
++               .replace("__CAPS__", _CAPS_SQL)
+                .replace("__AHOSTS__", _CAPS_SQL)
+                .replace("__ATAGS__", _CAPS_SQL)
+                .replace("__PROJECTS__", _CAPS_SQL)
+                .replace("__ROLES__", _CAPS_SQL)
+                .replace("__PROFILE__", PROFILE_PARAMS_SQL),
+-            (name, values["harness"], values["host"], values["cwd"], values["model"],
++            (name_lock_key(name),
++             name, values["harness"], values["host"], values["cwd"], values["model"],
+              values["budget_usd"], values["responsible"], values["team"], values["provider"],
+              values["credential_mode"], caps, caps, values["canon_ref"],
+              int(values.get("priority") or 0), ahosts, ahosts, atags, atags,
+@@ -437,6 +442,7 @@ class Ephemerals(interface.Ephemerals):
+         est encore le profil évalué."""
+         created = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, chantier, harness, host, cwd, model, responsible, team, projects, provider,
+                  credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
+@@ -465,6 +471,7 @@ class Ephemerals(interface.Ephemerals):
+                    -- L42 (0031) : l'éphémère appartient au canon de son créateur
+                    c.canon
+               FROM agent_registry c
++             CROSS JOIN l
+              WHERE c.name = %s
+                AND coalesce(c.responsible, '') <> ''
+                AND c.status <> 'stopped'
+@@ -473,8 +480,8 @@ class Ephemerals(interface.Ephemerals):
+             RETURNING name, responsible, host, harness, capabilities, created_by,
+                       placement_ok, placement_diagnostic,
+                       extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
+-            """.replace("__NOW__", profile_sql("c")),
+-            (name, cwd, ttl_seconds, ttl_seconds, creator),
++            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__NOW__", profile_sql("c")),
++            (name_lock_key(name), name, cwd, ttl_seconds, ttl_seconds, creator),
+         )
+         return created[0] if created else None
+ 
+diff --git a/src/ameesh/storage/postgres/decisions.py b/src/ameesh/storage/postgres/decisions.py
+index fc2ffe688..56d6b722a 100644
+--- a/src/ameesh/storage/postgres/decisions.py
++++ b/src/ameesh/storage/postgres/decisions.py
+@@ -17,6 +17,7 @@ import json
+ 
+ from .. import interface
+ from .mailbox import PROJECT_SQL
++from .registry import NAME_LOCK_CTE, name_lock_key
+ 
+ #: une ligne de `agent_mailbox` qui porte une demande de décision
+ _IS_DECISION = "kind = 'request' AND (payload -> 'decision') IS NOT NULL"
+@@ -138,10 +139,12 @@ class Decisions(interface.Decisions):
+         # session l'inscrit (`upsert_unleased` n'écrit qu'une session vide).
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, workstream, harness, host, cwd, session_id, status, status_text,
+                  mode, responsible, created_by, last_seen, updated_at)
+-            VALUES (%s, '', %s, %s, %s, NULL, 'idle', %s, 'externe', %s, %s, now(), now())
++            SELECT %s, '', %s, %s, %s, NULL, 'idle', %s, 'externe', %s, %s, now(), now()
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 harness = excluded.harness,
+                 host = excluded.host,
+@@ -160,7 +163,7 @@ class Decisions(interface.Decisions):
+                     OR agent_registry.lease_expires_at IS NULL
+                     OR agent_registry.lease_expires_at <= clock_timestamp())
+             RETURNING name, mode, responsible, harness, host
+-            """,
+-            (name, harness, host, cwd, status_text, human, human),
++            """.replace("__LOCK__", NAME_LOCK_CTE),
++            (name_lock_key(name), name, harness, host, cwd, status_text, human, human),
+         )
+         return rows[0] if rows else None
+diff --git a/src/ameesh/storage/postgres/mailbox.py b/src/ameesh/storage/postgres/mailbox.py
+index e144d9bcc..c4befb672 100644
+--- a/src/ameesh/storage/postgres/mailbox.py
++++ b/src/ameesh/storage/postgres/mailbox.py
+@@ -11,7 +11,7 @@ from __future__ import annotations
+ import json
+ 
+ from .. import interface
+-from .registry import canon_governed_sql
++from .registry import NAME_LOCK_SQL, canon_governed_sql, name_lock_key
+ 
+ #: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
+ #: gouverné par le canon, sinon son chantier, désormais `workstream` (un
+@@ -397,6 +397,39 @@ class Mailbox(interface.Mailbox):
+         # message pris entre-temps par une remise (verrou de ligne, WHERE
+         # réévalué) n'est pas renvoyé.
+         with self.db.transaction() as tx:
++            # L976 (R2 delta codex3, B1 résiduel) : le verrou par nom est pris
++            # AVANT toute lecture du registre, et les chemins de création
++            # prennent le même (`registry.NAME_LOCK_CTE`). L'absence d'une
++            # ligne — qu'un `FOR UPDATE` ne verrouille pas — ne peut donc plus
++            # se glisser entre la lecture et la copie : une inscription
++            # concurrente attend notre commit, et si elle l'a gagné, la lecture
++            # ci-dessous la voit (instantané de l'instruction suivante).
++            # Deux renvois croisés prennent les verrous par ordre de clé.
++            for key in sorted({name_lock_key(old), name_lock_key(new)}):
++                tx.query(NAME_LOCK_SQL, (key,))
++            # Puis la décision sous le verrou des deux lignes du registre
++            # (`FOR UPDATE`, par ordre de nom : deux renvois croisés ne
++            # s'interbloquent pas) et le statut est relu après l'attente
++            # éventuelle. Une relance de `old` ou un arrêt de `new` committé
++            # entre la lecture et la copie bloquait jusqu'ici sans être revu :
++            # il bloque désormais sur ce verrou jusqu'à notre commit, donc
++            # jamais entre la décision et la copie.
++            locked = {row["name"]: row["status"] for row in tx.query(
++                "SELECT name, status FROM agent_registry"
++                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))}
++            if old == new:
++                raise interface.MailboxRefused(
++                    "old and new recipient are the same (%s)" % old)
++            if old in locked and locked[old] != "stopped":
++                raise interface.MailboxRefused(
++                    "%s is not stopped (status %s): its mailbox is read, forward refused"
++                    % (old, locked[old]))
++            if new not in locked:
++                raise interface.MailboxRefused(
++                    "%s is not in the registry: forward to a live agent" % new)
++            if locked[new] == "stopped":
++                raise interface.MailboxRefused(
++                    "%s is stopped: forward to a live agent" % new)
+             ids = sorted(int(row["id"]) for row in tx.query(
+                 "SELECT m.id FROM agent_mailbox m"
+                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"
+@@ -439,3 +472,55 @@ class Mailbox(interface.Mailbox):
+                 """ % ", ".join("(%d, %d)" % pair for pair in pairs),
+                 (new, by))
+         return sorted(rows, key=lambda row: int(row["original_id"]))
++
++    def expire_dead_letters(self, recipient, note, before_ts, dry_run=False) -> list[dict]:
++        # L976 : expire le courrier en souffrance d'une boîte morte. La
++        # décision (boîte morte) est prise sous le verrou par nom
++        # (`registry.NAME_LOCK_*`, partagé avec les chemins de création), puis
++        # sous le verrou de la ligne du registre quand elle existe (`FOR
++        # SHARE`) : une relance concurrente comme une inscription d'un nom
++        # absent bloquent jusqu'à notre commit, et le statut est relu après
++        # l'attente — le courrier d'un vivant n'est jamais expiré (relectures
++        # codex3, B1 puis B1 résiduel). Mêmes exclusions que `dead_letters`
++        # (L124 : une demande de décision attend un humain) et que `forward`
++        # (réservation active : le message est peut-être montré). `before_ts` :
++        # seuls les messages reçus avant ce seuil (la rétention). `dry_run` :
++        # lecture seule, sans verrou.
++        v = ("WITH v AS (SELECT name, status FROM agent_registry"
++             " WHERE name = %%s FOR SHARE) ")
++        where = """
++             WHERE m.recipient = %%s
++               AND m.delivered_at IS NULL
++               AND m.created_at <= to_timestamp(%%s)
++               AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
++               AND NOT (%s)
++               AND (NOT EXISTS (SELECT 1 FROM v) OR (SELECT status FROM v) = 'stopped')
++            """ % _RESERVED_SQL
++        columns = ("m.id, m.sender, m.kind,"
++                   " extract(epoch from m.created_at)::float8 AS created_ts")
++        if dry_run:
++            rows = self.db.query((v + "SELECT %s FROM agent_mailbox AS m%s")
++                                 % (columns, where),
++                                 (recipient, recipient, float(before_ts)))
++        else:
++            # L976 (relecture codex3, B1 résiduel) : le verrou par nom est pris
++            # dans une instruction À PART, avant la décision : une inscription
++            # concurrente prend le même verrou (chemins de création), donc soit
++            # elle a gagné et la lecture de l'instruction suivante la voit,
++            # soit elle attend notre commit — l'absence ne se glisse plus entre
++            # la lecture et l'écriture (une seconde lecture sans verrou ne
++            # suffit pas : l'instantané d'une même instruction ne se rafraîchit
++            # pas après l'attente sur le verrou).
++            with self.db.transaction() as tx:
++                tx.query(NAME_LOCK_SQL, (name_lock_key(recipient),))
++                rows = tx.query(
++                    (v + """
++                    UPDATE agent_mailbox AS m
++                       SET delivered_at = now(), status = 'delivered',
++                           meta = m.meta || jsonb_build_object('expired', %%s::jsonb)
++                    %s
++                     RETURNING %s
++                    """) % (where, columns),
++                    (recipient, json.dumps(note or {}, ensure_ascii=False), recipient,
++                     float(before_ts)))
++        return sorted(rows, key=lambda row: int(row["id"]))
+diff --git a/src/ameesh/storage/postgres/registry.py b/src/ameesh/storage/postgres/registry.py
+index e94c6cdcf..013c9da53 100644
+--- a/src/ameesh/storage/postgres/registry.py
++++ b/src/ameesh/storage/postgres/registry.py
+@@ -163,6 +163,32 @@ def placement_admitted_sql(alias: str = "agent_registry") -> str:
+         "governed": canon_governed_sql(a), "a": a}
+ 
+ 
++# --------------------------------------------------------------------------
++# verrou par nom (L976)
++# --------------------------------------------------------------------------
++
++#: L976 : verrou advisory par nom, partagé par TOUS les chemins de création
++#: d'une ligne du registre et par la décision « boîte morte »
++#: (`mailbox.forward`, `mailbox.expire_dead_letters`). `FOR SHARE`/`FOR UPDATE`
++#: ne verrouillent que les lignes PRÉSENTES : sans ce verrou, une inscription
++#: concurrente pouvait se committer entre la lecture d'absence et l'écriture,
++#: et le courrier d'un agent vivant était expiré ou renvoyé (relecture codex3,
++#: B1 résiduel). La décision prend le verrou dans une instruction À PART, avant
++#: sa lecture : l'instantané de l'instruction suivante voit alors l'inscription
++#: qui a gagné le verrou.
++NAME_LOCK_EXPR = "pg_advisory_xact_lock(hashtextextended(%s, 0))"
++#: la prise de verrou seule (décision : instruction à part, avant la lecture)
++NAME_LOCK_SQL = "SELECT " + NAME_LOCK_EXPR
++#: la même prise de verrou, en CTE d'une instruction de création (le verrou
++#: est alors tenu jusqu'à la fin de l'instruction, donc du commit)
++NAME_LOCK_CTE = "WITH l AS (SELECT " + NAME_LOCK_EXPR + " AS _)"
++
++
++def name_lock_key(name: str) -> str:
++    """Clé du verrou advisory d'un nom (insensible à la casse)."""
++    return "ameesh-agent-registry:" + (name or "").lower()
++
++
+ # --------------------------------------------------------------------------
+ # lignes du registre
+ # --------------------------------------------------------------------------
+@@ -175,12 +201,14 @@ class Agents(interface.Agents):
+         # (`execute`) n'est jamais basculé par une inscription.
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, chantier, harness, host, cwd, session_id, status, status_text,
+                  model, budget_usd, mode, last_seen, updated_at)
+-            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+-                    coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
+-                    now(), now())
++            SELECT %s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
++                   coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
++                   now(), now()
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 chantier    = coalesce(nullif(%s,''), agent_registry.chantier),
+                 harness     = coalesce(nullif(%s,''), agent_registry.harness),
+@@ -200,8 +228,9 @@ class Agents(interface.Agents):
+                 last_seen   = now(),
+                 updated_at  = now()
+             RETURNING __COLUMNS__
+-            """.replace("__COLUMNS__", AGENT_COLUMNS),
+-            (name, chantier, harness, host, cwd, session_id, status, status_text,
++            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__COLUMNS__", AGENT_COLUMNS),
++            (name_lock_key(name),
++             name, chantier, harness, host, cwd, session_id, status, status_text,
+              model, budget_usd, mode, chantier, harness, host, status),
+         )
+         return rows[0]
+@@ -216,11 +245,13 @@ class Agents(interface.Agents):
+         # écrits seulement s'il n'y avait pas encore de session).
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, chantier, harness, host, cwd, session_id, mode,
+                  last_seen, updated_at)
+-            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+-                    'externe', now(), now())
++            SELECT %s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
++                   'externe', now(), now()
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 chantier = CASE WHEN agent_registry.mode = 'execute'
+                                 THEN agent_registry.chantier
+@@ -251,8 +282,8 @@ class Agents(interface.Agents):
+                 updated_at = CASE WHEN agent_registry.mode = 'execute'
+                                   THEN agent_registry.updated_at ELSE now() END
+             RETURNING __COLUMNS__
+-            """.replace("__COLUMNS__", AGENT_COLUMNS),
+-            (name, chantier, harness, host, cwd, session_id, harness),
++            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__COLUMNS__", AGENT_COLUMNS),
++            (name_lock_key(name), name, chantier, harness, host, cwd, session_id, harness),
+         )
+         return rows[0]
+ 
+diff --git a/src/ameesh/undeliverable.py b/src/ameesh/undeliverable.py
+index a14e09589..09ea04be9 100644
+--- a/src/ameesh/undeliverable.py
++++ b/src/ameesh/undeliverable.py
+@@ -28,9 +28,15 @@ Les parades, appelées par `ameesh mail send|forward`, `ameesh alerts` /
+ * `forward` : `ameesh mail forward <ancien> <nouveau>` re-livre le courrier en
+   attente d'une boîte morte à un agent vivant, expéditeur et date d'origine
+   gardés, renvoi noté ; l'original n'est plus en attente.
++* `sweep` (L976) : le ménage de l'exécuteur re-livre le courrier d'un agent
++  arrêté dont le successeur est connu, et expire au-delà de
++  `mail_dead_letter_days` celui dont personne ne lit la boîte (arrêté sans
++  successeur, nom absent du registre), avec une trace au fil : l'alerte
++  `mail_undeliverable` peut ainsi se vider sans geste humain. `ameesh mail
++  sweep` fait le même passage à la main.
+ 
+ Le SQL est dans le stockage (`storage.of(db).mailbox` : `dead_letters`,
+-`forward`).
++`forward`, `expire_dead_letters`).
+ """
+ from __future__ import annotations
+ 
+@@ -42,6 +48,9 @@ from . import fil, registry, storage
+ 
+ #: `mail_undeliverable` : courrier en attente depuis 15 min
+ DEFAULT_THRESHOLD_S = 900.0
++#: L976 : rétention du courrier en souffrance avant expiration, en jours
++#: (`cfg.mail_dead_letter_days`, 0 = aucune expiration)
++DEFAULT_DEAD_LETTER_DAYS = 7
+ #: noms proches proposés au plus
+ MAX_SUGGESTIONS = 5
+ #: orchestrateurs déclarés (comme `ameesh alerts --orchestrators`)
+@@ -430,12 +439,7 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
+             if row.get("status") != "stopped":
+                 continue                  # relancé entre les deux lectures
+             if bindings is None:
+-                try:
+-                    bindings = storage.of(db).session_bindings.listing()
+-                except db_mod.SchemaMissing:
+-                    raise
+-                except db_mod.DbError:
+-                    bindings = []
++                bindings = _bindings(db)
+             heir = successor(db, row, bindings=bindings)
+             teams = {team_of(row)}
+             reason = "arrete"
+@@ -447,6 +451,7 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
+                          name, heir.split(", ")[0] if heir else "<live agent>", name))
+             if heir:
+                 detail += " (work taken over by %s)" % heir
++            detail += _retention_note(cfg)
+             extra.update(stop_reason=row.get("stop_reason") or None, successor=heir,
+                          host=row.get("host") or None)
+         else:
+@@ -463,6 +468,7 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
+                       % (group["count"], age, name, _senders(group),
+                          "Close names: %s. " % ", ".join(n for n, _why in near) if near else "",
+                          name))
++            detail += _retention_note(cfg)
+             extra.update(suggestions=[n for n, _why in near])
+         orchestras = team_orchestrators(listing, known, {t for t in teams if t},
+                                         exclude=(name,))
+@@ -520,7 +526,12 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
+     Chaque message garde son expéditeur, sa date, sa nature et son lot ; la
+     copie porte `meta.forwarded_from` (montré au destinataire), l'original
+     passe remis avec `meta.forwarded` ; le renvoi est écrit dans le fil.
+-    `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`."""
++    `dry_run` : ce qui serait renvoyé, rien n'est écrit. Lève `Refused`.
++
++    L976 (relecture codex3, B1) : le statut de `old` et `new` est relu sous
++    verrou du registre DANS la transaction qui copie ; une relance de l'un ou
++    un arrêt de l'autre, committé entre la lecture et la copie, lève `Refused`
++    au lieu de copier le courrier d'un vivant vers un mort."""
+     if old == new:
+         raise Refused("old and new recipient are the same (%s)" % old)
+     old_row, new_row = db_mod.batched(db, lambda d: [registry.get(d, old),
+@@ -543,7 +554,13 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
+                               "kind": r.get("kind"), "created_ts": r.get("created_ts")}
+                              for r in rows],
+                 "forwarded": []}
+-    moved = storage.of(db).mailbox.forward(old, new, actor)
++    try:
++        moved = storage.of(db).mailbox.forward(old, new, actor)
++    except storage.MailboxRefused as exc:
++        # L976 (relecture codex3, B1) : le statut de `old`/`new` est relu sous
++        # verrou dans la transaction qui copie — une relance ou un arrêt
++        # concurrent gagne ici, jamais entre la lecture et la copie.
++        raise Refused(str(exc)) from None
+     if moved:
+         project = fil.project_for(cfg, team_of(new_row), team_of(old_row))
+         fil.record(
+@@ -558,3 +575,151 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
+                   "copies": [int(r["new_id"]) for r in moved]})
+     return {"old": old, "new": new, "old_state": state, "dry_run": False,
+             "messages": [], "forwarded": moved}
++
++
++# --------------------------------------------------------------------------
++# balayage (`ameesh mail sweep`, ménage de l'exécuteur) — L976
++# --------------------------------------------------------------------------
++
++def _bindings(db) -> list:
++    """Les liaisons de session, une fois : []; un schéma absent remonte."""
++    try:
++        return storage.of(db).session_bindings.listing()
++    except db_mod.SchemaMissing:
++        raise
++    except db_mod.DbError:
++        return []
++
++
++def _retention_days(cfg, days) -> int:
++    days = (getattr(cfg, "mail_dead_letter_days", DEFAULT_DEAD_LETTER_DAYS)
++            if days is None else days)
++    try:
++        days = int(days)
++    except (TypeError, ValueError):
++        raise ValueError("mail retention must be a whole number of days, >= 0")
++    if days < 0:
++        raise ValueError("mail retention must be a whole number of days, >= 0")
++    return days
++
++
++def _retention_note(cfg) -> str:
++    """Ce que l'alerte dit du balayage automatique, si la rétention est active."""
++    try:
++        days = _retention_days(cfg, None)
++    except ValueError:
++        return ""
++    return ("; expires automatically after %d day(s) without a live successor "
++            "(ameesh mail sweep)" % days) if days > 0 else ""
++
++
++def _trace_expiry(cfg, db, name, row, expired, days, actor) -> None:
++    """Trace d'une expiration, au fil du projet du mort (ou de l'inconnu)."""
++    senders: dict = {}
++    for message in expired:
++        sender = message.get("sender") or "?"
++        senders[sender] = senders.get(sender, 0) + 1
++    fil.record(
++        cfg, db, sender=actor, recipients=[name],
++        text=("Expired %d undeliverable message(s) addressed to %s, pending for more than "
++              "%d day(s): %s; nobody read them. From %s. The messages stay in the mailbox, "
++              "marked expired."
++              % (len(expired), name, days,
++                 "the agent is stopped" if row is not None
++                 else "the name is not in the registry",
++                 ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
++                                                           key=lambda kv: (-kv[1], kv[0]))))),
++        project=fil.project_for(cfg, team_of(row)),
++        meta={"audit": "expire", "recipient": name, "days": days,
++              "messages": [int(m["id"]) for m in expired]})
++
++
++def sweep(cfg, db, *, days=None, now=None, dry_run=False, actor="ameesh:mail-sweep") -> dict:
++    """L976 : re-livre ou expire le courrier en souffrance, sans geste humain.
++
++    Destinataires visés : ceux de `dead_letters` (agent arrêté, ou nom absent
++    du registre) — personne ne lit leur boîte.
++
++    * un agent arrêté dont le successeur est connu (`successor` : la session de
++      l'arrêté est liée à un agent vivant) : le courrier lui est re-livré
++      (`forward`, tracé au fil), quel que soit son âge ; si le successeur est
++      lui-même arrêté, le renvoi est refusé, noté, et le courrier suit la
++      rétention ci-dessous au lieu d'attendre indéfiniment ;
++    * sinon, le courrier attendu depuis plus de `days` jours
++      (`mail_dead_letter_days`, 0 = aucune expiration) est expiré
++      (`mailbox.expire_dead_letters` : remis, `meta.expired`), et le fil porte
++      la trace — l'alerte `mail_undeliverable` peut alors se vider sans
++      intervention humaine.
++
++    `dry_run` : ce qui serait fait, rien n'est écrit. Rend `{days, cutoff,
++    dry_run, forwarded, expired, refused}` ; les listes disent le
++    destinataire, le nombre et les ids. Une boîte relancée entre la lecture et
++    l'écriture garde son courrier (le stockage revérifie sous verrou)."""
++    days = _retention_days(cfg, days)
++    now = time.time() if now is None else float(now)
++    cutoff = now - days * 86400.0 if days > 0 else None
++    mail = storage.of(db).mailbox
++    groups = sorted(by_recipient(mail.dead_letters()), key=lambda g: g["recipient"])
++    rows = registry_rows(db, [g["recipient"] for g in groups]) if groups else {}
++    bindings: list | None = None
++    report = {"days": days, "cutoff": cutoff, "dry_run": bool(dry_run),
++              "forwarded": [], "expired": [], "refused": []}
++    for group in groups:
++        name = group["recipient"]
++        row = rows.get(name)
++        if row is not None and row.get("status") != "stopped":
++            continue                  # relancé entre les deux lectures : sa boîte est lue
++        heir = None
++        if row is not None:
++            if bindings is None:
++                bindings = _bindings(db)
++            heir = successor(db, row, bindings=bindings)
++        if heir:
++            target = heir.split(", ")[0]
++            if dry_run:
++                try:
++                    moved = forward(cfg, db, name, target, actor=actor, now=now, dry_run=True)
++                except Refused as exc:
++                    report["refused"].append({"old": name, "new": target, "reason": str(exc)})
++                else:
++                    if moved["messages"]:
++                        report["forwarded"].append({
++                            "old": name, "new": target, "count": len(moved["messages"]),
++                            "dry_run": True,
++                            "messages": [int(m["id"]) for m in moved["messages"]]})
++                        continue
++                heir = None
++            else:
++                try:
++                    moved = forward(cfg, db, name, target, actor=actor, now=now)
++                except Refused as exc:
++                    # successeur lui-même mort : le courrier reste, et suit la
++                    # rétention ci-dessous plutôt que d'attendre indéfiniment
++                    report["refused"].append({"old": name, "new": target, "reason": str(exc)})
++                    heir = None
++                else:
++                    if moved["forwarded"]:
++                        report["forwarded"].append({
++                            "old": name, "new": target, "count": len(moved["forwarded"]),
++                            "messages": [int(r["original_id"]) for r in moved["forwarded"]],
++                            "senders": sorted({r.get("sender") for r in moved["forwarded"]
++                                               if r.get("sender")})})
++                        continue
++                    heir = None       # rien à renvoyer (déjà remis entre-temps)
++        due = cutoff is not None and group["oldest_ts"] is not None \
++            and float(group["oldest_ts"]) <= cutoff
++        if not due:
++            continue
++        expired = mail.expire_dead_letters(name, {"at": now, "days": days, "by": actor},
++                                           cutoff, dry_run=dry_run)
++        if not expired:
++            continue                  # relancé, réservé ou déjà remis entre-temps
++        action = {"recipient": name, "count": len(expired),
++                  "oldest_ts": group["oldest_ts"], "unknown": bool(group["unknown"]),
++                  "messages": [int(m["id"]) for m in expired]}
++        if dry_run:
++            report["expired"].append(dict(action, dry_run=True))
++            continue
++        report["expired"].append(action)
++        _trace_expiry(cfg, db, name, row, expired, days, actor)
++    return report
+diff --git a/tests/test_undeliverable.py b/tests/test_undeliverable.py
+index 9aba33cad..a9cb0fe6f 100644
+--- a/tests/test_undeliverable.py
++++ b/tests/test_undeliverable.py
+@@ -13,11 +13,13 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import threading
+ import time
+ import unittest
+ 
+ from ameesh import exploitation, mail, notify, projects, registry, storage, undeliverable
+ from ameesh.backend import PgBackend
++from ameesh.scoped_db import ScopedDb
+ 
+ from .support import PgTestCase
+ 
+@@ -505,5 +507,429 @@ class RenvoiTest(_Base):
+         self.assertEqual([m["id"] for m in mail.unread(self.db, "claude3")], [reserved])
+ 
+ 
++class SweepTest(_Base):
++    """L976 : le balayage vide les boîtes mortes sans geste humain — re-livraison
++    au successeur déclaré (session liée, L41), sinon expiration message par
++    message après `mail_dead_letter_days`, avec trace ; l'alerte
++    `mail_undeliverable` peut alors se vider d'elle-même."""
++
++    def setUp(self) -> None:
++        super().setUp()
++        for name in ("claude1", "mesh-design", "orchestrateur"):
++            self.agent(name)
++        self.agent("claude3")
++
++    def lie(self, agent="claude3", session="s-claude3", to="mesh-design"):
++        """Déclare `to` successeur de `agent` (sa session est liée)."""
++        registry.set_session(self.db, agent, session)
++        storage.of(self.db).session_bindings.bind(
++            host=self.cfg.host, harness="claude", session_id=session, agent=to,
++            pid=None, created_by="human:proprio")
++
++    def age(self, days):
++        self.db.execute("UPDATE agent_mailbox SET created_at = now() - make_interval("
++                        "days => %s)", (int(days),))
++
++    def alertes(self):
++        return [a for a in exploitation.alerts(self.cfg, self.db)
++                if a["type"] == "mail_undeliverable"]
++
++    def test_re_delivre_au_successeur_declare(self):
++        self.lie()
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport 1.")
++        mail.send(self.db, "orchestrateur", "claude3", "Gel du lot.", kind="event")
++        self.age(2)
++        report = undeliverable.sweep(self.cfg, self.db)
++        self.assertEqual(report["days"], 7)
++        [fwd] = report["forwarded"]
++        self.assertEqual((fwd["old"], fwd["new"], fwd["count"]),
++                         ("claude3", "mesh-design", 2))
++        self.assertEqual(report["expired"], [])
++        self.assertEqual(self.pending("claude3"), [])
++        copies = mail.unread(self.db, "mesh-design")
++        self.assertEqual([c["body"] for c in copies], ["Rapport 1.", "Gel du lot."])
++        self.assertEqual(copies[0]["forwarded_from"], "claude3")   # expéditeur et date gardés
++        self.assertEqual(self.alertes(), [])
++        # rejoué : plus rien à faire, aucune erreur
++        again = undeliverable.sweep(self.cfg, self.db)
++        self.assertEqual((again["forwarded"], again["expired"], again["refused"]),
++                         ([], [], []))
++
++    def test_expire_apres_la_retention_avec_trace(self):
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport 1.")
++        mail.send(self.db, "claude1", "claude3", "Rapport 2.")
++        self.age(3)
++        report = undeliverable.sweep(self.cfg, self.db)
++        self.assertEqual((report["forwarded"], report["expired"]), ([], []))
++        self.assertEqual(len(self.pending("claude3")), 2)          # sous la rétention
++        self.assertEqual(len(self.alertes()), 1)                   # mais déjà en alerte
++        self.age(8)
++        report = undeliverable.sweep(self.cfg, self.db)
++        [exp] = report["expired"]
++        self.assertEqual((exp["recipient"], exp["count"], exp["unknown"]),
++                         ("claude3", 2, False))
++        self.assertEqual(self.pending("claude3"), [])
++        rows = self.db.query("SELECT meta->'expired' AS note FROM agent_mailbox"
++                             " WHERE recipient = 'claude3' ORDER BY id")
++        for row in rows:
++            note = json.loads(row["note"]) if isinstance(row["note"], str) else row["note"]
++            self.assertEqual((note["days"], note["by"]), (7, "ameesh:mail-sweep"))
++        self.assertIn("Expired 2 undeliverable message(s) addressed to claude3",
++                      self.mesh("fil", "show", "manaty").stdout)
++        self.assertEqual(self.alertes(), [])                       # l'alerte se vide
++
++    def test_expire_respecte_le_seuil_du_message(self):
++        """Le défaut corrigé : sans le seuil, un message FRAIS d'une boîte morte
++        partait avec les vieux."""
++        self.stop("claude3")
++        old = mail.send(self.db, "claude1", "claude3", "Vieux.")
++        fresh = mail.send(self.db, "claude1", "claude3", "Frais.")
++        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'"
++                        " WHERE id = %s", (old,))
++        report = undeliverable.sweep(self.cfg, self.db)
++        [exp] = report["expired"]
++        self.assertEqual(exp["messages"], [old])
++        self.assertEqual([m["id"] for m in mail.unread(self.db, "claude3")], [fresh])
++
++    def test_epargne_reservation_active_et_boite_relancee(self):
++        self.stop("claude3")
++        free = mail.send(self.db, "claude1", "claude3", "Libre.")
++        reserved = mail.send(self.db, "claude1", "claude3", "En cours de remise.")
++        self.db.execute(
++            "UPDATE agent_mailbox SET meta = jsonb_build_object('consigne', jsonb_build_object("
++            "'jeton', 'j', 'expire', extract(epoch from clock_timestamp()) + 600))"
++            " WHERE id = %s", (reserved,))
++        self.age(8)
++        report = undeliverable.sweep(self.cfg, self.db)
++        [exp] = report["expired"]
++        self.assertEqual(exp["messages"], [free])
++        self.assertEqual([m["id"] for m in mail.unread(self.db, "claude3")], [reserved])
++        # un agent VIVANT n'est jamais expiré, même avec du vieux courrier
++        self.agent("claude2")
++        mail.send(self.db, "claude1", "claude2", "Pour un vivant.")
++        self.age(8)
++        self.assertEqual(storage.of(self.db).mailbox.expire_dead_letters(
++            "claude2", {"by": "test"}, time.time()), [])
++        self.assertEqual(len(self.pending("claude2")), 1)
++
++    def test_dry_run_ne_touche_rien(self):
++        self.lie()
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport.")
++        self.age(8)
++        report = undeliverable.sweep(self.cfg, self.db, dry_run=True)
++        [fwd] = report["forwarded"]
++        self.assertEqual((fwd["count"], fwd["dry_run"]), (1, True))
++        self.assertEqual(len(self.pending("claude3")), 1)          # rien n'a bougé
++        # sans successeur : l'expiration à blanc dit ce qui partirait
++        self.db.execute("UPDATE session_bindings SET revoked_at = now()")
++        report = undeliverable.sweep(self.cfg, self.db, dry_run=True)
++        [exp] = report["expired"]
++        self.assertEqual((exp["count"], exp["dry_run"]), (1, True))
++        self.assertEqual(len(self.pending("claude3")), 1)
++
++    def test_retention_nulle_ou_surchargee(self):
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport.")
++        self.age(30)
++        report = undeliverable.sweep(self.cfg, self.db, days=0)
++        self.assertEqual((report["days"], report["cutoff"], report["expired"]),
++                         (0, None, []))                            # 0 = jamais
++        self.assertEqual(len(self.pending("claude3")), 1)
++        report = undeliverable.sweep(self.cfg, self.db, days=7)
++        self.assertEqual(report["expired"][0]["count"], 1)
++
++    def test_successeur_arrete_refus_puis_retention(self):
++        self.lie()
++        self.stop("mesh-design")
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport.")
++        self.age(8)
++        report = undeliverable.sweep(self.cfg, self.db)
++        self.assertEqual(report["forwarded"], [])
++        [refused] = report["refused"]
++        self.assertEqual((refused["old"], refused["new"]), ("claude3", "mesh-design"))
++        self.assertEqual(report["expired"][0]["count"], 1)         # pas d'attente infinie
++
++    def test_le_menage_de_l_executeur_balaye_et_respecte_dry_run(self):
++        import types
++        from ameesh import runner as runner_mod
++        self.lie()
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport.")
++        fake = types.SimpleNamespace(cfg=self.cfg, dry_run=True, mediated=False)
++        first = runner_mod.Runner.sweep_dead_letters_once(fake, self.db, clock=1000.0)
++        self.assertEqual(first["forwarded"][0]["count"], 1)
++        self.assertEqual(len(self.pending("claude3")), 1)          # dry-run : rien bougé
++        self.assertEqual(fake._dead_letters_next,
++                         1000.0 + runner_mod.DEAD_LETTER_SWEEP_EVERY_S)
++        self.assertIsNone(runner_mod.Runner.sweep_dead_letters_once(
++            fake, self.db, clock=1001.0))                          # au plus une fois par heure
++        fake.dry_run = False
++        second = runner_mod.Runner.sweep_dead_letters_once(fake, self.db, clock=5000.0)
++        self.assertEqual(second["forwarded"][0]["count"], 1)
++        self.assertEqual(self.pending("claude3"), [])
++
++    def test_cli_sweep(self):
++        self.lie()
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport.")
++        out = self.mesh("mail", "sweep", "--dry-run")
++        self.assertEqual(out.returncode, 0, out.stderr)
++        self.assertIn("dry run", out.stdout)
++        self.assertIn("claude3 (stopped): 1 message(s) would be re-delivered to mesh-design",
++                      out.stdout)
++        self.assertEqual(len(self.pending("claude3")), 1)
++        out = self.mesh("mail", "sweep", "--json")
++        self.assertEqual(out.returncode, 0, out.stderr)
++        payload = json.loads(out.stdout)
++        self.assertEqual(payload["forwarded"][0]["new"], "mesh-design")
++        self.assertEqual(self.pending("claude3"), [])
++        self.assertEqual(self.mesh("mail", "sweep", "--days", "-1").returncode, 2)
++
++    def test_expire_un_nom_absent_du_registre(self):
++        """Nom absent : rien à verrouiller, l'absence est constatée dans
++        l'instruction d'expiration — pas de ligne de registre créée."""
++        mail.send(self.db, "claude1", "fantome", "Rapport.")
++        self.age(8)
++        report = undeliverable.sweep(self.cfg, self.db)
++        [exp] = report["expired"]
++        self.assertEqual((exp["recipient"], exp["count"], exp["unknown"]),
++                         ("fantome", 1, True))
++        self.assertEqual(self.pending("fantome"), [])
++        self.assertEqual(self.db.query(
++            "SELECT name FROM agent_registry WHERE name = 'fantome'"), [])
++        self.assertEqual(self.alertes(), [])
++
++    # -- relecture codex3, B1 : la décision est relue SOUS VERROU -----------
++    #
++    # Chaque témoin tient une transaction DISTINCTE (une autre connexion) qui
++    # n'est pas committée ; le travail du balayage part ensuite et doit
++    # ATTENDRE le verrou du registre avant de décider. Sans le verrou, il
++    # déciderait sur l'instantané d'avant la relance et expédierait/expirerait
++    # le courrier d'un agent relancé.
++
++    def _attend_verrou(self, *needles, timeout=10.0):
++        """Attend qu'une AUTRE connexion soit réellement bloquée sur un verrou
++        (le texte de sa requête porte l'un des `needles`)."""
++        clause = " OR ".join(["query LIKE %s"] * len(needles))
++        params = tuple("%" + needle + "%" for needle in needles)
++        fin = time.monotonic() + timeout
++        while time.monotonic() < fin:
++            rows = self.db.query(
++                "SELECT count(*)::int AS n FROM pg_stat_activity"
++                " WHERE wait_event_type = 'Lock' AND (%s)" % clause, params)
++            if rows[0]["n"]:
++                return
++            time.sleep(0.05)
++        self.fail("aucune attente de verrou Postgres sur %s" % (needles,))
++
++    def _travail_concurrent(self, action):
++        """Lance `action(connexion)` dans un fil, rend (fil, resultats)."""
++        out: dict = {}
++
++        def run():
++            try:
++                out["value"] = action(ScopedDb(self.cfg))
++            except BaseException as exc:       # repris par le test
++                out["error"] = exc
++
++        thread = threading.Thread(target=run)
++        thread.start()
++        return thread, out
++
++    def test_expire_attend_une_relance_concurrente(self):
++        self.stop("claude3")
++        mid = mail.send(self.db, "claude1", "claude3", "Rapport.")
++        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'"
++                        " WHERE id = %s", (mid,))
++        started, release = threading.Event(), threading.Event()
++        errors = []
++
++        def hold():
++            try:
++                with ScopedDb(self.cfg).transaction() as tx:
++                    tx.execute("UPDATE agent_registry SET status = 'running'"
++                               " WHERE name = 'claude3'")
++                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
++                    started.set()
++                    release.wait(15)
++            except BaseException as exc:
++                errors.append(exc)
++
++        holder = threading.Thread(target=hold)
++        holder.start()
++        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
++        worker, out = self._travail_concurrent(
++            lambda db: storage.of(db).mailbox.expire_dead_letters(
++                "claude3", {"by": "test"}, time.time()))
++        self._attend_verrou("jsonb_build_object('expired'")
++        release.set()
++        holder.join(20)
++        worker.join(20)
++        self.assertFalse(holder.is_alive() or worker.is_alive())
++        self.assertEqual(errors, [])
++        self.assertNotIn("error", out, out.get("error"))
++        self.assertEqual(out.get("value"), [])              # la relance gagne : rien expiré
++        self.assertEqual(self.pending("claude3"), ["Rapport."])
++
++    def test_forward_refuse_une_relance_concurrente_de_old(self):
++        self.stop("claude3")
++        mid = mail.send(self.db, "claude1", "claude3", "Rapport.")
++        started, release = threading.Event(), threading.Event()
++        errors = []
++
++        def hold():
++            try:
++                with ScopedDb(self.cfg).transaction() as tx:
++                    tx.execute("UPDATE agent_registry SET status = 'running'"
++                               " WHERE name = 'claude3'")
++                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
++                    started.set()
++                    release.wait(15)
++            except BaseException as exc:
++                errors.append(exc)
++
++        holder = threading.Thread(target=hold)
++        holder.start()
++        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
++        worker, out = self._travail_concurrent(
++            lambda db: storage.of(db).mailbox.forward("claude3", "mesh-design", "test"))
++        self._attend_verrou("ORDER BY name FOR UPDATE", "ORDER BY m.id FOR UPDATE")
++        release.set()
++        holder.join(20)
++        worker.join(20)
++        self.assertFalse(holder.is_alive() or worker.is_alive())
++        self.assertEqual(errors, [])
++        self.assertIsInstance(out.get("error"), storage.MailboxRefused, out)
++        self.assertEqual(self.pending("claude3"), ["Rapport."])
++        self.assertEqual(self.pending("mesh-design"), [])
++
++    def test_forward_refuse_un_arret_concurrent_de_new(self):
++        self.stop("claude3")
++        mail.send(self.db, "claude1", "claude3", "Rapport.")
++        started, release = threading.Event(), threading.Event()
++        errors = []
++
++        def hold():
++            try:
++                with ScopedDb(self.cfg).transaction() as tx:
++                    tx.execute("UPDATE agent_registry SET status = 'stopped'"
++                               " WHERE name = 'mesh-design'")
++                    started.set()
++                    release.wait(15)
++            except BaseException as exc:
++                errors.append(exc)
++
++        holder = threading.Thread(target=hold)
++        holder.start()
++        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
++        worker, out = self._travail_concurrent(
++            lambda db: storage.of(db).mailbox.forward("claude3", "mesh-design", "test"))
++        self._attend_verrou("ORDER BY name FOR UPDATE")
++        release.set()
++        holder.join(20)
++        worker.join(20)
++        self.assertFalse(holder.is_alive() or worker.is_alive())
++        self.assertEqual(errors, [])
++        self.assertIsInstance(out.get("error"), storage.MailboxRefused, out)
++        self.assertEqual(self.pending("claude3"), ["Rapport."])
++        self.assertEqual(self.pending("mesh-design"), [])
++
++    # -- relecture codex3, B1 RÉSIDUEL : l'absence se sérialise aussi --------
++    #
++    # `FOR SHARE`/`FOR UPDATE` ne verrouillent que les lignes PRÉSENTES : une
++    # inscription concurrente d'un nom absent pouvait se committer entre la
++    # lecture d'absence et l'écriture. Les chemins de création prennent
++    # désormais le même verrou advisory par nom (`registry.NAME_LOCK_*`) que la
++    # décision ; ces témoins exigent que l'inscription ATTENDE ce verrou.
++
++    def _attend_verrou_inscription(self, register):
++        self._attend_verrou("pg_advisory_xact_lock")
++        self.assertTrue(register.is_alive(), "l'inscription a devancé la décision")
++
++    def test_expire_nom_absent_attend_une_inscription_concurrente(self):
++        mid = mail.send(self.db, "claude1", "fantome", "Rapport.")
++        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '8 days'"
++                        " WHERE id = %s", (mid,))
++        started, release = threading.Event(), threading.Event()
++        errors = []
++
++        def hold():
++            try:
++                with ScopedDb(self.cfg).transaction() as tx:
++                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
++                    started.set()
++                    release.wait(15)
++            except BaseException as exc:
++                errors.append(exc)
++
++        holder = threading.Thread(target=hold)
++        holder.start()
++        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
++        worker, out = self._travail_concurrent(
++            lambda db: storage.of(db).mailbox.expire_dead_letters(
++                "fantome", {"by": "test"}, time.time()))
++        self._attend_verrou("jsonb_build_object('expired'")
++        register, reg_out = self._travail_concurrent(
++            lambda db: registry.upsert(db, "fantome", status="idle"))
++        self._attend_verrou_inscription(register)
++        release.set()
++        holder.join(20)
++        worker.join(20)
++        register.join(20)
++        self.assertFalse(holder.is_alive() or worker.is_alive() or register.is_alive())
++        self.assertEqual(errors, [])
++        self.assertNotIn("error", out, out.get("error"))
++        self.assertNotIn("error", reg_out, reg_out.get("error"))
++        # ordre sérialisé : l'expiration (nom absent à sa décision) commite
++        # avant l'inscription, qui attendait le verrou par nom
++        self.assertEqual([r["id"] for r in out["value"]], [mid])
++        self.assertEqual(reg_out["value"]["name"], "fantome")
++        self.assertEqual(self.db.query(
++            "SELECT status FROM agent_registry WHERE name = 'fantome'"),
++            [{"status": "idle"}])
++        self.assertEqual(self.pending("fantome"), [])
++
++    def test_forward_nom_absent_attend_une_inscription_concurrente(self):
++        mid = mail.send(self.db, "claude1", "fantome", "Rapport.")
++        started, release = threading.Event(), threading.Event()
++        errors = []
++
++        def hold():
++            try:
++                with ScopedDb(self.cfg).transaction() as tx:
++                    tx.execute("SELECT id FROM agent_mailbox WHERE id = %s FOR UPDATE", (mid,))
++                    started.set()
++                    release.wait(15)
++            except BaseException as exc:
++                errors.append(exc)
++
++        holder = threading.Thread(target=hold)
++        holder.start()
++        self.assertTrue(started.wait(15), "la transaction concurrente n'a pas démarré")
++        worker, out = self._travail_concurrent(
++            lambda db: storage.of(db).mailbox.forward("fantome", "mesh-design", "test"))
++        self._attend_verrou("ORDER BY m.id FOR UPDATE")
++        register, reg_out = self._travail_concurrent(
++            lambda db: registry.upsert(db, "fantome", status="idle"))
++        self._attend_verrou_inscription(register)
++        release.set()
++        holder.join(20)
++        worker.join(20)
++        register.join(20)
++        self.assertFalse(holder.is_alive() or worker.is_alive() or register.is_alive())
++        self.assertEqual(errors, [])
++        self.assertNotIn("error", out, out.get("error"))
++        self.assertNotIn("error", reg_out, reg_out.get("error"))
++        # le renvoi (old absent à sa décision) commite avant l'inscription
++        self.assertEqual(len(out["value"]), 1)
++        self.assertEqual(self.pending("fantome"), [])
++        self.assertEqual(self.pending("mesh-design"), ["Rapport."])
++        self.assertEqual(reg_out["value"]["name"], "fantome")
++
++
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,0 +1,23 @@
+1:  31729f4e0 ! 1:  5ae19eb8d 976: delta du lot sur base fcff03db4 (temoin range-diff)
+    @@ Metadata
+     Author: mty-amh-impl-02 <mty-amh-impl-02@users.noreply.github.com>
+     
+      ## Commit message ##
+    -    976: delta du lot sur base fcff03db4 (temoin range-diff)
+    +    976: delta du lot sur base dc40ccbb (temoin range-diff)
+     
+      ## docs/EXPLOITATION.md ##
+     @@ docs/EXPLOITATION.md: de `ameesh progress` (texte, page HTML, clé `projects` du JSON).
+    @@ docs/EXPLOITATION.md: Une alerte = **un objet JSON par ligne** :
+        `manuel`, elle accompagne `stopped_with_mail` (qui dit de relancer
+        l'agent) : celle-ci dit que son courrier attend en vain, et prévient les
+        orchestrateurs.
+    -@@ docs/EXPLOITATION.md: if needed. It goes to the lot's assignee, agent or human (`human:…` as the
+    - alert's `responsible`), including history-only events after removal of the
+    - queue row, whose owner is read from the work item; `merge_blocked` too.
+    +@@ docs/EXPLOITATION.md: workflow restent relus par un autre modèle (classe sensible, canon §8) :
+    + cette commande ne change pas les exigences de relecture, elle change le geste
+    + de fusion.
+      
+     -## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`
+     +## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`, balayage

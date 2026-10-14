@@ -1,0 +1,19 @@
+diff --git a/src/ameesh/storage/__init__.py b/src/ameesh/storage/__init__.py
+index ea5551ee6..250be051b 100644
+--- a/src/ameesh/storage/__init__.py
++++ b/src/ameesh/storage/__init__.py
+@@ -35,11 +35,12 @@ la documentation de `storage.interface`.
+ """
+ from __future__ import annotations
+ 
+-from .interface import ReservationContention, Storage
++from .interface import MailboxRefused, ReservationContention, Storage
+ from .postgres import PostgresStorage
+ from .remote.client import RemoteDb
+ 
+-__all__ = ["ReservationContention", "Storage", "PostgresStorage", "of", "is_remote"]
++__all__ = ["MailboxRefused", "ReservationContention", "Storage", "PostgresStorage", "of",
++           "is_remote"]
+ 
+ 
+ def of(db) -> Storage:

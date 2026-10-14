@@ -1,0 +1,46 @@
+# #976 — constance du delta du lot après réintégration de main dc40ccbb
+# généré le 2026-10-14T09:56:34Z par mty-amh-impl-01 ; commandes locales, lecture seule.
+# reproductible : sh verifier.sh
+
+== 0. identités ==
+PASS  commit candidat : 57fa1824a378423d6fcf92d7ced90231d5ab203f
+PASS  arbre candidat : df596d3bd277d778b46d149436569e0dfe1cf61d
+PASS  parents candidat : 04a6281d909d2fb56c742067b32cd1cadd529bb7 dc40ccbb023e9f517687a81cf5854ed26e713ac6
+PASS  merge-base(A,M) : fcff03db4e77aeee6ccaa3bb09debde3e5ad089c
+== 1. même ensemble de fichiers ==
+PASS  14/14 fichiers identiques (14 fichiers)
+== 2. diff du lot, avant vs après (fichier par fichier) ==
+PASS  ensemble de lignes +/- identique : docs/EXPLOITATION.md (38 lignes)
+PASS  diff textuellement identique : docs/V1-MAILBOX-RUNNER.md
+PASS  diff textuellement identique : src/ameesh/cli.py
+PASS  diff textuellement identique : src/ameesh/config.py
+PASS  diff textuellement identique : src/ameesh/mediated_executor/contract.json
+PASS  diff textuellement identique : src/ameesh/runner.py
+PASS  diff textuellement identique : src/ameesh/storage/__init__.py
+PASS  diff textuellement identique : src/ameesh/storage/interface.py
+PASS  diff textuellement identique : src/ameesh/storage/postgres/canon.py
+PASS  diff textuellement identique : src/ameesh/storage/postgres/decisions.py
+PASS  diff textuellement identique : src/ameesh/storage/postgres/mailbox.py
+PASS  diff textuellement identique : src/ameesh/storage/postgres/registry.py
+PASS  diff textuellement identique : src/ameesh/undeliverable.py
+PASS  diff textuellement identique : tests/test_undeliverable.py
+== 3. blobs ==
+PASS  blobs du lot non touchés par main, identiques à la tête gelée : 13
+PASS  blob main conservé : src/ameesh/merge_pr.py : 9429e7a716485f28f18bd1e20dbae53b45fe6f83
+PASS  blob main conservé : src/ameesh/mesh_cli.py : cd7b6f3ae7915809290c9f9be0901ce1b2c7bd15
+PASS  blob main conservé : tests/test_1003_merge_pr.py : 0f50c001d48c6049d1fb71e02394846b18857193
+== 4. auto-fusion trois points ==
+PASS  merge-tree rc : 1
+PASS  fichiers en conflit : docs/EXPLOITATION.md
+PASS  message de conflit : CONFLICT (content): Merge conflict in docs/EXPLOITATION.md
+PASS  blob base (stage 1) : 97b6d1c39e6ce755326003fb862c73c861ba27e1
+PASS  blob lot (stage 2) : 4d7cd67d926db61acaa01b7198c6881ca9e53f94
+PASS  blob main (stage 3) : ee349bdcca935cbd7df0e8bdda7afa50b54ab423
+PASS  arbre candidat vs auto-fusion : un seul fichier : docs/EXPLOITATION.md
+== 5. union du document ==
+PASS  lignes ajoutées par le lot absentes du candidat : 0
+PASS  lignes ajoutées par main absentes du candidat : 0
+== 6. propreté ==
+PASS  diff --check propre (vs main et vs tête gelée)
+
+RESULTAT : tous les contrôles PASS

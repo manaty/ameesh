@@ -1,0 +1,36 @@
+diff --git a/src/ameesh/storage/postgres/decisions.py b/src/ameesh/storage/postgres/decisions.py
+index fc2ffe688..56d6b722a 100644
+--- a/src/ameesh/storage/postgres/decisions.py
++++ b/src/ameesh/storage/postgres/decisions.py
+@@ -17,6 +17,7 @@ import json
+ 
+ from .. import interface
+ from .mailbox import PROJECT_SQL
++from .registry import NAME_LOCK_CTE, name_lock_key
+ 
+ #: une ligne de `agent_mailbox` qui porte une demande de décision
+ _IS_DECISION = "kind = 'request' AND (payload -> 'decision') IS NOT NULL"
+@@ -138,10 +139,12 @@ class Decisions(interface.Decisions):
+         # session l'inscrit (`upsert_unleased` n'écrit qu'une session vide).
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, workstream, harness, host, cwd, session_id, status, status_text,
+                  mode, responsible, created_by, last_seen, updated_at)
+-            VALUES (%s, '', %s, %s, %s, NULL, 'idle', %s, 'externe', %s, %s, now(), now())
++            SELECT %s, '', %s, %s, %s, NULL, 'idle', %s, 'externe', %s, %s, now(), now()
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 harness = excluded.harness,
+                 host = excluded.host,
+@@ -160,7 +163,7 @@ class Decisions(interface.Decisions):
+                     OR agent_registry.lease_expires_at IS NULL
+                     OR agent_registry.lease_expires_at <= clock_timestamp())
+             RETURNING name, mode, responsible, harness, host
+-            """,
+-            (name, harness, host, cwd, status_text, human, human),
++            """.replace("__LOCK__", NAME_LOCK_CTE),
++            (name_lock_key(name), name, harness, host, cwd, status_text, human, human),
+         )
+         return rows[0] if rows else None

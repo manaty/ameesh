@@ -1,0 +1,105 @@
+diff --git a/src/ameesh/cli.py b/src/ameesh/cli.py
+index eef32455d..e98e4073a 100644
+--- a/src/ameesh/cli.py
++++ b/src/ameesh/cli.py
+@@ -26,6 +26,11 @@
+                                                  re-delivers the pending mail of a stopped
+                                                  agent (or one missing from the registry) to a
+                                                  live agent: sender and date kept
++  agent-mail sweep [--days N] [--dry-run] [--json]
++                                                 L976: re-delivers the dead mail of a stopped
++                                                 agent to its successor, expires the rest past
++                                                 `mail_dead_letter_days` (7; 0 = never), with
++                                                 a thread trace; run daily by the runner
+   agent-mail list                                agents, host, lease, unread
+   agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
+   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
+@@ -1233,6 +1238,75 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
+     return 0
+ 
+ 
++_SWEEP_USAGE = "usage: agent-mail sweep [--days N] [--dry-run] [--json]"
++
++
++def _sweep_line(action, kind) -> str:
++    """Une ligne du compte rendu de `ameesh mail sweep`."""
++    ids = action.get("messages") or []
++    suffix = " (#%s)" % ", #".join(str(i) for i in ids) if ids else ""
++    if kind == "forwarded":
++        return ("%s (stopped): %d message(s) %s re-delivered to %s%s"
++                % (action["old"], action["count"],
++                   "would be" if action.get("dry_run") else "were", action["new"], suffix))
++    return ("%s (%s): %d message(s) %s expired%s"
++            % (action["recipient"], "unknown" if action.get("unknown") else "stopped",
++               action["count"], "would be" if action.get("dry_run") else "were", suffix))
++
++
++def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
++    """L976 : re-livre au successeur, ou expire après la rétention, le courrier
++    en souffrance (`undeliverable.sweep`) — le même passage que le ménage de
++    l'exécuteur, à la main."""
++    from . import undeliverable
++    try:
++        opts, positional = _options(rest, ("--days",), ("--dry-run", "--json"))
++    except ValueError as exc:
++        print("%s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
++        return 2
++    if positional:
++        print(_SWEEP_USAGE, file=sys.stderr)
++        return 2
++    days = opts.get("--days")
++    if days is not None:
++        try:
++            days = int(days)
++        except (TypeError, ValueError):
++            print("--days expects a whole number of days\n%s" % _SWEEP_USAGE, file=sys.stderr)
++            return 2
++        if days < 0:
++            print("--days must be >= 0\n%s" % _SWEEP_USAGE, file=sys.stderr)
++            return 2
++    try:
++        result = undeliverable.sweep(cfg, bk.db, days=days, actor=_actor(),
++                                     dry_run=bool(opts.get("--dry-run")))
++    except ValueError as exc:
++        print("sweep refused — %s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
++        return 1
++    if opts.get("--json"):
++        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
++        return 0
++    actions = result["forwarded"] + result["expired"]
++    if not actions:
++        print("no dead letter to sweep (retention %d day(s), 0 = never)"
++              % result["days"])
++        return 0
++    if result["dry_run"]:
++        print("dry run: retention %d day(s); %d recipient(s) to sweep:"
++              % (result["days"], len(actions)))
++    for action in result["forwarded"]:
++        print("  " + _sweep_line(action, "forwarded"))
++    for action in result["expired"]:
++        print("  " + _sweep_line(action, "expired"))
++    for action in result["refused"]:
++        print("  %s: re-delivery to %s refused — %s" % (
++            action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
++    if not result["dry_run"]:
++        print("retention %d day(s); dead mail stays in the mailbox, marked expired"
++              % result["days"])
++    return 0
++
++
+ def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
+     if len(rest) > 1 and rest[0] == "--cwd":
+         # Diagnostic : le dossier ne donne aucune identité.
+@@ -1568,6 +1642,12 @@ def main(argv: list[str] | None = None) -> int:
+                       "registry", file=sys.stderr)
+                 return 1
+             return cmd_forward(bk, cfg, rest)
++        if command == "sweep":
++            if bk.kind != "pg":
++                print("the dead-letter sweep requires the database (AMEESH_DSN): the file "
++                      "fallback has no registry", file=sys.stderr)
++                return 1
++            return cmd_sweep(bk, cfg, rest)
+         if command in ("bind", "unbind", "bindings"):
+             if bk.kind != "pg":
+                 print("session bindings require the database (AMEESH_DSN): "

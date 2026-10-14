@@ -1,0 +1,94 @@
+diff --git a/src/ameesh/storage/postgres/registry.py b/src/ameesh/storage/postgres/registry.py
+index e94c6cdcf..013c9da53 100644
+--- a/src/ameesh/storage/postgres/registry.py
++++ b/src/ameesh/storage/postgres/registry.py
+@@ -163,6 +163,32 @@ def placement_admitted_sql(alias: str = "agent_registry") -> str:
+         "governed": canon_governed_sql(a), "a": a}
+ 
+ 
++# --------------------------------------------------------------------------
++# verrou par nom (L976)
++# --------------------------------------------------------------------------
++
++#: L976 : verrou advisory par nom, partagé par TOUS les chemins de création
++#: d'une ligne du registre et par la décision « boîte morte »
++#: (`mailbox.forward`, `mailbox.expire_dead_letters`). `FOR SHARE`/`FOR UPDATE`
++#: ne verrouillent que les lignes PRÉSENTES : sans ce verrou, une inscription
++#: concurrente pouvait se committer entre la lecture d'absence et l'écriture,
++#: et le courrier d'un agent vivant était expiré ou renvoyé (relecture codex3,
++#: B1 résiduel). La décision prend le verrou dans une instruction À PART, avant
++#: sa lecture : l'instantané de l'instruction suivante voit alors l'inscription
++#: qui a gagné le verrou.
++NAME_LOCK_EXPR = "pg_advisory_xact_lock(hashtextextended(%s, 0))"
++#: la prise de verrou seule (décision : instruction à part, avant la lecture)
++NAME_LOCK_SQL = "SELECT " + NAME_LOCK_EXPR
++#: la même prise de verrou, en CTE d'une instruction de création (le verrou
++#: est alors tenu jusqu'à la fin de l'instruction, donc du commit)
++NAME_LOCK_CTE = "WITH l AS (SELECT " + NAME_LOCK_EXPR + " AS _)"
++
++
++def name_lock_key(name: str) -> str:
++    """Clé du verrou advisory d'un nom (insensible à la casse)."""
++    return "ameesh-agent-registry:" + (name or "").lower()
++
++
+ # --------------------------------------------------------------------------
+ # lignes du registre
+ # --------------------------------------------------------------------------
+@@ -175,12 +201,14 @@ class Agents(interface.Agents):
+         # (`execute`) n'est jamais basculé par une inscription.
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, chantier, harness, host, cwd, session_id, status, status_text,
+                  model, budget_usd, mode, last_seen, updated_at)
+-            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+-                    coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
+-                    now(), now())
++            SELECT %s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
++                   coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
++                   now(), now()
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 chantier    = coalesce(nullif(%s,''), agent_registry.chantier),
+                 harness     = coalesce(nullif(%s,''), agent_registry.harness),
+@@ -200,8 +228,9 @@ class Agents(interface.Agents):
+                 last_seen   = now(),
+                 updated_at  = now()
+             RETURNING __COLUMNS__
+-            """.replace("__COLUMNS__", AGENT_COLUMNS),
+-            (name, chantier, harness, host, cwd, session_id, status, status_text,
++            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__COLUMNS__", AGENT_COLUMNS),
++            (name_lock_key(name),
++             name, chantier, harness, host, cwd, session_id, status, status_text,
+              model, budget_usd, mode, chantier, harness, host, status),
+         )
+         return rows[0]
+@@ -216,11 +245,13 @@ class Agents(interface.Agents):
+         # écrits seulement s'il n'y avait pas encore de session).
+         rows = self.db.query(
+             """
++            __LOCK__
+             INSERT INTO agent_registry
+                 (name, chantier, harness, host, cwd, session_id, mode,
+                  last_seen, updated_at)
+-            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+-                    'externe', now(), now())
++            SELECT %s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
++                   'externe', now(), now()
++              FROM l
+             ON CONFLICT (name) DO UPDATE SET
+                 chantier = CASE WHEN agent_registry.mode = 'execute'
+                                 THEN agent_registry.chantier
+@@ -251,8 +282,8 @@ class Agents(interface.Agents):
+                 updated_at = CASE WHEN agent_registry.mode = 'execute'
+                                   THEN agent_registry.updated_at ELSE now() END
+             RETURNING __COLUMNS__
+-            """.replace("__COLUMNS__", AGENT_COLUMNS),
+-            (name, chantier, harness, host, cwd, session_id, harness),
++            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__COLUMNS__", AGENT_COLUMNS),
++            (name_lock_key(name), name, chantier, harness, host, cwd, session_id, harness),
+         )
+         return rows[0]
+ 

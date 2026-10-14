@@ -1,0 +1,29 @@
+commit 57fa1824a378423d6fcf92d7ced90231d5ab203f
+parents 04a6281d909d2fb56c742067b32cd1cadd529bb7 dc40ccbb023e9f517687a81cf5854ed26e713ac6
+
+
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+remerge CONFLICT (content): Merge conflict in docs/EXPLOITATION.md
+index 6df665270..e42b39b53 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -3645,9 +3645,6 @@ if needed. It goes to the lot's assignee, agent or human (`human:…` as the
+ alert's `responsible`), including history-only events after removal of the
+ queue row, whose owner is read from the work item; `merge_blocked` too.
+ 
+-<<<<<<< 04a6281d9 (Merge remote-tracking branch 'origin/main' into lot/976-mail-undeliverable-expiry)
+-## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`, balayage
+-=======
+ ## Fusion hors API d'une PR touchant `.github/workflows/**` — `ameesh work merge-pr` (#1003/REL-11)
+ 
+ Incident #562/REL-11 (2026-10-13, nexlink) : la PR de release touchait
+@@ -3766,8 +3763,7 @@ workflow restent relus par un autre modèle (classe sensible, canon §8) :
+ cette commande ne change pas les exigences de relecture, elle change le geste
+ de fusion.
+ 
+-## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`
+->>>>>>> dc40ccbb0 (Merge pull request #776 from manaty/lot/1003-merge-pr-workflow)
++## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`, balayage
+ 
+ Constat du 2026-10-10 sur la base du mesh : 42 messages entre agents jamais
+ livrés, sans qu'aucun expéditeur le sache. 27 étaient adressés à
