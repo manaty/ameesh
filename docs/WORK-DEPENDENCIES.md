@@ -42,12 +42,16 @@ does not reset activity on the waiting lot: if that lot has already been idle
 for six hours, its stale alert can return immediately. Removing a link is an
 explicit edit and records ordinary activity.
 
-Closing a blocker also wakes the waiting agents. Once the last explicit
-prerequisite, open commitment dependency and future planned start are gone,
-`ameesh` deposits a durable `event` mail to the assignee of the waiting lot,
-linked to that lot. The existing runner delivers it (LISTEN/NOTIFY, no polling
-loop, no new session); an agent stopped by hand is not restarted — the message
-waits in its mailbox until it resumes.
+Closing a blocker also wakes the waiting agents. When the closed lot is an
+explicit blocking prerequisite of a waiting lot and that lot has no other wait
+left (no other blocking edge, no open commitment, no future planned start —
+the `planned_wait` truth), `ameesh` deposits a durable `event` mail to the
+assignee of the waiting lot, linked to that lot. Only an explicit edge
+triggers a wake: a `depends_on` commitment (on a lot or a package) never
+triggers one by itself — it only holds a wake back while it points at an open
+lot. The existing runner delivers the mail (LISTEN/NOTIFY, no polling loop, no
+new session); an agent stopped by hand is not restarted — the message waits in
+its mailbox until it resumes.
 
 The wake is part of the closure itself: it is written in the same transaction
 as the state change, after it, under the dependency graph lock. So there is no

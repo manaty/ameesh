@@ -884,7 +884,8 @@ def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
 
 def _notify_released(db: Db, item_id: int, *, blocker_state: str,
                      blocker_reason: str = "", after_commit: list | None = None) -> list[dict]:
-    """L385 suite : la fermeture d'un lot réveille les agents de ses dépendants.
+    """L385 suite : la fermeture d'un lot réveille les agents des lots qui le
+    déclarent en prérequis explicite.
 
     Appelé DANS la transaction de fermeture, après l'écriture de la transition
     et sous le verrou de graphe : le courrier est committé avec la fermeture.
@@ -916,8 +917,9 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     « fusion constatée par <source> », ou « fusion déclarée par … »
     (`declared`, `ameesh work merged`), suivie de `extra`.
 
-    Dans la MÊME transaction que la transition, les agents des lots dont
-    c'était la dernière attente reçoivent un courrier durable (L385 suite) :
+    Dans la MÊME transaction que la transition, les agents des lots qui
+    déclarent ce lot en prérequis explicite et dont c'était la dernière attente
+    reçoivent un courrier durable (L385 suite) :
     le réveil ne peut être ni perdu (un échec annule la fusion, la reprise
     refait les deux) ni doublé (le verrou de graphe sérialise les fermetures,
     une seule voit la dernière attente tomber).
@@ -1003,8 +1005,9 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     """Ferme un lot qui ne sera pas fusionné : abandonné, ou remplacé par un
     autre lot. Jalon `closed` ; rien ne reste ouvert par oubli.
 
-    Dans la MÊME transaction, les agents des lots dont c'était la dernière
-    attente reçoivent un courrier durable (L385 suite) : l'abandon libère
+    Dans la MÊME transaction, les agents des lots qui déclarent ce lot en
+    prérequis explicite et dont c'était la dernière attente reçoivent un
+    courrier durable (L385 suite) : l'abandon libère
     l'attente sans prouver la livraison, le dépendant doit réévaluer son
     prérequis. Un échec du courrier annule la fermeture (reprise) ; le verrou
     de graphe empêche deux fermetures de se doubler."""

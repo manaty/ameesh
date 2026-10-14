@@ -52,6 +52,12 @@ def grouped(db, item_ids):
 def released_by(db, blocker_id) -> list[dict]:
     """Lots ouverts dont la fermeture de `blocker_id` lève l'attente.
 
+    Ne sont candidats que les lots qui déclarent `blocker_id` en prérequis
+    EXPLICITE (une arête `work_item_dependencies`) : un engagement `depends_on`
+    (lot ou package) n'est pas une arête et sa cible fermée ne réveille
+    personne par elle-même ; il ne fait que retenir un candidat tant qu'il vise
+    un lot ouvert.
+
     Lecture faite DANS la transaction de fermeture, après l'écriture de la
     transition (et sous le verrou de graphe) : un dépendant n'est rendu que
     s'il ne lui reste AUCUNE attente une fois le blocage fermé — aucune arête
@@ -112,7 +118,8 @@ def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
 
 def notify_released(db, blocker_id, *, blocker_state, blocker_reason="",
                     after_commit=None) -> list[dict]:
-    """Dépose un courrier durable à l'agent de chaque dépendant libéré.
+    """Dépose un courrier durable à l'agent de chaque dépendant dont
+    `blocker_id` était le dernier prérequis explicite.
 
     Appelé DANS la transaction qui ferme le bloqueur, après l'écriture de la
     transition : le courrier est committé avec elle. Il n'existe donc aucune
