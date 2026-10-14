@@ -1,10 +1,12 @@
-# Redémarrer et contrôler une VM d’agents
+# Installer, redémarrer et contrôler une VM d’agents
 
 Un hôte d’agents utilise les unités **utilisateur**
 `ameesh-runner-agent@<agent>.service`, sous le compte `ameesh`.
 Depuis le poste, `deploy/mise-a-jour/vm.sh agents redemarrer` les redémarre
 une par une, hors tour. `agents controler` (ou `agents verifier`) contrôle
-les unités et les baux, sans redémarrer personne.
+les unités et les baux, sans redémarrer personne. `agents installer [REF]`
+installe une révision gelée dans le layout du compte et `agents retour`
+réinstalle la précédente (#1252).
 
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
@@ -63,9 +65,39 @@ d’hôte pendant le contrôle fait échouer la preuve. En cas d’échec, la
 commande indique l’unité et la commande `journalctl --user` à lancer sous
 `ameesh` sur la VM.
 
-Ce mode couvre le redémarrage et le contrôle du code déjà installé.
-`installer` et `retour` restent les opérations du serveur du mesh ; elles
-sont refusées en mode agents. Les migrations de la base commune doivent
-être appliquées avant l’installation du code, selon la procédure de
-[BASCULE.md](BASCULE.md). Les commandes de cette page sont à exécuter par
-le responsable du déploiement après revue et validation CI.
+## Installer une révision gelée, revenir en arrière
+
+Le mode agents travaille dans le layout du compte `ameesh`
+(`~/.local/share/ameesh` : clone `src`, instantanés `src-<sha7>`, venv,
+`previous-sha`). Un `BASCULE_ENV` par VM porte `AGENTS_SSH` et `HOTE_AGENTS`.
+
+```sh
+deploy/mise-a-jour/vm.sh agents verifier
+deploy/mise-a-jour/vm.sh agents installer <sha40>
+deploy/mise-a-jour/vm.sh agents redemarrer
+deploy/mise-a-jour/vm.sh agents controler
+deploy/mise-a-jour/vm.sh agents retour
+```
+
+`installer` refuse tant que les migrations du commit visé manquent de la base
+commune du mesh (`poste.sh migrer` d’abord), et refuse un code d’avant non
+traçable (`direct_url.json` du venv ou HEAD du clone). Il ne redémarre
+personne. Il sauvegarde l’état (env et unités, 0600, sous
+`~/.local/state/ameesh/mise-a-jour`), crée l’instantané immuable
+`src-<sha7>` s’il manque (jamais écrasé, HEAD vérifié), met le clone en
+détaché sur le SHA visé, réinstalle depuis l’instantané
+(`pip --force-reinstall --no-deps` puis les dépendances) et n’écrit
+`previous-sha` qu’après une installation réussie. Si la VM n’a pas le commit,
+il est envoyé en paquet git par SSH depuis le poste.
+
+Une erreur partielle ferme la commande sans écrire `previous-sha` : le retour
+reste possible. `retour` réinstalle le commit de `previous-sha` depuis son
+instantané (même chemin, `previous-sha` inchangé : idempotent), puis enchaîne
+`redemarrer` et `controler`. Il refuse si `previous-sha` est absent, invalide
+ou introuvable dans le clone de la VM comme dans le dépôt du poste.
+
+Les migrations de la base commune doivent être appliquées avant l’installation
+du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
+page sont à exécuter par le responsable du déploiement après revue et
+validation CI, une VM à la fois ; `controler` affiche le code installé, le
+clone et `previous-sha` avant les unités.

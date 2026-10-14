@@ -7,10 +7,10 @@
 # faite pour toute la base du mesh, qui est celle du serveur.
 #
 #   deploy/mise-a-jour/vm.sh <étape> [REF]
-#   deploy/mise-a-jour/vm.sh agents verifier|redemarrer|controler
-#     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV ;
-#     unités utilisateur sous ameesh, liste du registre lue sur la VM.
-#     Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
+#   deploy/mise-a-jour/vm.sh agents verifier|installer|redemarrer|controler|retour [REF]
+#     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV —
+#     un BASCULE_ENV par VM d'agents ; unités utilisateur sous ameesh, liste
+#     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
 #
 #   verifier     contrôles, rien n'est modifié
 #   installer    code REF dans /opt/ameesh/src (détaché), installé dans
@@ -20,6 +20,12 @@
 #                refuse tant que les migrations du code installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
 #   retour       réinstalle le commit d'avant et redémarre
+#
+#   En mode agents, installer et retour travaillent dans le layout du compte
+#   ameesh (~/.local/share/ameesh : clone src, instantanés src-<sha7> jamais
+#   écrasés, previous-sha, venv), avec les mêmes gardes de migrations ; le
+#   redémarrage reste hors tour sous bail. L'installation ne redémarre
+#   personne, le retour réinstalle l'ancien code puis redémarre et contrôle.
 #
 # REF (installer) : commit, branche ou étiquette du dépôt qui contient ce
 # script ; défaut : HEAD de ce dépôt. Si le serveur ne le trouve pas chez
@@ -42,8 +48,8 @@ if [ "${1:-}" = agents ]; then MODE=agents; shift; fi
 ACTION=${1:-}
 if [ "$MODE" = agents ]; then
   case "$ACTION" in
-    redemarrer|controler|verifier) ;;
-    *) echo "mode agents : verifier, redemarrer ou controler attendu" >&2; exit 2 ;;
+    redemarrer|controler|verifier|installer|retour) ;;
+    *) echo "mode agents : verifier, installer, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
   esac
   : "${AGENTS_SSH:?AGENTS_SSH manquant dans $BASCULE_ENV}" "${HOTE_AGENTS:?HOTE_AGENTS manquant dans $BASCULE_ENV}"
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
@@ -82,6 +88,20 @@ exiger_migrations() {  # $1 : commit, $2 : ce qu'on s'apprête à faire
   [ -z "$absentes" ] && return 0
   echo "migrations ${absentes}absentes de la base du mesh : lancer d'abord « poste.sh migrer » ($2 refusé)" >&2
   exit 1
+}
+# Envoie le commit $1 dans /tmp/ameesh.bundle sur la cible $2 (root@…) : paquet
+# git du poste pour un clone qui n'atteint pas l'origine (le dépôt local doit
+# contenir le commit). Le fichier distant est retiré par l'appelant, après le
+# fetch. Lisible par le compte ameesh des VM d'agents (chmod 644).
+paquet_git() {
+  local sha=$1 hote=$2
+  git -C "$DEPOT" update-ref refs/mise-a-jour/vm "$sha"
+  git -C "$DEPOT" bundle create -q "$TRAVAIL/ameesh.bundle" refs/mise-a-jour/vm \
+    $(git -C "$DEPOT" for-each-ref --format='^%(objectname)' refs/remotes/origin/main)
+  git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm
+  chmod 644 "$TRAVAIL/ameesh.bundle"
+  scp -q -o BatchMode=yes "$TRAVAIL/ameesh.bundle" "$hote:/tmp/ameesh.bundle"
+  rm -f "$TRAVAIL/ameesh.bundle"
 }
 # Commandes sur la VM d'agents : utilisateur ameesh et son bus systemd,
 # la base reste celle de la configuration du compte de l’unité.
@@ -216,8 +236,63 @@ else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
   fi
 }
 
+# --- mode agents : installer / retour (layout du compte ameesh) -------------
+# Clone ~/.local/share/ameesh/src, venv ~/.local/share/ameesh/venv, code
+# installé depuis des instantanés src-<sha7> jamais écrasés, sha du code
+# d'avant dans previous-sha. Détail : docs/DEPLOIEMENT-HOTE-AGENTS.md.
+
+installe_agents() {  # code réellement installé (direct_url.json -> src-<sha7>)
+  utilisateur_agents bash -c 'set -euo pipefail
+    V=/home/ameesh/.local/share/ameesh/venv
+    for d in "$V"/lib/python*/site-packages/ameesh-*.dist-info; do
+      [ -r "$d/direct_url.json" ] || continue
+      python3 -c "import json,sys
+u = json.load(open(sys.argv[1])).get(\"url\", \"\")
+print(u.rsplit(\"src-\", 1)[-1] if \"src-\" in u else \"\")" "$d/direct_url.json"
+      exit 0
+    done'
+}
+clone_agents() {
+  utilisateur_agents bash -c 'git -C /home/ameesh/.local/share/ameesh/src rev-parse HEAD 2>/dev/null || true'
+}
+previous_agents() {
+  utilisateur_agents bash -c 'cat /home/ameesh/.local/share/ameesh/previous-sha 2>/dev/null || true'
+}
+releve_agents() {  # identité et pièces du bon hôte, avant tout geste
+  local installe clone previous
+  installe=$(installe_agents) || return 1
+  clone=$(clone_agents) || return 1
+  previous=$(previous_agents) || return 1
+  echo "code installé : ${installe:-inconnu} ; clone : ${clone:-?} ; previous-sha : ${previous:-absent}"
+}
+# Versions de migration du commit $1 (clone de la VM) absentes de la base
+# commune du mesh : même garde que le mode serveur.
+migrations_absentes_agents() {
+  local connues faites
+  connues=$({ utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src ls-tree --name-only '$1' src/ameesh/migrations/" || true; } \
+    | sed -nE 's#.*/0*([0-9]+)_[^/]*\.sql$#\1#p' | sort -n)
+  [ -n "$connues" ] || { echo "aucune migration lue dans $1" >&2; exit 1; }
+  faites=$({ python_agents -c 'from ameesh import config,db
+conn = db.connect(config.load())
+try:
+    for row in conn.query("SELECT version FROM schema_migrations"):
+        print(row["version"])
+finally:
+    conn.close()' || true; } | sort -n)
+  comm -23 <(sort <<<"$connues") <(sort <<<"$faites") | sort -n
+}
+exiger_migrations_agents() {
+  local absentes
+  absentes=$(migrations_absentes_agents "$1" | tr '\n' ' ') || exit 1
+  [ -z "$absentes" ] && return 0
+  echo "migrations ${absentes}absentes de la base du mesh : « poste.sh migrer » d'abord (installation refusée)" >&2
+  exit 1
+}
+
 controler_agents() {
   local noms p ligne heure attendu echec=0
+  etape "code installé sur $HOTE_AGENTS"
+  releve_agents || { echo "relevé du code impossible" >&2; echec=1; }
   noms=$(agents_du_registre) || return 1
   while IFS= read -r p; do
     etape "$p"
@@ -232,6 +307,105 @@ controler_agents() {
   ameesh_agents doctor || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
+}
+
+installer_agents() {
+  local ref=${1:-HEAD} sha court avant complet courant
+  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
+  court=${sha:0:7}
+  etape "VM d'agents $HOTE_AGENTS ($AGENTS_SSH) : commit visé ${sha:0:9} ($ref)"
+  ssh_agents hostname
+  # 1. le commit doit être dans le clone de la VM : origine, sinon paquet du poste
+  utilisateur_agents bash -c 'git -C /home/ameesh/.local/share/ameesh/src fetch -q origin' \
+    || echo "origine injoignable : paquet du poste"
+  if ! utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src cat-file -e '$sha^{commit}'" 2>/dev/null; then
+    etape "la VM n'a pas ce commit : envoi d'un paquet git"
+    paquet_git "$sha" "$AGENTS_SSH"
+    utilisateur_agents bash -c 'git -C /home/ameesh/.local/share/ameesh/src fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm'
+    ssh_agents "rm -f /tmp/ameesh.bundle"
+  fi
+  # 2. migrations du commit passées sur la base commune du mesh
+  etape "migrations de ${sha:0:9} passées sur la base du mesh"
+  exiger_migrations_agents "$sha" installer
+  # 3. relevé avant : sans sha d'avant, le retour serait impossible
+  avant=$(installe_agents) || true
+  [[ $avant =~ ^[0-9a-fA-F]{7,40}$ ]] || avant=
+  complet=
+  if [ -n "$avant" ]; then
+    complet=$(utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src rev-parse --verify '$avant^{commit}'" 2>/dev/null || true)
+  fi
+  if [ -z "$complet" ]; then
+    courant=$(clone_agents) || true
+    [[ $courant =~ ^[0-9a-fA-F]{40}$ ]] && complet=$courant
+  fi
+  [ -n "$complet" ] || { echo "code d'avant introuvable (direct_url.json, clone) : installation refusée, retour impossible" >&2; exit 1; }
+  echo "avant : ${complet:0:9} (installé ${avant:-inconnu}, clone $(clone_agents))"
+  # 4. sauvegarde privée 0600 de l'état, instantané du code quitté
+  utilisateur_agents bash -c "set -euo pipefail
+    umask 077
+    P=/home/ameesh/.local/share/ameesh
+    T=/home/ameesh/.local/state/ameesh/mise-a-jour
+    mkdir -p \"\$T\"
+    cp /home/ameesh/.config/ameesh/env \"\$T/env-$court\"
+    cp /home/ameesh/.config/systemd/user/ameesh-runner-agent@*.service \"\$T/\" 2>/dev/null || true
+    courant=\$(git -C \"\$P/src\" rev-parse HEAD)
+    c=\${courant:0:7}
+    test -d \"\$P/src-\$c\" || cp -a \"\$P/src\" \"\$P/src-\$c\"
+    echo \"sauvegarde : \$T/env-$court, unités et src-\$c\""
+  # 5. révision visée : checkout puis instantané immuable, jamais écrasé
+  utilisateur_agents bash -c "set -euo pipefail
+    P=/home/ameesh/.local/share/ameesh
+    git -C \"\$P/src\" checkout -q --detach '$sha'
+    test \"\$(git -C \"\$P/src\" rev-parse HEAD)\" = '$sha'
+    test -d \"\$P/src-$court\" || cp -a \"\$P/src\" \"\$P/src-$court\"
+    test \"\$(git -C \"\$P/src-$court\" rev-parse HEAD)\" = '$sha'"
+  # 6. installation depuis l'instantané : code puis dépendances
+  etape "installation dans le venv (depuis src-$court)"
+  utilisateur_agents bash -c "set -euo pipefail
+    P=/home/ameesh/.local/share/ameesh; V=\$P/venv
+    \$V/bin/pip install -q --force-reinstall --no-deps \$P/src-$court
+    \$V/bin/pip install -q \$P/src-$court
+    \$V/bin/python -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
+  # 7. previous-sha seulement après une installation réussie
+  utilisateur_agents bash -c "printf '%s\n' '$complet' > /home/ameesh/.local/share/ameesh/previous-sha"
+  echo "installé depuis src-$court (avant $complet). Les exécuteurs tournent encore l'ancien code : « $0 agents redemarrer », puis « $0 agents controler »."
+}
+
+retour_agents() {
+  local precedent court
+  precedent=$(previous_agents) || true
+  [ -n "$precedent" ] || { echo "previous-sha absent sur $HOTE_AGENTS : aucun retour possible" >&2; exit 1; }
+  [[ $precedent =~ ^[0-9a-fA-F]{7,40}$ ]] || { echo "previous-sha invalide : $precedent" >&2; exit 1; }
+  court=${precedent:0:7}
+  etape "VM d'agents $HOTE_AGENTS ($AGENTS_SSH) : retour au commit ${precedent:0:9}"
+  # le commit d'avant doit exister dans le clone, sinon paquet git du poste
+  if ! utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src cat-file -e '$precedent^{commit}'" 2>/dev/null; then
+    git -C "$DEPOT" cat-file -e "$precedent^{commit}" 2>/dev/null \
+      || { echo "commit $precedent absent du dépôt local : retour impossible d'ici" >&2; exit 1; }
+    etape "la VM n'a pas ce commit : envoi d'un paquet git"
+    paquet_git "$precedent" "$AGENTS_SSH"
+    utilisateur_agents bash -c 'git -C /home/ameesh/.local/share/ameesh/src fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm'
+    ssh_agents "rm -f /tmp/ameesh.bundle"
+  fi
+  # instantané du code quitté (jamais écrasé), puis checkout de l'ancien
+  utilisateur_agents bash -c "set -euo pipefail
+    P=/home/ameesh/.local/share/ameesh
+    courant=\$(git -C \"\$P/src\" rev-parse HEAD)
+    c=\${courant:0:7}
+    test -d \"\$P/src-\$c\" || cp -a \"\$P/src\" \"\$P/src-\$c\"
+    git -C \"\$P/src\" checkout -q --detach '$precedent'
+    test \"\$(git -C \"\$P/src\" rev-parse HEAD)\" = '$precedent'
+    test -d \"\$P/src-$court\" || cp -a \"\$P/src\" \"\$P/src-$court\"
+    test \"\$(git -C \"\$P/src-$court\" rev-parse HEAD)\" = '$precedent'"
+  etape "réinstallation dans le venv (depuis src-$court)"
+  utilisateur_agents bash -c "set -euo pipefail
+    P=/home/ameesh/.local/share/ameesh; V=\$P/venv
+    \$V/bin/pip install -q --force-reinstall --no-deps \$P/src-$court
+    \$V/bin/pip install -q \$P/src-$court
+    \$V/bin/python -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
+  echo "code d'avant réinstallé depuis src-$court ; previous-sha inchangé (retour idempotent)."
+  redemarrer_agents
+  controler_agents
 }
 
 verifier() {
@@ -255,13 +429,8 @@ installer() {
     git -C $SRC fetch -q origin || echo 'origine injoignable : paquet du poste'"
   if ! ssh_vm "git -C $SRC cat-file -e '$sha^{commit}'" 2>/dev/null; then
     etape "le serveur n'a pas ce commit : envoi d'un paquet git"
-    git -C "$DEPOT" update-ref refs/mise-a-jour/vm "$sha"
-    git -C "$DEPOT" bundle create -q "$TRAVAIL/ameesh.bundle" refs/mise-a-jour/vm \
-      $(git -C "$DEPOT" for-each-ref --format='^%(objectname)' refs/remotes/origin/main)
-    git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm
-    scp -q -o BatchMode=yes "$TRAVAIL/ameesh.bundle" "root@$VM:/tmp/ameesh.bundle"
+    paquet_git "$sha" "root@$VM"
     ssh_vm "set -e; git -C $SRC fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm; rm -f /tmp/ameesh.bundle"
-    rm -f "$TRAVAIL/ameesh.bundle"
   fi
   # Le venv du serveur sert aussi les commandes des agents (mail send…) : le
   # nouveau code n'y entre qu'une fois la base migrée (10/10, L151)
@@ -352,6 +521,8 @@ if [ "$MODE" = agents ]; then
   case "$ACTION" in
     redemarrer) redemarrer_agents ;;
     verifier|controler) controler_agents ;;
+    installer) installer_agents "${2:-HEAD}" ;;
+    retour) retour_agents ;;
   esac
   exit
 fi
@@ -362,5 +533,5 @@ case "${1:-}" in
   redemarrer) redemarrer ;;
   controler) controler ;;
   retour) retour ;;
-  *) sed -n '4,22p' "$0" >&2; exit 2 ;;
+  *) sed -n '4,28p' "$0" >&2; exit 2 ;;
 esac
