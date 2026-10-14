@@ -3,7 +3,10 @@
 
   ameesh work link <id> <fiche>|--none
   ameesh work close <id> --abandoned | --superseded-by <id> [--note …]
-  ameesh work sync-merges --git-dir D [--target origin/main] [--repo R] [--dry-run] [--json]
+  ameesh work sync-merges --git-dir D [--target T] [--repo R] [--dry-run] [--json]
+                          (cible : celle du lot, sinon `ameesh.target` du dépôt,
+                           sinon sa branche par défaut, puis les refs
+                           d'intégration develop/main/master/release/*)
   ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118 : branche
                             ou commit de fusion qui désigne le lot)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
@@ -53,8 +56,11 @@ def add_parsers(work_sub, func) -> None:
     p_merges = work_sub.add_parser(
         "sync-merges", help="close the work items whose frozen content is merged (git, L29)")
     p_merges.add_argument("--git-dir", default=".", help="local clone (read-only)")
-    p_merges.add_argument("--target", default=plan_git.DEFAULT_TARGET,
-                          help="target branch (default origin/main; no fetch)")
+    p_merges.add_argument("--target", default=None,
+                          help="target branch, alone authoritative (default: the lot's, "
+                               "else the repository's `git config ameesh.target`, else its "
+                               "default branch, then the integration refs "
+                               "develop/main/master/release/*; no fetch)")
     p_merges.add_argument("--repo", default=None,
                           help="owner/repo: failing proof by content, the linked PR")
     p_merges.add_argument("--dry-run", action="store_true", help="report without closing")
@@ -377,7 +383,8 @@ def _sync_merges(db, args: argparse.Namespace) -> int:
         print(json.dumps({"git": report, "github": gh_report}, ensure_ascii=False, indent=2))
         return 1 if refused else 0
     print("%s%s (%s): %d work item(s) closed by content" % (
-        "[dry run] " if args.dry_run else "", report["git_dir"], report["target"],
+        "[dry run] " if args.dry_run else "", report["git_dir"],
+        report["target"] or "no default target",
         report["merged"]))
     for row in report["results"]:
         print("  work item #%-5s %-14s %-11s %-9s %s" % (
