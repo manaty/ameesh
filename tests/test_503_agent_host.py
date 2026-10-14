@@ -317,7 +317,9 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('injected', self.units())
 
     def test_mode_refuses_unsupported_action(self):
-        p = self.run_vm('installer')
+        # installer/retour/verifier existent depuis #1155 ; « migrer » reste
+        # une étape du poste, jamais du mode agents.
+        p = self.run_vm('migrer')
         self.assertNotEqual(p.returncode, 0)
         self.assertFalse((self.state / 'ssh.log').exists())
 
