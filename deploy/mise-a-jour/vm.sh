@@ -29,7 +29,8 @@
 #   Avant toute mutation, l'identité effective du compte runner (son
 #   EnvironmentFile) doit être celle de HOTE_AGENTS, et un journal de
 #   récupération retient le code quitté : une installation inachevée ferme la
-#   commande et « retour » ramène à ce code, même sans previous-sha.
+#   commande, « installer » refuse tant que ce journal existe (le résoudre par
+#   « retour »), et « retour » ramène à ce code, même sans previous-sha.
 #
 # REF (installer) : commit, branche ou étiquette du dépôt qui contient ce
 # script ; défaut : HEAD de ce dépôt. Si le serveur ne le trouve pas chez
@@ -290,20 +291,62 @@ previous_agents() {
 }
 # Identité effective du compte runner, lue dans l'environnement de l'unité
 # (EnvironmentFile) : le paquet installé peut être cassé par l'installation
-# inachevée que « retour » doit justement réparer, donc le repli lit le même
-# fichier sans passer par lui — même résolution que config.Config.host
-# (AMEESH_HOST, AGENT_MESH_HOST, puis le nom d'hôte). Toute lecture impossible
-# ou vide ferme la commande (#1252 B3).
+# inachevée que « retour » doit justement réparer, donc le repli reproduit
+# config.load().host sans importer le paquet — AMEESH_HOST/AGENT_MESH_HOST,
+# puis le champ `host` du JSON désigné par AMEESH_CONFIG/AGENT_MESH_CONFIG
+# (repli sur la config héritée agent-mesh, comme config.load), puis le nom
+# d'hôte. Un fichier présent mais illisible, ou un host non textuel ou vide,
+# ferme la commande au lieu de retomber sur le nom machine (#1252 B3).
 identite_agents() {
   local h
   if h=$(python_agents -c 'from ameesh import config
-print(config.load().host)' 2>/dev/null) && [ -n "${h//[$'\r\n ']/}" ]; then
+h = config.load().host
+if not isinstance(h, str) or not h.strip():
+    raise SystemExit("host unprovable")
+print(h)' 2>/dev/null) && [ -n "${h//[$'\r\n ']/}" ]; then
     printf '%s\n' "${h//[$'\r\n ']/}"
     return 0
   fi
-  commande_agents python3 -c 'import os, socket
-h = os.environ.get("AMEESH_HOST") or os.environ.get("AGENT_MESH_HOST") or ""
-print(h or socket.gethostname().split(".")[0])'
+  commande_agents python3 -c '
+import json, os, socket, sys
+
+def expand(chemin):
+    return os.path.abspath(os.path.expanduser(chemin))
+
+def refus(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+legacy = expand(os.environ.get("AGENT_MESH_CONFIG") or "~/.config/agent-mesh/config.json")
+chemin = expand(os.environ.get("AMEESH_CONFIG") or os.environ.get("AGENT_MESH_CONFIG")
+                or "~/.config/ameesh/config.json")
+if not os.path.exists(chemin) and os.path.exists(legacy):
+    chemin = legacy  # une config agent-mesh existante reste lue (config.load)
+
+absent = object()
+hote = absent
+if os.path.exists(chemin):
+    try:
+        with open(chemin, encoding="utf-8") as fh:
+            brut = json.load(fh)
+    except (OSError, ValueError) as exc:
+        refus("unreadable config %s: %s" % (chemin, exc))
+    if not isinstance(brut, dict):
+        refus("unreadable config %s: JSON object expected" % chemin)
+    if "host" in brut:
+        hote = brut["host"]
+
+env_hote = os.environ.get("AMEESH_HOST") or os.environ.get("AGENT_MESH_HOST")
+if env_hote:
+    valeur = env_hote
+elif hote is not absent:
+    valeur = hote
+else:
+    valeur = socket.gethostname().split(".")[0]
+if not isinstance(valeur, str) or not valeur.strip():
+    refus("host unprovable in the runner environment")
+print(valeur.strip("\r\n "))
+'
 }
 exiger_identite_agents() {
   local h
@@ -322,6 +365,8 @@ exiger_identite_agents() {
 # doit réinstaller si l'installation échoue après avoir remplacé le paquet.
 # Écrit avant toute mutation, effacé seulement après une réinstallation
 # réussie ; distinct de previous-sha, publié lui aussi seulement au succès.
+# Une relance d'« installer » après un échec ne doit jamais écraser ce journal :
+# le SHA quitté reste la cible de récupération jusqu'à résolution par « retour ».
 etat_journal_agents() {  # sha40, « absent » ou « invalide »
   utilisateur_agents bash -c 'f=/home/ameesh/.local/share/ameesh/installation-en-cours
     [ -e "$f" ] || { echo absent; exit 0; }
@@ -332,32 +377,113 @@ etat_journal_agents() {  # sha40, « absent » ou « invalide »
     fi
     echo "$sha"'
 }
-ecrire_journal_agents() {  # $1 : sha40 quitté, $2 : sha40 visé
+ecrire_journal_agents() {  # $1 : sha40 quitté, $2 : sha40 visé ; refuse d'écraser
   utilisateur_agents bash -c "set -euo pipefail
     umask 077
     P=/home/ameesh/.local/share/ameesh
+    f=\$P/installation-en-cours
+    test ! -e \"\$f\" || { echo 'journal de récupération déjà présent' >&2; exit 1; }
     t=\$(mktemp \"\$P/.installation-en-cours.XXXXXX\")
     printf 'sha=%s\ninstantane=src-%s\ncible=%s\n' '$1' '${1:0:7}' '$2' > \"\$t\"
-    mv \"\$t\" \"\$P/installation-en-cours\""
+    mv \"\$t\" \"\$f\""
 }
 effacer_journal_agents() {
   utilisateur_agents bash -c 'rm -f /home/ameesh/.local/share/ameesh/installation-en-cours'
+}
+# Vérifie le contenu du disque d'un instantané contre les objets du commit $1,
+# sans passer par l'index : `assume-unchanged` et `skip-worktree` ne masquent
+# rien, chaque fichier est haché et comparé au blob du commit, et un fichier
+# modifié, absent, en trop, ou au mauvais mode est refusé. Affiche « ok » ou la
+# raison du refus (#1252 B2).
+verifier_contenu_agents() {  # $1 : sha40
+  utilisateur_agents python3 -c '
+import hashlib, os, stat, subprocess, sys
+
+sha = sys.argv[1]
+d = "/home/ameesh/.local/share/ameesh/src-" + sha[:7]
+
+def git(*args):
+    return subprocess.run(["git", "-C", d, *args], capture_output=True)
+
+if not os.path.lexists(d):
+    print("absent"); sys.exit(0)
+if os.path.islink(d) or not os.path.isdir(d):
+    print("chemin non répertoire"); sys.exit(0)
+if not os.path.exists(os.path.join(d, ".git")):
+    print("sans dépôt git : contenu non prouvable"); sys.exit(0)
+res = git("rev-parse", "--verify", "HEAD^{commit}")
+tete = res.stdout.decode().strip() if res.returncode == 0 else ""
+if tete != sha:
+    print("HEAD=" + (tete or "illisible")); sys.exit(0)
+res = git("ls-tree", "-r", "-z", "--full-tree", sha)
+if res.returncode != 0:
+    print("arbre du commit illisible"); sys.exit(0)
+
+attendus = {}
+for entree in res.stdout.split(b"\0"):
+    if not entree:
+        continue
+    meta, chemin = entree.split(b"\t", 1)
+    mode, genre, objet = meta.decode().split()
+    attendus[chemin.decode("utf-8", "surrogateescape")] = (mode, genre, objet)
+
+vus = set()
+for racine, repertoires, fichiers in os.walk(d, followlinks=False):
+    # Un lien symbolique vers un répertoire est un élément du disque à vérifier,
+    # pas un répertoire à parcourir.
+    liens = [n for n in repertoires if os.path.islink(os.path.join(racine, n))]
+    repertoires[:] = [n for n in repertoires if n not in liens]
+    elements = fichiers + liens
+    if racine == d:
+        repertoires[:] = [n for n in repertoires if n != ".git"]
+        elements = [n for n in elements if n != ".git"]
+    for nom in elements:
+        chemin = os.path.relpath(os.path.join(racine, nom), d)
+        vus.add(chemin)
+        attendu = attendus.get(chemin)
+        if attendu is None:
+            print("fichier en trop : " + chemin); sys.exit(0)
+        mode, genre, objet = attendu
+        complet = os.path.join(racine, nom)
+        if genre == "commit":
+            if os.path.islink(complet) or not os.path.isdir(complet):
+                print("sous-module absent : " + chemin); sys.exit(0)
+            continue
+        try:
+            st = os.lstat(complet)
+        except OSError:
+            print("fichier illisible : " + chemin); sys.exit(0)
+        if mode == "120000":
+            if not stat.S_ISLNK(st.st_mode):
+                print("type différent du commit : " + chemin); sys.exit(0)
+            try:
+                donnees = os.readlink(complet).encode("utf-8", "surrogateescape")
+            except OSError:
+                print("lien illisible : " + chemin); sys.exit(0)
+        else:
+            if not stat.S_ISREG(st.st_mode):
+                print("type différent du commit : " + chemin); sys.exit(0)
+            try:
+                with open(complet, "rb") as fh:
+                    donnees = fh.read()
+            except OSError:
+                print("fichier illisible : " + chemin); sys.exit(0)
+        if hashlib.sha1(b"blob %d\0" % len(donnees) + donnees).hexdigest() != objet:
+            print("contenu modifié : " + chemin); sys.exit(0)
+        if (mode == "100755") != bool(st.st_mode & stat.S_IXUSR):
+            print("mode différent du commit : " + chemin); sys.exit(0)
+manquants = sorted(set(attendus) - vus)
+if manquants:
+    print("fichier absent : " + manquants[0]); sys.exit(0)
+print("ok")
+' "$1"
 }
 # État d'un instantané src-<sha7> : « absent », « ok » (arbre exact du commit)
 # ou la raison du refus. Un instantané venu d'un clone sale, modifié depuis sa
 # création ou sans dépôt git n'est jamais installé (#1252 B2). Les fichiers
 # ignorés comptent : un `build/` ajouté serait consommé par le build suivant.
 etat_instantane_agents() {
-  utilisateur_agents bash -c 'set -uo pipefail
-    d=/home/ameesh/.local/share/ameesh/src-'"${1:0:7}"'
-    [ -e "$d" ] || { echo absent; exit 0; }
-    [ -d "$d" ] || { echo "chemin non répertoire"; exit 0; }
-    [ -e "$d/.git" ] || { echo "sans dépôt git : contenu non prouvable"; exit 0; }
-    tete=$(git -C "$d" rev-parse HEAD 2>/dev/null || echo illisible)
-    [ "$tete" = '"$1"' ] || { echo "HEAD=$tete"; exit 0; }
-    sale=$(git -C "$d" status --porcelain -uall --ignored -- . 2>/dev/null || echo illisible)
-    [ -z "$sale" ] || { echo "contenu modifié : $(printf "%s" "$sale" | head -n1)"; exit 0; }
-    echo ok'
+  verifier_contenu_agents "$1"
 }
 # Retire les artefacts de construction ignorés (build/, *.egg-info, __pycache__)
 # d'un instantané existant : le build suivant repart de l'arbre du commit.
@@ -366,12 +492,13 @@ nettoyer_instantane_agents() {
     [ -e "$d/.git" ] && git -C "$d" clean -qfdX || true'
 }
 creer_instantane_agents() {  # $1 : sha40 ; refuse d'écraser un chemin existant
+  # Le contenu créé est vérifié exactement par assurer_instantane_agents, qui
+  # rappelle etat_instantane_agents juste après (objets du commit, pas l'index).
   utilisateur_agents bash -c 'set -euo pipefail
     P=/home/ameesh/.local/share/ameesh; d=$P/src-'"${1:0:7}"'
     test ! -e "$d" || { echo "instantané déjà présent : $d" >&2; exit 1; }
     git -C "$P/src" worktree add -q --detach "$d" '"$1"'
-    test "$(git -C "$d" rev-parse HEAD)" = '"$1"'
-    test -z "$(git -C "$d" status --porcelain -uall --ignored -- .)"'
+    test "$(git -C "$d" rev-parse HEAD)" = '"$1"''
 }
 assurer_instantane_agents() {  # $1 : sha40 ; instantané exact, créé ou vérifié
   local sha=$1 etat
@@ -449,8 +576,22 @@ controler_agents() {
 }
 
 installer_agents() {
-  local ref=${1:-HEAD} sha court avant complet courant
+  local ref=${1:-HEAD} sha court avant complet courant journal
   exiger_identite_agents
+  # 0. une installation inachevée (journal de récupération présent) se résout
+  # par « retour » : relancer « installer » écraserait la cible de récupération
+  # par un SHA dont le premier pip a déjà publié le direct_url.json (#1252 B1).
+  journal=$(etat_journal_agents) \
+    || { echo "journal de récupération illisible sur $HOTE_AGENTS : installation refusée" >&2; exit 1; }
+  case "$journal" in
+    absent) ;;
+    invalide)
+      echo "journal de récupération invalide sur $HOTE_AGENTS : installation refusée (le corriger ou le retirer à la main, puis « $0 agents retour »)" >&2
+      exit 1 ;;
+    *)
+      echo "installation inachevée (journal de récupération : ${journal:0:9}) : lancer d'abord « $0 agents retour », installation refusée" >&2
+      exit 1 ;;
+  esac
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
   court=${sha:0:7}
   etape "VM d'agents $HOTE_AGENTS ($AGENTS_SSH) : commit visé ${sha:0:9} ($ref)"

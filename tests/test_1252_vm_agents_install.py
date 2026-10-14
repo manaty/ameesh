@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -160,7 +161,7 @@ else:
 '''
 
 PIP = r'''#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 log = state / 'pip.log'
@@ -169,6 +170,13 @@ with log.open('a') as f:
 fail_at = int((state / 'pip-fail-at').read_text()) if (state / 'pip-fail-at').exists() else 0
 if fail_at and len(log.read_text().splitlines()) >= fail_at:
     sys.exit('pip failure (test)')
+# Un pip réussi publie direct_url.json sur la source installée : le venv pointe
+# alors l'instantané même si l'installation s'arrête au pip suivant.
+info = (Path(os.environ['FAKE_VM_HOME'])
+        / '.local/share/ameesh/venv/lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
+if info.is_dir():
+    (info / 'direct_url.json').write_text(json.dumps(
+        {'url': Path(sys.argv[-1]).resolve().as_uri()}))
 '''
 
 
@@ -227,6 +235,10 @@ class VmAgentsHarness(unittest.TestCase):
                         FAKE_STATE=str(self.state), FAKE_VM_HOME=str(self.vmhome),
                         FAKE_VM_TMP=str(self.vmtmp),
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'])
+        # L'hôte de test ne doit pas fournir d'identité par accident : elle
+        # vient de l'EnvironmentFile simulé ou du fichier de configuration.
+        for nom in ('AMEESH_HOST', 'AGENT_MESH_HOST', 'AMEESH_CONFIG', 'AGENT_MESH_CONFIG'):
+            self.env.pop(nom, None)
         self.old = self.git(ROOT, 'rev-parse', 'HEAD~1')
         self.target = self.git(ROOT, 'rev-parse', 'HEAD')
         self._clone_at_old()
@@ -276,6 +288,30 @@ class VmAgentsHarness(unittest.TestCase):
     def pip_calls(self):
         log = self.state / 'pip.log'
         return log.read_text().splitlines() if log.exists() else []
+
+    def installed_url(self):
+        info = (self.venv / 'lib/python3.11/site-packages'
+                / 'ameesh-1.9.0.dist-info/direct_url.json')
+        return json.loads(info.read_text())['url']
+
+    def runner_env(self, **env):
+        """EnvironmentFile simulé ; sans AMEESH_HOST, l'identité vient du JSON."""
+        (self.state / 'expected-env.json').write_text(json.dumps(
+            dict(AMEESH_DSN='postgresql://test@invalid/mesh', AMEESH_SCHEMA='test', **env)))
+
+    def point_bascule_at(self, host):
+        (self.root / 'bascule.env').write_text(
+            'AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=%s\n' % host)
+
+    def machine_host(self):
+        return socket.gethostname().split('.')[0]
+
+    def mask_tracked_source(self, snapshot, flag):
+        """Modifie une source suivie en la masquant de `git status` (index)."""
+        self.git(snapshot, 'update-index', flag, 'src/ameesh/__init__.py')
+        (snapshot / 'src/ameesh/__init__.py').write_text('# modifié sous %s\n' % flag)
+        self.assertEqual(self.git(snapshot, 'status', '--porcelain', '-uall',
+                                  '--ignored'), '')
 
 
 class VmAgentsInstallTest(VmAgentsHarness):
@@ -386,6 +422,101 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.head(self.src), self.target)
 
+    # -- identité de repli : même résolution que config.load().host ----------
+    def test_identity_fallback_reads_the_host_json_not_the_machine_name(self):
+        # Paquet cassé, HOTE_AGENTS = nom machine, JSON host divergent : le
+        # repli doit rendre le host du JSON et refuser, pas accepter le nom
+        # machine (#1252 B3).
+        (self.state / 'scenario').write_text('identity-error\n')
+        machine = self.machine_host()
+        self.point_bascule_at(machine)
+        self.runner_env()
+        (self.vmhome / '.config/ameesh/config.json').write_text(
+            json.dumps({'host': 'wrong-configured-host'}))
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('wrong-configured-host', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_identity_fallback_accepts_the_host_json_of_hote_agents(self):
+        (self.state / 'scenario').write_text('identity-error\n')
+        machine = self.machine_host()
+        self.point_bascule_at(machine)
+        self.runner_env()
+        (self.vmhome / '.config/ameesh/config.json').write_text(
+            json.dumps({'host': machine}))
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.head(self.src), self.target)
+
+    def test_identity_fallback_uses_the_machine_name_without_config(self):
+        (self.state / 'scenario').write_text('identity-error\n')
+        self.point_bascule_at(self.machine_host())
+        self.runner_env()
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.head(self.src), self.target)
+
+    def test_identity_fallback_uses_the_machine_name_when_json_has_no_host(self):
+        (self.state / 'scenario').write_text('identity-error\n')
+        self.point_bascule_at(self.machine_host())
+        self.runner_env()
+        (self.vmhome / '.config/ameesh/config.json').write_text(
+            json.dumps({'schema': 'test'}))
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_identity_fallback_refuses_a_null_host_in_the_json(self):
+        # host null : config.load().host vaut None, pas le nom machine.
+        (self.state / 'scenario').write_text('identity-error\n')
+        machine = self.machine_host()
+        self.point_bascule_at(machine)
+        self.runner_env()
+        (self.vmhome / '.config/ameesh/config.json').write_text(
+            json.dumps({'host': None}))
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('identité', p.stderr)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_identity_fallback_reads_the_legacy_config(self):
+        (self.state / 'scenario').write_text('identity-error\n')
+        self.point_bascule_at(self.machine_host())
+        self.runner_env()
+        legacy = self.vmhome / '.config/agent-mesh'
+        legacy.mkdir(parents=True)
+        (legacy / 'config.json').write_text(json.dumps({'host': 'legacy-wrong-host'}))
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('legacy-wrong-host', p.stderr)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_identity_fallback_reads_the_ameesh_config_pointer(self):
+        (self.state / 'scenario').write_text('identity-error\n')
+        self.point_bascule_at(self.machine_host())
+        ailleurs = self.vmhome / '.config/ameesh/ailleurs.json'
+        ailleurs.write_text(json.dumps({'host': 'pointer-wrong-host'}))
+        self.runner_env(AMEESH_CONFIG=str(ailleurs))
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('pointer-wrong-host', p.stderr)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_identity_fallback_refuses_an_unreadable_config(self):
+        # Un fichier présent mais illisible ne doit pas retomber sur le nom
+        # machine : l'installation reste fermée avant toute mutation.
+        (self.state / 'scenario').write_text('identity-error\n')
+        self.point_bascule_at(self.machine_host())
+        self.runner_env()
+        (self.vmhome / '.config/ameesh/config.json').write_text('{pas du json\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('identité', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual(self.pip_calls(), [])
+
     def _pristine_snapshot(self, sha):
         """An unmodified src-<sha7> clone, as a previous run would leave one."""
         snapshot = self.parts / ('src-' + sha[:7])
@@ -423,9 +554,43 @@ class VmAgentsInstallTest(VmAgentsHarness):
         (target_snapshot / 'sitecustomize.py').write_text('# ajouté\n')
         p = self.run_vm('installer', self.target)
         self.assertNotEqual(p.returncode, 0)
-        self.assertIn('contenu modifié', p.stderr)
+        self.assertIn('fichier en trop', p.stderr)
         self.assertEqual(self.head(self.src), self.old)
         self.assertEqual(self.pip_calls(), [])
+
+    def test_install_refuses_a_source_masked_by_assume_unchanged(self):
+        # `git status` est vide (index masqué) : la vérification par objets du
+        # commit doit voir le fichier modifié sur le disque.
+        target_snapshot = self._pristine_snapshot(self.target)
+        self.mask_tracked_source(target_snapshot, '--assume-unchanged')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('contenu modifié', p.stderr)
+        self.assertEqual(self.pip_calls(), [])
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual((target_snapshot / 'src/ameesh/__init__.py').read_text(),
+                         '# modifié sous --assume-unchanged\n')
+
+    def test_install_refuses_a_source_masked_by_skip_worktree(self):
+        target_snapshot = self._pristine_snapshot(self.target)
+        self.mask_tracked_source(target_snapshot, '--skip-worktree')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('contenu modifié', p.stderr)
+        self.assertEqual(self.pip_calls(), [])
+        self.assertEqual(self.head(self.src), self.old)
+
+    def test_install_refuses_a_type_change_in_a_snapshot(self):
+        # Fichier suivi remplacé par un lien : le type fait partie de l'arbre.
+        target_snapshot = self._pristine_snapshot(self.target)
+        cible = target_snapshot / 'src/ameesh/__init__.py'
+        cible.unlink()
+        cible.symlink_to('/dev/null')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('type différent du commit', p.stderr)
+        self.assertEqual(self.pip_calls(), [])
+        self.assertEqual(self.head(self.src), self.old)
 
     def test_install_normalizes_ignored_build_artifacts_before_reusing_a_snapshot(self):
         # `build/` est ignoré par le dépôt mais consommé par le build suivant :
@@ -479,6 +644,76 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.src), self.old)
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
+    # -- journal de récupération : relance d'installer (B1) ------------------
+    def test_install_refuses_while_a_recovery_journal_exists(self):
+        (self.parts / 'installation-en-cours').write_text(
+            'sha=%s\ninstantane=src-%s\ncible=%s\n'
+            % (self.old, self.old[:7], self.target))
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('installation inachevée', p.stderr)
+        self.assertIn('retour', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
+        self.assertEqual(self.pip_calls(), [])
+        self.assertIn('sha=' + self.old,
+                      (self.parts / 'installation-en-cours').read_text())
+
+    def test_install_refuses_an_invalid_recovery_journal_before_any_mutation(self):
+        (self.parts / 'installation-en-cours').write_text('sha=pas-un-sha\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('journal de récupération invalide', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_relaunching_install_keeps_the_original_recovery_target(self):
+        # A→B, le premier pip réussit puis le second échoue : le journal vaut A,
+        # mais direct_url.json pointe déjà B. Relancer installer ne doit pas
+        # prendre B pour cible de récupération ni écraser le journal.
+        plus_ancien = self.git(ROOT, 'rev-parse', 'HEAD~2')
+        (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
+        (self.state / 'pip-fail-at').write_text('2\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(len(self.pip_calls()), 2)
+        self.assertEqual(self.installed_url(),
+                         (self.parts / ('src-' + self.target[:7])).as_uri())
+        q = self.run_vm('installer', self.target)
+        self.assertNotEqual(q.returncode, 0)
+        self.assertIn('installation inachevée', q.stderr)
+        self.assertEqual(len(self.pip_calls()), 2)
+        self.assertIn('sha=' + self.old,
+                      (self.parts / 'installation-en-cours').read_text())
+        (self.state / 'pip-fail-at').unlink()
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertFalse((self.parts / 'installation-en-cours').exists())
+        for call in self.pip_calls()[2:]:
+            self.assertIn('src-' + self.old[:7], call)
+            self.assertNotIn('src-' + self.target[:7], call)
+
+    def test_relaunching_first_install_keeps_the_recovery_journal(self):
+        # Même cas sans previous-sha : le journal seul porte la récupération.
+        (self.parts / 'previous-sha').unlink()
+        (self.state / 'pip-fail-at').write_text('2\n')
+        p = self.run_vm('installer', self.target)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.installed_url(),
+                         (self.parts / ('src-' + self.target[:7])).as_uri())
+        q = self.run_vm('installer', self.target)
+        self.assertNotEqual(q.returncode, 0)
+        self.assertEqual(len(self.pip_calls()), 2)
+        self.assertIn('sha=' + self.old,
+                      (self.parts / 'installation-en-cours').read_text())
+        (self.state / 'pip-fail-at').unlink()
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
+
     # -- rollback -----------------------------------------------------------
     def test_retour_refuses_without_previous_sha(self):
         (self.parts / 'previous-sha').unlink()
@@ -515,6 +750,16 @@ class VmAgentsInstallTest(VmAgentsHarness):
         (self.parts / 'previous-sha').write_text(self.old + '\n')
         old_snapshot = self._pristine_snapshot(self.old)
         (old_snapshot / 'src/ameesh/__init__.py').write_text('# altéré\n')
+        p = self.run_vm('retour')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('contenu modifié', p.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+        self.assertEqual(self.pip_calls(), [])
+
+    def test_retour_refuses_a_source_masked_by_assume_unchanged(self):
+        (self.parts / 'previous-sha').write_text(self.old + '\n')
+        old_snapshot = self._pristine_snapshot(self.old)
+        self.mask_tracked_source(old_snapshot, '--assume-unchanged')
         p = self.run_vm('retour')
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('contenu modifié', p.stderr)

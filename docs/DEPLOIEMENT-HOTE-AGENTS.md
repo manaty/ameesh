@@ -83,9 +83,14 @@ deploy/mise-a-jour/vm.sh agents retour
 `installer` et `retour` refusent d’abord si l’identité effective du compte
 runner — `AMEESH_HOST` de son `EnvironmentFile`, lue dans l’environnement de
 l’unité — n’est pas `HOTE_AGENTS` : un `BASCULE_ENV` qui vise une autre VM
-n’écrit rien. La lecture passe par le paquet installé, avec un repli qui lit le
-même fichier sans lui (une installation inachevée peut l’avoir cassé) ; toute
-lecture impossible ferme la commande.
+n’écrit rien. La lecture passe par le paquet installé ; si celui-ci ne
+s’importe plus (une installation inachevée peut l’avoir cassé), un repli
+reproduit `config.load().host` sans l’importer : `AMEESH_HOST` puis
+`AGENT_MESH_HOST`, sinon le champ `host` du JSON désigné par `AMEESH_CONFIG`
+ou `AGENT_MESH_CONFIG` (repli sur `~/.config/agent-mesh/config.json` comme
+`config.load`), sinon le nom court de la machine. Un fichier de configuration
+présent mais illisible, ou un host non textuel ou vide, ferme la commande
+plutôt que de retomber sur le nom machine.
 
 `installer` refuse ensuite tant que les migrations du commit visé manquent de
 la base commune du mesh (`poste.sh migrer` d’abord), et refuse un code d’avant
@@ -98,21 +103,25 @@ sur le SHA visé et de réinstaller depuis l’instantané
 (`pip --force-reinstall --no-deps` puis les dépendances). Un instantané est un
 worktree détaché du commit : son arbre est celui du commit, jamais une copie
 d’un clone sale. Avant réutilisation, les artefacts de construction ignorés
-(`build/`, `*.egg-info`, `__pycache__`) en sont retirés, puis l’instantané doit
-correspondre exactement au commit, fichiers suivis comme ignorés ; sinon
-l’opération refuse de l’utiliser et ne l’écrase jamais — le retirer à la main
-pour le reconstruire.
+(`build/`, `*.egg-info`, `__pycache__`) en sont retirés, puis chaque fichier du
+disque est haché et comparé aux objets du commit, sans passer par l’index :
+`assume-unchanged` et `skip-worktree` ne masquent rien, et un fichier modifié,
+absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
+écrasé — le retirer à la main pour le reconstruire.
 
 `previous-sha` n’est publié qu’après une installation réussie, et le journal
 est alors effacé. Si l’installation échoue (même après un premier `pip` qui a
-déjà remplacé le paquet), la commande ferme en conservant le journal :
-`retour` ramène au code quitté qu’il désigne, et non à un `previous-sha` plus
-ancien — y compris à la première utilisation, sans `previous-sha`. `retour`
-réinstalle ce commit depuis son instantané puis enchaîne `redemarrer` et
-`controler` ; après réussite il laisse `previous-sha` sur le code installé,
-donc un second `retour` est idempotent. Il refuse si la cible (journal ou
-`previous-sha`) est absente, invalide ou introuvable dans le clone de la VM
-comme dans le dépôt du poste.
+déjà remplacé le paquet et publié `direct_url.json`), la commande ferme en
+conservant le journal : `retour` ramène au code quitté qu’il désigne, et non à
+un `previous-sha` plus ancien — y compris à la première utilisation, sans
+`previous-sha`. Tant que ce journal existe, `installer` refuse avant toute
+mutation et oriente vers `retour` : une relance ne peut ni écraser la cible de
+récupération ni prendre pour elle le SHA dont le venv porte déjà le
+`direct_url.json`. `retour` réinstalle le commit du journal depuis son
+instantané puis enchaîne `redemarrer` et `controler` ; après réussite il laisse
+`previous-sha` sur le code installé, donc un second `retour` est idempotent. Il
+refuse si la cible (journal ou `previous-sha`) est absente, invalide ou
+introuvable dans le clone de la VM comme dans le dépôt du poste.
 
 Si la VM n’a pas le commit visé, il est envoyé en paquet git par SSH depuis le
 poste. Le paquet exclut le HEAD du clone de la VM, dont la présence est prouvée
