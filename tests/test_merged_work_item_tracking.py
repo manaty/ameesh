@@ -876,6 +876,124 @@ class RealTargetTest(_Base):
         self.assertTrue(any("origin/develop" in (n or "") for n in notes))
 
 
+class ContentDeliveryTest(_Base):
+    """#1005 : `sync-merges` sans `--target` suit la cible réelle du clone —
+    celle du lot (`branch_target`), sinon `ameesh.target` du dépôt, sinon sa
+    branche par défaut, puis les refs d'intégration — au lieu d'`origin/main`
+    par défaut (cas #560 et #905, restés « waiting for merge » sur `develop`).
+
+    Le relevé automatique du lot (branche ou citation) n'est pas modifié ici ;
+    le patch-id exact (cherry-pick, rebase, squash) reste le travail de
+    `sync-merges`. Une cible déclarée ne ferme jamais ailleurs."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "depot1005")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        self.commit("socle")
+        _git(self.repo, "checkout", "-q", "-b", "develop")
+        # ni `ameesh.target` ni `origin/HEAD` : la cible par défaut est main
+        _git(self.repo, "update-ref", "refs/remotes/origin/main",
+             _git(self.repo, "rev-parse", "HEAD"))
+        self.agent("claude1", cwd=self.repo)
+        for state in (plan_git._pr_body_backoff, plan_git._pr_body_cache):
+            state.clear()                           # état du processus
+            self.addCleanup(state.clear)
+
+    def commit(self, name):
+        with open(os.path.join(self.repo, name), "w") as fh:
+            fh.write(name + "\n")
+        _git(self.repo, "add", name)
+        _git(self.repo, "commit", "-q", "-m", "ajoute %s" % name)
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def livrer(self, branch, message):
+        """Une branche fusionnée en `--no-ff` sur develop (la cible réelle),
+        sans trailer : le message d'une PR GitHub qui ne cite pas le lot."""
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        sha = self.commit(branch.replace("/", "-"))
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", message, branch)
+        _git(self.repo, "update-ref", "refs/remotes/origin/develop",
+             _git(self.repo, "rev-parse", "HEAD"))
+        return sha
+
+    def publish_develop(self):
+        _git(self.repo, "update-ref", "refs/remotes/origin/develop",
+             _git(self.repo, "rev-parse", "develop"))
+
+    def lot(self, sha):
+        """Un lot gelé en qa, sans branche ni cible déclarée (#905)."""
+        item = work.add(self.db, title="lot sans branche", assignee="claude1", actor="orch")
+        for state in ("build", "qa"):
+            work.move(self.db, item["id"], state)
+        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="ouvrier")
+        return item
+
+    def sync(self, **kw):
+        return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
+
+    def test_1005_gel_non_livre_laisse_le_lot_ouvert(self):
+        _git(self.repo, "checkout", "-q", "-b", "agent/jamais", "develop")
+        sha = self.commit("jamais")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.publish_develop()
+        lot = self.lot(sha)
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_sync_merges_sans_target_suit_develop(self):
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        report = plan_git.sync_merges(self.db, self.repo)
+        self.assertTrue(report["auto"])
+        self.assertEqual(report["target"], "origin/main")   # cible par défaut du clone
+        entry = {r["work_item"]: r for r in report["results"]}[lot["id"]]
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "ancestor"))
+        self.assertEqual(entry["target"], "origin/develop")
+        self.assertEqual(entry["off_target"], "origin/main")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        jalon = self.merged_milestone(lot["id"])
+        self.assertEqual((jalon["sha"], jalon["actor"]), (sha, "git:origin/develop"))
+
+    def test_1005_sync_merges_target_explicite_reste_seul(self):
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo, target="origin/main")["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("missing from origin/main", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        with self.assertRaises(plan_git.MergeProbeError):
+            plan_git.sync_merges(self.db, self.repo, target="origin/nulle-part")
+
+    def test_1005_patch_id_reste_a_sync_merges(self):
+        # cherry-pick : le gel n'est pas ancêtre de develop ; le relevé
+        # automatique (borné à l'ancêtre) laisse le lot ouvert, `sync-merges`
+        # le ferme par le patch-id exact
+        _git(self.repo, "checkout", "-q", "-b", "agent/cherry", "develop")
+        sha = self.commit("cherry")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.commit("socle2")          # develop avance : le cherry-pick change de parent
+        _git(self.repo, "cherry-pick", sha)
+        self.publish_develop()
+        lot = self.lot(sha)
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "patch-id"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1005_cli_sync_merges_cible_auto(self):
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        proc = self.mesh("work", "sync-merges", "--git-dir", self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("closed by content", proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""
 
