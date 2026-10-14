@@ -41,6 +41,25 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(texte=texte):
                 self.assertEqual(rate_limit.classify(error=texte), rate_limit.QUOTA)
 
+    def test_signature_fournisseur_positive_seule(self):
+        # R1 cx3 B2 : « billing » (ou « plafond ») dans un texte libre ne
+        # classe pas un quota — le mot seul ne désarme pas L48.
+        for texte in ("I updated the billing page",
+                      "the harness returned code 1: see the billing page",
+                      "plafond atteint dans le cache local"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(result=texte))
+
+    def test_quota_prime_entre_les_textes(self):
+        # R1 cx3 B2 : le quota prime sur le débit, tous textes confondus.
+        self.assertEqual(rate_limit.classify(
+            error="HTTP 429 Too Many Requests", stderr_tail="insufficient_quota"),
+            rate_limit.QUOTA)
+        self.assertEqual(rate_limit.classify(
+            error="429", result="you have hit your weekly limit"),
+            rate_limit.QUOTA)
+
     def test_aucune_conclusion_sur_un_texte_illisible(self):
         # ni vide, ni erreur sans rapport ne concluent quoi que ce soit sur le
         # budget : la garde comptable (L226b) reste seule juge.
@@ -77,6 +96,22 @@ class EtatTest(unittest.TestCase):
             with self.subTest(texte=texte):
                 self.assertIsNone(rate_limit.state(texte))
 
+    def test_l_echeance_durable_est_relue(self):
+        # #1270 B1 : `retry at` est absolue et relue telle quelle ; elle ne se
+        # recalcule pas (une tentative interrompue ne repousse pas la reprise).
+        since = time.time() - 30
+        retry_at = time.time() + 90
+        texte = rate_limit.status_text("mail in 3s (failed)", rate_limit.QUOTA, 2,
+                                       since, 120.0, retry_at=retry_at)
+        etat = rate_limit.state(texte)
+        self.assertEqual(etat["kind"], rate_limit.QUOTA)
+        self.assertAlmostEqual(etat["retry_at"], retry_at, delta=1.0)
+        self.assertAlmostEqual(rate_limit.remaining(etat), 90.0, delta=2.0)
+        # marqueur d'avant le champ : repli sur le délai nominal
+        ancien = "[rate_limited x1 since %s, retry in 60s] x" % rate_limit._stamp(since)
+        self.assertEqual(rate_limit.state(ancien)["retry_at"], 0.0)
+        self.assertAlmostEqual(rate_limit.remaining(rate_limit.state(ancien)), 60.0)
+
     def test_alerte_taise_puis_autorisee(self):
         now = time.time()
         etat = {"kind": rate_limit.RATE_LIMITED, "streak": 2, "since": now - 300,
@@ -105,12 +140,12 @@ class RepriseTest(_Base):
                              (rate_limit.RATE_LIMITED, 1, 60.0))
             # pas un échec rapide : L48 ne peut pas arrêter l'agent
             self.assertFalse(worker.fast_failure)
-            self.assertAlmostEqual(worker.failure_wait(), 60.0)
+            self.assertAlmostEqual(worker.failure_wait(), 60.0, delta=2.0)
             # deuxième tour, même épisode : la cadence monte
             self.assertIsNotNone(self._tour(worker, **self.DEBIT))
             etat = rate_limit.state(registry.get(self.db, "rl")["status_text"])
             self.assertEqual(etat["streak"], 2)
-            self.assertAlmostEqual(worker.failure_wait(), 120.0)
+            self.assertAlmostEqual(worker.failure_wait(), 120.0, delta=2.0)
             self.assertFalse(worker.fast_failure)
         finally:
             worker.watchdog_stop.set()
@@ -133,6 +168,8 @@ class RepriseTest(_Base):
     def test_l_episode_survit_au_redemarrage(self):
         _, worker = self._worker("rl3", "claude", {})
         self.assertIsNotNone(self._tour(worker, **self.DEBIT))
+        echeance = worker.rate_limit_retry_at
+        self.assertGreater(echeance, time.time())
         worker.watchdog_stop.set()
         worker.release_lease()
         runner2 = Runner(self.cfg, self.db, once=True)
@@ -142,7 +179,40 @@ class RepriseTest(_Base):
         self.addCleanup(worker2.watchdog_stop.set)
         self.assertEqual(worker2.rate_limit, rate_limit.RATE_LIMITED)
         self.assertEqual(worker2.rate_limit_streak, 1)
-        self.assertAlmostEqual(worker2.failure_wait(), 60.0)
+        # #1270 B1 : l'échéance absolue est relue telle quelle, jamais repoussée
+        self.assertAlmostEqual(worker2.rate_limit_retry_at, echeance, delta=1.0)
+        self.assertGreater(worker2.retry_remaining(), 0.0)
+        self.assertAlmostEqual(worker2.failure_wait(), 60.0, delta=5.0)
+
+    def test_begin_turn_preserve_l_echeance(self):
+        # #1270 B1 : le statut d'un tour en cours garde l'épisode et son
+        # échéance — un redémarrage pendant la tentative ne la repousse pas.
+        _, worker = self._worker("rl4", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(worker, **self.DEBIT))
+            echeance = worker.rate_limit_retry_at
+            texte = worker._marqueurs_durables("mail turn (claude)")
+            etat = rate_limit.state(texte)
+            self.assertEqual(etat["kind"], rate_limit.RATE_LIMITED)
+            self.assertEqual(etat["streak"], 1)
+            self.assertAlmostEqual(etat["retry_at"], echeance, delta=1.0)
+            self.assertIn("mail turn (claude)", texte)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_aucun_lancement_avant_l_echeance(self):
+        # #1270 B1 : même avec un réveil déjà posé, le mode banc ne lance pas
+        # de tour avant l'échéance durable.
+        _, worker = self._worker("rl5", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(worker, **self.DEBIT))
+            tours = len(self.turns())
+            worker.wake.set()  # un courrier/réveil en attente
+            self.assertFalse(worker.process_once(0.0))
+            self.assertEqual(len(self.turns()), tours)
+            self.assertGreater(worker.retry_remaining(), 0.0)
+        finally:
+            worker.watchdog_stop.set()
 
 
 class AlerteTest(PgTestCase):

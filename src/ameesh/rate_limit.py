@@ -10,9 +10,10 @@ Dans le doute — texte illisible — on ne conclut rien sur le budget : la gard
 comptable (L226b) reste seule juge, et l'agent suit la reprise cadencée.
 
 L'état vit dans `status_text` sous une forme lisible et analysable
-(``[rate_limited x2 since 2026-10-14T08:20:00Z, retry in 120s] …``) : il
-survit au redémarrage de l'exécuteur, qui le relit à la construction du
-worker. Un succès le fait disparaître. L'alerte #1268
+(``[rate_limited x2 since 2026-10-14T08:20:00Z, retry in 120s, retry at …]``) :
+il survit au redémarrage de l'exécuteur, qui le relit à la construction du
+worker — y compris l'**échéance absolue** de reprise, qu'aucun courrier, reset
+ou budget ne court-circuite. Un succès le fait disparaître. L'alerte #1268
 `critical_turn_failures` n'est levée qu'après `PERSIST_S` (15 min) d'un
 épisode de débit **entier** : un 429 d'une minute ne réveille personne.
 """
@@ -24,7 +25,10 @@ from datetime import datetime, timezone
 
 #: motifs d'un quota fournisseur épuisé — plus spécifiques que le débit, donc
 #: examinés en premier : « insufficient_quota » ou « usage limit » nomment un
-#: plafond, pas une cadence passagère.
+#: plafond, pas une cadence passagère. Ce sont des **signatures fournisseur
+#: positives** : le seul mot « billing » (ou « plafond ») d'un texte libre ne
+#: classe jamais un quota (R1 cx3 B2 : « I updated the billing page » ne doit
+#: pas désarmer L48).
 QUOTA_PATTERNS = (
     re.compile(r"insufficient[_ -]?quota", re.I),
     re.compile(r"exceeded your current quota", re.I),
@@ -32,8 +36,11 @@ QUOTA_PATTERNS = (
     re.compile(r"(?:weekly|monthly|daily) limit", re.I),
     re.compile(r"quota (?:exceeded|exhausted|reached|épuisé|epuise|atteint)", re.I),
     re.compile(r"credit balance is too low", re.I),
-    re.compile(r"plafond", re.I),
-    re.compile(r"billing", re.I),
+    re.compile(r"insufficient (?:credits?|funds?)\b", re.I),
+    re.compile(r"(?:out of|no) credits?\b", re.I),
+    re.compile(r"billing (?:hard )?limit (?:reached|exceeded)", re.I),
+    re.compile(r"(?:spend|spending) limit (?:reached|exceeded)", re.I),
+    re.compile(r"plafond (?:de |du )?(?:forfait|cr[eé]dit)", re.I),
 )
 
 #: motifs d'un débit passager (429, surcharge, Retry-After…)
@@ -59,7 +66,7 @@ MAX_RESULT_CHARS = 4000
 
 _STATE_RE = re.compile(
     r"\[(rate_limited|quota) x(\d+) since (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z),"
-    r" retry in (\d+)s\]")
+    r" retry in (\d+)s(?:, retry at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z))?\]")
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -78,14 +85,16 @@ def classify(error: str | None = None, result: str | None = None,
     `quota` : plafond/forfait/crédit épuisé — distinct, jamais déduit d'un
     simple 429 (le doute reste un débit passager ; la garde comptable L226b
     reste seule juge du budget).
+
+    Le quota prime sur le débit **tous textes confondus** : un « 429 » sur
+    l'erreur et un `insufficient_quota` sur stderr classent quota (R1 cx3 B2).
+    Un genre ne se déduit que d'une signature fournisseur positive.
     """
-    for text in _texts(error, result, stderr_tail):
-        if not text:
-            continue
-        if any(motif.search(text) for motif in QUOTA_PATTERNS):
-            return QUOTA
-        if any(motif.search(text) for motif in TRANSIENT_PATTERNS):
-            return RATE_LIMITED
+    textes = [t for t in _texts(error, result, stderr_tail) if t]
+    if any(motif.search(texte) for texte in textes for motif in QUOTA_PATTERNS):
+        return QUOTA
+    if any(motif.search(texte) for texte in textes for motif in TRANSIENT_PATTERNS):
+        return RATE_LIMITED
     return None
 
 
@@ -103,10 +112,21 @@ def _parse_stamp(texte: str) -> float:
     return datetime.strptime(texte, _STAMP).replace(tzinfo=timezone.utc).timestamp()
 
 
-def status_text(base: str, kind: str, streak: int, since: float, wait: float) -> str:
-    """`status_text` d'un échec de débit : l'état complet, relisible."""
-    return "[%s x%d since %s, retry in %ds] %s" % (
-        kind, max(1, int(streak)), _stamp(since), int(wait), base)
+def status_text(base: str, kind: str, streak: int, since: float, wait: float,
+                retry_at: float | None = None) -> str:
+    """`status_text` d'un échec de débit : l'état complet, relisible.
+
+    `since` est l'heure du **premier** échec de l'épisode (elle ne bouge plus
+    tant qu'un succès ne l'efface pas) ; `retry_at` est l'échéance absolue de
+    reprise — durable, elle est relue telle quelle après un redémarrage, donc
+    une tentative interrompue par un courrier, un reset ou le budget ne
+    court-circuite pas l'attente (#1270 B1). Sans `retry_at`, l'échéance est
+    calculée du délai nominal (`wait`) au moment de l'écriture.
+    """
+    if retry_at is None:
+        retry_at = time.time() + float(wait)
+    return "[%s x%d since %s, retry in %ds, retry at %s] %s" % (
+        kind, max(1, int(streak)), _stamp(since), int(wait), _stamp(retry_at), base)
 
 
 def state(status_text: str | None) -> dict | None:
@@ -122,8 +142,30 @@ def state(status_text: str | None) -> dict | None:
         since = _parse_stamp(m.group(3))
     except ValueError:
         return None
+    retry_at = 0.0
+    if m.group(5):
+        try:
+            retry_at = _parse_stamp(m.group(5))
+        except ValueError:
+            retry_at = 0.0
     return {"kind": m.group(1), "streak": int(m.group(2)), "since": since,
-            "wait": float(m.group(4))}
+            "wait": float(m.group(4)), "retry_at": retry_at}
+
+
+def remaining(etat: dict | None, now: float | None = None) -> float:
+    """Secondes restantes avant la reprise cadencée d'un épisode, 0 sans épisode.
+
+    L'échéance durable (`retry at`) prime ; un marqueur d'avant ce champ
+    retombe sur le délai nominal. C'est la seule horloge du lancement : une
+    échéance passée vaut 0, jamais un délai recalculé qui repousserait la
+    reprise.
+    """
+    if not etat:
+        return 0.0
+    maintenant = time.time() if now is None else float(now)
+    if etat.get("retry_at"):
+        return max(0.0, float(etat["retry_at"]) - maintenant)
+    return float(etat.get("wait") or 0.0)
 
 
 def alert_suppressed(etat: dict | None, streak: int, now: float | None = None) -> bool:

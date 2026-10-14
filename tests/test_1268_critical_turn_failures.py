@@ -12,6 +12,7 @@ l'alerte ; il disparaît au premier tour réussi.
 from __future__ import annotations
 
 import os
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from ameesh import cost, exploitation, notify, registry
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
+from .test_l30_accounts import _Base
 
 
 class FamilleDeModeleTest(unittest.TestCase):
@@ -55,6 +57,19 @@ class MarqueurTest(unittest.TestCase):
                                                       critical=False)
         self.assertEqual(exploitation.failure_streak(texte), 3)
         self.assertEqual(exploitation.critical_failure_streak(texte), 0)
+
+    def test_le_marqueur_porte_le_debut_d_episode(self):
+        # #1268 B1 : `since` est écrit dans le marqueur et relu à l'identique ;
+        # il ne dépend pas de `status_since_ts` (réécrit à chaque tentative).
+        since = time.time() - 120
+        texte = exploitation.turn_failure_status_text(
+            "mail in 3s (failed)", 2, critical=True, since=since)
+        self.assertTrue(texte.startswith("critical failures x2 since "))
+        self.assertEqual(exploitation.critical_failure_streak(texte), 2)
+        self.assertEqual(exploitation.failure_streak(texte), 2)
+        self.assertAlmostEqual(exploitation.failure_since(texte), since, delta=1.0)
+        self.assertAlmostEqual(exploitation.critical_failure_since(texte), since,
+                               delta=1.0)
 
 
 class LancementTest(PgTestCase):
@@ -138,6 +153,23 @@ class AlerteTest(PgTestCase):
         registry.set_status(self.db, "orch", "idle", status_text="mail in 20s")
         self.assertEqual(self._alertes(), [])
 
+    def test_la_cle_d_alerte_est_le_debut_d_episode(self):
+        # #1268 B1 : entre deux tentatives, `status_since_ts` change mais la
+        # clé de l'alerte (début d'épisode marqué) reste la même — pas de
+        # fausse résolution/relève.
+        since = time.time() - 300
+        cles = []
+        for _ in range(2):
+            registry.set_status(
+                self.db, "orch", "blocked",
+                status_text=exploitation.turn_failure_status_text(
+                    "mail in 3s (failed)", 2, critical=True, since=since),
+                error="codex exited 1: HTTP 400 model claude-opus-5-5")
+            [alerte] = self._alertes()
+            cles.append(alerte["since"])
+        self.assertEqual(cles[0], cles[1])
+        self.assertAlmostEqual(cles[0], since, delta=1.0)
+
 
 class SerieTest(PgTestCase):
     """La série vit dans la ligne : elle survit au redémarrage de l'exécuteur."""
@@ -167,6 +199,49 @@ class SerieTest(PgTestCase):
         attendu = min(worker.runner.failure_backoff_max,
                       worker.runner.failure_backoff * 4)
         self.assertAlmostEqual(worker.failure_wait(), attendu, places=3)
+
+    def test_le_debut_d_episode_est_relu(self):
+        since = time.time() - 600
+        worker = self._worker(exploitation.turn_failure_status_text(
+            "mail in 3s (failed)", 3, critical=True, since=since))
+        self.assertEqual(worker.failure_streak, 3)
+        self.assertAlmostEqual(worker.failure_since, since, delta=1.0)
+
+    def test_begin_turn_preserve_la_serie(self):
+        # #1268 B1 : le statut d'un tour en cours garde le marqueur et son
+        # début d'épisode — un redémarrage pendant la tentative ne perd pas la
+        # série, et la clé d'alerte ne bouge pas.
+        since = time.time() - 600
+        worker = self._worker(exploitation.turn_failure_status_text(
+            "mail in 3s (failed)", 3, critical=True, since=since))
+        texte = worker._marqueurs_durables("mail turn (claude)")
+        self.assertEqual(exploitation.failure_streak(texte), 3)
+        self.assertAlmostEqual(exploitation.failure_since(texte), since, delta=1.0)
+        self.assertIn("mail turn (claude)", texte)
+
+
+class SessionFilleTest(_Base):
+    """#1268 B2 : le refus d'une session fille ne compte pas dans la série."""
+
+    FILLE = "bc9d3965-d6c7-4e90-a482-96296b7beaa6"
+
+    def test_un_refus_de_session_fille_ne_compte_pas(self):
+        _, worker = self._worker("ds-fille", "deepseek", {})
+        try:
+            # premier échec réel : la série monte à 1
+            self.assertIsNotNone(self._tour(worker, AMEESH_TEST_EXIT="1"))
+            self.assertEqual(worker.failure_streak, 1)
+            # le refus d'une session fille (L166) ne la fait pas monter à 2
+            registry.set_session(self.db, "ds-fille", self.FILLE)
+            worker.agent = registry.get(self.db, "ds-fille")
+            self.assertIsNotNone(self._tour(
+                worker, AMEESH_TEST_DSH_CHILD_SESSIONS=self.FILLE))
+            self.assertFalse(worker.fast_failure)
+            self.assertEqual(worker.failure_streak, 1)
+            ligne = registry.get(self.db, "ds-fille")
+            self.assertEqual(exploitation.failure_streak(ligne["status_text"]), 1)
+        finally:
+            worker.watchdog_stop.set()
 
 
 if __name__ == "__main__":

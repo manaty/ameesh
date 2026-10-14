@@ -340,16 +340,31 @@ class AgentWorker(threading.Thread):
         self.fast_failures = 0
         #: #1268 : série d'échecs de tour **réels** (hors hôte, auth, bail,
         #: session fille), remise à zéro par un succès ; marquée dans
-        #: `status_text` et lue par l'alerte `critical_turn_failures`. Relue de
-        #: la ligne : elle survit au redémarrage de l'exécuteur.
+        #: `status_text` avec le **début de l'épisode** (`since`), et lue par
+        #: l'alerte `critical_turn_failures`. Relue de la ligne : elle survit
+        #: au redémarrage de l'exécuteur, y compris pendant une tentative
+        #: (`begin_turn` la préserve).
         from . import exploitation as exploitation_mod
         self.failure_streak = exploitation_mod.failure_streak(agent.get("status_text"))
+        self.failure_since = 0.0
+        if self.failure_streak:
+            # marqueur d'avant le champ `since` : repli sur la date de la ligne
+            self.failure_since = (exploitation_mod.failure_since(agent.get("status_text"))
+                                  or float(agent.get("status_since_ts") or 0.0))
         #: #1270 : épisode de débit/quota fournisseur, relu de la ligne comme la
-        #: série d'échecs — la reprise cadencée survit au redémarrage.
+        #: série d'échecs — la reprise cadencée et son **échéance absolue**
+        #: (`retry at`) survivent au redémarrage et ne se court-circuitent pas.
         etat_debit = rate_limit_mod.state(agent.get("status_text"))
         self.rate_limit = etat_debit["kind"] if etat_debit else None
         self.rate_limit_streak = etat_debit["streak"] if etat_debit else 0
         self.rate_limit_since = etat_debit["since"] if etat_debit else 0.0
+        self.rate_limit_retry_at = 0.0
+        if etat_debit:
+            self.rate_limit_retry_at = etat_debit.get("retry_at") or 0.0
+            if not self.rate_limit_retry_at:
+                # marqueur d'avant `retry at` : repli sur la date de la ligne
+                self.rate_limit_retry_at = (float(agent.get("status_since_ts") or 0.0)
+                                            + etat_debit["wait"])
         self.last_activity = time.monotonic()
         #: #408 : dernière lecture des lots actionnables (règle 1)
         self._lot_wake_checked = float("-inf")
@@ -3615,6 +3630,25 @@ class AgentWorker(threading.Thread):
             model = adapter.spec.defaults["model"]
         return model
 
+    def _marqueurs_durables(self, base: str) -> str:
+        """Le statut d'un tour **en cours** garde les marqueurs durables posés
+        par les échecs précédents (#1268/#1270) : `begin_turn` ne les efface
+        plus, donc un redémarrage pendant la tentative relit la série, son
+        début d'épisode et l'échéance de reprise — sans les recalculer (une
+        échéance n'est jamais repoussée par une tentative interrompue)."""
+        texte = base
+        if self.rate_limit:
+            texte = rate_limit_mod.status_text(
+                texte, self.rate_limit, self.rate_limit_streak, self.rate_limit_since,
+                rate_limit_mod.delay(self.rate_limit_streak),
+                retry_at=self.rate_limit_retry_at or None)
+        if self.failure_streak:
+            from . import exploitation as exploitation_mod
+            texte = exploitation_mod.turn_failure_status_text(
+                texte, self.failure_streak, critical=account_turn.is_critical(self),
+                since=self.failure_since)
+        return texte
+
     def _run_turn(self, spec: dict) -> bool:
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
@@ -3691,7 +3725,8 @@ class AgentWorker(threading.Thread):
                 % (self.name, shown, session or "new", " ".join(argv)))
             return True
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                                   "%s turn (%s)" % (shown, harness)):
+                                   self._marqueurs_durables(
+                                       "%s turn (%s)" % (shown, harness))):
             log("[%s] lease lost or agent stopped before the turn" % self.name)
             return False
         lot = spec.get("lot")
@@ -4249,6 +4284,7 @@ class AgentWorker(threading.Thread):
                 "goes back in the queue and the priority message goes first.",
                 meta={"action": "interruption", "tour_s": round(duration, 1)})
             return False
+        session_fille_ecartee = False
         if not ok:
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
             # d'être effacée par end_turn. Au pire elle est rejouée.
@@ -4304,10 +4340,12 @@ class AgentWorker(threading.Thread):
                 self.last_activity = time.monotonic()
                 self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
-            if session and adapters.child_session_refused(error):
+            session_fille_ecartee = bool(session and adapters.child_session_refused(error))
+            if session_fille_ecartee:
                 # L166 : la session reprise était une session fille ; la
-                # reprendre encore échouerait de même. Pas un échec rapide :
-                # le tour suivant repart d'une session saine.
+                # reprendre encore échouerait de même. Pas un échec rapide, et
+                # pas un échec « réel » de la série #1268 (B2) : le tour suivant
+                # repart d'une session saine.
                 self.fast_failure = False
                 self._avec_reprise("child session discarded",
                                    self._ecarte_session_fille, session)
@@ -4315,7 +4353,8 @@ class AgentWorker(threading.Thread):
             # échec rapide — il attend puis reprend seul, à délais cadencés ;
             # le quota est distingué du débit passager et la garde comptable
             # (L226b) reste seule juge du budget. Un échec d'une autre cause
-            # efface l'épisode.
+            # efface l'épisode (hors refus de session fille, qui n'est pas une
+            # panne fournisseur et n'efface ni n'étend l'épisode).
             genre = rate_limit_mod.classify(
                 error, self.last_final,
                 auth_failure.stderr_tail(stderr_path, start=stderr_debut))
@@ -4327,24 +4366,35 @@ class AgentWorker(threading.Thread):
                     self.rate_limit = genre
                     self.rate_limit_streak = 1
                     self.rate_limit_since = time.time()
-            else:
+                # échéance absolue, écrite dans `status_text` : elle survit au
+                # redémarrage et ne se recalcule pas à chaque réveil (#1270 B1)
+                self.rate_limit_retry_at = (time.time() + rate_limit_mod.delay(
+                    self.rate_limit_streak))
+            elif not session_fille_ecartee:
                 self.rate_limit = None
                 self.rate_limit_streak = 0
                 self.rate_limit_since = 0.0
+                self.rate_limit_retry_at = 0.0
         if self._session_en_attente is not None:
             self._avec_reprise("turn session", self._enregistre_session)
         if ok and clos:
             self._turn_closed(cloture or "cap", duration)
         elif ok:
             self._note_courrier_borne(turn_id, duration)
-        # #1268 : série d'échecs de tour **réels** (les échecs classés — hôte,
-        # authentification, bail, session fille — sont rendus plus haut et ne
-        # comptent pas) ; un succès la remet à zéro, la pause budget réécrit
-        # `status_text` sans marqueur.
+        # #1268 : série d'échecs de tour **réels**. Les échecs classés (hôte,
+        # authentification, bail) sont rendus plus haut ; le refus d'une
+        # session fille est écarté ici — il ne compte pas dans la série (B2)
+        # et ne l'efface pas non plus : seul un succès remet la série à zéro.
         if ok:
             self.failure_streak = 0
+            self.failure_since = 0.0
             self.rate_limit, self.rate_limit_streak, self.rate_limit_since = None, 0, 0.0
-        else:
+            self.rate_limit_retry_at = 0.0
+        elif not session_fille_ecartee:
+            if self.failure_streak < 1:
+                # début d'épisode : il ne bouge plus tant qu'un succès n'a pas
+                # remis la série à zéro (clé d'alerte stable, #1268 B1)
+                self.failure_since = time.time()
             self.failure_streak += 1
         texte_fin = ("%s in %ds%s" % (shown, int(duration), "" if ok else " (failed)")
                      + (" (closed: %s)" % cloture.split(":")[0]
@@ -4352,15 +4402,17 @@ class AgentWorker(threading.Thread):
         if not ok and self.rate_limit:
             # #1270 : l'épisode de débit est écrit dans le statut — visible
             # dans `ameesh list`/`show`, relu après un redémarrage, et lu par
-            # l'alerte #1268 (seuil de 15 min).
+            # l'alerte #1268 (seuil de 15 min). `retry at` porte l'échéance
+            # absolue, jamais recalculée à la relecture.
             texte_fin = rate_limit_mod.status_text(
                 texte_fin, self.rate_limit, self.rate_limit_streak,
-                self.rate_limit_since, rate_limit_mod.delay(self.rate_limit_streak))
+                self.rate_limit_since, rate_limit_mod.delay(self.rate_limit_streak),
+                retry_at=self.rate_limit_retry_at or None)
         if not ok and self.failure_streak:
             from . import exploitation as exploitation_mod
             texte_fin = exploitation_mod.turn_failure_status_text(
                 texte_fin, self.failure_streak,
-                critical=account_turn.is_critical(self))
+                critical=account_turn.is_critical(self), since=self.failure_since)
         self._avec_reprise(
             "end of turn", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,
@@ -4459,17 +4511,50 @@ class AgentWorker(threading.Thread):
         threading.Thread(target=copy_session, daemon=True,
                          name="%s-session-backup" % self.name).start()
 
+    def retry_remaining(self) -> float:
+        """#1270 : secondes restantes avant la reprise cadencée durable, 0 sinon.
+
+        L'échéance (`retry at`) est celle écrite au tour en échec : elle est
+        relue de la ligne après un redémarrage et ne se recalcule pas. C'est
+        elle qui garde le lancement — un courrier, un reset ou le budget ne la
+        court-circuitent pas (B1 cx3)."""
+        if not self.rate_limit:
+            return 0.0
+        if self.rate_limit_retry_at:
+            return max(0.0, self.rate_limit_retry_at - time.time())
+        return rate_limit_mod.delay(self.rate_limit_streak)
+
+    def _attendre_reprise(self, duree: float) -> None:
+        """Attend l'échéance de reprise sans se laisser court-circuiter.
+
+        Les réveils (courrier, reset, budget) sont consommés sans lancer de
+        tour ; le bail est renouvelé à son rythme, et l'arrêt, le drainage ou
+        la fermeture de la porte d'hôte interrompent l'attente (B1 cx3)."""
+        fin = time.monotonic() + max(0.0, float(duree))
+        while not self.stopping.is_set() and not self.runner.stop.is_set():
+            if self.runner.draining.is_set() or self.runner.gate_holds():
+                return
+            reste = fin - time.monotonic()
+            if reste <= 0:
+                return
+            self.wake.wait(timeout=max(0.02, min(self.wait_timeout(reste), reste)))
+            self.wake.clear()
+            if not self.renew():
+                return
+
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec
         consécutif, bornée par `failure_backoff_max` (L48).
 
         #1268 : la série d'échecs **réels** compte aussi (pas seulement les
         échecs rapides) — un harnais qui échoue lentement ne doit pas être
-        relancé toutes les 5 s sans fin."""
+        relancé toutes les 5 s sans fin.
+
+        #1270 : pour un épisode de débit/quota, c'est le temps **restant**
+        jusqu'à l'échéance durable (`retry at`) — jamais l'arrêt L48, jamais
+        un délai repoussé par un réveil."""
         if self.rate_limit:
-            # #1270 : débit/quota fournisseur — reprise cadencée (1, 2, 5,
-            # 10 min), jamais l'arrêt L48.
-            return rate_limit_mod.delay(self.rate_limit_streak)
+            return self.retry_remaining()
         base = self.runner.failure_backoff
         n = max(self.fast_failures, self.failure_streak)
         if n <= 1:
@@ -4562,6 +4647,14 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            # #1270 B1 : pas de tentative avant l'échéance de reprise durable ;
+            # un réveil déjà posé ne fait pas repartir le tour plus tôt.
+            if self.retry_remaining() > 0:
+                if time.monotonic() >= deadline:
+                    return False
+                self.wake.wait(timeout=min(0.25, max(0.02, deadline - time.monotonic())))
+                self.wake.clear()
+                continue
             self.apply_restart_if_requested()
             self.maybe_rotate()
             spec = self.rotate_for_lot(self.pick())
@@ -4606,6 +4699,15 @@ class AgentWorker(threading.Thread):
                         break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
+                    # #1270 B1 : l'échéance de reprise durable garde le
+                    # lancement du tour ; un courrier, un reset ou le budget
+                    # ne la court-circuitent pas — l'attente consomme les
+                    # réveils et renouvelle le bail. Aucune consigne n'est
+                    # consommée avant l'échéance (`pick` est après).
+                    attente_reprise = self.retry_remaining()
+                    if attente_reprise > 0:
+                        self._attendre_reprise(attente_reprise)
+                        continue
                     spec = self.rotate_for_lot(self.pick())
                     if spec is not None and self._moved_before_turn(spec):
                         break
@@ -4647,7 +4749,11 @@ class AgentWorker(threading.Thread):
                 # Un message non remis ou un harnais en échec ne doit pas
                 # produire une boucle serrée : on laisse retomber, de plus en
                 # plus longtemps tant que les échecs rapides se suivent (L48).
-                self.wake.wait(timeout=self.failure_wait())
+                # L'attente est bornée par l'échéance du bail : le worker
+                # renouvelle son bail au lieu de dormir au-delà (#1270 : la
+                # reprise cadencée peut dépasser le bail, la garde durable du
+                # haut de boucle prend le relais).
+                self.wake.wait(timeout=self.wait_timeout(self.failure_wait()))
                 self.wake.clear()
         finally:
             self._mark_power_stop()
