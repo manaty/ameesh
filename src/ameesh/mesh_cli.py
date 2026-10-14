@@ -2866,11 +2866,13 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
             print(json.dumps({"schema": "ameesh-turns/1", "turns": rows},
                              ensure_ascii=False, indent=2))
             return 0
-        print("%-19s %-16s %-9s %10s %10s %9s %10s" % (
-            "WHEN", "AGENT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD"))
+        print("%-19s %-16s %-6s %-9s %10s %10s %9s %10s" % (
+            "WHEN", "AGENT", "LOT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD"))
         for row in rows:
-            print("%-19s %-16s %-9s %10d %10d %9d %10.4f" % (
-                _fmt_moment(row["recorded_ts"]), row["agent"][:16], row["harness"][:9],
+            print("%-19s %-16s %-6s %-9s %10d %10d %9d %10.4f" % (
+                _fmt_moment(row["recorded_ts"]), row["agent"][:16],
+                "#%d" % row["work_item_id"] if row.get("work_item_id") else "—",
+                row["harness"][:9],
                 row["input_tokens"], row["cached_input_tokens"], row["output_tokens"],
                 row["usd"]))
         return 0

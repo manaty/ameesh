@@ -328,9 +328,17 @@ def release_hold(db: Db, name: str, owner: str, epoch: int, status_text: str,
 
 
 def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
-                      model: str | None = None) -> bool:
-    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""
-    return storage.of(db).pending_spend.put(name, start_index, turn, model)
+                      model: str | None = None,
+                      work_item_id: int | str | None = None,
+                      turn_id: str | None = None) -> bool:
+    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne.
+
+    `work_item_id` (#796) : le lot du tour, écrit avec le marqueur pour que la
+    ligne du grand livre — y compris réparée par un autre worker — porte la
+    même attribution. `turn_id` : l'identifiant du tour
+    (`turn_resources.turn_id`), pour la même raison."""
+    return storage.of(db).pending_spend.put(name, start_index, turn, model, work_item_id,
+                                            turn_id)
 
 
 def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
@@ -355,6 +363,10 @@ def pending_spend_get(db: Db, name: str) -> dict | None:
         "turn": row.get("turn") or "",
         "model": row.get("model"),
         "created_ts": row.get("created_ts"),
+        # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
+        "work_item_id": row.get("work_item_id"),
+        # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
+        "turn_id": row.get("turn_id"),
     }
 
 

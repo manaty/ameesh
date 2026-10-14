@@ -258,7 +258,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'version', 'name', 'checksum', 'applied_at'
     ]),
     ('spend_pending', ARRAY[
-        'agent', 'start_index', 'turn', 'model', 'created_at'
+        'agent', 'start_index', 'turn', 'model', 'created_at',
+        -- #796 (0423) : lot et tour du marqueur comptable, gardés pour la
+        -- réparation d'un tour interrompu (de l'état, aucun contenu)
+        'work_item_id', 'turn_id'
     ]),
     ('standing_approvals', ARRAY[
         'id', 'approver', 'authenticator_id', 'connector', 'operations',
@@ -382,7 +385,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L225 (0059) : raison d'un tour facturé au repli prudent
         'price_fallback',
         -- L225 (0059) : écritures de cache Claude du tour
-        'cache_write_tokens'
+        'cache_write_tokens',
+        -- #796 (0423) : lot servi, début du tour et lien aux ressources du tour
+        'work_item_id', 'started_at', 'turn_id'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
@@ -574,7 +579,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'work_item_id', 'measured_at', 'started_at', 'merged_at', 'total_minutes',
         'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
         'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
-        'measured_size', 'declared_size'
+        'measured_size', 'declared_size',
+        -- #796 (0423) : provenance des minutes d'agent ('turns' | 'states')
+        'agent_source'
     ]),
     -- L160e (0058): merge queue per target (lot, frozen commit, rank, state:
     -- STATE, no content) and the per-target merge lease
