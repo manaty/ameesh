@@ -116,7 +116,7 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
         self.assertIn("profile diverged", proc.stderr)
-        self.assertIn("dropped for: dev1", proc.stdout)
+        self.assertIn("delivered to dev1", proc.stdout)
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
         rows = self.unread("dev1")
         self.assertEqual(len(rows), 1)
@@ -165,7 +165,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("dev1", "Reprends ce lot.", "--from", "orch",
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("message not delivered", proc.stderr)
         self.assertIn("already merged", proc.stderr)
         self.assertEqual(self.unread("dev1"), [])
 
@@ -173,7 +173,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",
                          "--estimate", "1h")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("message not delivered", proc.stderr)
         self.assertEqual(self.unread("inconnu"), [])
         self.assertEqual(work.list_items(self.db), [])
 
