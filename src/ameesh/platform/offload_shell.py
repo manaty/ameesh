@@ -1043,41 +1043,52 @@ def _grant_tree(path: str, gid: int | None = None) -> None:
     `O_NOFOLLOW|O_DIRECTORY` before it is read, every entry `O_NOFOLLOW`
     before it is granted, and a link is never followed nor granted. A same-UID
     job racing the walk with a planted link therefore cannot make the shell
-    chmod its target (B3 of the #354 R2 review)."""
+    chmod its target (B3 of the #354 R2 review). A grant that raises closes
+    the directories still stacked, so the walk leaks no descriptor (N3 of the
+    #354 R2 review)."""
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
         root_fd = os.open(path, flags | os.O_DIRECTORY)
     except OSError:
         return
     stack = [root_fd]
-    while stack:
-        fd = stack.pop()
-        try:
-            _grant_fd(fd, gid)
+    try:
+        while stack:
+            fd = stack.pop()
             try:
-                names = os.listdir(fd)
+                _grant_fd(fd, gid)
+                try:
+                    names = os.listdir(fd)
+                except OSError:
+                    names = ()
+                for name in names:
+                    if name in (".", ".."):
+                        continue
+                    try:
+                        child = os.open(name, flags | os.O_DIRECTORY, dir_fd=fd)
+                    except OSError:
+                        child = -1
+                    if child >= 0:
+                        stack.append(child)
+                        continue
+                    try:
+                        child = os.open(name, flags, dir_fd=fd)
+                    except OSError:
+                        continue      # a link, a socket, an entry we may not open
+                    try:
+                        _grant_fd(child, gid)
+                    finally:
+                        os.close(child)
+            finally:
+                os.close(fd)
+    finally:
+        # an error while granting must not leave the directories still on the
+        # stack open: close what is left before the exception leaves
+        for fd in stack:
+            try:
+                os.close(fd)
             except OSError:
-                names = ()
-            for name in names:
-                if name in (".", ".."):
-                    continue
-                try:
-                    child = os.open(name, flags | os.O_DIRECTORY, dir_fd=fd)
-                except OSError:
-                    child = -1
-                if child >= 0:
-                    stack.append(child)
-                    continue
-                try:
-                    child = os.open(name, flags, dir_fd=fd)
-                except OSError:
-                    continue      # a link, a socket, an entry we may not open
-                try:
-                    _grant_fd(child, gid)
-                finally:
-                    os.close(child)
-        finally:
-            os.close(fd)
+                pass
 
 
 def make_executor(cfg: dict, job_id: str) -> Executor:
