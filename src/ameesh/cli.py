@@ -350,7 +350,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         if bk.kind == "pg":
             from . import undeliverable
             if undeliverable.registry_rows(bk.db, [name])[name] is None:
-                print("copy refused: unknown agent: %s (nothing dropped)" % name,
+                print("copy refused: unknown agent: %s (nothing delivered)" % name,
                       file=sys.stderr)
                 return 2
     # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
@@ -400,7 +400,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             notes = undeliverable.check_send(cfg, bk.db, sender=sender, dest=dest, queue=queue,
                                              explicit=explicit, binding=binding)
         except undeliverable.Refused as exc:
-            print("message not dropped — %s" % exc, file=sys.stderr)
+            print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         for note in notes:
             print("warning: %s" % note, file=sys.stderr)
@@ -436,7 +436,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
                 estimate=estimate, app=app, new_project=new_project)
         except assignments.AssignmentError as exc:
-            print("message not dropped — %s" % exc, file=sys.stderr)
+            print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]
         for warning in linked["warnings"]:
@@ -463,17 +463,17 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
     if skipped:
-        print("warning: not dropped for %s (%s) — --queue to drop anyway" % (
+        print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
             if len(skipped) > 1 else "stopped: nobody reads its mailbox"), file=sys.stderr)
     if not targets:
         print("no recipient")
     elif signed:
-        print("dropped for: %s (signed %s, expires %s)" % (
+        print("delivered to %s (signed %s, expires %s)" % (
             ", ".join(targets), signed["signature_key"][:12],
             time.strftime("%H:%M", time.localtime(signed["expires_us"] / 1_000_000))))
     else:
-        print("dropped for: " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
+        print("delivered to " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
     return 0
 
 
