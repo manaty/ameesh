@@ -81,6 +81,10 @@ class BoutEnBoutTest(PgTestCase):
         with open(self.gh_state, "w", encoding="utf-8") as fh:
             json.dump({"prs": {PR: {"state": "OPEN", "mergeCommit": None}}}, fh)
         self.absent = os.path.join(self.ws, "absent.json")
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        self.empty_config = os.path.join(self.ws, "config-vide.json")
+        with open(self.empty_config, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         self.clone = ""
 
     # -- environnement et commandes ------------------------------------------
@@ -91,7 +95,7 @@ class BoutEnBoutTest(PgTestCase):
             # pas d'AMEESH_PROJECT : le fil d'un agent du canon suit son équipe (team)
             AMEESH_CANON=self.clone, AMEESH_HOST=HOST,
             AMEESH_HUMANS="alice,bruno",
-            AMEESH_CONFIG=self.absent, AGENT_MESH_CONFIG=self.absent,
+            AMEESH_CONFIG=self.empty_config, AGENT_MESH_CONFIG=self.empty_config,
             AMEESH_APPROVE_CONFIG=self.absent,
             AMEESH_APPROVE_RP_ID=RP_ID, AMEESH_APPROVE_ORIGINS=ORIGIN,
             # ameesh, client d'ameesh-approve (posés une fois le service lancé)
@@ -262,7 +266,7 @@ class BoutEnBoutTest(PgTestCase):
             proc = self.run_mesh("mail", "send", name,
                                  "Bonjour %s, le lot 7 d'acme-web est à préparer." % name,
                                  "--from", "alice")
-            self.assertIn("dropped for: %s" % name, proc.stdout)
+            self.assertIn("delivered to %s" % name, proc.stdout)
         out = self.run_runner()
         for name in ("orchestre", "relecteur"):
             self.assertIn("lease acquired: %s" % name, out)
@@ -286,7 +290,7 @@ class BoutEnBoutTest(PgTestCase):
     def etape_4_message_et_fil(self) -> None:
         text = ("Relecteur, le lot 7 est prêt : relis la PR %s avant la fusion." % PR)
         proc = self.run_mesh("mail", "send", "relecteur", text, AGENT_MAIL_NAME="orchestre")
-        self.assertIn("dropped for: relecteur", proc.stdout)
+        self.assertIn("delivered to relecteur", proc.stdout)
 
         proc = self.run_mesh("fil", "show", PROJECT)
         self.assertRegex(proc.stdout, r"(?m)^### \S+ — human:alice → agent:orchestre$")
