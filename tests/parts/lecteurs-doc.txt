@@ -7,6 +7,7 @@
 #
 # Un module par ligne, dans l'ordre alphabétique, sa raison en commentaire.
 
+test_l1124_explorations  # docs/design/explorations et fiches de plan/roadmap/lot (sas hors roadmap, #1124)
 test_l159a_capacity_guard  # docs/schemas (JSON schemas of the capacity guard, L159a)
 test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
 test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
