@@ -12,7 +12,7 @@ import unittest
 
 from ameesh import authority, mail, migrations, registry, signing
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 
 OWNER = "proprietaire"
 AGENT = "deepseek7"
@@ -393,7 +393,7 @@ class AideSansEffetTest(unittest.TestCase):
     --help` avait appliqué des migrations à une base vivante)."""
 
     def run_cli(self, *args):
-        env = dict(os.environ, AMEESH_CONFIG="/nonexistent",
+        env = dict(os.environ, AMEESH_CONFIG=EMPTY_CONFIG,
                    AMEESH_DSN="postgresql://personne@127.0.0.1:1/aucune",
                    PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"))
         return subprocess.run([sys.executable, "-m", "ameesh", *args], env=env,
@@ -410,7 +410,7 @@ class AideSansEffetTest(unittest.TestCase):
             proc = subprocess.run(
                 [sys.executable, "-c", "import sys; from ameesh import runner; sys.exit(runner.main(sys.argv[1:]))",
                  sub, "--help"],
-                env=dict(os.environ, AMEESH_CONFIG="/nonexistent",
+                env=dict(os.environ, AMEESH_CONFIG=EMPTY_CONFIG,
                          AMEESH_DSN="postgresql://personne@127.0.0.1:1/aucune",
                          PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src")),
                 capture_output=True, text=True, timeout=60)

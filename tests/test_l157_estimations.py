@@ -357,7 +357,7 @@ class EstimatesPgTest(PgTestCase):
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",
                         "Sans durée", env=env)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("message not delivered", proc.stderr)
         self.assertIn("estimate required", proc.stderr)
         self.assertEqual(work.list_items(self.db), [])
         proc = self.cli("send", "dev1", "Nouveau travail.", "--from", "orch", "--new-lot",
