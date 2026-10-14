@@ -149,8 +149,14 @@ L’émission est bornée et **idempotente** : un seul courrier par rapporteur e
 par commit, même si la séquence est relancée. La clé d’émission est écrite
 dans l’attestation (champ `emissions`) **avant** l’envoi ; une relance relit
 le courrier déjà déposé portant cette clé et le réconcilie au lieu de le
-renvoyer. Si l’envoi échoue, la clé reste en attente et la relance renvoie
-une seule fois. L’attestation est réécrite en place, par un temporaire unique
+renvoyer. Cette recherche est **exhaustive** : la fenêtre relue double tant
+qu’elle est pleine, une absence n’est donc retenue que prouvée. Si l’absence
+ne peut pas être prouvée (base injoignable, ou fenêtre toujours pleine au
+plafond), la marque d’émission est **préservée** et rien n’est renvoyé
+automatiquement : `actif.py` sort en code 5 et `staging.sh` le signale, le
+relais opérateur vérifie le dépôt avant toute relance. Si l’envoi échoue et
+que l’absence est prouvée, la clé reste en attente et la relance renvoie une
+seule fois. L’attestation est réécrite en place, par un temporaire unique
 créé en `0600`.
 
 Si le courrier ne part pas (base indisponible), l’attestation reste écrite et
