@@ -472,6 +472,79 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
         self.assertEqual(out["certified"], {})
 
+    def test_new_file_shadowed_by_the_package_init_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2 résidu) : `from ameesh import new_feature`
+        # ne charge `src/ameesh/new_feature.py` que si le paquet ne lie pas
+        # déjà le nom ; un `__init__.py` qui le lie (`new_feature = object()`)
+        # laisse l'import du sous-module hors du chargement. Le test statique
+        # reste un candidat de sélection, jamais une preuve : le test qui
+        # charge réellement le fichier par importlib reste P3, donc la suite
+        # complète est conservée au lieu d'omettre le test rouge.
+        self.repo.write("tests/test_static.py", "from ameesh import new_feature\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\n\n"
+                        "def test_value():\n"
+                        "    mod = importlib.import_module('ameesh.new_feature')\n"
+                        "    assert mod.VALUE == -1\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/__init__.py", "new_feature = object()\n")
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new_feature.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        # le paquet, lui, est bien chargé par l'import : sa preuve reste
+        self.assertEqual(impact.certified, {"src/ameesh/__init__.py": ["test_static"]})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py", out["phase2_why"])
+        # le test statique reste sélectionné, le test dynamique reste P3
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
+        self.assertEqual(out["importers"],
+                         {"src/ameesh/__init__.py": ["test_static"],
+                          "src/ameesh/new_feature.py": ["test_static"]})
+
+    def test_new_file_imported_after_a_raise_in_a_with_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2 résidu) : un import placé dans un `with`
+        # après un `raise` absorbé (`contextlib.suppress`) n'est jamais
+        # atteint ; le corps d'un `with` ne prouve pas un chargement. Le test
+        # garde sa place dans la sélection (il peut l'atteindre), le test
+        # dynamique reste P3 et la suite complète est conservée.
+        self.repo.write("tests/test_static.py",
+                        "import contextlib\n"
+                        "with contextlib.suppress(RuntimeError):\n"
+                        "    raise RuntimeError\n"
+                        "    import ameesh.new_feature\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\n\n"
+                        "def test_value():\n"
+                        "    mod = importlib.import_module('ameesh.new_feature')\n"
+                        "    assert mod.VALUE == -1\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new_feature.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py", out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
         # l'importe ; les tests que la carte a mesurés sur ce module (ici un
@@ -812,6 +885,8 @@ class ImportGraphTest(unittest.TestCase):
             "conditionnel": "import sys\nif sys.version_info:\n    import ameesh.db\n",
             "try": "try:\n    import ameesh.db\nexcept ImportError:\n    pass\n",
             "boucle": "for _ in ():\n    import ameesh.db\n",
+            "with": "import contextlib\n"
+                    "with contextlib.suppress(RuntimeError):\n    import ameesh.db\n",
             "TYPE_CHECKING": "from typing import TYPE_CHECKING\n"
                              "if TYPE_CHECKING:\n    import ameesh.db\n",
         }
@@ -822,6 +897,31 @@ class ImportGraphTest(unittest.TestCase):
                 if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
                     self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                      {"src/ameesh/db.py"}, why)
+
+    def test_guaranteed_package_import_does_not_prove_the_member(self):
+        # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
+        # prouve pas que `ameesh/db.py` est chargé — le paquet peut lier le nom
+        # dans son `__init__` (`db = object()`) et l'import du sous-module n'a
+        # alors pas lieu. Le module résolu par l'import (le paquet) reste une
+        # preuve, l'alias `module.membre` n'est qu'un candidat de sélection ;
+        # les formes explicites (`import ameesh.db`, `from ameesh.db import x`)
+        # gardent la preuve.
+        known = {"src/ameesh/__init__.py", "src/ameesh/db.py"}
+        source = "from ameesh import db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True),
+                         {"src/ameesh/__init__.py"})
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                         {"src/ameesh/__init__.py", "src/ameesh/db.py"})
+        for why, explicit in {
+            "module importé": "import ameesh.db\n",
+            "module importé aliasé": "import ameesh.db as db\n",
+            "membre du module": "from ameesh.db import connect\n",
+        }.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(explicit, "tests/test_a.py", known,
+                                                      guaranteed=True),
+                                 {"src/ameesh/__init__.py", "src/ameesh/db.py"}, why)
 
     def test_import_graph_reaches_the_test_through_the_changed_module(self):
         self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")

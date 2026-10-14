@@ -90,9 +90,13 @@ caller, and a test can reach it by a computed name (`dir()` then `getattr`)
 as soon as it has loaded the file. The selection falls back to the full
 suite when no test is proven to load such a file: a dynamic import
 (`importlib.import_module`) leaves no static edge, an import under `if
-TYPE_CHECKING:` never runs at runtime, and a lazy or conditional import is
-only a candidate — none certifies that a test loads the file, so the full
-suite stays (`phase2_why` names it).
+TYPE_CHECKING:` never runs at runtime, a lazy, conditional or `with`-guarded
+import is only a candidate, and a from-import proves the module it names,
+never a member as a file (`from ameesh import new_feature` loads nothing
+when the package `__init__` binds `new_feature = object()`; `import
+ameesh.new_feature` and `from ameesh.new_feature import x` keep the proof) —
+none of them certifies that a test loads the file, so the full suite stays
+(`phase2_why` names it).
 
 Any error while reading the map gives the fallback plan, never a failure.
 
@@ -339,7 +343,9 @@ class _RuntimeImports(ast.NodeVisitor):
     `if False:` — loads nothing and is left out; everything else stays, lazy
     imports included: they may run. `guaranteed` keeps only the imports the
     module body executes itself: at the top level (a class body runs at
-    import, a function body does not), outside any condition, loop or `try`.
+    import, a function body does not), outside any condition, loop, `try` or
+    `with` — a `with` body may never run (its `__enter__` may fail, or an
+    earlier statement may raise and be suppressed), so it is no proof.
     A lazy or conditional import alone is a possible load, never a proof
     (relecture Codex, B2 résiduel)."""
 
@@ -370,6 +376,8 @@ class _RuntimeImports(ast.NodeVisitor):
     visit_Try = _visit_guarded
     visit_TryStar = _visit_guarded
     visit_Match = _visit_guarded
+    visit_With = _visit_guarded
+    visit_AsyncWith = _visit_guarded
 
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
@@ -398,9 +406,15 @@ def _imported_files(source: str, path: str, known: set[str], *,
     never — the flag is false at runtime — so it leaves no edge and never
     certifies that a test loads a new file (relecture Codex, B2). With
     `guaranteed`, only the imports executed by the module body itself are
-    kept: a lazy or conditional import may load the file, it does not prove
-    that importing `source` loads it (B2 résiduel). Only `ameesh.*` and
-    `tests.*` names are resolved; a syntax error leaves no edge."""
+    kept: a lazy, conditional or `with`-guarded import may load the file, it
+    does not prove that importing `source` loads it (B2 résiduel). A
+    from-import (`from ameesh import db`) proves its resolved module (the
+    package `ameesh`, whose `__init__` runs), never the member as a file:
+    the package may already bind the name (`db = object()`), and then the
+    submodule is not imported at all (B2 résiduel) — `import ameesh.db` and
+    `from ameesh.db import x` name the module itself and keep the proof.
+    Only `ameesh.*` and `tests.*` names are resolved; a syntax error leaves
+    no edge."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -425,8 +439,13 @@ def _imported_files(source: str, path: str, known: set[str], *,
                 module = f"{base}.{module}" if module else base
             if module:
                 names.add(module)
-                names.update(f"{module}.{alias.name}" for alias in node.names
-                             if alias.name != "*")
+                # Un from-import charge son module ; un membre peut déjà être
+                # un objet du module (`from ameesh import db` avec
+                # `db = object()` dans `__init__`), donc un fichier enfant
+                # n'est qu'une cible possible, jamais une preuve.
+                if not guaranteed:
+                    names.update(f"{module}.{alias.name}" for alias in node.names
+                                 if alias.name != "*")
     return {f for name in names if name.split(".")[0] in ("ameesh", "tests")
             for f in _module_files(name, known)}
 
@@ -612,10 +631,13 @@ def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
       test qui a chargé le fichier peut l'exécuter (B1) ; élargir ne nuit pas.
     - la **preuve** : la mesure, ou un chargement garanti au niveau module (le
       graphe des imports que le corps du fichier exécute à l'import). Un test
-      n'est certifié que par une preuve : un import paresseux ou conditionnel
-      seul ne lève pas le doute, `uncovered` porte le fichier et la suite
-      complète reste — au lieu de certifier une couverture qu'un test
-      dynamique (`importlib`) assurerait sans être sélectionné (B2).
+      n'est certifié que par une preuve : un import paresseux, conditionnel ou
+      sous `with` seul ne lève pas le doute, et un from-import ne prouve que
+      son module résolu — pas le membre, que le paquet peut lier à un objet
+      (`from ameesh import new_feature` avec `new_feature = object()` dans
+      `__init__`). `uncovered` porte le fichier et la suite complète reste —
+      au lieu de certifier une couverture qu'un test dynamique (`importlib`)
+      assurerait sans être sélectionné (B2).
     """
     unknown_files = {b.split("::", 1)[0] for b in impact.unknown_blocks}
     untested_files = {u["file"] for u in impact.untested}
