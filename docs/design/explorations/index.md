@@ -19,10 +19,9 @@ des lots exige une décision explicite de l’owner, consignée dans
 Une fiche de plan, de roadmap ou de lot référence alors l’étude décidée,
 jamais cette réserve d’idées.
 
-Ce sas est préparé pour le lot #1124. La règle commune correspond à la
-[proposition canon home#52](https://github.com/manaty/home/pull/52), encore
-ouverte lors de la préparation ; ce lien ne la présente pas comme du canon
-publié.
+La règle commune est publiée dans le
+[Processus de lot, §4](https://github.com/manaty/home/blob/main/processus/lots.md#4-files-de-travail),
+après fusion de [home#52](https://github.com/manaty/home/pull/52).
 
 - [Provisionnement d’ameesh-approve hébergé](ameesh-approve-heberge.md)
 - [Évaluation des modèles](evaluation-modeles.md)
