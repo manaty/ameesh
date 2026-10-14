@@ -1388,7 +1388,9 @@ class PlanTest(unittest.TestCase):
             "test::f changed and no test executes it (map abcdef123456)"])
 
     def test_fallback_plan_lets_the_parts_split(self):
-        p = plan.fallback_plan("pull_request", "boom")
+        # refs explicites : ne pas lire le GITHUB_* ambiant, où une tête de
+        # paquet integration/** est une PR de release (canon §3)
+        p = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
         f = pathlib.Path(tempfile.mkdtemp()) / "plan.json"
         self.addCleanup(shutil.rmtree, f.parent)
         f.write_text(json.dumps(p), encoding="utf-8")
