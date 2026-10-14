@@ -209,6 +209,7 @@ last resort. Each account takes these optional settings in the host's
 | `overage` [`auto`] | may the account be billed beyond its plan? `auto` reads it from the harness (Claude `overageStatus`, Codex `credits.has_credits`), `allowed` or `none` declare it |
 | `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
 | `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
+| `pace_multiplier` [1.0] | multiplies the **elapsed share** of the pace cap: `min(90 %, elapsed × m + 10 points)`. Set per account, no implicit value (#1075: `2.0` on the Codex primary to spend its plan reserve without a reset). The reserve, the fixed caps, the overage rules, the gauges and the reset dates are unchanged |
 
 A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
 on the short window), `cap`, and `overage_cap` when the account may be billed.
