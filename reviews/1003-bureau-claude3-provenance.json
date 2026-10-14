@@ -1,0 +1,26 @@
+{
+  "session": "42d4372c-1c4f-473d-9516-1cbdb2246a4e",
+  "primary_log": "/home/smichea/.claude-tertiary/projects/-home-smichea-development-manaty-ameesh-revue-c3-2/42d4372c-1c4f-473d-9516-1cbdb2246a4e.jsonl",
+  "review_sha": "ca30043140583aac85ac01847bfe63789883192e",
+  "worker": "revue-c3-2-1003",
+  "evidence": [
+    {
+      "kind": "assistant_verdict",
+      "line": 129,
+      "timestamp": "2026-10-14T05:31:19.354Z",
+      "model": "claude-opus-5-5",
+      "tool_id": "toolu_013QeCoQYc6zhwn2cu78WZmE",
+      "command": "ameesh work milestone 1003 verdict ok --sha ca30043140583aac85ac01847bfe63789883192e --actor bureau --note \"Relecture Claude (bureau, compte Claude 3) : GO 0 B / 5 N sur la tete actuelle ca3004314 (= gel, PR #776). Identite de depot liee avant toute lecture, admission readiness rejouee deux fois, PR CLEAN + checks verts, arbre de fusion == arbre gele, CAS --force-with-lease, relecture MERGED avant declaration. Tests cibles 43/43 OK. N : chemin already sans controle du lot, --actor vide, numerotation des gardes dans la doc, protection de branche mal decrite, doc/messages en francais.\"",
+      "line_sha256": "0603c342370be0481f29e3bb043d5b9e15ff9a0bbccad7646de7042f1d26b868"
+    },
+    {
+      "kind": "result",
+      "line": 130,
+      "timestamp": "2026-10-14T05:31:23.089Z",
+      "tool_id": "toolu_013QeCoQYc6zhwn2cu78WZmE",
+      "is_error": false,
+      "content": "milestone verdict added to lot #1003 (ok)",
+      "line_sha256": "df0b0ee58b0c7c5a7ea4e8ebc28fd2c3699fa3e341ed505938f643d5d005586c"
+    }
+  ]
+}
