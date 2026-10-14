@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L132 : `stale_lot`, `plan_underused` et `idle_capacity` partent aussi, par
 courrier `event`, aux orchestrateurs et à l'auditeur, avec l'action attendue ;
-une fois par alerte, une relance après 6 h."""
+une fois par alerte, une relance après 6 h. L713 : `stale_lot` ne réveille plus
+l'auditeur, qui le lit à sa passe (`ameesh alerts --json`)."""
 from __future__ import annotations
 
 import time
@@ -35,13 +36,21 @@ class BriefsTest(unittest.TestCase):
 
     def test_stale_lot(self):
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
-        self.assertEqual(sorted(briefs), ["auditeur", "orch"])   # équipe de l'assigné
+        self.assertEqual(sorted(briefs), ["orch"])   # équipe de l'assigné
         text = briefs["orch"]
         self.assertIn('#42 "export"', text)
         self.assertIn('ameesh mail send dev1 "…" --lot 42', text)
         self.assertIn("ameesh work merged 42 --sha", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
-        self.assertEqual(briefs["auditeur"], text)
+
+    def test_stale_lot_ne_reveille_pas_l_auditeur(self):
+        """L713 : lu à la passe de l'auditeur, pas poussé ; les autres alertes si."""
+        briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
+        self.assertNotIn("auditeur", briefs)
+        idle = {"type": "idle_capacity", "agents": ["dev1"], "lots": [],
+                "orchestrators": ["orch"], "detail": "1 agent au repos"}
+        self.assertIn("auditeur", alert_briefs.briefs(idle, self.listing,
+                                                      auditor_names=["auditeur"]))
 
     def test_stale_lot_sans_assigne(self):
         alert = dict(STALE, agent=None)
@@ -108,7 +117,7 @@ class NotifierBriefsTest(PgTestCase):
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["kind"], "event")
         self.assertIn("ameesh mail send dev1", rows[0]["body"])
-        self.assertEqual(len(self.mails("auditeur")), 1)
+        self.assertEqual(len(self.mails("auditeur")), 0)   # L713 : pas de réveil
         clock[0] += 6 * HEURE
         notifier.run_pass(self.db, current=[alert])
         rows = self.mails("orch")
