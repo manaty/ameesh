@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import (canon, canon_sync, lot_class, plan, plan_git, plan_github, progress,
+from ameesh import (canon, canon_sync, plan, plan_git, plan_github, progress,
                     registry, review_lot, stagnation, storage, work)
 
 from .fake_github import FakeGh
@@ -459,13 +459,15 @@ class GithubTest(_PlanDb):
 
     def test_sync_github_ouvre_le_lot_de_relecture_l539(self):
         # #1104 : une fusion constatée par GitHub est une fusion enregistrée
-        # comme une autre ; elle ouvre le lot de relecture (L539). La lecture
-        # de classe est doublée : sans dépôt local ni radar, `of_lot` ne peut
-        # que douter ici — elle a ses propres témoins (test_1104…, test_l160e).
+        # comme une autre ; elle ouvre le lot de relecture (L539). Une fusion
+        # GitHub n'a pas de dépôt local, donc pas d'intervalle de fusion
+        # prouvé : la classe est doublée ici (R1 #1104 P2-1 : sans intervalle
+        # prouvé, `class_at_merge` ne classe jamais) ; la lecture de classe a
+        # ses propres témoins (test_1104…).
         a = work.add(self.db, title="léger", package="cat-recherche")
         work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="alice")
         self.merged_pr(1, "lot/cat-recherche-index")
-        with mock.patch.object(lot_class, "of_lot",
+        with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "policy"}):
             report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},

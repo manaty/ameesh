@@ -76,6 +76,48 @@ class OpenForMergeRuleTest(unittest.TestCase):
         self.assertIn("RuntimeError", out["why"])
 
 
+class ClassAtMergeRuleTest(unittest.TestCase):
+    """R1 #1104 P2-1 : sans intervalle de fusion **prouvé**, `of_lot` n'est pas
+    appelé — son repli gel/cible relirait `cible..gel`, vide dès que le gel est
+    ancêtre de la cible, et classerait « light » un lot SQL fusionné."""
+
+    ITEM = {"id": 1, "assignee": "a", "app": "ameesh"}
+    FREEZE = [{"kind": "frozen", "sha": "f" * 40, "id": 1, "at_ts": 1}]
+
+    def call(self, diff):
+        with mock.patch.object(review_lot, "_repo_of_agent", return_value="/depot"), \
+                mock.patch.object(review_lot.work, "milestones", return_value=self.FREEZE), \
+                mock.patch("ameesh.plan_git.latest_freeze",
+                           return_value={"kind": "frozen", "sha": "f" * 40}), \
+                mock.patch("ameesh.lot_measures.diff_range", **diff), \
+                mock.patch.object(review_lot.lot_class, "of_lot") as of_lot:
+            out = review_lot.class_at_merge(None, 1, item=dict(self.ITEM), sha="s" * 40)
+        return out, of_lot
+
+    def test_une_panne_de_lecture_du_diff_ne_classe_pas_light(self):
+        out, of_lot = self.call({"side_effect": RuntimeError("panne de lecture")})
+        of_lot.assert_not_called()
+        self.assertEqual(out["class"], "sensitive")
+        self.assertTrue(out["doubt"])
+        self.assertIn("lecture du diff impossible", out["why"])
+
+    def test_un_intervalle_introuvable_ne_classe_pas_light(self):
+        """Gel lisible et ancêtre de la cible, commit de fusion absent du
+        dépôt : le repli serait un diff vide, donc « light »."""
+        out, of_lot = self.call({"return_value": None})
+        of_lot.assert_not_called()
+        self.assertEqual(out["class"], "sensitive")
+        self.assertTrue(out["doubt"])
+        self.assertIn("ne contient pas le commit", out["why"])
+
+    def test_un_intervalle_prouve_est_transmis_a_of_lot(self):
+        out, of_lot = self.call({"return_value": ("base", "head")})
+        of_lot.assert_called_once()
+        self.assertEqual(of_lot.call_args.kwargs["base"], "base")
+        self.assertEqual(of_lot.call_args.kwargs["head"], "head")
+        self.assertIs(out, of_lot.return_value)
+
+
 class _Witness(PgTestCase):
     """Un dépôt réel, un canon minimal (`light` par défaut, `**/*.sql`
     sensible), un agent placé dessus : de quoi constater une vraie fusion et
@@ -177,6 +219,53 @@ class SweepWitnessTest(_Witness):
              "lot/1104-une-fois")
         self.assertEqual(plan_git.sync_branches(self.db, host=self.cfg.host)["merged"], 1)
         self.assertEqual(plan_git.sync_branches(self.db, host=self.cfg.host)["merged"], 0)
+        self.assertEqual(len(self.review_lots(lot)), 1)
+
+
+class CatchUpWitnessTest(_Witness):
+    """R1 #1104 P2-2 : une ouverture ratée au moment de la fusion est reprise,
+    durablement et sans duplication — la fusion reste acquise."""
+
+    def merge_lot(self, lot, branch="lot/1104-reprise"):
+        self.frozen_on_branch(lot, branch)
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot, branch)
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def test_le_releve_suivant_retrouve_le_parent_fusionne(self):
+        lot = self.lot()
+        self.merge_lot(lot)
+        with mock.patch.object(review_lot, "open_for_merge",
+                               side_effect=RuntimeError("panne d'écriture")):
+            first = plan_git.sync_branches(self.db, host=self.cfg.host)
+        self.assertEqual(first["merged"], 1)
+        self.assertEqual(self.review_lots(lot), [], "la panne a bien perdu la relecture")
+        # panne passée : le relevé récurrent (qui ne sélectionne plus un lot
+        # fusionné) rattrape la relecture manquante
+        second = plan_git.sync_branches(self.db, host=self.cfg.host)
+        self.assertEqual(second["merged"], 0)
+        self.assertEqual(second["review_catch_up"]["opened"], 1)
+        rows = self.review_lots(lot)
+        self.assertEqual(len(rows), 1, rows)
+        # reprise sans duplication
+        third = plan_git.sync_branches(self.db, host=self.cfg.host)
+        self.assertEqual(third["review_catch_up"]["opened"], 0)
+        self.assertEqual(len(self.review_lots(lot)), 1)
+
+    def test_un_lot_deja_fusionne_reprend_l_ouverture(self):
+        lot = self.lot()
+        sha = self.merge_lot(lot, "lot/1104-deja")
+        with mock.patch.object(review_lot, "open_for_merge",
+                               side_effect=RuntimeError("panne d'écriture")):
+            done = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
+        self.assertEqual(done["result"], "merged")
+        self.assertEqual(self.review_lots(lot), [])
+        again = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
+        self.assertEqual(again["result"], "already", again)
+        rows = self.review_lots(lot)
+        self.assertEqual(len(rows), 1, rows)
+        third = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
+        self.assertEqual(third["result"], "already")
         self.assertEqual(len(self.review_lots(lot)), 1)
 
 

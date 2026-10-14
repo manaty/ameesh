@@ -891,5 +891,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                        text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),
                        lot=str(lot), meta={"kind": "event"})
         results.append(entry)
+    # L539 (#1104) : les relevés ne revoient jamais un lot déjà fusionné ; ce
+    # rattrapage borné rouvre les relectures dont l'ouverture avait échoué à la
+    # fusion (R1 #1104 P2-2). Jamais en dry-run, jamais bloquant.
+    review_catch_up: dict = {}
+    if not dry_run:
+        try:
+            from . import review_lot
+            review_catch_up = review_lot.catch_up(
+                db, limit=review_lot.CATCH_UP_LIMIT)
+        except Exception:  # noqa: BLE001 - un rattrapage ne casse pas le relevé
+            review_catch_up = {}
     return {"host": host, "dry_run": bool(dry_run), "results": results,
-            "merged": sum(1 for r in results if r["result"] == "merged")}
+            "merged": sum(1 for r in results if r["result"] == "merged"),
+            "review_catch_up": review_catch_up}

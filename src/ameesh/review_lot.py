@@ -255,9 +255,13 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     `repo` est le dépôt où la fusion a été constatée (le relevé des branches
     le connaît), sinon le dossier de travail de l'assigné au registre, sinon
     le dépôt du projet (`lot_class.repository`) — toujours pour y lire le diff
-    de la fusion, jamais `cible..gel`. `target` la cible déjà résolue. Tout
-    doute rend `sensitive` — d'une classe inconnue, on n'ouvre pas de lot de
-    relecture."""
+    de la fusion, jamais `cible..gel`. `target` la cible déjà résolue.
+
+    Sans intervalle **prouvé** (diff illisible, commit de fusion absent du
+    dépôt, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
+    repli gel/cible rendrait `cible..gel`, vide dès que le gel est un ancêtre
+    de la cible — « light » sur un lot SQL fusionné (R1 #1104 P2-1). On rend un
+    doute conservateur, et d'une classe inconnue on n'ouvre pas de relecture."""
     from . import lot_measures, plan_git
     if item is None:
         item = work.get(db, lot)
@@ -267,22 +271,36 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     if not where:
         where = lot_class.repository(getattr(db, "cfg", None), item) or ""
     base = head = ""
+    proven = False
+    why = "aucun intervalle de fusion lisible"
     try:
         frozen = ""
         if where:
             freeze = plan_git.latest_freeze(work.milestones(db, int(lot)))
             frozen = str((freeze or {}).get("sha") or "").strip()
+        tips = [t for t in ((sha or "").strip(), frozen) if t]
+        if not where:
+            why = "dépôt inconnu : aucun intervalle de fusion lisible"
+        elif not tips:
+            why = "ni commit de fusion ni gel : aucun intervalle de fusion lisible"
         # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
         # déclarée sans commit lisible, `ameesh work merged` à la main)
-        for tip in ((sha or "").strip(), frozen):
-            if not where or not tip:
-                continue
+        for tip in tips:
             rng = lot_measures.diff_range(where, tip, target or None)
             if rng:
                 base, head = rng
+                proven = True
                 break
-    except Exception:  # noqa: BLE001 - pas d'intervalle : `of_lot` doubtera
-        base = head = ""
+            why = "le dépôt %s ne contient pas le commit %s" % (where, tip[:12])
+    except Exception as exc:  # noqa: BLE001 - pas d'intervalle : doute, jamais de classe
+        proven = False
+        why = "lecture du diff impossible : %s: %s" % (type(exc).__name__, str(exc)[:160])
+    if not proven:
+        # R1 #1104 P2-1 : `of_lot` ne reçoit jamais ce repli (base/head vides),
+        # qui relirait `cible..gel` — vide après fusion — et classerait light.
+        return {"lot": int(lot), "class": lot_class.SENSITIVE, "why": why, "files": [],
+                "policy_ref": "", "repo": where or "", "target": target or "",
+                "frozen_sha": "", "doubt": True}
     try:
         return lot_class.of_lot(db, int(lot), cfg=getattr(db, "cfg", None), item=item,
                                 repo=where or None, base=base or None, head=head or None)
@@ -331,3 +349,67 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         out["why"] = "lot de relecture non ouvert : %s: %s" % (
             type(exc).__name__, str(exc)[:200])
         return out
+
+
+#: le nombre de lots fusionnés reparcourus par un rattrapage (borné)
+CATCH_UP_LIMIT = 20
+
+
+def merged_sha(db, lot: int) -> str:
+    """Le commit du dernier jalon `merged` du lot, ou "" (best effort)."""
+    try:
+        rows = [m for m in work.milestones(db, int(lot)) if m.get("kind") == "merged"]
+    except Exception:  # noqa: BLE001 - pas de jalon lisible : pas de commit
+        return ""
+    if not rows:
+        return ""
+    last = max(rows, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+    return str(last.get("sha") or "").strip()
+
+
+def catch_up(db, *, repo: str = "", target: str = "",
+             limit: int = CATCH_UP_LIMIT) -> dict:
+    """L539 (#1104) : rattrapage des relectures manquantes après une panne.
+
+    Les relevés ne sélectionnent que des lots **ouverts** : un lot déjà `merged`
+    dont l'ouverture de relecture a échoué (panne d'écriture, base indisponible)
+    ne serait plus jamais revu — la relecture manquerait définitivement (R1
+    #1104 P2-2). Ici les lots fusionnés les plus récents sont reparcourus ;
+    `open_for_merge` (idempotent, best effort, jamais d'exception) ouvre ceux
+    dont la relecture manque.
+
+    Borné (`limit`) et sans horloge : l'ordre « plus récemment modifié » de
+    `WorkStore.items`. Un lot déjà pourvu — quel que soit l'état du lot de
+    relecture — n'est pas relu. Ne lève jamais ; rend le compte
+    `{examined, missing, opened, failed}`."""
+    out = {"examined": 0, "missing": 0, "opened": 0, "failed": 0}
+    try:
+        ops = storage.of(db).work
+        rows: list[dict] = []
+        for state in work.MERGED_STATES:
+            try:
+                rows.extend(ops.items(state=state, assignee=None, limit=int(limit)))
+            except Exception:  # noqa: BLE001 - un état illisible ne bloque pas l'autre
+                continue
+    except Exception:  # noqa: BLE001 - pas de base : rien à rattraper
+        return out
+    seen: set[int] = set()
+    for row in rows:
+        if len(seen) >= int(limit):
+            break
+        lot = int(row["id"])
+        if lot in seen:
+            continue
+        seen.add(lot)
+        out["examined"] += 1
+        try:
+            if _open(ops, ref_of(lot)) is not None:
+                continue
+            out["missing"] += 1
+            done = open_for_merge(db, lot, merged_sha=merged_sha(db, lot), repo=repo,
+                                  target=target or str(row.get("branch_target") or ""))
+            if done.get("created"):
+                out["opened"] += 1
+        except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
+            out["failed"] += 1
+    return out
