@@ -623,7 +623,7 @@ class MeasurePgTest(PgTestCase):
         work.milestone(self.db, lid, "frozen", sha="abc1234")
         with tempfile.TemporaryDirectory() as root:
             repo, sha = make_repo(root)
-            work.merged(self.db, lid, sha=sha)
+            work.close_merged(self.db, lid, sha=sha)
             self.t0 = float(self.db.query(
                 "SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"]) - 100 * M
             # build at 0, frozen at 60, merged at 100
@@ -675,7 +675,7 @@ class MeasurePgTest(PgTestCase):
     def _delivered(self, title, *, branch=None, sha="abcdef1"):
         lot = work.add(self.db, title=title, branch=branch)
         work.move(self.db, lot["id"], "build")
-        work.merged(self.db, lot["id"], sha=sha)
+        work.close_merged(self.db, lot["id"], sha=sha)
         return int(lot["id"])
 
     def test_ci_unknown_retried_and_one_failure_does_not_block(self):
@@ -710,7 +710,7 @@ class MeasurePgTest(PgTestCase):
     def test_runner_pass_only_recent_lots(self):
         lot = work.add(self.db, title="old")
         work.move(self.db, lot["id"], "build")
-        work.merged(self.db, lot["id"], sha="abcdef1")
+        work.close_merged(self.db, lot["id"], sha="abcdef1")
         self.db.execute("UPDATE work_item_milestones SET at = now() - interval '3 days'"
                         " WHERE work_item_id = %s", (int(lot["id"]),))
         self.db.execute("UPDATE work_items SET started_at = now() - interval '4 days'"
@@ -723,7 +723,7 @@ class MeasurePgTest(PgTestCase):
 
     def test_lot_without_start_is_not_measured(self):
         lot = work.add(self.db, title="no start")
-        work.merged(self.db, lot["id"], sha="abcdef1")
+        work.close_merged(self.db, lot["id"], sha="abcdef1")
         self.db.execute("UPDATE work_items SET started_at = NULL WHERE id = %s",
                         (int(lot["id"]),))
         self.assertEqual(lot_measures.measure(self.db, None, repos=[], ci=None), [])
