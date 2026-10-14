@@ -45,8 +45,9 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   d'agent, schéma, état, DSN, canon…), sauf les réglages du banc
   (`AMEESH_TEST_DSN`, `AMEESH_REQUIRE_DB`, `AMEESH_DRIVER`, `AMEESH_DB_TRACE`
   et leurs alias `AGENT_MESH_*`), et pointe `AMEESH_CONFIG` et
-  `AGENT_MESH_CONFIG` vers un fichier absent : ni
-  `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus.
+  `AGENT_MESH_CONFIG` vers un fichier **vide mais existant** (`{}`) : ni
+  `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus,
+  et un chemin explicite absent est refusé avant toute connexion (#1127).
   `HOME` reste celui du poste (le banc lit `~/.pgpass`). Les caches de
   gestionnaires de paquets du poste (`npm_config_*`, `pnpm_config_*`,
   `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`) sont retirés de même (L73) : le
