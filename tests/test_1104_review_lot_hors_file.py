@@ -283,7 +283,13 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual(first["merged"], 1)
         self.assertEqual(self.review_lots(lot), [], "la panne a bien perdu la relecture")
         # panne passée : le relevé récurrent (qui ne sélectionne plus un lot
-        # fusionné) rattrape la relecture manquante
+        # fusionné) rattrape la relecture manquante. La tentative en panne a
+        # été marquée (binôme 14/10) : le relevé immédiat l'exclut le temps du
+        # délai — on recule la marque pour éprouver la reprise après le délai.
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - interval '2 hours'"
+            " WHERE work_item_id = %s AND split_part(note, ' ', 1) = %s",
+            (lot, review_lot.ATTEMPT_PREFIX + str(lot)))
         second = plan_git.sync_branches(self.db, host=self.cfg.host)
         self.assertEqual(second["merged"], 0)
         self.assertEqual(second["review_catch_up"]["opened"], 1)
@@ -353,6 +359,82 @@ class CatchUpWitnessTest(_Witness):
             second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
         self.assertEqual((second["examined"], second["opened"]), (0, 0), second)
         self.assertEqual(len(self.review_lots(promoted)), 1)
+
+
+    def test_vingt_sensibles_confirmes_ne_cachent_pas_un_light_ancien(self):
+        """Contre-épreuve du binôme (14/10) : vingt candidats SQL **prouvés**
+        non-light (sensitive, doute=False) plus récents ne consomment plus
+        chaque passage ; le light ancien est atteint au passage suivant. Le
+        marqueur de tentative est un délai, pas une suppression."""
+        old = self.merged_lot("light ancien")
+        for i in range(review_lot.CATCH_UP_LIMIT):
+            self.merged_lot("sensible %d" % i)
+
+        def klass(_db, lot, **_kw):
+            if int(lot) == old:
+                return {"class": "light", "why": "témoin light"}
+            return {"class": "sensitive", "why": "témoin SQL", "doubt": False}
+
+        with mock.patch.object(review_lot, "class_at_merge", side_effect=klass):
+            first = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((first["examined"], first["missing"], first["opened"]),
+                         (review_lot.CATCH_UP_LIMIT, review_lot.CATCH_UP_LIMIT, 0), first)
+        self.assertEqual(first["attempted"], review_lot.CATCH_UP_LIMIT, first)
+        self.assertEqual(self.review_lots(old), [])
+        with mock.patch.object(review_lot, "class_at_merge", side_effect=klass):
+            second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((second["examined"], second["missing"], second["opened"]), (1, 1, 1),
+                         second)
+        self.assertEqual(len(self.review_lots(old)), 1)
+        with mock.patch.object(review_lot, "class_at_merge", side_effect=klass):
+            third = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((third["examined"], third["opened"]), (0, 0), third)
+
+    def test_vingt_doutes_ne_cachent_pas_un_light_ancien(self):
+        """Même contre-épreuve avec vingt classes en **doute** (intervalle de
+        fusion illisible) : le doute est marqué puis réessayé après le délai,
+        et le light ancien passe au passage suivant."""
+        old = self.merged_lot("light ancien")
+        for i in range(review_lot.CATCH_UP_LIMIT):
+            self.merged_lot("doute %d" % i)
+
+        def klass(_db, lot, **_kw):
+            if int(lot) == old:
+                return {"class": "light", "why": "témoin light"}
+            return {"class": "sensitive", "why": "gel illisible", "doubt": True}
+
+        with mock.patch.object(review_lot, "class_at_merge", side_effect=klass):
+            first = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((first["examined"], first["missing"], first["opened"]),
+                         (review_lot.CATCH_UP_LIMIT, review_lot.CATCH_UP_LIMIT, 0), first)
+        self.assertEqual(first["attempted"], review_lot.CATCH_UP_LIMIT, first)
+        with mock.patch.object(review_lot, "class_at_merge", side_effect=klass):
+            second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((second["examined"], second["missing"], second["opened"]), (1, 1, 1),
+                         second)
+        self.assertEqual(len(self.review_lots(old)), 1)
+
+    def test_une_erreur_est_retentee_apres_le_delai(self):
+        """Reprise des erreurs : une tentative en panne est marquée puis exclue
+        le temps du délai ; le délai écoulé (`retry_s=0`), elle est réessayée
+        et ouvre — l'échec n'est ni perdu ni rejoué en boucle."""
+        lot = self.merged_lot("erreur de rattrapage")
+        with mock.patch.object(review_lot, "open_for_merge",
+                               side_effect=RuntimeError("panne d'écriture")), \
+                mock.patch.object(review_lot, "class_at_merge",
+                                  return_value={"class": "light", "why": "témoin"}):
+            first = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((first["examined"], first["failed"]), (1, 1), first)
+        self.assertEqual(self.review_lots(lot), [])
+        second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
+        self.assertEqual((second["examined"], second["failed"]), (0, 0), second)
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            third = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT,
+                                        retry_s=0)
+        self.assertEqual((third["examined"], third["missing"], third["opened"]), (1, 1, 1),
+                         third)
+        self.assertEqual(len(self.review_lots(lot)), 1)
 
 
 class DeclaredMergeWitnessTest(_Witness):

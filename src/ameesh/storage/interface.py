@@ -1201,7 +1201,8 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def items_missing_ref(self, *, states: Sequence[str], ref_prefix: str,
-                          limit: int) -> list[dict]:
+                          limit: int, attempt_prefix: str = "",
+                          retry_s: float = 0) -> list[dict]:
         """L539 (#1104) : les lots de `states` dont **aucun** lot ne porte la
         référence `ref_prefix + <id>` (celui qui leur correspond), du plus
         récemment modifié au plus ancien, `limit` au plus.
@@ -1210,7 +1211,14 @@ class WorkItems(Domain):
         balayage préalable : un lot ancien encore manquant n'est pas caché par
         `limit` lots plus récents déjà pourvus (R2 #1104 P2-2). `states` est un
         seul ensemble ordonné, donc un `promoted` n'est pas affamé par des
-        `merged` plus récents. Lecture pure : ni verrou ni écriture."""
+        `merged` plus récents. Lecture pure : ni verrou ni écriture.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : excluent aussi
+        **avant** la borne les lots dont le journal porte une tentative
+        `attempt_prefix<id>` plus récente que `retry_s` secondes (voir
+        `log_review_attempt`) — sinon les mêmes candidats sans ouverture
+        affameraient les plus anciens. Le délai écoulé, ils redeviennent
+        sélectionnables (délai, pas suppression)."""
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
@@ -1235,6 +1243,15 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def note(self, item_id: int, state: str, text: str, actor: str) -> None:
         """Journalise une note et rafraîchit `updated_at`."""
+
+    @abc.abstractmethod
+    def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        Le texte commence par le marqueur `<attempt_prefix><id>` (premier mot),
+        que `items_missing_ref` reconnaît ; le journal seul est écrit,
+        `updated_at` reste intact (une tentative de fond ne réordonne pas la
+        sélection et ne rend pas le lot actif)."""
 
     @abc.abstractmethod
     def lock_deep_analysis(self, item_id: int) -> None:

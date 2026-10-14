@@ -267,14 +267,23 @@ class WorkItems(interface.WorkItems):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
-    def items_missing_ref(self, *, states, ref_prefix, limit) -> list[dict]:
+    def items_missing_ref(self, *, states, ref_prefix, limit,
+                          attempt_prefix="", retry_s=0) -> list[dict]:
         """L539 (#1104) : les lots dont `ref_prefix + id` n'existe pas encore.
 
         L'anti-jointure est faite **avant** la borne : `limit` borne les
         manquants rendus, pas un balayage de lots déjà pourvus (R2 #1104
         P2-2 : vingt pourvus plus récents ne cachent plus un manquant ancien).
         Les états forment un seul ensemble ordonné ; `id` départage deux
-        `updated_at` égaux, sans quoi la sélection ne serait pas stable."""
+        `updated_at` égaux, sans quoi la sélection ne serait pas stable.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : une tentative
+        de rattrapage sans création journalise `attempt_prefix<id>` (voir
+        `log_review_attempt`) ; un lot dont la tentative est plus récente que
+        `retry_s` est exclu **avant** la borne, sinon les mêmes candidats
+        confirmés (non-light, doutes, erreurs) consommeraient chaque passage et
+        affameraient les plus anciens. Le délai passé, la tentative redevient
+        sélectionnable : le marqueur est un délai, pas une suppression."""
         wanted = [str(s) for s in (states or ())]
         if not wanted:
             return []
@@ -283,10 +292,22 @@ class WorkItems(interface.WorkItems):
             " WHERE w.state IN (__STATES__)"
             "   AND NOT EXISTS (SELECT 1 FROM work_items r"
             "                    WHERE r.issue_ref = %s || w.id::text)"
-            " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
-        ).replace("__COLUMNS__", ITEM_COLUMNS).replace(
-            "__STATES__", ", ".join(["%s"] * len(wanted)))
-        return self.db.query(sql, tuple(wanted) + (str(ref_prefix), int(limit)))
+        )
+        params: list = list(wanted) + [str(ref_prefix)]
+        if attempt_prefix and float(retry_s) > 0:
+            sql += (
+                "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                "                    WHERE e.work_item_id = w.id"
+                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text"
+                "                      AND e.created_at > now() - make_interval(secs => %s))"
+            )
+            params += [str(attempt_prefix), float(retry_s)]
+        sql += " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
+        params.append(int(limit))
+        return self.db.query(
+            sql.replace("__COLUMNS__", ITEM_COLUMNS).replace(
+                "__STATES__", ", ".join(["%s"] * len(wanted))),
+            tuple(params))
 
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
@@ -543,6 +564,14 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
+
+    def log_review_attempt(self, item_id, state, text, actor) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        N'écrit que le journal (`work_item_events`) : `updated_at` n'est pas
+        touché — une tentative de fond ne doit ni réordonner la sélection ni
+        faire passer le lot pour actif."""
+        self._event(int(item_id), str(state or ""), str(text or ""), actor)
 
     def lock_deep_analysis(self, item_id) -> None:
         self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",

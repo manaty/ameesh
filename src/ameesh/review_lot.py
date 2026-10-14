@@ -39,6 +39,13 @@ from . import lot_class, storage, work
 
 #: la référence qui identifie le lot de relecture d'un lot fusionné
 PREFIX = "review-after-merge:"
+#: le marqueur de journal d'une tentative de rattrapage sans création ; le
+#: premier mot de la note est `ATTEMPT_PREFIX + <id>` (reconnu par la sélection)
+ATTEMPT_PREFIX = "review-after-merge:attempt:#"
+#: le délai (s) avant de réessayer une tentative sans création : le temps que
+#: les candidats plus anciens passent, qu'un doute se résolve ou qu'une panne
+#: se reprenne. Délai, jamais suppression : le journal garde l'historique.
+ATTEMPT_RETRY_S = 3600
 #: l'échéance du canon §2 : le jour même de la fusion, heure de Paris
 TZ = "Europe/Paris"
 HOUR = "23:59"
@@ -368,7 +375,8 @@ def merged_sha(db, lot: int) -> str:
 
 
 def catch_up(db, *, repo: str = "", target: str = "",
-             limit: int = CATCH_UP_LIMIT) -> dict:
+             limit: int = CATCH_UP_LIMIT,
+             retry_s: float = ATTEMPT_RETRY_S) -> dict:
     """L539 (#1104) : rattrapage des relectures manquantes après une panne.
 
     Les relevés ne sélectionnent que des lots **ouverts** : un lot déjà `merged`
@@ -382,21 +390,42 @@ def catch_up(db, *, repo: str = "", target: str = "",
     balayage préalable de lots déjà pourvus — un parent ancien dont
     l'ouverture a échoué n'est plus caché par `limit` parents plus récents
     déjà pourvus. `merged` et `promoted` sont un seul ensemble ordonné par
-    récence : un `promoted` manquant n'est pas affamé par des `merged`. Chaque
-    ouverture réussie sort le parent de la sélection, donc les passages
-    successifs la drainent, sans doublon ni réouverture de fusion ; un
-    manquant qui ne peut pas s'ouvrir (classe en doute, lecture impossible)
-    reste sélectionnable et sera réexaminé au passage suivant. Ne lève
-    jamais ; rend le compte `{examined, missing, opened, failed}`."""
-    out = {"examined": 0, "missing": 0, "opened": 0, "failed": 0}
+    récence : un `promoted` manquant n'est pas affamé par des `merged`.
+
+    Binôme mesh-design (14/10) : un candidat qui n'ouvre rien (classe
+    confirmée non-light, doute, lecture impossible, erreur) reste « manquant » ;
+    sans marqueur, les `limit` plus récents consomment chaque passage et
+    affament les plus anciens (contre-épreuve : vingt sensibles confirmés +
+    un light ancien -> vingt examinés, zéro ouvert, à chaque passage). Chaque
+    tentative sans création est donc journalisée (`log_review_attempt`,
+    marqueur `ATTEMPT_PREFIX<id>`) et exclue avant la borne tant qu'elle a
+    moins de `retry_s` secondes ; le délai écoulé, elle est **réessayée** — un
+    doute peut se résoudre, une panne se reprendre. Toute ouverture réussie
+    sort le parent de la sélection (drain sans doublon, fusion jamais
+    rouverte). Ne lève jamais ; rend `{examined, missing, opened, attempted,
+    failed}` (`attempted` : tentatives sans création marquées)."""
+    out = {"examined": 0, "missing": 0, "opened": 0, "attempted": 0, "failed": 0}
     try:
         ops = storage.of(db).work
         rows = ops.items_missing_ref(states=work.MERGED_STATES,
-                                     ref_prefix=PREFIX + "#", limit=int(limit))
+                                     ref_prefix=PREFIX + "#", limit=int(limit),
+                                     attempt_prefix=ATTEMPT_PREFIX,
+                                     retry_s=float(retry_s))
     except Exception:  # noqa: BLE001 - pas de base : rien à rattraper
         return out
+
+    def mark(lot, state, detail):
+        """Marque la tentative sans création (best effort : le lot reste)."""
+        try:
+            ops.log_review_attempt(lot, state, "%s%d %s"
+                                   % (ATTEMPT_PREFIX, int(lot), detail),
+                                   work.SYSTEM_SENDER)
+        except Exception:  # noqa: BLE001 - marqueur best effort
+            pass
+
     for row in rows:
         lot = int(row["id"])
+        state = str(row.get("state") or "")
         out["examined"] += 1
         try:
             # la sélection a exclu les pourvus ; le recontrôle couvre une
@@ -408,6 +437,10 @@ def catch_up(db, *, repo: str = "", target: str = "",
                                   target=target or str(row.get("branch_target") or ""))
             if done.get("created"):
                 out["opened"] += 1
+            else:
+                out["attempted"] += 1
+                mark(lot, state, "sans ouverture: %s" % (done.get("why") or "?"))
         except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
             out["failed"] += 1
+            mark(lot, state, "erreur")
     return out
