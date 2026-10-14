@@ -311,6 +311,69 @@ complet est à revoir avant tout nouveau créneau** (exigence bureau) ; la
 validation de schéma **n'est pas un feu** et n'autorise aucune activation par
 elle-même.
 
+### 3quater. Repli documentaire `land: "off"` — qualifié sur le code installé (demande orchestrateur 14/10 07:38Z)
+
+L'orchestrateur Nexlink a demandé de **qualifier le repli documentaire
+`land: "off"`** : schéma exact du code installé, garantie d'absence de fusion
+automatique, comportement radar/file, retour à `land: "pr"` après les
+déploiements `#1037`/`#1236`. **Préparation seulement** : aucun profil actif,
+aucun drop-in, aucun `restart` ; le créneau `land: "pr"` reste à coordonner par
+le bureau avec `#1037`/`#1236`.
+
+**Schéma exact de la clé `land`** (lu dans `src/ameesh/radar.py`) :
+
+| point | valeur |
+|---|---|
+| emplacement | `radar.projects.<projet>.land`, **par projet** (aucune clé globale `land`) |
+| valeurs admises | `off` \| `local` \| `pr` (`LAND_MODES`, radar.py:71) |
+| défaut | `off` si la clé est absente **ou vide** (radar.py:179, `value.get("land") or "off"`) |
+| valeur invalide | `SettingsError` au chargement — `…land: off \| local \| pr expected` (radar.py:180-181), jamais un repli silencieux |
+| clés voisines | toute clé hors `PROJECT_KEYS` (radar.py:61) est refusée (radar.py:162-165) |
+
+La validation bureau du 14/10 07:33Z (`radar.parse_settings` du venv exécuteur
+sur `land: "pr"`) **prouve que le code installé porte déjà la clé** : elle
+n'existe qu'à partir de L160e2 (`3898d7e8`), absente de `v1.9.1` (vérifié :
+`git ls-tree v1.9.1 --name-only src/ameesh/` ne contient ni `land.py` ni
+`merge_queue.py`). Comme aucun tag `v1.10.0` n'existe dans le dépôt, le build
+exact se contrôle sur l'hôte (§4 étape 0 le complète) :
+
+```bash
+AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
+"$AMEESH_PY" -c "from ameesh import radar, land, merge_queue; print(radar.LAND_MODES, 'land' in radar.PROJECT_KEYS)"
+ameesh work --help | grep -E 'queue|land'    # sous-commandes présentes
+```
+
+**Absence de fusion automatique — trois verrous indépendants** :
+
+1. `radar.run_pass` n'appelle `run_land` **que** si `project.land != "off"`
+   (radar.py:606-607) : avec `off`, la passe d'atterrissage n'existe pas ;
+2. `land.run_pass` re-teste `if project.land == "off": return []` (land.py:931) ;
+3. le geste manuel `ameesh work land <lot>` refuse aussi : `LandError` —
+   « project X does not declare `land` (local \| pr) » (land.py:1000-1001).
+
+Avec `off`, `develop` ne reçoit donc **aucun** commit de la file : ni bail, ni
+portes exécutées par le radar, ni push, ni fusion de PR.
+
+**Ce qui continue** : `run_queue` tourne **avant** le test de `land` et ne le
+lit pas (radar.py:605) — la file **ordonne, rejoue empilé, éjecte** et écrit
+rangs et raisons ; le relevé des branches, les conflits et résolutions
+préparées, les réservations de migrations et le courrier (conflit nouveau, tête
+bloquée) restent actifs. La fusion du rang 1 redevient le geste **manuel de
+l'orchestrateur** (§5, §6), au vert exact de la CI et après le verdict de la
+file.
+
+**Retour à `land: "pr"` après `#1037`/`#1236`** : changer **une seule valeur**
+dans le profil dédié (`"off"` → `"pr"`), puis redémarrer la seule unité
+désignée — l'exécuteur lit la configuration à son démarrage (`config.load`,
+runner.py:7307/7389), sans recharge à chaud. Aucun autre fichier, aucun
+drop-in ; `zz-compte-owner-1013.conf` reste intact.
+
+**Diff proposé au bureau** (préparation, pour revue) : le bloc
+`radar.projects.nexlink` de §2 avec `"land": "off"` — **toutes les autres clés
+sont inchangées** (`repo`, `github`, `target`, `migrations`, `protected`,
+`gates`, `generated`). C'est aussi le défaut du parseur si la clé est absente ;
+la poser explicitement rend le repli lisible et l'écart avec `pr` d'une ligne.
+
 ## 4. Runbook d'application (sur décision du bureau)
 
 **Profil dédié** (§3, §3bis) — pas le `critiques-2.json` partagé. `SRC` est le
@@ -517,9 +580,10 @@ Tranché le 13/10 :
    sensibles `915`, `695` et `943` en vol.
    **Mise à jour 14/10 07:4xZ** : la qualification bureau est arrivée (§3ter) —
    profil dédié créé (SHA256 `b3b1c32e…`), schéma validé par le venv exécuteur,
-   réserves levées, rien d'appliqué (aucun drop-in, aucun restart). Reste la
-   coordination d'un nouveau créneau avec les déploiements `#1037`/`#1236`, ou
-   la qualification du repli documentaire `land: "off"`.
+   réserves levées, rien d'appliqué (aucun drop-in, aucun restart). Le repli
+   documentaire `land: "off"` est qualifié sur le code installé (§3quater,
+   demande orchestrateur 07:38Z) ; le créneau `land: "pr"` reste à coordonner
+   avec les déploiements `#1037`/`#1236`.
 7. **Portes** — les deux portes locales suffisent-elles pour le pilote, ou
    faut-il des portes par chemin (`scripts/__tests__/*.test.mjs`) dès le
    premier jour ?
