@@ -17,7 +17,7 @@ from unittest import mock
 from ameesh import (account_turn, accounts, alert_briefs, budget, config, cost, exploitation,
                     notify, progress, registry, storage)
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 from .test_l242b_critical_accounts import _Comptes
 from .test_l30_accounts import _Base as _L30Base, _codex_rollout
 
@@ -306,13 +306,13 @@ class PartDuPlafondHoraireTest(_Paye):
         self.assertIn("(cap 20.00 $)", self.book.over("ds"))
 
     def test_configuration(self):
-        cfg = config.load({"AMEESH_CONFIG": "/nonexistent"})
+        cfg = config.load({"AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.noncritical_hourly_share, 0.75)
-        cfg = config.load({"AMEESH_CONFIG": "/nonexistent",
+        cfg = config.load({"AMEESH_CONFIG": EMPTY_CONFIG,
                            "AMEESH_NONCRITICAL_HOURLY_SHARE": "0.5"})
         self.assertEqual(cfg.noncritical_hourly_share, 0.5)
         for wrong in ("2", "-0.1", "x"):
-            cfg = config.load({"AMEESH_CONFIG": "/nonexistent",
+            cfg = config.load({"AMEESH_CONFIG": EMPTY_CONFIG,
                                "AMEESH_NONCRITICAL_HOURLY_SHARE": wrong})
             self.assertEqual(cfg.noncritical_hourly_share, 0.75, wrong)
 
