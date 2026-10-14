@@ -87,9 +87,20 @@ def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='
         raise work.WorkError('repository migrations directory unknown')
     branch = merge_queue._remote_branch(target_branch)
     _git(checkout, 'check-ref-format', 'refs/heads/' + branch)
-    canonical = merge_queue.source_of(checkout)
-    if canonical.split('/', 1)[0].split(':', 1)[0] == 'github.com':
-        canonical = canonical.lower()
+    # #879 : un seul espace d'allocation par dépôt. `source_of` garde le
+    # serveur et le port (deux serveurs sur un hôte sont deux sources pour la
+    # file), mais la projection legacy du trigger 0419 alloue toujours sous
+    # `github.com/<slug>` : une cible qui ne s'y ramène pas (autre hôte, ou
+    # `github.com:2222`) ouvrirait un second espace pour le même dépôt, donc
+    # une double réservation possible. `_checkout` a déjà vérifié que le clone
+    # est celui du dépôt du lot ; on alloue sous cette clé canonique.
+    source = merge_queue.source_of(checkout)
+    host, _, path = source.partition('/')
+    if host.split(':', 1)[0].lower() != 'github.com' or path.lower() != slug:
+        raise work.WorkError(
+            'migration slots allocate under github.com/%s (the lot repository); '
+            'observed target %s' % (slug, source))
+    canonical = 'github.com/' + slug
     # Exact commit and target ref; caller fetches first. Never scan the
     # worktree, package, source branch or any other target for the floor.
     resolved = _git(checkout, 'rev-parse', '--verify', target_sha + '^{commit}')

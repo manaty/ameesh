@@ -37,9 +37,11 @@ The result is an array, in the requested slot order:
 `slot` is the symbolic name used by a consumer's `@MIG(slot)@` marker. `id` is
 the numeric database record identity; `number` is the migration number.
 Slots are unique per lot. `default` belongs to the legacy single reservation.
-`target.repo` is the canonical origin from `merge_queue.source_of`, with GitHub
-paths lowercased and nondefault ports retained. It is distinct from the local
-clone path. Branches omit `origin/`, `refs/heads/` and `refs/remotes/origin/`.
+`target.repo` is the lot repository's canonical GitHub origin,
+`github.com/<owner>/<repo>` in lowercase: the same key the legacy projection
+writes, so a clone reached through another scheme or port allocates in the same
+space (a non-GitHub origin is refused). It is distinct from the local clone
+path. Branches omit `origin/`, `refs/heads/` and `refs/remotes/origin/`.
 
 The allocator uses the key `(target.repo, target.branch)`. `project` is
 context data: projects sharing a repository and target share their numbers. The first
@@ -91,7 +93,16 @@ reserved SHA is an ancestor of the supplied target commit and that each
 reserved number appears in its migration directory. The consumer remains
 responsible for checking the migration contents. Repeated lifecycle transitions
 are idempotent. Released slots can reserve again; landed slots retain their
-history and cannot be released or reused. Explicit cleanup and landing remain
+history and cannot be released or reused. A landing transition (`merged`,
+`promoted`) lands the slot even when `work_items.migration` is set to NULL in
+the same statement or transaction; a release without landing (lot `closed`, or
+projection cleared while the lot stays open) leaves it `released`. A lot
+returning from `merged` to `blocked` keeps its landed number: the projection
+never turns a landed record back into `reserved`, so the transition cannot
+collide with a number another lot reserved meanwhile. If that lot reserves a
+new number, the record follows the new number as `reserved`. Migration 0420
+and its copy 0432 each carry both rules in full, since unapplied files are not
+guaranteed to be applied in numeric order. Explicit cleanup and landing remain
 possible after the lot is closed or merged. The reservation stays active across
 freeze, review and lot-state changes until explicitly landed, released, or
 invalidated by target requalification.
@@ -118,6 +129,10 @@ The repository is rechecked after locking the lot: if it changed concurrently,
 the operation rolls back with a readable retry error instead of taking another
 repository lock after the row lock. The named path retries a deadlock victim
 from clients using the older lock order; every failed attempt rolls its records and journal back.
+The upgraded `work_items` writers (`move`, `set_app`, `set_branch`, `close`,
+`close_merged`, `reserve_migration`) retry a 40P01 victim the same way, with
+bounded attempts: the retry re-runs in the repository-before-lot order and
+finds the locks the other transaction released.
 
 During rollout, install the additive schema and upgrade/restart legacy writers
 before enabling named reservations. Pre-0419 code does not see named slots or
