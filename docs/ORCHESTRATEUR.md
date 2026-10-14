@@ -283,6 +283,21 @@ après un échec de `gh`, il n'en lit plus d'autre dans ce dépôt, et la PR en
 plus). `ameesh work sync-github` suit les mêmes règles et ne retient que
 les PR dont la branche est dans le dépôt même, pas dans un fork.
 
+Un lot peut demander plusieurs PR, l'une après l'autre : une PR fusionnée ne
+le ferme plus si une autre PR ouverte, ou la branche déclarée du lot (autre
+que la sienne), y reste liée — le relevé écrit alors « stage merged » au
+journal du lot, qui reste ouvert (#759). La dernière étape lève cette retenue
+en se déclarant :
+
+```
+ameesh-work: <numéro du lot> final
+```
+
+`ameesh-work-partial:` l'emporte : une PR partielle ne ferme jamais, même
+avec `final`. Un lot fermé trop tôt par une PR d'étape se corrige
+(`ameesh work move <id> build --correct "raison"`), réservé aux humains,
+orchestrateurs et agents de conception.
+
 ## Fusion sans PR ni branche déclarée
 
 Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,

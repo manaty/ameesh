@@ -70,9 +70,10 @@ TRANSITIONS = {
 }
 WAITING = {"blocked", "waiting_human"}
 #: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
-#: vers). Un `promoted` à tort revient en `merged` ; ensuite, les transitions
-#: habituelles (merged → blocked → …) s'appliquent.
-CORRECTIONS = {("promoted", "merged")}
+#: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
+#: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
+#: transitions habituelles (merged → blocked → …) s'appliquent.
+CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
@@ -1011,7 +1012,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
 
     `correct` (la raison) : correction d'un état posé par erreur, hors machine
     à états, limitée à `CORRECTIONS` (un `promoted` à tort revient en
-    `merged`) ; le journal la dit (« correction : promoted → merged — raison »).
+    `merged` ; un `merged` à tort, PR d'étape fusionnée trop tôt, revient en
+    `build`) ; le journal la dit (« correction : promoted → merged — raison »).
     L'appelant a vérifié qui corrige (`corrector`)."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
