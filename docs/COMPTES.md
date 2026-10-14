@@ -172,6 +172,19 @@ d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
 relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
 « codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
 
+Un relevé ne date pas de son écriture : un `rate_limit_event` ne porte aucun
+instant, et le dater au `mtime` du journal faisait passer la dernière mesure
+d'un agent arrêté pour une mesure fraîche (incident du 13/10 : seven_day 67 %
+a écrasé 87 % et l'admission est passée sous le plafond). Chaque relevé Claude
+porte donc sa **provenance** : l'instant de production — le ts du marqueur du
+tour qui l'a publié, absent pour un flux sans marqueur — et le journal
+d'origine. Un relevé dont une fenêtre était déjà close quand le tour a
+commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vaut
+0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
+lecteurs départagent par instant de production, jamais par l'heure
+d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
+
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : 0 % utilisé,
 le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 %

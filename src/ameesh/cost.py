@@ -232,6 +232,12 @@ class Gauge:
     used: float                     #: 0..1 (le harnais publie des pourcents)
     resets_at: float | None         #: epoch, ou None si le harnais ne le dit pas
     window_s: float
+    #: #1132 : instant de PRODUCTION du relevé (epoch), None quand le flux ne
+    #: le date pas (sans marqueur, ou Codex) — l'heure d'insertion n'en tient
+    #: pas lieu, un relevé périmé ne doit pas se faire passer pour frais.
+    produced_at: float | None = None
+    #: #1132 : journal d'origine du relevé (nom de l'agent), '' si inconnu.
+    source: str = ""
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -668,6 +674,10 @@ class CostBook:
         account claims them (L1078), never "the account itself". Leading
         readings before any established marker in a marked stream stay
         unknown, never primary.
+
+        #1132 : une mesure est classée par son instant de **production** (le ts
+        du marqueur du tour qui l'a publiée), jamais par le mtime du fichier —
+        un flux sans marqueur est non daté et ne remplace pas une mesure datée.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary)
@@ -680,17 +690,12 @@ class CostBook:
                 mtime = os.stat(path).st_mtime
             except OSError:
                 continue
-            if newest is not None and mtime <= newest[0]:
+            found = _last_claude_reading(self.events(agent, tail=True), agent, mtime)
+            if found is None:
                 continue
-            for line in reversed(self.events(agent, tail=True)):
-                if line.get("type") != "rate_limit_event":
-                    continue
-                gauges = _claude_windows(line)
-                if gauges is None:
-                    break
-                newest = (mtime, Gauges(gauges, _claude_overage(line)))
-                break
-        return newest[1] if newest else []
+            if newest is None or _reading_rank(found) >= _reading_rank(newest):
+                newest = found
+        return list(newest[2]) if newest else []
 
     def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
@@ -699,6 +704,11 @@ class CostBook:
         any marker uses the `primary` account (the harness's default one,
         L1078) and file modification time; with `primary` None, no account
         claims them.
+
+        #1132 : la comparaison porte sur l'instant de production, puis la
+        lecture est complétée par l'historique partagé (`_gauges_with_history`)
+        — un exécuteur qui ne voit que des flux figés ne juge plus un compte
+        sur la mesure périmée quand un autre état a publié plus frais.
         """
         best = None
         for agent in self.agents():
@@ -718,7 +728,7 @@ class CostBook:
                     # make a racy snapshot old enough to be cached.
                     seen = time.time_ns()
                     events, stat, complete = _claude_account_tail(path)
-                    readings = _claude_account_readings(events, stat.st_mtime)
+                    readings = _claude_account_readings(events, stat.st_mtime, agent)
                     if complete and not _racy(stat, seen):
                         self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
                     else:
@@ -729,10 +739,64 @@ class CostBook:
             found = readings.get(account)
             if found is None and primary is not None and account == primary:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
-            if found and (best is None or found[0] >= best[0]):
+            if found and (best is None or _reading_rank(found) >= _reading_rank(best)):
                 best = found
         # A caller must not mutate the cached list seen by another CostBook.
-        return list(best[1]) if best else []
+        if best is None:
+            return self._gauges_with_history(account, [])
+        return self._gauges_with_history(account, best[2])
+
+    def _gauges_with_history(self, account: str, gauges) -> list:
+        """#1132 : complète la lecture locale par l'historique partagé (0027/0434).
+
+        Un exécuteur ne voit que SON dossier d'état : la mesure la plus récente
+        y est vite périmée alors qu'un autre état (ou hôte) a publié plus frais
+        pour le même compte. Fenêtre par fenêtre, l'historique l'emporte quand
+        son instant de production est STRICTEMENT plus récent que celui de la
+        mesure locale ; une mesure non datée ne remplace jamais une mesure
+        datée. Lecture seule, jamais fatale : sans base, en panne, ou sans
+        relevé daté, la lecture locale est rendue.
+        """
+        if self.db is None:
+            return list(gauges)
+        try:
+            rows = self._gauge_latest("claude", account)
+        except Exception:  # historique facultatif : jamais fatal à la garde
+            return list(gauges)
+        known = {row.get("key"): row for row in rows if row.get("produced_ts") is not None}
+        if not known:
+            return list(gauges)
+        merged, changed = [], False
+        for gauge in gauges:
+            row = known.get(gauge.key)
+            if row is not None and (gauge.produced_at is None
+                                    or float(row["produced_ts"]) > float(gauge.produced_at)):
+                merged.append(Gauge("claude", gauge.key, float(row["used"]),
+                                    row.get("resets_at_ts"), float(row["window_s"]),
+                                    produced_at=float(row["produced_ts"]),
+                                    source=row.get("source") or ""))
+                changed = True
+            else:
+                merged.append(gauge)
+        if not gauges:
+            for key in sorted(known):
+                row = known[key]
+                merged.append(Gauge("claude", key, float(row["used"]),
+                                    row.get("resets_at_ts"), float(row["window_s"]),
+                                    produced_at=float(row["produced_ts"]),
+                                    source=row.get("source") or ""))
+                changed = True
+        if not changed:
+            return list(gauges)
+        # Le chemin par COMPTE rend une liste simple, comme avant #1132 : les
+        # drapeaux d'overage restent portés par la lecture SANS compte, et un
+        # drapeau local périmé ne doit pas être recollé à une mesure fraîche
+        # venue de l'historique.
+        return list(merged)
+
+    def _gauge_latest(self, harness: str, account: str) -> list:
+        """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
+        return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -821,7 +885,9 @@ class CostBook:
             lignes = []
             for g in gauges:
                 ligne = {"harness": g.harness, "key": g.key, "used": g.used,
-                         "resets_at": g.resets_at, "window_s": g.window_s}
+                         "resets_at": g.resets_at, "window_s": g.window_s,
+                         "produced_at": getattr(g, "produced_at", None),
+                         "source": getattr(g, "source", "")}
                 if account is not None:
                     ligne["account"] = account
                 lignes.append(ligne)
@@ -1887,22 +1953,107 @@ def _racy(stat, now_ns: int) -> bool:
     return now_ns - stat.st_ctime_ns < RACY_CTIME_NS
 
 
-def _claude_account_readings(events: list, mtime: float) -> dict:
-    """Attribute all accounts in one pass; None is a verified legacy stream."""
+#: #1132 : tolérance entre le ts du marqueur d'un tour et le `resetsAt` d'une
+#: fenêtre qu'il publie. Au-delà, la fenêtre était déjà close quand le tour a
+#: commencé : le harnais a rejoué une mesure périmée (incident du 13/10, la
+#: five_hour du relevé figé était échue de ~24 h sous un marqueur récent).
+REPLAY_TOLERANCE_S = 60.0
+
+
+def _marker_ts(event: dict) -> float | None:
+    """Le ts d'un marqueur de compte, ou None s'il est absent/illisible."""
+    try:
+        value = float(event.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _reading_rank(found) -> tuple:
+    """#1132 : classe une mesure par son instant de PRODUCTION.
+
+    Une mesure non datée (flux sans marqueur) ne date pas le fichier : le mtime
+    ne sert qu'à départager deux mesures non datées entre elles, jamais à
+    battre une mesure datée (`(False, mtime) < (True, ts)`).
+    """
+    stamp, produced = found[0], found[1]
+    return (produced is not None, produced if produced is not None else stamp)
+
+
+def _stamp_gauges(gauges: list, produced: float | None, agent: str,
+                  overage: Overage | None) -> Gauges:
+    """#1132 : chaque fenêtre porte sa provenance (production, journal)."""
+    return Gauges([replace(gauge, produced_at=produced, source=agent or "")
+                   for gauge in gauges], overage)
+
+
+def _replayed(gauges: list, produced: float | None) -> bool:
+    """#1132 : une fenêtre déjà close avant le tour qui la publie est un rejeu.
+
+    Un `rate_limit_event` ne porte pas d'instant ; le ts du marqueur de compte
+    borne le début du tour. Si le `resetsAt` d'une fenêtre publiée est
+    antérieur à cette borne (tolérance `REPLAY_TOLERANCE_S`, même horloge), le
+    harnais a rejoué une mesure d'un tour antérieur : elle ne doit jamais
+    remplacer une mesure fraîche.
+    """
+    if produced is None:
+        return False
+    return any(gauge.resets_at is not None
+               and float(gauge.resets_at) < produced - REPLAY_TOLERANCE_S
+               for gauge in gauges)
+
+
+def _last_claude_reading(events: list, agent: str, mtime: float):
+    """Dernier `rate_limit_event` d'un flux, daté par son marqueur (#1132).
+
+    Rend `(estampille, production, Gauges)` : `production` est le ts du dernier
+    marqueur de compte vu avant l'événement (None pour un flux sans marqueur),
+    `estampille` le mtime du fichier quand il n'y a pas de marqueur — il ne
+    sert qu'à départager deux flux non datés.
+    """
+    produced, found = None, None
+    for event in events:
+        if _is_claude_marker(event):
+            produced = _marker_ts(event)
+        elif event.get("type") == "rate_limit_event":
+            gauges = _claude_windows(event)
+            if gauges is not None:
+                found = (produced, gauges, _claude_overage(event))
+    if found is None:
+        return None
+    produced, gauges, overage = found
+    if _replayed(gauges, produced):
+        produced = None
+    stamp = produced if produced is not None else mtime
+    return (stamp, produced, _stamp_gauges(gauges, produced, agent, overage))
+
+
+def _claude_account_readings(events: list, mtime: float, agent: str = "") -> dict:
+    """Attribute all accounts in one pass; None is a verified legacy stream.
+
+    #1132 : chaque mesure porte sa provenance. `produced_at` est le ts du
+    marqueur du tour qui l'a publiée — jamais le mtime du fichier, qui ne sert
+    qu'à départager deux flux sans marqueur (non datés). Une mesure dont une
+    fenêtre était déjà close au début du tour est un rejeu : elle est rendue
+    NON datée, pour ne pas remplacer une mesure fraîche.
+    """
     marked = any(_is_claude_marker(e) for e in events)
-    current, stamp = None, 0.0 if marked else mtime
+    current, stamp, produced = None, (0.0 if marked else mtime), None
     readings = {}
     for event in events:
         if _is_claude_marker(event):
             current = str(event.get("account") or "") or None
-            try:
-                stamp = float(event.get("ts") or 0.0)
-            except (TypeError, ValueError):
-                stamp = 0.0
+            produced = _marker_ts(event)
+            stamp = produced if produced is not None else 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
             gauges = _claude_windows(event)
             if gauges is not None:
-                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+                at = produced
+                if _replayed(gauges, at):
+                    at = None             # rejeu : jamais daté
+                readings[current] = (stamp, at,
+                                     _stamp_gauges(gauges, at, agent,
+                                                   _claude_overage(event)))
     return readings
 
 

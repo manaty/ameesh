@@ -355,13 +355,17 @@ class Operations(interface.Operations):
     def record_gauges(self, readings) -> int:
         inserted = 0
         for g in readings:
-            # L30 (0028) : une jauge de COMPTE porte son nom ; NULL = sans comptes
+            # L30 (0028) : une jauge de COMPTE porte son nom ; NULL = sans comptes.
+            # #1132 (0434) : `produced_at` (instant de production, NULL quand le
+            # flux ne le date pas) et `source` (journal d'origine) : la provenance.
             account = g.get("account")
+            produced = g.get("produced_at")
             rows = self.db.query(
                 """
                 INSERT INTO quota_gauge_readings (harness, gauge_key, used, resets_at, window_s,
-                                                  account)
-                SELECT %s, %s, %s, to_timestamp(%s), %s, %s
+                                                  account, produced_at, source)
+                SELECT %s, %s, %s, to_timestamp(%s), %s, %s,
+                       to_timestamp(%s::double precision), %s
                  WHERE NOT EXISTS (
                      SELECT 1 FROM (
                          SELECT used, resets_at, observed_at FROM quota_gauge_readings
@@ -374,7 +378,8 @@ class Operations(interface.Operations):
                 RETURNING id
                 """,
                 (g["harness"], g["key"], float(g["used"]), g.get("resets_at"),
-                 float(g["window_s"]), account, g["harness"], g["key"], account,
+                 float(g["window_s"]), account, produced, g.get("source"),
+                 g["harness"], g["key"], account,
                  float(g["used"]), g.get("resets_at")),
             )
             inserted += len(rows)
@@ -383,7 +388,8 @@ class Operations(interface.Operations):
     def gauge_history(self, *, since_s, harness, account=None) -> list[dict]:
         sql = ("SELECT harness, gauge_key AS key, used,"
                " extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,"
-               " extract(epoch from observed_at)::float8 AS observed_ts, account"
+               " extract(epoch from observed_at)::float8 AS observed_ts,"
+               " extract(epoch from produced_at)::float8 AS produced_ts, source, account"
                " FROM quota_gauge_readings"
                " WHERE observed_at >= now() - make_interval(secs => %s)")
         params: list = [float(since_s)]
@@ -397,17 +403,39 @@ class Operations(interface.Operations):
         return _sans_compte_nul(self.db.query(sql, tuple(params)))
 
     def latest_gauges(self, *, since_s) -> list[dict]:
+        """L94 : le DERNIER relevé de chaque jauge, par instant de PRODUCTION
+        (#1132) : un relevé périmé réinséré ne remplace plus le frais."""
         return self.db.query(
             """
             SELECT DISTINCT ON (harness, account, gauge_key)
                    harness, gauge_key AS key, used,
                    extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
-                   extract(epoch from observed_at)::float8 AS observed_ts, account
+                   extract(epoch from observed_at)::float8 AS observed_ts,
+                   extract(epoch from produced_at)::float8 AS produced_ts, source, account
               FROM quota_gauge_readings
              WHERE observed_at >= now() - make_interval(secs => %s)
-             ORDER BY harness, account, gauge_key, observed_at DESC, id DESC
+             ORDER BY harness, account, gauge_key,
+                      produced_at DESC NULLS LAST, observed_at DESC, id DESC
             """,
             (float(since_s),))
+
+    def gauge_latest(self, *, harness, account) -> list[dict]:
+        """#1132 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
+        sans limite d'âge : le plus récent par instant de production (NULL en
+        dernier), puis par insertion. Sert à l'exécuteur pour ne pas juger un
+        compte sur son seul flux local quand un autre état a produit plus frais."""
+        return self.db.query(
+            """
+            SELECT DISTINCT ON (gauge_key)
+                   harness, gauge_key AS key, used,
+                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
+                   extract(epoch from observed_at)::float8 AS observed_ts,
+                   extract(epoch from produced_at)::float8 AS produced_ts, source, account
+              FROM quota_gauge_readings
+             WHERE harness = %s AND account = %s
+             ORDER BY gauge_key, produced_at DESC NULLS LAST, observed_at DESC, id DESC
+            """,
+            (harness, account))
 
     def assigners(self, *, since_s) -> list[str]:
         rows = self.db.query(
