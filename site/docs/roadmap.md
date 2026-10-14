@@ -294,8 +294,8 @@ release is published yet. The main lines:
   1.10.0 companion docs (L712).
 
 Migrations 0058 to 0069 and 0359, 0361–0364, 0368, 0371–0373, 0380, 0384,
-0388, 0390, 0392, 0395, 0398, 0402, 0410, 0412, 0413, all additive; apply them
-with `ameesh migrate` before installing the new code.
+0388, 0390, 0392, 0395, 0398, 0402, 0403, 0410, 0412, 0413, 0427, all additive;
+apply them with `ameesh migrate` before installing the new code.
 
 ## Planned
 
