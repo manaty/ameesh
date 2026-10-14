@@ -95,6 +95,7 @@ python3 -m ameesh progress
 
 ## Next steps
 
+- Install ameesh for real: [Install on a workstation](guides/install.md).
 - Understand the model: [Concepts](concepts/index.md).
 - Describe your own team: [Write a canon](guides/write-a-canon.md).
 - Every command: [CLI reference](reference/cli.md).
