@@ -726,9 +726,10 @@ def body_of(text: str) -> str:
 def process_projection(body: str) -> tuple[str, str]:
     """#1372 : la projection courte portée par le corps d'une carte Process.
 
-    Rend `(projection, code)`. Les marqueurs sont cherchés en DÉBUT de ligne
-    (espaces ignorés) ; le texte entre les deux est la projection. `code` vaut
-    "" quand il n'y a pas de marqueur ou que la projection est lue, sinon :
+    Rend `(projection, code)`. Un marqueur est SEUL sur sa ligne (espaces
+    ignorés) : un marqueur suivi d'un texte n'en est pas un (R1 #1372, B1) ;
+    le texte entre les deux marqueurs est la projection. `code` vaut "" quand
+    il n'y a pas de marqueur ou que la projection est lue, sinon :
     `unterminated` (début sans fin), `stray-end` (fin sans début, ou fin avant
     le début), `multiple` (plus d'un marqueur), `empty` (aucun texte). Une
     projection illisible n'est jamais injectée : l'appelant garde le texte
@@ -736,9 +737,9 @@ def process_projection(body: str) -> tuple[str, str]:
     """
     lignes = (body or "").splitlines()
     debuts = [i for i, l in enumerate(lignes)
-              if l.strip().startswith(PROCESS_PROJECTION_START)]
+              if l.strip() == PROCESS_PROJECTION_START]
     fins = [i for i, l in enumerate(lignes)
-            if l.strip().startswith(PROCESS_PROJECTION_END)]
+            if l.strip() == PROCESS_PROJECTION_END]
     if not debuts and not fins:
         return "", ""
     if len(debuts) > 1 or len(fins) > 1:

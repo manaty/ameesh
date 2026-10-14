@@ -86,6 +86,25 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         self.assertEqual(loaded.processes[0].projection, "")
         self.assertEqual(loaded.processes[0].projection_error, "")
 
+    def test_un_marqueur_avec_suffixe_n_en_est_pas_un(self):
+        # R1 #1372 B1 : le contrat est « marqueur SEUL sur sa ligne » ; un
+        # marqueur suivi d'un texte ne doit ni ouvrir ni fermer de projection
+        body = ("# Règles\n\n%s exemple\n\n- fragment\n\n%s exemple\n"
+                % (DEBUT, FIN))
+        loaded = self.charge(carte(body=body))
+        self.assertEqual(loaded.processes[0].projection, "")
+        self.assertEqual(loaded.processes[0].projection_error, "")
+        # un vrai début et une fin suffixée : le début reste sans fin, et c'est dit
+        body = "# Règles\n\n%s\n\n- fragment\n\n%s exemple\n" % (DEBUT, FIN)
+        loaded = self.charge(carte(body=body))
+        self.assertEqual(loaded.processes[0].projection, "")
+        self.assertEqual(loaded.processes[0].projection_error, "unterminated")
+        # entouré d'espaces, le marqueur reste un marqueur (strip, pas de texte)
+        body = "# Règles\n\n  %s  \n\n- projeté\n\n\t%s\t\n" % (DEBUT, FIN)
+        loaded = self.charge(carte(body=body))
+        self.assertEqual(loaded.processes[0].projection, "- projeté")
+        self.assertEqual(loaded.processes[0].projection_error, "")
+
     def test_les_defauts_de_forme_sont_signales(self):
         cas = {
             "unterminated": carte(body="# Règles\n\n%s\n\n- sans fin\n" % DEBUT),
@@ -243,6 +262,28 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         self.assertIn("the rules block is cut", texte)
         self.assertIn("the end is not injected", texte)
         self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
+
+    def test_des_diagnostics_nombreux_ne_chassent_pas_les_regles(self):
+        # R1 #1372 B2 : 220 cartes fautives (≈ 15 000 octets de diagnostics)
+        # ne doivent ni vider le bloc ni emporter les règles ; les diagnostics
+        # sont bornés et agrégés, et la coupe des règles reste dite.
+        for i in range(220):
+            write(self.clone, "processus/carte-%03d.md" % i, carte(
+                title="Carte %03d" % i,
+                body="# Règles\n\n%s\n\n- sans fin\n" % DEBUT))
+        commit_all(self.clone, "220 projections illisibles")
+        bloc = reprise.process_rules_block(self.cfg, agent="ouvrier",
+                                           host=self.cfg.host)
+        self.assertIn(reprise.PROCESS_RULES_HEADER, bloc)
+        self.assertIn(reprise.PROCESS_RULES_FOOTER, bloc)
+        self.assertIn("more rule diagnostics", bloc)      # l'excédent est agrégé
+        self.assertIn("the rules block is cut", bloc)     # la coupe est dite
+        self.assertIn("### Carte 000", bloc)              # des règles sont là
+        self.assertLessEqual(len(bloc.encode()), reprise.BRIEF_MAX_BYTES)
+        diags = [l for l in bloc.splitlines()
+                 if l.startswith(reprise.RULES_DIAG_PREFIX)]
+        self.assertLessEqual(len(("\n".join(diags) + "\n").encode()),
+                             reprise.RULES_DIAG_MAX)
 
     def test_un_resume_plein_ne_chasse_pas_la_projection(self):
         # la place des règles reste réservée d'abord (#538) : la projection

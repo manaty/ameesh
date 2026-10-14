@@ -402,33 +402,70 @@ def _clip_rules(rules: str, place: int) -> str:
 #: APRÈS l'en-tête du bloc, donc ils survivent à la coupe qui emporte la fin du
 #: texte : la perte de règles est dite, jamais silencieuse.
 RULES_DIAG_PREFIX = "> rules: "
+#: #1372 : plafond des diagnostics dans le bloc (octets). Des constats nombreux
+#: (une carte fautive par ligne) ne doivent jamais chasser le texte des règles
+#: ni rendre le bloc vide : au-delà, les lignes sont agrégées (R1 #1372, B2).
+RULES_DIAG_MAX = 1200
 
 
-def _diag_lines(diagnostics) -> str:
-    """Les diagnostics prêts à poser dans le bloc, ou ""."""
-    lignes = [RULES_DIAG_PREFIX + str(d).strip() for d in (diagnostics or ())]
-    return "\n".join(lignes) + "\n" if lignes else ""
+def _diag_block(diagnostics, cap: int) -> str:
+    """Les diagnostics prêts à poser dans le bloc, bornés à `cap` octets.
+
+    Les premières lignes qui tiennent sont gardées ; l'excédent est résumé par
+    une dernière ligne `… N more rule diagnostics`. Rend "" si même le résumé
+    ne tient pas : l'appelant garde alors le texte des règles."""
+    lignes = [RULES_DIAG_PREFIX + str(d).strip()
+              for d in (diagnostics or ()) if str(d).strip()]
+    if not lignes or cap <= 0:
+        return ""
+    gardees: list[str] = []
+    for i, ligne in enumerate(lignes):
+        reste = len(lignes) - i - 1
+        suite = ["%s… %d more rule diagnostics (`canon check`)"
+                 % (RULES_DIAG_PREFIX, reste)] if reste else []
+        if _octets("\n".join(gardees + [ligne] + suite) + "\n") > cap:
+            break
+        gardees.append(ligne)
+    reste = len(lignes) - len(gardees)
+    if not reste:
+        return "\n".join(gardees) + "\n"
+    agregat = ("%s… %d more rule diagnostics (`canon check`)"
+               % (RULES_DIAG_PREFIX, reste))
+    while gardees:
+        texte = "\n".join(gardees + [agregat]) + "\n"
+        if _octets(texte) <= cap:
+            return texte
+        gardees.pop()
+    # une seule ligne, plus longue que le plafond : la couper sans casser l'UTF-8
+    return _clip(lignes[0], cap).rstrip() + "\n"
 
 
 def _rules_bloc(rules: str, limit: int, diagnostics=()) -> str:
     """#538/#1372 : le bloc de règles (en-tête, diagnostics, règles, pied) borné
     à `limit` octets, ou "" quand l'en-tête et le pied n'y tiennent déjà pas.
 
-    Un diagnostic (#1372) est posé avant les règles ; si le bloc doit couper
-    les règles, une dernière ligne le DIT (et sa place est comptée)."""
+    Les diagnostics (#1372) sont posés avant les règles, sous un plafond
+    (`RULES_DIAG_MAX`, au plus le quart de la place) : leur nombre ne peut ni
+    chasser les règles ni vider le bloc (R1 #1372, B2). Si les règles doivent
+    être coupées, une ligne le DIT, et ce constat passe avant les diagnostics
+    de cartes."""
     entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
-    diags = list(diagnostics or ())
-    diag = _diag_lines(diags)
-    place = limit - _octets(entete) - _octets(pied) - _octets(diag)
-    if place <= 6:
+    place_total = limit - _octets(entete) - _octets(pied)
+    if place_total <= 6:
         return ""
+    diags = list(diagnostics or ())
+    cap = max(0, min(RULES_DIAG_MAX, place_total // 4))
+    diag = _diag_block(diags, cap)
+    place = place_total - _octets(diag)
     if _octets(rules) > place:
-        diags.append("the rules block is cut: %d bytes of rules, the end is not "
-                     "injected" % _octets(rules))
-        diag = _diag_lines(diags)
-        place = limit - _octets(entete) - _octets(pied) - _octets(diag)
+        coupe = ("the rules block is cut: %d bytes of rules, the end is not "
+                 "injected" % _octets(rules))
+        diag_coupe = _diag_block([coupe], cap)
+        diag = _diag_block(diags, max(0, cap - _octets(diag_coupe))) + diag_coupe
+        place = place_total - _octets(diag)
         if place <= 6:
-            return ""
+            # même sans diagnostics, le texte des règles prime
+            diag, place = "", place_total
     return entete + diag + _clip_rules(rules, place) + pied
 
 
