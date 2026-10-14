@@ -18,7 +18,7 @@ from typing import Any
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
-from .work import has_reviewer
+from .work import REQUEUED_PARAMS, has_reviewer, requeued_sql
 from .work_dependencies import current_verdict as _current_verdict
 
 #: états de lot terminés (le reste est « ouvert »)
@@ -377,8 +377,9 @@ class Operations(interface.Operations):
 
     #: corps commun de `open_lots_activity` / `state_lots_activity` : la
     #: dernière activité d'un lot (ligne, transitions, jalons, actions,
-    #: messages). `%%s` du LIMIT est échappé : `_lots_activity` injecte le
-    #: WHERE, qui peut lui-même porter un `%s`.
+    #: messages). `__WHERE__` reçoit le filtre de l'appelant (qui peut porter
+    #: un `%s`) ; le fragment §4 `__RETURNED__` porte ses propres paramètres
+    #: (`REQUEUED_PARAMS`), d'où la substitution, jamais un `%` de formatage.
     #: #1922/N13 : `workflow_ref` (0452) est porté par la lecture, comme
     #: `work.get` le fait par `to_jsonb` — '' sur une base d'avant la
     #: migration. `released_by` en écarte les dépendants pinnés, dont la
@@ -388,6 +389,7 @@ class Operations(interface.Operations):
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
                    to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
+                   __RETURNED__
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
                             nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
@@ -405,9 +407,9 @@ class Operations(interface.Operations):
                                   WHERE a.work_item = w.id) ac ON true
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
                                   WHERE b.work_item_id = w.id::text) mb ON true
-             WHERE %s
+             WHERE __WHERE__
              ORDER BY last_activity_ts ASC, w.id
-             LIMIT %%s
+             LIMIT %s
             """
 
     def _lots_activity(self, where, params) -> list[dict]:
@@ -415,9 +417,15 @@ class Operations(interface.Operations):
         # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
         reviewer = ("w.reviewer" if has_reviewer(self.db)
                     else "''::text AS reviewer")
-        return self.db.query(
-            self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where,
-            params)
+        # §4 : `returned_to_queue` distingue un lot `build` RENDU à la file
+        # (limite d'en-cours) d'un lot en cours sans assigné (prérequis,
+        # travail confié par courrier) — voir `work.requeued_sql`.
+        sql = (self._LOTS_ACTIVITY
+               .replace("__REVIEWER__", reviewer)
+               .replace("__RETURNED__", "(w.state = 'build' AND "
+                        + requeued_sql("w") + ") AS returned_to_queue,")
+               .replace("__WHERE__", where))
+        return self.db.query(sql, REQUEUED_PARAMS + tuple(params))
 
     def open_lots_activity(self, limit) -> list[dict]:
         return self._lots_activity(
