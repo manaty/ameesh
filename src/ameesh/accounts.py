@@ -108,7 +108,6 @@ sont plus posées : le choix par retard sur le rythme les remplace.
 """
 from __future__ import annotations
 
-import json
 import math
 import os
 import stat
@@ -738,91 +737,36 @@ class Ceiling(NamedTuple):
     end: float | None = None
 
 
-def claude_global_config(profile: Profile, environ=None) -> str:
-    """Le `.claude.json` global de ce compte Claude (#1176), ou ''.
-
-    Claude Code range ce fichier dans `CLAUDE_CONFIG_DIR` quand la variable
-    est posée (dossier déclaré, ou variable héritée par un compte sans
-    dossier), sinon à la racine du foyer (`~/.claude.json`) — pas dans
-    `~/.claude`. Aucun autre harnais n'a ce fichier.
-    """
-    if profile.harness != "claude" or profile.kind != "config_dir":
-        return ""
-    if profile.path:
-        directory = _expand(profile.path)
-    else:
-        environ = os.environ if environ is None else environ
-        inherited = environ.get(config_env_of(profile.harness)) or ""
-        directory = _expand(inherited) if inherited else os.path.expanduser("~")
-    return os.path.join(directory, ".claude.json")
-
-
-def _claude_extra_usage_disabled(profile: Profile, gauge, now: float, environ=None) -> bool:
-    """Le `.claude.json` du compte dit-il l'usage supplémentaire désactivé ?
-
-    On ne lit QUE `cachedExtraUsageDisabledReason` (une chaîne, jamais un
-    secret) : renseigné, il prouve que Claude Code a coupé l'usage
-    supplémentaire — donc qu'aucun overage n'est facturé. La preuve doit être
-    fraîche : un fichier ordinaire, à l'utilisateur, écrit **pendant la
-    fenêtre visée** (`resets_at` moins `window_s`) et pas dans le futur. Un
-    cache d'une fenêtre close ne prouve rien de la fenêtre suivante.
-    """
-    path = claude_global_config(profile, environ)
-    if not path or not gauge.resets_at:
-        return False
-    uid = os.getuid() if hasattr(os, "getuid") else None
-    try:
-        info = os.lstat(path)
-    except OSError:
-        return False
-    if not stat.S_ISREG(info.st_mode) or (uid is not None and info.st_uid != uid):
-        return False
-    start = float(gauge.resets_at) - float(gauge.window_s)
-    if not start <= info.st_mtime <= now + 1.0:
-        return False
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    reason = data.get("cachedExtraUsageDisabledReason")
-    return isinstance(reason, str) and bool(reason.strip())
-
-
-def overage_impossible(profile: Profile, gauges, gauge, now: float,
-                       environ=None) -> bool:
+def overage_impossible(gauges, now: float) -> bool:
     """L'overage est-il impossible pour ce compte, prouvé par un relevé frais ?
 
-    Deux sources, jamais une déclaration de configuration :
-    * le relevé de jauges : `overage.capable` explicitement faux (Claude
-      `overageStatus`, Codex `credits.has_credits`), avec au moins une fenêtre
-      encore en cours — un relevé dont toutes les fenêtres sont remises à zéro
-      est périmé (L71) ;
-    * Claude seulement : le `.claude.json` du dossier du compte
-      (`_claude_extra_usage_disabled`).
+    Une seule source, jamais une déclaration de configuration : le relevé de
+    jauges, `overage.capable` **explicitement faux** (Claude `overageStatus`,
+    Codex `credits.has_credits`) et frais — au moins une fenêtre encore en
+    cours (un relevé dont toutes les fenêtres sont remises à zéro est périmé,
+    L71), et pas en overage.
 
-    Toute autre situation — information absente, périmée, ou overage
-    possiblement facturé — vaut « non » : le plafond de base tient. Un overage
-    **possible** l'emporte sur un cache qui le dit désactivé : le relevé du
-    harnais est le plus proche de l'état réel.
+    #1176 (B2) : le `.claude.json` du compte a été retiré de cette preuve.
+    Son `cachedExtraUsageDisabledReason` peut dater d'une autre fenêtre, et
+    le mtime du **contenant** ne date pas la valeur : Claude Code réécrit ce
+    fichier pour d'autres raisons (une clé étrangère ajoutée suffisait à
+    faire relever le plafond alors que la capacité d'overage restait
+    inconnue). Aucune preuve fraîche rattachée à la capacité n'étant
+    démontrable, la suppression conservatrice s'impose : information
+    inconnue, absente ou périmée ⇒ pas de relèvement.
+
+    Toute autre situation — information absente, inconnue, périmée, ou
+    overage possiblement facturé — vaut « non » : le plafond de base tient.
     """
     read = getattr(gauges, "overage", None)
-    capable = None if read is None else read.capable
-    if capable is True:
+    if read is None or read.capable is not False:
         return False
-    if capable is False:
-        if in_overage(gauges, now):
-            return False
-        if any(not g.reset_passed(now) for g in gauges):
-            return True
-        # relevé périmé : le cache du compte peut encore prouver la fenêtre visée
-    return _claude_extra_usage_disabled(profile, gauge, now, environ)
+    if in_overage(gauges, now):
+        return False
+    return any(not g.reset_passed(now) for g in gauges)
 
 
-def pace_ceiling(profile: Profile, gauges, gauge, now: float,
-                 environ=None) -> Ceiling:
+def pace_ceiling(profile: Profile, gauges, gauge, now: float) -> Ceiling:
     """Le plafond de rythme effectif de cette fenêtre, et sa raison (#1176).
 
     Le plafond de base est `profile.pace_ceiling` (défaut `PACE_CEILING`).
@@ -837,23 +781,22 @@ def pace_ceiling(profile: Profile, gauges, gauge, now: float,
     if end is None or end <= base or not gauge.resets_at:
         return Ceiling(base)
     if in_overage(gauges, now):
-        # un compte en overage n'est jamais choisi : son plafond ne se relève
-        # pas, même si un cache le dit « impossible »
+        # un compte en overage n'est jamais choisi : son plafond ne se relève pas
         return Ceiling(base)
     from_ts = float(gauge.resets_at) - profile.pace_ceiling_end_hours * 3600.0
     left = float(gauge.resets_at) - now
     if left < 0.0:
         return Ceiling(base)
-    if not overage_impossible(profile, gauges, gauge, now, environ):
+    if not overage_impossible(gauges, now):
         return Ceiling(base)
     if now >= from_ts:
         return Ceiling(end, CEILING_REASON_END, from_ts, end)
     return Ceiling(base, from_ts=from_ts, end=end)
 
 
-def pace_ceilings(profile: Profile, gauges, now: float, environ=None) -> dict:
+def pace_ceilings(profile: Profile, gauges, now: float) -> dict:
     """{clé de jauge: Ceiling} pour toutes les fenêtres du compte (#1176)."""
-    return {gauge.key: pace_ceiling(profile, gauges, gauge, now, environ)
+    return {gauge.key: pace_ceiling(profile, gauges, gauge, now)
             for gauge in gauges}
 
 
@@ -877,8 +820,7 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
 
 
 def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
-           reserve: bool = False, ceilings: dict | None = None,
-           environ=None) -> dict:
+           reserve: bool = False, ceilings: dict | None = None) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
@@ -901,7 +843,7 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
     if ceilings is None:
-        ceilings = pace_ceilings(profile, gauges, now, environ)
+        ceilings = pace_ceilings(profile, gauges, now)
     out = {}
     for gauge in gauges:
         ceiling = ceilings.get(gauge.key)
@@ -998,7 +940,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
-    result.ceilings = pace_ceilings(profile, result.gauges, now, environ)
+    result.ceilings = pace_ceilings(profile, result.gauges, now)
     result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve,
                            ceilings=result.ceilings)
     depasses = []

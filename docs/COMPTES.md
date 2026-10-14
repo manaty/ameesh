@@ -239,16 +239,22 @@ A plan window that ends with unused capacity loses it. `pace_ceiling_end`
 lets the account spend that end of window, but only where no paid overage can
 result. The raise applies to a window when `resets_at` is at most
 `pace_ceiling_end_hours` away and the account's overage is **proven
-impossible by a fresh reading**, from either source:
+impossible by a fresh reading**: the gauge reading itself, with an explicit
+"not capable" flag (Claude `overageStatus` not allowed, Codex
+`credits.has_credits` false) and at least one window still running — a
+reading whose windows have all reset is stale (L71).
 
-* the gauge reading itself: an explicit "not capable" flag (Claude
-  `overageStatus` not allowed, Codex `credits.has_credits` false), with at
-  least one window still running — a reading whose windows have all reset is
-  stale (L71);
-* Claude only: the account's `.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`,
-  or `~/.claude.json` without the variable) carries a non-empty
-  `cachedExtraUsageDisabledReason`, and that cache was written **during the
-  window being raised** — never a closed window's cache.
+An unknown, partial or non-boolean flag is **not** a proof: a Codex `credits`
+object with no `has_credits`/`unlimited`, or non-boolean values, leaves the
+capability unknown (B1, #1176).
+
+The account's `.claude.json` is **not** a source of proof (B2, #1176): its
+`cachedExtraUsageDisabledReason` can date from another window, and the mtime
+of the file dates the container, not the cached value — Claude Code rewrites
+that file for unrelated reasons (adding a single foreign key was enough to
+raise the ceiling while the overage capability stayed unknown). No fresh
+proof tied to the value being demonstrable, the fallback is removed: unknown
+stays unknown.
 
 Anything else — flag absent, unknown, possible overage, stale proof, undated
 window — keeps the base ceiling (`pace_ceiling`), and an account that may be

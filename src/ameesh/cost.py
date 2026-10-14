@@ -1728,12 +1728,26 @@ def _claude_overage(event: dict) -> Overage:
 
 def _codex_overage(limits: dict, gauges: list) -> Overage:
     """The overage flags of a Codex `rate_limits` object (L226b): credits
-    let the account go on, billed, once a window is at 100 %."""
+    let the account go on, billed, once a window is at 100 %.
+
+    #1176 (B1) : un objet `credits` vide, partiel, ou dont les champs ne sont
+    pas des booléens ne prouve RIEN — `capable` reste None (inconnu), et
+    aucun relèvement de fin de fenêtre ne s'appuie dessus. Seule une capacité
+    explicite (`has_credits` ou `unlimited` vrai) rend True ; une incapacité
+    n'est rendue False que si elle est explicite (`has_credits` faux) et non
+    contredite par `unlimited` vrai.
+    """
     credits = limits.get("credits")
     if not isinstance(credits, dict):
         return Overage()
-    capable = credits.get("has_credits") is True or credits.get("unlimited") is True
-    return Overage(capable, capable and any(g.used >= 1.0 for g in gauges))
+    has_credits, unlimited = credits.get("has_credits"), credits.get("unlimited")
+    if has_credits is True or unlimited is True:
+        capable: bool | None = True
+    elif has_credits is False:
+        capable = False
+    else:
+        capable = None
+    return Overage(capable, capable is True and any(g.used >= 1.0 for g in gauges))
 
 
 def _find_rate_limits(node, depth: int = 0):

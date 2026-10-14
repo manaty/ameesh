@@ -5,8 +5,8 @@ Décision de l'owner du 2026-10-14 (bureau, courrier 28505) : ne plus perdre la
 fin des fenêtres de forfait. `pace_ceiling` remplace les 90 % en dur ;
 `pace_ceiling_end` relève le plafond dans les dernières heures avant
 `resets_at`, **seulement** quand l'overage est impossible, prouvé par un relevé
-frais (jauges ou `.claude.json`). Le refus d'overage et la coupure d'un tour sur
-`isUsingOverage` restent inchangés.
+frais de jauges (capacité explicitement fausse). Le refus d'overage et la
+coupure d'un tour sur `isUsingOverage` restent inchangés.
 
 Aucun compte réel, aucune base : les jauges sont des objets `cost.Gauge`, les
 dossiers de compte sont des dossiers du bac à sable.
@@ -153,106 +153,134 @@ class GaugeMathTest(unittest.TestCase):
 
 
 class OverageProofTest(_Sandbox):
-    """La preuve d'overage impossible : jauges fraîches, puis `.claude.json`."""
+    """La preuve d'overage impossible : un relevé de jauges frais, rien d'autre.
+
+    Revue Codex B2 (#1176) : le `.claude.json` du compte n'est plus une
+    source de preuve (son cache peut dater d'une autre fenêtre, et le mtime du
+    contenant ne date pas la valeur). Les témoins qui l'utilisaient gardent le
+    plafond de base, y compris après réécriture du fichier dans la fenêtre.
+    """
 
     def test_gauges_flag_not_capable_with_a_live_window_is_a_proof(self):
         gauge = _gauge(0.5, harness="codex", key="codex-300min", window=5 * HOUR)
         profile = self._profile("codex")
         self.assertTrue(accounts.overage_impossible(
-            profile, _reading([gauge], cost.Overage(capable=False)), gauge, NOW))
+            _reading([gauge], cost.Overage(capable=False)), NOW))
 
     def test_capable_unknown_or_possible_is_never_a_proof(self):
         gauge = _gauge(0.5, harness="codex", key="codex-300min", window=5 * HOUR)
-        profile = self._profile("codex")
         for overage in (cost.Overage(), cost.Overage(capable=True), cost.Overage(capable=None)):
             self.assertFalse(accounts.overage_impossible(
-                profile, _reading([gauge], overage), gauge, NOW), overage)
+                _reading([gauge], overage), NOW), overage)
 
     def test_a_stale_reading_proves_nothing(self):
         gauge = _gauge(0.5, before_reset=-100.0, harness="codex",
                        key="codex-300min", window=5 * HOUR)
-        profile = self._profile("codex")
         self.assertFalse(accounts.overage_impossible(
-            profile, _reading([gauge], cost.Overage(capable=False)), gauge, NOW))
+            _reading([gauge], cost.Overage(capable=False)), NOW))
 
     def test_in_overage_is_never_impossible(self):
         gauge = _gauge(1.0, harness="codex", key="codex-300min", window=5 * HOUR)
-        profile = self._profile("codex")
         reading = _reading([gauge], cost.Overage(capable=False, in_use=True))
         self.assertTrue(reading.in_overage(NOW))
-        self.assertFalse(accounts.overage_impossible(profile, reading, gauge, NOW))
+        self.assertFalse(accounts.overage_impossible(reading, NOW))
 
     def test_a_declared_overage_none_is_not_a_proof(self):
         gauge = _gauge(0.5, harness="codex", key="codex-300min", window=5 * HOUR)
-        profile = self._profile("codex", overage="none")
-        self.assertFalse(accounts.overage_impossible(
-            profile, _reading([gauge]), gauge, NOW))
+        profile = self._profile("codex", overage="none", pace_ceiling=0.90,
+                                pace_ceiling_end=0.98)
+        reading = _reading([gauge])
+        self.assertFalse(accounts.overage_impossible(reading, NOW))
+        self.assertEqual(accounts.pace_ceiling(profile, reading, gauge, NOW).value, 0.90)
 
-    def test_a_possible_overage_beats_a_disabled_cache(self):
+    def test_a_claude_cache_in_the_window_never_raises_the_ceiling(self):
         directory = self._dir("claude-2")
         self._claude_config(directory, "out_of_credits", mtime=NOW - 60.0)
-        gauge = _gauge(0.5)
-        profile = self._profile(path=directory)
-        self.assertFalse(accounts.overage_impossible(
-            profile, _reading([gauge], cost.Overage(capable=True)), gauge, NOW,
-            environ={}))
+        gauge = _gauge(0.95)
+        profile = self._profile(path=directory, pace_ceiling=0.90, pace_ceiling_end=0.98)
+        reading = _reading([gauge])              # capacité inconnue
+        self.assertFalse(accounts.overage_impossible(reading, NOW))
+        self.assertEqual(accounts.pace_ceiling(profile, reading, gauge, NOW).value, 0.90)
 
-    def test_claude_cache_written_in_the_window_is_a_proof(self):
+    def test_a_foreign_key_rewrite_is_not_a_fresh_proof(self):
+        """Témoin de la revue B2 : réécrire le contenant ne date pas la valeur."""
         directory = self._dir("claude-2")
-        self._claude_config(directory, "out_of_credits", mtime=NOW - 60.0)
-        gauge = _gauge(0.5)
-        profile = self._profile(path=directory)
-        self.assertTrue(accounts.overage_impossible(
-            profile, _reading([gauge]), gauge, NOW, environ={}))
+        path = self._claude_config(directory, "out_of_credits", mtime=NOW - 60.0)
+        gauge = _gauge(0.95)
+        profile = self._profile(path=directory, pace_ceiling=0.90, pace_ceiling_end=0.98)
+        reading = _reading([gauge])
+        self.assertEqual(accounts.pace_ceiling(profile, reading, gauge, NOW).value, 0.90)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["uneCleEtrangere"] = True            # la raison mise en cache est inchangée
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data))
+        os.utime(path, (NOW - 30.0, NOW - 30.0))  # mtime dans la fenêtre
+        self.assertEqual(accounts.pace_ceiling(profile, reading, gauge, NOW).value, 0.90)
+        self.assertFalse(accounts.overage_impossible(reading, NOW))
 
-    def test_claude_cache_out_of_the_window_or_in_the_future_is_not_a_proof(self):
-        directory = self._dir("claude-2")
-        gauge = _gauge(0.5)                       # fenêtre commencée il y a ~7 jours
-        window_start = gauge.resets_at - gauge.window_s
-        profile = self._profile(path=directory)
-        for mtime in (window_start - 100.0, NOW + 100.0):
-            self._claude_config(directory, "out_of_credits", mtime=mtime)
-            self.assertFalse(accounts.overage_impossible(
-                profile, _reading([gauge]), gauge, NOW, environ={}), mtime)
 
-    def test_claude_cache_without_a_reason_is_not_a_proof(self):
-        directory = self._dir("claude-2")
-        gauge = _gauge(0.5)
-        profile = self._profile(path=directory)
-        for reason in ("", "   ", None):
-            self._claude_config(directory, reason, mtime=NOW - 60.0)
-            self.assertFalse(accounts.overage_impossible(
-                profile, _reading([gauge]), gauge, NOW, environ={}), reason)
+class CodexCreditsTest(_Sandbox):
+    """Revue Codex B1 (#1176) : du payload brut jusqu'à `limits`/`evaluate`.
 
-    def test_unreadable_or_missing_cache_is_not_a_proof(self):
-        directory = self._dir("claude-2")
-        gauge = _gauge(0.5)
-        profile = self._profile(path=directory)
-        self.assertFalse(accounts.overage_impossible(
-            profile, _reading([gauge]), gauge, NOW, environ={}))
-        self._claude_config(directory, "", mtime=NOW - 60.0, text="{not json")
-        self.assertFalse(accounts.overage_impossible(
-            profile, _reading([gauge]), gauge, NOW, environ={}))
-    def test_the_cache_is_claude_only(self):
-        directory = self._dir("codex-2")
-        self._claude_config(directory, "out_of_credits", mtime=NOW - 60.0)
-        gauge = _gauge(0.5, harness="codex", key="codex-300min", window=5 * HOUR)
-        profile = self._profile("codex", path=directory)
-        self.assertFalse(accounts.overage_impossible(
-            profile, _reading([gauge]), gauge, NOW, environ={}))
+    Un objet `credits` vide, partiel ou aux valeurs non booléennes ne prouve
+    pas l'incapacité : `capable` reste None, et le plafond de fin de fenêtre
+    ne se relève pas.
+    """
 
-    def test_the_global_config_path_follows_the_config_dir(self):
-        directory = self._dir("claude-2")
-        profile = self._profile(path=directory)
-        self.assertEqual(accounts.claude_global_config(profile, {}),
-                         os.path.join(directory, ".claude.json"))
-        default = self._profile("claude", name="primaire")
-        self.assertEqual(accounts.claude_global_config(default, {}),
-                         os.path.join(os.path.expanduser("~"), ".claude.json"))
-        self.assertEqual(accounts.claude_global_config(default, {"CLAUDE_CONFIG_DIR": "/x/c"}),
-                         "/x/c/.claude.json")
-        self.assertEqual(accounts.claude_global_config(self._profile("codex", path=directory), {}),
-                         "")
+    def _setup(self, credits, used: float = 95.0):
+        home = self._dir("codex-home")
+        sessions = os.path.join(home, "sessions")
+        os.makedirs(sessions, exist_ok=True)
+        with open(os.path.join(sessions, "fil.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"payload": {"rate_limits": {
+                "primary": {"used_percent": used, "window_minutes": 10080,
+                            "resets_at": NOW + 3 * HOUR},
+                "credits": credits}}}) + "\n")
+        self.profile = accounts.parse({"codex": [{
+            "name": "secondaire", "path": home, "check_credentials": False,
+            "pace_ceiling": 0.90, "pace_ceiling_end": 0.98}]})["codex"][0]
+        return cost.CostBook(state_dir=self.tmp, codex_sessions=sessions)
+
+    def test_empty_partial_or_non_boolean_credits_stay_unknown(self):
+        for credits in ({}, {"balance": 12}, {"has_credits": "false"},
+                        {"unlimited": "yes"}, {"has_credits": None}, {"unlimited": False}):
+            reading = self._setup(credits).codex_gauges()
+            self.assertEqual(reading.overage.capable, None, credits)
+            self.assertFalse(reading.overage.in_use, credits)
+
+    def test_explicit_capability_or_incapacity_is_reported(self):
+        for credits, expected in (({"has_credits": True}, True),
+                                  ({"unlimited": True}, True),
+                                  ({"has_credits": False}, False),
+                                  ({"has_credits": False, "unlimited": True}, True)):
+            reading = self._setup(credits).codex_gauges()
+            self.assertIs(reading.overage.capable, expected, credits)
+
+    def test_from_the_raw_payload_to_the_ceiling_and_the_limits(self):
+        for credits in ({}, {"balance": 12}, {"has_credits": "false"}):
+            book = self._setup(credits)
+            reading = book.codex_gauges(sessions=os.path.join(self.profile.path, "sessions"))
+            gauge = reading[0]
+            self.assertEqual(accounts.pace_ceiling(self.profile, reading, gauge, NOW).value,
+                             0.90, credits)
+            self.assertEqual(accounts.limits(self.profile, reading, NOW)[gauge.key],
+                             (0.90, "pace cap"), credits)
+            ev = accounts.evaluate(book, self.profile, [self.profile], NOW, record=False)
+            self.assertFalse(ev.ok, credits)
+            self.assertAlmostEqual(ev.limits[gauge.key][0], 0.90, msg=credits)
+            self.assertIn("pace cap 90%", ev.reason)
+
+    def test_an_explicit_incapacity_still_lifts_the_ceiling(self):
+        book = self._setup({"has_credits": False})
+        reading = book.codex_gauges(sessions=os.path.join(self.profile.path, "sessions"))
+        gauge = reading[0]
+        self.assertIs(reading.overage.capable, False)
+        self.assertEqual(accounts.pace_ceiling(self.profile, reading, gauge, NOW).value, 0.98)
+        ev = accounts.evaluate(book, self.profile, [self.profile], NOW, record=False)
+        self.assertTrue(ev.ok, ev.reason)
+        self.assertAlmostEqual(ev.limits[gauge.key][0], 0.98)
+        self.assertEqual(ev.ceilings[gauge.key].reason, accounts.CEILING_REASON_END)
 
 
 class EndOfWindowTest(_Sandbox):
