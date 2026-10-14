@@ -15,12 +15,23 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    `overlap`) ; chaque lot contre sa cible (`conflict` ou `clean`) ;
 3. la sonde des migrations (si le projet déclare `migrations`) : un même
    numéro `NNNN_` ajouté par deux lots, ou par un lot alors que la cible l'a
-   déjà sous un autre nom.
+   déjà sous un autre nom. Seules les migrations du **delta propre** du lot
+   comptent (celles que la cible ne porte pas déjà) : une migration de la
+   cible ramenée par une fusion dans la branche n'est à personne (#1333).
 
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
 alternates), aucun worktree, aucun `fetch`. Une paire n'est recalculée que si
 l'une de ses deux pointes a bougé (cache en mémoire de l'exécuteur).
+
+Une cible qui nomme une branche — `develop`, `origin/develop`,
+`refs/remotes/origin/develop`, `refs/heads/develop`, `release/1.x`, ou
+`origin/HEAD` — est lue sur la ref publiée de son remote quand elle existe :
+dans un clone partagé, la branche locale reste figée alors que les agents
+poussent (#1333). Un SHA ou un tag est une cible figée, lue telle quelle. La
+sonde des migrations ne parle que d'une cible **certifiée** : `git ls-remote`
+(lecture seule, rien n'est écrit dans le dépôt) vérifie que la ref lue est
+bien la pointe publiée ; sinon la sonde se tait et le rapport dit pourquoi.
 
 Le résultat est un journal de l'hôte, pas une table : le dernier passage dans
 `<state_dir>/radar/<projet>.json` (lu par `ameesh conflicts`), et une ligne par
@@ -80,6 +91,8 @@ _GITHUB_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ORIGIN_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 #: conclusions de check qui ne bloquent pas une PR verte
 CI_OK = frozenset(("SUCCESS", "NEUTRAL", "SKIPPED"))
+#: #1333: lecture seule de la pointe publiée d'une cible (`git ls-remote`)
+LS_REMOTE_TIMEOUT = 30.0
 
 
 class SettingsError(ValueError):
@@ -376,6 +389,105 @@ def _numbers_in(repo: str, commit: str, directory: str) -> dict[str, str]:
     return out
 
 
+_REMOTE_REFS = "refs/remotes/"
+_HEADS_REFS = "refs/heads/"
+
+
+def _remotes(repo: str) -> tuple[str, ...]:
+    """Les remotes déclarés du dépôt (`git remote`), `origin` par défaut."""
+    names = tuple((plan_git._out(repo, "remote") or "").split())
+    return names or ("origin",)
+
+
+def _branch_target(target: str, remotes: tuple[str, ...]) -> tuple[str, str] | None:
+    """(remote, branche) d'une cible qui nomme une branche, None sinon.
+
+    Toutes les écritures d'une branche sont reconnues — `develop`,
+    `origin/develop`, `refs/remotes/origin/develop`, `refs/heads/develop` — y
+    compris un nom qui porte un slash (`release/1.x`, #1333) : le premier
+    segment n'est un remote que s'il est déclaré. Un SHA est un cas distinct
+    (cible figée) : None, lu tel quel."""
+    target = (target or "").strip()
+    if not target or plan_git._SHA_RE.match(target):
+        return None
+    if target == "HEAD":
+        return "origin", "HEAD"
+    if target.startswith(_REMOTE_REFS):
+        remote, _, branch = target[len(_REMOTE_REFS):].partition("/")
+        return (remote, branch) if remote and branch else None
+    if target.startswith(_HEADS_REFS):
+        branch = target[len(_HEADS_REFS):]
+        return ("origin", branch) if branch else None
+    if "/" in target:
+        head, _, branch = target.partition("/")
+        if branch and head in remotes:
+            return head, branch
+    return "origin", target
+
+
+def _symbolic_head(repo: str, remote: str) -> str | None:
+    """La branche que désigne `refs/remotes/<remote>/HEAD`, ou None."""
+    resolved = plan_git._out(repo, "symbolic-ref", "--quiet",
+                             _REMOTE_REFS + remote + "/HEAD")
+    prefix = _REMOTE_REFS + remote + "/"
+    if resolved and resolved.startswith(prefix) and len(resolved) > len(prefix):
+        return resolved[len(prefix):]
+    return None
+
+
+def target_commit(repo: str, target: str,
+                  remotes: tuple[str, ...] | None = None
+                  ) -> tuple[str | None, str, str | None, str | None]:
+    """(commit, ref lue, branche publiée, remote publié) de la cible.
+
+    Une cible qui nomme une branche — quelle qu'en soit l'écriture — est lue
+    sur `refs/remotes/<remote>/<branche>` quand cette ref existe : dans un
+    clone partagé, la branche locale reste figée pendant que les agents
+    poussent (#1333). La branche locale ne sert que de repli ; la branche et
+    le remote rendus permettent à l'appelant de certifier la pointe publiée
+    (`published_tip`). `origin/HEAD` est résolu sur la branche qu'il désigne.
+    Un SHA, un tag ou une ref qui n'est pas une branche sont rendus tels quels,
+    sans branche publiée : cas distinct, sans certification."""
+    remotes = _remotes(repo) if remotes is None else remotes
+    split = _branch_target(target, remotes)
+    if split is None:
+        return plan_git._commit(repo, target), target, None, None
+    remote, branch = split
+    if branch == "HEAD":
+        resolved = _symbolic_head(repo, remote)
+        if resolved:
+            branch = resolved
+        else:
+            return (plan_git._commit(repo, _REMOTE_REFS + remote + "/HEAD"),
+                    remote + "/HEAD", "HEAD", remote)
+    tracking = _REMOTE_REFS + remote + "/" + branch
+    found = plan_git._commit(repo, tracking)
+    if found:
+        return found, remote + "/" + branch, branch, remote
+    local = plan_git._commit(repo, _HEADS_REFS + branch)
+    if local:
+        return local, target, branch, remote
+    return plan_git._commit(repo, target), target, None, None
+
+
+def published_tip(repo: str, remote: str, branch: str) -> str | None:
+    """La pointe publiée de `branch` sur `remote`, lue par `git ls-remote` :
+    lecture seule, rien n'est écrit dans `.git`, aucun `fetch`. None si elle
+    est illisible (réseau, droits, branche absente) : la cible n'est alors pas
+    certifiée et la sonde des migrations se tait (#1333). `branch == "HEAD"`
+    certifie la pointe par défaut du remote."""
+    spec = "HEAD" if branch == "HEAD" else _HEADS_REFS + branch
+    try:
+        proc = _git(repo, "ls-remote", "--exit-code", remote, spec,
+                    timeout=LS_REMOTE_TIMEOUT)
+    except GitError:
+        return None
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.decode("utf-8", "replace").split()
+    return parts[0] if parts and plan_git._SHA_RE.match(parts[0]) else None
+
+
 # --------------------------------------------------------------------------
 # un passage
 # --------------------------------------------------------------------------
@@ -401,9 +513,21 @@ class Cache:
 
 
 def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
-         migrations: str = "", cache: Cache | None = None) -> dict:
+         migrations: str = "", cache: Cache | None = None,
+         verify=None) -> dict:
     """Le radar sur un dépôt. `lots` : `{id, branch, branch_target?, title?,
-    assignee?}`. Rend le rapport (sans horodatage ni durée)."""
+    assignee?}`. Rend le rapport (sans horodatage ni durée).
+
+    `verify` (facultatif) : `(dépôt, remote, branche) -> pointe publiée | None`,
+    appelée pour une cible qui nomme une branche afin de certifier la ref
+    lue avant la sonde des migrations (`run_pass` passe `published_tip`,
+    lecture seule). Une certification qui échoue ou constate une pointe non
+    récupérée laisse la cible non certifiée : la sonde se tait. Sans
+    `verify`, la ref de la branche est crue telle quelle.
+
+    Un dépôt superficiel suspend la sonde des migrations : `merge-base` peut
+    y rendre une frontière fausse, et le delta d'une branche contiendrait
+    alors les migrations de la cible (#1333)."""
     cache = cache if cache is not None else Cache()
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
@@ -411,8 +535,14 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         raise GitError("%s is not a readable git repository" % repo)
     if default_target is None:
         default_target = plan_git.default_target(repo)
+    # #1333: dans un clone superficiel, `merge-base` peut rendre une frontière
+    # fausse (ou rien) : le delta d'une branche contiendrait alors les
+    # migrations de la cible. Conservateur : la sonde se tait.
+    shallow = plan_git._out(repo, "rev-parse", "--is-shallow-repository") == "true"
+    remotes = _remotes(repo)
     branches: list[dict] = []
     skipped: list[dict] = []
+    verified: dict = {}
     for row in lots:
         branch = row.get("branch")
         if not branch:
@@ -423,10 +553,38 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if tip is None:
             continue                      # branche d'un autre dépôt, ou pas encore poussée
         target = row.get("branch_target") or default_target
-        head = plan_git._commit(repo, target) if target else None
+        head, head_ref, published_branch, published_remote = (
+            target_commit(repo, target, remotes) if target
+            else (None, target or "", None, None))
         if head is None:
             skipped.append(dict(entry, reason="target %s not found" % (target or "—")))
             continue
+        certified, reason = True, ""
+        if migrations and shallow:
+            certified = False
+            reason = "shallow repository (history is incomplete)"
+        elif published_branch and verify is not None:
+            published_ref = "%s/%s" % (published_remote, published_branch)
+            key = (published_remote, published_branch)
+            if key not in verified:
+                try:
+                    verified[key] = verify(repo, published_remote, published_branch)
+                except Exception:  # noqa: BLE001 - une sonde ne fait jamais échouer le passage
+                    verified[key] = None
+            published = verified[key]
+            if not published:
+                certified = False
+                reason = "%s is unreadable (network, rights or no fetch)" \
+                    % published_ref
+            elif published != head:
+                found = plan_git._commit(repo, published)
+                if found is None:
+                    certified = False
+                    reason = ("%s is at %s, %s publishes %s (not fetched)"
+                              % (published_ref, head[:12], published_remote,
+                                 published[:12]))
+                else:
+                    head, head_ref = found, published
         base = plan_git._out(repo, "merge-base", tip, head)
         if not base:
             skipped.append(dict(entry, reason="no common base with %s" % target))
@@ -437,8 +595,12 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if key not in cache.diffs:
             cache.diffs[key] = _changed(repo, base, tip)
         touched, added = cache.diffs[key]
-        branches.append(dict(entry, target=target, target_head=head, tip=tip, base=base,
-                             files=touched, added=added))
+        one = dict(entry, target=target, target_head=head, target_ref=head_ref,
+                   target_certified=certified, tip=tip, base=base,
+                   files=touched, added=added)
+        if not certified:
+            one["target_reason"] = reason
+        branches.append(one)
 
     pairs: list[dict] = []
     against: list[dict] = []
@@ -477,19 +639,33 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     cache.trim()
-    return {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
-                                       for b in branches],
-            "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
-            "against_target": against,
-            "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+    uncertified: dict = {}
+    for one in branches:
+        if not one.get("target_certified", True):
+            uncertified.setdefault((one["target"], one["target_ref"]),
+                                   one.get("target_reason") or "")
+    report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
+                                         for b in branches],
+              "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
+              "against_target": against,
+              "uncertified_targets": [{"target": target, "ref": ref, "reason": why}
+                                      for (target, ref), why in sorted(uncertified.items())],
+              "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+    if migrations and shallow:
+        report["migration_probe"] = "suspended: shallow repository (history is incomplete)"
+    return report
 
 
 def migration_probe(repo: str, branches: list[dict], directory: str) -> list[dict]:
     """Numéros de migration en double : ajoutés par deux lots de même cible,
-    ou par un lot alors que sa cible a déjà ce numéro sous un autre nom."""
+    ou par un lot alors que sa cible a déjà ce numéro sous un autre nom. Un
+    lot dont la cible n'est pas certifiée est ignoré : son delta peut
+    contenir les migrations de la cible (#1333)."""
     by_target: dict = {}
     in_target: dict = {}
     for one in branches:
+        if not one.get("target_certified", True):
+            continue
         if one["target_head"] not in in_target:
             in_target[one["target_head"]] = _numbers_in(repo, one["target_head"], directory)
         for path in one.get("added") or ():
@@ -546,7 +722,8 @@ def summary(report: dict) -> dict:
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
             "migration_duplicates": len(report.get("migrations") or ()),
-            "unreserved_migrations": len(report.get("unreserved_migrations") or ())}
+            "unreserved_migrations": len(report.get("unreserved_migrations") or ()),
+            "uncertified_targets": len(report.get("uncertified_targets") or ())}
 
 
 def read_snapshot(cfg, project: str) -> dict | None:
@@ -591,7 +768,8 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
         started = now()
         try:
             report = scan(project.repo, lots, default_target=project.target or None,
-                          migrations=project.migrations, cache=cache)
+                          migrations=project.migrations, cache=cache,
+                          verify=published_tip if project.migrations else None)
             from .migration_reservations import probe
             if project.migrations and not github_slug(project):
                 report["reservation_error"] = "migration reservations need a GitHub repository identity"
@@ -1089,6 +1267,11 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
         out.append("  resolutions: %s" % report["resolution_error"])
     if report.get("reservation_error"):
         out.append("  reservations: %s" % report["reservation_error"])
+    if report.get("migration_probe"):
+        out.append("  sonde des migrations %s" % report["migration_probe"])
+    for one in report.get("uncertified_targets") or ():
+        out.append("  cible non certifiée %s (%s) : %s — sonde des migrations suspendue"
+                   % (one["target"], one["ref"], one["reason"]))
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
