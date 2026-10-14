@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,8 @@ from pathlib import Path
 from ameesh import config, db as db_mod, mail, work
 
 SCHEMA = "ameesh-staging-actif/1"
+#: instant ISO UTC, tel que produit par `date -u +%Y-%m-%dT%H:%M:%SZ`
+DEPUIS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 #: hôtes du staging complet (canon §14) : un sous-ensemble n'atteste rien
 HOTES_CANON = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
 #: etapes qui, par hote, prouvent l'activation et pas seulement l'installation
@@ -181,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
     sha = args.sha.strip().lower()
     if not sha:
         parser.error("--sha vide")
+    if not DEPUIS_RE.match(args.depuis):
+        parser.error("--depuis attend un instant ISO UTC (AAAA-MM-JJTHH:MM:SSZ)")
     journal = Path(args.journal)
 
     try:
