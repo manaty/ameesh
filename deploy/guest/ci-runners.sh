@@ -42,6 +42,11 @@
 #   --host NAME           the host's short name (default: hostname -s)
 #   --count N             runners, 1 to 4 (default 2, or the count a
 #                         previous --prepare recorded in the state file)
+#   --disk-floor-mib N    refuse --prepare/--register when the guest
+#                         directory holds less than N MiB free (default
+#                         15360 = 15 GiB). The Host fiche's reclaim.disk_free_min
+#                         plus the install margin: a guest installed under the
+#                         threshold that stops it would never run (plan §3, §6)
 #   --tarball FILE        use this actions-runner tarball instead of the
 #                         download (offline hosts)
 #   --version V           runner version to download (default 2.338.0, the
@@ -91,6 +96,11 @@ URL_BASE=https://github.com/actions/runner/releases/download
 HOST=$(hostname -s)
 COUNT=2
 COUNT_SET=0
+# the prepare/register floor (MiB): the Host fiche's `reclaim.disk_free_min`
+# plus the runner install margin. The preflight revises it on measurement
+# (#1256: 6144 on the measured ci-3, 8.95 GiB free), never below the guard's
+# own stop threshold.
+DISK_FLOOR_MIB=15360
 TARBALL=""
 WAIT=0
 KEEP=0
@@ -108,12 +118,13 @@ BAD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host|--count|--tarball|--version|--sha256|--token-file|--wait-terminal)
+    --host|--count|--tarball|--version|--sha256|--token-file|--wait-terminal|--disk-floor-mib)
       [ $# -ge 2 ] || die "$1 needs a value" ;;
   esac
   case "$1" in
     --host) HOST=$2; shift 2 ;;
     --count) COUNT=$2; COUNT_SET=1; shift 2 ;;
+    --disk-floor-mib) DISK_FLOOR_MIB=$2; shift 2 ;;
     --tarball) TARBALL=$2; shift 2 ;;
     --version) VERSION=$2; shift 2 ;;
     --sha256) SHA256=$2; shift 2 ;;
@@ -136,6 +147,10 @@ done
 [ -n "$MODE" ] || die "one mode: --prepare, --register, --enable, --disable, --check, --remove"
 case "$COUNT" in ''|*[!0-9]*) die "invalid --count $COUNT" ;; esac
 [ "$COUNT" -ge 1 ] && [ "$COUNT" -le 4 ] || die "--count 1..4, not $COUNT"
+case "$DISK_FLOOR_MIB" in ''|*[!0-9]*) die "invalid --disk-floor-mib $DISK_FLOOR_MIB" ;; esac
+[ ${#DISK_FLOOR_MIB} -le 7 ] || die "--disk-floor-mib: at most 1048576 MiB (1 TiB) expected"
+[ "$DISK_FLOOR_MIB" -ge 1 ] || die "--disk-floor-mib: a positive number of MiB expected"
+[ "$DISK_FLOOR_MIB" -le 1048576 ] || die "--disk-floor-mib: at most 1048576 MiB (1 TiB) expected"
 case "$WAIT" in ''|*[!0-9]*) die "invalid --wait-terminal $WAIT" ;; esac
 case "$HOST" in ''|*[!a-z0-9-]*|-*) die "invalid --host $HOST" ;; esac
 case "$VERSION" in ''|*[!A-Za-z0-9._-]*) die "invalid --version $VERSION" ;; esac
@@ -306,9 +321,9 @@ preconditions() {
   command -v psql >/dev/null 2>&1 \
     || die "psql is missing: the ameesh CI installs postgresql-client with sudo, which the guest has not; install it on the host"
   command -v git >/dev/null 2>&1 || die "git is missing"
-  local free; free=$(free_kib "$ROOT")
-  [ "${free:-0}" -ge 15728640 ] \
-    || die "$ROOT holds $(( ${free:-0} / 1024 )) MiB free, under the 15 GiB floor"
+  local free floor_kib; free=$(free_kib "$ROOT"); floor_kib=$((DISK_FLOOR_MIB * 1024))
+  [ "${free:-0}" -ge "$floor_kib" ] \
+    || die "$ROOT holds $(( ${free:-0} / 1024 )) MiB free, under the ${DISK_FLOOR_MIB} MiB floor (--disk-floor-mib)"
   if [ -n "$(host_says systemctl list-units --all --plain --no-legend \
       'gha-runner-scale-set*' 'arc-*' '*autoscal*' 2>/dev/null)" ]; then
     die "an autoscaler unit is present: this host is not a static VM (the loan needs one)"

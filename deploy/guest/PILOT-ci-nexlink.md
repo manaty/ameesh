@@ -5,19 +5,23 @@ touched. Source of the request: bureau, 2026-10-14 05:45Z (mail #31258, lot
 ameesh #1256), on the measured saturation of the ameesh queue (#824: 24
 `ameesh-ci` runners, 3 hosts × 8, all busy; job wait p80 22 min for an SLO of
 15). The loan is a **guest** of an existing Nexlink CI VM that no autoscaler
-drives (example: `ci-3`, 4 `scaleway-ci` runners, most idle), never a new VM,
-never a paid runner, and never a change to Nexlink's own runners, jobs,
-workflows or registrations.
+drives, never a new VM, never a paid runner, and never a change to Nexlink's
+own runners, jobs, workflows or registrations. The candidate is
+`nexlink-ci-3` (`fr-par-1`, instance `961baf63-3cfd-48f7-9520-9436b84a1a28`,
+IP `78.232.60.26`): `orchestrateur`, its pilot, ran the read-only preflight on
+2026-10-14 07:1xZ and the offer and the prepare floor of §3 are qualified on
+those measurements. The host pilot's written consent (gate 4) is still
+missing, so nothing is activated.
 
 ## 1. What is lent
 
 | | |
 |---|---|
-| Runners | `ameesh-nxl-<host>-1…N`, `N` = 2 by default (1 to 4), registered to `manaty/ameesh`, label `ameesh-ci` (the fleet's `runs-on`) |
+| Runners | `ameesh-nxl-<host>-1…N`: **1 to qualify**, a 2nd only if the post-job disk check of §6 passes (1 to 4); registered to `manaty/ameesh`, label `ameesh-ci` (the fleet's `runs-on`) |
 | Guest | user `ameesh-guest`, slice `ameesh-guest.slice`, root `/srv/ameesh-guest`, containers in **rootless Podman** |
 | Host | one static CI VM of the Nexlink fleet (`scaleway-ci`), chosen and confirmed by its pilot; nothing else on it changes |
 | Duration | temporary: from the activation go to the removal below; the offer can be closed at any time by the guard or by the host's pilot |
-| Cost | none: the VM is already paid for and its runners stay idle most of the day |
+| Cost | none: the VM is already paid for; the guard stops the guests as soon as the application's jobs need it (the fleet is not idle in bursts: ci-3 went 0/4 to 4/4 within a minute on 2026-10-14 06:30–06:33Z, so a guest running then would have been reclaimed at once) |
 
 The application (Nexlink's own CI jobs) always wins: the guest runs in a
 low-weight slice (`CPUWeight=10`, `IOWeight=10`) under hard caps
@@ -93,7 +97,7 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
       cpu_max: 2
       cpu_weight: 10
       memory_max: 6GiB
-      disk_max: 30GiB
+      disk_max: 4GiB         # mesuré : 8.95 GiB libres ; déclaré, le seuil du garde protège
       agent_memory_max: 3GiB
       reclaim:
         memory_available_min: 6GiB
@@ -103,7 +107,7 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
         busy_units: ["actions.runner.*"]   # les unités CI de Nexlink
         busy_tasks: ["Runner.Worker"]      # un job en cours, pas l'écouteur idle
         busy_max: 2        # busy >= 2 : avertissement ; busy > 2 : l'invité s'arrête
-        disk_free_min: 10GiB
+        disk_free_min: 5GiB  # réserve de l'hôte : l'invité s'arrête sous 5 GiB libres
         disk_paths: ["/", "/srv/ameesh-guest"]
       drain_seconds: 90
       calm_seconds: 600
@@ -111,12 +115,48 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
   ---
   ```
 
-  The sizes are a starting offer: the preflight (§6 step 0) measures the
-  host and the pilot revises them; `busy_max: 2` on four runners stops the
-  guest as soon as the application runs three jobs and warns at two, so the
-  loan never takes the last runner; `disk_max` is held by the guest
-  directory only (no dedicated volume on this VM), so the guard's
-  `disk_free_min`/`disk_paths` watch is the real protection.
+  The sizes are qualified on measurements, and the pilot revises them if the
+  host changes; `busy_max: 2` on four runners stops the guest as soon as the
+  application runs three jobs and warns at two, so the loan never takes the
+  last runner; `disk_max` is held by the guest directory only (no dedicated
+  volume on this VM), so the guard's `disk_free_min`/`disk_paths` watch is
+  the real protection.
+
+  **Measurements and qualified values** (read-only SSH preflight by the
+  host's pilot `orchestrateur`, 2026-10-14 07:1xZ, nothing modified):
+
+  * `nproc` 8; MemTotal 32090 MiB, MemAvailable 29621 MiB, no swap: `cpu_max:
+    2` (a quarter of the host) with `cpu_weight: 10`; PSI cpu avg10 0 /
+    avg60 0.06 / avg300 0.75, memory 0, io some avg10 0.36 — all far under
+    the 20 % / 2 % / 20 % thresholds at the reading (the guard decides on
+    avg60).
+  * `/` free 9614548992 B (8.95 GiB): `disk_max: 4GiB` (at that free space
+    the contract's `disk_free − 2 GiB` = 6.95 GiB is above it, so the
+    declared cap holds; as the disk fills, `disk_free − 2 GiB` takes over)
+    and `disk_free_min: 5GiB` — the reserve the host keeps; the guard stops
+    the guest at `disk_low` under it, so the guest may use ≈ 3.95 GiB.
+  * prepare/register floor: `--disk-floor-mib 6144` = the 5 GiB guard
+    threshold + 1 GiB install margin (the pinned asset is 227660598 B
+    compressed; the extraction is budgeted at ≤ 1 GiB per runner and is
+    measured at qualification). The 15 GiB default would refuse here.
+  * four persistent `actions.runner.manaty-nexlink.nexlink-ci-3-[1-4]` units
+    and one real `Runner.Worker` at the reading (listeners and jobs counted
+    apart): `busy_max: 2` warns at two jobs and stops the guest above two, so
+    the application keeps two of its four runners.
+  * `memory_max: 6GiB` / `agent_memory_max: 3GiB` /
+    `memory_available_min: 6GiB` on 29.6 GiB available, no swap.
+
+  **Autoscaler.** Repository side: the fleet is addressed by the static label
+  `[self-hosted, linux, scaleway-ci]`, the registrations are named and
+  persistent (same ids across readings), and nothing in `manaty/nexlink`
+  mentions `autoscal|actions-runner-controller|scale-set|gha-runner|runner-scale-set`
+  outside an unrelated desktop runbook. Host side: no unit matching
+  `gha-runner-scale-set*`, `arc-*` or `*autoscal*` (and `ci-runners.sh
+  --prepare` refuses if one appears), and the filtered process/cron listing
+  showed the four runners and Docker only. An autoscaler external to the host
+  cannot be disproven from the host itself: the provider-side fact (a
+  standalone Scaleway Instance, not a scaling group) and the absence of any
+  controller are part of the host pilot's written consent (gate 4).
 * **Nexlink rules** `AGENTS.md` (a–g, source orchestrateur 2026-10-13):
   rule (c) "no hosted runners, `runs-on` pinned to the fleet" is untouched —
   the loan adds *ameesh* runners on a Nexlink VM, it changes no Nexlink
@@ -135,7 +175,7 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
 | 7 | The workspaces are distinct | `/srv/ameesh-guest/ci/rN` (guest) vs `/home/runner/rN/_work/nexlink` (application); `RequiresMountsFor` keeps the guest on its own root | `ci-runners.sh --check`; `ls -ld` |
 | 8 | The tokens are distinct | registration minted for `manaty/ameesh` only, read from a root-only file, `.credentials` 0600 `ameesh-guest`; the script never sees a Nexlink token | `.runner` `serverUrl`; `gh api repos/manaty/ameesh/actions/runners` |
 | 9 | The workspaces are separate | each runner has its own `_work`; the application's sweep is nominative (its `RUNNER_NAME`) and never looks at `ci/rN` | its `self-hosted-sweep.sh` (Nexlink repo) |
-| 10 | The disk is watched | own directory on the root filesystem (no volume on this VM), `disk_free_min`/`disk_paths` in the offer, `df` floor at prepare (15 GiB) | `df -Pk /srv/ameesh-guest`; guard state |
+| 10 | The disk is watched | own directory on the root filesystem (no volume on this VM), `disk_free_min`/`disk_paths` in the offer, `df` floor at prepare (`--disk-floor-mib`; 15 GiB default, 6 GiB qualified on ci-3, §3) | `df -Pk /srv/ameesh-guest`; `--check`; guard state |
 
 Residual limits, stated rather than hidden: the guest shares the kernel (a
 rootless container is not a VM); a job killed at level 4 is lost, not
@@ -161,28 +201,32 @@ runners instead of leaving them running.
    executed, none cancelled — per canon §3, and after the #1211 wave has
    relieved the queue.
 3. **Pilot's fire** (`mesh-design`) for the merge, on the frozen head.
-4. **Host pilot's written consent** (`orchestrateur`): the VM, that no
-   autoscaler drives it, and the loan window.
+4. **Host pilot's written consent** (`orchestrateur`): the VM (identity of
+   §3), that no autoscaler drives it (§3, "Autoscaler": the provider-side
+   attestation is the pilot's), and the loan window.
 5. **Activation go** (`mesh-design`), distinct from the merge fire, after
    the canon Host fiche PR is merged.
 6. **Enforce before the first guest job** (R1 #1256): the guard is switched
    to `enforce` while the guest runners are still stopped; observation runs
    with the guests off, and `ci-runners.sh --enable` refuses in `observe`.
 7. **Qualification first**: one real ameesh job on one guest runner, its
-   container proven inside the slice, `/home/runner` untouched; only then
+   container proven inside the slice, `/home/runner` untouched, and the
+   post-job disk check of §6 (free ≥ 6 GiB, no `disk_low` episode); only then
    the others are enabled and left in service.
 
 ## 6. Activation order (operator, on the VM; each step is reversible)
 
 ```
 # 0. read-only preflight: the application's units and resources, the runner
-#    version/digest, the free disk; nothing is changed
+#    version/digest, the free disk; nothing is changed. Measured on ci-3 on
+#    2026-10-14 07:1xZ (8 CPUs, 32 GiB RAM, 8.95 GiB free on /): the offer and
+#    the floor of §3 are qualified on it.
 systemctl list-units --all 'actions.runner.*'
 # idle listeners are not jobs: the guard's busy_tasks counts real workers, so
 # the preflight must show both (four listeners online, zero or more workers)
 systemctl list-units --all --plain --no-legend 'actions.runner.*' | wc -l
 ps -eo user=,args= | grep '[R]unner.Worker' | wc -l
-nproc; free -h; df -h /srv
+nproc; free -h; df -h / /srv
 sudo deploy/guest/ci-runners.sh --dry-run --check
 
 # 1. canon PR merged (Host policy.lend, §3) — ameesh pilot
@@ -201,10 +245,13 @@ sudo deploy/guest/install-pilot.sh --lend offer.json \
   --agent-units 'ameesh-guest-*.service' --allow-rootfs
 
 # 4. the runners (this lot), prepared and registered but NOT started; the
-#    guard must already cover them or --prepare refuses
-sudo deploy/guest/ci-runners.sh --prepare --count 2
+#    guard must already cover them or --prepare refuses. ci-3 holds 8.95 GiB
+#    free: qualify ONE runner with the floor §3 justifies (5 GiB guard
+#    threshold + 1 GiB install margin), not the 15 GiB default
+sudo deploy/guest/ci-runners.sh --prepare --count 1 --disk-floor-mib 6144
 sudo deploy/guest/ci-runners.sh --register --token-file /root/reg.token
 sudo deploy/guest/ci-runners.sh --check
+du -sh /srv/ameesh-guest/ci; df -Pk /    # record the real install cost
 
 # 5. enforce, guests still off: --enable refuses while the guard observes
 #    (R1 #1256). The observation day of step 3 is done by now.
@@ -216,7 +263,15 @@ sudo deploy/guest/ci-runners.sh --enable 1
 systemd-cgls ameesh-guest.slice | grep -E 'Runner.Worker|postgres'
 docker ps                       # no guest container here (host daemon)
 
-# 7. service
+# 6bis. the disk decides the 2nd runner, not the plan: after the job, with the
+#    guest idle, free must be back >= 6 GiB and the guard must never have
+#    published `disk_low`. Otherwise the loan stays at one runner (or closes).
+df -Pk /; /opt/ameesh/venv/bin/ameesh guard check --json | grep -E 'disk|level'
+
+# 7. service: only after 6bis passes; the recorded count (1) is adopted, r1 is
+#    kept, r2 is prepared, registered and enabled
+sudo deploy/guest/ci-runners.sh --prepare --count 2 --disk-floor-mib 6144
+sudo deploy/guest/ci-runners.sh --register --token-file /root/reg.token
 sudo deploy/guest/ci-runners.sh --enable 2
 ```
 
