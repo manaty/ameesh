@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,11 @@ UNIT = os.path.join(GUEST, "ameesh-guest-ci@.service")
 PLAN = os.path.join(GUEST, "PILOT-ci-nexlink.md")
 WRAPPER = os.path.join(GUEST, "ci-runner-gate.py")
 SRC = os.path.join(REPO, "src")
+# The privileged tools --prepare installs (the docker shim and the gate
+# wrapper): root-owned, outside the guest's own root, which the guest owns
+# (R1 delta B4, #1256, binôme).
+TOOLS = "/usr/local/lib/ameesh-guest-ci"
+TOOLS_REL = TOOLS.lstrip("/")
 
 
 def unit(name: str) -> dict[str, list[str]]:
@@ -52,11 +58,14 @@ class GuestCiUnitTest(unittest.TestCase):
         self.assertEqual(u["TimeoutStopSec"], ["180"])
         self.assertEqual(u["RequiresMountsFor"], ["/srv/ameesh-guest"])
         env = dict(v.partition("=")[::2] for v in u["Environment"])
-        self.assertTrue(env["PATH"].startswith("/srv/ameesh-guest/bin:"))
+        self.assertTrue(env["PATH"].startswith(TOOLS + ":"))
         self.assertEqual(env["HOME"], "/srv/ameesh-guest/home")
+        # the guest's own tree is not on the unit's PATH: a job cannot shadow
+        # the privileged tools with a file of its own (R1 delta B4, binôme)
+        self.assertNotIn("/srv/ameesh-guest", env["PATH"])
         # the gate (R1 #1256): the unit runs the wrapper, which obeys the
         # guard's state, not run.sh directly
-        self.assertIn("/srv/ameesh-guest/bin/ci-runner-gate", u["ExecStart"][0])
+        self.assertIn(TOOLS + "/ci-runner-gate", u["ExecStart"][0])
         self.assertIn("--dir /srv/ameesh-guest/ci/r%i", u["ExecStart"][0])
         self.assertEqual(env["AMEESH_HOST_GATE_PATH"],
                          "/run/ameesh-gate/state/state.json")
@@ -211,7 +220,8 @@ class CiRunnersTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.host = os.path.realpath(tmp.name)
-        for d in ("etc/systemd/system", "etc/ameesh", "srv/ameesh-guest/bin", "root", "bin"):
+        for d in ("etc/systemd/system", "etc/ameesh", "srv/ameesh-guest",
+                  TOOLS_REL, "root", "bin"):
             os.makedirs(os.path.join(self.host, d))
         self.write("etc/passwd",
                    "root:x:0:0:root:/root:/bin/bash\n"
@@ -221,7 +231,7 @@ class CiRunnersTest(unittest.TestCase):
         self.write("etc/ameesh/guard.json", json.dumps(
             {"host": "ci-3", "max_agents": 0, "agent_units": "ameesh-guest-*.service",
              "lend": {"cpu_max": 2, "memory_max": "6GiB", "disk_max": "30GiB"}}))
-        self.write("srv/ameesh-guest/bin/docker", "#!/bin/sh\n# lot #1256\nexit 0\n", mode=0o755)
+        self.write(TOOLS_REL + "/docker", "#!/bin/sh\n# lot #1256\nexit 0\n", mode=0o755)
         # the tools the preconditions look for, without this machine's
         for name in ("podman", "psql", "git"):
             self.write("bin/%s" % name, "#!/bin/sh\nexit 0\n", mode=0o755)
@@ -283,7 +293,7 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("root-equivalent", res.stderr)
 
     def test_prepare_refuses_a_foreign_shim(self):
-        self.write("srv/ameesh-guest/bin/docker", "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.write(TOOLS_REL + "/docker", "#!/bin/sh\nexit 0\n", mode=0o755)
         res = self.run_script("--prepare", "--host", "ci-3")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("not this script's shim", res.stderr)
@@ -430,8 +440,10 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotIn("curl -fL", out)
 
     def test_prepare_refuses_a_symlinked_guest_path(self):
-        # #1256 R1 delta B4 : $ROOT appartient à l'invité ; un lien planté
-        # sous lui ne doit pas rediriger une création ou une écriture root
+        # #1256 R1 delta B4 (binôme) : $ROOT appartient à l'invité ; un lien
+        # planté sous lui ne doit pas faire sortir le prêt de son périmètre.
+        # Root n'y écrit plus du tout (témoin « root never mutates »), mais
+        # l'extraction et la publication invitées doivent rester dans $ROOT.
         os.symlink(os.path.join(self.host, "srv/ameesh-guest/elsewhere"),
                    os.path.join(self.host, "srv/ameesh-guest/ci"))
         res = self.run_script("--prepare", "--host", "ci-3")
@@ -439,8 +451,8 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("symbolic link", res.stderr)
 
     def test_prepare_refuses_a_symlinked_cache_entry(self):
-        # même raison, sur l'entrée de cache elle-même : le digest root ne
-        # doit pas lire un fichier que l'invité a redirigé
+        # même raison, sur l'entrée de cache elle-même : root la recopie dans
+        # son instantané privé ; un lien lui ferait lire un autre fichier root
         self.write("srv/ameesh-guest/elsewhere.tar.gz", "not the tarball\n")
         os.makedirs(os.path.join(self.host, "srv/ameesh-guest/ci/cache"))
         os.symlink(os.path.join(self.host, "srv/ameesh-guest/elsewhere.tar.gz"),
@@ -451,14 +463,136 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("symbolic link", res.stderr)
 
     def test_prepare_refuses_a_symlinked_destination(self):
-        # et sur la destination : l'extraction tourne sous l'invité, mais root
-        # ne doit pas non plus créer un chemin que l'invité a redirigé
+        # et sur la destination : l'extraction tourne sous l'invité, mais un
+        # lien la ferait écrire hors du prêt
         os.makedirs(os.path.join(self.host, "srv/ameesh-guest/ci/elsewhere"))
         os.symlink(os.path.join(self.host, "srv/ameesh-guest/ci/elsewhere"),
                    os.path.join(self.host, "srv/ameesh-guest/ci/r1"))
         res = self.run_script("--prepare", "--host", "ci-3", "--count", "1")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("symbolic link", res.stderr)
+
+    def test_prepare_root_never_mutates_under_the_guest_tree(self):
+        # #1256 R1 delta B4 (binôme) : root n'écrit plus sous $ROOT, que
+        # l'invité possède. Toute création, extraction ou publication sous
+        # l'arbre invité passe par runuser ; les seules écritures root sont
+        # les outils (hors arbre) et l'unité systemd.
+        res = self.run_script("--prepare", "--host", "ci-3", "--count", "2")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        guest_root = "/srv/ameesh-guest/"
+        touched = [line for line in res.stdout.splitlines()
+                   if line.startswith("DRY ") and guest_root in line
+                   and not line.startswith("DRY state ")]     # état = /etc/ameesh
+        self.assertTrue(touched, "aucune mutation sous l'arbre invité ?")
+        for line in touched:
+            self.assertTrue(line.startswith("DRY runuser -u ameesh-guest -- "),
+                            "root muterait sous l'arbre invité : %s" % line)
+        wrote = [line for line in res.stdout.splitlines()
+                 if line.startswith("DRY write ")]
+        self.assertTrue(wrote)
+        for line in wrote:
+            self.assertNotIn(guest_root, line)                # jamais sous $ROOT
+            self.assertTrue(TOOLS + "/" in line or "/etc/systemd/system/" in line,
+                            "écriture root inattendue : %s" % line)
+
+    def test_prepare_refuses_a_symlinked_tools_directory(self):
+        # #1256 R1 delta B4 (binôme) : les outils privilégiés vivent hors de
+        # l'arbre invité. Si le chemin des outils est un lien — le parent a
+        # été échangé après le contrôle — root n'écrit pas : refus avant tout.
+        shutil.rmtree(os.path.join(self.host, TOOLS_REL))
+        os.makedirs(os.path.join(self.host, "elsewhere/ameesh-guest-ci"))
+        os.symlink(os.path.join(self.host, "elsewhere/ameesh-guest-ci"),
+                   os.path.join(self.host, TOOLS_REL))
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unsafe root tools directory", res.stderr)
+        self.assertNotIn("DRY write %s/" % TOOLS, res.stdout)
+
+    def test_prepare_refuses_a_swapped_tools_ancestor(self):
+        # même attaque, un cran plus haut : un ancêtre de la chaîne remplacé
+        # par un lien. Le répertoire des outils existe encore *à travers* le
+        # lien : seul le contrôle de chaîne (lstat, composant par composant)
+        # l'attrape.
+        shutil.rmtree(os.path.join(self.host, "usr/local/lib"))
+        os.makedirs(os.path.join(self.host, "usr/local/lib-real/ameesh-guest-ci"))
+        self.write("usr/local/lib-real/ameesh-guest-ci/docker",
+                   "#!/bin/sh\n# lot #1256\nexit 0\n", mode=0o755)
+        os.symlink(os.path.join(self.host, "usr/local/lib-real"),
+                   os.path.join(self.host, "usr/local/lib"))
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unsafe root tools directory", res.stderr)
+
+    def test_prepare_refuses_a_symlinked_tool_file(self):
+        # un outil remplacé par un lien vers un fichier qui porte même le
+        # marqueur du lot : le contrôle de type (fichier régulier, pas un
+        # lien) passe avant la reprise d'un shim existant
+        self.write("elsewhere/docker", "#!/bin/sh\n# lot #1256\nexit 0\n", mode=0o755)
+        os.remove(os.path.join(self.host, TOOLS_REL, "docker"))
+        os.symlink(os.path.join(self.host, "elsewhere/docker"),
+                   os.path.join(self.host, TOOLS_REL, "docker"))
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unsafe root tools file", res.stderr)
+
+    def test_the_tools_guard_refuses_a_chain_the_guest_could_change(self):
+        # Le seam de test (CI_RUNNERS_TEST_HOST) saute le contrôle root:root /
+        # non inscriptible, qui ne peut pas s'exercer sur un hôte de test non
+        # root : on exerce donc le vérificateur embarqué tel quel, sans seam.
+        # Une chaîne possédée par un autre utilisateur est refusée ; avec le
+        # seam, la même chaîne passe — le contrôle n'est pas décoratif.
+        with open(SCRIPT, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("<<'PYSAFE'", src)
+        guard = src.split("<<'PYSAFE'\n", 1)[1].split("\nPYSAFE\n", 1)[0]
+        path = os.path.join(self.host, TOOLS_REL)
+        for seam, ok in (("", False), (self.host, True)):
+            res = subprocess.run([sys.executable, "-I", "-", path, seam],
+                                 input=guard, capture_output=True, text=True)
+            if ok:
+                self.assertEqual(res.returncode, 0, res.stderr)
+            else:
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("unsafe root tools", res.stderr)
+
+    def test_remove_refuses_a_tools_parent_swapped_after_prepare(self):
+        # le retrait est protégé de la même façon (R1 delta B4, binôme) : un
+        # parent échangé après --prepare fait refuser --remove avant tout rm
+        # root, au lieu de suivre le lien
+        shutil.rmtree(os.path.join(self.host, TOOLS_REL))
+        os.makedirs(os.path.join(self.host, "elsewhere/ameesh-guest-ci"))
+        os.symlink(os.path.join(self.host, "elsewhere/ameesh-guest-ci"),
+                   os.path.join(self.host, TOOLS_REL))
+        self.write("etc/ameesh/ci-runners.state",
+                   "host ci-3\ncount 1\ncreated %s/docker\n" % TOOLS)
+        res = self.run_script("--remove", "--count", "1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unsafe root tools path", res.stderr)
+        self.assertNotIn("DRY rm -f", res.stdout)
+
+    def test_remove_returns_the_tools_only_when_it_created_them(self):
+        # #1256 R1 delta B4 (binôme) : le retrait ne suit que l'état écrit par
+        # --prepare ; les outils sont retirés hors de l'arbre invité, et leur
+        # répertoire seulement s'il est vide.
+        self.write("etc/ameesh/ci-runners.state",
+                   "host ci-3\ncount 1\n"
+                   "created %s\ncreated %s/docker\ncreated %s/ci-runner-gate\n"
+                   "created /srv/ameesh-guest/ci/r1\n"
+                   % (TOOLS, TOOLS, TOOLS))
+        res = self.run_script("--remove", "--count", "1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn("runuser -u ameesh-guest -- rm -rf ", out)
+        self.assertIn("srv/ameesh-guest/ci/r1", out)
+        self.assertIn("rm -f ", out)
+        self.assertIn(TOOLS + "/docker", out)
+        self.assertIn(TOOLS + "/ci-runner-gate", out)
+        self.assertIn("rmdir --ignore-fail-on-non-empty", out)
+        self.assertIn(TOOLS, out)
+        # root ne suit jamais un chemin sous l'arbre invité pour un rm
+        for line in out.splitlines():
+            if line.startswith("DRY rm ") and "/srv/ameesh-guest/" in line:
+                self.fail("rm root sous l'arbre invité : %s" % line)
 
     def test_the_recorded_disk_floor_is_adopted_by_the_later_commands(self):
         # #1256 R1 delta B5 : le plancher qualifié au --prepare est enregistré ;
@@ -490,7 +624,7 @@ class CiRunnersTest(unittest.TestCase):
         # le garde-barrière qui obéit à la porte
         res = self.run_script("--prepare", "--host", "ci-3")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("DRY write /srv/ameesh-guest/bin/ci-runner-gate (0755 root:root)",
+        self.assertIn("DRY write %s/ci-runner-gate (0755 root:root)" % TOOLS,
                       res.stdout)
         self.assertIn("capacity_guard", res.stdout)   # le contrat, pas un doublon
         self.assertIn("gate available: starting", res.stdout)
@@ -498,11 +632,11 @@ class CiRunnersTest(unittest.TestCase):
     def test_remove_returns_the_gate_wrapper(self):
         self.write("etc/ameesh/ci-runners.state",
                    "host ci-3\ncount 1\n"
-                   "created /srv/ameesh-guest/bin/ci-runner-gate\n")
+                   "created %s/ci-runner-gate\n" % TOOLS)
         res = self.run_script("--remove", "--count", "1")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("rm -f", res.stdout)
-        self.assertIn("srv/ameesh-guest/bin/ci-runner-gate", res.stdout)
+        self.assertIn(TOOLS + "/ci-runner-gate", res.stdout)
 
     def test_check_reports_the_gate_and_the_wrapper(self):
         for n in (1, 2):
@@ -513,7 +647,7 @@ class CiRunnersTest(unittest.TestCase):
         res = self.run_script("--check")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("state: stopped (no document yet", res.stdout)
-        self.assertIn("wrapper: /srv/ameesh-guest/bin/ci-runner-gate is missing",
+        self.assertIn("wrapper: %s/ci-runner-gate is missing" % TOOLS,
                       res.stdout)
         self.assertIn("check: every line ok", res.stdout)
 
