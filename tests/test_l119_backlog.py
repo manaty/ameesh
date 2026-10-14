@@ -96,6 +96,40 @@ class FileTest(_Base):
 
 
 class PriseTest(_Base):
+    def test_lot_du_projet_bloque_laisse_prendre_l_amelioration(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        lot = work.add(self.db, title="projet bloque")
+        item = self.element("amelioration prete", 50)
+        storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+
+        self.assertEqual([t["item"]["id"] for t in self.take(dry_run=True)], [item["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+        # Un projet dont l'amont est satisfait reprend la priorite sur la file.
+        work.close(self.db, amont["id"], abandoned=True)
+        self.agent("claude2")
+        self.element("autre amelioration", 50)
+        self.assertEqual(self.take(), [])
+
+    def test_capacite_idle_ne_propose_pas_un_lot_du_projet_bloque(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        lot = work.add(self.db, title="projet bloque")
+        storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+        listing = storage.of(self.db).operations.listing()
+
+        def alertes(**kw):
+            return sous_utilisation.idle_capacity(
+                self.db, listing, self.now, [], idle_s=30, paid=("deepseek",), **kw)
+
+        self.assertEqual(alertes(), [])
+        self.assertEqual(alertes(lots=storage.of(self.db).operations.open_lots_activity(500)), [])
+        work.close(self.db, amont["id"], abandoned=True)
+        self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
+        self.assertIn("#%d" % lot["id"], alertes()[0]["detail"])
+
     def test_dependance_ouverte_laisse_prendre_l_amelioration_prete(self):
         self.agent("claude1")
         amont = work.add(self.db, title="amont", assignee="human:proprio")
