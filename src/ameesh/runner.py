@@ -167,6 +167,9 @@ BOOT_REVIEW_START = ("running", 0)
 #: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
 LIVE_REVIEW_EVERY_S = 300.0
 LIVE_REVIEW_IDLE_S = 600.0
+#: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
+#: l'alerte `mail_undeliverable` est de 15 min)
+DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: #339 r2: a process of this user whose environment cannot be read keeps a
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
@@ -5057,10 +5060,17 @@ class Runner:
     def release_stopped_lots_once(self) -> list[dict]:
         """#753 : un agent arrêté ne garde pas ses lots. À chaque passe, les
         lots ouverts d'un agent `stopped` retournent à la file d'équipe, et ses
-        lots promus dont la mesure reste à refaire vont à l'auditeur. Ne dépend
-        d'aucun agent : tout exécuteur vivant le fait ; idempotent (verrou de
-        ligne et recontrôle côté base). Une erreur de base n'est pas fatale à
-        la passe ; `--dry-run` dit ce qui serait fait sans écrire."""
+        lots promus dont la mesure reste à refaire vont à l'auditeur.
+
+        Seuls les arrêts DÉLIBÉRÉS (`stop_reason` dans
+        `work.RELEASABLE_STOP_REASONS`) dessaisissent : un arrêt automatique et
+        réversible (`erreur` de `stop_after_failures`, `retire_du_canon` que
+        `canon.revive` annule, bail expiré) laisse l'agent reprendre ses lots —
+        sinon une panne fournisseur viderait en rafale tous ses lots (R2
+        Claude, B1). La transaction de `release_agent` revérifie elle-même
+        l'état du registre (`stopped_with`, N3). Ne dépend d'aucun agent : tout
+        exécuteur vivant le fait ; idempotent. Une erreur de base n'est pas
+        fatale à la passe ; `--dry-run` dit ce qui serait fait sans écrire."""
         from . import work as work_mod
 
         if getattr(self, "mediated", False):
@@ -5081,13 +5091,20 @@ class Runner:
         for agent in agents:
             if agent.get("status") != "stopped":
                 continue
+            # B1 (R2 Claude) : un arrêt automatique et réversible — `erreur` de
+            # `stop_after_failures`, `retire_du_canon` que `canon.revive`
+            # annule, bail expiré — ne dessaisit pas : l'agent relancé retrouve
+            # ses lots. Seul un arrêt délibéré (manuel) les rend.
+            if agent.get("stop_reason") not in work_mod.RELEASABLE_STOP_REASONS:
+                continue
             try:
                 done = work_mod.release_lots(
                     self.db, agent["name"],
                     reason="agent stopped: returned to the team queue (#753)",
                     actor="runner %s" % self.runner_id,
                     measure_actor=measure_actor, measure_reason=measure_reason,
-                    dry_run=self.dry_run)
+                    dry_run=self.dry_run,
+                    stopped_with=work_mod.RELEASABLE_STOP_REASONS)
             except db_mod.DbError as exc:
                 message = "stopped lots of %s not released (%s)" % (agent["name"], exc)
                 if message != getattr(self, "_stopped_lots_error", None):
@@ -5933,6 +5950,7 @@ class Runner:
                 # L230: the worktrees are walked at most every few hours
                 artifact_scan=build_artifacts.due(time.time()))
             self.expire_threads_once(db)
+            self.sweep_dead_letters_once(db)
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("cleanup: %s" % "; ".join(
@@ -6000,6 +6018,40 @@ class Runner:
                     "y" if report["dropped"] == 1 else "ies", report["before"],
                     "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
         return reports
+
+    def sweep_dead_letters_once(self, db, now: float | None = None,
+                                clock: float | None = None) -> dict | None:
+        """L976 : le courrier en souffrance (destinataire arrêté ou inconnu)
+        est re-livré au successeur déclaré, sinon expiré après
+        `mail_dead_letter_days`, au plus une fois par heure depuis le ménage
+        (le seuil d'alerte est de 15 min) ; l'alerte `mail_undeliverable` se
+        vide donc sans geste humain. Ne lève jamais."""
+        now = time.time() if now is None else now
+        # l'intervalle se compte sur l'horloge monotone (r8), le seuil sur l'horloge murale
+        tick = time.monotonic() if clock is None else clock
+        due = getattr(self, "_dead_letters_next", None)
+        if due is not None and tick < due:
+            return None
+        self._dead_letters_next = tick + DEAD_LETTER_SWEEP_EVERY_S
+        if getattr(self, "mediated", False) or db is None:
+            return None               # exécuteur médié : pas de base, pas de balayage
+        try:
+            from . import undeliverable
+            report = undeliverable.sweep(self.cfg, db, now=now, dry_run=self.dry_run)
+        except Exception as exc:      # jamais fatal pour l'exécuteur
+            log_async("dead-letter sweep failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        suffix = " [dry-run]" if self.dry_run else ""
+        for action in report["forwarded"]:
+            log_async("undeliverable mail: %d message(s) for %s re-delivered to %s%s"
+                      % (action["count"], action["old"], action["new"], suffix))
+        for action in report["expired"]:
+            log_async("undeliverable mail: %d message(s) for %s expired after %d day(s)%s"
+                      % (action["count"], action["recipient"], report["days"], suffix))
+        for action in report["refused"]:
+            log_async("undeliverable mail: %s not re-delivered to %s (%s)"
+                      % (action["old"], action["new"], action["reason"].splitlines()[0]))
+        return report
 
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
@@ -6989,6 +7041,7 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
     # retournent à la file d'équipe (assignee = NULL, journal avec la raison),
     # et ses lots promus dont la mesure reste à refaire vont à l'auditeur.
+    # `stopped_with` referme la course avec une reprise simultanée (B1/N3).
     from . import work as work_mod
     measure_actor = work_mod.measurement_actor(db, cfg)
     returned = work_mod.release_lots(
@@ -6996,7 +7049,8 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
         reason="stopped by hand: returned to the team queue (#753)",
         actor="stop", measure_actor=measure_actor,
         measure_reason=("promoted lot whose measurement is still to be redone: "
-                        "handed to %s (#753)" % measure_actor) if measure_actor else "")
+                        "handed to %s (#753)" % measure_actor) if measure_actor else "",
+        stopped_with=work_mod.RELEASABLE_STOP_REASONS)
     for row in returned:
         to = row.get("assigned_to")
         if to:

@@ -3,7 +3,10 @@
 (assigné effacé, journal avec la raison) ; un agent ne les garde pas."""
 from __future__ import annotations
 
+import types
+
 from ameesh import registry, storage, work
+from ameesh import runner as runner_mod
 
 from .support import PgTestCase
 
@@ -166,3 +169,81 @@ class DryRunTest(_Base):
         self.assertTrue(done and all(row.get("dry_run") for row in done))
         self.assertEqual({row["id"] for row in done}, {open_lot["id"]})
         self.assertEqual(work.get(self.db, open_lot["id"])["assignee"], "dev1")
+
+
+class DeliberateStopTest(_Base):
+    """#753 (B1, R2 Claude) : seuls les arrêts DÉLIBÉRÉS rendent les lots. Un
+    arrêt automatique et réversible (`erreur` de `stop_after_failures`,
+    `retire_du_canon` que `canon.revive` annule, bail expiré) laisse l'agent
+    retrouver ses lots à la reprise — sinon une panne fournisseur viderait en
+    rafale tous ses lots."""
+
+    def stopped(self, name, reason):
+        registry.set_status(self.db, name, "stopped", status_text="stopped",
+                            stop_reason=reason)
+
+    def test_automatic_stop_keeps_the_lots(self):
+        for reason in ("erreur", "bail_expire", "retire_du_canon", "externe"):
+            name = "dev-" + reason
+            self.agent(name)
+            lot = self.lot("lot " + reason, assignee=name)
+            self.stopped(name, reason)
+            done = work.release_lots(self.db, name, reason="r", actor="a",
+                                     stopped_with=work.RELEASABLE_STOP_REASONS)
+            self.assertEqual(done, [], reason)
+            self.assertEqual(work.get(self.db, lot["id"])["assignee"], name, reason)
+
+    def test_manual_stop_still_releases(self):
+        self.agent("dev1")
+        lot = self.lot("A", assignee="dev1")
+        self.stopped("dev1", "manuel")
+        done = work.release_lots(self.db, "dev1", reason="r", actor="a",
+                                 stopped_with=work.RELEASABLE_STOP_REASONS)
+        self.assertEqual([row["id"] for row in done], [lot["id"]])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+    def test_resumed_agent_keeps_its_lots(self):
+        """N3 : la transaction revérifie le registre. Un agent relancé entre le
+        relevé et le geste ne perd pas ses lots."""
+        self.agent("dev1")
+        lot = self.lot("A", assignee="dev1")
+        self.stopped("dev1", "manuel")
+        registry.set_status(self.db, "dev1", "idle", status_text="resumed")
+        done = work.release_lots(self.db, "dev1", reason="r", actor="a",
+                                 stopped_with=work.RELEASABLE_STOP_REASONS)
+        self.assertEqual(done, [])
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+
+    def test_dry_run_keeps_the_non_deliberate_agent_out(self):
+        self.agent("dev1")
+        error = self.lot("B", assignee="dev1")
+        self.stopped("dev1", "erreur")
+        done = work.release_lots(self.db, "dev1", reason="r", actor="a",
+                                 dry_run=True,
+                                 stopped_with=work.RELEASABLE_STOP_REASONS)
+        self.assertEqual(done, [])
+        self.assertEqual(work.get(self.db, error["id"])["assignee"], "dev1")
+
+
+class SweepReleasesLotsTest(_Base):
+    """N1 : la passe du runner (`release_stopped_lots_once`) dessaisit les
+    arrêts délibérés, et seulement eux."""
+
+    def runner(self):
+        return types.SimpleNamespace(
+            mediated=False, db=self.db, cfg=self.cfg, runner_id="runner-test",
+            dry_run=False)
+
+    def test_sweep_releases_manual_only(self):
+        self.agent("manuel1")
+        self.agent("erreur1")
+        manual = self.lot("A", assignee="manuel1")
+        error = self.lot("B", assignee="erreur1")
+        registry.set_status(self.db, "manuel1", "stopped", status_text="s",
+                            stop_reason="manuel")
+        registry.set_status(self.db, "erreur1", "stopped", status_text="s",
+                            stop_reason="erreur")
+        done = runner_mod.Runner.release_stopped_lots_once(self.runner())
+        self.assertEqual({row["id"] for row in done}, {manual["id"]})
+        self.assertIsNone(work.get(self.db, manual["id"])["assignee"])
+        self.assertEqual(work.get(self.db, error["id"])["assignee"], "erreur1")

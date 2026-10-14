@@ -195,14 +195,22 @@ class WorkItems(interface.WorkItems):
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, mark_item_id=None,
-            mark_note="") -> dict:
+            mark_note="", parent_lot=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
         si bien qu'un échec de la marque annule la création (et l'inverse).
         La ligne marquée est verrouillée **avant** l'insertion et la
         `issue_ref` est relue sous ce verrou : deux appels concurrents ne
-        peuvent pas créer deux lots pour la même référence (revue #544 r2)."""
+        peuvent pas créer deux lots pour la même référence (revue #544 r2).
+
+        `parent_lot` (#1193): the explicit parent of a suite lot. The parent is
+        read back **under lock in the same transaction**: still open, the
+        blocking dependency edge is written with the creation (a failure of the
+        edge rolls the creation back, the suite lot is never exposed ready);
+        already finished, no edge is written (the suite is available at once)
+        and the parent stays traced in the journal; unknown, everything is
+        rolled back. No number is ever guessed from the title or the body."""
         with self.db.transaction() as tx:
             marked = None
             if mark_item_id is not None:
@@ -243,6 +251,28 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if parent_lot is not None:
+                # #1193: the explicit parent of a suite lot is linked in the
+                # same transaction as the creation — never a forgotten edge,
+                # and an edge failure never leaves the lot ready.
+                parent = tx.query(
+                    "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
+                    (int(parent_lot),))
+                if not parent:
+                    raise DbError("parent lot %s: no such lot" % parent_lot)
+                if parent[0]["state"] not in ("merged", "promoted", "closed"):
+                    tx.execute(
+                        "INSERT INTO work_item_dependencies(work_item_id, blocker_id,"
+                        " created_by) VALUES (%s, %s, %s)",
+                        (int(item["id"]), int(parent_lot), actor or ""))
+                    WorkItems(tx)._event(
+                        int(item["id"]), "intake",
+                        "Dependency added: lot #%d" % int(parent_lot), actor)
+                else:
+                    WorkItems(tx)._event(
+                        int(item["id"]), "intake",
+                        "suite of lot #%d (already %s)"
+                        % (int(parent_lot), parent[0]["state"]), actor)
             if mark_item_id is not None and str(mark_note or "").strip():
                 WorkItems(tx)._event(
                     int(mark_item_id), marked[0]["state"],
@@ -914,20 +944,23 @@ class WorkItems(interface.WorkItems):
             " ORDER BY id" % ITEM_COLUMNS, (assignee,))
 
     def release_agent(self, agent, *, reason, actor, measure_actor="",
-                      measure_reason="", dry_run=False) -> list[dict]:
+                      measure_reason="", dry_run=False, stopped_with=()) -> list[dict]:
         """#753 : à l'arrêt d'un agent, ses lots ouverts retournent à la file
         d'équipe — assigné effacé, journal au lot (raison), délégation en cours
         annulée —, et ses lots promus (un déploiement porte toujours sa mesure
         post-déploiement à refaire) vont à `measure_actor` (l'auditeur), journal
         au lot (`measure_reason`). Le tout dans une transaction ; le lot est
         verrouillé puis l'assigné recontrôlé : un lot repris entre-temps n'est
-        pas touché. `dry_run` : rien n'est écrit, les lots concernés sont rendus
-        tels quels (clé `assigned_to` pour ceux qui iraient à l'acteur de la
-        mesure)."""
+        pas touché. `stopped_with` : si non vide, l'agent est relu et verrouillé
+        dans la transaction, et rien n'est rendu s'il n'est plus `stopped` pour
+        l'une de ces raisons (reprise entre le relevé et le geste). `dry_run` :
+        rien n'est écrit, les lots concernés sont rendus tels quels (clé
+        `assigned_to` pour ceux qui iraient à l'acteur de la mesure)."""
         with self.db.transaction() as tx:
             return WorkItems(tx)._release_agent(
                 agent, reason=reason, actor=actor, measure_actor=measure_actor,
-                measure_reason=measure_reason, dry_run=dry_run)
+                measure_reason=measure_reason, dry_run=dry_run,
+                stopped_with=stopped_with)
 
     def _cancel_delegation(self, item_id, actor) -> None:
         """Annule la délégation en cours du lot (L40), dans la transaction."""
@@ -938,9 +971,21 @@ class WorkItems(interface.WorkItems):
             (actor or "", int(item_id)))
 
     def _release_agent(self, agent, *, reason, actor, measure_actor="",
-                       measure_reason="", dry_run=False) -> list[dict]:
+                       measure_reason="", dry_run=False, stopped_with=()) -> list[dict]:
         """`release_agent` dans la transaction ouverte."""
         lock = "" if dry_run else " FOR NO KEY UPDATE"
+        # #753 (N3) : recontrôle de l'agent DANS la transaction. Sans lui, une
+        # reprise (`ameesh resume`) ou un arrêt d'une autre nature entre le
+        # relevé du registre et le geste rendrait les lots d'un agent qui
+        # travaille de nouveau. Verrou de la ligne du registre d'abord (ordre
+        # stable agent -> lots).
+        if stopped_with:
+            rows = self.db.query(
+                "SELECT status, stop_reason FROM agent_registry"
+                "   WHERE name = %s" + lock, (agent,))
+            if (not rows or rows[0]["status"] != "stopped"
+                    or rows[0]["stop_reason"] not in tuple(stopped_with)):
+                return []
         out: list[dict] = []
         # 1. lots ouverts : file d'équipe (assignee = NULL)
         rows = self.db.query(
@@ -1127,7 +1172,7 @@ class WorkItems(interface.WorkItems):
 
     def unassigned_lots(self, limit) -> list[dict]:
         return self.db.query(
-            "SELECT w.*,"
+            ("SELECT w.*,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
             "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
             "       EXISTS (SELECT 1 FROM agent_mailbox b"
@@ -1143,13 +1188,17 @@ class WorkItems(interface.WorkItems):
             "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
             "         WHERE state = 'intake' AND assignee IS NULL"
-            "           AND type <> 'improvement') w"
+            "           AND type <> 'improvement'"
+            "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
+            "                             JOIN work_items b ON b.id = d.blocker_id"
+            "                            WHERE d.work_item_id = work_items.id"
+            "                              AND b.state NOT IN " + _CLOSED + ")) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
             " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
-            " LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+            " LIMIT %%s") % ITEM_COLUMNS, (int(limit),))
 
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(
