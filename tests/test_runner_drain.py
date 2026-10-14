@@ -21,7 +21,7 @@ import unittest
 
 from ameesh import config as config_mod, registry
 
-from .support import REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase
 
 UNIT = os.path.join(REPO, "deploy", "systemd", "ameesh-runner-agent@.service")
 
@@ -49,10 +49,10 @@ class UniteSystemdTest(unittest.TestCase):
     def test_defaut_et_environnement(self):
         self.assertEqual(config_mod.Config().drain_seconds, 1800)
         cfg = config_mod.load(env={"AMEESH_DRAIN_SECONDS": "90",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.drain_seconds, 90.0)
         cfg = config_mod.load(env={"AMEESH_DRAIN_SECONDS": "-1",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.drain_seconds, 1800.0)
 
 
