@@ -125,14 +125,19 @@ Pourquoi chaque clé (au regard des conditions de l'orchestrateur) :
 **Validation** — lire le **profil dédié retenu** (§3), celui que l'unité
 désignée lira après la recharge — pas le `critiques-2.json` partagé par trois
 unités — avec l'interpréteur de l'exécuteur, pas `python3` du système
-(l'installation vit dans un venv). `AMEESH_CONFIG` est résolu en **chemin
+(l'installation vit dans un venv) : il se lit dans le **shebang du lanceur**,
+jamais en supposant `<répertoire du lanceur>/python3` (bloc `AMEESH_PY`
+ci-dessous). `AMEESH_CONFIG` est résolu en **chemin
 absolu depuis le répertoire courant** du processus : le renseigner en absolu,
 ou se placer dans le répertoire de l'unité.
 
 ```bash
 CFG="${AMEESH_CONFIG:?chemin absolu du profil dédié (§3)}"   # refus si non renseigné
 REPO=~/development/manaty/nexlink
-AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
+AMEESH_BIN="$(readlink -f "$(command -v ameesh)")"
+AMEESH_PY="$(sed -n '1s/^#! *//p' "$AMEESH_BIN")"   # interpréteur réel : shebang du lanceur
+case "$AMEESH_PY" in */env\ *) AMEESH_PY="$(command -v "${AMEESH_PY##*/env }")";; esac
+test -x "$AMEESH_PY" || { echo "interpréteur du lanceur illisible : $AMEESH_PY" >&2; exit 1; }
 "$AMEESH_PY" - "$CFG" <<'PY'
 import json, os, sys
 from ameesh import radar
@@ -149,6 +154,14 @@ for ref in ("origin/main", "origin/develop", "refs/tags/desktop-v1.2.3",
 PY
 git -C "$REPO" rev-parse --show-toplevel      # le parseur ne vérifie pas le dépôt
 ```
+
+`AMEESH_PY` est l'**interpréteur réel du lanceur**, lu dans son shebang et
+vérifié exécutable. Ne pas le déduire du répertoire du lanceur
+(`dirname(readlink -f "$(command -v ameesh)")/python3`) : le raccourci est vrai
+sur `ameesh-agents-1`, où `~/.local/bin/ameesh` est un lien vers le venv, mais
+faux sur `pc-smichea`, où le lanceur est un script de `~/.local/bin` dont le
+shebang est `/home/smichea/.local/share/ameesh/venv/bin/python3` — le répertoire
+ne contient alors aucun `python3` (relevé orchestrateur, 14/10 07:44Z).
 
 Résultat obtenu le 2026-10-13 avec le paquet **1.10.0 installé**
 (`…/venv/lib/python3.12/site-packages/ameesh/`, sans `sys.path`) ; le chemin
@@ -338,7 +351,10 @@ n'existe qu'à partir de L160e2 (`3898d7e8`), absente de `v1.9.1` (vérifié :
 exact se contrôle sur l'hôte (§4 étape 0 le complète) :
 
 ```bash
-AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
+AMEESH_BIN="$(readlink -f "$(command -v ameesh)")"
+AMEESH_PY="$(sed -n '1s/^#! *//p' "$AMEESH_BIN")"   # interpréteur réel : shebang du lanceur
+case "$AMEESH_PY" in */env\ *) AMEESH_PY="$(command -v "${AMEESH_PY##*/env }")";; esac
+test -x "$AMEESH_PY" || { echo "interpréteur du lanceur illisible : $AMEESH_PY" >&2; exit 1; }
 "$AMEESH_PY" -c "from ameesh import radar, land, merge_queue; print(radar.LAND_MODES, 'land' in radar.PROJECT_KEYS)"
 ameesh work --help | grep -E 'queue|land'    # sous-commandes présentes
 ```
@@ -373,6 +389,28 @@ drop-in ; `zz-compte-owner-1013.conf` reste intact.
 sont inchangées** (`repo`, `github`, `target`, `migrations`, `protected`,
 `gates`, `generated`). C'est aussi le défaut du parseur si la clé est absente ;
 la poser explicitement rend le repli lisible et l'écart avec `pr` d'une ligne.
+Ce diff a été appliqué par le bureau au profil dédié **inactif** le 14/10 07:45Z
+(§3quinquies).
+
+### 3quinquies. Préparation report-only bureau (14/10 07:45Z) — `land: "off"` posé sur PC
+
+Le bureau a passé le profil dédié — toujours **inactif** — à `land: "off"` et
+fourni une contre-preuve directe d'inertie (courrier bureau → dev3, 14/10
+07:45Z ; preuve `outils/183-profile-report-only-20261014.json`) :
+
+| point | état constaté |
+|---|---|
+| profil dédié | `radar-nexlink.json` **inactif**, `land: "off"` ; `accounts` et tout le non-`radar` identiques au profil partagé |
+| schéma | `radar.parse_settings` du venv exécuteur valide |
+| contre-preuve d'inertie | `land.run_pass(None, NoDb, <projet off>, {}, owner=bureau)` → `[]`, **sans aucun accès base** |
+| effets de bord | aucun drop-in, aucun `restart`, aucune entrée en file, aucun geste GitHub |
+
+La préparation **report-only** est donc prête — elle n'est pas une activation.
+Le retour à `land: "pr"` se fait **après** `#1037`/`#1236` effectivement
+déployés (portes de famille), les fusions restant manuelles et contrôlées d'ici
+là. L'autorisation et la nomination de l'activation du profil restent à
+coordonner **orchestrateur + mesh-design**, sur **une seule** unité : ni le parse
+ni la validation de schéma ne valent feu (§3ter).
 
 ## 4. Runbook d'application (sur décision du bureau)
 
@@ -388,7 +426,10 @@ ZZ=$(systemctl --user show -p DropInPaths --value "$UNIT" | tr ' ' '\n' \
      | grep -E '/zz-compte-owner-1013\.conf$')      # drop-in du propriétaire, à préserver
 DROPIN="${ZZ%/*}/zzz-radar-nexlink.conf"            # même répertoire, trié APRÈS zz
 REPO=~/development/manaty/nexlink
-AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
+AMEESH_BIN="$(readlink -f "$(command -v ameesh)")"
+AMEESH_PY="$(sed -n '1s/^#! *//p' "$AMEESH_BIN")"   # interpréteur réel : shebang du lanceur
+case "$AMEESH_PY" in */env\ *) AMEESH_PY="$(command -v "${AMEESH_PY##*/env }")";; esac
+test -x "$AMEESH_PY" || { echo "interpréteur du lanceur illisible : $AMEESH_PY" >&2; exit 1; }
 ```
 
 0. **Vérifier l'hôte** — version, outillage, clone **et le chemin réel du
@@ -582,8 +623,11 @@ Tranché le 13/10 :
    profil dédié créé (SHA256 `b3b1c32e…`), schéma validé par le venv exécuteur,
    réserves levées, rien d'appliqué (aucun drop-in, aucun restart). Le repli
    documentaire `land: "off"` est qualifié sur le code installé (§3quater,
-   demande orchestrateur 07:38Z) ; le créneau `land: "pr"` reste à coordonner
-   avec les déploiements `#1037`/`#1236`.
+   demande orchestrateur 07:38Z) et le bureau l'a posé sur le profil dédié
+   **inactif** (report-only, §3quinquies, 07:45Z ; contre-preuve d'inertie sans
+   accès base) ; le créneau `land: "pr"` reste à coordonner avec les
+   déploiements `#1037`/`#1236`, et l'activation du profil à autoriser/nommer
+   par orchestrateur + mesh-design sur une seule unité.
 7. **Portes** — les deux portes locales suffisent-elles pour le pilote, ou
    faut-il des portes par chemin (`scripts/__tests__/*.test.mjs`) dès le
    premier jour ?
