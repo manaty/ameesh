@@ -1,0 +1,3039 @@
+diff --git a/.github/workflows/carte.yml b/.github/workflows/carte.yml
+index f47eb4116..71c965eb2 100644
+--- a/.github/workflows/carte.yml
++++ b/.github/workflows/carte.yml
+@@ -126,7 +126,7 @@ jobs:
+           path: ${{ runner.temp }}/mesure
+           include-hidden-files: true  # cov/.coverage.*
+           if-no-files-found: ignore
+-          retention-days: 3
++          retention-days: 1
+ 
+   carte:
+     name: carte
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 892100cf0..de733120e 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -49,6 +49,10 @@
+ # reste en attente ; une fusion plus récente remplace ce run en attente et
+ # valide aussi les fusions intermédiaires qu'elle contient.
+ #
++# #833 — le filtre s'applique aussi à une poussée vers main, sur le diff de
++# toute la poussée (`github.event.before` → tête, jamais HEAD^1 seul). Une
++# poussée vers release/** ou une histoire réécrite garde la suite complète.
++#
+ # L161b — chaque part écrit ses résultats au fil de l'eau (--flow, JSON lignes,
+ # un test par ligne, schéma ameesh-test-event/1), publiés en artefact
+ # (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flow.py).
+@@ -118,6 +122,13 @@ jobs:
+     name: plan
+     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+     timeout-minutes: 5
++    env:
++      # #833 : sur une poussée, le diff va du commit d'avant la poussée
++      # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
++      # La référence distingue main (filtre doc) des branches release (suite
++      # complète, quel que soit le contenu).
++      AMEESH_CI_BASE: ${{ github.event_name == 'push' && github.event.before || 'HEAD^1' }}
++      AMEESH_CI_REF: ${{ github.ref }}
+     outputs:
+       version_only: ${{ steps.plan.outputs.version_only }}
+       docs_only: ${{ steps.plan.outputs.docs_only }}
+@@ -151,6 +162,7 @@ jobs:
+         run: |
+           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
+             --event "${{ github.event_name }}" \
++            --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
+             --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
+             --github-output "$GITHUB_OUTPUT" \
+             --summary "$GITHUB_STEP_SUMMARY" --annotations
+@@ -158,7 +170,7 @@ jobs:
+         with:
+           name: plan
+           path: plan.json
+-          retention-days: 14
++          retention-days: 3
+ 
+   psycopg:
+     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+@@ -263,7 +275,7 @@ jobs:
+           name: flux-psycopg-${{ matrix.part }}
+           path: ${{ runner.temp }}/flux.jsonl
+           if-no-files-found: ignore
+-          retention-days: 14
++          retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
+ 
+   psql:
+     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
+@@ -329,7 +341,7 @@ jobs:
+           name: flux-psql-${{ matrix.part }}
+           path: ${{ runner.temp }}/flux.jsonl
+           if-no-files-found: ignore
+-          retention-days: 14
++          retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
+ 
+   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
+   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
+@@ -398,7 +410,7 @@ jobs:
+         with:
+           name: leaks
+           path: leaks.json
+-          retention-days: 90
++          retention-days: 15  # the two-week tally (L161i)
+ 
+   # L158: a PR that changes the version number carries the number its content
+   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
+diff --git a/deploy/sql/role-executor.sql b/deploy/sql/role-executor.sql
+index 983968a49..cc3c086ad 100644
+--- a/deploy/sql/role-executor.sql
++++ b/deploy/sql/role-executor.sql
+@@ -40,6 +40,15 @@ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I T
+ SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I',
+               :'schema', :'role') \gexec
+ SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', :'schema', :'role') \gexec
++-- L244 (#420): ameesh_module_agent is SECURITY DEFINER (it takes the shared
++-- lock on the registry for the isolated module roles). The executor group is
++-- granted EXECUTE by the blanket line above but must never hold it: the audit
++-- below flags any executable SECURITY DEFINER function, and rightly so.
++SELECT format('REVOKE EXECUTE ON FUNCTION %I.ameesh_module_agent(text) FROM %I',
++              :'schema', :'role')
++ WHERE EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
++               WHERE n.nspname = :'schema' AND p.proname = 'ameesh_module_agent'
++                 AND p.prosecdef) \gexec
+ -- Module policy writes belong exclusively to isolated canon synchronization.
+ SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
+               :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
+diff --git a/deploy/sql/role-module-writers.sql b/deploy/sql/role-module-writers.sql
+index 67a872f9a..1017a39c3 100644
+--- a/deploy/sql/role-module-writers.sql
++++ b/deploy/sql/role-module-writers.sql
+@@ -9,23 +9,34 @@ SELECT 'CREATE ROLE ameesh_canon_sync NOLOGIN'
+  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_canon_sync') \gexec
+ SELECT 'CREATE ROLE ameesh_it_proof NOLOGIN'
+  WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_proof') \gexec
+-SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof', :'schema') \gexec
++-- L244 (#420): the QA verdict has its own isolated writer, distinct from the
++-- execution proof writer.
++SELECT 'CREATE ROLE ameesh_it_qa NOLOGIN'
++ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ameesh_it_qa') \gexec
++SELECT format('GRANT USAGE ON SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
+ -- Canon sync executes the existing registry/authenticator/package transaction.
+ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
+ SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA %I TO ameesh_canon_sync', :'schema') \gexec
+-SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof', :'schema') \gexec
+-SELECT format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM ameesh_it_proof', :'schema') \gexec
+-SELECT format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM ameesh_it_proof', :'schema') \gexec
+-SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module_milestones TO ameesh_it_proof',
++SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO ameesh_canon_sync, ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
++SELECT format('REVOKE ALL ON ALL TABLES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
++SELECT format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA %I FROM ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
++SELECT format('GRANT SELECT ON %I.work_items, %I.project_modules, %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa',
+               :'schema', :'schema', :'schema') \gexec
+ -- SELECT FOR NO KEY UPDATE needs UPDATE on at least one column.
+-SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof', :'schema') \gexec
+-SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof', :'schema') \gexec
+-SELECT format('GRANT USAGE ON SEQUENCE %I.work_module_milestones_id_seq TO ameesh_it_proof', :'schema') \gexec
++SELECT format('GRANT UPDATE (id) ON %I.work_items TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
++SELECT format('GRANT INSERT ON %I.work_module_milestones TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
++SELECT format('GRANT USAGE ON SEQUENCE %I.work_module_milestones_id_seq TO ameesh_it_proof, ameesh_it_qa', :'schema') \gexec
++-- L244 (#420): the QA guard reads the actor's declared roles and projects
++-- under a share lock through ameesh_module_agent (SECURITY DEFINER, fixed
++-- search_path, migration 0427). The isolated role needs EXECUTE, not SELECT:
++-- FOR SHARE on agent_registry requires UPDATE, which it must not have.
++SELECT format('GRANT EXECUTE ON FUNCTION %I.ameesh_module_agent(text) TO ameesh_it_qa', :'schema')
++ WHERE EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
++               WHERE n.nspname = :'schema' AND p.proname = 'ameesh_module_agent') \gexec
+ DO $audit$
+ DECLARE r record;
+ BEGIN
+-    FOR r IN SELECT * FROM pg_roles WHERE rolname IN ('ameesh_it_proof', 'ameesh_canon_sync') LOOP
++    FOR r IN SELECT * FROM pg_roles WHERE rolname IN ('ameesh_it_proof', 'ameesh_it_qa', 'ameesh_canon_sync') LOOP
+         IF r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolbypassrls OR r.rolreplication OR r.rolcanlogin THEN
+             RAISE EXCEPTION 'module writer groups must be nonadministrative NOLOGIN roles';
+         END IF;
+@@ -39,6 +50,9 @@ BEGIN
+     IF has_table_privilege('ameesh_it_proof', 'project_modules', 'INSERT,UPDATE,DELETE') THEN
+         RAISE EXCEPTION 'proof writer must not change module policies, including PUBLIC grants';
+     END IF;
++    IF has_table_privilege('ameesh_it_qa', 'project_modules', 'INSERT,UPDATE,DELETE') THEN
++        RAISE EXCEPTION 'QA writer must not change module policies, including PUBLIC grants';
++    END IF;
+ END
+ $audit$;
+ COMMIT;
+diff --git a/deploy/sql/role-superviseur.sql b/deploy/sql/role-superviseur.sql
+index 04817c04a..9b4c91ee5 100644
+--- a/deploy/sql/role-superviseur.sql
++++ b/deploy/sql/role-superviseur.sql
+@@ -201,7 +201,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
+         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+         'projects',
+         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
+-        'workstream'
++        'workstream',
++        -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
++        -- pas de contenu) — comme `projects`, le garde QA les lit
++        'roles'
+     ]),
+     ('authenticator_syncs', ARRAY[
+         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
+diff --git a/docs/COMPTES.md b/docs/COMPTES.md
+index 586045d45..68e4e49e8 100644
+--- a/docs/COMPTES.md
++++ b/docs/COMPTES.md
+@@ -588,9 +588,13 @@ counted amount next to the estimate.
+ **A budget pause is shown as one.** The pause reason starts with the account
+ that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
+ all claude accounts at threshold — …". It is the agent's `status_text`
+-("budget : pause (…) until 14:20; …"). An account held by several windows
+-frees when the last of them resets: the label names that window, and the
+-date when it is not today ("until 14/10 09:00"). Without declared accounts the
++("budget : pause (…) until 14:20; …"). The announced time is the real one: a
++window held by the pace alone frees when the elapsed part catches up with the
++usage (the guard is re-evaluated on every turn, #898), while a usage at the
++pace ceiling (90 %, less the reserve kept for critical agents) only falls back
++at the window reset. An account held by several windows frees with the last of
++them: the label names that window, and the date when it is not today ("until
++14/10 09:00"). Without declared accounts the
+ account is `(default)`, the harness's own. `ameesh progress` and the alerts read
+ `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
+ 
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index 9c91b4a61..ec7dab7f3 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -5375,7 +5375,7 @@ Où le lire :
+ * le **résumé du job** (onglet « Summary » de l'exécution) : compte par
+   statut, échecs avec la commande qui les relance seuls, extraits de trace,
+   tests les plus lents ;
+-* l'**artefact** `flux-<pilote>-<part>` (14 jours), même si la part a échoué :
++* l'**artefact** `flux-<pilote>-<part>` (1 jour), même si la part a échoué :
+   `gh run download <exécution> -n flux-psycopg-2`.
+ 
+ **Ordre.** Dans chaque part, les modules de test touchés par la PR passent
+@@ -5520,7 +5520,7 @@ as the `plan` artifact. Every part (`psycopg K/N`, `psql K/N`) then runs from
+ that same plan (`scripts/test-parts.py run --plan plan.json`): the split is
+ computed once, from the map durations, and never differs between parts. The
+ matrices of the parts come from the plan (`fromJSON`); a driver the plan gives
+-no part to (version-only or documentation-only pull request) is skipped, and
++no part to (version-only or documentation-only change) is skipped, and
+ the `tests` aggregate accepts it. When code changed, only `psql` may have no
+ part (no pilot module); an empty `psycopg` matrix then fails `tests` (e.g. the
+ test modules moved to a subfolder and `parts.modules()` finds none). A stale or
+@@ -5545,11 +5545,15 @@ job summary of `plan` and in every line of the result stream:
+ | P3 | the rest | — |
+ 
+ Each part runs P0, P1, P2 (shortest first within each class), then P3
+-(alphabetical). On a documentation-only pull request, the P0 and P1 modules
++(alphabetical). On a documentation-only pull request, and on a push to `main`
++whose whole pushed range (`github.event.before` → head, #833) is
++documentation, the P0 and P1 modules
+ of the plan (readers of the changed documents, listers of a directory where
+ a document appeared or vanished) join the declared readers
+-(`tests/parts/lecteurs-doc.txt`) in `doc-readers`. That fast lane needs a map
+-that judged everything: the pull request leaves it, and the full suite runs,
++(`tests/parts/lecteurs-doc.txt`) in `doc-readers`. A push to any other ref
++(a release branch in particular), a branch created by the push and a
++rewritten history keep the full suite. That fast lane needs a map
++that judged everything: the run leaves it, and the full suite runs,
+ when the map is missing, stale or unusable, when the selection is unsure,
+ or when one of those modules needs Postgres, which `doc-readers` lacks (it
+ touched a table, or it is unknown to the map).
+@@ -5635,7 +5639,7 @@ to the agent's mailbox while the suite runs is lot L161c; until then it is in
+ the stream artifacts and in the `bilan des impactés` job summary.
+ 
+ **Leaks.** The `bilan des impactés` job (never required) reads the plan and
+-the streams of the run and writes the `leaks` artifact (90 days, schema
++the streams of the run and writes the `leaks` artifact (15 days, schema
+ `ameesh-test-leaks/1`): the failed modules, the **leaks** (failed modules the
+ map did not select: P2 or P3), the selection size against the full suite,
+ and when the provisional green came. Leaks are only counted when the map was
+@@ -5975,6 +5979,9 @@ extensions:
+     projects:
+       acme:
+         modules: [it]
++      nexlink:
++        modules:
++          it: {require_qa: [promoted]}
+ ```
+ 
+ Apply it through `ameesh canon sync` with the existing trusted-ref procedure.
+@@ -5984,7 +5991,8 @@ applied rules. Another canon cannot take ownership of an enabled project.
+ Projects with no module retain their existing work item types and lifecycle.
+ Do not remove a module while its work items remain active: its additional
+ work item types then fail closed. Removing a declaration does not delete its
+-historical milestones.
++historical milestones. A module accepts options after its name
++(`modules: {it: {…}}`); `it.require_qa` is described below.
+ 
+ The **IT module** adds `release` and `publication` types. Use them for a tag,
+ GitHub release, update manifest (`latest.json`/`latest.yml`), store upload or
+@@ -6026,6 +6034,35 @@ structured payload. The supervisor role reads milestone state; command and
+ output require the additional contents role. Migration `0363` is reserved for
+ lot #318. Auditor reporting follows separately in lot #319.
+ 
++### QA verdict and release gate (L244)
++
++A project may add a QA verdict to its IT lots with `require_qa`, which lists
++the guarded lifecycle states (`merged` and/or `promoted`):
++
++```yaml
++extensions:
++  ameesh:
++    projects:
++      nexlink: {modules: {it: {require_qa: [promoted]}}}
++```
++
++A verdict is recorded on the current delivery by an agent holding the `qa`
++role for the lot's project. It is refused when the same identity is the lot
++assignee, the delivery author or the proof author (`qa-same-actor`), and the
++SQL guard enforces this for both drivers and direct storage calls:
++
++```sh
++ameesh module it qa 123 --sha256 <digest> --verdict ok \
++                       --scope install,login --report https://ci.example/run/42
++```
++
++`--verdict ok` opens the gate for the delivery it is bound to; `blocked`
++keeps it closed. A new delivery declaration invalidates the verdict, even
++when the bytes are identical. The audit reports `missing_qa` (no current
++`ok` verdict) and `stale_qa` (verdict bound to an earlier delivery) as
++module deviations. Without `require_qa` nothing changes. Migration `0427`
++is reserved for lot #420.
++
+ ### Isolated IT proof and policy writers (L317a r2)
+ 
+ `ameesh module it proof` requests observed execution from the installed one-shot
+diff --git a/docs/design/etudes/index.md b/docs/design/etudes/index.md
+index f6a95515c..fd5f09828 100644
+--- a/docs/design/etudes/index.md
++++ b/docs/design/etudes/index.md
+@@ -20,3 +20,4 @@
+ * [Autonomous host provisioning](l232-autonomous-host-provisioning.md) - L232: recoverable agent moves between lots, SSH code and systemd delivery, mesh-store API secrets, per-host OAuth browser approvals, reserved owner decisions and four dated implementation lots.
+ * [Real trial of Hermes with DeepSeek](l153-hermes-deepseek-trial.md) - L153: Hermes Agent and dsh on deepseek-flash, same two tasks, two runs each: tie on fidelity and cost, dsh slightly faster, Hermes about 1.3 GB per host and not wired into ameesh; stay on dsh, Hermes kept as an ACP fallback.
+ * [mergiraf pilot](l160g-mergiraf-pilot.md) - L160g: the syntactic merge driver replayed on 115 conflicting merges of ameesh and Nexlink: 16 fully resolved, 13 wrong results (duplicated additions, lost changes, code that does not compile, markers left in); not adopted, for any language.
++* [QA role and QA sign-off](l244-qa-role.md) - L244 (#420): `qa` canon role, `qa` milestone bound to the current delivery in the IT module, separation of duties, opt-in `require_qa` gate, notices to QA holders; lots L244-1 to L244-3 for DeepSeek.
+diff --git a/docs/design/etudes/l244-qa-role.md b/docs/design/etudes/l244-qa-role.md
+new file mode 100644
+index 000000000..79e69cbbd
+--- /dev/null
++++ b/docs/design/etudes/l244-qa-role.md
+@@ -0,0 +1,148 @@
++---
++type: Study
++title: "QA role and QA sign-off in the IT release gate"
++description: "L244 (lot #420): a `qa` canon role, a `qa` milestone bound to the current delivery in the IT module, a separation-of-duties rule, routing release lots to QA holders; three implementation lots."
++status: draft
++tags: [roles, qa, modules, IT, release]
++generated: { by: "mesh-design", at: "2026-10-12" }
++---
++
++# Design for lot #420
++
++The owner chose option a in decision 10410 (2026-10-12 14:55). It has two
++parts:
++- QA becomes a role in the cards (home#25), and the role is not critical.
++- The roles are filled as follows:
++  - On Nexlink, codex3 does QA. It runs on the nexlink-ci runners, a harness
++    that adds no cost.
++  - On ameesh, the QA agent is mty-amh-qa-01, delivered by #412 (L233a).
++
++Today nobody holds a QA role. A release lot of the IT module (#318, L317a)
++needs only two things to be `merged` or `promoted`:
++- a `delivery` declaration;
++- a `proof` of real execution bound to it.
++
++Nobody other than the author checks that the product actually works for a
++user.
++
++## Role
++
++- **Card.** `qa` is one of the canon roles of #414 (L242c). A card carries it
++  as `roles: [qa]`, or as a Persona's held role with holder or deputy
++  (0032). The role does not change criticality, so a QA agent is paused like
++  any non-critical agent.
++- **Scope.** A QA agent belongs to the projects it checks: `projects:` from
++  L243, or `team`.
++- **Global QA.** A QA agent with no project identity is global, like global
++  auditors in #319.
++- **No fallback.** Nothing falls back to "any reviewer". An agent counts as QA
++  only through the explicit role.
++
++## `qa` milestone in the IT module
++
++A new evidence kind is added to the IT descriptor:
++
++```python
++"qa": {"strings": ["sha256", "verdict", "report"],
++       "arrays": ["scope"],
++       "patterns": {"sha256": "^[0-9a-f]{64}$", "verdict": "^(ok|blocked)$"},
++       "subject_field": "sha256", "binding_kind": "delivery",
++       "writer_role": "ameesh_it_qa"}
++```
++
++- **Binding.** The milestone is bound to the current `delivery` declaration,
++  exactly as `proof` is. A new delivery invalidates earlier QA, including a
++  return to an earlier digest.
++- **Content.**
++  - `scope` lists what was exercised, for example
++    `["install-win", "update-0.2.10", "login", "call"]`.
++  - `report` is a link to the QA report: a lot thread entry, a PR comment or a
++    CI run.
++- **Who can write it.** The SQL guard checks two things, as it already does
++  for `proof`:
++  - membership of the `ameesh_it_qa` writer role;
++  - that the actor holds the `qa` role for the lot's project, read from the
++    registry under a share lock.
++- **Separation of duties.** The QA actor must differ from three people:
++  - the lot's assignee;
++  - the author of the delivery declaration;
++  - the author of the proof.
++
++  When the same identity tries, the milestone is refused with
++  `qa-same-actor`.
++- **CLI.**
++
++  ```
++  ameesh it qa <lot> --sha256 <digest> --verdict ok|blocked \
++                     --scope install-win,login --report <url>
++  ```
++
++  It records evidence only. It never runs anything.
++
++## Gate
++
++- **Opt-in rule.** The lifecycle rule is enabled per project:
++
++  ```yaml
++  extensions:
++    ameesh:
++      projects:
++        nexlink: {modules: {it: {require_qa: [promoted]}}}
++  ```
++
++  With it, `promoted` (publication) also requires a `qa` milestone with
++  `verdict: ok` for the current delivery. The project chooses the states:
++  - `[promoted]` is the default proposal. A release candidate can merge,
++    then QA runs on the candidate, then it is published.
++  - `[merged, promoted]` gates the merge as well.
++- **Blocked verdict.** A `blocked` verdict keeps the gate closed and does not
++  expire. Only a new delivery, or a later `ok` from a QA holder, reopens it.
++- **Audit.** The audit pass of #319 gains two findings:
++  - `missing_qa`: a promoted release without QA for its current delivery.
++  - `stale_qa`: QA bound to an older declaration.
++
++  Both are reported as `module_deviation` with the same routing as the
++  existing findings.
++
++## Routing
++
++- **Notification.** A release lot of a project with `require_qa` reaches
++  `qa` once both of these exist for its current delivery: a `delivery`
++  declaration and a `proof`. At that point the project's QA holders are told
++  through event mail on the lot thread.
++- **Addressing.** QA holders are reached by role (`role:qa@<project>`, C2 of
++  the v2 plan) once role addressing exists. Before that, the mail goes to
++  every agent with the `qa` role in the project.
++- **No QA holder.** The owner's alert channel receives the notice. A
++  reviewer is never picked in their place.
++- **Assignment.** The QA agent does not take the lot. It records its verdict
++  and the lot stays with its assignee.
++
++## Hosts and current assignments
++
++- **Nexlink.** Two lots carry the work:
++  - Release gate: #314 (codex2).
++  - QA of 0.2.11: #426, on RC #428.
++
++  codex3 does QA full time after #397.
++- **ameesh.** mty-amh-qa-01 needs a Host card for `ameesh-tests` in the canon
++  (manaty/home). That card is a canon PR outside home#26, prepared by #412.
++
++## Lots
++
++Implementation goes to DeepSeek agents, at the owner's request of 12/10
++14:46. Every PR is reviewed by Codex.
++
++| Lot | Content | Depends on | Estimate |
++|---|---|---|---|
++| L244-1 | `qa` evidence kind, writer role `ameesh_it_qa`, role and separation-of-duties checks in SQL (both drivers), `ameesh it qa` | #414 (roles) | 3 h |
++| L244-2 | Opt-in `require_qa` rule, `missing_qa` / `stale_qa` audit findings | L244-1 | 2 h |
++| L244-3 | Notice to QA holders when a release lot is ready, owner-channel fallback | L244-1, L243-2 | 2 h |
++| canon | Host card `ameesh-tests`, `qa` role on codex3 and mty-amh-qa-01, `require_qa: [promoted]` for nexlink | owner approval | 30 min |
++
++## Out of scope
++
++- Running QA scenarios automatically. QA agents use the existing CI and
++  hosts. ameesh only records their verdict.
++- QA for lot types other than IT releases. This is possible later through
++  other modules, with the same evidence pattern.
+diff --git a/docs/versions/1.9.1.md b/docs/versions/1.9.1.md
+new file mode 100644
+index 000000000..d9b4d179f
+--- /dev/null
++++ b/docs/versions/1.9.1.md
+@@ -0,0 +1,11 @@
++Patch version, from lot #347 / PR #333 (`e2a2c1944`) on base `release/1.9`, narrowed to automatic mail inheritance and identity fixes. It brings no new command, option, setting, migration or alert type.
++
++**Mail and lots**
++- L118c: `agent-mail send --new-lot` no longer creates a lot with an empty project when the sender's or the recipient's project is known. The sender's project is inherited first, then the recipient's — registry data first, then an unambiguous project from the agent's own canon as fallback. Unknown projects keep 1.9.0's unclassified creation behaviour; conflicting own-canon projects refuse the inheritance (#347, PR #333).
++- Repairing the lots already created with an empty project is outside this patch.
++
++**Identity and corrections**
++- The correction guard now rejects invalid runner/session identities before any human fallback, and requires the correction roles to come from the agent's own canon. Regression tests exercise both attacks through the existing `work move --correct` command (#347).
++
++**Validation**
++- 140 tests passed under `ameesh heavy` (2 skipped), covering `test_l118c_mail_projects`, `test_l118_assignments`, `test_l124_decisions`, `test_l26_exploitation`, `test_l37_mode_et_alertes` and `test_l157_estimations`; `git diff --check` passes and the L158 checker accepts the range `1.9.0 → 1.9.1` as a patch.
+diff --git a/scripts/test-plan.py b/scripts/test-plan.py
+index c973be571..097b5fe0a 100644
+--- a/scripts/test-plan.py
++++ b/scripts/test-plan.py
+@@ -3,6 +3,7 @@
+ """Test plan from the measured test → code map (L161f).
+ 
+     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
++                              [--base SHA] [--ref REF]
+                               [--base-ref B] [--head-ref H]
+                               [--github-output F] [--summary F] [--annotations]
+     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
+@@ -46,15 +47,24 @@ same holds for the fallback plan, so an unreadable map never narrows a
+ release to the pilot list. Only the full suite prepares the merge of a
+ release.
+ 
++**Documentation-only** (L161a): a pull request whose whole diff is
++documentation, and a push to `main` whose whole pushed range (`--base`,
++`github.event.before`, to the new head) is documentation, runs only its
++declared readers (`tests/parts/lecteurs-doc.txt`, plus the impacted ones)
++and skips the parts. A push to any other ref keeps the full suite (release
++branches in particular); so do a branch created by the push, a rewritten
++history and any event but `pull_request` and `push` on `main`. A pushed
++version number never takes the lane: L157 is a pull-request rule.
++
+ **The full suite is the fallback.** The changed files are taken from the
+ map commit to HEAD, not from the merge base: whatever changed on main since
+ the map counts as changed, so the selection widens, never narrows. Map
+ missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
+-falls back to the textual heuristic of L161b (`--since HEAD^1`) and the
+-plan is marked unsure. A file the map cannot judge (Python outside
+-`src/ameesh`, a non-documentation file no test reads, a syntax error) uses
+-the textual heuristic for that file and marks the plan unsure; test
+-infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
++falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
++default) and the plan is marked unsure. A file the map cannot judge (Python
++outside `src/ameesh`, a non-documentation file no test reads, a syntax
++error) uses the textual heuristic for that file and marks the plan unsure;
++test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+ `.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
+ A file removed outside documentation marks it unsure as well: the map knows
+ the readers it measured, never the ones it cannot see (an import by a
+@@ -688,11 +698,41 @@ def lot_part_count(driver: str, modules: list[str], card: dict | None) -> int:
+     return max(1, math.ceil(estimate / PR_TARGET_PART_S))
+ 
+ 
++#: the branch whose documentation-only pushes take the fast lane (L161a)
++DOC_PUSH_REF = "main"
++#: git's null object id: `github.event.before` of a branch created by the push
++NULL_SHA = "0" * 40
++
++
++def pushed_range(base: str, head: str, repo: pathlib.Path = REPO) -> bool:
++    """True if `base` is the tip before a push to `head` (fast-forward).
++
++    `github.event.before` on a branch created by the push is the null sha,
++    and a rewritten history leaves a tip that is not an ancestor: both keep
++    the full suite."""
++    if base in ("", NULL_SHA) or not re.fullmatch(r"[0-9a-fA-F]{40}", base):
++        return False
++    return is_ancestor(base, head, repo)
++
++
+ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
+-           repo: pathlib.Path = REPO) -> dict:
+-    """Version-only or documentation-only pull request (L157, L161a)."""
++           repo: pathlib.Path = REPO, ref: str = "") -> dict:
++    """Version-only pull request (L157), documentation-only change (L161a).
++
++    On a push, `base` is the tip before the push (`github.event.before`), so
++    the diff covers every pushed commit. Only a push to `main` takes the
++    documentation lane: a push to a release branch keeps the full suite, and
++    version-only stays a pull-request rule (a pushed version always runs)."""
+     out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
+-    if event != "pull_request":
++    if event == "push":
++        if ref.removeprefix("refs/heads/") != DOC_PUSH_REF:
++            out["why"] = f"push to {ref or 'an unknown ref'}: full suite"
++            return out
++        if not pushed_range(base, head, repo):
++            out["why"] = ("pushed range unknown (new branch or rewritten history): "
++                          "full suite")
++            return out
++    elif event != "pull_request":
+         return out
+     try:
+         names = _git(repo, "diff", "--name-only", "--no-renames", base, head).splitlines()
+@@ -700,9 +740,11 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
+     except (OSError, subprocess.CalledProcessError) as exc:
+         out["why"] = f"diff unreadable ({exc})"
+         return out
+-    out["version_only"], why = version_only.version_only(names, patch)
++    version_why = ""
++    if event == "pull_request":
++        out["version_only"], version_why = version_only.version_only(names, patch)
+     out["docs_only"], doc_why = version_only.docs_only(names)
+-    out["why"] = why if out["version_only"] else doc_why
++    out["why"] = version_why if out["version_only"] else doc_why
+     out["files"] = names
+     return out
+ 
+@@ -724,6 +766,7 @@ def doc_readers(classes: dict, card: dict,
+ 
+ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
+               head: str = "HEAD", repo: pathlib.Path = REPO,
++              base: str = "HEAD^1", ref: str = "",
+               base_ref: str | None = None, head_ref: str | None = None) -> dict:
+     now = now or datetime.datetime.now(datetime.timezone.utc)
+     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+@@ -734,8 +777,8 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
+             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
+             "tested": _rev(head, repo), "release": release,
+             "refs": {"base": base_ref, "head": head_ref},
+-            **nature(event, head=head, repo=repo)}
+-    plan.update(classify(modules, card, now, head=head, repo=repo))
++            **nature(event, base=base, head=head, repo=repo, ref=ref)}
++    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo))
+     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+     #: #749 : modules « always » declenches par le diff (contrat de base, baux
+     #: et orphelins), a rejoindre au pilote psql sur une PR.
+@@ -1028,6 +1071,12 @@ def main(argv: list[str] | None = None) -> int:
+     p.add_argument("--out", required=True)
+     p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
+     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
++    p.add_argument("--base", default="HEAD^1",
++                   help="tip before a push (github.event.before); HEAD^1 by default, "
++                        "the first parent of a pull request's merge commit")
++    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
++                   help="github.ref; a documentation-only push takes the fast lane "
++                        "on main only")
+     p.add_argument("--base-ref", default=None,
+                    help="target branch of a pull request (default: $GITHUB_BASE_REF)")
+     p.add_argument("--head-ref", default=None,
+@@ -1050,7 +1099,8 @@ def main(argv: list[str] | None = None) -> int:
+         if card is None and args.map:
+             print(f"map: {why}", file=sys.stderr)
+         try:
+-            plan = make_plan(args.event, card, base_ref=args.base_ref, head_ref=args.head_ref)
++            plan = make_plan(args.event, card, base=args.base, ref=args.ref,
++                             base_ref=args.base_ref, head_ref=args.head_ref)
+         except Exception as exc:  # planning must never block the suite
+             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
+             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
+diff --git a/src/ameesh/accounts.py b/src/ameesh/accounts.py
+index 9ae896b3b..6e4598490 100644
+--- a/src/ameesh/accounts.py
++++ b/src/ameesh/accounts.py
+@@ -569,7 +569,9 @@ class Evaluation:
+     profile: Profile
+     reason: str = ""                     #: '' = sous le seuil
+     gauges: list = field(default_factory=list)
+-    until: float | None = None           #: heure de libération si au seuil (#777)
++    until: float | None = None           #: heure de libération si au seuil
++                                         #: (#777) : croisement du rythme ou
++                                         #: remise à zéro (#898)
+     problems: list = field(default_factory=list)
+     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
+     held: tuple | None = None
+@@ -771,7 +773,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
+         if reserve and not hard:
+             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
+         # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
+-        # plus longtemps ; #777 : à l'heure où elle libère vraiment.
++        # plus longtemps ; #777, #898 : à l'heure où elle libère vraiment —
++        # croisement du rythme, ou remise à zéro quand il ne rattrape plus.
+         result.until, late = _release(profile, depasses, hard, now,
+                                       RESERVE if reserve else 0.0)
+         if late is not None:
+diff --git a/src/ameesh/backend.py b/src/ameesh/backend.py
+index 2240071ed..d4feeae6f 100644
+--- a/src/ameesh/backend.py
++++ b/src/ameesh/backend.py
+@@ -345,11 +345,18 @@ class PgBackend:
+                 self.db, name, chantier=identity.chantier_of(name, self.cfg),
+                 harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
+             return
++        # #1037 : sous bail, le harnais DÉCLARÉ de la ligne n'est jamais
++        # réécrit par un hook — le harnais du tour peut être EMPRUNTÉ (L242b :
++        # un agent critique au seuil tourne sous un autre harnais), et le hook
++        # le faisait clignoter pendant que modèle et session restaient ceux de
++        # la session précédente. `harness=None` : l'ON CONFLICT de `upsert`
++        # garde la valeur existante (la ligne existe — le bail a été vérifié
++        # par `identity.resolve_binding`). Le dossier et l'hôte du tour, eux,
++        # suivent (L61 : sous bail le hook réinscrit le dossier ; L166 a déjà
++        # filtré la session du hook, jamais inscrite sous bail).
+         registry.upsert(
+-            self.db, name,
+-            chantier=identity.chantier_of(name, self.cfg),
+-            harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id,
+-        )
++            self.db, name, chantier=identity.chantier_of(name, self.cfg),
++            harness=None, host=self.cfg.host, cwd=cwd, session_id=session_id)
+ 
+     def agents(self) -> list[dict]:
+         rows = registry.overview(self.db)
+diff --git a/src/ameesh/backlog.py b/src/ameesh/backlog.py
+index fc64d115d..1cac76ed1 100644
+--- a/src/ameesh/backlog.py
++++ b/src/ameesh/backlog.py
+@@ -103,6 +103,10 @@ LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+ LOT_MIN_AGE_S = 300.0
+ #: capacités exigées qui réservent un lot à une attribution explicite
+ RESERVED_CAPABILITIES = ("decision", "production")
++#: capacités déclarées qui marquent la classe d'un lot (canon §1/#803) : un lot
++#: qui en exige une n'est tiré que si une autre famille de harnais est au
++#: registre (canon §2). `sensitive` est la variante anglaise de `sensible`.
++CLASS_CAPABILITIES = ("sensible", "sensitive", "production", "decision")
+ #: capacité exigée qui désigne un harnais (`harness:codex`)
+ HARNESS_PREFIX = "harness:"
+ TAKE_WINDOW_S = 3600.0
+@@ -211,15 +215,57 @@ def auditor_may_take(item: dict, name: str, card=None) -> bool:
+                          + r"|(?:sa|ses|own)\s+(?:fiche|card)", text)
+ 
+ 
+-def fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
+-    """L'élément correspond-il à l'équipe et aux capacités de l'agent ?"""
++def declared_class(item: dict) -> bool:
++    """Le lot déclare-t-il une capacité de classe (sensible/production/decision) ?
++
++    #803 : la classe d'un lot n'est lisible sur le diff gelé qu'à la porte de
++    fusion ; à la prise, c'est le marqueur déclaré qui fait foi (le doute du
++    canon §8 se tranche au gel, pas ici, sinon tout lot `intake` serait
++    sensible). `sensitive` est accepté comme variante de `sensible`.
++    """
++    return bool(set(item.get("required_capabilities") or ())
++                & set(CLASS_CAPABILITIES))
++
++
++def other_family_available(agent: dict, others) -> bool:
++    """Une famille de harnais autre que celle du preneur est-elle au registre ?
++
++    Garde **structurelle** de la classe (#803, canon §2) : elle ne regarde pas
++    la disponibilité d'un relecteur — un relecteur peut revenir, et la
++    relecture croisée joue au moment voulu — mais seulement l'impossibilité de
++    principe d'une relecture par une autre famille (mesh mono-famille). Elle ne
++    mord donc que sur un lot marqué. Sans registre lisible, ou sans harnais
++    connu pour le preneur, on refuse (doute -> sensible).
++    """
++    mine = str((agent or {}).get("harness") or "").strip().lower()
++    if not mine:
++        return False
++    name = (agent or {}).get("name") or ""
++    for row in others or ():
++        if (row.get("name") or "") == name:
++            continue
++        harness = str(row.get("harness") or "").strip().lower()
++        if harness and harness != mine:
++            return True
++    return False
++
++
++def fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
++         others=None) -> bool:
++    """L'élément correspond-il à l'équipe et aux capacités de l'agent ?
++
++    `others` : les lignes du registre, pour la garde structurelle de classe
++    (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
++    """
+     if auditor and not auditor_may_take(item, agent["name"], card):
+         return False
+     team = (item.get("team") or "").strip()
+     if team and team != (agent.get("team") or "").strip():
+         return False
+     required = set(item.get("required_capabilities") or ())
+-    return required <= set(agent.get("capabilities") or ())
++    if not required <= set(agent.get("capabilities") or ()):
++        return False
++    return not declared_class(item) or other_family_available(agent, others)
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -312,9 +358,14 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
+     return bool((item.get("lot_team") or "").strip())
+ 
+ 
+-def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
++def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
++             others=None) -> bool:
+     """Le lot est-il de l'équipe de l'agent, et l'agent sait-il le faire ?
+-    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent."""
++    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent.
++
++    `others` : les lignes du registre, pour la garde structurelle de classe
++    (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
++    """
+     if auditor and not auditor_may_take(item, agent["name"], card):
+         return False
+     team = (agent.get("team") or "").strip()
+@@ -323,7 +374,9 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bo
+     have = set(agent.get("capabilities") or ())
+     if agent.get("harness"):
+         have.add("%s%s" % (HARNESS_PREFIX, agent["harness"]))
+-    return set(item.get("required_capabilities") or ()) <= have
++    if not set(item.get("required_capabilities") or ()) <= have:
++        return False
++    return not declared_class(item) or other_family_available(agent, others)
+ 
+ 
+ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
+@@ -451,7 +504,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
+             auditors = auditor_mod.cards([agent], canons)
+             for item in list(lots):
+                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
+-                                card=auditors.get(row["name"])):
++                                card=auditors.get(row["name"]), others=listing):
+                     continue
+                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
+                                                orchestras)
+@@ -505,7 +558,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
+         auditors = auditor_mod.cards([agent], canons)
+         for item in list(queue):
+             if not fits(item, agent, auditor=row["name"] in auditors,
+-                        card=auditors.get(row["name"])):
++                        card=auditors.get(row["name"]), others=listing):
+                 continue
+             if dry_run:
+                 taken.append({"item": item, "agent": row["name"], "message_id": None,
+diff --git a/src/ameesh/canon.py b/src/ameesh/canon.py
+index 7769619ee..8bf52c366 100644
+--- a/src/ameesh/canon.py
++++ b/src/ameesh/canon.py
+@@ -2547,6 +2547,24 @@ class _Loader:
+             deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
+             superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
+ 
++    def _roles(self, fiche: Fiche, where: dict, subject: dict) -> list[str] | None:
++        """L244 (#420) : les rôles déclarés d'une fiche Agent/Persona.
++
++        Lus sous `roles` (liste ou chaîne), ou `role` au singulier ; normalisés
++        en minuscules, sans blanc ni doublon : le garde SQL du verdict QA les
++        compare tels quels au registre. `roles: [QA]` vaut `['qa']`."""
++        roles = self._list(fiche, "roles", where, "agent-roles-invalid", **subject)
++        if roles is None:
++            roles = self._list(fiche, "role", where, "agent-roles-invalid", **subject)
++        if roles is None:
++            return None
++        out: list[str] = []
++        for role in roles:
++            name = role.strip().lower()
++            if name and name not in out:
++                out.append(name)
++        return out
++
+     def _build_agent(self, fiche: Fiche, where: dict) -> None:
+         subject = {"agent": fiche.title}
+         budget = fiche.data.get("budget_usd_per_day")
+@@ -2616,7 +2634,7 @@ class _Loader:
+             memory_repository=memory_repository,
+             fiche=fiche,
+             harnesses=harnesses,
+-            roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
++            roles=self._roles(fiche, where, subject),
+             projects=projects,
+         ))
+ 
+diff --git a/src/ameesh/canon_sync.py b/src/ameesh/canon_sync.py
+index c764942fc..8fb8a7321 100644
+--- a/src/ameesh/canon_sync.py
++++ b/src/ameesh/canon_sync.py
+@@ -156,7 +156,11 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
+                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
+                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
+                "visibility_ok", "visibility_diagnostic",
+-               "placement_ok", "placement_diagnostic", "placement_ref", "projects")
++               "placement_ok", "placement_diagnostic", "placement_ref", "projects",
++               # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
++               # persistés pour le garde SQL du rôle QA. Le vocabulaire est
++               # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
++               "roles")
+ 
+ #: statuts de `canon_state` (0008)
+ CANON_OK = "ok"
+@@ -1128,7 +1132,7 @@ def _same(row: dict, values: dict) -> bool:
+         if key == "budget_usd":
+             old = None if old is None else float(old)
+             new = None if new is None else float(new)
+-        if key in ("capabilities", "projects"):
++        if key in ("capabilities", "projects", "roles"):
+             old = None if old is None else list(old)
+         if old != new:
+             return False
+@@ -1265,6 +1269,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
+             # stays the primary one for the readers of a single project
+             "team": agent.team,
+             "projects": agent.effective_projects,
++            # L244 (#420): les rôles déclarés, vocable des fiches (L242c, #414),
++            # pour que le garde SQL du verdict QA les lise au registre.
++            "roles": agent.roles,
+             "provider": agent.provider,
+             "credential_mode": admission.credential_mode or agent.credential_mode,
+             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute
+diff --git a/src/ameesh/cost.py b/src/ameesh/cost.py
+index 09c528c5c..bb123e3ab 100644
+--- a/src/ameesh/cost.py
++++ b/src/ameesh/cost.py
+@@ -839,9 +839,10 @@ class CostBook:
+         # comptes déclarés (`accounts.pause_label`) ; sans compte déclaré,
+         # c'est le compte par défaut du harnais. #373 r2 : la pause dure
+         # jusqu'à la libération la plus tardive des fenêtres qui bloquent —
+-        # aucune date si l'une d'elles n'est pas datée. #777 : la libération
+-        # est l'heure où le rythme rattrape l'usage (`free_at`), pas la remise
+-        # à zéro, sauf pour un usage que le rythme ne rattrape plus.
++        # aucune date si l'une d'elles n'est pas datée. #777, #898 : la
++        # libération est l'heure où le rythme rattrape l'usage (`free_at`),
++        # pas la remise à zéro, sauf pour un usage que le rythme ne rattrape
++        # plus.
+         head = ""
+         if all(gauge.resets_at for gauge in held):
+             free, gauge = max(((float(g.free_at(now, reserve)), g) for g in held),
+diff --git a/src/ameesh/handoff.py b/src/ameesh/handoff.py
+index 4042f02d2..331e2f612 100644
+--- a/src/ameesh/handoff.py
++++ b/src/ameesh/handoff.py
+@@ -367,7 +367,8 @@ def budget_handoff(cfg, db, *, now: float | None = None,
+                 if not backlog.lot_fits(dict(item, lot_team=project),
+                                         dict(agent, team=project),
+                                         auditor=row["name"] in auditors,
+-                                        card=auditors.get(row["name"])):
++                                        card=auditors.get(row["name"]),
++                                        others=listing):
+                     continue
+                 target = row
+                 break
+diff --git a/src/ameesh/identity.py b/src/ameesh/identity.py
+index a7cee6583..6770ff766 100644
+--- a/src/ameesh/identity.py
++++ b/src/ameesh/identity.py
+@@ -135,6 +135,31 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
+     return Binding(name=name, source="explicit", ok=True)
+ 
+ 
++#: L244 (#420) : sources acceptées pour signer un geste de droits — le bail du
++#: runner (le plus fort), ou une liaison de session explicite (L41). Une simple
++#: variable `AGENT_MAIL_NAME` (source `explicit`) est auto-déclarée.
++BOUND_SOURCES = ("runner", "session")
++
++
++def require_bound(cfg: Config, db=None, *, what: str = "this command",
++                  sources: tuple[str, ...] = BOUND_SOURCES) -> Binding:
++    """L'identité liée qu'exige un geste de droits (L244, #420).
++
++    Refuse une identité absente, un bail qui ne correspond pas, ou une source
++    seulement explicite : une signature de droits ne se contente pas d'un nom
++    auto-déclaré."""
++    binding = resolve_binding(cfg, db)
++    if not binding.name or not binding.ok or binding.source not in sources:
++        if binding.name and not binding.ok:
++            reason = binding.reason or "identity does not match a live lease"
++        elif binding.name:
++            reason = "identity %s is %s, not bound" % (binding.name, binding.source)
++        else:
++            reason = binding.reason or "no bound session identity"
++        raise ValueError("%s requires a bound session identity (%s)" % (what, reason))
++    return binding
++
++
+ _UNBOUND = ("AGENT_MAIL_NAME not set (the runner sets it for the harness) and no "
+             "session binding (ameesh mail bind)")
+ 
+diff --git a/src/ameesh/migrations/0427_qa_role_guard.sql b/src/ameesh/migrations/0427_qa_role_guard.sql
+new file mode 100644
+index 000000000..57ecf8e73
+--- /dev/null
++++ b/src/ameesh/migrations/0427_qa_role_guard.sql
+@@ -0,0 +1,316 @@
++-- SPDX-License-Identifier: AGPL-3.0-only
++-- L244 (#420) : le rôle QA et son verdict dans la porte des releases IT.
++--
++-- Le module IT déclare une évidence `qa` (writer_role `ameesh_it_qa`,
++-- actor_role `qa`) : le garde SQL vérifie que l'acteur tient le rôle `qa` pour
++-- le projet du lot (registre lu sous verrou partagé) et qu'il diffère de
++-- l'assigne, de l'auteur de la livraison et de celui de la preuve
++-- (séparation des devoirs, refus `qa-same-actor`). Une règle `require_qa`
++-- optionnelle exige un verdict `ok` **dernier** lié à la livraison courante
++-- pour les états qu'elle garde : un `blocked` ferme la porte jusqu'à un `ok`
++-- ultérieur (R2 #420, B1).
++--
++-- R2 #420 (B2) : le garde lit la fiche de l'acteur par `ameesh_module_agent`,
++-- une fonction SECURITY DEFINER à search_path figé. Un rôle isolé qui n'a que
++-- SELECT (`ameesh_it_qa`) ne peut pas prendre lui-même le verrou `FOR SHARE`,
++-- qui exige UPDATE ; cette fonction le fait pour lui, sans lui donner de
++-- droits d'écriture sur le registre.
++--
++-- R2 #420 (B3) : la séparation des devoirs est revérifiée à la porte, et les
++-- preuves d'un projet gardé par `require_qa` doivent être attribuables à un
++-- agent lié à son exécuteur (`runner_bound_actor`) : l'assistant sudo écrivait
++-- `uid:<SUDO_UID>`, jamais un nom d'agent, ce qui rendait le contrôle
++-- inopérant en production.
++
++-- Les rôles déclarés d'une fiche Agent/Persona (`roles:`), comme `projects`
++-- (0388) : `canon sync` les écrit, le garde SQL les lit.
++alter table agent_registry add column if not exists roles text[];
++
++-- --------------------------------------------------------------------------
++-- Lecture du registre pour les rôles isolés (R2 #420, B2)
++-- --------------------------------------------------------------------------
++-- Le garde lit la fiche sous verrou partagé. `FOR SHARE` exige UPDATE sur la
++-- table : un rôle isolé qui n'a que SELECT ne peut pas le prendre. Cette
++-- fonction, exécutée par le propriétaire du schéma avec le search_path figé
++-- de la migration, fait la lecture pour lui. EXECUTE est retiré à PUBLIC :
++-- seuls les rôles écrivains du module (et le propriétaire) l'appellent.
++create or replace function ameesh_module_agent(p_name text)
++returns table (roles text[], projects text[], team text,
++               lease_owner text, lease_epoch bigint)
++language plpgsql security definer set search_path from current as $$
++begin
++    return query
++        select a.roles, a.projects, a.team, a.lease_owner, a.lease_epoch
++          from agent_registry a
++         where a.name = p_name
++           for share;
++end $$;
++
++revoke all on function ameesh_module_agent(text) from public;
++do $$
++declare
++    role_name text;
++begin
++    foreach role_name in array array['ameesh_it_qa', 'ameesh_it_proof'] loop
++        if exists (select 1 from pg_roles where rolname = role_name) then
++            execute format('grant execute on function ameesh_module_agent(text) to %I',
++                           role_name);
++        end if;
++    end loop;
++end $$;
++
++-- La règle d'évidence accepte une valeur de verdict (`evidence_verdict`) : le
++-- `qa` du module IT n'est satisfait que par un verdict `ok`, un verdict
++-- `blocked` laisse la porte fermée.
++create or replace function ameesh_module_requirements(item work_items, target_state text,
++    milestone_kind text, milestone_verdict text) returns void language plpgsql as $$
++declare
++    project_name text := coalesce(nullif(item.app, ''), item.workstream, '');
++    policy record;
++    requirement jsonb;
++    definition jsonb;
++    current_subject record;
++    evidence_verdict text;
++    evidence_actor text;
++    declaration_actor text;
++    duties jsonb;
++    admitted boolean := item.type in ('bug', 'evolution', 'improvement');
++begin
++    if exists (select 1 from project_modules where project = project_name) then
++        perform pg_advisory_xact_lock_shared(hashtext('ameesh-module-project'), hashtext(project_name));
++    end if;
++    for policy in select * from project_modules where project = project_name loop
++        if policy.types ? item.type then admitted := true; end if;
++        for requirement in select value from jsonb_array_elements(policy.rules) loop
++            if not (requirement->'types' ? item.type) then continue; end if;
++            if not (coalesce(requirement->'states' ? target_state, false)
++                or coalesce(requirement->'milestones'->milestone_kind ? milestone_verdict, false))
++                then continue; end if;
++            select id, subject, actor into current_subject from work_module_milestones
++                where work_item_id = item.id and module = policy.module
++                  and kind = requirement->>'subject_kind' order by id desc limit 1;
++            if not found then
++                raise exception 'AMEESH_MODULE_RULE: module %: lot % lacks current % milestone',
++                    policy.module, item.id, requirement->>'subject_kind';
++            end if;
++            -- Le DERNIER verdict de la livraison courante décide (R2 #420, B1) :
++            -- un `ok` suivi d'un `blocked` referme la porte, l'audit
++            -- `missing_qa` lit la même ligne.
++            select e.payload->>'verdict', e.actor into evidence_verdict, evidence_actor
++                from work_module_milestones e
++                where e.work_item_id = item.id and e.module = policy.module
++                  and e.kind = requirement->>'evidence_kind'
++                  and e.subject = current_subject.subject
++                  and e.binding_id = current_subject.id
++                order by e.id desc limit 1;
++            if not found then
++                raise exception 'AMEESH_MODULE_RULE: module %: lot % lacks % for current subject %',
++                    policy.module, item.id, requirement->>'evidence_kind', current_subject.subject;
++            end if;
++            if requirement->>'evidence_verdict' is not null
++                and evidence_verdict is distinct from requirement->>'evidence_verdict' then
++                raise exception 'AMEESH_MODULE_RULE: module %: lot % lacks % verdict % for current subject % (last verdict: %)',
++                    policy.module, item.id, requirement->>'evidence_kind',
++                    requirement->>'evidence_verdict', current_subject.subject,
++                    coalesce(evidence_verdict, 'none');
++            end if;
++            -- R2 #420 (B3) : la séparation des devoirs est revérifiée ici, à
++            -- chaque passage de porte, et pas seulement à l'écriture du
++            -- verdict. Une preuve écrite après le verdict ne peut donc plus
++            -- libérer son auteur.
++            definition := policy.schemas->(requirement->>'evidence_kind');
++            if definition ? 'separation_of_duties' then
++                duties := definition->'separation_of_duties';
++                if coalesce((duties->>'assignee')::boolean, false)
++                    and evidence_actor = item.assignee then
++                    raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the lot assignee cannot record this milestone',
++                        policy.module, requirement->>'evidence_kind';
++                end if;
++                if coalesce((duties->>'declaration')::boolean, false) then
++                    declaration_actor := current_subject.actor;
++                    if declaration_actor = evidence_actor then
++                        raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the delivery author cannot record this milestone',
++                            policy.module, requirement->>'evidence_kind';
++                    end if;
++                end if;
++                if duties ? 'evidence' then
++                    perform 1 from work_module_milestones p
++                        where p.work_item_id = item.id and p.module = policy.module
++                          and p.kind = duties->>'evidence'
++                          and p.subject = current_subject.subject
++                          and p.binding_id = current_subject.id
++                          and p.actor = evidence_actor;
++                    if found then
++                        raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the evidence author cannot record this milestone',
++                            policy.module, requirement->>'evidence_kind';
++                    end if;
++                end if;
++            end if;
++        end loop;
++    end loop;
++    if not admitted then
++        raise exception 'AMEESH_MODULE_RULE: work item type % has no active module in project %',
++            item.type, project_name;
++    end if;
++end $$;
++
++-- Le garde d'évidence gagne deux contrôles déclarés par le schéma du module :
++--   actor_role            : l'acteur tient ce rôle au registre, pour ce projet ;
++--   separation_of_duties  : l'acteur diffère de l'assigne, de l'auteur de la
++--                           déclaration liée et de l'auteur de l'évidence nommée;
++--   runner_bound_actor    : l'acteur est un agent lié à son exécuteur (le
++--                           payload porte `agent`, `runner_id`, `lease_epoch`).
++create or replace function ameesh_module_milestone_guard() returns trigger language plpgsql as $$
++declare
++    item work_items;
++    policy record;
++    definition jsonb;
++    field text;
++    condition record;
++    binding record;
++    actor_row record;
++    actor_projects text[];
++    lot_project text;
++    duties jsonb;
++    other_actor text;
++begin
++    if TG_OP <> 'INSERT' then raise exception 'module milestones are append-only'; end if;
++    select * into item from work_items where id = NEW.work_item_id for no key update;
++    if not found then raise exception 'work item does not exist'; end if;
++    perform ameesh_module_requirements(item, null, null, null);
++    select * into policy from project_modules
++        where project = coalesce(nullif(item.app,''), item.workstream, '') and module = NEW.module;
++    if not found or not (policy.types ? item.type) then
++        raise exception 'module % is not active for this work item type', NEW.module;
++    end if;
++    definition := policy.schemas->NEW.kind;
++    if definition is null then raise exception 'unknown module milestone %', NEW.kind; end if;
++    if definition ? 'writer_role' and not ameesh_module_writer(definition->>'writer_role') then
++        raise exception 'module evidence requires the isolated writer role';
++    end if;
++    for field in select jsonb_array_elements_text(coalesce(definition->'strings','[]')) loop
++        if jsonb_typeof(NEW.payload->field) is distinct from 'string'
++            or btrim(NEW.payload->>field) = '' then
++            raise exception 'module milestone field % must be a nonempty string', field;
++        end if;
++    end loop;
++    for field in select jsonb_array_elements_text(coalesce(definition->'arrays','[]')) loop
++        if jsonb_typeof(NEW.payload->field) is distinct from 'array'
++            or NEW.payload->field = '[]'::jsonb then
++            raise exception 'module milestone field % must be a nonempty array', field;
++        end if;
++    end loop;
++    for condition in select * from jsonb_each(coalesce(definition->'equals','{}')) loop
++        if NEW.payload->condition.key is distinct from condition.value then
++            raise exception 'module milestone field % violates its schema', condition.key;
++        end if;
++    end loop;
++    for condition in select * from jsonb_each_text(coalesce(definition->'patterns','{}')) loop
++        if (NEW.payload->>condition.key) is null
++            or not ((NEW.payload->>condition.key) ~ condition.value) then
++            raise exception 'module milestone field % violates its pattern', condition.key;
++        end if;
++    end loop;
++    if definition ? 'subject_field' and
++        (NEW.payload->>(definition->>'subject_field')) is distinct from NEW.subject then
++        raise exception 'module milestone subject does not match its payload';
++    end if;
++    if definition ? 'binding_kind' then
++        select id, subject into binding from work_module_milestones
++            where work_item_id = NEW.work_item_id and module = NEW.module
++              and kind = definition->>'binding_kind' order by id desc limit 1;
++        if not found or NEW.binding_id is distinct from binding.id
++            or NEW.subject is distinct from binding.subject then
++            raise exception 'module milestone does not match the current subject declaration';
++        end if;
++    elsif NEW.binding_id is not null then
++        raise exception 'this module milestone has no binding';
++    end if;
++    if definition ? 'actor_role' then
++        select a.roles, a.projects, a.team into actor_row
++            from ameesh_module_agent(NEW.actor) a;
++        if not found then
++            raise exception 'AMEESH_MODULE_RULE: module %: %-role-required: actor % is not a registered agent',
++                NEW.module, NEW.kind, NEW.actor;
++        end if;
++        if not (definition->>'actor_role' = any(coalesce(actor_row.roles, '{}'::text[]))) then
++            raise exception 'AMEESH_MODULE_RULE: module %: %-role-required: actor % does not hold role %',
++                NEW.module, NEW.kind, NEW.actor, definition->>'actor_role';
++        end if;
++        -- Un agent sans identité de projet est global ; sinon le lot doit être
++        -- l'un de ses projets (le premier de la fiche étant le projet principal).
++        actor_projects := coalesce(actor_row.projects,
++            case when coalesce(actor_row.team, '') = '' then '{}'::text[]
++                 else array[actor_row.team] end);
++        lot_project := coalesce(nullif(item.app, ''), item.workstream, '');
++        if cardinality(actor_projects) > 0 and not (lot_project = any(actor_projects)) then
++            raise exception 'AMEESH_MODULE_RULE: module %: %-role-scope: actor % does not hold role % for project %',
++                NEW.module, NEW.kind, NEW.actor, definition->>'actor_role', lot_project;
++        end if;
++    end if;
++    -- R2 #420 (B3) : une preuve attribuable. L'assistant sudo écrivait
++    -- `uid:<SUDO_UID>` ; un projet gardé par `require_qa` déclare
++    -- `runner_bound_actor` et exige l'agent lié à son exécuteur.
++    if coalesce((definition->>'runner_bound_actor')::boolean, false) then
++        if jsonb_typeof(NEW.payload->'agent') is distinct from 'string'
++            or NEW.payload->>'agent' is distinct from NEW.actor
++            or jsonb_typeof(NEW.payload->'runner_id') is distinct from 'string'
++            or btrim(NEW.payload->>'runner_id') = ''
++            or jsonb_typeof(NEW.payload->'lease_epoch') is distinct from 'number' then
++            raise exception 'AMEESH_MODULE_RULE: module %: %-identity-required: the actor must name the runner-bound agent',
++                NEW.module, NEW.kind;
++        end if;
++        select a.lease_owner, a.lease_epoch into actor_row
++            from ameesh_module_agent(NEW.actor) a;
++        if not found
++            or actor_row.lease_owner is distinct from NEW.payload->>'runner_id'
++            or actor_row.lease_epoch is distinct from (NEW.payload->>'lease_epoch')::bigint then
++            raise exception 'AMEESH_MODULE_RULE: module %: %-identity-unbound: actor % is not bound to runner %',
++                NEW.module, NEW.kind, NEW.actor, NEW.payload->>'runner_id';
++        end if;
++    end if;
++    if definition ? 'separation_of_duties' then
++        duties := definition->'separation_of_duties';
++        if coalesce((duties->>'assignee')::boolean, false) and NEW.actor = item.assignee then
++            raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the lot assignee cannot record this milestone',
++                NEW.module, NEW.kind;
++        end if;
++        if coalesce((duties->>'declaration')::boolean, false) then
++            select actor into other_actor from work_module_milestones where id = NEW.binding_id;
++            if other_actor = NEW.actor then
++                raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the delivery author cannot record this milestone',
++                    NEW.module, NEW.kind;
++            end if;
++        end if;
++        if duties ? 'evidence' then
++            -- Tout auteur d'une preuve liée à la livraison courante, pas
++            -- seulement la dernière : une preuve réécrite par un autre ne
++            -- rend pas l'auteur initial indépendant de sa propre exécution.
++            perform 1 from work_module_milestones
++                where work_item_id = NEW.work_item_id and module = NEW.module
++                  and kind = duties->>'evidence' and subject = NEW.subject
++                  and binding_id = NEW.binding_id and actor = NEW.actor;
++            if found then
++                raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the evidence author cannot record this milestone',
++                    NEW.module, NEW.kind;
++            end if;
++        end if;
++    end if;
++    -- R2 #420 (B3) : symétrie. Un acteur qui a déjà signé le verdict QA de
++    -- cette livraison ne peut pas écrire ensuite la preuve nommée par la
++    -- séparation des devoirs (et réciproquement le cas est couvert plus haut).
++    if NEW.binding_id is not null then
++        for condition in select key as kind from jsonb_each(policy.schemas)
++            where value->'separation_of_duties'->>'evidence' = NEW.kind loop
++            perform 1 from work_module_milestones
++                where work_item_id = NEW.work_item_id and module = NEW.module
++                  and kind = condition.kind and binding_id = NEW.binding_id
++                  and subject = NEW.subject and actor = NEW.actor;
++            if found then
++                raise exception 'AMEESH_MODULE_RULE: module %: %-same-actor: the QA verdict author cannot record this evidence',
++                    NEW.module, condition.kind;
++            end if;
++        end loop;
++    end if;
++    return NEW;
++end $$;
+diff --git a/src/ameesh/modules/__init__.py b/src/ameesh/modules/__init__.py
+index 28cba9f83..d5c829ce1 100644
+--- a/src/ameesh/modules/__init__.py
++++ b/src/ameesh/modules/__init__.py
+@@ -34,16 +34,35 @@ def declarations(federation):
+             raise ValueError("invalid module project: %r" % (project,))
+         if not isinstance(spec, dict) or set(spec) - {"modules"}:
+             raise ValueError("project %s expects {modules: [installed names]}" % project)
++        # L244 (#420): a project may pass options to a module, either as
++        # `modules: [it]` (no option) or `modules: {it: {require_qa: [promoted]}}`.
+         modules = spec.get("modules", [])
+-        if not isinstance(modules, list) or any(not isinstance(m, str) for m in modules):
+-            raise ValueError("project %s modules must be a list of installed names" % project)
+-        if len(set(modules)) != len(modules):
+-            raise ValueError("duplicate modules for project %s" % project)
++        if isinstance(modules, list):
++            if any(not isinstance(m, str) for m in modules):
++                raise ValueError("project %s modules must be a list of installed names" % project)
++            if len(set(modules)) != len(modules):
++                raise ValueError("duplicate modules for project %s" % project)
++            options = {name: {} for name in modules}
++        elif isinstance(modules, dict):
++            options = {}
++            for name, module_options in modules.items():
++                if not isinstance(name, str):
++                    raise ValueError("project %s modules must be a list of installed names "
++                                     "or a {name: options} mapping" % project)
++                if module_options is None:
++                    module_options = {}
++                if not isinstance(module_options, dict):
++                    raise ValueError("project %s module %s options must be a mapping"
++                                     % (project, name))
++                options[name] = module_options
++        else:
++            raise ValueError("project %s modules must be a list of installed names "
++                             "or a {name: options} mapping" % project)
+         seen_types = set()
+-        for name in modules:
++        for name, module_options in options.items():
+             if name not in registry:
+                 raise ValueError("unknown installed module: %s" % name)
+-            descriptor = registry[name].descriptor()
++            descriptor = registry[name].descriptor(module_options)
+             if seen_types.intersection(descriptor["types"]):
+                 raise ValueError("conflicting module types for project %s" % project)
+             seen_types.update(descriptor["types"])
+diff --git a/src/ameesh/modules/it/__init__.py b/src/ameesh/modules/it/__init__.py
+index 65e45f7c1..1e230804e 100644
+--- a/src/ameesh/modules/it/__init__.py
++++ b/src/ameesh/modules/it/__init__.py
+@@ -5,22 +5,63 @@ from __future__ import annotations
+ NAME = "it"
+ TYPES = ("release", "publication")
+ 
++#: L244 (#420) : états de cycle de vie qu'une règle `require_qa` peut garder.
++QA_STATES = ("merged", "promoted")
+ 
+-def descriptor():
++
++def descriptor(options=None):
++    """L244 : `options` porte `require_qa` (états gardés par un verdict QA `ok`)."""
++    options = dict(options or {})
++    require_qa = options.pop("require_qa", None)
++    if options:
++        raise ValueError("unknown IT module option(s): %s" % ", ".join(sorted(options)))
++    if require_qa is not None:
++        if not isinstance(require_qa, list) or any(not isinstance(s, str) for s in require_qa):
++            raise ValueError("it.require_qa must be a list of lifecycle states")
++        if len(set(require_qa)) != len(require_qa):
++            raise ValueError("it.require_qa: duplicate state")
++        for state in require_qa:
++            if state not in QA_STATES:
++                raise ValueError("it.require_qa: state %r cannot require QA (choose from %s)"
++                                 % (state, ", ".join(QA_STATES)))
++    rules = [{"types": list(TYPES), "states": ["merged", "promoted"],
++              "milestones": {"verdict": ["ok"]},
++              "subject_kind": "delivery", "evidence_kind": "proof"}]
++    schemas = {
++        "delivery": {"strings": ["artifact", "sha256"], "subject_field": "sha256",
++                     "patterns": {"sha256": "^[0-9a-f]{64}$"}},
++        "proof": {"strings": ["artifact", "sha256", "output"],
++                  "arrays": ["command"], "equals": {"exit_code": 0},
++                  "subject_field": "sha256", "binding_kind": "delivery",
++                  "writer_role": "ameesh_it_proof",
++                  "patterns": {"sha256": "^[0-9a-f]{64}$"}},
++        "qa": {"strings": ["sha256", "verdict", "report"],
++               "arrays": ["scope"],
++               "patterns": {"sha256": "^[0-9a-f]{64}$", "verdict": "^(ok|blocked)$"},
++               "subject_field": "sha256", "binding_kind": "delivery",
++               "writer_role": "ameesh_it_qa",
++               # L244 : le verdict vient d'un porteur du rôle `qa`, distinct
++               # de l'assigne, de l'auteur de la livraison et de celui de la
++               # preuve (séparation des devoirs, refus `qa-same-actor`).
++               "actor_role": "qa",
++               "separation_of_duties": {"assignee": True, "declaration": True,
++                                        "evidence": "proof"}},
++    }
++    if require_qa:
++        # The gate reads the current delivery and demands a matching QA verdict
++        # `ok`; a `blocked` verdict or an older delivery keeps it closed.
++        rules.append({"types": list(TYPES), "states": list(require_qa),
++                      "subject_kind": "delivery", "evidence_kind": "qa",
++                      "evidence_verdict": "ok"})
++        # R2 #420 (B3) : la séparation d'avec l'auteur de la preuve n'a de sens
++        # que si la preuve est attribuable. L'assistant sudo écrivait
++        # `uid:<SUDO_UID>` : un projet gardé par `require_qa` exige donc une
++        # preuve signée par l'agent lié à son exécuteur.
++        schemas["proof"]["runner_bound_actor"] = True
+     return {
+         "types": list(TYPES),
+-        "schemas": {
+-            "delivery": {"strings": ["artifact", "sha256"], "subject_field": "sha256",
+-                         "patterns": {"sha256": "^[0-9a-f]{64}$"}},
+-            "proof": {"strings": ["artifact", "sha256", "output"],
+-                      "arrays": ["command"], "equals": {"exit_code": 0},
+-                      "subject_field": "sha256", "binding_kind": "delivery",
+-                      "writer_role": "ameesh_it_proof",
+-                      "patterns": {"sha256": "^[0-9a-f]{64}$"}},
+-        },
+-        "rules": [{"types": list(TYPES), "states": ["merged", "promoted"],
+-                   "milestones": {"verdict": ["ok"]},
+-                   "subject_kind": "delivery", "evidence_kind": "proof"}],
++        "schemas": schemas,
++        "rules": rules,
+     }
+ 
+ 
+@@ -46,7 +87,7 @@ def declare(db, item_id, artifact, *, actor):
+ 
+ 
+ def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60, execution_user=None,
+-          snapshot_root=None, snapshot_limits=None):
++          snapshot_root=None, snapshot_limits=None, identity=None, invoker=None):
+     from .execution import execute
+     from ..storage import ModuleStore
+     item(db, item_id)
+@@ -59,11 +100,39 @@ def prove(db, item_id, artifact, *, actor, runner=None, arguments=(), timeout=60
+                        expected_sha=delivery["subject"], snapshot_limits=snapshot_limits)
+     if evidence["sha256"] != delivery["subject"]:
+         raise ValueError("executed artifact differs from the declared delivery")
++    # R2 #420 (B3) : l'identité liée de l'agent demandeur, pour que la preuve
++    # soit attribuable (la séparation des devoirs du verdict QA la compare) ;
++    # `invoker` garde la trace de l'uid qui a demandé l'exécution.
++    if identity:
++        evidence.update(identity)
++    if invoker:
++        evidence["invoker"] = invoker
+     # The database rechecks this exact declaration under the item lock.
+     return store.record(item_id, NAME, "proof", evidence["sha256"], evidence,
+                         actor=actor, binding_id=delivery["id"])
+ 
+ 
++def record_qa(db, item_id, *, sha256, verdict, scope, report, actor):
++    """L244 (#420): le verdict QA d'un porteur du rôle `qa`, lié à la livraison courante.
++
++    Le contrôle de rôle et la séparation des devoirs sont faits par le garde SQL
++    (sous le verrou du lot), pas ici : cette fonction ne fait que valider la
++    forme et la liaison à la déclaration courante."""
++    from ..storage import ModuleStore
++    item(db, item_id)
++    store = ModuleStore(db)
++    delivery = store.latest(item_id, NAME, "delivery")
++    if delivery is None:
++        raise ValueError("declare the delivered artifact before recording its QA")
++    if sha256 != delivery["subject"]:
++        raise ValueError("QA digest differs from the current delivery; "
++                         "declare or prove that artifact first")
++    payload = {"sha256": sha256, "verdict": verdict, "scope": [s for s in scope if s],
++               "report": report}
++    return store.record(item_id, NAME, "qa", sha256, payload,
++                        actor=actor, binding_id=delivery["id"])
++
++
+ def main(db, argv, *, actor):
+     import argparse
+     import json
+@@ -79,6 +148,12 @@ def main(db, argv, *, actor):
+         if name == "proof":
+             command.add_argument("--runner", help="optional interpreter/compatibility executable")
+             command.add_argument("--timeout", type=float, default=60)
++    qa = sub.add_parser("qa")
++    qa.add_argument("lot", type=int)
++    qa.add_argument("--sha256", required=True, help="digest of the delivered artifact")
++    qa.add_argument("--verdict", required=True, choices=("ok", "blocked"))
++    qa.add_argument("--scope", default="", help="what was exercised, comma-separated")
++    qa.add_argument("--report", required=True, help="link to the QA report")
+     show = sub.add_parser("show")
+     show.add_argument("lot", type=int)
+     args = parser.parse_args(options)
+@@ -88,18 +163,47 @@ def main(db, argv, *, actor):
+         row = ModuleStore(db).milestones(args.lot)
+     elif args.operation == "delivery":
+         row = declare(db, args.lot, args.artifact, actor=actor)
++    elif args.operation == "qa":
++        # L244 (N2 #420) : une signature de droits exige une identité liée
++        # (bail du runner, ou liaison de session L41), jamais un nom seulement
++        # auto-déclaré par `AGENT_MAIL_NAME`.
++        from ... import config as config_mod, identity
++        binding = identity.require_bound(config_mod.load(), db, what="the QA verdict")
++        if actor and actor != binding.name:
++            raise ValueError("the QA verdict is signed by the bound session %s, not %s"
++                             % (binding.name, actor))
++        scope = [s.strip() for s in args.scope.split(",")]
++        row = record_qa(db, args.lot, sha256=args.sha256, verdict=args.verdict,
++                        scope=scope, report=args.report, actor=binding.name)
+     else:
++        from ... import config as config_mod, identity
+         from .proof_service import request
+         project_row = item(db, args.lot)
+         project = project_row.get("app") or project_row.get("workstream") or ""
++        # R2 #420 (B3) : le helper sudo ne voyait que `uid:<SUDO_UID>` ; l'agent
++        # demandeur est lié à son exécuteur, et cette identité part avec la
++        # demande d'exécution pour rendre la preuve attribuable.
++        binding = identity.require_bound(config_mod.load(), db, what="the IT proof",
++                                         sources=("runner",))
+         row = request(project, args.lot, args.artifact, runner=args.runner,
+-                      arguments=arguments, timeout=args.timeout)
++                      arguments=arguments, timeout=args.timeout,
++                      identity={"agent": binding.name, "runner_id": binding.runner_id,
++                                "lease_epoch": binding.epoch})
+     print(json.dumps(row, ensure_ascii=False, default=str))
+     return 0
+ 
+ 
++def _qa_states(policy):
++    """États gardés par une règle `require_qa` du module IT (L244)."""
++    states = []
++    for rule in (policy or {}).get("rules") or []:
++        if rule.get("evidence_kind") == "qa":
++            states.extend(rule.get("states") or [])
++    return sorted(set(states))
++
++
+ def audit(store, project):
+-    """Point 12: a release/publication without current execution evidence."""
++    """Point 12: execution evidence and, under `require_qa`, the QA verdict."""
+     out = []
+     for row in store.audit_evidence(project, NAME, TYPES, "delivery", "proof"):
+         if row["proved"]:
+@@ -119,4 +223,47 @@ def audit(store, project):
+                     "value": 1, "threshold": 0,
+                     "reason": "it:execution-proof:%s" % (declaration or "undeclared"),
+                     "detail": detail, "action": detail})
++    out.extend(_qa_findings(store, project))
++    return out
++
++
++def _qa_findings(store, project):
++    """L244: `missing_qa` (pas de verdict `ok` courant) et `stale_qa` (verdict lié à une
++    livraison antérieure), sur les seuls états gardés par `require_qa`."""
++    policy = store.policy(project, NAME)
++    states = _qa_states(policy)
++    if not states:
++        return []
++    out = []
++    for row in store.audit_qa(project, NAME, TYPES, "delivery", "qa", states):
++        if row["declaration_id"] is None:
++            continue  # la livraison manquante est déjà un constat execution-proof
++        evidence = row["evidence_id"]
++        if evidence is not None and row["evidence_binding"] == row["declaration_id"]:
++            if row["evidence_verdict"] == "ok":
++                continue
++            rule = "missing_qa"
++            detail = ("IT procedure deviation: QA verdict is %r for the current delivery of %s lot "
++                      "#%s in project %s; the gate stays closed until a QA holder records `ok` with "
++                      "ameesh module it qa."
++                      % (row["evidence_verdict"], row["type"], row["id"], project))
++        elif evidence is not None:
++            rule = "stale_qa"
++            detail = ("IT procedure deviation: QA verdict of %s lot #%s in project %s is bound to an "
++                      "earlier delivery; the current delivery needs its own verdict with ameesh "
++                      "module it qa." % (row["type"], row["id"], project))
++        else:
++            rule = "missing_qa"
++            detail = ("IT procedure deviation: %s lot #%s in project %s is in %s and requires QA for "
++                      "its current delivery; record the verdict with ameesh module it qa after real "
++                      "execution." % (row["type"], row["id"], project, row["state"]))
++        out.append({"type": "module_deviation", "module": NAME,
++                    "rule": rule, "project": project, "lot": row["id"],
++                    "title": row["title"], "agent": None, "assignee": row["assignee"],
++                    "lot_state": row["state"],
++                    "declaration_id": row["declaration_id"], "subject": row["subject"],
++                    "since": row["declaration_ts"] or row["created_ts"],
++                    "value": 1, "threshold": 0,
++                    "reason": "it:%s:%s" % (rule, row["declaration_id"]),
++                    "detail": detail, "action": detail})
+     return out
+diff --git a/src/ameesh/modules/it/proof_service.py b/src/ameesh/modules/it/proof_service.py
+index 97944e9e1..0f9699cfa 100644
+--- a/src/ameesh/modules/it/proof_service.py
++++ b/src/ameesh/modules/it/proof_service.py
+@@ -15,12 +15,16 @@ CONFIG_ROOT = "/etc/ameesh-it-proof"
+ MAX_REQUEST = 65536
+ 
+ 
+-def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
++def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60, identity=None):
+     runner_path = shutil.which(runner) if runner else None
+     if runner and runner_path is None:
+         raise ValueError("runner executable not found")
+     payload = dict(project=project, lot=int(lot), artifact=str(Path(artifact).absolute()),
+                    runner=runner_path, arguments=list(arguments), timeout=timeout)
++    # R2 #420 (B3) : l'agent demandeur, lié à son exécuteur, accompagne la
++    # demande ; le helper vérifie le bail et signe la preuve en son nom.
++    if identity:
++        payload.update(identity)
+     try:
+         result = subprocess.run(["sudo", "-n", HELPER],
+                                 input=json.dumps(payload), capture_output=True, text=True,
+@@ -37,10 +41,12 @@ def request(project, lot, artifact, *, runner=None, arguments=(), timeout=60):
+     return response["milestone"]
+ 
+ 
+-def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_root=None,
++def produce(db, payload, *, invoker, execution_user, allowed_runners=(), snapshot_root=None,
+             snapshot_limits=None):
+     from . import item, prove
+-    if not isinstance(payload, dict) or set(payload) != {
++    from ..storage import ModuleStore
++    identity_keys = {"agent", "runner_id", "lease_epoch"}
++    if not isinstance(payload, dict) or set(payload) - identity_keys != {
+             "project", "lot", "artifact", "runner", "arguments", "timeout"}:
+         raise ValueError("proof requests accept execution inputs only, never evidence")
+     if not isinstance(payload["artifact"], str) or not Path(payload["artifact"]).is_absolute():
+@@ -58,10 +64,34 @@ def produce(db, payload, *, actor, execution_user, allowed_runners=(), snapshot_
+     row = item(db, payload["lot"])
+     if (row.get("app") or row.get("workstream") or "") != payload["project"]:
+         raise ValueError("proof helper project does not own this lot")
+-    return prove(db, payload["lot"], payload["artifact"], actor=actor,
++    # R2 #420 (B3) : une preuve attribuable — l'agent lié à son exécuteur. Un
++    # projet gardé par `require_qa` l'exige ; sinon l'ancien `uid:<SUDO_UID>`
++    # reste permis.
++    agent = str(payload.get("agent") or "").strip()
++    identity = None
++    if agent:
++        epoch = payload.get("lease_epoch")
++        if (not str(payload.get("runner_id") or "").strip()
++                or not isinstance(epoch, int) or isinstance(epoch, bool)):
++            raise ValueError("proof identity: runner_id and lease_epoch are required with agent")
++        rows = db.query("SELECT lease_owner, lease_epoch FROM ameesh_module_agent(%s)", (agent,))
++        if not rows:
++            raise ValueError("proof identity: agent %r is not registered" % agent)
++        if (rows[0]["lease_owner"] != payload["runner_id"]
++                or int(rows[0]["lease_epoch"] or 0) != epoch):
++            raise ValueError("proof identity: agent %r is not bound to runner %r"
++                             % (agent, payload["runner_id"]))
++        identity = {"agent": agent, "runner_id": payload["runner_id"], "lease_epoch": epoch}
++    policy = ModuleStore(db).policy(payload["project"], "it")
++    gated = any((rule or {}).get("evidence_kind") == "qa"
++                for rule in (policy or {}).get("rules") or [])
++    if gated and not agent:
++        raise ValueError("this project requires QA: the proof must name the runner-bound agent")
++    return prove(db, payload["lot"], payload["artifact"], actor=agent or invoker,
+                  runner=payload["runner"], arguments=payload["arguments"],
+-                 timeout=float(payload["timeout"]), execution_user=execution_user, snapshot_root=snapshot_root,
+-                 snapshot_limits=snapshot_limits)
++                 timeout=float(payload["timeout"]), execution_user=execution_user,
++                 snapshot_root=snapshot_root, snapshot_limits=snapshot_limits,
++                 identity=identity, invoker=invoker)
+ 
+ 
+ def private_path(path, *, directory=False):
+@@ -109,7 +139,7 @@ def main():
+             "FROM pg_roles r WHERE r.rolname = current_user")
+         if not rows or rows[0]["unsafe"] or not rows[0]["writer"]:
+             raise ValueError("helper requires the isolated nonadministrative IT proof database role")
+-        result = produce(db, payload, actor="uid:%s" % os.environ.get("SUDO_UID", "0"),
++        result = produce(db, payload, invoker="uid:%s" % os.environ.get("SUDO_UID", "0"),
+                          execution_user=execution_user, allowed_runners=settings.get("runners", []),
+                          snapshot_root=snapshot_root, snapshot_limits=settings.get("snapshot_limits"))
+         print(json.dumps({"milestone": result}, default=str))
+diff --git a/src/ameesh/modules/storage.py b/src/ameesh/modules/storage.py
+index 55d6d151f..a55e1a62b 100644
+--- a/src/ameesh/modules/storage.py
++++ b/src/ameesh/modules/storage.py
+@@ -100,3 +100,38 @@ class ModuleStore:
+             "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
+             "AND w.state <> 'closed' ORDER BY w.id",
+             (evidence_kind, subject_kind, project, module, json.dumps(list(types))))
++
++    def policy(self, project, module):
++        """Installed policy of a project module, or None when it is not active."""
++        rows = self.db.query("SELECT project, module, canon, types, schemas, rules "
++                             "FROM project_modules WHERE project = %s AND module = %s",
++                             (project, module))
++        return rows[0] if rows else None
++
++    def audit_qa(self, project, module, types, subject_kind, evidence_kind, states):
++        """Current declaration and latest evidence of lots in the given states (L244).
++
++        One snapshot: a lot whose current declaration has no matching `ok`
++        evidence, or whose evidence is bound to an earlier declaration, is a
++        deviation the module decides how to report."""
++        return self.db.query(
++            "SELECT w.id, w.title, w.type, w.state, w.assignee, "
++            "extract(epoch from w.created_at)::float8 AS created_ts, "
++            "d.id AS declaration_id, d.subject, "
++            "extract(epoch from d.at)::float8 AS declaration_ts, "
++            "e.id AS evidence_id, e.binding_id AS evidence_binding, "
++            "e.payload->>'verdict' AS evidence_verdict "
++            "FROM work_items w JOIN project_modules p "
++            "ON p.project = coalesce(nullif(w.app, ''), w.workstream, '') "
++            "LEFT JOIN LATERAL (SELECT id, subject, at FROM work_module_milestones "
++            "WHERE work_item_id = w.id AND module = p.module AND kind = %s "
++            "ORDER BY id DESC LIMIT 1) d ON true "
++            "LEFT JOIN LATERAL (SELECT id, binding_id, payload FROM work_module_milestones "
++            "WHERE work_item_id = w.id AND module = p.module AND kind = %s "
++            "ORDER BY id DESC LIMIT 1) e ON true "
++            "WHERE p.project = %s AND p.module = %s "
++            "AND w.type IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
++            "AND w.state IN (SELECT jsonb_array_elements_text(%s::jsonb)) "
++            "ORDER BY w.id",
++            (subject_kind, evidence_kind, project, module,
++             json.dumps(list(types)), json.dumps(list(states))))
+diff --git a/src/ameesh/persona_sessions.py b/src/ameesh/persona_sessions.py
+index e01ae0c29..b48f9961e 100644
+--- a/src/ameesh/persona_sessions.py
++++ b/src/ameesh/persona_sessions.py
+@@ -23,9 +23,16 @@ def record_start(db, persona: str, session_id: str, *, account: str | None = Non
+     # One statement keeps replacement and insertion atomic on both drivers.
+     # Lock and read only the accepted registry session: an external hook may
+     # supply an ID that L36/L46 deliberately refuses to install.
++    # #1037 : le harnais de l'historique est celui de la SESSION (0384,
++    # `session_harness`, tenu égal à `session_origin` par déclencheur), pas le
++    # harnais déclaré de l'agent — L242b fait tourner un agent sous un harnais
++    # emprunté, et l'historique doit le dire.
+     _write(db, best_effort,
+         "WITH current_session AS ("
+-        "SELECT name AS persona, session_id, harness, host, session_account, session_work_item "
++        "SELECT name AS persona, session_id,"
++        "       CASE WHEN session_origin = session_id THEN coalesce(session_harness, harness)"
++        "            ELSE harness END AS harness,"
++        "       host, session_account, session_work_item "
+         "FROM agent_registry WHERE name = %s AND session_id = %s FOR UPDATE"
+         "), closed_sessions AS ("
+         "UPDATE persona_sessions AS history SET ended_at = now(), "
+diff --git a/src/ameesh/registry.py b/src/ameesh/registry.py
+index 3d3f87de1..93a76ac9d 100644
+--- a/src/ameesh/registry.py
++++ b/src/ameesh/registry.py
+@@ -111,6 +111,21 @@ def get(db: Db, name: str) -> dict | None:
+     return storage.of(db).agents.get(name)
+ 
+ 
++def live_harness(row: dict | None) -> str:
++    """#1037 : le harnais de la session VIVANTE d'un agent.
++
++    `session_harness` (0384) est le harnais d'ouverture de la session active,
++    tenu égal à `session_origin` par déclencheur ; `harness`, lui, est
++    DÉCLARÉ (canon, `agent-runner register`, `adopt`) et ne dit pas sous
++    lequel la session tourne (L242b : harnais emprunté). Sans session ouverte
++    — origine inconnue — le harnais déclaré reste le seul connu.
++
++    C'est ce que lit la porte §2 « autre famille de modèle » : la famille de
++    celui qui a réellement produit le travail, pas l'étiquette déclarée."""
++    row = row or {}
++    return str(row.get("session_harness") or row.get("harness") or "")
++
++
+ def overview(db: Db) -> list[dict]:
+     """Vue d'observabilité (`mesh list --json`).
+ 
+diff --git a/src/ameesh/reprise.py b/src/ameesh/reprise.py
+index d0baba18f..3f527f9ef 100644
+--- a/src/ameesh/reprise.py
++++ b/src/ameesh/reprise.py
+@@ -617,6 +617,21 @@ def _forget_local(cfg: Config, name: str) -> None:
+         pass
+ 
+ 
++#: #1037 : réglages locaux qui n'ont de sens que sous le harnais déclaré
++_HARNESS_SETTINGS = ("model", "effort", "tier")
++
++
++def _drop_harness_settings(cfg: Config, name: str) -> None:
++    """Efface les réglages locaux du harnais quitté (l'exécuteur les relit
++    avant les colonnes du registre : les garder ferait lancer le nouveau
++    harnais avec le modèle, l'effort ou le tier de l'ancien)."""
++    for cle in _HARNESS_SETTINGS:
++        try:
++            os.unlink(os.path.join(cfg.agent_dir(name), cle))
++        except OSError:
++            pass
++
++
+ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
+           account: str | None = None, cwd: str | None = None, brief: str = "",
+           chantier: str | None = None, force: bool = False, actor: str = "",
+@@ -735,6 +750,15 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
+         session_account=compte, prompt=prompt, status_text=status_text)
+     if result is None:
+         raise RepriseError("%s: a lease was taken in the meantime; try again" % name)
++    # #1037 : le harnais déclaré a changé — les réglages du précédent
++    # (modèle, effort, tier ; base et état local) ne s'appliquent plus. Le
++    # registre les a effacés dans la même écriture que le harnais ; l'état
++    # local est effacé ici (même hôte seulement : ailleurs, il n'existe pas).
++    quitte = str(result.get("previous_harness") or "")
++    if quitte and quitte != harness:
++        _drop_harness_settings(cfg, name)
++        constats.append("harness %s → %s: model, effort and tier of the former harness "
++                        "dropped (they do not apply to %s)" % (quitte, harness, harness))
+     _forget_local(cfg, name)
+     # L46 : l'agent adopté est mené par l'exécuteur — ses liaisons de session
+     # externes (L41) sont révoquées, sinon une session externe lui volerait
+diff --git a/src/ameesh/review_lot.py b/src/ameesh/review_lot.py
+index fd1abe06f..a1676abb7 100644
+--- a/src/ameesh/review_lot.py
++++ b/src/ameesh/review_lot.py
+@@ -63,7 +63,12 @@ def reviewer_family(harness: Optional[str]) -> str:
+ 
+ 
+ def _author(db, name: str) -> dict:
+-    """Le harnais de l'auteur du lot, si le registre le connaît."""
++    """Le harnais de l'auteur du lot, si le registre le connaît.
++
++    #1037 : c'est celui de sa session VIVANTE (`registry.live_harness`), pas
++    seulement son harnais déclaré — L242b fait tourner un agent sous un
++    harnais emprunté, et la relecture doit venir d'une autre famille que
++    celle qui a réellement produit le travail."""
+     name = (name or "").strip()
+     if not name:
+         return {"name": "", "harness": ""}
+@@ -72,7 +77,7 @@ def _author(db, name: str) -> dict:
+         row = registry.get(db, name) or {}
+     except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
+         return {"name": name, "harness": ""}
+-    return {"name": name, "harness": str(row.get("harness") or "")}
++    return {"name": name, "harness": registry.live_harness(row)}
+ 
+ 
+ def _open(ops, ref: str) -> Optional[dict]:
+diff --git a/src/ameesh/storage/postgres/canon.py b/src/ameesh/storage/postgres/canon.py
+index 7f62e2328..07ebb677c 100644
+--- a/src/ameesh/storage/postgres/canon.py
++++ b/src/ameesh/storage/postgres/canon.py
+@@ -181,6 +181,7 @@ class Canon(interface.Canon):
+     def host_rows(self, host, names) -> list[dict]:
+         sql = """
+             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, projects,
++                   roles,
+                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
+                    admitted_hosts, admitted_tags, memory_repository,
+                    visibility_ok, visibility_diagnostic,
+@@ -210,6 +211,7 @@ class Canon(interface.Canon):
+         ahosts = _caps_param(values.get("admitted_hosts"))
+         atags = _caps_param(values.get("admitted_tags"))
+         projects = _caps_param(values.get("projects"))
++        roles = _caps_param(values.get("roles"))
+         rows = self.db.query(
+             """
+             INSERT INTO agent_registry
+@@ -218,10 +220,10 @@ class Canon(interface.Canon):
+                  priority, admitted_hosts, admitted_tags, memory_repository,
+                  visibility_ok, visibility_diagnostic,
+                  placement_ok, placement_diagnostic, placement_ref, placement_profile, canon,
+-                 projects)
++                 projects, roles)
+             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
+                     %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s,
+-                    __PROJECTS__)
++                    __PROJECTS__, __ROLES__)
+             ON CONFLICT (name) DO UPDATE SET
+                 harness         = excluded.harness,
+                 host            = excluded.host,
+@@ -231,6 +233,7 @@ class Canon(interface.Canon):
+                 responsible     = excluded.responsible,
+                 team            = excluded.team,
+                 projects        = excluded.projects,
++                roles           = excluded.roles,
+                 provider        = excluded.provider,
+                 credential_mode = excluded.credential_mode,
+                 capabilities    = excluded.capabilities,
+@@ -258,6 +261,7 @@ class Canon(interface.Canon):
+                .replace("__AHOSTS__", _CAPS_SQL)
+                .replace("__ATAGS__", _CAPS_SQL)
+                .replace("__PROJECTS__", _CAPS_SQL)
++               .replace("__ROLES__", _CAPS_SQL)
+                .replace("__PROFILE__", PROFILE_PARAMS_SQL),
+             (name, values["harness"], values["host"], values["cwd"], values["model"],
+              values["budget_usd"], values["responsible"], values["team"], values["provider"],
+@@ -267,6 +271,7 @@ class Canon(interface.Canon):
+              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
+              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
+             + profile_params(values) + (values.get("canon"), projects, projects,
++                                       roles, roles,
+                                        values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
+         )
+         return bool(rows)
+diff --git a/src/ameesh/storage/postgres/operations.py b/src/ameesh/storage/postgres/operations.py
+index e9b5e1c8a..276e99f1b 100644
+--- a/src/ameesh/storage/postgres/operations.py
++++ b/src/ameesh/storage/postgres/operations.py
+@@ -230,7 +230,23 @@ class Operations(interface.Operations):
+                    cwd = coalesce(%s::text, r.cwd),
+                    session_id = %s,
+                    session_account = %s::text,
++                   -- #1037 : la session adoptée est connue AVANT tout tour ;
++                   -- son ouverture est celle du harnais adopté (le déclencheur
++                   -- de 0384 garde les trois tant que origin = session).
++                   session_harness = %s,
++                   session_cwd = coalesce(%s::text, r.cwd),
++                   session_origin = %s,
+                    session_work_item = NULL,
++                   -- #1037 : un changement de harnais DÉCLARÉ emporte les
++                   -- réglages du harnais précédent : les garder ferait lancer
++                   -- le nouveau harnais avec le modèle, l'effort ou le tier de
++                   -- l'ancien (r.harness = la valeur d'avant l'UPDATE).
++                   model = CASE WHEN r.harness IS DISTINCT FROM %s::text
++                                THEN NULL ELSE r.model END,
++                   effort = CASE WHEN r.harness IS DISTINCT FROM %s::text
++                                 THEN NULL ELSE r.effort END,
++                   tier = CASE WHEN r.harness IS DISTINCT FROM %s::text
++                               THEN NULL ELSE r.tier END,
+                    session_reset_at = clock_timestamp(),
+                    pending_prompt = concat_ws(E'\\n\\n', %s::text,
+                                               r.current_prompt, r.pending_prompt),
+@@ -249,7 +265,8 @@ class Operations(interface.Operations):
+             RETURNING r.name, verrou.session_id AS previous_session,
+                       verrou.mode AS previous_mode, verrou.harness AS previous_harness
+             """,
+-            (name, harness, host, cwd, session_id, session_account, prompt, status_text),
++            (name, harness, host, cwd, session_id, session_account, harness, cwd,
++             session_id, harness, harness, harness, prompt, status_text),
+         )
+         return rows[0] if rows else None
+ 
+diff --git a/src/ameesh/storage/postgres/registry.py b/src/ameesh/storage/postgres/registry.py
+index d9dc5419d..e94c6cdcf 100644
+--- a/src/ameesh/storage/postgres/registry.py
++++ b/src/ameesh/storage/postgres/registry.py
+@@ -49,7 +49,11 @@ AGENT_COLUMNS = """
+     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
+     extract(epoch from session_reset_at)::float8     as session_reset_ts,
+     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
+-    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake
++    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake,
++    -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
++    -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
++    -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
++    session_harness, session_cwd, session_origin
+ """
+ 
+ 
+diff --git a/tests/parts/pilote-psql.txt b/tests/parts/pilote-psql.txt
+index 728b92687..8fb0d4248 100644
+--- a/tests/parts/pilote-psql.txt
++++ b/tests/parts/pilote-psql.txt
+@@ -20,6 +20,7 @@
+ # une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
+ # deux endroits différents du fichier, sans conflit.
+ 
++test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
+ test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
+ test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
+ test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
+diff --git a/tests/test_1037_bascule_harnais.py b/tests/test_1037_bascule_harnais.py
+new file mode 100644
+index 000000000..c4a7b7384
+--- /dev/null
++++ b/tests/test_1037_bascule_harnais.py
+@@ -0,0 +1,115 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#1037 : apres une bascule de harnais, la ligne de l'agent ne garde pas les
++traces du harnais quitte.
++
++Constat (auditeur, 13/10) : la session vivante d'un agent pouvait etre Codex
++alors que sa ligne exposait un modele (et une session) Claude perimes — la
++porte §2 « autre famille de modele » pouvait donc compter un avis Codex comme
++Claude. Trois temoins de contrat ici :
++
++* un hook — sous bail ou non — ne reecrit jamais la DECLARATION d'un agent
++  `execute` (le harnais du tour, L242b, faisait clignoter `harness` ; modele et
++  session restaient ceux de la session precedente) ; sous bail, le dossier et
++  l'hote du tour continuent de suivre (L61, deja tenu par ses bornes) ;
++* `adopt` pose la session vivante de 0384 (`session_harness`, `session_cwd`,
++  `session_origin`) et efface modele, effort et tier quand le harnais declare
++  change — en base comme dans l'etat local, que l'exécuteur relit avant les
++  colonnes du registre ;
++* la porte de relecture lit le harnais de la session vivante
++  (`registry.live_harness`), pas l'etiquette declaree.
++"""
++from __future__ import annotations
++
++import dataclasses
++import os
++import unittest
++
++from ameesh import registry, reprise, review_lot
++from ameesh.backend import PgBackend
++
++from .support import PgTestCase
++from .test_l39_adoption_reprise import SID, _dossier, _rollout
++
++
++class HookNeReecritPasLaDeclarationTest(PgTestCase):
++    """Le hook d'un tour emprunte (L242b) ne touche pas la declaration."""
++
++    def test_hook_sous_bail_laisse_harnais_modele_et_session(self):
++        registry.upsert(self.db, "ouvrier", harness="claude", host=self.cfg.host,
++                        cwd=self.tmp, session_id="session-declaree",
++                        model="claude-opus-5-5")
++        avant = registry.get(self.db, "ouvrier")
++        ailleurs = os.path.join(self.tmp, "ailleurs")
++        os.makedirs(ailleurs, exist_ok=True)
++        PgBackend(self.cfg, self.db).register("ouvrier", "codex", ailleurs, None,
++                                              leased=True)
++        apres = registry.get(self.db, "ouvrier")
++        self.assertEqual(apres["harness"], "claude")
++        self.assertEqual(apres["model"], "claude-opus-5-5")
++        self.assertEqual(apres["session_id"], "session-declaree")
++        # L61 : sous bail, le dossier du tour suit le hook (sa session, non :
++        # L166 l'a deja filtree) — la declaration ne porte que harnais/modele.
++        self.assertEqual(apres["cwd"], ailleurs)
++        self.assertEqual(apres["host"], avant["host"])
++        self.assertEqual(apres["mode"], "execute")
++        self.assertGreaterEqual(apres["last_seen_ts"], avant["last_seen_ts"])
++
++
++class AdoptBasculeTest(PgTestCase):
++    """`adopt` d'un autre harnais : session vivante posee, reglages purges."""
++
++    def setUp(self):
++        super().setUp()
++        self.travail = os.path.join(self.tmp, "travail")
++        os.makedirs(self.travail, exist_ok=True)
++        self.compte = _dossier(os.path.join(self.tmp, "comptes", "codex-1"),
++                               creds="auth.json")
++        _rollout(self.compte, SID, self.travail)
++
++    def _cfg(self):
++        return dataclasses.replace(
++            self.cfg, accounts={"codex": [{"name": "primaire", "path": self.compte}]})
++
++    def test_bascule_efface_les_reglages_du_harnais_quitte(self):
++        registry.upsert(self.db, "coord", harness="claude", host=self.cfg.host,
++                        cwd=self.travail, model="claude-opus-5-5")
++        self.db.execute("UPDATE agent_registry SET effort = 'high', tier = 'max' "
++                        "WHERE name = 'coord'")
++        dossier = self.cfg.agent_dir("coord")
++        os.makedirs(dossier, exist_ok=True)
++        for cle in ("model", "effort", "tier"):
++            with open(os.path.join(dossier, cle), "w", encoding="utf-8") as fh:
++                fh.write("reglage-du-harnais-quitte")
++        out = reprise.adopt(self._cfg(), self.db, "coord", session_id=SID,
++                            harness="codex")
++        row = registry.get(self.db, "coord")
++        self.assertEqual(row["harness"], "codex")
++        self.assertIsNone(row["model"])
++        self.assertIsNone(row["effort"])
++        self.assertIsNone(row["tier"])
++        self.assertEqual(row["session_id"], SID)
++        self.assertEqual(row["session_harness"], "codex")
++        self.assertEqual(row["session_origin"], SID)
++        self.assertEqual(row["session_cwd"], self.travail)
++        for cle in ("model", "effort", "tier"):
++            self.assertFalse(os.path.exists(os.path.join(dossier, cle)), cle)
++        self.assertTrue(any("dropped" in note for note in out["notes"]),
++                        out["notes"])
++
++
++class PorteLitLaSessionVivanteTest(PgTestCase):
++    """La porte §2 suit la session vivante, pas l'etiquette declaree."""
++
++    def test_famille_de_l_auteur_suit_la_session_vivante(self):
++        registry.upsert(self.db, "auteur", harness="claude", host=self.cfg.host,
++                        cwd=self.tmp, model="claude-opus-5-5")
++        self.db.execute(
++            "UPDATE agent_registry SET session_id = %s, session_origin = %s, "
++            "session_harness = 'codex' WHERE name = 'auteur'", (SID, SID))
++        auteur = review_lot._author(self.db, "auteur")
++        self.assertEqual(auteur["harness"], "codex")
++        self.assertEqual(review_lot.reviewer_family(auteur["harness"]), "claude")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_420_qa_role.py b/tests/test_420_qa_role.py
+new file mode 100644
+index 000000000..455be433b
+--- /dev/null
++++ b/tests/test_420_qa_role.py
+@@ -0,0 +1,528 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""L244 (#420) : le rôle QA et son verdict dans la porte des releases IT.
++
++Le verdict QA est une évidence du module IT, liée à la livraison courante,
++écrite par un porteur du rôle `qa` du projet, distinct de l'assigne, de
++l'auteur de la livraison et de celui de la preuve. La règle opt-in
++`require_qa` exige un verdict `ok` courant pour les états qu'elle garde ;
++l'audit rapporte `missing_qa` et `stale_qa`.
++
++Les contrôles de rôle et de séparation des devoirs vivent dans le garde SQL
++(migration 0427) : ils valent pour les deux pilotes et pour tout appel direct
++au stockage, pas seulement pour la CLI.
++"""
++from __future__ import annotations
++
++import contextlib
++import io
++import json
++import sys
++import unittest
++import uuid
++from pathlib import Path
++from unittest import mock
++
++from tests import support  # noqa: F401  (isole la config de l'hôte avant les modules)
++from tests.support import PgTestCase
++from ameesh import canon_sync, config as config_mod, db as db_mod, identity, modules, storage, work
++from ameesh.modules import it
++from ameesh.modules.storage import ModuleStore
++
++from .test_canon import _CanonDbCase, fiche, write
++
++
++def federation(project="acme", require_qa=None):
++    spec = {"it": {"require_qa": require_qa}} if require_qa is not None else ["it"]
++    return {"extensions": {"ameesh": {"projects": {project: {"modules": spec}}}}}
++
++
++def card(**fields) -> str:
++    declared = dict(type="Agent", title="orchestre", responsible="human:alice",
++                    capabilities=["read", "report-drift", "propose"], harness="claude",
++                    model="claude-opus", provider="anthropic",
++                    credential_mode="subscription")
++    declared.update(fields)
++    return fiche(**{k: v for k, v in declared.items() if v is not None})
++
++
++class QaDeclarationTest(unittest.TestCase):
++    """Le descripteur et les déclarations, sans base."""
++
++    def test_require_qa_adds_the_gate_rule_and_nothing_else(self):
++        plain = modules.declarations(federation())[0]
++        self.assertFalse(any(r.get("evidence_kind") == "qa" for r in plain["rules"]))
++        gated = modules.declarations(federation(require_qa=["promoted"]))[0]
++        self.assertEqual(gated["rules"][-1], {
++            "types": ["release", "publication"], "states": ["promoted"],
++            "subject_kind": "delivery", "evidence_kind": "qa", "evidence_verdict": "ok"})
++        self.assertEqual(gated["types"], plain["types"])
++        # R2 #420 (B3) : la porte QA n'a de sens que si la preuve est
++        # attribuable à un agent lié à son exécuteur ; le reste du schéma est
++        # inchangé.
++        self.assertEqual(gated["schemas"]["proof"],
++                         dict(plain["schemas"]["proof"], runner_bound_actor=True))
++        self.assertEqual(gated["schemas"]["qa"], plain["schemas"]["qa"])
++        self.assertEqual(gated["schemas"]["delivery"], plain["schemas"]["delivery"])
++
++    def test_qa_schema_binds_the_delivery_and_declares_roles_and_duties(self):
++        schema = modules.declarations(federation())[0]["schemas"]["qa"]
++        self.assertEqual(schema["writer_role"], "ameesh_it_qa")
++        self.assertEqual(schema["actor_role"], "qa")
++        self.assertEqual(schema["binding_kind"], "delivery")
++        self.assertEqual(schema["subject_field"], "sha256")
++        self.assertEqual(schema["patterns"]["sha256"], "^[0-9a-f]{64}$")
++        self.assertEqual(schema["patterns"]["verdict"], "^(ok|blocked)$")
++        self.assertEqual(schema["separation_of_duties"],
++                         {"assignee": True, "declaration": True, "evidence": "proof"})
++
++    def test_list_and_mapping_forms_are_equivalent(self):
++        listed = modules.declarations(federation())[0]
++        mapped = modules.declarations({"extensions": {"ameesh": {"projects": {
++            "acme": {"modules": {"it": None}}}}}})[0]
++        self.assertEqual(listed, mapped)
++
++    def test_unknown_options_and_states_are_refused(self):
++        for spec in ({"wat": 1}, {"require_qa": "promoted"}, {"require_qa": [3]},
++                     {"require_qa": ["promoted", "promoted"]}, {"require_qa": ["intake"]},
++                     {"require_qa": ["closed"]}, {"require_qa": ["qa"]}):
++            with self.subTest(spec=spec), self.assertRaises(ValueError):
++                modules.declarations({"extensions": {"ameesh": {"projects": {
++                    "acme": {"modules": {"it": spec}}}}}})
++
++    def test_both_qa_states_are_accepted(self):
++        rule = modules.declarations(federation(require_qa=["merged", "promoted"]))[0]["rules"][-1]
++        self.assertEqual(rule["states"], ["merged", "promoted"])
++
++
++class RequireBoundTest(unittest.TestCase):
++    """R2 #420 (N2) : une signature de droits exige une identité liée."""
++
++    def test_unbound_and_explicit_identities_are_refused(self):
++        cfg = config_mod.Config()
++        explicit = identity.Binding(name="qa-1", source="explicit", ok=True)
++        with mock.patch.object(identity, "resolve_binding", return_value=explicit):
++            with self.assertRaisesRegex(ValueError, "not bound"):
++                identity.require_bound(cfg, None, what="the QA verdict")
++        unbound = identity.Binding(reason="AGENT_MAIL_NAME not set")
++        with mock.patch.object(identity, "resolve_binding", return_value=unbound):
++            with self.assertRaisesRegex(ValueError, "bound session identity.*AGENT_MAIL_NAME not set"):
++                identity.require_bound(cfg, None, what="the QA verdict")
++
++    def test_runner_and_session_bindings_are_accepted(self):
++        cfg = config_mod.Config()
++        runner = identity.Binding(name="qa-1", source="runner", runner_id="r", epoch=2, ok=True)
++        with mock.patch.object(identity, "resolve_binding", return_value=runner):
++            self.assertEqual(identity.require_bound(cfg, None).name, "qa-1")
++        session = identity.Binding(name="qa-1", source="session", ok=True)
++        with mock.patch.object(identity, "resolve_binding", return_value=session):
++            self.assertEqual(identity.require_bound(cfg, None).name, "qa-1")
++        with mock.patch.object(identity, "resolve_binding", return_value=runner):
++            with self.assertRaisesRegex(ValueError, "not bound"):
++                identity.require_bound(cfg, None, sources=("session",))
++
++
++class RolesPersistenceTest(PgTestCase):
++    """Les rôles d'une fiche sont écrits au registre et comparés comme une liste."""
++
++    def declared(self, roles):
++        return {
++            "harness": "deepseek", "host": "h1", "cwd": "/work/dev", "model": "m",
++            "budget_usd": None, "responsible": None, "team": "acme", "provider": "deepseek",
++            "credential_mode": "api-key", "capabilities": ["read"], "canon_ref": "card",
++            "priority": 0, "admitted_hosts": [], "admitted_tags": [], "memory_repository": None,
++            "visibility_ok": True, "visibility_diagnostic": "", "placement_ok": True,
++            "placement_diagnostic": "", "placement_ref": "placement", "placement_profile": None,
++            "canon": None, "ephemeral": False, "projects": ["acme"], "roles": roles,
++            "_expected_lease_epoch": -1,
++        }
++
++    def test_roles_are_written_read_and_compared(self):
++        self.assertTrue(storage.of(self.db).canon.write_declared("dev", self.declared(["qa"])))
++        row = {r["name"]: r for r in storage.of(self.db).canon.host_rows("h1", ["dev"])}["dev"]
++        self.assertEqual(row["roles"], ["qa"])
++        self.assertTrue(canon_sync._same(row, self.declared(["qa"])))
++        self.assertFalse(canon_sync._same(row, self.declared(["qa", "relecture"])))
++        self.assertFalse(canon_sync._same(row, self.declared(None)))
++        self.assertIn("roles", canon_sync.DECLARATIVE)
++
++
++class RolesSyncTest(_CanonDbCase):
++    """La fiche porte les rôles ; `canon sync` les écrit et les compare."""
++
++    def roles(self) -> list[str] | None:
++        rows = self.db.query("SELECT roles FROM agent_registry WHERE name = 'orchestre'")
++        return rows[0]["roles"] if rows else None
++
++    def test_sync_writes_the_declared_roles_and_their_order(self):
++        write(self.root, "agents/orchestre.md", card(roles=["qa"]))
++        self.sync()
++        self.assertEqual(self.roles(), ["qa"])
++        self.assertEqual(self.actions(self.sync())["orchestre"], "inchangé")
++        write(self.root, "agents/orchestre.md", card(roles=["qa", "relecture"]))
++        self.assertNotEqual(self.actions(self.sync())["orchestre"], "inchangé")
++        self.assertEqual(self.roles(), ["qa", "relecture"])
++        # Une fiche sans `roles` remet la colonne à NULL : aucun rôle hérité.
++        write(self.root, "agents/orchestre.md", card())
++        self.sync()
++        self.assertIsNone(self.roles())
++
++    def test_declared_roles_are_normalized_and_role_is_accepted(self):
++        """N1 (#420 R2) : `roles` est normalisé, `role` au singulier est lu."""
++        write(self.root, "agents/orchestre.md", card(roles=["QA", " qa ", "Relecture"]))
++        self.sync()
++        self.assertEqual(self.roles(), ["qa", "relecture"])
++        write(self.root, "agents/orchestre.md", card(role="Qa"))
++        self.sync()
++        self.assertEqual(self.roles(), ["qa"])
++
++
++class QaEvidenceTest(PgTestCase):
++    """Rôle, projet, séparation des devoirs et porte, par le garde SQL."""
++
++    def setUp(self):
++        super().setUp()
++        with self.db.transaction() as tx:
++            ModuleStore(tx).replace("", modules.declarations(federation(require_qa=["promoted"])))
++        self.artifact = Path(self.tmp, "artifact.py")
++        self.artifact.write_text("print('qa smoke passed')\n")
++        self.lot = work.add(self.db, title="Publication", type="release", app="acme")["id"]
++        self.register("qa-1", roles=["qa"], projects=["acme"])
++        self.register("qa-other", roles=["qa"], projects=["other"])
++        self.register("dev-1", roles=["implementation"], projects=["acme"])
++        self.register("reviewer-1", roles=["relecture"], projects=["acme"])
++
++    def register(self, name, roles=None, projects=None, team="", runner_id=None, epoch=2):
++        def param(values):
++            return (None, None) if values is None else (json.dumps(values), json.dumps(values))
++        roles_a, roles_b = param(roles)
++        projects_a, projects_b = param(projects)
++        self.db.execute(
++            "INSERT INTO agent_registry(name, team, roles, projects, lease_owner, lease_epoch) VALUES "
++            "(%s, %s, CASE WHEN %s::jsonb IS NULL THEN NULL "
++            "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END, "
++            "CASE WHEN %s::jsonb IS NULL THEN NULL "
++            "ELSE ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) END, %s, %s) "
++            "ON CONFLICT (name) DO UPDATE SET team = excluded.team, roles = excluded.roles, "
++            "projects = excluded.projects, lease_owner = excluded.lease_owner, "
++            "lease_epoch = excluded.lease_epoch",
++            (name, team, roles_a, roles_b, projects_a, projects_b,
++             "runner-%s" % name if runner_id is None else runner_id, epoch))
++
++    def deliver(self, actor="dev-1"):
++        return it.declare(self.db, self.lot, self.artifact, actor=actor)
++
++    def prove(self, actor="dev-1", runner_id=None, epoch=2):
++        """Une preuve attribuable (R2 #420, B3) : l'agent, lié à son exécuteur."""
++        return it.prove(self.db, self.lot, self.artifact, actor=actor, runner=sys.executable,
++                        identity={"agent": actor,
++                                  "runner_id": runner_id or "runner-%s" % actor,
++                                  "lease_epoch": epoch})
++
++    def isolated_qa_role(self):
++        """Un rôle QA isolé, avec les seuls droits de `role-module-writers.sql`."""
++        role = "t_qa_writer_%s" % uuid.uuid4().hex[:8]
++        q = db_mod.quote_ident
++        self.db.execute("CREATE ROLE %s NOLOGIN" % q(role))
++        self.addCleanup(self.drop_role, role)
++        with self.db.transaction() as tx:
++            tx.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(role)))
++            tx.execute("GRANT SELECT ON work_items, project_modules, work_module_milestones "
++                       "TO %s" % q(role))
++            tx.execute("GRANT UPDATE (id) ON work_items TO %s" % q(role))
++            tx.execute("GRANT INSERT ON work_module_milestones TO %s" % q(role))
++            tx.execute("GRANT USAGE ON SEQUENCE work_module_milestones_id_seq TO %s" % q(role))
++            tx.execute("GRANT EXECUTE ON FUNCTION ameesh_module_agent(text) TO %s" % q(role))
++        return role
++
++    def drop_role(self, role):
++        q = db_mod.quote_ident
++        if self.db.query("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
++            self.db.execute("DROP OWNED BY %s" % q(role))
++            self.db.execute("DROP ROLE %s" % q(role))
++
++    def current_delivery(self):
++        return ModuleStore(self.db).latest(self.lot, "it", "delivery")
++
++    def qa(self, actor="qa-1", verdict="ok", digest=None):
++        delivery = self.current_delivery()
++        return it.record_qa(self.db, self.lot, sha256=digest or delivery["subject"],
++                            verdict=verdict, scope=["install"], report="https://qa.test/run",
++                            actor=actor)
++
++    def go_and_merge(self):
++        work.milestone(self.db, self.lot, "verdict", verdict="ok", sha="abcdef1234")
++        return work.merged(self.db, self.lot, sha="abcdef1234")
++
++    # -- rôle et portée ---------------------------------------------------
++
++    def test_qa_holder_of_the_project_records_a_bound_verdict(self):
++        self.deliver()
++        self.prove()
++        delivery = self.current_delivery()
++        row = self.qa()
++        self.assertEqual((row["module"], row["kind"]), ("it", "qa"))
++        self.assertEqual(row["actor"], "qa-1")
++        self.assertEqual(row["binding_id"], delivery["id"])
++        self.assertEqual(row["subject"], delivery["subject"])
++        self.assertEqual(row["payload"]["scope"], ["install"])
++        self.assertEqual(row["payload"]["verdict"], "ok")
++
++    def test_actor_without_the_qa_role_is_refused(self):
++        self.deliver()
++        self.prove()
++        for actor in ("dev-1", "reviewer-1", "not-registered"):
++            with self.subTest(actor=actor), self.assertRaisesRegex(db_mod.DbError,
++                                                                   "qa-role-required"):
++                self.qa(actor=actor)
++
++    def test_qa_role_outside_the_lot_project_is_refused(self):
++        self.deliver()
++        self.prove()
++        with self.assertRaisesRegex(db_mod.DbError, "qa-role-scope"):
++            self.qa(actor="qa-other")
++
++    def test_global_qa_has_no_project_scope_and_a_team_fallback_applies(self):
++        self.register("qa-global", roles=["qa"], projects=[])
++        self.register("qa-team", roles=["qa"], projects=None, team="acme")
++        self.deliver()
++        self.prove()
++        self.assertEqual(self.qa(actor="qa-global")["actor"], "qa-global")
++        self.assertEqual(self.qa(actor="qa-team")["actor"], "qa-team")
++        self.register("qa-elsewhere", roles=["qa"], projects=None, team="other")
++        with self.assertRaisesRegex(db_mod.DbError, "qa-role-scope"):
++            self.qa(actor="qa-elsewhere")
++
++    # -- séparation des devoirs ------------------------------------------
++
++    def test_the_lot_assignee_cannot_record_the_verdict(self):
++        self.db.execute("UPDATE work_items SET assignee = 'qa-1' WHERE id = %s", (self.lot,))
++        self.deliver()
++        self.prove()
++        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
++            self.qa(actor="qa-1")
++
++    def test_the_delivery_author_cannot_record_the_verdict(self):
++        self.deliver(actor="qa-1")
++        self.prove()
++        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
++            self.qa(actor="qa-1")
++
++    def test_the_proof_author_cannot_record_the_verdict(self):
++        self.deliver()
++        self.prove(actor="qa-1")
++        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
++            self.qa(actor="qa-1")
++
++    def test_a_later_proof_by_another_actor_does_not_free_the_proof_author(self):
++        self.deliver()
++        self.prove(actor="qa-1")
++        self.prove(actor="dev-1")  # second proof of the same delivery
++        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
++            self.qa(actor="qa-1")
++
++    def test_a_proof_after_the_verdict_by_its_author_is_refused(self):
++        """R2 #420 (B3) : une preuve écrite APRÈS le verdict, par son auteur."""
++        self.deliver()
++        self.prove(actor="dev-1")
++        self.qa(actor="qa-1")
++        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
++            self.prove(actor="qa-1")
++
++    def test_the_gate_rechecks_the_separation_of_duties(self):
++        """R2 #420 (B3) : la porte revérifie la séparation, pas seulement l'écriture.
++
++        La preuve est insérée hors du garde (comme une ligne héritée ou une
++        course) : la promotion doit la refuser."""
++        self.deliver()
++        self.prove(actor="dev-1")
++        self.qa(actor="qa-1")
++        self.go_and_merge()
++        self.db.execute("ALTER TABLE work_module_milestones "
++                        "DISABLE TRIGGER ameesh_module_milestone_guard")
++        try:
++            self.prove(actor="qa-1")
++        finally:
++            self.db.execute("ALTER TABLE work_module_milestones "
++                            "ENABLE TRIGGER ameesh_module_milestone_guard")
++        with self.assertRaisesRegex(db_mod.DbError, "qa-same-actor"):
++            work.move(self.db, self.lot, "promoted")
++
++    def test_a_qa_gated_proof_must_be_runner_bound(self):
++        """R2 #420 (B3) : sous `require_qa`, la preuve nomme l'agent lié."""
++        self.deliver()
++        with self.assertRaisesRegex(db_mod.DbError, "identity-required"):
++            it.prove(self.db, self.lot, self.artifact, actor="dev-1", runner=sys.executable)
++        with self.assertRaisesRegex(db_mod.DbError, "identity-unbound"):
++            it.prove(self.db, self.lot, self.artifact, actor="dev-1", runner=sys.executable,
++                     identity={"agent": "dev-1", "runner_id": "runner-other",
++                               "lease_epoch": 2})
++        proof = self.prove()
++        self.assertEqual(proof["payload"]["agent"], "dev-1")
++        self.assertEqual(proof["payload"]["runner_id"], "runner-dev-1")
++
++    # -- porte et nouvelle livraison -------------------------------------
++
++    def test_promotion_needs_a_current_ok_verdict(self):
++        self.deliver()
++        self.prove()
++        self.go_and_merge()
++        with self.assertRaises(db_mod.DbError) as caught:
++            work.move(self.db, self.lot, "promoted")
++        self.assertIn("qa", str(caught.exception))
++        self.qa()
++        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
++
++    def test_blocked_verdict_keeps_the_gate_closed_until_a_later_ok(self):
++        self.deliver()
++        self.prove()
++        self.go_and_merge()
++        self.qa(verdict="blocked")
++        with self.assertRaises(db_mod.DbError):
++            work.move(self.db, self.lot, "promoted")
++        self.qa()
++        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
++
++    def test_ok_then_blocked_keeps_the_gate_closed(self):
++        """R2 #420 (B1) : c'est le DERNIER verdict qui décide, pas un ok ancien."""
++        self.deliver()
++        self.prove()
++        self.go_and_merge()
++        self.qa()  # ok
++        self.qa(verdict="blocked")
++        with self.assertRaises(db_mod.DbError):
++            work.move(self.db, self.lot, "promoted")
++        self.qa()  # un ok ultérieur rouvre la porte
++        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
++
++    def test_a_new_declaration_invalidates_the_verdict_even_for_same_bytes(self):
++        self.deliver()
++        self.prove()
++        self.qa()
++        self.go_and_merge()
++        self.deliver()  # same bytes, new declaration: the binding moves
++        self.prove()
++        with self.assertRaises(db_mod.DbError):
++            work.move(self.db, self.lot, "promoted")
++        self.qa()
++        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
++
++    def test_a_return_to_the_old_digest_is_still_a_new_delivery(self):
++        self.deliver()
++        self.prove()
++        self.qa()
++        self.go_and_merge()
++        self.artifact.write_text("print('second artifact')\n")
++        self.deliver()
++        self.prove()
++        self.qa()
++        self.artifact.write_text("print('qa smoke passed')\n")  # back to the first digest
++        self.deliver()
++        self.prove()
++        with self.assertRaises(db_mod.DbError):
++            work.move(self.db, self.lot, "promoted")
++        self.qa()
++        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
++
++    def test_the_verdict_must_match_the_current_delivery(self):
++        self.deliver()
++        self.prove()
++        with self.assertRaisesRegex(ValueError, "current delivery"):
++            self.qa(digest="f" * 64)
++        self.assertIsNone(ModuleStore(self.db).latest(self.lot, "it", "qa"))
++
++    def test_a_project_without_require_qa_still_promotes_without_verdict(self):
++        with self.db.transaction() as tx:
++            ModuleStore(tx).replace("", modules.declarations(federation(require_qa=None)))
++        self.deliver()
++        self.prove()
++        self.go_and_merge()
++        self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
++
++    # -- CLI --------------------------------------------------------------
++
++    def test_cli_records_the_verdict_and_its_scope(self):
++        self.deliver()
++        self.prove()
++        binding = identity.Binding(name="qa-1", source="runner", runner_id="runner-qa-1",
++                                   epoch=2, ok=True)
++        out = io.StringIO()
++        with mock.patch.object(identity, "require_bound", return_value=binding), \
++                contextlib.redirect_stdout(out):
++            code = it.main(self.db, ["qa", str(self.lot), "--sha256",
++                                     self.current_delivery()["subject"], "--verdict", "ok",
++                                     "--scope", "install, login", "--report", "https://qa.test/cli"],
++                           actor="qa-1")
++        self.assertEqual(code, 0)
++        row = json.loads(out.getvalue())
++        self.assertEqual(row["kind"], "qa")
++        self.assertEqual(row["payload"]["scope"], ["install", "login"])
++        self.assertEqual(row["payload"]["report"], "https://qa.test/cli")
++
++    def test_cli_signs_with_the_bound_session_not_the_declared_name(self):
++        """R2 #420 (N2) : le nom auto-déclaré ne signe pas à la place du bail."""
++        self.deliver()
++        self.prove()
++        binding = identity.Binding(name="qa-1", source="runner", runner_id="runner-qa-1",
++                                   epoch=2, ok=True)
++        with mock.patch.object(identity, "require_bound", return_value=binding), \
++                self.assertRaisesRegex(ValueError, "signed by the bound session"):
++            it.main(self.db, ["qa", str(self.lot), "--sha256",
++                              self.current_delivery()["subject"], "--verdict", "ok",
++                              "--report", "https://qa.test/impostor"], actor="qa-other")
++
++    # -- rôle QA isolé (R2 #420, B2) --------------------------------------
++
++    def test_isolated_qa_writer_records_the_verdict(self):
++        """Un rôle QA avec les seuls droits de `role-module-writers.sql`.
++
++        Le garde lit le registre par `ameesh_module_agent` (SECURITY DEFINER,
++        search_path figé) : une lecture directe `FOR SHARE` exigerait UPDATE
++        sur `agent_registry`, que ce rôle n'a pas (R2 #420, B2)."""
++        role = self.isolated_qa_role()
++        entries = modules.declarations(federation(require_qa=["promoted"]))
++        entries[0]["schemas"]["qa"]["writer_role"] = role
++        with self.db.transaction() as tx:
++            ModuleStore(tx).replace("", entries)
++        self.deliver()
++        self.prove()
++        delivery = self.current_delivery()
++        q = db_mod.quote_ident
++        with self.db.transaction() as tx:
++            tx.execute("SET LOCAL ROLE %s" % q(role))
++            row = it.record_qa(tx, self.lot, sha256=delivery["subject"], verdict="ok",
++                               scope=["install"], report="https://qa.test/isolated",
++                               actor="qa-1")
++        self.assertEqual(row["actor"], "qa-1")
++        self.assertEqual(row["payload"]["verdict"], "ok")
++
++    # -- audit ------------------------------------------------------------
++
++    def test_audit_reports_missing_then_stale_qa(self):
++        # Le projet est promu avant l'activation de la règle : le constat suit
++        # l'état courant, pas la date de la promotion.
++        with self.db.transaction() as tx:
++            ModuleStore(tx).replace("", modules.declarations(federation(require_qa=None)))
++        self.deliver()
++        self.prove()
++        self.go_and_merge()
++        work.move(self.db, self.lot, "promoted")
++        self.assertEqual([f for f in modules.audit(self.db) if f["rule"].endswith("qa")], [])
++        with self.db.transaction() as tx:
++            ModuleStore(tx).replace("", modules.declarations(federation(require_qa=["promoted"])))
++        findings = [f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")]
++        self.assertEqual([(f["rule"], f["lot"], f["lot_state"]) for f in findings],
++                         [("missing_qa", self.lot, "promoted")])
++        self.qa()
++        self.assertEqual([f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")],
++                         [])
++        self.deliver()  # new declaration: the verdict becomes stale
++        self.prove()
++        findings = [f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")]
++        self.assertEqual([(f["rule"], f["lot"]) for f in findings], [("stale_qa", self.lot)])
++        self.qa(verdict="blocked")
++        findings = [f for f in modules.audit(self.db) if f["rule"] in ("missing_qa", "stale_qa")]
++        self.assertEqual([(f["rule"], f["lot"]) for f in findings], [("missing_qa", self.lot)])
++
++
++if __name__ == "__main__":  # pragma: no cover
++    unittest.main()
+diff --git a/tests/test_803_classes_famille.py b/tests/test_803_classes_famille.py
+new file mode 100644
+index 000000000..8461a9d83
+--- /dev/null
++++ b/tests/test_803_classes_famille.py
+@@ -0,0 +1,127 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#803 : la prise automatique honore la classe déclarée du lot.
++
++Un lot qui exige une capacité de classe (sensible/production/decision) n'est
++tiré que si le registre porte une famille de harnais autre que celle du
++preneur — garde **structurelle** du canon §2, jamais la disponibilité d'un
++relecteur. La classe d'un lot non gelé se lit sur ce marqueur déclaré ; le
++doute du canon §8 (diff non gelé) se tranche à la porte de fusion, pas à la
++prise, sinon tout lot `intake` serait sensible.
++"""
++from __future__ import annotations
++
++import time
++import unittest
++
++from ameesh import backlog, registry
++
++from .support import PgTestCase
++
++HEURE = 3600.0
++
++AUTRES = (
++    {"name": "ds1", "harness": "deepseek"},
++    {"name": "cx1", "harness": "codex"},
++    {"name": "cl1", "harness": "claude"},
++)
++
++
++class MarqueurTest(unittest.TestCase):
++    """Lecture du marqueur et de la famille, sans base."""
++
++    def test_marqueur_de_classe(self):
++        for cap in ("sensible", "sensitive", "production", "decision"):
++            self.assertTrue(backlog.declared_class({"required_capabilities": [cap]}), cap)
++        self.assertFalse(backlog.declared_class({"required_capabilities": ["read"]}))
++        self.assertFalse(backlog.declared_class({}))
++
++    def test_une_autre_famille_au_registre(self):
++        ds = {"name": "ds1", "harness": "deepseek"}
++        # une autre famille suffit, quelle qu'elle soit (lecture structurelle)
++        self.assertTrue(backlog.other_family_available(ds, AUTRES))
++        # mono-famille : impossibilité de principe -> refus
++        self.assertFalse(backlog.other_family_available(ds, [AUTRES[0]]))
++        # le preneur ne se compte pas lui-même
++        self.assertFalse(backlog.other_family_available(ds, [dict(ds)]))
++        # registre illisible, ou harnais du preneur inconnu : refus
++        self.assertFalse(backlog.other_family_available(ds, None))
++        self.assertFalse(backlog.other_family_available({"name": "x", "harness": ""},
++                                                        AUTRES))
++
++    def test_fits_refuse_un_lot_marque_sans_autre_famille(self):
++        item = {"team": "web", "required_capabilities": ["read", "sensible"]}
++        agent = {"name": "ds1", "team": "web", "harness": "deepseek",
++                 "capabilities": ["read", "sensible"]}
++        self.assertTrue(backlog.fits(item, agent, others=AUTRES))
++        self.assertFalse(backlog.fits(item, agent,
++                                      others=[{"name": "ds2", "harness": "deepseek"}]))
++        self.assertFalse(backlog.fits(item, agent))     # registre non fourni
++        # un lot sans marqueur n'est pas concerné par la garde
++        self.assertTrue(backlog.fits({"team": "web",
++                                      "required_capabilities": ["read"]}, agent))
++        # la capacité de classe reste exigée du preneur
++        self.assertFalse(backlog.fits(item, dict(agent, capabilities=["read"]),
++                                      others=AUTRES))
++
++    def test_lot_fits_refuse_un_lot_marque_sans_autre_famille(self):
++        item = {"lot_team": "web", "required_capabilities": ["sensible"]}
++        agent = {"name": "ds1", "team": "web", "harness": "deepseek",
++                 "capabilities": ["sensible"]}
++        self.assertTrue(backlog.lot_fits(item, agent, others=AUTRES))
++        self.assertFalse(backlog.lot_fits(
++            item, agent, others=[{"name": "ds2", "harness": "deepseek"}]))
++        self.assertFalse(backlog.lot_fits(item, agent))     # registre non fourni
++        self.assertTrue(backlog.lot_fits({"lot_team": "web"}, agent))
++
++
++class PriseTest(PgTestCase):
++    """La garde branchée sur la prise automatique, sur une base migrée."""
++
++    def setUp(self):
++        super().setUp()
++        self.now = time.time()
++
++    def agent(self, name, harness, *, capabilities=(), since_s=2 * HEURE):
++        registry.upsert(self.db, name, harness=harness, host=self.cfg.host)
++        self.db.execute(
++            "UPDATE agent_registry SET status = 'idle', lease_owner = %s,"
++            " lease_expires_at = now() + interval '1 hour', responsible = %s"
++            " WHERE name = %s", ("runner-%s@h" % name, "human:proprio", name))
++        self.db.execute("UPDATE agent_registry SET capabilities = %s::text[]"
++                        " WHERE name = %s", ("{" + ",".join(capabilities) + "}", name))
++        self.db.execute(
++            "UPDATE agent_registry SET status_since = now() - make_interval(secs => %s),"
++            " last_turn_at = now() - make_interval(secs => %s) WHERE name = %s",
++            (since_s, since_s, name))
++
++    def element(self, title, score, **kw):
++        kw.setdefault("expected_value", "valeur mesurable pour %s" % title)
++        return backlog.add(self.db, title=title, value_score=score, **kw)
++
++    def take(self, **kw):
++        kw.setdefault("now", self.now)
++        kw.setdefault("paid", ("deepseek",))
++        kw.setdefault("budget_check", lambda agent: "")
++        return backlog.auto_take(self.cfg, self.db, **kw)
++
++    def test_lot_marque_pris_avec_une_autre_famille(self):
++        self.agent("ds1", "deepseek", capabilities=["read", "sensible"])
++        self.agent("cx1", "codex", capabilities=["read"])
++        item = self.element("sensible", 50, required_capabilities=["sensible"])
++        out = self.take()
++        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
++                         [("ds1", item["id"])])
++
++    def test_lot_marque_refuse_en_mesh_mono_famille(self):
++        self.agent("ds1", "deepseek", capabilities=["read", "sensible"])
++        self.agent("ds2", "deepseek", capabilities=["read", "sensible"])
++        self.element("sensible", 50, required_capabilities=["sensible"])
++        self.assertEqual(self.take(), [])
++        # dans le même mesh mono-famille, un lot sans marqueur reste pris
++        item = self.element("leger", 40)
++        out = self.take()
++        self.assertEqual([t["item"]["id"] for t in out], [item["id"]])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_898_pause_rythme.py b/tests/test_898_pause_rythme.py
+new file mode 100644
+index 000000000..e6468a846
+--- /dev/null
++++ b/tests/test_898_pause_rythme.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#898 : l'échéance d'une pause de rythme est l'heure où le rythme rejoint
++l'utilisation, pas la remise à zéro de la fenêtre.
++
++Une fenêtre tenue par le seul rythme se libère d'elle-même : la part écoulée
++rattrape l'utilisation (la garde est réévaluée à chaque tour). Annoncer la
++remise à zéro faisait lire « en pause jusqu'au 20/10 » pour un forfait utilisé
++à 5 %. Seule une utilisation au plafond de rythme (90 %, moins la réserve des
++non-critiques) attend la fenêtre suivante.
++"""
++from __future__ import annotations
++
++import time
++from unittest import mock
++
++from ameesh import accounts, cost
++
++from .test_l242b_critical_accounts import _Comptes
++
++JOUR = 86400.0
++FENETRE = 7 * JOUR
++
++
++class PauseDeRythmeTest(_Comptes):
++    """Jauge de 7 jours à 5 % de la fenêtre écoulée, sur le secondaire (aucun
++    plafond fixe)."""
++
++    def jauge_longue(self, part, ecoule=0.05):
++        reset = self.now + (1.0 - ecoule) * FENETRE
++        return cost.Gauge("codex", "codex-10080min", part, reset, FENETRE)
++
++    def evaluate(self, jauge, **kw):
++        with mock.patch.object(self.book, "codex_gauges", return_value=[jauge]):
++            return accounts.evaluate(self.book, self.items[1], self.items, self.now,
++                                     record=False, **kw)
++
++    def heure(self, ts):
++        return time.strftime(
++            "%H:%M" if time.localtime(ts)[:3] == time.localtime(self.now)[:3]
++            else "%d/%m %H:%M", time.localtime(ts))
++
++    def test_une_tenue_de_rythme_annonce_l_heure_de_croisement(self):
++        # 10 % utilisés, 5 % de la fenêtre écoulée : avec la réserve des
++        # non-critiques le rythme permis vaut 0 %, il rejoint 10 % à 10 % de
++        # la fenêtre — la reprise est là, pas à la remise à zéro (7 jours).
++        ev = self.evaluate(self.jauge_longue(0.10), reserve=True)
++        self.assertFalse(ev.hard)
++        self.assertEqual(ev.held, ("codex-10080min", 0.10))
++        self.assertAlmostEqual(ev.until, self.now + 0.05 * FENETRE, delta=1.0)
++
++    def test_un_agent_critique_se_libere_au_croisement_sans_reserve(self):
++        # sans réserve, le rythme permis vaut 10 % + 5 % écoulés : 30 %
++        # utilisés sont rejoints à 20 % de la fenêtre.
++        ev = self.evaluate(self.jauge_longue(0.30), critical=True)
++        self.assertFalse(ev.hard)
++        self.assertAlmostEqual(ev.until, self.now + 0.15 * FENETRE, delta=1.0)
++
++    def test_une_utilisation_au_plafond_de_rythme_attend_la_remise_a_zero(self):
++        # 85 % utilisés : au-dessus du plafond de rythme (80 % avec la
++        # réserve), il ne redescend pas avant la fenêtre suivante.
++        jauge = self.jauge_longue(0.85)
++        ev = self.evaluate(jauge, reserve=True)
++        self.assertAlmostEqual(ev.until, jauge.resets_at, delta=1.0)
++
++    def test_la_pause_nomme_la_fenetre_qui_bloque_le_plus_longtemps(self):
++        # une fenêtre courte au plafond (remise dans 30 min) et une longue
++        # tenue par le rythme (croisement dans 8 h 24) : c'est la longue.
++        court = cost.Gauge("codex", "codex-300min", 0.96, self.now + 1800, 5 * 3600.0)
++        long = self.jauge_longue(0.10)
++        with mock.patch.object(self.book, "codex_gauges", return_value=[court, long]):
++            ev = accounts.evaluate(self.book, self.items[1], self.items, self.now,
++                                   record=False, reserve=True)
++        self.assertEqual(ev.held[0], "codex-10080min")
++        self.assertAlmostEqual(ev.until, self.now + 0.05 * FENETRE, delta=1.0)
++
++    def test_sans_comptes_declares_la_pause_annonce_le_croisement(self):
++        # même règle sur le chemin sans comptes déclarés
++        # (cost.CostBook.pace_exceeded), qui porte le compte par défaut.
++        jauge = self.jauge_longue(0.10)
++        with mock.patch.object(self.book, "gauges", return_value=[jauge]), \
++                mock.patch.object(self.book, "clock", return_value=self.now):
++            raison = self.book.pace_exceeded("codex", accounts.RESERVE)
++        self.assertTrue(raison.startswith(
++            "pause (account (default), codex-10080min 10 %%) until %s; plan codex"
++            % self.heure(self.now + 0.05 * FENETRE)), raison)
+diff --git a/tests/test_l161f_plan.py b/tests/test_l161f_plan.py
+index 56bacc1a4..a9b88f4ea 100644
+--- a/tests/test_l161f_plan.py
++++ b/tests/test_l161f_plan.py
+@@ -605,6 +605,80 @@ class DocsLaneTest(unittest.TestCase):
+         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
+ 
+ 
++class PushLaneTest(unittest.TestCase):
++    """nature() on a push: the whole pushed range decides (#833)."""
++
++    def setUp(self):
++        self.repo = _Repo()
++        self.addCleanup(self.repo.close)
++
++    def _nature(self, base, head="HEAD", ref="refs/heads/main", event="push"):
++        return plan.nature(event, base=base, head=head, repo=self.repo.path, ref=ref)
++
++    def _doc_commit(self, name, text="# Doc\n"):
++        self.repo.write(f"docs/{name}", text)
++        return self.repo.commit()
++
++    def test_multi_commit_documentation_push_takes_the_fast_lane(self):
++        # #833: github.event.before, not HEAD^1, so every pushed commit counts
++        self._doc_commit("a.md")
++        head = self._doc_commit("b.md")
++        out = self._nature(self.repo.base, head)
++        self.assertTrue(out["docs_only"], out["why"])
++        self.assertEqual(sorted(out["files"]), ["docs/a.md", "docs/b.md"])
++
++    def test_code_hidden_behind_a_last_documentation_commit_runs_the_suite(self):
++        # the bug: HEAD^1 alone saw only the last commit, documentation, and
++        # took the fast lane over a push that carried code
++        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
++        code = self.repo.commit()
++        head = self._doc_commit("note.md")
++        last_only = self._nature(code, head)
++        self.assertTrue(last_only["docs_only"], last_only["why"])
++        out = self._nature(self.repo.base, head)
++        self.assertFalse(out["docs_only"], out["why"])
++        self.assertIn("src/ameesh/code.py", out["files"])
++
++    def test_a_push_to_a_release_branch_always_runs_the_suite(self):
++        head = self._doc_commit("a.md")
++        out = self._nature(self.repo.base, head, ref="refs/heads/release/1.10.0")
++        self.assertFalse(out["docs_only"], out["why"])
++        self.assertIn("full suite", out["why"])
++        self.assertIn("release/1.10.0", out["why"])
++
++    def test_created_branch_and_rewritten_history_run_the_suite(self):
++        head = self._doc_commit("a.md")
++        for base in (plan.NULL_SHA, "", "not a sha"):
++            with self.subTest(base or "empty"):
++                out = self._nature(base, head)
++                self.assertFalse(out["docs_only"], out["why"])
++                self.assertIn("pushed range unknown", out["why"])
++        # a rewritten history: the tip before the push is no ancestor anymore
++        _git(self.repo.path, "checkout", "-q", "-b", "side", self.repo.base)
++        side = self._doc_commit("side.md")
++        _git(self.repo.path, "checkout", "-q", "-")
++        out = self._nature(side, head)
++        self.assertFalse(out["docs_only"], out["why"])
++        self.assertIn("pushed range unknown", out["why"])
++
++    def test_a_pushed_version_bump_runs_the_suite(self):
++        # L157 is a pull-request rule: a pushed version never takes the lane
++        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.3"\n')
++        base = self.repo.commit()
++        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.4"\n')
++        head = self.repo.commit()
++        out = self._nature(base, head)
++        self.assertFalse(out["version_only"], out["why"])
++        self.assertFalse(out["docs_only"], out["why"])
++
++    def test_a_pull_request_is_unchanged(self):
++        # the reference of the source branch does not matter on a PR
++        head = self._doc_commit("a.md")
++        out = self._nature(self.repo.base, head, ref="refs/heads/lot/833-x",
++                           event="pull_request")
++        self.assertTrue(out["docs_only"], out["why"])
++
++
+ class PlanTest(unittest.TestCase):
+     def test_fallback_without_a_map(self):
+         p = plan.make_plan("push", None, NOW)
+@@ -1141,6 +1215,12 @@ class WorkflowTest(unittest.TestCase):
+                       "carte/carte.json.gz", self.text)
+         self.assertIn("--annotations", self.text)
+ 
++    def test_plan_job_passes_the_pushed_range(self):
++        # #833: a push is planned from github.event.before, not HEAD^1 alone
++        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
++                      "github.event.before || 'HEAD^1' }}", self.text)
++        self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
++
+     def test_dynamic_matrices(self):
+         for driver in ("psycopg", "psql"):
+             self.assertIn(f"part: ${{{{ fromJSON(needs.plan.outputs.{driver}) }}}}", self.text)
+diff --git a/tests/test_l317_project_modules.py b/tests/test_l317_project_modules.py
+index 344e52c0f..128081f9b 100644
+--- a/tests/test_l317_project_modules.py
++++ b/tests/test_l317_project_modules.py
+@@ -11,7 +11,7 @@ from unittest import mock
+ 
+ from tests import support  # isolate host config before module tests
+ from tests.support import PgTestCase
+-from ameesh import canon, canon_sync, db as db_mod, modules, work
++from ameesh import canon, canon_sync, db as db_mod, identity, modules, work
+ from ameesh.modules import it
+ from ameesh.modules.it.execution import OUTPUT_BYTES, digest, execute
+ from ameesh.modules.storage import ModuleStore
+@@ -33,12 +33,16 @@ class ModuleConfigurationTest(unittest.TestCase):
+             with self.assertRaises(db_mod.DbError):
+                 work.close_merged(mock.Mock(), 1)
+     def test_it_cli_parses_artifact_options_after_lot_and_requests_isolated_execution(self):
++        bound = identity.Binding(name="tester", source="runner", runner_id="r1", epoch=2, ok=True)
+         with mock.patch.object(it, "item", return_value={"app": "acme"}), \
++                mock.patch("ameesh.identity.require_bound", return_value=bound), \
+                 mock.patch("ameesh.modules.it.proof_service.request", return_value={"id": 1}) as request:
+             it.main(mock.Mock(), ["proof", "123", "--artifact", "/artifact", "--runner", "python3",
+                                  "--", "--help", "quoted argument"], actor="tester")
+         request.assert_called_once_with("acme", 123, "/artifact", runner="python3",
+-                                        arguments=["--help", "quoted argument"], timeout=60)
++                                        arguments=["--help", "quoted argument"], timeout=60,
++                                        identity={"agent": "tester", "runner_id": "r1",
++                                                  "lease_epoch": 2})
+ 
+     def test_only_named_project_is_enabled(self):
+         entries = modules.declarations(federation())
+diff --git a/tests/test_l317_proof_helper.py b/tests/test_l317_proof_helper.py
+index c3e0207d3..e68f3b85f 100644
+--- a/tests/test_l317_proof_helper.py
++++ b/tests/test_l317_proof_helper.py
+@@ -25,14 +25,14 @@ class ProofHelperTest(unittest.TestCase):
+             with self.subTest(fields=fields), mock.patch.object(it, "prove") as prove:
+                 with self.assertRaisesRegex(ValueError, "execution inputs only"):
+                     proof_service.produce(mock.Mock(), dict(self.payload(), **fields),
+-                                          actor="uid:1000", execution_user="worker")
++                                          invoker="uid:1000", execution_user="worker")
+                 prove.assert_not_called()
+ 
+     def test_unapproved_runner_cannot_turn_true_into_execution_evidence(self):
+         with mock.patch.object(it, "prove") as prove:
+             with self.assertRaisesRegex(ValueError, "not approved"):
+                 proof_service.produce(mock.Mock(), dict(self.payload(), runner="/bin/true"),
+-                                      actor="uid:1000", execution_user="worker",
++                                      invoker="uid:1000", execution_user="worker",
+                                       allowed_runners=["/usr/bin/python3"])
+         prove.assert_not_called()
+ 
+@@ -40,14 +40,17 @@ class ProofHelperTest(unittest.TestCase):
+         with mock.patch.object(it, "item", return_value={"app": "other"}), \
+                 mock.patch.object(it, "prove") as prove:
+             with self.assertRaisesRegex(ValueError, "does not own"):
+-                proof_service.produce(mock.Mock(), self.payload(), actor="uid:1000", execution_user="worker")
++                proof_service.produce(mock.Mock(), self.payload(), invoker="uid:1000", execution_user="worker")
+             prove.assert_not_called()
++        db = mock.Mock()
++        db.query.return_value = []          # no QA policy installed: the legacy proof stays allowed
+         with mock.patch.object(it, "item", return_value={"app": "acme"}), \
+                 mock.patch.object(it, "prove", return_value={"id": 17}) as prove:
+-            result = proof_service.produce(mock.Mock(), self.payload(), actor="uid:1000", execution_user="worker")
++            result = proof_service.produce(db, self.payload(), invoker="uid:1000", execution_user="worker")
+         self.assertEqual(result, {"id": 17})
+         prove.assert_called_once_with(mock.ANY, 1, "/artifact", actor="uid:1000", runner=None,
+-                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None, snapshot_limits=None)
++                                      arguments=[], timeout=60., execution_user="worker", snapshot_root=None,
++                                      snapshot_limits=None, identity=None, invoker="uid:1000")
+ 
+     def test_cli_uses_fixed_privileged_entry_without_evidence_or_config_arguments(self):
+         process = mock.Mock(returncode=0, stdout=json.dumps({"milestone": {"id": 17}}))
+diff --git a/tests/test_l317_snapshot_limits.py b/tests/test_l317_snapshot_limits.py
+index f81a0d399..c1d41ad18 100644
+--- a/tests/test_l317_snapshot_limits.py
++++ b/tests/test_l317_snapshot_limits.py
+@@ -150,10 +150,12 @@ class SnapshotLimitsTest(unittest.TestCase):
+ 
+     def test_project_limits_are_private_helper_settings_not_request_fields(self):
+         payload = dict(project="acme", lot=1, artifact=str(self.artifact), runner=None, arguments=[], timeout=60)
++        db = mock.Mock()
++        db.query.return_value = []
+         with mock.patch("ameesh.modules.it.item", return_value={"app": "acme"}), \
+                 mock.patch("ameesh.modules.it.prove", return_value={"id": 1}) as prove:
+-            produce(mock.Mock(), payload, actor="uid:1000", execution_user="worker", snapshot_limits=self.limits)
++            produce(db, payload, invoker="uid:1000", execution_user="worker", snapshot_limits=self.limits)
+         self.assertEqual(prove.call_args.kwargs["snapshot_limits"], self.limits)
+         with self.assertRaisesRegex(ValueError, "execution inputs only"):
+             produce(mock.Mock(), dict(payload, snapshot_limits={"max_bytes": 9999999999}),
+-                    actor="uid:1000", execution_user="worker")
++                    invoker="uid:1000", execution_user="worker")
+diff --git a/tests/test_l317b_module_audit.py b/tests/test_l317b_module_audit.py
+index d7192ab86..b297e87b7 100644
+--- a/tests/test_l317b_module_audit.py
++++ b/tests/test_l317b_module_audit.py
+@@ -36,6 +36,9 @@ class AuditReportingTest(unittest.TestCase):
+     def finding(self):
+         store = mock.Mock()
+         store.audit_evidence.return_value = [missing()]
++        # Pas de règle require_qa dans cette politique : le constat reste celui
++        # de la preuve d'exécution (L244 ajoute les constats QA à part).
++        store.policy.return_value = None
+         return it.audit(store, "acme")[0]
+ 
+     def test_no_active_modules_and_unknown_module_do_not_run_it(self):
+diff --git a/tests/test_l56_role_executor.py b/tests/test_l56_role_executor.py
+index 05d9a8947..6ad0e8c35 100644
+--- a/tests/test_l56_role_executor.py
++++ b/tests/test_l56_role_executor.py
+@@ -150,8 +150,10 @@ class RoleExecutorTest(PgTestCase):
+ 
+     def test_module_writer_role_contract_and_executor_separation(self):
+         q = db_mod.quote_ident
+-        names = ("ameesh_canon_sync", "ameesh_it_proof")
+-        existing = {r["rolname"] for r in self.db.query("SELECT rolname FROM pg_roles WHERE rolname IN (%s,%s)", names)}
++        names = ("ameesh_canon_sync", "ameesh_it_proof", "ameesh_it_qa")
++        placeholders = ", ".join(["%s"] * len(names))
++        existing = {r["rolname"] for r in self.db.query(
++            "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
+         script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+         try:
+             for _ in range(2):
+@@ -165,10 +167,11 @@ class RoleExecutorTest(PgTestCase):
+             with self.db.transaction() as tx:
+                 tx.execute("SET LOCAL ROLE ameesh_canon_sync")
+                 ModuleStore(tx).replace("", modules.declarations(federation()))
+-            # Neither executor nor proof writer is a policy writer.
+-            with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
+-                tx.execute("SET LOCAL ROLE ameesh_it_proof")
+-                ModuleStore(tx).replace("", [])
++            # Neither executor nor proof/QA writer is a policy writer.
++            for writer in ("ameesh_it_proof", "ameesh_it_qa"):
++                with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
++                    tx.execute("SET LOCAL ROLE %s" % writer)
++                    ModuleStore(tx).replace("", [])
+         finally:
+             for name in names:
+                 self.db.execute("DROP OWNED BY %s" % q(name))
