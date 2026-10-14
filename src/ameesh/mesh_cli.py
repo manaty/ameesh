@@ -1315,6 +1315,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "land":   # merge of the head of the queue (L160e2)
             from . import land
             return land.run(cfg, db, args)
+        if args.work_command == "merge-pr":   # REL-11 (#1003) : fusion hors API gh
+            from . import merge_pr
+            return merge_pr.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -2494,6 +2497,8 @@ def build_parser() -> argparse.ArgumentParser:
     merge_queue.add_parser(work_sub, cmd_work)  # merge queue per target (L160e)
     from . import land
     land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
+    from . import merge_pr
+    merge_pr.add_parser(work_sub, cmd_work)  # fusion hors API gh (REL-11, #1003)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
