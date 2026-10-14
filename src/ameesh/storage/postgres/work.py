@@ -17,6 +17,7 @@ import time
 from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
+from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
 
 ITEM_COLUMNS = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
@@ -324,13 +325,32 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, note, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor,
+               ready_only=False) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
         en cours est effacée (issue `annulee` au registre)."""
         with self.db.transaction() as tx:
-            return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            if ready_only:
+                # Même verrou que les éditions du graphe : une dépendance ne
+                # peut apparaître entre le contrôle et l'attribution. Verrouiller
+                # aussi les amonts empêche leur réouverture pendant la prise.
+                tx.execute(_DEPENDENCIES_LOCK)
+                rows = tx.query(
+                    "SELECT id, state, assignee FROM work_items"
+                    " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
+                    "                         WHERE work_item_id = %s)"
+                    " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
+                item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
+                if current is not None or item is None or item["state"] != "intake" \
+                        or item["assignee"] is not None:
+                    return None
+                if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
+                       for r in rows):
+                    return None
+            return WorkItems(tx)._reassign(item_id, assignee, current,
+                                          "intake" if ready_only else None, note, actor)
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
         """`assign` dans la transaction ouverte ; `state` : celui exigé."""
