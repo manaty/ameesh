@@ -459,6 +459,13 @@ else
   for rapporteur in ${VERIF_RAPPORTEURS[@]+"${VERIF_RAPPORTEURS[@]}"}; do
     ARGS_ACTIF+=(--rapporteur "$rapporteur")
   done
-  "$VENV/bin/python" "$ACTIF_PY" "${ARGS_ACTIF[@]}" \
-    || echo "signal actif non emis (rc=$?) : journal $JOURNAL a relayer a la main" >&2
+  rc=0
+  "$VENV/bin/python" "$ACTIF_PY" "${ARGS_ACTIF[@]}" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 5 ]; then
+      echo "signal actif ambigu (emission anterieure non prouvee, aucun renvoi automatique) : attestation $TRAVAIL/actif-${SHA_TRAVE:0:12}.json a verifier, journal $JOURNAL a relayer a la main" >&2
+    else
+      echo "signal actif non emis (rc=$rc) : journal $JOURNAL a relayer a la main" >&2
+    fi
+  fi
 fi

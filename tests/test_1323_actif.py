@@ -13,6 +13,7 @@ Deux bancs, aucun acces reel :
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -101,6 +102,8 @@ class ActifTest(unittest.TestCase):
         self.etat = self.root / 'etat'
         self.journal = self.root / 'staging.jsonl'
         self.actif = charger_actif()
+        #: la reconciliation reelle, pour les temoins qui exercent la recherche
+        self.deja_emis_reel = self.actif.deja_emis
         self.envois = []
         #: double du transport : un envoi depose vraiment la cle, comme la base
         self.deposes = {}
@@ -425,6 +428,59 @@ class ActifTest(unittest.TestCase):
         self.assertIn('relecture', erreur)
         self.assertEqual(len(self.envois), 1)
 
+    def test_courrier_sorti_des_500_derniers_est_retrouve(self):
+        """B3 : 600 courriers plus recents ne cachent pas un depot durable ;
+        la relance reconcilie au lieu de renvoyer (temoin de l'avis R1)."""
+        self.ecrire(journal_complet())
+        code, _, erreur = self.echec_ecriture_apres_envoi()
+        self.assertEqual(code, 4, erreur)
+        self.assertEqual(len(self.envois), 1)
+        cle = self.envois[0]['charge']['emission']
+        expediteur = self.actif.work.SYSTEM_SENDER
+        # ordre DESC, comme `mail.history` : le depot vise est le plus ancien
+        courriers = [{'id': 4000 + i, 'sender': expediteur, 'recipient': 'docs01',
+                      'payload': {'notify': True}} for i in range(600)]
+        courriers.append({'id': 4242, 'sender': expediteur, 'recipient': 'docs01',
+                          'payload': {'staging_actif': {'emission': cle}}})
+
+        def history(conn, recipient, limit=50):
+            return courriers[:int(limit)]
+
+        with mock.patch.object(self.actif.config, 'load', return_value={}), \
+             mock.patch.object(self.actif.db_mod, 'connect',
+                               return_value=mock.MagicMock()), \
+             mock.patch.object(self.actif.mail, 'history', side_effect=history), \
+             mock.patch.object(self.actif, 'deja_emis', side_effect=self.deja_emis_reel):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        self.assertEqual(len(self.envois), 1)     # aucun second envoi
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(attestation['emissions'], {})
+        self.assertEqual(attestation['notifies']['docs01']['message'], 4242)
+        self.assertTrue(attestation['notifies']['docs01']['reconcilie'])
+
+    def test_marque_ambigue_preservee_et_aucun_renvoi(self):
+        """B3 : quand l'absence ne peut pas etre prouvee, la marque durable
+        reste ambigue (non reinitialisee) et rien n'est renvoye."""
+        self.ecrire(journal_complet())
+        code, _, _ = self.echec_ecriture_apres_envoi()
+        self.assertEqual(code, 4)
+        self.assertEqual(len(self.envois), 1)
+        avant = json.loads(self.attestations()[0].read_text())['emissions']['docs01']
+        with mock.patch.object(
+                self.actif, 'deja_emis',
+                side_effect=self.actif.RechercheNonExhaustive('plafond atteint')), \
+             mock.patch.object(self.actif.time, 'strftime',
+                               return_value='2026-10-14T18:00:00Z'):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, self.actif.CODE_AMBIGU, erreur)
+        self.assertIn('ambigu', erreur)
+        self.assertIn('relais operateur', erreur)
+        self.assertEqual(len(self.envois), 1)     # aucun renvoi automatique
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(attestation['emissions']['docs01'], avant)
+        self.assertNotIn('docs01', attestation['notifies'])
+
     def test_courrier_non_remis_attestation_conservee(self):
         self.ecrire(journal_complet())
         with mock.patch.object(self.actif, 'envoyer', side_effect=RuntimeError('base absente')):
@@ -534,6 +590,75 @@ class PreuveSondeTest(unittest.TestCase):
                 with self.assertRaises(self.mod.PreuveManquante) as ctx:
                     self.mod.controle_message(row, 'ameesh-agents-1', self.sonde(), SHA)
                 self.assertIn(attendu, str(ctx.exception))
+
+
+class ReconciliationExhaustiveTest(unittest.TestCase):
+    """B3 : `deja_emis` prouve l'absence ou reste ambigue — jamais bornee."""
+
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = charger_actif()
+
+    def setUp(self):
+        self.cle = '0123456789ab:docs01'
+        self.fenetres = []
+        self.courriers = []
+
+    def faux_history(self, conn, recipient, limit=50):
+        self.fenetres.append(int(limit))
+        return self.courriers[:int(limit)]
+
+    def banc(self):
+        pile = contextlib.ExitStack()
+        self.addCleanup(pile.close)
+        pile.enter_context(mock.patch.object(self.mod.config, 'load', return_value={}))
+        pile.enter_context(mock.patch.object(self.mod.db_mod, 'connect',
+                                             return_value=mock.MagicMock()))
+        pile.enter_context(mock.patch.object(self.mod.mail, 'history',
+                                             side_effect=self.faux_history))
+        return pile
+
+    def courrier(self, id_, cle=None, expediteur=None):
+        return {'id': id_, 'sender': expediteur or self.mod.work.SYSTEM_SENDER,
+                'recipient': 'docs01',
+                'payload': {'staging_actif': {'emission': cle or self.cle}}}
+
+    def bruit(self, n, debut=1000):
+        return [{'id': debut + i, 'sender': self.mod.work.SYSTEM_SENDER,
+                 'recipient': 'docs01', 'payload': {'notify': True}}
+                for i in range(n)]
+
+    def test_absence_prouvee_quand_tout_le_depot_est_relu(self):
+        self.courriers = self.bruit(3) + [self.courrier(7, cle='autre:docs01')]
+        with self.banc():
+            self.assertIsNone(self.mod.deja_emis('docs01', self.cle))
+        self.assertEqual(self.fenetres, [self.mod.HISTORIQUE_RECONCILIATION])
+
+    def test_cle_d_un_autre_expediteur_ne_reconcilie_pas(self):
+        self.courriers = [self.courrier(9, expediteur='agent')]
+        with self.banc():
+            self.assertIsNone(self.mod.deja_emis('docs01', self.cle))
+
+    def test_courrier_hors_fenetre_retrouve_par_doublement(self):
+        """Le depot est plus ancien que la fenetre initiale : elle double
+        jusqu'a le relire au lieu de conclure a tort a une absence."""
+        with mock.patch.object(self.mod, 'HISTORIQUE_RECONCILIATION', 2), \
+             mock.patch.object(self.mod, 'HISTORIQUE_MAX', 64):
+            self.courriers = self.bruit(5) + [self.courrier(42)]
+            with self.banc():
+                self.assertEqual(self.mod.deja_emis('docs01', self.cle), 42)
+        self.assertEqual(self.fenetres, [2, 4, 8])
+
+    def test_fenetre_toujours_pleine_au_plafond_reste_ambigue(self):
+        with mock.patch.object(self.mod, 'HISTORIQUE_RECONCILIATION', 2), \
+             mock.patch.object(self.mod, 'HISTORIQUE_MAX', 8):
+            self.courriers = self.bruit(40)
+            with self.banc(), self.assertRaises(self.mod.RechercheNonExhaustive) as ctx:
+                self.mod.deja_emis('docs01', self.cle)
+        self.assertIn('absence non prouvee', str(ctx.exception))
+        self.assertEqual(self.fenetres, [2, 4, 8])
 
 
 class StagingSignalTest(unittest.TestCase):
@@ -721,6 +846,17 @@ class StagingSignalTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.actifs(), [])
 
+    def test_rc_ambigu_est_relaye(self):
+        """B3 : un code 5 (emission ambigue, aucun renvoi) est signale comme
+        tel et n'echoue pas le deploiement."""
+        self.creer_poste_installe()
+        (self.state / 'scenario').write_text('ko=actif:5\n')
+        p = self.run_staging('--lots', '917', '--rapporteurs', 'docs01')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(len(self.actifs()), 1)
+        self.assertIn('ambigu', p.stderr)
+        self.assertIn('relayer a la main', p.stderr)
+
     def test_listes_normalisees(self):
         self.creer_poste_installe()
         p = self.run_staging('--lots', '917, 988 917', '--rapporteurs', 'docs01 docs01')
@@ -766,6 +902,11 @@ case "${1:-}" in
 esac
 if [ "$(basename "${1:-}")" = actif.py ]; then
   printf 'actif %s\n' "$*" >> "$state/calls.log"
+  if grep -qx "ko=actif:5" "$state/scenario" 2>/dev/null; then
+    grep -vx "ko=actif:5" "$state/scenario" > "$state/scenario.tmp" || true
+    mv "$state/scenario.tmp" "$state/scenario"
+    exit 5
+  fi
   exit 0
 fi
 hote=""; sha=""; cible=auto; precedent=""

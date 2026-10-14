@@ -22,10 +22,16 @@ Le signal est durable — une attestation JSON sous
 `~/.local/state/ameesh/mise-a-jour/actif-<sha>.json` — et borne : un courrier
 par rapporteur, jamais deux fois pour le meme commit, meme apres une erreur
 d'ecriture survenue apres l'envoi. La cle d'emission est ecrite dans
-l'attestation AVANT l'envoi, et une relance reconcilie l'envoi deja depose en
-base avant de renvoyer. Une preuve manquante n'ecrit ni attestation ni
-courrier de reussite. Aucun lot n'est clos automatiquement et aucun sondage
-n'est arme : le rapporteur reprend sa verification apres deploiement lui-meme.
+l'attestation AVANT l'envoi ; une relance recherche le courrier deja depose
+portant cette cle avant de renvoyer, et cette recherche est exhaustive : la
+fenetre relue double tant qu'elle est pleine, donc une absence n'est retenue
+que prouvee. Si la recherche ne peut pas prouver l'absence (fenetre toujours
+pleine au plafond, base injoignable), la marque d'emission est preservee et
+le courrier n'est PAS renvoye automatiquement : le relais operateur prend le
+signal (code de sortie 5, distinct d'un echec). Une preuve manquante n'ecrit
+ni attestation ni courrier de reussite. Aucun lot n'est clos automatiquement
+et aucun sondage n'est arme : le rapporteur reprend sa verification apres
+deploiement lui-meme.
 """
 from __future__ import annotations
 
@@ -49,12 +55,25 @@ HOTES_CANON = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smiche
 ETAPES_REQUISES = ("installer", "redemarrer", "controler", "sante")
 #: etat par defaut des attestations (meme arbre que le journal de staging)
 ETAT_DEFAUT = Path.home() / ".local/state/ameesh/mise-a-jour"
-#: messages relus par rapporteur pour reconcilier un envoi deja depose
+#: fenetre de depart de la reconciliation d'emission ; elle double tant
+#: qu'elle est pleine, une fenetre bornee ne prouvant pas une absence.
 HISTORIQUE_RECONCILIATION = 500
+#: plafond de la recherche exhaustive : au-dela, fenetre pleine, l'absence
+#: n'est pas prouvee et l'emission reste ambigue (aucun renvoi automatique).
+HISTORIQUE_MAX = 20000
+#: code de sortie d'une emission ambigue : rien n'a ete renvoye, le relais
+#: operateur doit verifier le depot avant toute relance manuelle.
+CODE_AMBIGU = 5
+#: code de sortie d'un echec (attestation non ecrite, courrier non remis).
+CODE_ECHEC = 4
 
 
 class PreuveManquante(Exception):
     """Une preuve d'activation manque : aucun signal de reussite."""
+
+
+class RechercheNonExhaustive(Exception):
+    """L'absence d'un envoi n'a pas pu etre prouvee : ne rien renvoyer."""
 
 
 def prefixe_du_commit(sha: str, vu: str) -> bool:
@@ -221,23 +240,37 @@ def emission_cle(sha: str, nom: str) -> str:
 
 
 def deja_emis(nom: str, cle: str) -> int | None:
-    """Id du courrier portant cette cle d'emission, s'il a deja ete depose.
+    """Id du courrier portant cette cle d'emission, ou None si son absence du
+    depot est PROUVEE.
 
     La relecture sert a reconcilier une relance apres une erreur d'ecriture
     survenue entre l'envoi et la sauvegarde des marques : le courrier deja
-    depose est retrouve, pas renvoye.
+    depose est retrouve, pas renvoye. Une fenetre bornee ne prouve pas
+    l'absence — un courrier peut etre sorti des N derniers — donc la fenetre
+    double tant qu'elle est pleine. Si elle reste pleine au plafond,
+    l'absence n'est pas prouvee : `RechercheNonExhaustive` est levee et
+    l'appelant s'abstient de renvoyer (avis R1 B3).
     """
     conn = db_mod.connect(config.load())
     try:
-        for row in mail.history(conn, nom, limit=HISTORIQUE_RECONCILIATION):
-            if row.get("sender") != work.SYSTEM_SENDER:
-                continue
-            charge = mail.message_payload(row).get("staging_actif") or {}
-            if isinstance(charge, dict) and charge.get("emission") == cle:
-                return int(row["id"])
+        fenetre = HISTORIQUE_RECONCILIATION
+        while True:
+            lignes = mail.history(conn, nom, limit=fenetre)
+            for row in lignes:
+                if row.get("sender") != work.SYSTEM_SENDER:
+                    continue
+                charge = mail.message_payload(row).get("staging_actif") or {}
+                if isinstance(charge, dict) and charge.get("emission") == cle:
+                    return int(row["id"])
+            if len(lignes) < fenetre:
+                # fenetre non pleine : tout le depot du rapporteur a ete relu
+                return None
+            if fenetre >= HISTORIQUE_MAX:
+                raise RechercheNonExhaustive(
+                    "fenetre de %d courriers pleine : absence non prouvee" % fenetre)
+            fenetre = min(fenetre * 2, HISTORIQUE_MAX)
     finally:
         conn.close()
-    return None
 
 
 def ecrire_attestation(chemin: Path, attestation: dict) -> None:
@@ -379,22 +412,35 @@ def main(argv: list[str] | None = None) -> int:
     }
 
     echecs = []
+    ambigus = []
     for nom in attestation["rapporteurs"]:
         if nom in notifies:
             continue
         cle = emission_cle(sha, nom)
-        emissions[nom] = {"cle": cle, "ts": attestation["date"]}
-        try:
-            # la cle doit etre durable AVANT l'envoi : sinon un arret entre
-            # l'envoi et la sauvegarde des marques produirait un doublon.
-            ecrire_attestation(chemin, attestation)
-        except OSError as exc:
-            echecs.append(nom)
-            print("cle d'emission non ecrite pour %s (aucun envoi) : %s"
-                  % (nom, exc), file=sys.stderr)
-            continue
+        # une marque d'emission deja durable signifie qu'une tentative
+        # anterieure n'a pas enregistre son resultat : elle est PRESERVEE
+        # telle quelle, jamais reinitialisee (avis R1 B3).
+        if not emissions.get(nom):
+            emissions[nom] = {"cle": cle, "ts": attestation["date"]}
+            try:
+                # la cle doit etre durable AVANT l'envoi : sinon un arret entre
+                # l'envoi et la sauvegarde des marques produirait un doublon.
+                ecrire_attestation(chemin, attestation)
+            except OSError as exc:
+                emissions.pop(nom, None)
+                echecs.append(nom)
+                print("cle d'emission non ecrite pour %s (aucun envoi) : %s"
+                      % (nom, exc), file=sys.stderr)
+                continue
         try:
             deja = deja_emis(nom, cle)
+        except RechercheNonExhaustive as exc:
+            # absence non prouvee : renvoyer risquerait un doublon ; la marque
+            # reste ambigue et le relais operateur verifie le depot.
+            ambigus.append(nom)
+            print("emission ambigue pour %s, aucun renvoi (relais operateur) : %s"
+                  % (nom, exc), file=sys.stderr)
+            continue
         except Exception as exc:  # noqa: BLE001 — sans relecture, pas de renvoi
             echecs.append(nom)
             print("relecture de l'envoi impossible pour %s (aucun renvoi) : %s"
@@ -420,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         ecrire_attestation(chemin, attestation)
     except OSError as exc:
         print("attestation non ecrite (%s) : %s" % (chemin, exc), file=sys.stderr)
-        return 4
+        return CODE_ECHEC
     if args.json:
         print(json.dumps(attestation, ensure_ascii=False))
     else:
@@ -430,7 +476,9 @@ def main(argv: list[str] | None = None) -> int:
             print("rapporteurs : %s" % ", ".join(
                 "%s%s" % (nom, "" if nom in notifies else " (non remis)")
                 for nom in attestation["rapporteurs"]))
-    return 4 if echecs else 0
+    if ambigus:
+        return CODE_AMBIGU
+    return CODE_ECHEC if echecs else 0
 
 
 if __name__ == "__main__":
