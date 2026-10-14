@@ -463,13 +463,15 @@ class GithubTest(_PlanDb):
         ms = [m for m in work.milestones(self.db, a["id"]) if m["kind"] == "merged"][0]
         self.assertEqual((ms["sha"], ms["actor"]), (SHA, "github:alice"))
         self.assertEqual(work.get(self.db, a["id"])["pr_ref"], "%s#1" % REPO)
-        # idempotent ; et GitHub n'est que LU
+        # idempotent ; et GitHub n'est que LU (les PR ouvertes en REST paginé,
+        # exhaustives, #759)
         again = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(again["merged"], 0)
         # #759 : un relevé répété ne répète pas le constat dans le journal
         self.assertEqual(sum(1 for e in work.events(self.db, b["id"])
                              if (e["note"] or "").startswith("stage merged")), 1)
-        self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()}, {"pr list"})
+        self.assertEqual({c[0] + " " + c[1] for c in self.gh.calls()},
+                         {"pr list", "api --paginate"})
 
     def test_sync_github_branche_lot_numero_et_pr_partielle(self):
         # L118b : lot/<id>-… sans fiche de ce nom ferme le lot <id> ; une PR
@@ -559,6 +561,41 @@ class GithubTest(_PlanDb):
                        body="Part.\n\nameesh-work-partial: %d\n\nameesh-work: %d final" % (n, n))
         report = plan_github.sync_github(self.db, self.gh, REPO)
         self.assertEqual(report["results"], [])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_759_pr_partielle_ouverte_retient_le_lot(self):
+        # R1 codex3 P2 : une PR ouverte qui ne se déclare que
+        # `ameesh-work-partial:` (branche d'étape `agent/…`, pas `lot/<id>`)
+        # n'apparaît pas dans les lignes `ameesh-work:` — elle doit pourtant
+        # retenir le lot, sinon l'incident #147 se reproduit.
+        a = work.add(self.db, title="parapluie")
+        n = a["id"]
+        self.merged_pr(71, "agent/etape-1", body="Étape 1.\n\nameesh-work: %d" % n)
+        self.gh.state["prs"]["%s#72" % REPO] = {
+            "state": "OPEN", "headRefName": "agent/etape-2",
+            "body": "Part.\n\nameesh-work-partial: %d" % n}
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {n: "stage-merged"})
+        self.assertIn("PR ouverte %s#72" % REPO, report["results"][0]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_759_pr_ouverte_au_dela_du_plafond_retient_le_lot(self):
+        # R1 codex3 P2 : la liste des PR ouvertes ne se tronque pas au
+        # `--limit` du relevé des fusions (ici 1) : une PR liée au-delà du
+        # plafond reste vue, sinon le lot se ferme à tort.
+        a = work.add(self.db, title="plafond")
+        n = a["id"]
+        self.merged_pr(81, "agent/etape-1", body="Étape 1.\n\nameesh-work: %d" % n)
+        self.gh.state["prs"]["%s#82" % REPO] = {
+            "state": "OPEN", "headRefName": "agent/bruyante", "body": "rien"}
+        self.gh.state["prs"]["%s#83" % REPO] = {
+            "state": "OPEN", "headRefName": "agent/etape-2",
+            "body": "Part.\n\nameesh-work: %d" % n}
+        report = plan_github.sync_github(self.db, self.gh, REPO, limit=1)
+        self.assertEqual({r["work_item"]: r["result"] for r in report["results"]},
+                         {n: "stage-merged"})
+        self.assertIn("PR ouverte %s#83" % REPO, report["results"][0]["detail"])
         self.assertEqual(work.get(self.db, n)["state"], "intake")
 
     def issue(self, prefix: str) -> dict:

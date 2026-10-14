@@ -371,6 +371,30 @@ def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None) -> str | No
     return "stage merged: %s — lot non fermé" % " ; ".join(reasons)
 
 
+def open_prs_of_repo(gh, repo: str) -> list[dict]:
+    """#759 : TOUTES les PR ouvertes du dépôt (REST paginé, sans plafond).
+
+    La décision de fermer un lot exige de connaître exhaustivement les PR
+    ouvertes qui le désignent encore : un `gh pr list --limit` tronqué
+    laisserait une PR liée invisible et le lot se fermerait à tort. Les
+    champs rendus sont ceux de `gh pr list --json` attendus par
+    `_targets_of_pr` (le `--limit` du relevé des fusions ne s'y applique
+    pas)."""
+    rows = _lines(gh, ["api", "--paginate",
+                       "repos/%s/pulls?state=open&per_page=100" % repo,
+                       "--jq", ".[] | @json"])
+    out: list[dict] = []
+    for row in rows:
+        head = row.get("head") or {}
+        head_repo = (head.get("repo") or {}).get("full_name")
+        out.append({"number": row.get("number"),
+                    "headRefName": head.get("ref") or "",
+                    "isCrossRepository": head_repo != repo,
+                    "body": row.get("body") or "",
+                    "url": row.get("html_url") or ""})
+    return out
+
+
 def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -> dict:
     """Ferme les lots dont la PR est fusionnée. Rend le compte rendu.
 
@@ -384,11 +408,7 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
                      "mergedAt,url"])
     if not isinstance(prs, list):
         raise GithubError("gh pr list: list expected")
-    open_prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "open", "--limit",
-                          str(int(limit)), "--json",
-                          "number,headRefName,isCrossRepository,body,url"])
-    if not isinstance(open_prs, list):
-        raise GithubError("gh pr list: list expected")
+    open_prs = open_prs_of_repo(gh, repo)
     st = storage.of(db)
     idents = [p["id"] for p in st.packages.all() if p.get("kind") in work_mod.LINKABLE_KINDS]
     results: list[dict] = []
@@ -398,7 +418,10 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
     for pr in sorted(open_prs, key=lambda p: int(p.get("number") or 0)):
         ref = "%s#%s" % (repo, pr.get("number"))
         targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
-        for item_id, _pid in targets:
+        # L118b : une PR ouverte qui ne livre qu'une partie du lot le retient
+        # aussi — `ameesh-work-partial:` n'est pas une ligne `ameesh-work:`,
+        # elle n'apparaît donc pas dans `targets` (#759, incident #147).
+        for item_id in sorted({i for i, _pid in targets} | partial_lots(pr.get("body"))):
             open_lots.setdefault(item_id, []).append(ref)
     for pr in sorted(prs, key=lambda p: int(p.get("number") or 0)):
         if (pr.get("state") or "MERGED") != "MERGED":
