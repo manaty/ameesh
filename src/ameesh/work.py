@@ -208,6 +208,7 @@ def add(
     estimate_source: str | None = None,
     size: str | None = None,
     note: str = "",
+    parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
 ) -> dict:
@@ -228,7 +229,13 @@ def add(
     #506: `note` is appended to the creation event (a project introduced
     with --new-project). L539 : `mark_item_id` et `mark_note` écrivent la
     marque d'idempotence du lot de relecture au journal de ce lot, dans la
-    même transaction que la création (`{lot}` y vaut l'identifiant créé)."""
+    même transaction que la création (`{lot}` y vaut l'identifiant créé).
+
+    #1193: `parent_lot` is the explicit parent of a suite lot. The blocking
+    edge is written **in the same transaction** as the creation (parent still
+    open), traced in the journal if the parent is already finished; an unknown
+    parent is refused before any creation. No number is ever guessed from the
+    title or the body."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -244,6 +251,15 @@ def add(
         raise WorkError("title required")
     if priority is not None and priority not in PRIORITIES:
         raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
+    if parent_lot is not None:
+        try:
+            parent_lot = int(parent_lot)
+        except (TypeError, ValueError):
+            raise WorkError("--parent-lot: a lot number, not %r" % (parent_lot,)) from None
+        if parent_lot <= 0:
+            raise WorkError("--parent-lot: a positive lot number")
+        if get(db, parent_lot) is None:
+            raise WorkError("parent lot #%d not found" % parent_lot)
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
@@ -263,7 +279,7 @@ def add(
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
         if minutes else None, change_size=size or None,
-        mark_item_id=mark_item_id, mark_note=mark_note)
+        mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
