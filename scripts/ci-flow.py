@@ -54,6 +54,12 @@ la part, et une valeur absente ou illisible ne publie rien. `summary` affiche
 en plus, sur chaque part, la part du plafond consommée à la fin du job
 (« Plafond du job : … sur N min (P %) »), avec un ⚠ au-delà du seuil : c'est
 la mesure qui montre la croissance de la suite d'une exécution à l'autre.
+
+#1044 — un nombre non fini (NaN, ±infini, ou un débordement de conversion)
+n'est jamais un nombre : il est refusé comme illisible, avant tout calcul et
+toute écriture. Et quand la part n'a pas de durée finale attestée (interrompue
+sans ligne `fin`), `summary` donne la durée « au moment de l'alerte » et le
+dit, au lieu de la présenter comme une durée de fin de part.
 """
 from __future__ import annotations
 
@@ -61,6 +67,7 @@ import argparse
 import collections
 import datetime
 import json
+import math
 import os
 import pathlib
 import sys
@@ -109,11 +116,13 @@ def _duration(s: float) -> str:
 
 
 def _nombre(valeur) -> float | None:
-    """Un nombre d'option ou d'environnement, ou None s'il est absent ou illisible."""
+    """Un nombre fini d'option, d'environnement ou d'état, ou None s'il est
+    absent, illisible ou non fini (#1044 : NaN, ±infini et débordement)."""
     try:
-        return float(valeur)
-    except (TypeError, ValueError):
+        nombre = float(valeur)
+    except (TypeError, ValueError, OverflowError):
         return None
+    return nombre if math.isfinite(nombre) else None
 
 
 def _minutes(valeur) -> str:
@@ -208,24 +217,30 @@ def summary(chemins: list[str]) -> str:
         # #899 : la part du plafond consommée, mesure de la croissance de la suite
         publication = etat_publication(chemin)
         plafond = _nombre(publication.get("plafond_min"))
-        alerte = publication.get("alerte")
-        alerte = alerte if isinstance(alerte, dict) else None
-        if plafond:
-            ecoule = _nombre(publication.get("fin_ecoule_s"))
-            if ecoule is None and alerte:
-                ecoule = _nombre(alerte.get("ecoule_s"))
-            if ecoule is not None:
-                part_du_plafond = ecoule / (plafond * 60.0)
-                ligne = ("%sPlafond du job : %s à la fin de la part sur %s min (%.0f %%)"
-                         % ("⚠ " if alerte or part_du_plafond >= ALERTE_SEUIL else "",
-                            _duration(ecoule), _minutes(plafond), 100 * part_du_plafond))
-                if alerte:
-                    ligne += " — alerte à %d %% publiée dans le check run." % seuil_pourcent(alerte)
-                elif part_du_plafond >= ALERTE_SEUIL:
-                    ligne += " — seuil de %d %% atteint." % round(ALERTE_SEUIL * 100)
-                else:
-                    ligne += "."
-                check_output.append(ligne + "\n")
+        alerte = alerte_de(publication)
+        fin_ecoule = _nombre(publication.get("fin_ecoule_s"))
+        ecoule_alerte = _nombre(alerte.get("ecoule_s")) if alerte else None
+        if plafond and fin_ecoule is not None:
+            part_du_plafond = fin_ecoule / (plafond * 60.0)
+            ligne = ("%sPlafond du job : %s à la fin de la part sur %s min (%.0f %%)"
+                     % ("⚠ " if alerte or part_du_plafond >= ALERTE_SEUIL else "",
+                        _duration(fin_ecoule), _minutes(plafond), 100 * part_du_plafond))
+            if alerte:
+                ligne += " — alerte à %d %% publiée dans le check run." % seuil_pourcent(alerte)
+            elif part_du_plafond >= ALERTE_SEUIL:
+                ligne += " — seuil de %d %% atteint." % round(ALERTE_SEUIL * 100)
+            else:
+                ligne += "."
+            check_output.append(ligne + "\n")
+        elif plafond and ecoule_alerte is not None:
+            # #1044 : sans `fin_ecoule_s`, la durée de l'alerte n'atteste pas la
+            # fin de la part (interruption, annulation) : ne pas la présenter
+            # comme telle.
+            part_du_plafond = ecoule_alerte / (plafond * 60.0)
+            check_output.append(
+                "⚠ Plafond du job : %s écoulées au moment de l'alerte sur %s min (%.0f %%)"
+                " — durée finale non attestée (part sans ligne de fin).\n"
+                % (_duration(ecoule_alerte), _minutes(plafond), 100 * part_du_plafond))
         classes = debut.get("classes", {})
         touches = [m for m in debut.get("modules", []) if classes.get(m, "P3") != "P3"]
         impacted = next((e for e in events if e.get("type") == "impacted"), None)
