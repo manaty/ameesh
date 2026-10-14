@@ -899,9 +899,10 @@ class CostBook:
         # comptes déclarés (`accounts.pause_label`) ; sans compte déclaré,
         # c'est le compte par défaut du harnais. #373 r2 : la pause dure
         # jusqu'à la libération la plus tardive des fenêtres qui bloquent —
-        # aucune date si l'une d'elles n'est pas datée. #777 : la libération
-        # est l'heure où le rythme rattrape l'usage (`free_at`), pas la remise
-        # à zéro, sauf pour un usage que le rythme ne rattrape plus.
+        # aucune date si l'une d'elles n'est pas datée. #777, #898 : la
+        # libération est l'heure où le rythme rattrape l'usage (`free_at`),
+        # pas la remise à zéro, sauf pour un usage que le rythme ne rattrape
+        # plus.
         head = ""
         if all(gauge.resets_at for gauge in held):
             free, gauge = max(((float(g.free_at(now, reserve)), g) for g in held),
