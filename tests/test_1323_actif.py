@@ -205,6 +205,16 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(self.attestations(), [])
         self.assertEqual(self.envois, [])
 
+    def test_depuis_invalide_refuse(self):
+        self.ecrire(journal_complet())
+        argv = ['--journal', str(self.journal), '--sha', SHA, '--depuis', 'hier',
+                '--etat-dir', str(self.etat)] + self.hotes()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            self.actif.main(argv)
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
     def test_execution_precedente_du_meme_jour_ignoree(self):
         """Le journal est quotidien : un echec anterieur (retour) ne
         disqualifie pas l'execution courante, posterieure a --depuis."""
