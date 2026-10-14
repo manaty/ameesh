@@ -17,7 +17,7 @@ from unittest import mock
 from ameesh import db as db_mod
 from ameesh import fil, projects, storage, watch
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 
 
 class TextTest(unittest.TestCase):
@@ -85,7 +85,7 @@ class TextTest(unittest.TestCase):
         for line in pinned.splitlines():
             name, _, value = line.partition("=")
             timer_env[name] = value.strip('"')
-        cfg = config_mod.load(env=dict(timer_env, AMEESH_CONFIG="/nonexistent"))
+        cfg = config_mod.load(env=dict(timer_env, AMEESH_CONFIG=EMPTY_CONFIG))
         self.assertEqual((cfg.dsn, cfg.host), ("postgresql://b/db", "vm-b"))
 
     def test_linger(self):
