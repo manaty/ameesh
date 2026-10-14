@@ -42,10 +42,19 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(texte=texte):
                 self.assertEqual(rate_limit.classify(error=texte),
                                  rate_limit.RATE_LIMITED)
-                self.assertEqual(rate_limit.classify(result=texte),
-                                 rate_limit.RATE_LIMITED)
                 self.assertEqual(rate_limit.classify(stderr_tail="bruit\n" + texte),
                                  rate_limit.RATE_LIMITED)
+
+    def test_un_texte_libre_qui_parle_de_debit_ne_classe_pas(self):
+        # P2 dev1 (14/10) : le résultat libre du tour (dernier message du
+        # modèle) peut *parler* d'un débit sans l'avoir subi — il ne désarme
+        # pas L48 et ne tait pas l'alerte #1268.
+        for texte in ("handled the rate limit exceeded case and too many requests retries",
+                      "rate_limit_error: 429 Too Many Requests",
+                      "429",
+                      "Error code: 429 - rate limit reached"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(result=texte))
 
     def test_quota_est_distingue_et_prime(self):
         for texte in ("insufficient_quota: you exceeded your current quota",
@@ -82,13 +91,20 @@ class ClassifyTest(unittest.TestCase):
                 self.assertIsNone(rate_limit.classify(error=texte))
 
     def test_debit_seulement_sur_signature_fournisseur(self):
-        # P2 dev1 (14/10) : « line 429 », le sujet « rate limit » ou
-        # l'adjectif « overloaded » d'un texte libre ne sont pas des
-        # signatures de débit — sinon un tour réellement en échec repart
-        # toutes les 10 min (L48 désarmé) et l'alerte #1268 est tue.
+        # P2 dev1/cx3 (14/10) : un numéro de ligne « 429 » (trace Node,
+        # request.py, api/client.py), le sujet « rate limit » ou l'adjectif
+        # « overloaded » d'un texte libre ne sont pas des signatures de débit
+        # — sinon un tour réellement en échec repart toutes les 10 min (L48
+        # désarmé) et l'alerte #1268 est tue.
         for texte in ("Traceback (most recent call last):\n"
                       "  File \"runner.py\", line 429, in run\n"
                       "ValueError: boom",
+                      "Traceback (most recent call last):\n"
+                      "  File \"request.py\", line 429, in send\n"
+                      "ValueError: boom",
+                      "File \"/srv/app/api/client.py\", line 429",
+                      "(/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js:429:15)",
+                      "runner.py:429: in rate_limit",
                       "j'ai corrigé le handling du rate limit dans rate_limit.py",
                       "le parseur est overloaded par les options",
                       "voir la ligne 429 du journal"):
@@ -98,18 +114,22 @@ class ClassifyTest(unittest.TestCase):
                 self.assertIsNone(rate_limit.classify(stderr_tail=texte))
 
     def test_signatures_ancrees_du_debit(self):
-        # les formes fournisseur réelles restent des signatures : contexte
-        # d'erreur HTTP, phrase 429, ou statut seul.
+        # les formes fournisseur réelles restent des signatures : en-tête HTTP,
+        # statut explicite, phrase 429, ou statut seul.
         for texte in ("Error code: 429 - rate limit reached",
                       "HTTP 429 Too Many Requests",
+                      "HTTP/1.1 429 Too Many Requests",
+                      "last status: 429",
+                      "status_code=429",
                       "429",
+                      "429 Client Error: Too Many Requests for url",
                       "RateLimitError: too many requests",
                       "The engine is currently overloaded, please try again later",
                       "Rate limit exceeded"):
             with self.subTest(texte=texte):
                 self.assertEqual(rate_limit.classify(error=texte),
                                  rate_limit.RATE_LIMITED)
-                self.assertEqual(rate_limit.classify(result=texte),
+                self.assertEqual(rate_limit.classify(stderr_tail=texte),
                                  rate_limit.RATE_LIMITED)
 
 
@@ -169,9 +189,13 @@ class EtatTest(unittest.TestCase):
 
 
 class RepriseTest(_Base):
-    """Un vrai tour qui prend un 429 : attente cadencée, reprise, pas d'arrêt."""
+    """Un vrai tour qui prend un 429 : attente cadencée, reprise, pas d'arrêt.
 
-    DEBIT = {"AMEESH_TEST_RESULT": "rate_limit_error: 429 Too Many Requests",
+    Le débit est écrit sur le **stderr du fournisseur** (le vrai canal d'un
+    429) ; le résultat libre du tour ne conclut plus rien sur un débit (P2
+    dev1 du 14/10)."""
+
+    DEBIT = {"AMEESH_TEST_STDERR": "rate_limit_error: 429 Too Many Requests\n",
              "AMEESH_TEST_EXIT": "1"}
 
     def test_429_attend_et_reprend_sans_arret(self):
@@ -195,22 +219,26 @@ class RepriseTest(_Base):
         finally:
             worker.watchdog_stop.set()
 
-    FAUX_429 = {"AMEESH_TEST_RESULT": "Traceback (most recent call last):\n"
-                                      "  File \"runner.py\", line 429, in run\n"
-                                      "ValueError: boom",
-                "AMEESH_TEST_EXIT": "1"}
+    FAUX_429 = ("Traceback (most recent call last):\n"
+                "  File \"runner.py\", line 429, in run\n"
+                "ValueError: boom")
 
     def test_une_ligne_429_ne_desarme_pas_l48(self):
-        # P2 dev1 (14/10) : un texte libre qui contient « line 429 » n'est pas
-        # un 429 fournisseur — le tour compte comme un échec rapide (L48 armé)
-        # et aucun épisode de débit n'est ouvert.
-        _, worker = self._worker("rl8", "claude", {})
-        try:
-            self.assertIsNotNone(self._tour(worker, **self.FAUX_429))
-            self.assertIsNone(worker.rate_limit)
-            self.assertTrue(worker.fast_failure)
-        finally:
-            worker.watchdog_stop.set()
+        # P2 dev1/cx3 (14/10) : un texte qui contient « line 429 » n'est pas un
+        # 429 fournisseur — le tour compte comme un échec rapide (L48 armé) et
+        # aucun épisode de débit n'est ouvert. Les deux canaux lus pour un débit
+        # sont couverts : stderr du fournisseur et résultat libre du modèle.
+        for canal, env in (("stderr", {"AMEESH_TEST_STDERR": self.FAUX_429}),
+                           ("result", {"AMEESH_TEST_RESULT": self.FAUX_429})):
+            with self.subTest(canal=canal):
+                _, worker = self._worker("rl8" + canal[0], "claude", {})
+                try:
+                    self.assertIsNotNone(
+                        self._tour(worker, **env, AMEESH_TEST_EXIT="1"))
+                    self.assertIsNone(worker.rate_limit)
+                    self.assertTrue(worker.fast_failure)
+                finally:
+                    worker.watchdog_stop.set()
 
     def test_un_succes_efface_l_episode(self):
         _, worker = self._worker("rl2", "claude", {})

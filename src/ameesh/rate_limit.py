@@ -7,7 +7,9 @@ rapide (L48 : cinq échecs rapides arrêtent l'agent et exigent `ameesh resume`)
 Un **quota épuisé** (plafond de forfait, crédit) est distingué du débit
 passager : le même rythme lent s'applique, mais l'état et le texte le nomment.
 Dans le doute — texte illisible — on ne conclut rien sur le budget : la garde
-comptable (L226b) reste seule juge, et l'agent suit la reprise cadencée.
+comptable (L226b) reste seule juge, et l'agent suit la reprise cadencée. Un
+débit ne se déduit que d'un texte du fournisseur (`error`, fin de `stderr`) :
+le dernier message du modèle ne conclut rien.
 
 L'état vit dans `status_text` sous une forme lisible et analysable
 (``[rate_limited x2 since 2026-10-14T08:20:00Z, retry in 120s, retry at …]``) :
@@ -44,16 +46,27 @@ QUOTA_PATTERNS = (
 )
 
 #: motifs d'un débit passager (429, surcharge, Retry-After…) — signatures
-#: fournisseur **positives**, comme les quotas : un numéro de ligne « 429 »,
-#: le sujet « rate limit » ou l'adjectif « overloaded » d'un texte libre ne
-#: désarment pas L48 et ne taisent pas l'alerte #1268 (P2 dev1 du 14/10 : un
-#: tour réellement en échec repartait sinon toutes les 10 min sans fin).
+#: fournisseur **positives**, comme les quotas : un numéro de ligne « 429 »
+#: (trace Node `cli.js:429:15`, `File "request.py", line 429`), le sujet
+#: « rate limit » ou l'adjectif « overloaded » d'un texte libre ne désarment
+#: pas L48 et ne taisent pas l'alerte #1268 (P2 dev1 et cx3 du 14/10 : un tour
+#: réellement en échec repartait sinon toutes les 10 min sans fin).
+#: Ces motifs ne lisent que les textes du **fournisseur** — `error` et
+#: `stderr_tail` —, jamais le résultat libre du tour (dernier message du
+#: modèle), qui peut *parler* d'un débit sans l'avoir subi.
 TRANSIENT_PATTERNS = (
-    # un « 429 » doit nommer une panne HTTP, pas une ligne de trace
-    re.compile(r"\b(?:http|status|code|error|response|request|api|upstream)\b"
-               r"[^\n]{0,24}?\b429\b", re.I),
-    re.compile(r"\b429\b[^\n]{0,24}?\b(?:too many requests|rate[_ -]?limit)",
-               re.I),
+    # un « 429 » doit nommer un statut HTTP explicite : en-tête (`HTTP 429`,
+    # `HTTP/1.1 429`), statut (`status: 429`, `status_code=429`) ou code
+    # d'erreur fournisseur (`Error code: 429`, `API Error: 429`) — séparateurs
+    # et espaces, jamais de texte arbitraire entre le nom et le numéro
+    re.compile(r"\b(?:https?(?:/\d(?:\.\d)?)?|status(?:[_ ]?code)?|error code|api error)"
+               r"\b\s*[:=]?\s*429\b", re.I),
+    # ou « 429 » suivi immédiatement de la panne qu'il nomme (`429 Too Many
+    # Requests`, `429: rate limit reached`, `429 Client Error: Too Many
+    # Requests`) — toujours pas de texte arbitraire entre les deux
+    re.compile(r"\b429\b\s*(?:client error)?\s*[:=-]?\s*"
+               r"(?:too many requests|rate[_ -]?limit(?:ed|s|ing)?[ _-]?"
+               r"(?:error|exceeded|reached|exception))", re.I),
     # un statut « 429 » seul (texte entier) reste une signature
     re.compile(r"^\s*(?:http[\s/]*)?429\s*$", re.I),
     # « rate limit » doit nommer la panne (error/exceeded/reached), pas le sujet
@@ -85,10 +98,21 @@ _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def _texts(error=None, result=None, stderr_tail=None):
+    """Textes lus pour un **quota**, résultat libre compris."""
     out = [error or "", stderr_tail or ""]
     if result and len(result) <= MAX_RESULT_CHARS:
         out.append(result)
     return out
+
+
+def _directs(error=None, stderr_tail=None):
+    """Textes écrits par le **fournisseur** : erreur et fin de stderr.
+
+    Le résultat libre du tour (dernier message du modèle) n'en fait pas
+    partie : un modèle qui *parle* d'un débit ne le subit pas et ne doit ni
+    désarmer L48 ni taire l'alerte #1268 (P2 dev1 du 14/10).
+    """
+    return [t for t in (error or "", stderr_tail or "") if t]
 
 
 def classify(error: str | None = None, result: str | None = None,
@@ -102,12 +126,15 @@ def classify(error: str | None = None, result: str | None = None,
 
     Le quota prime sur le débit **tous textes confondus** : un « 429 » sur
     l'erreur et un `insufficient_quota` sur stderr classent quota (R1 cx3 B2).
+    Un débit, lui, ne se déduit que d'un texte du fournisseur (`error`,
+    `stderr_tail`) : le résultat libre du tour n'est jamais lu pour lui.
     Un genre ne se déduit que d'une signature fournisseur positive.
     """
     textes = [t for t in _texts(error, result, stderr_tail) if t]
     if any(motif.search(texte) for texte in textes for motif in QUOTA_PATTERNS):
         return QUOTA
-    if any(motif.search(texte) for texte in textes for motif in TRANSIENT_PATTERNS):
+    directs = _directs(error, stderr_tail)
+    if any(motif.search(texte) for texte in directs for motif in TRANSIENT_PATTERNS):
         return RATE_LIMITED
     return None
 
