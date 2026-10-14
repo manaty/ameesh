@@ -1,0 +1,9 @@
+........................................................................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmp4ysev_af/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmpo015cqr9/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+............................................
+----------------------------------------------------------------------
+Ran 174 tests in 42.484s
+
+OK
+tests-exit:0

@@ -1,0 +1,107 @@
+diff --git a/scripts/test-plan.py b/scripts/test-plan.py
+index 161efe94f..e544160cd 100644
+--- a/scripts/test-plan.py
++++ b/scripts/test-plan.py
+@@ -1263,7 +1263,9 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
+         #: version seule (L157) et documentation seule (L161a) restent des
+         #: voies de PR ; ici elles sont éteintes, y compris dans le doute.
+         plan["version_only"] = plan["docs_only"] = False
+-        plan["why"] = plan.get("why") or "lot CI at freeze: impacted + contract"
++        #: `nature` a répondu « not a pull request » : la raison du dispatch est
++        #: le gel, pas l'événement ; une cible release/** la remplacera plus bas.
++        plan["why"] = "lot CI at freeze: impacted + contract"
+     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
+                          docs_only=bool(plan["docs_only"] and not release)))
+     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+diff --git a/src/ameesh/ci.py b/src/ameesh/ci.py
+index c39cfd34b..0e0662b8a 100644
+--- a/src/ameesh/ci.py
++++ b/src/ameesh/ci.py
+@@ -732,27 +732,31 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
+     freeze = frozen_of(db, item_id)
+     frozen = ((freeze or {}).get("sha") or "").strip().lower()
+     asked = (sha or "").strip().lower()
++    exempt = bool(exception or full)
+     if asked and not _sha_ok(asked):
+         raise GelError("--sha: the frozen commit (40 hex), not %r" % sha)
+     if asked and frozen and asked != frozen:
+         raise GelError("--sha %s is not the freeze of lot #%s (%s): refreeze first, "
+                        "a correction needs a new review" % (asked[:12], item_id, frozen[:12]))
+-    frozen_sha = asked or frozen
+-    if not frozen_sha and (exception or full):
+-        # l'exception et le run complet n'attendent pas de gel : la tête de la
+-        # branche est le commit testé
+-        frozen_sha = _head_of(api, name, branch)
+-    if not frozen_sha:
++    if not frozen and not exempt:
++        # le gel est un jalon, pas un drapeau : `--sha` seul ne le remplace pas,
++        # sinon un lot jamais gelé obtiendrait sa CI sans trace de gel.
+         raise GelError("lot #%s is not frozen: ameesh work milestone %s frozen --sha <sha>"
+                        % (item_id, item_id))
+-    if not _sha_ok(frozen_sha):
+-        raise GelError("lot #%s: the frozen milestone carries no usable sha (%r): "
+-                       "refreeze with --sha" % (item_id, frozen_sha))
+     head = _head_of(api, name, branch)
+-    if head != frozen_sha:
+-        raise GelError("branch %s is on %s, the freeze is %s: the ref moved — refreeze "
+-                       "and re-review, nothing dispatched"
+-                       % (branch, head[:12], frozen_sha[:12]))
++    #: le commit testé : le gel pour un run normal ; pour une exception ou la
++    #: suite complète, le `--sha` nommé ou la tête de la branche (le correctif
++    #: d'un incident arrive après le gel et n'attend pas un nouveau gel).
++    tested = (asked or head) if exempt else frozen
++    if not _sha_ok(tested):
++        raise GelError("lot #%s: the frozen milestone carries no usable sha (%r): "
++                       "refreeze with --sha" % (item_id, tested))
++    if head != tested:
++        raise GelError("branch %s is on %s, %s is %s: the ref moved — refreeze and "
++                       "re-review, nothing dispatched"
++                       % (branch, head[:12], "--sha" if exempt else "the freeze",
++                          tested[:12]))
++    frozen_sha = tested
+     reviews = independent_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
+     if not (exception or full) and len(reviews) < avis:
+         raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
+diff --git a/tests/test_l161f_plan.py b/tests/test_l161f_plan.py
+index 75873ee0a..a90cc26b8 100644
+--- a/tests/test_l161f_plan.py
++++ b/tests/test_l161f_plan.py
+@@ -1984,6 +1984,9 @@ class LotFreezePlanTest(unittest.TestCase):
+                                repo=self.repo.path, ref="refs/heads/lot/x",
+                                base="HEAD^1", mode="lot")
+         self.assertEqual(p["selection"]["mode"], "impacted")
++        # la raison du plan est le gel, pas l'événement (`nature` dit « not a
++        # pull request » pour un dispatch) : le plan.json relu le dit.
++        self.assertEqual(p["why"], "lot CI at freeze: impacted + contract")
+         ran = [m for ps in p["parts"]["psycopg"] for m in ps["modules"]]
+         self.assertIn(touched, ran)
+         self.assertTrue(p["contract"])
+diff --git a/tests/test_l161g_ci_gel.py b/tests/test_l161g_ci_gel.py
+index d07266c0c..7c945242c 100644
+--- a/tests/test_l161g_ci_gel.py
++++ b/tests/test_l161g_ci_gel.py
+@@ -246,6 +246,24 @@ class GelPlanTest(GelTestCase):
+             self.gel(Github(), sha=AUTRE)
+         self.assertIn("is not the freeze", str(caught.exception))
+ 
++    def test_un_sha_seul_ne_remplace_pas_le_gel(self):
++        # le gel est un jalon : nommer un SHA ne dispense pas de le déclarer,
++        # sinon la CI d'un lot jamais gelé partirait sans trace de gel.
++        api = Github()
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(api, sha=GEL)
++        self.assertIn("is not frozen", str(caught.exception))
++        self.assertEqual(api.paths, [], "rien ne doit être lu sans gel")
++
++    def test_une_exception_apres_gel_test_la_tete_du_correctif(self):
++        # un correctif d'incident arrive après le gel : l'exception teste la
++        # tête, pas le gel périmé, et le dispatch est marqué.
++        self.gele()
++        api = Github(head=TETE)
++        decision = self.gel(api, exception="incident", reason="incident prod")
++        self.assertEqual((decision["action"], decision["sha"]), ("dispatch", TETE))
++        self.assertEqual(decision["base"], BASE)
++
+     def test_un_workflow_sans_declencheur_est_refuse(self):
+         self.gele()
+         api = Github(workflow="name: tests\n")

@@ -1,0 +1,11 @@
+# 1343 — preuves de discrimination : chaque garde mutée fait rougir son témoin
+# sha du candidat : b60889b6151c3c01ebdf7ba79177197eb610aec2
+MUTATION tete-bougee: rouge attendu (tests.test_l161g_ci_gel.GelPlanTest.test_une_tete_bougee_est_refusee_jamais_un_vert_ailleurs)
+MUTATION gel-obligatoire: rouge attendu (tests.test_l161g_ci_gel.GelPlanTest.test_un_sha_seul_ne_remplace_pas_le_gel)
+MUTATION avis-auteur: rouge attendu (tests.test_l161g_ci_gel.GelPlanTest.test_l_avis_de_l_auteur_ne_compte_pas)
+MUTATION idempotence-vert: rouge attendu (tests.test_l161g_ci_gel.GelPlanTest.test_un_vert_deja_obtenu_ne_redispatch_pas)
+MUTATION cancel-hors-gel: rouge attendu (tests.test_l161g_ci_gel.CancelPlanTest.test_seuls_les_runs_ouverts_hors_sha_gele_sont_annules)
+# apres restauration :
+Ran 31 tests in 0.049s
+
+OK

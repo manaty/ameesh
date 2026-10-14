@@ -1,0 +1,1735 @@
+From fc5a0feeb9799d1a4c3204cb3a45e8a72d46abc5 Mon Sep 17 00:00:00 2001
+From: mty-amh-impl-04 <mty-amh-impl-04@ameesh.invalid>
+Date: Wed, 14 Oct 2026 20:42:30 +0000
+Subject: [PATCH 1/2] #1343 : la CI d'un lot part au gel, pas a chaque poussee
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+canon §3 (owner 14/10 21:45) : relecture avant CI. Une poussee de lot ne
+lance plus rien ; ameesh ci run <lot> dispatche une fois, sur la tete gelee,
+apres les verdicts requis ; ameesh ci cancel <lot> annule les runs perimes.
+
+- .github/workflows/tests.yml : lot PR sans run automatique, mode dispatch
+  (sha gele + base + lot), garde plan (tete bougee -> check requis rouge),
+  agregation sans vert sans tests, marque d'exception.
+- scripts/test-plan.py : plan du mode dispatch, refus d'une ref perimee.
+- src/ameesh/ci.py : gel_plan / cancel_plan (idempotence, avis independants,
+  tete changee refusee, annulation des runs non conclues hors SHA gele).
+- src/ameesh/mesh_cli.py : ameesh ci run / ameesh ci cancel.
+- tests/test_l161f_plan.py : temoins declenchement, porte SHA gele, agregation.
+
+Rebase sur main 2458ec05 (#1339) : conflit de docstring de lot_selection,
+resolution en gardant le parametre `lot` du dispatch et la liste de doutes
+de #1339. Aucun push, aucun dispatch.
+---
+ .github/workflows/tests.yml | 158 ++++++++++++-
+ scripts/test-plan.py        | 125 ++++++++---
+ src/ameesh/ci.py            | 437 ++++++++++++++++++++++++++++++++++++
+ src/ameesh/mesh_cli.py      |  40 ++++
+ tests/test_l161f_plan.py    | 153 ++++++++++++-
+ 5 files changed, 869 insertions(+), 44 deletions(-)
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 517f0ac5a..db6a305ce 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -33,6 +33,23 @@
+ # refusion (a : delta de main disjoint, b : migrations seules) viendront
+ # ensuite.
+ #
++# #1343 — canon §3 (bureau home 66, owner 14/10 21:45) : sur ameesh, la
++# relecture passe avant la CI. Une poussée sur une PR de lot ne lance plus
++# rien ; la CI d'un lot (impactés + contrat, voie `mode=lot` du plan) ne tourne
++# qu'une fois, sur la tête gelée, quand les verdicts requis sont acquis.
++# `ameesh ci run <lot>` (src/ameesh/ci.py) porte ce déclencheur : gel présent,
++# branche distante et tête de PR au SHA gelé, verdict `ok` sur ce SHA (sauf lot
++# léger), un seul run par SHA, puis `gh workflow run tests.yml --ref <branche>
++# -f mode=lot -f sha=<gelé> -f base=<merge-base> -f lot=<n>`. Le job `plan`
++# revérifie le SHA gelé face à HEAD et échoue (check `tests` rouge, rien
++# exécuté) si la branche a bougé. Le dispatch ne prend jamais les voies
++# version seule ou documentation seule : sur la tête gelée, un check `tests`
++# vert veut dire que des tests ont tourné. Exceptions (canon) : un lot qui
++# débloque la CI ou corrige un incident dispatche en parallèle de sa
++# relecture, avec `-f exception=incident|unblock` et une note au lot. Un run
++# devenu périmé (autre SHA) est annulé par `ameesh ci run` ou `ameesh ci
++# cancel <lot>`, jamais un run vert du SHA gelé.
++#
+ # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
+ # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
+ # déjà validée pour ce contenu. Le job « changements » le détecte
+@@ -84,17 +101,57 @@
+ # fourche), rien n'est publié et la part n'en est pas affectée.
+ name: tests
+ 
++# #1343 : le titre du run dit ce qui l'a déclenché — mode, SHA testé, exception
++# éventuelle (canon §3 : une exception incident/déblocage est explicitement
++# marquée) ; une poussée garde le nom de sa branche.
++run-name: "tests${{ github.event_name == 'workflow_dispatch' && format(' {0}', inputs.mode) || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.sha != '' && format(' {0}', inputs.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.lot != '' && format(' lot #{0}', inputs.lot) || '' }}${{ github.event_name == 'workflow_dispatch' && inputs.exception != '' && format(' · exception {0}', inputs.exception) || '' }}${{ github.event_name != 'workflow_dispatch' && format(' · {0}', github.ref_name) || '' }}"
++
+ on:
+   push:
+     branches: [main, "release/**", "integration/**"]
++  # #1343 (canon §3, bureau home 66) : une poussée sur une PR de LOT ne lance
++  # plus rien. Seules les PR dont la CIBLE est release/** ou integration/**
++  # gardent ici la suite complète ; une PR de release depuis release/** vers
++  # main est déjà couverte par la poussée sur release/**, qui porte le même
++  # commit. La CI d'un lot part au gel, après les verdicts requis, sur le SHA
++  # gelé : `ameesh ci run <lot>` (workflow_dispatch, mode=lot).
+   pull_request:
++    branches: ["release/**", "integration/**"]
+   workflow_dispatch:
++    inputs:
++      lot:
++        description: "work item number, for the trace (mode=lot)"
++        required: false
++        type: string
++      sha:
++        description: "frozen commit (full 40-hex); must be the head of the ref"
++        required: false
++        type: string
++      base:
++        description: "commit the freeze is compared to (merge-base with the target)"
++        required: false
++        type: string
++      mode:
++        description: "lot: impacted+contract on a frozen head; full: whole suite"
++        required: true
++        default: full
++        type: choice
++        options: [lot, full]
++      exception:
++        description: "incident|unblock: CI in parallel of the review, marked (#1343)"
++        required: false
++        type: string
+ 
+ # Une PR dépassée est annulée. Les pushes de main partagent un groupe :
+ # GitHub garde un run en cours et un seul en attente, remplacé par le suivant.
+ # Release et dispatch gardent un groupe par exécution (périmètre gelé).
++# #1343 : un dispatch de lot partage le groupe de sa branche, sans annulation
++# automatique — annuler un run vert du même SHA laisserait des checks annulés
++# dans le rollup de la PR, que `ameesh work merge-pr` refuse (tous les checks
++# doivent être terminés et verts). `ameesh ci run` annule lui-même les runs
++# périmés d'un autre SHA avant de dispatcher.
+ concurrency:
+-  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
++  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'workflow_dispatch' && format('gel-{0}', github.ref_name) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+ 
+ permissions:
+@@ -127,8 +184,16 @@ jobs:
+       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
+       # La référence distingue main (filtre doc) des branches release (suite
+       # complète, quel que soit le contenu).
+-      AMEESH_CI_BASE: ${{ github.event_name == 'push' && github.event.before || 'HEAD^1' }}
++      # #1343 : au gel, la base du diff est le SHA passé par le déclencheur
++      # (merge-base avec la cible) ; HEAD^1, le commit précédent de la branche,
++      # ne dit rien du lot.
++      AMEESH_CI_BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || (github.event_name == 'push' && github.event.before || 'HEAD^1') }}
+       AMEESH_CI_REF: ${{ github.ref }}
++      # #1343 : la CI d'un lot au gel est impactés+contrat (`lot`) ; un
++      # dispatch manuel garde la suite complète (`full`, le défaut).
++      AMEESH_CI_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'auto' }}
++      # le SHA gelé, vérifié face à HEAD avant tout plan
++      AMEESH_CI_GEL: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || '' }}
+     outputs:
+       version_only: ${{ steps.plan.outputs.version_only }}
+       docs_only: ${{ steps.plan.outputs.docs_only }}
+@@ -142,6 +207,48 @@ jobs:
+       - uses: actions/checkout@v4
+         with:
+           fetch-depth: 0  # the map commit, and whether it is an ancestor
++      # #1343 : le dispatch ne teste que la tête gelée. Une branche qui a bougé
++      # entre le contrôle du déclencheur et le run est refusée ici (check
++      # requis rouge, aucune part exécutée) — jamais un vert sur une autre tête.
++      # Le mode `lot` (sélection impactés+contrat) exige le SHA gelé *et* la
++      # base du diff : sans eux, la sélection porterait sur HEAD^1 et pourrait
++      # manquer des modules du lot.
++      - name: gel (mode, SHA gelé, base — #1343)
++        if: github.event_name == 'workflow_dispatch'
++        env:
++          MODE: ${{ inputs.mode }}
++          GEL: ${{ inputs.sha }}
++          BASE: ${{ inputs.base }}
++          EXCEPTION: ${{ inputs.exception }}
++          LOT: ${{ inputs.lot }}
++        run: |
++          echo "dispatch: mode=$MODE lot=${LOT:-—} sha=${GEL:-—} base=${BASE:-—} exception=${EXCEPTION:-—}"
++          if [ "$MODE" = "lot" ]; then
++            [ -n "$GEL" ] || { echo "::error::mode=lot needs sha (the frozen commit)"; exit 1; }
++            [ -n "$BASE" ] || { echo "::error::mode=lot needs base (the merge-base with the target)"; exit 1; }
++          fi
++          if [ -n "$GEL" ]; then
++            case "$GEL" in
++              *[!0-9a-f]*) echo "::error::invalid frozen sha: '$GEL' (full 40-hex expected)"; exit 1 ;;
++            esac
++            if [ "${#GEL}" != 40 ]; then
++              echo "::error::invalid frozen sha: '$GEL' (${#GEL} characters, full 40-hex expected)"
++              exit 1
++            fi
++            [ -n "$BASE" ] || { echo "::error::sha needs base (the merge-base with the target)"; exit 1; }
++          fi
++          if [ -n "$BASE" ]; then
++            git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null \
++              || { echo "::error::base '$BASE' is not a commit of this repository"; exit 1; }
++          fi
++          if [ -n "$GEL" ]; then
++            tete="$(git rev-parse HEAD)"
++            if [ "$tete" != "$GEL" ]; then
++              echo "::error::ref moved: head is $tete, the freeze is $GEL; nothing run — refreeze and re-dispatch"
++              exit 1
++            fi
++            echo "frozen head confirmed: $tete"
++          fi
+       - uses: actions/setup-python@v5
+         with:
+           python-version: "3.12"
+@@ -163,7 +270,7 @@ jobs:
+           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
+             --event "${{ github.event_name }}" \
+             --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
+-            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
++            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" --mode "$AMEESH_CI_MODE" \
+             --github-output "$GITHUB_OUTPUT" \
+             --summary "$GITHUB_STEP_SUMMARY" --annotations
+       - uses: actions/upload-artifact@v4
+@@ -436,9 +543,12 @@ jobs:
+   # L158: a PR that changes the version number carries the number its content
+   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
+   # compares it with the content since the last tag. Any other PR: nothing to check.
++  # #1343 : la CI d'un lot gelé (dispatch avec `sha`) vérifie aussi le numéro,
++  # sur la base passée par le déclencheur ; sans ce contrôle, un lot qui change
++  # la version obtiendrait un `tests` vert sans que le numéro soit regardé.
+   version:
+     name: version number
+-    if: github.event_name == 'pull_request'
++    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.sha != '')
+     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+     timeout-minutes: 5
+     steps:
+@@ -446,13 +556,24 @@ jobs:
+         with:
+           fetch-depth: 0  # the tags, and the range since the last one
+       - name: number against content
+-        run: python3 scripts/version-level.py pr HEAD^1 HEAD
++        env:
++          VERSION_BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || 'HEAD^1' }}
++          GEL: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || '' }}
++          GEL_BASE: ${{ github.event_name == 'workflow_dispatch' && inputs.base || '' }}
++        run: |
++          if [ -n "$GEL" ] && [ -z "$GEL_BASE" ]; then
++            echo "::error::frozen CI needs a base commit (merge-base with the target)"
++            exit 1
++          fi
++          python3 scripts/version-level.py pr "$VERSION_BASE" HEAD
+ 
+   # nom de vérification stable : vert seulement si toutes les parts le sont
+   # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
+   # L161a : ou que de la documentation, et ses lecteurs sont verts ;
+   # L161f : une part que le plan n'a pas prévue est sautée ;
+-  # L158: on a PR, the version number check must pass)
++  # L158: on a PR, the version number check must pass ;
++  # #1343 : sur une CI dispatchée, jamais de voie qui saute les tests, et le
++  # numéro est vérifié quand la CI porte un gel)
+   tests:
+     name: tests
+     if: always()
+@@ -461,6 +582,9 @@ jobs:
+     timeout-minutes: 5
+     steps:
+       - name: bilan des parts
++        env:
++          CI_EVENT: ${{ github.event_name }}
++          CI_GEL: ${{ github.event_name == 'workflow_dispatch' && inputs.sha || '' }}
+         run: |
+           echo "plan    : ${{ needs.plan.result }} (version seule : ${{ needs.plan.outputs.version_only }}, doc seule : ${{ needs.plan.outputs.docs_only }})"
+           echo "doc     : ${{ needs.doc-readers.result }}"
+@@ -469,11 +593,23 @@ jobs:
+           echo "macOS   : ${{ needs.platform-macos.result }}"
+           echo "version : ${{ needs.version.result }}"
+           test "${{ needs.plan.result }}" = success
+-          # L158: on a PR, the version number check passes (skipped elsewhere).
+-          # #940 : sous `bash -e`, l'échec de la branche gauche du `&&` interne
+-          # est exempté et le groupe rend 1 sans faire sortir le script — le job
+-          # concluait SUCCESS. Sortie explicite après le repli légitime.
+-          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; } || exit 1
++          # L158 + #1343 : la version est vérifiée sur une PR de release et sur
++          # la CI d'un lot gelé (dispatch avec `sha`) ; elle est sautée ailleurs
++          # (push, dispatch sans gel), et ce saut est légitime.
++          # #940 : sous `bash -e`, l'échec de la branche gauche d'un `&&` interne
++          # est exempté et le groupe peut rendre 1 sans faire sortir le script —
++          # d'où la sortie explicite après le seul saut légitime.
++          if [ "$CI_EVENT" = "pull_request" ] \
++             || { [ "$CI_EVENT" = "workflow_dispatch" ] && [ -n "$CI_GEL" ]; }; then
++            test "${{ needs.version.result }}" = success || exit 1
++          fi
++          # #1343 : une CI dispatchée ne prend jamais les voies version seule ou
++          # documentation seule (mode lot) ; si le plan en produisait une, le
++          # check requis rougit au lieu de verdir sans tests.
++          if [ "$CI_EVENT" = "workflow_dispatch" ]; then
++            test "${{ needs.plan.outputs.version_only }}" = "false" || exit 1
++            test "${{ needs.plan.outputs.docs_only }}" = "false" || exit 1
++          fi
+           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
+             echo "PR de version seule : suite déjà validée sur main, parts sautées"
+             exit 0
+diff --git a/scripts/test-plan.py b/scripts/test-plan.py
+index 502141ea8..e544160cd 100644
+--- a/scripts/test-plan.py
++++ b/scripts/test-plan.py
+@@ -4,7 +4,7 @@
+ 
+     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                               [--base SHA] [--ref REF]
+-                              [--base-ref B] [--head-ref H]
++                              [--base-ref B] [--head-ref H] [--mode auto|lot|full]
+                               [--github-output F] [--summary F] [--annotations]
+     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
+                                [--summary F]
+@@ -37,6 +37,14 @@ P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
+ driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
+ matrix.
+ 
++**Lot CI dispatched at freeze (#1343).** `--mode lot` is the
++`workflow_dispatch` run of a frozen lot (canon §3: review first, one CI on the
++frozen head). It runs the same impacted + contract selection, with the same
++doubt-falls-back-to-full rule, and it never takes the version-only (L157) or
++documentation-only (L161a) lane: those are pull-request lanes, so a green
++required check on the frozen commit always means tests ran. `--mode full` is
++the package or hand dispatch: the full suite, both drivers.
++
+ **Release pull requests keep the full suite (canon §3).** A pull request
+ whose source or target is `release/**` or the package integration branch
+ (§12) is a release PR: like the `push` to those branches, it runs the full
+@@ -1111,19 +1119,23 @@ def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
+     return ""
+ 
+ 
+-def lot_selection(event: str, state: dict, modules: list[str],
++def lot_selection(lot: bool, state: dict, modules: list[str],
+                   classes: dict[str, tuple[str, str]],
+                   release: str = "") -> tuple[list[str] | None, str]:
+-    """Modules a lot branch runs (L1211): impacted plus contract.
+-
+-    `None` means the full suite: an event other than a pull request, a
+-    release pull request (`release`, `release_pr`), or any doubt the plan
+-    cannot decide through — no usable map, a selection that is not safe
+-    (stale map, unmeasured blocks no test is guaranteed to load, test
+-    infrastructure, a removed file), an empty contract list. The reason goes
+-    to the summary.
++    """Modules a lot CI runs (L1211, canon §3): impacted plus contract.
++
++    `lot` is true for a pull request whose source and target are lot branches
++    *and* for the CI dispatched at freeze (`--mode lot`, #1343): both run the
++    impacted modules and the contract, one part per driver.
++
++    `None` means the full suite: a branch that is not a lot (`main`,
++    `release/**`, the package integration branch), a release pull request
++    (`release`, `release_pr`), or any doubt the plan cannot decide through —
++    no usable map, a selection that is not safe (stale map, unmeasured blocks
++    no test is guaranteed to load, test infrastructure, a removed file), an
++    empty contract list. The reason goes to the summary.
+     """
+-    if event != "pull_request":
++    if not lot:
+         return None, "main, release/** and the integration branch run the full suite"
+     if release:
+         return None, release
+@@ -1217,17 +1229,43 @@ def doc_readers(classes: dict, card: dict,
+ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
+               head: str = "HEAD", repo: pathlib.Path = REPO,
+               base: str = "HEAD^1", ref: str = "",
+-              base_ref: str | None = None, head_ref: str | None = None) -> dict:
++              base_ref: str | None = None, head_ref: str | None = None,
++              mode: str = "auto") -> dict:
++    """The plan of one run; `mode` says which CI this is (canon §3).
++
++    `auto` (default): inferred from the event, as before — a pull request
++    whose source and target are lot branches runs impacted + contract, a
++    release pull request and every `push` run the full suite. `lot`: the CI
++    dispatched at freeze (#1343): impacted + contract, never the version-only
++    or documentation-only lane, so a green `tests` on the frozen commit always
++    means the tests ran. `full`: the full suite, for a package or a hand
++    dispatch.
++    """
+     now = now or datetime.datetime.now(datetime.timezone.utc)
+     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+     release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
++    if mode == "lot":
++        #: #1343 : un dispatch de lot sur `release/**` ou `integration/**` ne
++        #: prend jamais la sélection impactés+contrat — ces branches gardent la
++        #: suite complète, même si le déclencheur s'est trompé de cible.
++        release = release or release_pr(None, _branch(ref))
+     modules = parts.modules()
+     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
+             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
+-            "tested": _rev(head, repo), "release": release,
++            "tested": _rev(head, repo), "release": release, "mode": mode,
+             "refs": {"base": base_ref, "head": head_ref},
+             **nature(event, base=base, head=head, repo=repo, ref=ref)}
++    if mode == "lot":
++        #: canon §3 (#1343) : la CI d'un lot au gel ne prend jamais une voie
++        #: qui saute les tests — le contrat tourne au minimum, donc un check
++        #: `tests` vert sur la tête gelée a bien exécuté des tests. Les voies
++        #: version seule (L157) et documentation seule (L161a) restent des
++        #: voies de PR ; ici elles sont éteintes, y compris dans le doute.
++        plan["version_only"] = plan["docs_only"] = False
++        #: `nature` a répondu « not a pull request » : la raison du dispatch est
++        #: le gel, pas l'événement ; une cible release/** la remplacera plus bas.
++        plan["why"] = "lot CI at freeze: impacted + contract"
+     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
+                          docs_only=bool(plan["docs_only"] and not release)))
+     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+@@ -1260,25 +1298,27 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
+         plan["why"] = release
+     skip = plan["version_only"] or plan["docs_only"]
+     pr = event == "pull_request"
+-    #: L1211 : la sélection impactés+contrat est réservée aux PR de lot ; une
+-    #: PR de release garde la suite complète, y compris dans le repli.
+-    lot_pr = pr and not release
++    #: L1211/canon §3 : la sélection impactés+contrat est celle d'un lot — une
++    #: PR de lot (mode `auto`) ou la CI dispatchée au gel (mode `lot`, #1343) ;
++    #: une PR de release et une CI `full` gardent la suite complète, y compris
++    #: dans le repli.
++    lot = (mode == "lot" or (mode == "auto" and pr)) and not release
+     #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
+     #: tout doute rend la suite complète (lot_selection). La sélection se
+     #: contente d'une part par pilote tant que l'estimation le permet.
+     selection, why = ((None, "") if skip
+-                      else lot_selection(event, plan, modules, classes, release))
++                      else lot_selection(lot, plan, modules, classes, release))
+     chosen_set = None if selection is None else set(selection)
+     contract = [m for m in plan.get("contract", []) if m in modules]
+     plan["parts"] = {}
+     for driver, (n_pr, n_other) in PARTS.items():
+         selected = modules
+-        if driver == "psql" and lot_pr:
++        if driver == "psql" and lot:
+             selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
+                                        always)
+         if chosen_set is not None:
+             selected = [m for m in selected if m in chosen_set]
+-        n = n_pr if lot_pr else n_other
++        n = n_pr if lot else n_other
+         if chosen_set is not None:
+             n = min(n, lot_part_count(driver, selected, card))
+         plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
+@@ -1288,7 +1328,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
+     ran = sorted({m for ps in plan["parts"].values() for p in ps for m in p["modules"]})
+     plan["selection"] = {
+         "mode": "skipped" if skip else ("impacted" if chosen_set is not None else "full"),
+-        "why": plan["why"] if skip else why,
++        "why": plan["why"] if skip else (release or why),
+         "modules": len(every), "impacted": len(chosen), "contract": len(contract),
+         "selected": len(ran), "skipped": len(every) - len(ran),
+         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
+@@ -1304,19 +1344,29 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
+ 
+ 
+ def fallback_plan(event: str, error: str, base_ref: str | None = None,
+-                  head_ref: str | None = None) -> dict:
+-    """The plan when planning itself failed: full suite, alphabetical order."""
++                  head_ref: str | None = None, mode: str = "auto",
++                  ref: str = "") -> dict:
++    """The plan when planning itself failed: full suite, alphabetical order.
++
++    The lot shape of `mode` is kept: a lot CI that cannot plan still runs the
++    full suite on both drivers, with the lot part counts and the psql pilot
++    list — never fewer parts than the impacted selection would have had.
++    """
+     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+     release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
++    if mode == "lot":
++        #: #1343 : le repli d'un dispatch de lot garde la règle release/**.
++        release = release or release_pr(None, _branch(ref))
+     pr = event == "pull_request"
+     #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
+-    #: jamais la liste pilote psql d'une PR de lot.
+-    lot_pr = pr and not release
++    #: jamais la liste pilote psql d'un lot ; le repli d'un lot (PR ou CI au
++    #: gel, #1343) garde sa forme de lot.
++    lot = (mode == "lot" or (mode == "auto" and pr)) and not release
+     why = "planning failed" + (f"; {release}" if release else "")
+     modules = parts.modules()
+     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
+-            "version_only": False, "docs_only": False, "why": why,
++            "version_only": False, "docs_only": False, "why": why, "mode": mode,
+             "release": release, "refs": {"base": base_ref, "head": head_ref},
+             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
+             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
+@@ -1325,11 +1375,11 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
+             "doc_readers": [],
+             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+     for driver, (n_pr, n_other) in PARTS.items():
+-        n = n_pr if lot_pr else n_other
++        n = n_pr if lot else n_other
+         # no module list: scripts/test-parts.py splits the suite itself (L116)
+         plan["parts"][driver] = [
+             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
+-             "pilot_list": driver == "psql" and lot_pr, "estimate_s": 0}
++             "pilot_list": driver == "psql" and lot, "estimate_s": 0}
+             for i in range(1, n + 1)]
+     plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
+                          "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
+@@ -1380,7 +1430,9 @@ def summary(plan: dict) -> str:
+                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
+                  f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
+     if sel.get("mode") == "impacted":
+-        lines.append(f"* lot branch (L1211): impacted + {sel['contract']} contract module(s), "
++        where = ("lot CI at freeze (#1343, canon §3)" if plan.get("mode") == "lot"
++                 else "lot branch (L1211)")
++        lines.append(f"* {where}: impacted + {sel['contract']} contract module(s), "
+                      f"{sel['selected']} module(s) run, {sel['skipped']} left to main, "
+                      f"release/** and the integration branch")
+     elif sel.get("mode") == "skipped":
+@@ -1546,6 +1598,9 @@ def main(argv: list[str] | None = None) -> int:
+                    help="target branch of a pull request (default: $GITHUB_BASE_REF)")
+     p.add_argument("--head-ref", default=None,
+                    help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
++    p.add_argument("--mode", choices=("auto", "lot", "full"), default="auto",
++                   help="auto (event), lot (CI dispatched at freeze: impacted + "
++                        "contract, #1343) or full (package, hand dispatch)")
+     p.add_argument("--github-output", help="appends the job outputs to this file")
+     p.add_argument("--summary", help="appends the Markdown summary to this file")
+     p.add_argument("--annotations", action="store_true",
+@@ -1559,17 +1614,27 @@ def main(argv: list[str] | None = None) -> int:
+     p.add_argument("records", nargs="+")
+     args = ap.parse_args(argv)
+ 
++    if args.command == "plan" and args.mode == "lot" and args.base in ("", "HEAD^1"):
++        #: #1343 : sans la base du gel (merge-base avec la cible), la sélection
++        #: porterait sur le dernier commit de la branche et manquerait des
++        #: modules du lot — un vert trop large. On refuse plutôt que de deviner.
++        print("plan: --mode lot requires --base (the merge-base with the target), "
++              "not %r" % args.base, file=sys.stderr)
++        return 2
++
+     if args.command == "plan":
+         card, why = _load_map(args.map)
+         if card is None and args.map:
+             print(f"map: {why}", file=sys.stderr)
+         try:
+             plan = make_plan(args.event, card, base=args.base, ref=args.ref,
+-                             base_ref=args.base_ref, head_ref=args.head_ref)
++                             base_ref=args.base_ref, head_ref=args.head_ref,
++                             mode=args.mode)
+         except Exception as exc:  # planning must never block the suite
+             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
+             plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
+-                                 base_ref=args.base_ref, head_ref=args.head_ref)
++                                 base_ref=args.base_ref, head_ref=args.head_ref,
++                                 mode=args.mode, ref=args.ref)
+         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
+                                           + "\n", encoding="utf-8")
+         if args.github_output:
+diff --git a/src/ameesh/ci.py b/src/ameesh/ci.py
+index 7974fe34f..0e0662b8a 100644
+--- a/src/ameesh/ci.py
++++ b/src/ameesh/ci.py
+@@ -2,6 +2,14 @@
+ """Échecs de tests remontés en temps réel au courrier de l'agent du lot (L161c).
+ 
+     ameesh ci status <lot> [--limit N] [--json]
++    ameesh ci run <lot> [--avis N] [--exception incident|unblock --reason …]
++                        [--full --reason …] [--sha S] [--force] [--dry-run] [--json]
++    ameesh ci cancel <lot> [--all] [--dry-run] [--json]
++
++`ci status` lit les exécutions suivies ; `ci run` est le déclencheur du gel
++(#1343, canon §3 : la relecture passe avant la CI) — il vérifie le gel, les
++verdicts requis, l'idempotence du SHA et dispatche `tests.yml` en `mode=lot`
++sur la tête gelée ; `ci cancel` annule les runs périmés d'un lot.
+ 
+ Étude L161 (docs/design/etudes/l161-tests-par-impact.md, section 3), voie A :
+ pendant les tests, chaque part de la CI publie un check run « tests (flux) »
+@@ -539,8 +547,437 @@ def render_status(report: dict) -> list[str]:
+     return lines
+ 
+ 
++# --------------------------------------------------------------------------
++# ameesh ci run / ameesh ci cancel — la CI d'un lot part au gel (#1343)
++# --------------------------------------------------------------------------
++#
++# canon §3 (manaty/home#66, owner 14/10 21:45) : sur ameesh, la relecture passe
++# avant la CI. Une poussée sur une PR de lot ne lance plus rien ; la CI du lot
++# (tests impactés + contrat) ne tourne qu'une fois, sur la tête gelée, quand
++# les verdicts requis sont acquis. `ameesh ci run <lot>` porte ce déclencheur :
++#
++#   * le lot porte un gel (`ameesh work milestone <lot> frozen --sha S`) et sa
++#     branche distante est encore sur S — une tête changée est refusée, jamais
++#     un vert sur une autre tête ;
++#   * `--avis N` verdicts `ok` sur S, d'acteurs distincts et hors de l'assigné
++#     (0 pour un lot léger, 1 pour un lot sensible, 2 pour SQL/sécurité/prod) ;
++#   * aucun run déjà vu sur S : vert ou en cours rend la main sans dispatcher
++#     (idempotence du gel et d'un événement rejoué), un run rouge ou annulé
++#     demande `--force` ;
++#   * `gh workflow run tests.yml --ref <branche> -f mode=lot -f sha=S
++#     -f base=<merge-base> -f lot=<n>` ; le job `plan` revérifie S face à HEAD
++#     et échoue (check requis rouge, rien exécuté) si la branche a bougé.
++#
++# Avant de dispatcher, les runs non conclues de la branche qui ne portent pas S
++# sont annulés (canon §3 : un run lancé sur un lot qui attend encore un verdict
++# ou une correction est annulé) ; un échec d'annulation est dit, jamais fatal.
++#
++# Exceptions (canon §3) : un lot qui débloque la CI ou corrige un incident
++# dispatche en parallèle de sa relecture, `--exception incident|unblock
++# --reason …` ; le run porte la marque et le lot reçoit une note.
++#
++# `ameesh ci cancel <lot>` fait la même annulation seule (`--all` : tout, y
++# compris le SHA gelé).
++
++GEL_SCHEMA = "ameesh-ci-gel/1"
++CANCEL_SCHEMA = "ameesh-ci-cancel/1"
++#: exceptions du canon §3 : la CI part en parallèle de la relecture, marquée
++EXCEPTIONS = ("incident", "unblock")
++#: états GitHub d'un run qui n'a pas conclu (LIVE_STATUSES en est un sous-ensemble)
++OPEN_STATUSES = ("queued", "in_progress", "requested", "waiting", "pending")
++#: nombre d'avis que `--avis` accepte (léger, sensible, SQL/sécurité/prod)
++MAX_AVIS = 2
++
++
++class GelError(CiError):
++    """Déclencheur du gel : refus actionnable, jamais un run silencieux."""
++
++
++def _q(value: str) -> str:
++    """Une valeur de chemin ou de requête GitHub (une branche `lot/x` incluse)."""
++    from urllib.parse import quote
++    return quote(value or "", safe="")
++
++
++def _sha_ok(sha: str) -> bool:
++    import re
++    return bool(re.fullmatch(r"[0-9a-f]{40}", sha or ""))
++
++
++def repo_of(cfg, item: dict, *, repo: str = "") -> str:
++    """`owner/repo` du lot : `--repo`, son `issue_ref`, sinon `github.projects`."""
++    from . import plan_github
++    if repo.strip():
++        return repo.strip()
++    parts = plan_github._ref_parts(item.get("issue_ref"))
++    if parts and parts[0]:
++        return parts[0]
++    try:
++        found = plan_github.settings_of(cfg).repo_for(item.get("app"))
++    except plan_github.SettingsError as exc:
++        raise GelError(str(exc)) from exc
++    if found:
++        return found
++    raise GelError("lot #%s: no issue_ref and no github.projects entry for %r: "
++                   "pass --repo owner/name" % (item.get("id"), item.get("app")))
++
++
++def frozen_of(db, item_id: int) -> dict | None:
++    """Le dernier jalon `frozen` du lot, ou None (le lot n'est pas gelé)."""
++    from . import work
++    return next((m for m in work.milestones(db, int(item_id))
++                 if m["kind"] == "frozen"), None)
++
++
++def independent_verdicts(db, item_id: int, sha: str, assignee: str) -> list[dict]:
++    """Les verdicts `ok` posés sur `sha` par des acteurs distincts, hors assigné.
++
++    Le canon §3 demande des avis *indépendants* : un verdict rendu par l'auteur
++    du lot, ou deux verdicts du même acteur, ne comptent pas.
++    """
++    from . import work
++    who = (assignee or "").strip().casefold()
++    out, seen = [], set()
++    for m in work.milestones(db, int(item_id)):
++        if m["kind"] != "verdict" or (m.get("verdict") or "") != "ok":
++            continue
++        if (m.get("sha") or "").strip().casefold() != (sha or "").casefold():
++            continue
++        actor = (m.get("actor") or "").strip()
++        key = actor.casefold()
++        if not actor or key == who or key in seen:
++            continue
++        seen.add(key)
++        out.append(m)
++    return out
++
++
++def _head_of(api, repo: str, branch: str) -> str:
++    data = api("repos/%s/branches/%s" % (repo, _q(branch))) or {}
++    sha = ((data.get("commit") or {}).get("sha") or "").strip().lower()
++    if not _sha_ok(sha):
++        raise GelError("branch %s not found in %s" % (branch, repo))
++    return sha
++
++
++def _runs_of(api, repo: str, *, sha: str = "", branch: str = "") -> list[dict]:
++    query = "per_page=50"
++    if sha:
++        query += "&head_sha=%s" % _q(sha)
++    if branch:
++        query += "&branch=%s" % _q(branch)
++    data = api("repos/%s/actions/workflows/tests.yml/runs?%s" % (repo, query)) or {}
++    return list(data.get("workflow_runs") or ())
++
++
++def _merge_base_of(api, repo: str, target: str, sha: str) -> str:
++    data = api("repos/%s/compare/%s...%s" % (repo, _q(target), _q(sha))) or {}
++    return ((data.get("merge_base_commit") or {}).get("sha") or "").strip().lower()
++
++
++def _carries_gel(api, repo: str, sha: str) -> bool:
++    """Le workflow du SHA gelé porte-t-il le déclencheur #1343 ?
++
++    Sans ce contrôle, un lot dont la branche précède la bascule serait refusé
++    par GitHub (« Unexpected inputs ») sans dire quoi faire ; ici le refus est
++    explicite : refusionner la branche sur main avant de dispatcher.
++    """
++    import base64
++    data = api("repos/%s/contents/.github/workflows/tests.yml?ref=%s"
++               % (repo, _q(sha))) or {}
++    content = (data.get("content") or "").replace("\n", "")
++    if not content:
++        return False
++    try:
++        text = base64.b64decode(content).decode("utf-8", "replace")
++    except (ValueError, TypeError):
++        return False
++    return "#1343" in text
++
++
++def _short_run(row: dict) -> dict:
++    return {"id": row.get("id"), "status": row.get("status"),
++            "conclusion": row.get("conclusion"), "event": row.get("event"),
++            "url": row.get("html_url")}
++
++
++def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
++             exception: str = "", reason: str = "", full: bool = False,
++             force: bool = False, repo: str = "") -> dict:
++    """La décision de `ameesh ci run <lot>`, sans aucune écriture.
++
++    Rend `{schema, action: dispatch|green|running|refuse, …}` : `dispatch` est
++    le seul cas qui écrit (`cmd_ci_run` dispatche). Un refus est une `GelError`
++    dont le message dit le geste à faire (geler, refusionner, relire…).
++    """
++    from . import work
++    item = work.get(db, int(item_id))
++    if item is None:
++        raise GelError("lot #%s unknown" % item_id)
++    if exception and exception not in EXCEPTIONS:
++        raise GelError("--exception: %s (one of %s)" % (exception, ", ".join(EXCEPTIONS)))
++    if exception and not reason.strip():
++        raise GelError("--exception %s requires --reason: the exception is marked "
++                       "(canon §3)" % exception)
++    if full and not reason.strip():
++        raise GelError("--full requires --reason: the full suite is an explicit "
++                       "gesture (release, package, hand dispatch)")
++    if avis < 0 or avis > MAX_AVIS:
++        raise GelError("--avis: 0 (lot léger), 1 (sensible) or 2 (SQL/sécurité/prod)")
++    name = repo_of(cfg, item, repo=repo)
++    branch = (item.get("branch") or "").strip()
++    if not branch:
++        raise GelError("lot #%s has no branch: push the lot first" % item_id)
++    target = (item.get("branch_target") or "main").strip() or "main"
++    freeze = frozen_of(db, item_id)
++    frozen = ((freeze or {}).get("sha") or "").strip().lower()
++    asked = (sha or "").strip().lower()
++    exempt = bool(exception or full)
++    if asked and not _sha_ok(asked):
++        raise GelError("--sha: the frozen commit (40 hex), not %r" % sha)
++    if asked and frozen and asked != frozen:
++        raise GelError("--sha %s is not the freeze of lot #%s (%s): refreeze first, "
++                       "a correction needs a new review" % (asked[:12], item_id, frozen[:12]))
++    if not frozen and not exempt:
++        # le gel est un jalon, pas un drapeau : `--sha` seul ne le remplace pas,
++        # sinon un lot jamais gelé obtiendrait sa CI sans trace de gel.
++        raise GelError("lot #%s is not frozen: ameesh work milestone %s frozen --sha <sha>"
++                       % (item_id, item_id))
++    head = _head_of(api, name, branch)
++    #: le commit testé : le gel pour un run normal ; pour une exception ou la
++    #: suite complète, le `--sha` nommé ou la tête de la branche (le correctif
++    #: d'un incident arrive après le gel et n'attend pas un nouveau gel).
++    tested = (asked or head) if exempt else frozen
++    if not _sha_ok(tested):
++        raise GelError("lot #%s: the frozen milestone carries no usable sha (%r): "
++                       "refreeze with --sha" % (item_id, tested))
++    if head != tested:
++        raise GelError("branch %s is on %s, %s is %s: the ref moved — refreeze and "
++                       "re-review, nothing dispatched"
++                       % (branch, head[:12], "--sha" if exempt else "the freeze",
++                          tested[:12]))
++    frozen_sha = tested
++    reviews = independent_verdicts(db, item_id, frozen_sha, item.get("assignee") or "")
++    if not (exception or full) and len(reviews) < avis:
++        raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required "
++                       "(ameesh work milestone %s verdict ok --sha %s --actor <relecteur>); "
++                       "an incident or a CI unblock uses --exception incident|unblock "
++                       "--reason …" % (item_id, len(reviews), frozen_sha[:12], avis,
++                                       item_id, frozen_sha[:12]))
++    runs = _runs_of(api, name, sha=frozen_sha)
++    green = [r for r in runs if (r.get("conclusion") or "") == "success"]
++    live = [r for r in runs if (r.get("status") or "") in OPEN_STATUSES]
++    decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
++                "branch": branch, "target": target, "sha": frozen_sha,
++                "mode": "full" if full else "lot", "exception": exception,
++                "reason": reason.strip(), "avis": avis,
++                "verdicts": sorted((m.get("actor") or "") for m in reviews),
++                "frozen": bool(freeze), "runs": len(runs)}
++    if not force:
++        if green:
++            return {**decision, "action": "green", "why": "already green on the frozen "
++                    "commit: nothing dispatched", "run": _short_run(green[-1])}
++        if live:
++            return {**decision, "action": "running", "why": "a run of the frozen commit "
++                    "is already in flight: nothing dispatched", "run": _short_run(live[0])}
++        if runs:
++            raise GelError("lot #%s: %d run(s) already seen on %s, none green (%s): "
++                           "--force to dispatch again (a correction needs a new freeze "
++                           "and a new review)" % (item_id, len(runs), frozen_sha[:12],
++                                                  ", ".join(sorted({(r.get("conclusion") or
++                                                                     r.get("status") or "?")
++                                                                    for r in runs}))))
++    base = _merge_base_of(api, name, target, frozen_sha)
++    if not _sha_ok(base):
++        raise GelError("merge-base %s...%s not found in %s: the freeze is not on the "
++                       "target branch" % (target, frozen_sha[:12], name))
++    if not _carries_gel(api, name, frozen_sha):
++        raise GelError("the workflow at %s does not carry the freeze trigger (#1343): "
++                       "rebase the lot on main before dispatching" % frozen_sha[:12])
++    return {**decision, "action": "dispatch", "base": base,
++            "why": ("%s verdict(s) on %s" % (len(reviews), frozen_sha[:12])
++                    if not (exception or full) else
++                    ("exception %s: %s" % (exception, reason.strip()) if exception
++                     else "full suite: %s" % reason.strip()))}
++
++
++def cancel_plan(db, cfg, item_id: int, *, api, all_runs: bool = False,
++                repo: str = "") -> dict:
++    """Les runs d'un lot à annuler : non conclues, hors du SHA gelé.
++
++    `all_runs` annule aussi le run du SHA gelé (geste explicite). Un lot non
++    gelé n'a pas de SHA de référence : tous ses runs ouverts sont périmés.
++    """
++    from . import work
++    item = work.get(db, int(item_id))
++    if item is None:
++        raise GelError("lot #%s unknown" % item_id)
++    name = repo_of(cfg, item, repo=repo)
++    branch = (item.get("branch") or "").strip()
++    if not branch:
++        raise GelError("lot #%s has no branch: nothing to cancel" % item_id)
++    freeze = frozen_of(db, item_id)
++    frozen = ((freeze or {}).get("sha") or "").strip().lower()
++    rows = [r for r in _runs_of(api, name, branch=branch)
++            if (r.get("status") or "") in OPEN_STATUSES]
++    if frozen and not all_runs:
++        rows = [r for r in rows if (r.get("head_sha") or "").strip().lower() != frozen]
++    return {"schema": CANCEL_SCHEMA, "work_item": int(item_id), "repo": name,
++            "branch": branch, "frozen": frozen, "all": bool(all_runs),
++            "runs": [_short_run(r) for r in rows],
++            "why": ("every open run of the branch" if all_runs or not frozen else
++                    "open runs that do not carry the frozen commit %s" % frozen[:12])}
++
++
++def _cancel_runs(gh, repo: str, runs: list[dict], *, say=print) -> int:
++    """Annule les runs (POST …/cancel) ; rend le nombre d'échecs, jamais fatal."""
++    failed = 0
++    for row in runs:
++        path = "repos/%s/actions/runs/%s/cancel" % (repo, row.get("id"))
++        code, out, err = gh.run(["api", "-X", "POST", path])
++        if code != 0:
++            failed += 1
++            say("cancel run %s: %s" % (row.get("id"),
++                                       " ".join((err or out or "failed").split())[:200]))
++        else:
++            say("cancel run %s (%s) requested" % (row.get("id"),
++                                                  (row.get("url") or "")[:80]))
++    return failed
++
++
++def _render_gel(decision: dict) -> list[str]:
++    lines = ["lot #%d  %s  %s  %s" % (decision["work_item"], decision["repo"],
++                                    decision["branch"], decision["sha"][:12])]
++    lines.append("  %s: %s" % (decision["action"], decision.get("why") or ""))
++    if decision.get("base"):
++        lines.append("  base (merge-base with %s): %s" % (decision["target"],
++                                                          decision["base"][:12]))
++    if decision.get("exception"):
++        lines.append("  exception %s (canon §3): %s" % (decision["exception"],
++                                                        decision["reason"]))
++    if decision.get("verdicts"):
++        lines.append("  verdict(s): %s" % ", ".join(decision["verdicts"]))
++    if decision.get("run"):
++        run = decision["run"]
++        lines.append("  run %s %s %s" % (run.get("id"), run.get("status"),
++                                         run.get("url") or ""))
++    return lines
++
++
++def cmd_ci_run(cfg, args) -> int:
++    """`ameesh ci run <lot>` : vérifie le gel et dispatche la CI une fois."""
++    from . import plan_github, work
++    from .db import open_db
++    db = open_db(cfg)
++    gh = plan_github.Gh()
++
++    def api(path: str):
++        return plan_github._json(gh, ["api", path])
++
++    try:
++        decision = gel_plan(db, cfg, args.id, api=api, sha=args.sha or "",
++                            avis=args.avis, exception=args.exception or "",
++                            reason=args.reason or "", full=args.full, force=args.force,
++                            repo=args.repo or "")
++    except (GelError, plan_github.GithubError) as exc:
++        if getattr(args, "json", False):
++            print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
++                              "action": "refuse", "why": str(exc)}, ensure_ascii=False,
++                             indent=1))
++        else:
++            print("ameesh ci run: %s" % exc)
++        return 1
++    if args.dry_run or decision["action"] != "dispatch":
++        if args.json:
++            print(json.dumps({**decision, "ok": True, "dispatched": False},
++                             ensure_ascii=False, indent=1))
++        else:
++            print("\n".join(_render_gel(decision)))
++        return 0
++    # canon §3 : un run de la branche qui ne porte pas le SHA gelé est périmé.
++    stale = cancel_plan(db, cfg, args.id, api=api, repo=args.repo or "")["runs"]
++    if stale and not args.dry_run:
++        _cancel_runs(gh, decision["repo"], stale,
++                     say=lambda text: print("  %s" % text))
++    argv = ["workflow", "run", "tests.yml", "--repo", decision["repo"],
++            "--ref", decision["branch"],
++            "-f", "mode=%s" % decision["mode"],
++            "-f", "sha=%s" % decision["sha"],
++            "-f", "base=%s" % decision["base"],
++            "-f", "lot=%d" % decision["work_item"]]
++    if decision["exception"]:
++        argv += ["-f", "exception=%s" % decision["exception"]]
++    code, out, err = gh.run(argv)
++    if code != 0:
++        # l'erreur du dispatch est dite, et le lot la garde
++        why = "dispatch refused: %s" % " ".join((err or out or "failed").split())[:300]
++        try:
++            work.note(db, args.id, "ci: %s (sha %s, mode %s)"
++                      % (why, decision["sha"][:12], decision["mode"]))
++        except Exception:  # noqa: BLE001 - la note ne masque pas l'échec
++            pass
++        print("ameesh ci run: %s" % why)
++        return 1
++    runs = _runs_of(api, decision["repo"], sha=decision["sha"])
++    run = next((r for r in runs if (r.get("event") or "") == "workflow_dispatch"), None)
++    url = (run or {}).get("html_url") or ""
++    note = ("ci: %s dispatched on %s (mode %s%s)%s"
++            % ("full suite" if decision["mode"] == "full" else "impacted + contract",
++               decision["sha"], decision["mode"],
++               ", exception %s: %s" % (decision["exception"], decision["reason"])
++               if decision["exception"] else "",
++               " — %s" % url if url else ""))
++    try:
++        work.note(db, args.id, note)
++    except Exception as exc:  # noqa: BLE001 - le dispatch est parti, on le dit
++        print("ameesh ci run: dispatched, but the lot note failed (%s)" % exc)
++    if args.json:
++        print(json.dumps({**decision, "ok": True, "dispatched": True,
++                          "run": _short_run(run or {})}, ensure_ascii=False, indent=1))
++    else:
++        print("\n".join(_render_gel(decision)))
++        print("  dispatched: %s" % (url or "run queued, it will appear shortly"))
++    return 0
++
++
++def cmd_ci_cancel(cfg, args) -> int:
++    """`ameesh ci cancel <lot>` : annule les runs périmés de la branche."""
++    from . import plan_github
++    from .db import open_db
++    db = open_db(cfg)
++    gh = plan_github.Gh()
++
++    def api(path: str):
++        return plan_github._json(gh, ["api", path])
++
++    try:
++        report = cancel_plan(db, cfg, args.id, api=api, all_runs=args.all,
++                             repo=args.repo or "")
++    except (GelError, plan_github.GithubError) as exc:
++        print("ameesh ci cancel: %s" % exc)
++        return 1
++    if args.json:
++        print(json.dumps(report, ensure_ascii=False, indent=1))
++    else:
++        print("lot #%d  %s  %s" % (report["work_item"], report["repo"], report["branch"]))
++        print("  %s: %d run(s)" % (report["why"], len(report["runs"])))
++    if not report["runs"]:
++        return 0
++    if args.dry_run:
++        for row in report["runs"]:
++            print("  would cancel run %s (%s)" % (row["id"], row["url"] or ""))
++        return 0
++    failed = _cancel_runs(gh, report["repo"], report["runs"])
++    return 1 if failed else 0
++
++
+ def cmd_ci(cfg, args) -> int:
+     from .db import open_db
++    command = getattr(args, "ci_command", "status")
++    if command == "run":
++        return cmd_ci_run(cfg, args)
++    if command == "cancel":
++        return cmd_ci_cancel(cfg, args)
+     db = open_db(cfg)
+     try:
+         report = status_of(db, args.id, limit=args.limit)
+diff --git a/src/ameesh/mesh_cli.py b/src/ameesh/mesh_cli.py
+index db7cfedc9..4a0f70534 100644
+--- a/src/ameesh/mesh_cli.py
++++ b/src/ameesh/mesh_cli.py
+@@ -37,6 +37,9 @@
+   agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
+   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
+   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
++  agent-mesh ci run <item> [--avis N] [--exception …]   the CI of a frozen lot, once,
++        [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
++  agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
+   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
+ 
+ The owner's authority is never inferred from text: it is proven by an Ed25519
+@@ -2219,6 +2222,43 @@ def build_parser() -> argparse.ArgumentParser:
+                              help="maximum runs shown (default 5)")
+     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
+     p_ci_status.set_defaults(func=cmd_ci)
++    # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis.
++    p_ci_run = ci_sub.add_parser(
++        "run", help="dispatch the CI of a frozen lot, once, on the frozen commit (#1343)")
++    p_ci_run.add_argument("id", type=int, help="work item number")
++    p_ci_run.add_argument("--sha", default="", help="the frozen commit (default: the "
++                          "last `frozen` milestone)")
++    p_ci_run.add_argument("--avis", type=int, default=1,
++                          help="required independent verdicts on the frozen commit: "
++                               "0 (lot léger), 1 (sensible), 2 (SQL/sécurité/prod)")
++    p_ci_run.add_argument("--exception", choices=("incident", "unblock"), default="",
++                          help="incident|unblock: CI in parallel of the review, marked "
++                               "(canon §3); requires --reason")
++    p_ci_run.add_argument("--reason", default="",
++                          help="why (the exception, the full suite): written to the lot")
++    p_ci_run.add_argument("--full", action="store_true",
++                          help="full suite (release, package, hand dispatch), not the "
++                               "lot selection; requires --reason")
++    p_ci_run.add_argument("--force", action="store_true",
++                          help="dispatch again although a run of the frozen commit is "
++                               "already seen (red or cancelled)")
++    p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
++                          "issue_ref or github.projects)")
++    p_ci_run.add_argument("--dry-run", action="store_true",
++                          help="decide and print, dispatch nothing")
++    p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
++    p_ci_run.set_defaults(func=cmd_ci)
++    p_ci_cancel = ci_sub.add_parser(
++        "cancel", help="cancel the open runs of a lot that do not carry its frozen commit")
++    p_ci_cancel.add_argument("id", type=int, help="work item number")
++    p_ci_cancel.add_argument("--all", action="store_true",
++                             help="also cancel the run of the frozen commit")
++    p_ci_cancel.add_argument("--repo", default="", help="owner/name (default: the lot's "
++                             "issue_ref or github.projects)")
++    p_ci_cancel.add_argument("--dry-run", action="store_true",
++                             help="list the runs, cancel nothing")
++    p_ci_cancel.add_argument("--json", action="store_true", help="`ameesh-ci-cancel/1` report")
++    p_ci_cancel.set_defaults(func=cmd_ci)
+ 
+     p_models = sub.add_parser("models", help="model catalog (L14)")
+     models_sub = p_models.add_subparsers(dest="models_command")
+diff --git a/tests/test_l161f_plan.py b/tests/test_l161f_plan.py
+index 32184f67b..a90cc26b8 100644
+--- a/tests/test_l161f_plan.py
++++ b/tests/test_l161f_plan.py
+@@ -11,6 +11,7 @@ modules the map did not select. No database needed.
+ from __future__ import annotations
+ 
+ import ast
++import contextlib
+ import datetime
+ import importlib.util
+ import io
+@@ -1856,9 +1857,12 @@ class WorkflowTest(unittest.TestCase):
+         self.assertIn("--annotations", self.text)
+ 
+     def test_plan_job_passes_the_pushed_range(self):
+-        # #833: a push is planned from github.event.before, not HEAD^1 alone
+-        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
+-                      "github.event.before || 'HEAD^1' }}", self.text)
++        # #833: a push is planned from github.event.before, not HEAD^1 alone ;
++        # #1343 : un dispatch au gel est planifié depuis le SHA de base passé
++        # par le déclencheur (merge-base avec la cible), jamais HEAD^1.
++        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'workflow_dispatch' && "
++                      "inputs.base || (github.event_name == 'push' && "
++                      "github.event.before || 'HEAD^1') }}", self.text)
+         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
+ 
+     def test_dynamic_matrices(self):
+@@ -1906,6 +1910,149 @@ class WorkflowTest(unittest.TestCase):
+         self.assertIn("tests/parts/toujours.txt", self.text)
+         self.assertIn("une PR de release", self.text)
+ 
++    def test_no_lot_push_ci_review_first(self):
++        # #1343 (canon §3, home 66) : une poussée sur une PR de LOT ne lance
++        # plus rien — la CI part au gel, après les verdicts requis. Seules les
++        # PR dont la cible est release/** ou integration/** gardent la CI ici ;
++        # les poussées main/release/integration gardent la suite complète.
++        self.assertIn('  pull_request:\n    branches: ["release/**", "integration/**"]\n',
++                      self.text)
++        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
++
++    def test_dispatch_gate_exact_frozen_sha_and_base(self):
++        # #1343 : le dispatch ne teste que le SHA gelé, et le mode lot exige sa
++        # base — un ref bougé ou un SHA sans base rougit le check requis sans
++        # exécuter de tests, jamais un vert sur une autre tête.
++        self.assertIn("workflow_dispatch:\n    inputs:\n", self.text)
++        self.assertIn("options: [lot, full]", self.text)
++        self.assertIn("ref moved: head is", self.text)
++        self.assertIn("mode=lot needs sha", self.text)
++        self.assertIn("mode=lot needs base", self.text)
++        self.assertIn("sha needs base", self.text)
++        self.assertIn('--mode "$AMEESH_CI_MODE"', self.text)
++
++    def test_dispatch_aggregate_refuses_a_green_without_tests(self):
++        # #1343 : sur un dispatch, les voies version seule (L157) et
++        # documentation seule (L161a) sont éteintes ; si le plan en produisait
++        # une, l'agrégat requis rougit au lieu de verdir sans tests.
++        job = self.text[self.text.index("\n  tests:\n"):]
++        self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
++        self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
++
++    def test_dispatch_run_name_marks_the_exception(self):
++        # canon §3 : une exception incident/déblocage est explicitement marquée.
++        self.assertIn("run-name:", self.text)
++        self.assertIn("exception {0}", self.text)
++        self.assertIn("exception:", self.text)
++
++
++class LotFreezePlanTest(unittest.TestCase):
++    """#1343 — la CI d'un lot au gel (canon §3) : impactés + contrat sur la
++    tête gelée, jamais une voie qui saute les tests ; release/**, l'intégration
++    et le dispatch `full` gardent la suite complète."""
++
++    def setUp(self):
++        self.repo = _Repo()
++        self.addCleanup(self.repo.close)
++
++    def _card(self) -> dict:
++        mods = parts.modules()
++        card = self.repo.card()
++        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
++                           for m in mods}
++        return card
++
++    def _code_change(self) -> None:
++        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
++        self.repo.commit()
++
++    def _plan(self, mode: str, *, ref: str = "refs/heads/lot/1343-ci-au-gel",
++              nature: dict | None = None) -> dict:
++        nat = nature or {"version_only": False, "docs_only": False, "why": "", "files": []}
++        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
++            return plan.make_plan("workflow_dispatch", self._card(), NOW, head="HEAD",
++                                  repo=self.repo.path, ref=ref, base="HEAD^1", mode=mode)
++
++    def test_gel_selectionne_impactes_et_contrat(self):
++        self._code_change()
++        touched = parts.modules()[0]
++        card = self._card()
++        card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [touched]
++        nat = {"version_only": False, "docs_only": False, "why": "", "files": []}
++        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
++            p = plan.make_plan("workflow_dispatch", card, NOW, head="HEAD",
++                               repo=self.repo.path, ref="refs/heads/lot/x",
++                               base="HEAD^1", mode="lot")
++        self.assertEqual(p["selection"]["mode"], "impacted")
++        # la raison du plan est le gel, pas l'événement (`nature` dit « not a
++        # pull request » pour un dispatch) : le plan.json relu le dit.
++        self.assertEqual(p["why"], "lot CI at freeze: impacted + contract")
++        ran = [m for ps in p["parts"]["psycopg"] for m in ps["modules"]]
++        self.assertIn(touched, ran)
++        self.assertTrue(p["contract"])
++        for module in p["contract"]:
++            self.assertIn(module, ran)
++        # le pilote psql est borné à sa liste (3 parts au plus, L1211)
++        self.assertLessEqual(len(p["parts"]["psql"]), 3)
++
++    def test_gel_ne_prend_jamais_les_voies_qui_sautent_les_tests(self):
++        # L157 (version seule) et L161a (documentation seule) sont des voies de
++        # PR : au gel, le contrat tourne, donc un check vert veut dire tests.
++        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
++        self.repo.commit()
++        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.1"\n')
++        self.repo.commit()
++        version = self._plan("lot")
++        self.assertFalse(version["version_only"], version["why"])
++        self.assertNotEqual(version["parts"]["psycopg"], [])
++        self.repo.write("docs/x.md", "# x\n")
++        self.repo.commit()
++        doc = self._plan("lot", nature={"version_only": False, "docs_only": True,
++                                        "why": "documentation seule",
++                                        "files": ["docs/x.md"]})
++        self.assertFalse(doc["docs_only"], doc["why"])
++        self.assertEqual(doc["doc_readers"], [])
++        self.assertNotEqual(doc["parts"]["psycopg"], [])
++
++    def test_gel_sur_une_branche_release_garde_la_suite_complete(self):
++        self._code_change()
++        p = self._plan("lot", ref="refs/heads/release/1.10.0")
++        self.assertEqual(p["selection"]["mode"], "full")
++        self.assertIn("release/**", p["selection"]["why"])
++        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
++        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
++
++    def test_dispatch_full_garde_la_suite_complete(self):
++        self._code_change()
++        p = self._plan("full")
++        self.assertEqual(p["selection"]["mode"], "full")
++        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
++        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
++
++    def test_repli_d_un_gel_garde_la_forme_du_lot(self):
++        p = plan.fallback_plan("workflow_dispatch", "boom", mode="lot",
++                               ref="refs/heads/lot/x")
++        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
++        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3] * 3)
++        self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
++
++    def test_repli_d_un_gel_release_garde_la_suite_complete(self):
++        p = plan.fallback_plan("workflow_dispatch", "boom", mode="lot",
++                               ref="refs/heads/release/1.10.0")
++        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
++        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
++
++    def test_cli_mode_lot_sans_base_refuse(self):
++        # sans la base du gel, la sélection porterait sur HEAD^1 et manquerait
++        # des modules du lot : la CLI refuse plutôt que de deviner.
++        err = io.StringIO()
++        with contextlib.redirect_stderr(err):
++            code = plan.main(["plan", "--out", str(self.repo.path / "plan.json"),
++                              "--event", "workflow_dispatch", "--mode", "lot"])
++        self.assertEqual(code, 2)
++        self.assertIn("requires --base", err.getvalue())
++        self.assertFalse((self.repo.path / "plan.json").exists())
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+
+
+From b60889b6151c3c01ebdf7ba79177197eb610aec2 Mon Sep 17 00:00:00 2001
+From: mty-amh-impl-04 <mty-amh-impl-04@ameesh.invalid>
+Date: Wed, 14 Oct 2026 20:53:23 +0000
+Subject: [PATCH 2/2] #1343 : temoins unitaires du gel (gel_plan/cancel_plan)
+ et protocole borne
+
+- tests/test_l161g_ci_gel.py : 31 temoins sans base ni reseau. gel_plan :
+  refus sans gel avant toute lecture, un --sha seul ne remplace pas le jalon
+  de gel, tete bougee (aucune base/workflow lu), avis independants (auteur,
+  doublon du meme acteur, verdict sur un autre SHA, verdict bloque),
+  idempotence (vert, en cours, rouge -> --force), SHA demande hors gel,
+  workflow sans declencheur, base introuvable, exception et full marques et
+  motives, une exception apres gel teste la tete du correctif, bornes
+  d'--avis, lot inconnu ou sans branche ; cancel_plan : garde le run du SHA
+  gele (--all le reprend), ignore les runs conclus, lot sans gel = tous les
+  runs ouverts ; cmd_ci_run : annule les perimes puis dispatche
+  (mode/sha/base/lot), note le lot, dry-run n'ecrit rien, un dispatch refuse
+  est dit et note, l'exception est marquee ; parseur ci run/cancel.
+- docs/EXPLOITATION.md : protocole borne du declencheur au gel, dans la
+  section L161f.
+
+Preuves auteur : 5 mutations des gardes (tete bougee, gel obligatoire malgre
+--sha, avis de l'auteur, idempotence du vert, annulation hors SHA gele) font
+rougir le temoin correspondant ; tests.test_l161g_ci_gel 31/31 ;
+tests.test_l161f_plan + test_l744_ci_entrypoint + test_l161a_ci_sans_code +
+test_hermeticity_lint 172/172 ; test_l161c_failures_realtime 26/26 sur base ;
+lint d'hermeticite 0 constat. Aucun push, aucun dispatch.
+---
+ docs/EXPLOITATION.md       |  29 +++
+ tests/test_l161g_ci_gel.py | 430 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 459 insertions(+)
+ create mode 100644 tests/test_l161g_ci_gel.py
+
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index adb7fbaf7..23be6797a 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -5748,6 +5748,35 @@ integration branch — only the impacted modules (P0, P1) and the contract list
+ cluster) run; the full suite runs on `main`, `release/**` and the package
+ integration branch (§12).
+ 
++**Lot CI at freeze — `ameesh ci run <lot>` (#1343).** On a lot branch a push
++starts nothing (canon §3: review comes before CI); the lot CI (impacted +
++contract, `--mode lot`) is dispatched **once**, on the frozen head, when the
++required verdicts are acquired:
++
++```
++ameesh ci run <lot> [--avis 0|1|2] [--sha S] [--force] [--dry-run] [--json]
++ameesh ci cancel <lot> [--all] [--dry-run]
++```
++
++`ci run` refuses to dispatch unless the branch head is the last `frozen`
++milestone commit, `--avis N` verdicts `ok` were declared on that exact commit
++by distinct actors other than the assignee (0 for a lot léger, 1 for a
++sensible lot, 2 for SQL, security or prod), the workflow at that commit
++carries the trigger (an older branch is told to rebase on main), and no run
++was already seen on that commit: green or in flight returns without writing,
++red or cancelled needs `--force`. Before dispatching, the branch's open runs
++that do not carry the frozen commit are cancelled (canon §3); `ameesh ci
++cancel <lot>` does that alone, `--all` including the frozen run. The dispatch
++carries `mode`, `sha`, `base` (merge-base with the target) and `lot`; the
++`plan` job compares `sha` to `HEAD` and fails the required check, running no
++test, when the ref moved, and the `tests` aggregate refuses a green that ran
++no test (no version-only or documentation-only lane at freeze). An incident
++or a CI unblock dispatches in parallel of the review with `--exception
++incident|unblock --reason …`, marked in the run name and in a note on the
++lot; `--full --reason …` runs the whole suite (release, package, manual
++dispatch). `main`, `release/**`, the integration branch and release pull
++requests keep their automatic full suite.
++
+ **Release pull requests keep the full suite (canon §3).** A pull request whose
+ source or target is `release/**` or the integration branch runs the full suite
+ under both drivers, like the push to those branches, whatever the map says: no
+diff --git a/tests/test_l161g_ci_gel.py b/tests/test_l161g_ci_gel.py
+new file mode 100644
+index 000000000..7c945242c
+--- /dev/null
++++ b/tests/test_l161g_ci_gel.py
+@@ -0,0 +1,430 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#1343 — la décision de `ameesh ci run` / `ci cancel` : gel, avis, idempotence.
++
++Le canon §3 (owner 14/10 21:45) met la relecture avant la CI : une poussée de
++lot ne lance plus rien, et la CI du lot (impactés + contrat) part au gel, une
++fois, sur la tête gelée. Ces témoins tiennent la décision seule
++(`ci.gel_plan`, `ci.cancel_plan`), sans réseau ni base : le faux `api` rend
++les quatre lectures GitHub (tête de branche, exécutions, merge-base, contenu
++du workflow) et les jalons du lot sont posés à la main.
++
++Chaque refus est vérifié par son message *et* par l'absence de lecture de la
++base ou du workflow — donc aucun dispatch possible ; chaque acceptation prouve
++que c'est le SHA gelé qui part, avec sa base. Le faux `head_sha=`/`branch=`
++applique le filtre de la requête comme GitHub le ferait : un témoin ne passe
++pas parce que le faux aurait rendu des exécutions que la vraie requête
++n'aurait pas rendues.
++"""
++from __future__ import annotations
++
++import argparse
++import base64
++import contextlib
++import io
++import re
++import sys
++import unittest
++from pathlib import Path
++from unittest import mock
++from urllib.parse import unquote
++
++sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
++
++from ameesh import ci, mesh_cli, plan_github, work  # noqa: E402
++
++DEPOT = "manaty/ameesh"
++GEL = "a" * 40
++TETE = "b" * 40
++BASE = "c" * 40
++AUTRE = "d" * 40
++BRANCHE = "lot/1343-ci-au-gel"
++
++
++def lot(**extra) -> dict:
++    """Le lot relu : une branche de lot, une cible main, un assigné."""
++    row = {"id": 1343, "app": "ameesh", "assignee": "mty-amh-impl-04",
++           "branch": BRANCHE, "branch_target": "main",
++           "issue_ref": "manaty/ameesh#1040"}
++    row.update(extra)
++    return row
++
++
++def jalon(kind: str, *, sha: str = "", actor: str = "",
++          verdict: str | None = None) -> dict:
++    """Un jalon tel que `work.milestones` le rend (les clés lues suffisent)."""
++    return {"kind": kind, "sha": sha, "actor": actor, "verdict": verdict}
++
++
++def execution(ident: int = 1, *, statut: str = "completed",
++              conclusion: str | None = "success", sha: str = GEL,
++              branche: str = BRANCHE) -> dict:
++    """Une exécution de `tests.yml` telle que GitHub la rend."""
++    return {"id": ident, "status": statut, "conclusion": conclusion, "head_sha": sha,
++            "head_branch": branche, "event": "workflow_dispatch",
++            "html_url": "https://github.com/%s/actions/runs/%d" % (DEPOT, ident)}
++
++
++class Github:
++    """Les lectures GitHub de `gel_plan`/`cancel_plan`, sans réseau."""
++
++    def __init__(self, *, head: str = GEL, runs=(), merge_base: str = BASE,
++                 workflow: str | None = "#1343 : declencheur du gel\n"):
++        self.head = head
++        self.runs = list(runs)
++        self.merge_base = merge_base
++        self.workflow = workflow
++        self.paths: list[str] = []
++
++    def __call__(self, path: str) -> dict:
++        self.paths.append(path)
++        if path.startswith("repos/%s/branches/" % DEPOT):
++            return {"commit": {"sha": self.head}}
++        if "/actions/workflows/tests.yml/runs?" in path:
++            runs = self.runs
++            found = re.search(r"[?&]head_sha=([0-9a-f]{40})", path)
++            if found:
++                runs = [r for r in runs if (r.get("head_sha") or "") == found.group(1)]
++            found = re.search(r"[?&]branch=([^&]+)", path)
++            if found:
++                branche = unquote(found.group(1))
++                runs = [r for r in runs if (r.get("head_branch") or "") == branche]
++            return {"workflow_runs": runs}
++        if path.startswith("repos/%s/compare/" % DEPOT):
++            return {"merge_base_commit": {"sha": self.merge_base}}
++        if "/contents/.github/workflows/tests.yml" in path:
++            if self.workflow is None:
++                return {}
++            return {"content": base64.b64encode(self.workflow.encode()).decode()}
++        raise AssertionError("chemin GitHub inattendu : %s" % path)
++
++    def ecrit(self) -> list[str]:
++        """Les lectures faites seulement avant un dispatch (base, workflow)."""
++        return [p for p in self.paths if "/compare/" in p or "/contents/" in p]
++
++
++class Gh:
++    """Le `gh` des écritures : enregistre les argv, réussit (sauf refus)."""
++
++    def __init__(self, refuse_dispatch: bool = False):
++        self.calls: list[list[str]] = []
++        self.refuse_dispatch = refuse_dispatch
++
++    def run(self, argv: list[str], stdin: str | None = None) -> tuple[int, str, str]:
++        self.calls.append(list(argv))
++        if self.refuse_dispatch and argv and argv[0] == "workflow":
++            return 1, "", "Unexpected inputs provided: ['exception']"
++        return 0, "", ""
++
++    def annulations(self) -> list[list[str]]:
++        return [c for c in self.calls if c[:2] == ["api", "-X"]]
++
++    def dispatch(self) -> list[str]:
++        return next((c for c in self.calls if c and c[0] == "workflow"), [])
++
++
++class GelTestCase(unittest.TestCase):
++    """Le faux `work` : un lot et ses jalons, sans base ni courrier."""
++
++    def setUp(self) -> None:
++        self.item = lot()
++        self.jalons: list[dict] = []
++        self.db = object()
++        self.work = contextlib.ExitStack()
++        self.addCleanup(self.work.close)
++        self.work.enter_context(mock.patch.object(work, "get", self._get))
++        self.work.enter_context(mock.patch.object(work, "milestones", self._milestones))
++
++    def _get(self, db, item_id):
++        return self.item if int(item_id) == self.item["id"] else None
++
++    def _milestones(self, db, item_id, limit=100):
++        return list(self.jalons)
++
++    def gele(self, sha: str = GEL, acteur: str = "relecteur") -> None:
++        """Le lot gelé sur `sha`, avec un verdict `ok` indépendant dessus."""
++        self.jalons += [jalon("frozen", sha=sha, actor="auteur"),
++                        jalon("verdict", sha=sha, actor=acteur, verdict="ok")]
++
++    def gel(self, api, **kw) -> dict:
++        args = {"sha": "", "avis": 1, "exception": "", "reason": "", "full": False,
++                "force": False, "repo": DEPOT}
++        args.update(kw)
++        return ci.gel_plan(self.db, None, self.item["id"], api=api, **args)
++
++    def annule(self, api, **kw) -> dict:
++        args = {"all_runs": False, "repo": DEPOT}
++        args.update(kw)
++        return ci.cancel_plan(self.db, None, self.item["id"], api=api, **args)
++
++
++class GelPlanTest(GelTestCase):
++    """`ci.gel_plan` : ce qui refuse, ce qui ne redispatch pas, ce qui part."""
++
++    def test_un_lot_sans_gel_est_refuse_avant_toute_lecture(self):
++        api = Github()
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(api)
++        self.assertIn("is not frozen", str(caught.exception))
++        self.assertEqual(api.paths, [], "rien ne doit être lu sans gel")
++
++    def test_une_tete_bougee_est_refusee_jamais_un_vert_ailleurs(self):
++        self.gele()
++        api = Github(head=TETE)
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(api)
++        self.assertIn("the ref moved", str(caught.exception))
++        self.assertEqual(api.ecrit(), [], "aucune base, aucun workflow lu")
++
++    def test_un_avis_independant_dispatch_sur_le_sha_gele(self):
++        self.gele()
++        api = Github()
++        decision = self.gel(api)
++        self.assertEqual(decision["action"], "dispatch")
++        self.assertEqual(decision["sha"], GEL)
++        self.assertEqual(decision["base"], BASE)
++        self.assertEqual(decision["mode"], "lot")
++        self.assertEqual(decision["verdicts"], ["relecteur"])
++        self.assertIn("compare/main...%s" % GEL, " ".join(api.paths))
++
++    def test_l_avis_de_l_auteur_ne_compte_pas(self):
++        self.jalons += [jalon("frozen", sha=GEL),
++                        jalon("verdict", sha=GEL, actor=self.item["assignee"], verdict="ok")]
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github())
++        self.assertIn("0 independent verdict(s)", str(caught.exception))
++
++    def test_deux_avis_du_meme_acteur_ne_font_qu_un(self):
++        self.jalons += [jalon("frozen", sha=GEL),
++                        jalon("verdict", sha=GEL, actor="relecteur", verdict="ok"),
++                        jalon("verdict", sha=GEL, actor="relecteur", verdict="ok")]
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github(), avis=2)
++        self.assertIn("1 independent verdict(s)", str(caught.exception))
++        self.jalons.append(jalon("verdict", sha=GEL, actor="second", verdict="ok"))
++        self.assertEqual(self.gel(Github(), avis=2)["action"], "dispatch")
++
++    def test_un_avis_sur_une_autre_tete_ne_compte_pas(self):
++        self.jalons += [jalon("frozen", sha=GEL),
++                        jalon("verdict", sha=TETE, actor="relecteur", verdict="ok")]
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github())
++        self.assertIn("0 independent verdict(s)", str(caught.exception))
++
++    def test_un_verdict_bloque_ne_compte_pas(self):
++        self.jalons += [jalon("frozen", sha=GEL),
++                        jalon("verdict", sha=GEL, actor="relecteur", verdict="blocked")]
++        with self.assertRaises(ci.GelError):
++            self.gel(Github())
++
++    def test_un_lot_leger_dispatch_sans_avis(self):
++        self.jalons.append(jalon("frozen", sha=GEL))
++        self.assertEqual(self.gel(Github(), avis=0)["action"], "dispatch")
++
++    def test_un_vert_deja_obtenu_ne_redispatch_pas(self):
++        self.gele()
++        api = Github(runs=[execution(7, conclusion="success")])
++        decision = self.gel(api)
++        self.assertEqual((decision["action"], decision["run"]["id"]), ("green", 7))
++        self.assertEqual(api.ecrit(), [], "un vert ne relit ni base ni workflow")
++
++    def test_une_execution_en_cours_ne_redispatch_pas(self):
++        self.gele()
++        api = Github(runs=[execution(8, statut="in_progress", conclusion=None)])
++        self.assertEqual(self.gel(api)["action"], "running")
++
++    def test_un_rouge_demande_force(self):
++        self.gele()
++        rouge = [execution(9, conclusion="failure")]
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github(runs=rouge))
++        self.assertIn("--force", str(caught.exception))
++        self.assertEqual(self.gel(Github(runs=rouge), force=True)["action"], "dispatch")
++
++    def test_un_sha_demande_hors_gel_est_refuse(self):
++        self.gele()
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github(), sha=AUTRE)
++        self.assertIn("is not the freeze", str(caught.exception))
++
++    def test_un_sha_seul_ne_remplace_pas_le_gel(self):
++        # le gel est un jalon : nommer un SHA ne dispense pas de le déclarer,
++        # sinon la CI d'un lot jamais gelé partirait sans trace de gel.
++        api = Github()
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(api, sha=GEL)
++        self.assertIn("is not frozen", str(caught.exception))
++        self.assertEqual(api.paths, [], "rien ne doit être lu sans gel")
++
++    def test_une_exception_apres_gel_test_la_tete_du_correctif(self):
++        # un correctif d'incident arrive après le gel : l'exception teste la
++        # tête, pas le gel périmé, et le dispatch est marqué.
++        self.gele()
++        api = Github(head=TETE)
++        decision = self.gel(api, exception="incident", reason="incident prod")
++        self.assertEqual((decision["action"], decision["sha"]), ("dispatch", TETE))
++        self.assertEqual(decision["base"], BASE)
++
++    def test_un_workflow_sans_declencheur_est_refuse(self):
++        self.gele()
++        api = Github(workflow="name: tests\n")
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(api)
++        self.assertIn("does not carry the freeze trigger", str(caught.exception))
++
++    def test_une_base_introuvable_est_refusee(self):
++        self.gele()
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github(merge_base=""))
++        self.assertIn("merge-base", str(caught.exception))
++
++    def test_une_exception_dispatch_sans_gel_ni_avis_mais_marquee(self):
++        api = Github(head=TETE)
++        decision = self.gel(api, exception="incident", reason="CI cassée sur main")
++        self.assertEqual(decision["action"], "dispatch")
++        self.assertEqual((decision["sha"], decision["exception"]), (TETE, "incident"))
++        self.assertIn("CI cassée sur main", decision["reason"])
++
++    def test_une_exception_sans_reason_est_refusee(self):
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github(), exception="unblock")
++        self.assertIn("requires --reason", str(caught.exception))
++        with self.assertRaises(ci.GelError):
++            self.gel(Github(), exception="autre", reason="x")
++
++    def test_full_dispatch_sans_avis_en_mode_full(self):
++        self.jalons.append(jalon("frozen", sha=GEL))
++        decision = self.gel(Github(), full=True, reason="paquet §12")
++        self.assertEqual((decision["action"], decision["mode"]), ("dispatch", "full"))
++
++    def test_avis_hors_bornes_refuse(self):
++        for avis in (-1, 3):
++            with self.assertRaises(ci.GelError):
++                self.gel(Github(), avis=avis)
++
++    def test_lot_inconnu_refuse(self):
++        with self.assertRaises(ci.GelError) as caught:
++            ci.gel_plan(self.db, None, 999, api=Github(), repo=DEPOT)
++        self.assertIn("unknown", str(caught.exception))
++
++    def test_lot_sans_branche_refuse(self):
++        self.item = lot(branch="")
++        with self.assertRaises(ci.GelError) as caught:
++            self.gel(Github())
++        self.assertIn("has no branch", str(caught.exception))
++
++
++class CancelPlanTest(GelTestCase):
++    """`ci.cancel_plan` : les exécutions non conclues, le SHA gelé gardé."""
++
++    def test_seuls_les_runs_ouverts_hors_sha_gele_sont_annules(self):
++        self.jalons.append(jalon("frozen", sha=GEL))
++        api = Github(runs=[execution(1, statut="in_progress", conclusion=None, sha=GEL),
++                           execution(2, statut="queued", conclusion=None, sha=TETE),
++                           execution(3, conclusion="success", sha=TETE)])
++        report = self.annule(api)
++        self.assertEqual([r["id"] for r in report["runs"]], [2])
++        self.assertIn(GEL[:12], report["why"])
++
++    def test_le_sha_gele_s_annule_avec_all(self):
++        self.jalons.append(jalon("frozen", sha=GEL))
++        api = Github(runs=[execution(1, statut="in_progress", conclusion=None, sha=GEL),
++                           execution(2, statut="queued", conclusion=None, sha=TETE)])
++        report = self.annule(api, all_runs=True)
++        self.assertEqual(sorted(r["id"] for r in report["runs"]), [1, 2])
++        self.assertTrue(report["all"])
++
++    def test_un_lot_sans_gel_annule_tous_ses_runs_ouverts(self):
++        api = Github(runs=[execution(1, statut="queued", conclusion=None, sha=GEL),
++                           execution(2, conclusion="failure", sha=TETE)])
++        self.assertEqual([r["id"] for r in self.annule(api)["runs"]], [1])
++
++    def test_un_lot_sans_branche_refuse(self):
++        self.item = lot(branch="")
++        with self.assertRaises(ci.GelError) as caught:
++            self.annule(Github())
++        self.assertIn("nothing to cancel", str(caught.exception))
++
++
++class DispatchTest(GelTestCase):
++    """`ci.cmd_ci_run` : annule les périmés, dispatche une fois, note le lot."""
++
++    def setUp(self) -> None:
++        super().setUp()
++        self.args = argparse.Namespace(id=1343, sha="", avis=1, exception="", reason="",
++                                       full=False, force=False, repo=DEPOT, dry_run=False,
++                                       json=True)
++
++    def dispatch(self, api, gh, *, args=None, note=None):
++        """`cmd_ci_run` avec le `gh`, la base et la note remplacés."""
++        notes = [] if note is None else note
++        with mock.patch("ameesh.db.open_db", lambda cfg: self.db), \
++                mock.patch.object(plan_github, "Gh", lambda *a, **k: gh), \
++                mock.patch.object(plan_github, "_json",
++                                  lambda g, argv, *a, **k: api(argv[-1])), \
++                mock.patch.object(work, "note", lambda db, i, text, **kw: notes.append(text)), \
++                contextlib.redirect_stdout(io.StringIO()):
++            code = ci.cmd_ci_run(None, args or self.args)
++        return code, notes
++
++    def test_dispatch_annule_les_perimes_puis_porte_sha_base_lot(self):
++        self.gele()
++        api = Github(runs=[execution(4, statut="queued", conclusion=None, sha=TETE)])
++        gh = Gh()
++        code, notes = self.dispatch(api, gh)
++        self.assertEqual(code, 0)
++        self.assertEqual([c[-1] for c in gh.annulations()],
++                         ["repos/%s/actions/runs/4/cancel" % DEPOT])
++        self.assertEqual(gh.dispatch(),
++                         ["workflow", "run", "tests.yml", "--repo", DEPOT,
++                          "--ref", BRANCHE, "-f", "mode=lot", "-f", "sha=%s" % GEL,
++                          "-f", "base=%s" % BASE, "-f", "lot=1343"])
++        self.assertEqual(len(notes), 1)
++        self.assertIn("dispatched on %s" % GEL, notes[0])
++
++    def test_dry_run_n_annule_ni_ne_dispatche(self):
++        self.gele()
++        api = Github(runs=[execution(4, statut="queued", conclusion=None, sha=TETE)])
++        gh = Gh()
++        code, notes = self.dispatch(api, gh, args=argparse.Namespace(
++            **{**vars(self.args), "dry_run": True}))
++        self.assertEqual((code, gh.calls, notes), (0, [], []))
++
++    def test_un_dispatch_refuse_est_dit_et_note(self):
++        self.gele()
++        api = Github()
++        gh = Gh(refuse_dispatch=True)
++        code, notes = self.dispatch(api, gh)
++        self.assertEqual(code, 1)
++        self.assertEqual(len(notes), 1)
++        self.assertIn("dispatch refused", notes[0])
++        self.assertIn("Unexpected inputs", notes[0])
++
++    def test_une_exception_nomme_le_drapeau_dans_le_dispatch(self):
++        self.jalons.append(jalon("frozen", sha=GEL))
++        api = Github()
++        gh = Gh()
++        code, notes = self.dispatch(api, gh, args=argparse.Namespace(
++            **{**vars(self.args), "exception": "unblock", "reason": "main rouge"}))
++        self.assertEqual(code, 0)
++        self.assertIn("exception=unblock", gh.dispatch())
++        self.assertNotIn("main rouge", " ".join(gh.dispatch()),
++                         "le motif reste au lot, pas dans l'argv du dispatch")
++        self.assertIn("exception unblock: main rouge", notes[0])
++
++
++class ParserTest(unittest.TestCase):
++    """Le parseur : `ci run`/`ci cancel` et leurs défauts, sans base."""
++
++    def test_ci_run_et_cancel_sont_du_parseur(self):
++        parser = mesh_cli.build_parser()
++        args = parser.parse_args(["ci", "run", "1343"])
++        self.assertEqual(args.func.__name__, "cmd_ci")
++        self.assertEqual((args.id, args.avis), (1343, 1))
++        self.assertFalse(args.full or args.force or args.dry_run)
++        args = parser.parse_args(["ci", "cancel", "1343", "--all", "--dry-run"])
++        self.assertEqual(args.func.__name__, "cmd_ci")
++        self.assertTrue(args.all and args.dry_run)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

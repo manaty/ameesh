@@ -1,0 +1,35 @@
+test_fermer_cree_si_absent (tests.test_l161c_failures_realtime.PublicationTest.test_fermer_cree_si_absent) ... ok
+test_publier_suit_jusqu_a_la_fin (tests.test_l161c_failures_realtime.PublicationTest.test_publier_suit_jusqu_a_la_fin) ... ok
+test_refus_jamais_bloquant (tests.test_l161c_failures_realtime.PublicationTest.test_refus_jamais_bloquant) ... ok
+test_sans_jeton (tests.test_l161c_failures_realtime.PublicationTest.test_sans_jeton) ... ok
+test_sortie_bornee (tests.test_l161c_failures_realtime.PublicationTest.test_sortie_bornee) ... ok
+test_sortie_lue_par_ameesh (tests.test_l161c_failures_realtime.PublicationTest.test_sortie_lue_par_ameesh)
+La sortie du check run est exactement ce que `ci.events_of` relit. ... ok
+test_base (tests.test_l161c_failures_realtime.RoutageTest.test_base) ... ok
+test_lot_par_branche_puis_ligne (tests.test_l161c_failures_realtime.RoutageTest.test_lot_par_branche_puis_ligne) ... ok
+test_textes (tests.test_l161c_failures_realtime.RoutageTest.test_textes) ... ok
+test_annulee_avant_que_la_suivante_soit_vue (tests.test_l161c_failures_realtime.WatcherTest.test_annulee_avant_que_la_suivante_soit_vue) ... ok
+test_annulee_sans_message (tests.test_l161c_failures_realtime.WatcherTest.test_annulee_sans_message) ... ok
+test_assigne_humain_ou_absent (tests.test_l161c_failures_realtime.WatcherTest.test_assigne_humain_ou_absent) ... ok
+test_deja_remis_reste (tests.test_l161c_failures_realtime.WatcherTest.test_deja_remis_reste) ... ok
+test_extrait_illisible_part_sans_extrait (tests.test_l161c_failures_realtime.WatcherTest.test_extrait_illisible_part_sans_extrait) ... ok
+test_main_rouge_une_seule_alerte (tests.test_l161c_failures_realtime.WatcherTest.test_main_rouge_une_seule_alerte) ... ok
+test_pas_l_hote_designe (tests.test_l161c_failures_realtime.WatcherTest.test_pas_l_hote_designe) ... ok
+test_poussee_suivante_retire_les_non_lus (tests.test_l161c_failures_realtime.WatcherTest.test_poussee_suivante_retire_les_non_lus) ... ok
+test_retrait_reserve_au_courrier_de_ci (tests.test_l161c_failures_realtime.WatcherTest.test_retrait_reserve_au_courrier_de_ci) ... ok
+test_rouge_herite_jamais_impute (tests.test_l161c_failures_realtime.WatcherTest.test_rouge_herite_jamais_impute) ... ok
+test_run_obsolete_non_rattache_quand_la_tete_a_avance (tests.test_l161c_failures_realtime.WatcherTest.test_run_obsolete_non_rattache_quand_la_tete_a_avance)
+#1321 : si le relevé des branches connaît une tête plus récente, un ... ok
+test_run_vu_sans_branche_est_rattache_a_la_pose (tests.test_l161c_failures_realtime.WatcherTest.test_run_vu_sans_branche_est_rattache_a_la_pose)
+#1321 : un run vu avant la pose de la branche du lot (work_item_id ... ok
+test_sans_base_relevee_passif (tests.test_l161c_failures_realtime.WatcherTest.test_sans_base_relevee_passif) ... ok
+test_suivante_en_attente_quand_l_ancienne_est_annulee (tests.test_l161c_failures_realtime.WatcherTest.test_suivante_en_attente_quand_l_ancienne_est_annulee) ... ok
+test_urgent_puis_ordinaire_puis_verdict (tests.test_l161c_failures_realtime.WatcherTest.test_urgent_puis_ordinaire_puis_verdict) ... ok
+test_vert_sans_echec (tests.test_l161c_failures_realtime.WatcherTest.test_vert_sans_echec) ... ok
+test_parts_publient (tests.test_l161c_failures_realtime.WorkflowTest.test_parts_publient) ... ok
+
+----------------------------------------------------------------------
+Ran 26 tests in 107.069s
+
+OK
+exit:0
