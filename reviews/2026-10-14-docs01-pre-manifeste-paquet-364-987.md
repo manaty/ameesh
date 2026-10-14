@@ -7,7 +7,10 @@ consolidées : impl-04 `review/impl04-364-piece-constante @627baee0c`
 `review/impl05-piece-987-paquet-suivant @39e3f2ded`
 (`reviews/2026-10-14-impl05-piece-987-paquet-suivant.md`). Les chiffres d'union de cette
 pièce sont revérifiés en première main (§4). Révisé 14/10 06:1xZ : recoupement indépendant
-ameesh-cx2 (06:15Z) intégré (§4bis).
+ameesh-cx2 (06:15Z) intégré (§4bis). Révisé 14/10 06:2xZ (corrections documentaires
+demandées par cx2, 06:17Z) : le **cœur** (#364+#987, arbre `4b65a177…`, 77 fichiers) est
+distingué de la **simulation avec compagnons** (annexe B) ; blobs propres au cœur en
+**annexe C** ; §7 (patch-ids du cœur) et §8 (paquet à six lots = #1204) corrigés.
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -20,6 +23,8 @@ n'est ni élargi ni touché.
 - **Cœur du paquet : #364 + #987.** Compagnons **candidats**, non inclus par défaut :
   #974 (après #364) et #1002 (après #987), inclus seulement si leurs avis/dépendances
   sont qualifiés avant le gel. #1257 (cause racine carte, impl-06) reste suivi à part.
+  Le « paquet à six lots » cité par le corps #1260 désigne **#1204, déjà gelé** ; #1260
+  n'ajoute aucun sixième lot (correction cx2, 14/10 06:17Z).
 - **Porte #1211** : non active. PR #923, tête
   `39f51fd9d0105b21911adb1d56c7df67fc3876eb` inchangée ; delta propre = 10 fichiers depuis
   le merge-base `229434d7b27353c042c968fec4989a3afd90edcc` ; `merge-tree` main × #1211 =
@@ -47,7 +52,8 @@ n'est ni élargi ni touché.
   `src/ameesh/migrations/0417_host_release_fences.sql`, `storage/postgres/registry.py`,
   `storage/postgres/release_fences.py`, 24 tests `test_l232b_*` + 4 tests existants.
 - La table complète des 73 fichiers (blob git + SHA256) est dans la pièce impl-04 ;
-  les empreintes de l'arbre composé sont en annexe B.
+  les empreintes du **cœur** sont en **annexe C**, celles de la **simulation avec
+  compagnons** (hors cœur par défaut) en annexe B.
 
 ### #987 — 4 fichiers (`b85777c1e3e7` → `2df0b80d`)
 
@@ -80,12 +86,13 @@ n'est ni élargi ni touché.
 | cœur : main + #987 | 0 | `37abd5a2538ef41558e004aebd0628e0f5d40f11` | 4 |
 | cœur : puis + #364 | 0 | **`4b65a17719bb…` (cœur `#364+#987`)** | 77 |
 | cœur + #974 (après #364) | 0 | `a00ae7b57c62…` | 77 |
-| cœur + #1002 (après #987) | 0 | `b44b0ef096b62b4420a8a84969b66c4097b57845` | 5 |
-| cœur + #1002 puis + #364 + #974 | 0 | **`581607ca974304da4af28d0ee46ece07147fc0c0`** | 78 |
-| ordre inverse : #364, #974, #987, #1002 | 0 | **`581607ca…` (même arbre)** | 78 |
+| **hors cœur** : #987 + #1002 (sans #364) | 0 | `b44b0ef096b62b4420a8a84969b66c4097b57845` | 5 |
+| simulation : #987+#1002 puis + #364 + #974 | 0 | **`581607ca974304da4af28d0ee46ece07147fc0c0`** | 78 |
+| simulation, ordre inverse : #364, #974, #987, #1002 | 0 | **`581607ca…` (même arbre)** | 78 |
 
-- **Composition commutative sur cette base** : les deux ordres testés donnent le même
-  arbre final `581607ca…` ; aucune conflit à aucune étape.
+- **Composition commutative sur cette base** : les deux ordres testés (avec compagnons)
+  donnent le même arbre final `581607ca…` ; aucun conflit à aucune étape. Le **cœur**,
+  sans #974 ni #1002, reste `4b65a177…` (77 fichiers, annexe C).
 - Delta union vs main = **exactement les fichiers des lots** (77 pour le cœur = 73 ∪ 4 ;
   78 avec #974 et #1002), **aucun fichier étranger**.
 - **Fichiers adaptés** (blob d'union ≠ blob de la tête du lot, parce que main a modifié le
@@ -111,7 +118,7 @@ n'est ni élargi ni touché.
   ordre inverse #987 → #364 = **exactement `4b65a177`** ; delta 77 fichiers = 73 + 4,
   aucun étranger ni manquant.
 - Blobs #364 constants **64/73** (les 9 adaptés du §4) ; `tests.yml` composé
-  `00b374d7dbd3…`, identique à l'annexe B.
+  `00b374d7dbd3…`, identique aux annexes B et C.
 - Patch-id `-U0` : **73/73** pour #364 (les 3 écarts standard sont des contextes) ;
   #987 4/4 dans les deux formes.
 - **#974 et #1002 restent candidats, exclus par défaut** : inclusion seulement si
@@ -163,9 +170,11 @@ réjeu individuel.
 ## 7. Conditions de gel (canon §12)
 
 1. **#1211 active** (PR #923 fusionnée) et ses deux conflits avec #833 résolus.
-2. **main fraîche** : refaire les unions ; revérifier les patch-ids (73 + 4 + 3 + 2) ;
-   relire les **10 fichiers adaptés** du §4 et les **2 recouvrements #1211**
-   (`tests.yml`, `tests/parts/pilote-psql.txt`) ; tout écart = arrêt et signalement.
+2. **main fraîche** : refaire les unions ; revérifier les patch-ids du **cœur** (73 pour
+   #364 + 4 pour #987) ; n'ajouter 3 (#1002) + 2 (#974) que si les compagnons sont
+   qualifiés et inclus ; relire les **10 fichiers adaptés** du §4 et les
+   **2 recouvrements #1211** (`tests.yml`, `tests/parts/pilote-psql.txt`) ; tout écart =
+   arrêt et signalement.
 3. **Qualification pilote** : classes réelles, familles/sources des avis, dépendances,
    inclusion ou exclusion motivée des compagnons (#974, #1002) ; #1257 à part.
 4. **Nouveau gel** : branche d'intégration distincte de `39df7c316c9e` + manifeste final
@@ -177,8 +186,6 @@ réjeu individuel.
 
 ## 8. Points ouverts
 
-- « Paquet à six lots » (#1260) : cinq candidats nommés (#364, #974, #987, #1002,
-  #1257) ; le sixième n'est pas nommé dans le mandat — à confirmer par le pilote.
 - #1002 : `waiting` à réconcilier (R1 déjà GO).
 - #974 : avis/feu propres non rendus ; PR à retarget après #364.
 - Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4).
@@ -207,9 +214,15 @@ git diff --name-status $M $U2                          # exactement 77 fichiers
 # extension #1002 : meme arbre final 581607ca dans les deux ordres
 git diff b132d5d4397efdd7ba05e7682bdbf68eab61703e $B364 -- <f> | git patch-id --stable
 git diff $M $U -- <f> | git patch-id --stable          # 70/73 identiques
+git diff -U0 $M $U -- <f> | git patch-id --stable      # 73/73 identiques (contextes ignores)
 ```
 
-## Annexe B — empreintes du paquet (arbre final `581607ca…`, 78 fichiers)
+## Annexe B — simulation avec compagnons #974 + #1002 (arbre `581607ca…`, 78 fichiers)
+
+**Cette annexe n'est pas le paquet final** : elle simule l'inclusion des deux compagnons
+#974 et #1002, **exclus par défaut** (§1). Le cœur admissible en préparation est l'arbre
+`4b65a177…` (77 fichiers) ; les 4 blobs qui diffèrent de cette simulation, et l'absence
+du test #1002, sont en **annexe C**.
 
 | Fichier | Blob |
 |---|---|
@@ -291,3 +304,23 @@ git diff $M $U -- <f> | git patch-id --stable          # 70/73 identiques
 | `tests/test_l232b_ssh_transport.py` | `d92ddaa00313dfb7b4c54844d28b3b3c27c60c36` |
 | `tests/test_l232b_versioned_environment.py` | `34c7e7fa10a7bc43b8a24316b38af5cc1691d693` |
 | `tests/test_l56_role_executor.py` | `10db514ce956c98d5134279a82e15fd880ea004c` |
+
+## Annexe C — cœur admissible en préparation (arbre `4b65a177…`, 77 fichiers)
+
+Cœur = main `7305957e` + #987 + #364, **sans #974 ni #1002**. 73 des 77 blobs sont
+identiques à l'annexe B ; seuls les 4 fichiers suivants diffèrent, et
+`tests/test_1002_relance_perimee.py` (présent dans la simulation) est absent du cœur.
+Union refaite et blobs comparés en première main le 14/10 ; recoupement indépendant
+ameesh-cx2 (mail 06:18Z) : mêmes 4 blobs, `tests.yml` inchangé.
+
+| Fichier | Blob cœur (`4b65a177`) | Blob simulation (`581607ca`) |
+|---|---|---|
+| `.github/workflows/relance-hosted.yml` | `668b992b79395024964fb23a8fa22c47bf7a61ea` (version #987) | `9463b99f39298dc941df57a97f62c32104dffd3e` (version #1002) |
+| `scripts/ci-relance-hosted.py` | `b6deec3246d5665f837d81add7c18d0d426c54db` (version #987) | `ae8a83ee05ff5966785ab4c75632b57757b07254` (version #1002) |
+| `docs/L232B-PRIVATE-BACKUPS.md` | `3ac6c3ab00f7cde8d9ba5e391d333688e63f6780` (version #364) | `3868cd378a34f678a4f77f9e42d1c3e8d736e0d9` (version #974) |
+| `docs/L232B-RELEASE-CONTROLLER.md` | `36d9b2a028a4754e059c5f0edd58b5d36a50d924` (version #364) | `a9ffa79b592ad216812c7d3bd51f72ee59f2f61d` (version #974) |
+| `tests/test_1002_relance_perimee.py` | absent | `03060cf30f8b9413dce7fb28cdf05f0c9520c67c` |
+
+Les 73 autres blobs du cœur sont ceux de l'annexe B (dont `tests.yml` composé
+`00b374d7dbd3…`, identique dans les deux arbres). Rapport détaillé du recoupement cx2 :
+`/home/smichea/Work/ameesh-cx2-1260-recoupage.md`.
