@@ -292,6 +292,8 @@ class Config:
     #: withdrawal deadline when a `draining` state gives none (seconds); 0 =
     #: the offer's `drain_seconds` on a lending host, 90 otherwise
     host_gate_drain: float = 0.0
+    #: L159i: require the Linux guard heartbeat in a mediated VM's file gate.
+    host_gate_lending: bool = False
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -678,6 +680,8 @@ def load(env: dict | None = None) -> Config:
                                     default=cfg.host_gate_fallback) or "").strip().lower(),
         host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
                                     False, "AMEESH_HOST_MEDIATED")),
+        host_gate_lending=bool(_as_bool(pick("AMEESH_HOST_GATE_LENDING", default=cfg.host_gate_lending),
+                                       False, "AMEESH_HOST_GATE_LENDING")),
         host_gate_drain=float(_as_count(pick("AMEESH_HOST_GATE_DRAIN"),
                                         int(cfg.host_gate_drain))),
     )
