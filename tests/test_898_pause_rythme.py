@@ -41,8 +41,9 @@ class PauseDeRythmeTest(_Comptes):
 
     def test_une_tenue_de_rythme_annonce_l_heure_de_croisement(self):
         # 10 % utilisés, 5 % de la fenêtre écoulée : avec la réserve des
-        # non-critiques le rythme permis vaut 0 %, il rejoint 10 % à 10 % de
-        # la fenêtre — la reprise est là, pas à la remise à zéro (7 jours).
+        # non-critiques le rythme permis vaut max(rythme − réserve, marge)
+        # = 10 % (PACE_MARGIN, #777), il rejoint 10 % à 10 % de la fenêtre —
+        # la reprise est là, pas à la remise à zéro (7 jours).
         ev = self.evaluate(self.jauge_longue(0.10), reserve=True)
         self.assertFalse(ev.hard)
         self.assertEqual(ev.held, ("codex-10080min", 0.10))
