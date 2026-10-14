@@ -16,7 +16,7 @@ from ameesh import db as db_mod, mail, registry, work, modules
 from ameesh.modules.storage import ModuleStore
 from tests.test_l317_project_modules import federation
 
-from .support import REPO, PgTestCase
+from .support import REPO, PgTestCase, attendu
 from .test_cluster import TEST_DSN, _dsn_for
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
@@ -129,19 +129,19 @@ class RoleExecutorTest(PgTestCase):
                (lot, "a" * 64, delivery["id"], payload))
         result = self.as_host(sql)
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("isolated writer role", result.stderr)
+        self.assertIn("isolated writer role", result.stderr, attendu(result.stderr))
         for sql in ("UPDATE project_modules SET rules = '[]'::jsonb",
                     "DELETE FROM project_modules",
                     "INSERT INTO project_modules SELECT 'other',module,canon,types,schemas,rules FROM project_modules"):
             result = self.as_host(sql)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("permission denied", result.stderr)
+            self.assertIn("permission denied", result.stderr, attendu(result.stderr))
         # Even an accidental grant cannot bypass the canonical writer trigger.
         self.db.execute("GRANT UPDATE ON project_modules TO %s" % db_mod.quote_ident(self.role))
         try:
             result = self.as_host("UPDATE project_modules SET rules = '[]'::jsonb")
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("isolated canon sync role", result.stderr)
+            self.assertIn("isolated canon sync role", result.stderr, attendu(result.stderr))
         finally:
             self.db.execute("REVOKE UPDATE ON project_modules FROM %s" % db_mod.quote_ident(self.role))
         # The trusted policies are unchanged and direct storage still refuses closure.
@@ -215,7 +215,8 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute("GRANT %s TO %s" % (q(parent), q(self.role)))
             result = self.run_script(self.role)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("forbidden UPDATE on project_modules", result.stderr)
+            self.assertIn("forbidden UPDATE on project_modules", result.stderr,
+                          attendu(result.stderr))
         finally:
             self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
             self.db.execute("DROP OWNED BY %s" % q(parent))
@@ -232,7 +233,7 @@ class RoleExecutorTest(PgTestCase):
             self.assertNotEqual(proc.returncode, 0, sql)
             error = proc.stderr.lower()
             self.assertTrue("permission denied" in error or "must be owner" in error,
-                            (sql, proc.stderr))
+                            (sql, attendu(proc.stderr)))
 
     def test_host_cannot_replace_a_key(self):
         """#326 r1: every agent shares this role; the owner's key is never
@@ -258,7 +259,7 @@ class RoleExecutorTest(PgTestCase):
                          [{"name": "l56-owner", "public_key": "k0"}])
         # an agent of that name is refused; a revocation is not
         proc = self.as_host("INSERT INTO agent_registry (name) VALUES ('l56-owner')")
-        self.assertIn("holds a human's key", proc.stderr)
+        self.assertIn("holds a human's key", proc.stderr, attendu(proc.stderr))
         proc = self.as_host("UPDATE key_holders SET key_revoked_at = now() "
                             "WHERE name = 'l56-owner'")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -325,7 +326,7 @@ class RoleExecutorTest(PgTestCase):
         proc = self.as_host("BEGIN ISOLATION LEVEL REPEATABLE READ; "
                             "INSERT INTO agent_registry (name) VALUES ('l56-rr'); COMMIT")
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("read committed only", proc.stderr)
+        self.assertIn("read committed only", proc.stderr, attendu(proc.stderr))
         proc = self.as_host("INSERT INTO agent_registry (name) VALUES ('l56-rr')")
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
@@ -337,8 +338,8 @@ class RoleExecutorTest(PgTestCase):
         try:
             proc = self.run_script(new_role)
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("ROLE CONTRACT FAILED", proc.stderr)
-            self.assertIn("CREATE or ownership on schema", proc.stderr)
+            self.assertIn("ROLE CONTRACT FAILED", proc.stderr, attendu(proc.stderr))
+            self.assertIn("CREATE or ownership on schema", proc.stderr, attendu(proc.stderr))
             self.assertFalse(self.db.query("SELECT 1 FROM pg_roles WHERE rolname = %s", (new_role,)))
         finally:
             self.db.execute("REVOKE CREATE ON SCHEMA %s FROM PUBLIC" % q(self.schema))
@@ -353,7 +354,8 @@ class RoleExecutorTest(PgTestCase):
                     try:
                         result = self.run_script(self.role)
                         self.assertNotEqual(result.returncode, 0)
-                        self.assertIn(privilege + " on database", result.stderr)
+                        self.assertIn(privilege + " on database", result.stderr,
+                                      attendu(result.stderr))
                     finally:
                         self.db.execute("REVOKE %s ON DATABASE %s FROM %s" % (
                             privilege, q(self.database), grant_to))
@@ -368,7 +370,7 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute("GRANT %s TO %s" % (q(parent), q(self.role)))
             result = self.run_script(self.role)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("CREATE on database", result.stderr)
+            self.assertIn("CREATE on database", result.stderr, attendu(result.stderr))
         finally:
             self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
             self.db.execute("ALTER ROLE %s INHERIT" % q(self.role))
@@ -383,7 +385,8 @@ class RoleExecutorTest(PgTestCase):
                 try:
                     result = self.run_script(self.role)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('privileged predefined role ' + parent, result.stderr)
+                    self.assertIn('privileged predefined role ' + parent, result.stderr,
+                                  attendu(result.stderr))
                 finally:
                     self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
 
@@ -402,7 +405,8 @@ class RoleExecutorTest(PgTestCase):
                         try:
                             result = self.run_script(self.role)
                             self.assertNotEqual(result.returncode, 0)
-                            self.assertIn(privilege + ' on table agent_mailbox', result.stderr)
+                            self.assertIn(privilege + ' on table agent_mailbox', result.stderr,
+                                          attendu(result.stderr))
                         finally:
                             self.db.execute('REVOKE ' + grant.replace(' TO ', ' FROM '))
                         for scope in ('', ' IN SCHEMA ' + q(self.schema)):
@@ -411,7 +415,8 @@ class RoleExecutorTest(PgTestCase):
                             try:
                                 result = self.run_script(self.role)
                                 self.assertNotEqual(result.returncode, 0)
-                                self.assertIn('unsafe default ' + privilege, result.stderr)
+                                self.assertIn('unsafe default ' + privilege, result.stderr,
+                                              attendu(result.stderr))
                             finally:
                                 self.db.execute('ALTER DEFAULT PRIVILEGES%s REVOKE %s' % (
                                     scope, grant.replace(' TO ', ' FROM ')))
@@ -460,8 +465,8 @@ class RoleExecutorTest(PgTestCase):
                     self.db.execute('GRANT %s ON %s %s TO %s' % (privileges, kind, obj, q(creator)))
                     result = self.run_script(executor, schema=schema, applying_role=creator)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('missing', result.stderr)
-                    self.assertIn(name, result.stderr)
+                    self.assertIn('missing', result.stderr, attendu(result.stderr))
+                    self.assertIn(name, result.stderr, attendu(result.stderr))
                     self.db.execute('ALTER %s %s OWNER TO %s' % (kind, obj, q(creator)))
                     result = self.run_script(executor, schema=schema, applying_role=creator)
                     self.assertEqual(result.returncode, 0, result.stderr)
