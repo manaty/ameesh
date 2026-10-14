@@ -475,15 +475,16 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
-    -- est un CONTENU)
+    -- est un CONTENU). `run_attempt` (#901, 0429) : quel essai de l'exécution
+    -- relancée (`gh run rerun`) porte la ligne.
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
         'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
-        'urgent_message_id', 'verdict_message_id'
+        'urgent_message_id', 'verdict_message_id', 'run_attempt'
     ]),
     ('ci_test_failures', ARRAY[
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
-        'duration_s', 'failed_at', 'message_id', 'recorded_at'
+        'duration_s', 'failed_at', 'message_id', 'recorded_at', 'run_attempt'
     ]),
     -- Session history (L52, 0032 §2): which sessions, when and where;
     -- no content (transcripts stay in harness storage).

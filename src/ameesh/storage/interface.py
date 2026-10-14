@@ -2809,8 +2809,19 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
-                 base: str, work_item_id: int | None, url: str | None) -> dict:
+                 base: str, work_item_id: int | None, url: str | None,
+                 run_attempt: int = 1) -> dict:
         """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
+
+    @abc.abstractmethod
+    def reopen_run(self, repo: str, run_id: int, *, run_attempt: int) -> dict | None:
+        """Une exécution conclue que GitHub dit de nouveau en cours (relance,
+        #901 : même `run_id`, `run_attempt` strictement supérieur) repasse
+        `running`, note l'attempt et efface les messages de l'attempt
+        précédent. None si rien ne change : attempt non supérieur (une liste
+        en retard, #828, ne rouvre pas une exécution conclue au même attempt)
+        ou tête plus récente de la branche (la relance d'une exécution périmée
+        ne la ressuscite pas)."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:
@@ -2832,23 +2843,29 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def failures(self, repo: str, run_id: int) -> list[dict]:
-        """Les tests en échec de l'exécution, dans l'ordre où ils ont échoué."""
+        """Les tests en échec de l'attempt courant de l'exécution, dans
+        l'ordre où ils ont échoué."""
 
     @abc.abstractmethod
-    def add_failure(self, repo: str, run_id: int, *, part: str, test: str, module: str,
-                    status: str, inherited: bool, excerpt: str, replay: str,
+    def add_failure(self, repo: str, run_id: int, *, run_attempt: int, part: str, test: str,
+                    module: str, status: str, inherited: bool, excerpt: str, replay: str,
                     duration_s: float | None, failed_at: str | None) -> bool:
-        """Enregistre un échec ; False s'il l'était déjà (même part, même test)."""
+        """Enregistre un échec de l'attempt `run_attempt` ; False s'il l'était
+        déjà (même part, même test, même attempt). Un échec de l'attempt
+        précédent re-vu à la relance reprend la ligne et compte comme nouveau ;
+        un événement d'un attempt antérieur ne réécrit jamais la ligne d'un
+        attempt postérieur (#901)."""
 
     @abc.abstractmethod
-    def set_failure_message(self, repo: str, run_id: int, tests: Sequence[tuple],
-                            message_id: int) -> None:
-        """Note le message qui a signalé ces échecs (`(part, test)`)."""
+    def set_failure_message(self, repo: str, run_id: int, run_attempt: int,
+                            tests: Sequence[tuple], message_id: int) -> None:
+        """Note le message qui a signalé ces échecs (`(part, test)`) de l'attempt."""
 
     @abc.abstractmethod
     def base_failures(self, repo: str, branch: str) -> dict:
         """Dernière exécution conclue (verte ou rouge) de `branch` :
-        `{run_id, head_sha, tests}` (tests en échec), ou {} sans exécution."""
+        `{run_id, head_sha, tests}` (tests en échec de son attempt courant),
+        ou {} sans exécution."""
 
     @abc.abstractmethod
     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
