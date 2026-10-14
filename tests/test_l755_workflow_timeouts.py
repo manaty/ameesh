@@ -27,11 +27,13 @@ timeout-minutes: 10}`, lu sans PyYAML.
 
 Le sous-ensemble reste volontairement étroit, mais rien n'est ignoré en
 silence : une forme qu'il ne sait pas interpréter (ancre, alias, liste,
-mapping imbriqué, `jobs:` en ligne, indentation incohérente ou par tabulation)
-lève `UnsupportedWorkflow`, et un job compact dont le `timeout-minutes` manque
-est rendu `None` — donc signalé — au lieu de disparaître du relevé. Le parseur
-est testé sur des textes synthétiques, clé d'étape et formes compactes
-comprises.
+mapping imbriqué, `jobs:` en ligne, indentation incohérente ou par tabulation,
+guillemet non apparié) lève `UnsupportedWorkflow`, et un job compact dont le
+`timeout-minutes` manque est rendu `None` — donc signalé — au lieu de
+disparaître du relevé. Dans un mapping compact, la virgule d'un scalaire cité
+(`name: "a, b"`) ne sépare pas les paires et ne peut donc pas fabriquer un
+`timeout-minutes` absent. Le parseur est testé sur des textes synthétiques, clé
+d'étape et formes compactes comprises.
 """
 from __future__ import annotations
 
@@ -53,14 +55,16 @@ MAX_TIMEOUT_MINUTES = 60
 _JOB = re.compile(r"""^(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:(.*)$""")
 #: `timeout-minutes` d'un job ou d'une étape, à l'indentation du corps.
 _TIMEOUT = re.compile(r"""^timeout-minutes\s*:\s*(.*)$""")
-#: Un `timeout-minutes` numérique, nu ou entre guillemets.
-_TIMEOUT_VALUE = re.compile(r"""^["']?(\d+)["']?$""")
+#: Un `timeout-minutes` numérique, nu ou entre guillemets appariés.
+_TIMEOUT_VALUE = re.compile(r"""^(?:(\d+)|"(\d+)"|'(\d+)')$""")
 #: Une paire `clé: valeur` d'un mapping compact ; la valeur reste scalaire.
 _FLOW_PAIR = re.compile(r"""^([A-Za-z0-9_.-]+)\s*:\s*([^{}\[\]]*)$""")
 #: `uses:` du corps d'un job : l'appel d'un workflow réutilisable (#1410).
 _USES = re.compile(r"""^uses\s*:\s*(.*)$""")
 #: La cible d'un `uses:` : un seul mot, nu ou entre guillemets.
 _USES_VALUE = re.compile(r"""^["']?([^"'\s]+)["']?$""")
+#: Un guillemet ouvre un scalaire cité en tête de paire ou après `{`, `,`, `:`.
+_QUOTE_OPENERS = " \t{,:"
 
 
 class UnsupportedWorkflow(ValueError):
@@ -92,8 +96,44 @@ def _timeout_value(value: str, where: str) -> int | None:
     match = _TIMEOUT_VALUE.match(value)
     if match is None:
         raise UnsupportedWorkflow(
-            "%s : timeout-minutes non numérique %r" % (where, value))
-    return int(match.group(1))
+            "%s : timeout-minutes non numérique ou guillemets non appariés %r"
+            % (where, value))
+    return int(next(group for group in match.groups() if group is not None))
+
+
+def _flow_pairs(inner: str, where: str) -> list[str]:
+    """Paires d'un mapping compact, coupées aux virgules hors guillemets.
+
+    `name: "a, b"` reste une seule paire : la virgule d'un scalaire cité ne
+    sépare pas. Un guillemet non apparié est refusé, jamais deviné.
+    """
+    pairs: list[str] = []
+    start = 0
+    quote: str | None = None
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if quote is not None:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if quote == "'" and char == "'" and inner[index + 1:index + 2] == "'":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "\"'" and (index == 0 or inner[index - 1] in _QUOTE_OPENERS):
+            quote = char
+        elif char == ",":
+            pairs.append(inner[start:index])
+            start = index + 1
+        index += 1
+    if quote is not None:
+        raise UnsupportedWorkflow(
+            "%s : guillemet %s non apparié dans le mapping compact %r"
+            % (where, quote, inner))
+    pairs.append(inner[start:])
+    return pairs
 
 
 def _uses_value(value: str, where: str) -> str:
@@ -113,7 +153,7 @@ def _flow_job(rest: str, where: str) -> tuple[int | None, str | None]:
     uses: str | None = None
     inner = rest[1:-1].strip()
     if inner:
-        for pair in inner.split(","):
+        for pair in _flow_pairs(inner, where):
             match = _FLOW_PAIR.match(pair.strip())
             if match is None:
                 raise UnsupportedWorkflow(
@@ -320,6 +360,47 @@ class WorkflowTimeoutsTest(unittest.TestCase):
             "  b: {runs-on: self-hosted, timeout-minutes: 12}  # compact\n"
         )
         self.assertEqual(job_timeouts(text), {"a": 10, "b": 12})
+
+    def test_une_virgule_citee_ne_fabrique_pas_un_timeout(self):
+        # Sonde de la R1 : le `timeout-minutes` cité dans `name` est du texte.
+        text = (
+            "jobs:\n"
+            '  b: {runs-on: self-hosted, name: "display, timeout-minutes: 10"}\n'
+        )
+        self.assertEqual(job_timeouts(text), {"b": None})
+
+    def test_un_timeout_reel_gagne_sur_un_scalaire_cite(self):
+        text = (
+            "jobs:\n"
+            '  b: {timeout-minutes: 120, name: "display, timeout-minutes: 10"}\n'
+        )
+        self.assertEqual(job_timeouts(text), {"b": 120})
+
+    def test_un_timeout_entre_guillemets_apparies_est_lu(self):
+        text = (
+            "jobs:\n"
+            '  a: {timeout-minutes: "12"}\n'
+            "  b: {timeout-minutes: '8'}\n"
+        )
+        self.assertEqual(job_timeouts(text), {"a": 12, "b": 8})
+
+    def test_une_apostrophe_dans_un_scalaire_nu_ne_coupe_rien(self):
+        text = (
+            "jobs:\n"
+            "  a: {name: don't, timeout-minutes: 10}\n"
+        )
+        self.assertEqual(job_timeouts(text), {"a": 10})
+
+    def test_les_guillemets_non_apparies_sont_refuses(self):
+        for text in (
+            'jobs:\n  a: {timeout-minutes: 10"}\n',
+            "jobs:\n  a: {timeout-minutes: '10}\n",
+            'jobs:\n  a: {name: "display}\n',
+            'jobs:\n  a: {name: "display, timeout-minutes: 10}\n',
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(UnsupportedWorkflow):
+                    job_timeouts(text)
 
     def test_les_formes_non_supportees_sont_refusees(self):
         for text in (
