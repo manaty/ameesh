@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -1175,33 +1176,169 @@ class LeaksTest(unittest.TestCase):
         self.assertEqual(out["not_counted"], 1)
 
 
+def _key_column(line: str) -> int:
+    """Column of the YAML key: indentation, then an optional `- `."""
+    col = len(line) - len(line.lstrip(" "))
+    if line[col:].startswith("- "):
+        col += 2
+        while col < len(line) and line[col] == " ":
+            col += 1
+    return col
+
+
+def _block_header(token: str) -> bool:
+    """Does the token after `key:` open a block scalar?
+
+    `|`, `>`, their indentation and chomping indicators in either order
+    (`|2`, `>-2`, `|-2`) and a trailing comment (`| # ...`) are all headers,
+    never an inline body (#1247).
+    """
+    token = token.split("#", 1)[0].strip()
+    return bool(token) and token[0] in "|>" and all(
+        char.isdigit() or char in "+-" for char in token[1:])
+
+
+def _block_body(lines: list[str], i: int, key_col: int) -> tuple[str, int]:
+    """Body of the block scalar opened on line `i`, and the next line."""
+    body, j = [], i + 1
+    while j < len(lines):
+        nxt = lines[j]
+        if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= key_col:
+            break
+        body.append(nxt)
+        j += 1
+    return "\n".join(body), j
+
+
+def _anchors(lines: list[str]) -> dict[str, str]:
+    """Values declared by an anchor (`key: &name |` or `key: &name value`).
+
+    An inline value keeps its `#`: a quoted `#` belongs to the value, and the
+    gate witness must not lose a `github.base_ref` hidden after it.
+    """
+    found: dict[str, str] = {}
+    pattern = re.compile(
+        r"^\s*(?:-\s+)?[^\s:#][^:#]*:\s*&(?P<name>[A-Za-z0-9_.-]+)\s*(?P<rest>.*)$")
+    for i, line in enumerate(lines):
+        match = pattern.match(line)
+        if not match:
+            continue
+        rest = match.group("rest").strip()
+        if _block_header(rest):
+            found[match.group("name")] = _block_body(lines, i, _key_column(line))[0]
+        else:
+            found[match.group("name")] = rest
+    return found
+
+
 def _run_bodies(text: str) -> list[str]:
-    """Le texte de chaque bloc `run:` de tests.yml (inline ou littéral)."""
-    bodies: list[str] = []
+    """Text of every `run:` body in tests.yml.
+
+    Covers inline scalars, block scalars (`|`, `>`, `|2`, `>-2`, header
+    comment), the list form (`- run:`) and aliases (`run: *anchor`): no body
+    may escape the gate witness that forbids `github.base_ref` /
+    `github.head_ref` inside a `run:` block (#1247).
+    """
     lines = text.splitlines()
+    anchors = _anchors(lines)
+    bodies: list[str] = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
+        col = _key_column(line)
+        stripped = line[col:]
         if not stripped.startswith("run:"):
             i += 1
             continue
         inline = stripped[len("run:"):].strip()
-        if inline and inline not in ("|", ">", "|-", ">-", "|+", ">+"):
+        if inline.startswith("*"):
+            name = inline[1:].split("#", 1)[0].strip()
+            if name in anchors:
+                bodies.append(anchors[name])
+            i += 1
+            continue
+        if inline and not _block_header(inline):
             bodies.append(inline)
             i += 1
             continue
-        body, j = [], i + 1
-        while j < len(lines):
-            nxt = lines[j]
-            if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= indent:
-                break
-            body.append(nxt)
-            j += 1
-        bodies.append("\n".join(body))
+        body, j = _block_body(lines, i, col)
+        bodies.append(body)
         i = j
     return bodies
+
+
+class RunBodiesTest(unittest.TestCase):
+    """#1247: no exotic `run:` body escapes the merge-gate witness."""
+
+    def test_block_headers_indicators_and_comment(self):
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: |2
+                      echo "${{ github.base_ref }}"
+                  - run: >-2
+                      echo "${{ github.head_ref }}"
+                  - run: |- # header comment
+                      echo ok
+                  - run: echo inline
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(4, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.head_ref", bodies[1])
+        self.assertEqual("echo ok", bodies[2].strip())
+        self.assertEqual("echo inline", bodies[3])
+
+    def test_list_form_does_not_swallow_the_next_key(self):
+        text = textwrap.dedent("""\
+            steps:
+              - run: |2
+                  echo "${{ github.base_ref }}"
+                name: suite
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertNotIn("name:", bodies[0])
+
+    def test_alias_resolves_the_anchored_block(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd |2
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+                  - run: echo inline
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertEqual("echo inline", bodies[1])
+
+    def test_alias_of_an_inline_anchor_keeps_the_quoted_hash(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd "echo # ${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_only_run_keys_are_read(self):
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                runs-on: ubuntu-latest
+                run-name: build
+                steps:
+                  - run: echo hi
+            """)
+        self.assertEqual(["echo hi"], _run_bodies(text))
 
 
 class WorkflowTest(unittest.TestCase):
