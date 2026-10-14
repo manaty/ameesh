@@ -63,7 +63,8 @@
 # Environment (test seams, dry runs only: nothing is changed by the tests):
 #   CI_RUNNERS_TEST_HOST, CI_RUNNERS_TEST_STATE, CI_RUNNERS_TEST_BUSY,
 #   CI_RUNNERS_TEST_ACTIVE (active units), CI_RUNNERS_TEST_CHILD (live runner
-#   processes), CI_RUNNERS_TEST_STOP_DELAY
+#   processes, stopped by the /run/ci-runners-test-child-gone-<N> marker),
+#   CI_RUNNERS_TEST_STOP_DELAY
 #
 # Safety, by construction:
 #   * every systemd unit this script writes matches `ameesh-guest-ci@*`; it
@@ -367,18 +368,18 @@ unit_state() { # N PROPERTY (the test host fakes the states it asserts)
 # l'arrête pas. Le wrapper lui-même porte `--dir .../ci/rN` : il est exclu.
 runner_child() { # N : un processus runner de l'unité N est vivant
   if [ -n "$HOSTDIR" ]; then
-    case ",${CI_RUNNERS_TEST_CHILD:-}," in *",$1,"*) return 0 ;; esac
-    return 1
+    case ",${CI_RUNNERS_TEST_CHILD:-}," in *",$1,"*) ;; *) return 1 ;; esac
+    # le témoin peut poser ce marqueur pendant l'attente : child arrêté
+    [ -e "$(at "/run/ci-runners-test-child-gone-$1")" ] && return 1
+    return 0
   fi
   pgrep -u "$GUEST" -af 'Runner\.(Listener|Worker)|/run\.sh' 2>/dev/null \
     | grep -q "ci/r$1/"
 }
 runner_stop_delay_s() { # le délai du wrapper : intervalle de veille + grâce
-  if [ -n "$HOSTDIR" ]; then
-    case "${CI_RUNNERS_TEST_STOP_DELAY:-0}" in ''|*[!0-9]*) echo 0 ;; *) echo "$CI_RUNNERS_TEST_STOP_DELAY" ;; esac
-    return
-  fi
-  python3 -I - "$HERE/ci-runner-gate.py" <<'PY'
+  local delay=${CI_RUNNERS_TEST_STOP_DELAY:-}
+  if [ -z "$HOSTDIR" ]; then
+    delay=$(python3 -I - "$HERE/ci-runner-gate.py" <<'PY'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("ci_runner_gate", sys.argv[1])
 mod = importlib.util.module_from_spec(spec)
@@ -388,13 +389,40 @@ try:
 except Exception:  # source illisible : la borne dure de l'unité (TimeoutStopSec)
     print(180)
 PY
+) || delay=180
+  fi
+  case "$delay" in ''|*[!0-9]*) echo 0 ;; *) echo "$delay" ;; esac
 }
-wait_runner_stops() { # N : le processus runner disparaît dans le délai
+# la porte que le wrapper obéit : fraîche, `available` ET publiée en `enforce`
+# (mêmes règles que `ci-runner-gate.py:read_gate`) ; rend « yes » ou « no ».
+gate_obeys() {
+  python3 -I - "$(at "$GATE_STATE")" "$HERE/../../src" <<'PY'
+import json, sys, time
+sys.path.insert(0, sys.argv[2])
+try:
+    from ameesh.capacity_guard import gate_state
+except ImportError:
+    print("no"); sys.exit(0)
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        doc = json.load(fh)
+except (OSError, ValueError):
+    doc = None
+guard = doc.get("guard") if isinstance(doc, dict) else None
+mode = guard.get("mode") if isinstance(guard, dict) else None
+print("yes" if gate_state(doc, time.time(), lending=True) == "available"
+      and mode == "enforce" else "no")
+PY
+}
+wait_runner_stops() { # N : 0 child disparu, 2 porte rouverte (child légitime), 1 délai épuisé
   local n=$1 delay deadline
   delay=$(runner_stop_delay_s)
   say "r$n: the gate is closed and its runner process is alive; waiting up to ${delay}s for the wrapper to stop it"
   deadline=$(( $(date +%s) + delay ))
   while runner_child "$n"; do
+    # la porte est relue à chaque tour : une réouverture available/enforce
+    # rend le child légitime, le KO ne juge pas sur une porte périmée
+    [ "$(gate_obeys)" = yes ] && return 2
     [ "$(date +%s)" -lt "$deadline" ] || return 1
     sleep 1
   done
@@ -811,12 +839,16 @@ PY
   # est donc ce fonctionnement correct ; un processus runner encore vivant
   # après le délai d'arrêt du wrapper est la désobéissance.
   if [ "$active_runners" != 0 ] && [ "$gate" != available ]; then
-    local waiting=0 offender=""
+    local waiting=0 offender="" rc=0
     for n in $(seq 1 "$COUNT"); do
       [ "$(unit_state "$n" ActiveState)" = active ] || continue
       if runner_child "$n"; then
-        if wait_runner_stops "$n"; then
-          say "r$n: the wrapper stopped its runner while the gate is $gate"
+        rc=0
+        wait_runner_stops "$n" || rc=$?
+        if [ "$rc" = 0 ]; then
+          say "r$n: the runner process is gone (gate $gate)"
+        elif [ "$rc" = 2 ]; then
+          say "r$n: the gate reopened while waiting; its runner is legitimate"
         else
           offender=$n
         fi
@@ -824,8 +856,14 @@ PY
         waiting=$((waiting + 1))
       fi
     done
+    # relecture fraîche avant le verdict : une porte rouverte pendant
+    # l'attente ne doit pas devenir un KO sur la porte initialement fermée
+    if [ -n "$offender" ] && [ "$(gate_obeys)" = yes ]; then
+      say "r$offender: the gate reopened while checking; its runner is legitimate"
+      offender=""
+    fi
     if [ -n "$offender" ]; then
-      ko "r$offender still runs after the wrapper's stop delay while the gate is $gate: the guard is not obeyed"
+      ko "r$offender still runs after the wrapper's stop delay while the gate is $(gate_now): the guard is not obeyed"
     elif [ "$waiting" != 0 ]; then
       echo "note: $waiting guest runner(s) active without their runner process: the wrapper waits for the gate"
     fi

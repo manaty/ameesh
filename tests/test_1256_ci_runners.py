@@ -245,14 +245,18 @@ class CiRunnersTest(unittest.TestCase):
             os.chmod(full, mode)
         return full
 
-    def run_script(self, *args, busy=False, **env_extra):
+    def script_env(self, **env_extra):
         env = dict(os.environ, CI_RUNNERS_TEST_HOST=self.host,
                    PATH=os.path.join(self.host, "bin") + os.pathsep + os.environ["PATH"])
-        if busy:
-            env["CI_RUNNERS_TEST_BUSY"] = "1"
         env.update({name: str(value) for name, value in env_extra.items()})
+        return env
+
+    def run_script(self, *args, busy=False, **env_extra):
+        if busy:
+            env_extra["CI_RUNNERS_TEST_BUSY"] = "1"
         return subprocess.run(["bash", SCRIPT, "--dry-run", *args],
-                              capture_output=True, text=True, env=env)
+                              capture_output=True, text=True,
+                              env=self.script_env(**env_extra))
 
     def test_prepare_prints_the_install_and_changes_nothing(self):
         before = sorted(os.path.relpath(os.path.join(d, f), self.host)
@@ -704,9 +708,65 @@ class CiRunnersTest(unittest.TestCase):
         self.registered(1)
         res = self.run_script("--check", "--count", "1",
                               CI_RUNNERS_TEST_ACTIVE="1",
+                              CI_RUNNERS_TEST_CHILD="1",
+                              CI_RUNNERS_TEST_STOP_DELAY="0")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("waiting up to 0s", res.stdout)
+        self.assertIn("still runs after the wrapper's stop delay", res.stderr)
+        self.assertNotIn("unbound variable", res.stderr)
+
+    def test_check_stop_delay_defaults_without_the_seam(self):
+        # C3 : sans seam, le délai reste un nombre (aucun `unbound variable`)
+        # et le refus garde sa raison ; le défaut des dry runs est zéro.
+        self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.gate_document()
+        self.registered(1)
+        res = self.run_script("--check", "--count", "1",
+                              CI_RUNNERS_TEST_ACTIVE="1",
                               CI_RUNNERS_TEST_CHILD="1")
         self.assertNotEqual(res.returncode, 0)
+        self.assertIn("waiting up to 0s", res.stdout)
         self.assertIn("still runs after the wrapper's stop delay", res.stderr)
+        self.assertNotIn("unbound variable", res.stderr)
+
+    def test_check_accepts_a_runner_stopped_within_the_delay(self):
+        # C2 : un child vivant au premier relevé mais arrêté dans le délai du
+        # wrapper est un drainage obéi ; le chemin positif est couvert.
+        self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.gate_document()
+        self.registered(1)
+        env = self.script_env(CI_RUNNERS_TEST_ACTIVE="1", CI_RUNNERS_TEST_CHILD="1",
+                              CI_RUNNERS_TEST_STOP_DELAY="30")
+        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", "--check", "--count", "1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        time.sleep(4)
+        self.write("run/ci-runners-test-child-gone-1", "")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn("waiting up to 30s", out)
+        self.assertIn("the runner process is gone", out)
+        self.assertNotIn("KO", err)
+
+    def test_check_reads_the_gate_again_and_accepts_a_reopening(self):
+        # C2 résiduel : la porte est relue pendant l'attente ; une réouverture
+        # available/enforce rend le child légitime au lieu d'un KO sur la
+        # porte initialement fermée (le child simulé reste vivant).
+        self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.gate_document()
+        self.registered(1)
+        env = self.script_env(CI_RUNNERS_TEST_ACTIVE="1", CI_RUNNERS_TEST_CHILD="1",
+                              CI_RUNNERS_TEST_STOP_DELAY="10")
+        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", "--check", "--count", "1"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        time.sleep(3)
+        self.gate_document(state="available")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, out + err)
+        self.assertIn("waiting up to 10s", out)
+        self.assertIn("the gate reopened while waiting", out)
+        self.assertNotIn("still runs", err)
 
     def test_the_documented_offer_counts_jobs(self):
         # le brouillon de fiche d'hôte du plan est lu par le contrat : le
