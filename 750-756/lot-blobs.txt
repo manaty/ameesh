@@ -1,0 +1,21 @@
+# 14 lot files (merge-base 5bc2c5de..aaad7117): blob in frozen aaad71177d523f9c7cb7797451529d5fc475cd15 vs blob in union 16764d9b85836f6a7a353c058cee2b4e65a56eb6
+COMBINED     docs/EXPLOITATION.md  88c7e1ad2b -> b6a8ece55c
+COMBINED     docs/ORCHESTRATEUR.md  c99f574e64 -> 2f7c69873d
+COMBINED     site/docs/reference/cli.md  5a43147bf7 -> ec5b7554db
+COMBINED     src/ameesh/main.py  f0199d15dc -> 56debe63a9
+constant     src/ameesh/merge_queue.py  b870b222ce -> b870b222ce
+COMBINED     src/ameesh/mesh_cli.py  fef97d6532 -> 9d38392a7f
+constant     src/ameesh/radar.py  df5c029e8e -> df5c029e8e
+constant     src/ameesh/release.py  5b9e9daae6 -> 5b9e9daae6
+constant     tests/fixtures/l756-run-38350245246-jobs.txt  2a25db74bc -> 2a25db74bc
+COMBINED     tests/test_l160b_radar.py  b69d158c15 -> 93edfc4d01
+constant     tests/test_l160e_merge_queue.py  69d14aec1c -> 69d14aec1c
+constant     tests/test_l160g_nexlink.py  785caa39da -> 785caa39da
+constant     tests/test_l750_release.py  5e50ba415b -> 5e50ba415b
+constant     tests/test_l756_full_suite.py  fa2a4a3ec3 -> fa2a4a3ec3
+
+# intersection(main delta acd8a0f0..c4fa14a23b07bd4fe07a9d162049774f3e90cb24, lot files)
+  (empty = disjoint)
+
+# diff --check union-vs-qualifie
+clean
