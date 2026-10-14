@@ -395,6 +395,16 @@ only a display name for the status bar and `whoami --cwd`
 `--from`, `status` and `whoami` refuse, and `inbox <nom>` remains a read
 without consumption.
 
+**Git identity of a session (#834).** The runner sets the four variables
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and
+`GIT_COMMITTER_EMAIL` for every turn, and for an `attach` session, from the agent
+name of the lease (`<name>@ameesh.invalid`, the address the mediated device
+already uses). Git environment variables override configuration, so a repository
+whose `.git/config` is shared by all its worktrees can no longer attribute one
+agent's commit to another (incident of 2026-10-13, where a resumed session
+without these variables committed under the name of the agent that had written
+`user.name` first). No git configuration is read or written for this.
+
 **External sessions: explicit binding (L41, decision 0030).** An interactive
 session launched by a human has neither a lease nor `AGENT_MAIL_NAME`. It only has
 an identity if it is **bound**: `ameesh mail bind <agent> --session

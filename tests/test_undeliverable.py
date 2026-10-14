@@ -187,7 +187,7 @@ class EnvoiRefuseTest(_Base):
                          AMEESH_ALERT_ORCHESTRATORS="orchestrateur,chef-b")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertIn('message not dropped — "orchestrator" is not in the registry',
+        self.assertIn('message not delivered — "orchestrator" is not in the registry',
                       proc.stderr)
         # le rôle : l'orchestrateur de l'équipe de l'expéditeur, pas celui d'une autre
         self.assertIn("close names: orchestrateur (orchestrator of team manaty)",
@@ -225,7 +225,7 @@ class EnvoiRefuseTest(_Base):
         self.stop("claude3")
         proc = self.send("claude3", "Verdict : ok, gèle.", AGENT_MAIL_NAME="claude1")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("message not dropped — claude3 is stopped (since ", proc.stderr)
+        self.assertIn("message not delivered — claude3 is stopped (since ", proc.stderr)
         self.assertIn("reason: manuel — arrêté à la main", proc.stderr)
         self.assertIn("responsible: human:proprio", proc.stderr)
         self.assertIn("its work was taken over by mesh-design", proc.stderr)
@@ -233,7 +233,7 @@ class EnvoiRefuseTest(_Base):
         self.assertEqual(self.pending("claude3"), [])
         proc = self.send("claude3", "Pour ta reprise.", "--queue", AGENT_MAIL_NAME="claude1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("dropped for: claude3", proc.stdout)
+        self.assertIn("delivered to claude3", proc.stdout)
         self.assertIn("warning: claude3 is stopped", proc.stderr)
         self.assertEqual(self.pending("claude3"), ["Pour ta reprise."])
 
@@ -284,7 +284,7 @@ class EnvoiRefuseTest(_Base):
         proc = self.send("all", "Point d'équipe à 15 h.", AGENT_MAIL_NAME="orchestrateur")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("claude3", proc.stdout)
-        self.assertIn("not dropped for claude3 (stopped", proc.stderr)
+        self.assertIn("not delivered to claude3 (stopped", proc.stderr)
         self.assertEqual(self.pending("claude3"), [])
         self.assertEqual(self.pending("claude1"), ["Point d'équipe à 15 h."])
         skipped: list = []

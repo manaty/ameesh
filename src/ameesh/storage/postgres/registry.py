@@ -49,7 +49,11 @@ AGENT_COLUMNS = """
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
-    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake
+    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake,
+    -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
+    -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
+    -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
+    session_harness, session_cwd, session_origin
 """
 
 
