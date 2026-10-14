@@ -64,7 +64,8 @@
 #   CI_RUNNERS_TEST_HOST, CI_RUNNERS_TEST_STATE, CI_RUNNERS_TEST_BUSY,
 #   CI_RUNNERS_TEST_ACTIVE (active units), CI_RUNNERS_TEST_CHILD (live runner
 #   processes, stopped by the /run/ci-runners-test-child-gone-<N> marker),
-#   CI_RUNNERS_TEST_STOP_DELAY
+#   CI_RUNNERS_TEST_STOP_DELAY, CI_RUNNERS_TEST_GUEST_READS (logical paths the
+#   guest can read on the test host; the real probe runs `runuser`)
 #
 # Safety, by construction:
 #   * every systemd unit this script writes matches `ameesh-guest-ci@*`; it
@@ -329,6 +330,32 @@ app_units() { # the application's own runner units: read, never written
     | awk '{print $1}' | sort || true
 }
 app_count() { app_units | grep -c . || true; }
+# R2 #1256 B2 : l'isolation dans l'autre sens. Un job de l'application est
+# root-equivalent sur cette VM (les jobs de la flotte lancent Docker) : il ne
+# doit donc pas pouvoir lire les secrets du runner ameesh, ni son arbre de
+# travail. Le test tourne en tant qu'invité (`runuser`), jamais en root.
+guest_reads() { # PATH logique : 0 si ameesh-guest peut le lire
+  if [ -n "$HOSTDIR" ]; then
+    case ",${CI_RUNNERS_TEST_GUEST_READS:-}," in
+      *",$1,"*) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  runuser -u "$GUEST" -- test -r "$(at "$1")" 2>/dev/null
+}
+app_isolation_paths() { # les chemins logiques de l'application à sonder
+  local root=/home/runner mapped; mapped=$(at "$root")
+  [ -e "$mapped" ] || return 0
+  printf '%s\n' "$root"
+  [ -d "$mapped" ] || return 0
+  local p
+  while IFS= read -r p; do
+    printf '%s\n' "$root${p#"$mapped"}"
+  done < <(find "$mapped" -xdev -maxdepth 5 \
+             \( -name .runner -o -name .credentials \
+                -o -name .credentials_rsaparams -o -name _work \) \
+             -print 2>/dev/null)
+}
 guest_busy() { # N : a job of runner N is running
   [ -n "${CI_RUNNERS_TEST_BUSY:-}" ] && return 0
   host_says pgrep -u "$GUEST" -af 'Runner.Worker' 2>/dev/null \
@@ -805,6 +832,20 @@ PY
     ko "the application's runner units changed ($then -> $now)"
   fi
   [ -d "$(at /home/runner)" ] && echo "note: /home/runner exists; this script never writes there"
+  say "application isolation (a job of the application is root-equivalent here)"
+  local probe probes
+  probes=$(app_isolation_paths)
+  if [ -z "$probes" ]; then
+    echo "note: no application runner tree at /home/runner: nothing to probe"
+  else
+    while IFS= read -r probe; do
+      if guest_reads "$probe"; then
+        ko "$GUEST can read $probe: an application job could impersonate the ameesh runner (R2 B2)"
+      else
+        ok "$GUEST cannot read $probe"
+      fi
+    done <<<"$probes"
+  fi
   say "guard"
   local guard; guard=$(at "$ETC/guard.json")
   if [ -f "$guard" ]; then

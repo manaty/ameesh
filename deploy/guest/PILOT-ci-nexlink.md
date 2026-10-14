@@ -182,9 +182,17 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
 | 9 | The workspaces are separate | each runner has its own `_work`; the application's sweep is nominative (its `RUNNER_NAME`) and never looks at `ci/rN` | its `self-hosted-sweep.sh` (Nexlink repo) |
 | 10 | The disk is watched | own directory on the root filesystem (no volume on this VM), `disk_free_min`/`disk_paths` in the offer, `df` floor at prepare (`--disk-floor-mib`; 15 GiB default, 6 GiB qualified on ci-3, §3) | `df -Pk /srv/ameesh-guest`; `--check`; guard state |
 | 11 | The privileged tools are out of the guest's reach | `docker` shim and gate wrapper installed in `/usr/local/lib/ameesh-guest-ci` (root:root); the whole chain is checked (no symlink, root-owned, not group/other-writable) before every `--prepare` and `--remove`; every creation, extraction, publication and removal under `/srv/ameesh-guest` runs as `ameesh-guest` | `ls -ld /usr/local/lib/ameesh-guest-ci /usr/local/lib/ameesh-guest-ci/docker`; witness `tests/test_1256_ci_runners.py` (a symlinked tools path, ancestor or tool file is refused; no root mutation names a path under the guest tree; removal goes through `runuser`) |
+| 12 | The application's runner secrets stay out of the guest's read | probed as `ameesh-guest`, never as root: `/home/runner`, then every `.runner`, `.credentials`, `.credentials_rsaparams` and `_work` under it (depth 5) must fail `test -r`. An application job is root-equivalent on this VM (the fleet's jobs run Docker), so reading them would let it impersonate the ameesh runner | `ci-runners.sh --check` (`runuser -u ameesh-guest -- test -r …`; any readable path is a KO, with the path named); witness `tests/test_1256_ci_runners.py` (unreadable tree accepted, readable `.credentials` refused); qualification §5.7 (R2 #1256 B2) |
 
 Residual limits, stated rather than hidden: the guest shares the kernel (a
-rootless container is not a VM); a job killed at level 4 is lost, not
+rootless container is not a VM); **the isolation is not symmetric**: on this
+VM an application job is root-equivalent (the fleet's jobs run Docker and
+`docker run`), so it could read a persistent guest runner's `.credentials`
+and pass itself off as it; `--check` proves the guest cannot read the
+application (row 12), and the reverse direction needs either ephemeral/JIT
+runners with a label outside the required checks, or the owner's written
+acceptance of that risk — named at gate 4, as a security decision (R2 #1256
+B1); a job killed at level 4 is lost, not
 retried (GitHub marks it failed); `disk_max` has no volume to hold it here
 (the guard's free-space threshold is the protection); `config.sh` receives
 the registration token in its argument vector for the seconds it runs (the
@@ -217,14 +225,21 @@ runners instead of leaving them running.
 3. **Pilot's fire** (`mesh-design`) for the merge, on the frozen head.
 4. **Host pilot's written consent** (`orchestrateur`): the VM (identity of
    §3), that no autoscaler drives it (§3, "Autoscaler": the provider-side
-   attestation is the pilot's), and the loan window.
+   attestation is the pilot's), and the loan window. This gate also carries
+   the reverse-direction decision of §4: an application job is root-equivalent
+   here, so either the owner's written acceptance of that risk (a security
+   decision) or the JIT/ephemeral redesign is named here before activation
+   (R2 #1256 B1).
 5. **Activation go** (`mesh-design`), distinct from the merge fire, after
    the canon Host fiche PR is merged.
 6. **Enforce before the first guest job** (R1 #1256): the guard is switched
    to `enforce` while the guest runners are still stopped; observation runs
    with the guests off, and `ci-runners.sh --enable` refuses in `observe`.
 7. **Qualification first**: one real ameesh job on one guest runner, its
-   container proven inside the slice, `/home/runner` untouched, and the
+   container proven inside the slice, `/home/runner` untouched, the guest
+   proven unable to read `/home/runner`, the application runners'
+   `.runner`/`.credentials`/`.credentials_rsaparams` and their `_work`
+   (`ci-runners.sh --check`; a readable path is a KO, R2 #1256 B2), and the
    post-job disk check of §6 (free ≥ 6 GiB, no `disk_low` episode); only then
    the others are enabled and left in service.
 

@@ -721,6 +721,32 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("r1: .runner unreadable or registered on another repository",
                       res.stderr)
 
+    def test_check_proves_the_application_is_out_of_the_guest_s_read(self):
+        # R2 #1256 B2 : un job de l'application est root-equivalent sur cette
+        # VM (Docker) ; `--check` sonde donc en tant qu'invité la racine des
+        # runners, leurs secrets et leurs arbres de travail, et exige l'échec
+        # de `test -r` sur chacun.
+        self.registered(1)
+        self.write("home/runner/r1/.runner", "{}\n", mode=0o600)
+        self.write("home/runner/r1/.credentials", "secret\n", mode=0o600)
+        self.write("home/runner/r1/_work/nexlink/README", "x\n", mode=0o644)
+        res = self.run_script("--check", "--count", "1")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        for path in ("/home/runner", "/home/runner/r1/.runner",
+                     "/home/runner/r1/.credentials", "/home/runner/r1/_work"):
+            self.assertIn("ok ameesh-guest cannot read %s" % path, res.stdout)
+
+    def test_check_refuses_an_application_secret_the_guest_can_read(self):
+        # le KO nomme le chemin fautif, pas seulement un compte
+        self.registered(1)
+        self.write("home/runner/r1/.credentials", "secret\n", mode=0o600)
+        res = self.run_script(
+            "--check", "--count", "1",
+            CI_RUNNERS_TEST_GUEST_READS="/home/runner/r1/.credentials")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("KO ameesh-guest can read /home/runner/r1/.credentials",
+                      res.stderr)
+
     def gate_document(self, state="stopped"):
         return self.write("run/ameesh-gate/state/state.json", json.dumps(
             {"schema": "ameesh-host-state/1", "state": state, "seq": 3,
