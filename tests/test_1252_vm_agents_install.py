@@ -28,7 +28,7 @@ SCRIPT = ROOT / 'deploy/mise-a-jour/vm.sh'
 BAIL = ROOT / 'deploy/mise-a-jour/bail.sh'
 
 SSH = r'''#!/usr/bin/env python3
-import os, subprocess, sys
+import os, re, subprocess, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 vmhome = Path(os.environ['FAKE_VM_HOME'])
@@ -36,13 +36,19 @@ vmtmp = Path(os.environ['FAKE_VM_TMP'])
 live = '/home/ameesh'
 sentinel = '@@VMHOME@@'
 command = sys.argv[-1]
+# Un chemin déjà traduit (rendu par un `mktemp` distant, relu par le script)
+# ne doit pas l'être deux fois : on le met de côté avant le reste.
+command = command.replace(str(vmtmp), '@@VMTMP@@')
 command = command.replace(live, sentinel)
 # A live path left here would reach the host: refuse before any fake path,
 # which legitimately contains /home/ameesh under this harness's TMPDIR.
 if live in command:
     sys.exit('untranslated remote path: ' + command)
-command = command.replace('/tmp/ameesh.bundle', str(vmtmp / 'ameesh.bundle'))
+command = re.sub(r'/tmp/ameesh\.bundle(\.[A-Za-z0-9]+)?',
+                 lambda m: '@@VMTMP@@/ameesh.bundle' + (m.group(1) or ''),
+                 command)
 command = command.replace(sentinel, str(vmhome))
+command = command.replace('@@VMTMP@@', str(vmtmp))
 command = command.replace('$HOME/.config/ameesh/env', str(vmhome / '.config/ameesh/env'))
 with (state / 'ssh.log').open('a') as f:
     f.write(command.replace('\n', ' ') + '\n')
@@ -58,6 +64,9 @@ dest = sys.argv[-1]
 assert dest.startswith('root@vm.invalid:'), dest
 target = Path(os.environ['FAKE_VM_TMP']) / Path(dest.split(':', 1)[1]).name
 shutil.copy2(source, target)
+# Le root distant crée le fichier sous son umask : sans le chmod 644 du script,
+# le compte ameesh ne pourrait pas lire le paquet (#1252 R2).
+os.chmod(target, 0o600)
 with (state / 'scp.log').open('a') as f:
     f.write(' '.join(sys.argv[1:]) + '\n')
 '''
@@ -742,6 +751,35 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.src), self.old)
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
+    def test_relaunching_install_on_the_installed_sha_keeps_the_return_target(self):
+        # A→B réussi (previous-sha = A), puis relance de « installer B » : la
+        # cible de retour reste A. Sans la garde, previous-sha serait réécrit à
+        # B et « retour » reviendrait sur place — un faux retour (#1252 R2).
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.installed_url(),
+                         (self.parts / ('src-' + self.target[:7])).as_uri())
+        self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
+        q = self.run_vm('installer', self.target)
+        self.assertEqual(q.returncode, 0, q.stderr)
+        self.assertIn('previous-sha inchangé', q.stdout)
+        self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
+        r = self.run_vm('retour')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.head(self.src), self.old)
+
+    def test_relaunch_on_installed_sha_without_previous_sha_invents_none(self):
+        # Code déjà en place sans previous-sha : la relance n'en invente pas un
+        # qui pointerait le code courant ; « retour » refuse au lieu de mentir.
+        (self.parts / 'previous-sha').unlink()
+        self._write_direct_url(self.target)
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse((self.parts / 'previous-sha').exists())
+        r = self.run_vm('retour')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('aucun retour possible', r.stderr)
+
     # -- rollback -----------------------------------------------------------
     def test_retour_refuses_without_previous_sha(self):
         (self.parts / 'previous-sha').unlink()
@@ -865,7 +903,23 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.src), self.target)
         self.assertEqual(self.head(self.parts / ('src-' + self.target[:7])), self.target)
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
-        self.assertFalse((self.vmtmp / 'ameesh.bundle').exists())
+        self.assertFalse(list(self.vmtmp.glob('ameesh.bundle*')))
+
+    def test_bundle_lands_on_a_private_temp_name_made_readable(self):
+        # Le nom distant n'est pas le nom fixe /tmp/ameesh.bundle (pré-création
+        # ou symlink exploitable) et le script rend la cible lisible APRÈS le
+        # transfert : le scp simulé la crée en 0600 (umask restrictif du root
+        # distant), le chmod 644 du script la remet en 0644 pour ameesh.
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        scp = (self.state / 'scp.log').read_text().strip().splitlines()[-1]
+        dest = scp.rsplit(':', 1)[1]
+        nom = dest.rsplit('/', 1)[1]
+        self.assertTrue(nom.startswith('ameesh.bundle.'), dest)
+        mirroir = self.vmtmp / nom
+        ssh_log = (self.state / 'ssh.log').read_text()
+        self.assertIn("chmod 644 '%s'" % mirroir, ssh_log)
+        self.assertFalse(list(self.vmtmp.glob('ameesh.bundle*')), ssh_log)
 
     def test_install_sends_a_bundle_for_a_target_already_merged_into_main(self):
         # Cible déjà fusionnée : l'ancien ^origin/main rendait le paquet vide.

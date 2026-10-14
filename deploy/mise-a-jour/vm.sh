@@ -103,16 +103,20 @@ tete_clone_distante() {
     ssh_vm "git -C $SRC rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true"
   fi
 }
-# Envoie le commit $1 dans /tmp/ameesh.bundle sur la cible $2 (root@…) : paquet
+# Envoie le commit $1 dans un fichier temporaire de la cible $2 (root@…) : paquet
 # git du poste pour un clone qui n'atteint pas l'origine (le dépôt local doit
 # contenir le commit). La seule base exclue est le HEAD de la cible, que la
 # cible prouve présente avant l'envoi ; sans base lisible, ou si l'exclusion
 # vide le paquet, le paquet est autonome — plus de « Refusing to create empty
-# bundle » pour une cible déjà fusionnée dans origin/main (#1252 B4). Le
-# fichier distant est retiré par l'appelant, après le fetch. Lisible par le
-# compte ameesh des VM d'agents (chmod 644).
+# bundle » pour une cible déjà fusionnée dans origin/main (#1252 B4). Le nom
+# distant vient de `mktemp` (créé en 0600 par le root distant : ni nom fixe
+# pré-créable, ni symlink exploitable), puis la cible est rendue lisible par le
+# compte ameesh (`chmod 644` sur la cible : le umask du root distant ne décide
+# pas de la lecture). Le chemin créé est publié dans PAQUET_DISTANT ; l'appelant
+# le retire après le fetch (#1252 R2 : lisibilité et nom non devinable).
 paquet_git() {
-  local sha=$1 hote=$2 base
+  local sha=$1 hote=$2 base distant
+  PAQUET_DISTANT=
   git -C "$DEPOT" cat-file -e "$sha^{commit}" 2>/dev/null \
     || { echo "commit $sha absent du dépôt local : paquet git impossible" >&2; return 1; }
   base=$(tete_clone_distante) || true
@@ -126,9 +130,23 @@ paquet_git() {
       || { git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm; rm -f "$TRAVAIL/ameesh.bundle"; return 1; }
   fi
   git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm
+  distant=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$hote" \
+              'umask 077; mktemp /tmp/ameesh.bundle.XXXXXX') \
+    || { rm -f "$TRAVAIL/ameesh.bundle"
+         echo "fichier temporaire distant impossible : paquet git non envoyé" >&2; return 1; }
+  [[ $distant =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || { ssh -o BatchMode=yes "$hote" "rm -f '$distant'" 2>/dev/null || true
+         rm -f "$TRAVAIL/ameesh.bundle"
+         echo "chemin distant inattendu : $distant" >&2; return 1; }
   chmod 644 "$TRAVAIL/ameesh.bundle"
-  scp -q -o BatchMode=yes "$TRAVAIL/ameesh.bundle" "$hote:/tmp/ameesh.bundle"
+  scp -q -o BatchMode=yes "$TRAVAIL/ameesh.bundle" "$hote:$distant" \
+    || { ssh -o BatchMode=yes "$hote" "rm -f '$distant'" 2>/dev/null || true
+         rm -f "$TRAVAIL/ameesh.bundle"; return 1; }
+  ssh -o BatchMode=yes "$hote" "chmod 644 '$distant'" \
+    || { ssh -o BatchMode=yes "$hote" "rm -f '$distant'" 2>/dev/null || true
+         rm -f "$TRAVAIL/ameesh.bundle"; return 1; }
   rm -f "$TRAVAIL/ameesh.bundle"
+  PAQUET_DISTANT=$distant
 }
 # Commandes sur la VM d'agents : utilisateur ameesh et son bus systemd,
 # la base reste celle de la configuration du compte de l’unité.
@@ -602,8 +620,8 @@ installer_agents() {
   if ! utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src cat-file -e '$sha^{commit}'" 2>/dev/null; then
     etape "la VM n'a pas ce commit : envoi d'un paquet git"
     paquet_git "$sha" "$AGENTS_SSH"
-    utilisateur_agents bash -c 'git -C /home/ameesh/.local/share/ameesh/src fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm'
-    ssh_agents "rm -f /tmp/ameesh.bundle"
+    utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src fetch -q '$PAQUET_DISTANT' refs/mise-a-jour/vm"
+    ssh_agents "rm -f '$PAQUET_DISTANT'"
   fi
   # 2. migrations du commit passées sur la base commune du mesh
   etape "migrations de ${sha:0:9} passées sur la base du mesh"
@@ -655,8 +673,15 @@ installer_agents() {
     echo "installation inachevée : « $0 agents retour » revient à ${complet:0:9} (journal conservé)" >&2
     exit 1
   fi
-  # 9. previous-sha seulement après une installation réussie
-  utilisateur_agents bash -c "printf '%s\n' '$complet' > /home/ameesh/.local/share/ameesh/previous-sha"
+  # 9. previous-sha seulement après une installation réussie, et seulement si
+  # le code installé change : relancer « installer » sur le SHA déjà en place
+  # ne doit pas écraser la cible de retour (sinon « retour » revient sur place,
+  # un faux retour — #1252 R2). Sans previous-sha, on n'en invente pas un.
+  if [ "$complet" != "$sha" ]; then
+    utilisateur_agents bash -c "printf '%s\n' '$complet' > /home/ameesh/.local/share/ameesh/previous-sha"
+  else
+    echo "code ${sha:0:9} déjà installé : previous-sha inchangé (aucun faux retour)"
+  fi
   effacer_journal_agents
   echo "installé depuis src-$court (avant $complet). Les exécuteurs tournent encore l'ancien code : « $0 agents redemarrer », puis « $0 agents controler »."
 }
@@ -687,8 +712,8 @@ retour_agents() {
       || { echo "commit $cible absent du dépôt local : retour impossible d'ici" >&2; exit 1; }
     etape "la VM n'a pas ce commit : envoi d'un paquet git"
     paquet_git "$cible" "$AGENTS_SSH"
-    utilisateur_agents bash -c 'git -C /home/ameesh/.local/share/ameesh/src fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm'
-    ssh_agents "rm -f /tmp/ameesh.bundle"
+    utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src fetch -q '$PAQUET_DISTANT' refs/mise-a-jour/vm"
+    ssh_agents "rm -f '$PAQUET_DISTANT'"
   fi
   complet=$(utilisateur_agents bash -c "git -C /home/ameesh/.local/share/ameesh/src rev-parse --verify '$cible^{commit}'" 2>/dev/null || true)
   [ -n "$complet" ] || { echo "commit $cible illisible dans le clone de la VM : retour refusé" >&2; exit 1; }
@@ -739,7 +764,7 @@ installer() {
   if ! ssh_vm "git -C $SRC cat-file -e '$sha^{commit}'" 2>/dev/null; then
     etape "le serveur n'a pas ce commit : envoi d'un paquet git"
     paquet_git "$sha" "root@$VM"
-    ssh_vm "set -e; git -C $SRC fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm; rm -f /tmp/ameesh.bundle"
+    ssh_vm "set -e; git -C $SRC fetch -q '$PAQUET_DISTANT' refs/mise-a-jour/vm; rm -f '$PAQUET_DISTANT'"
   fi
   # Le venv du serveur sert aussi les commandes des agents (mail send…) : le
   # nouveau code n'y entre qu'une fois la base migrée (10/10, L151)

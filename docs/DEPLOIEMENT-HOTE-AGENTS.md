@@ -109,8 +109,10 @@ disque est haché et comparé aux objets du commit, sans passer par l’index :
 absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
 écrasé — le retirer à la main pour le reconstruire.
 
-`previous-sha` n’est publié qu’après une installation réussie, et le journal
-est alors effacé. Si l’installation échoue (même après un premier `pip` qui a
+`previous-sha` n’est publié qu’après une installation réussie, et seulement
+quand le code installé change : relancer `installer` sur le SHA déjà en place le
+laisse intact (sans `previous-sha`, on n’en invente pas un — pas de faux
+retour), et le journal est alors effacé. Si l’installation échoue (même après un premier `pip` qui a
 déjà remplacé le paquet et publié `direct_url.json`), la commande ferme en
 conservant le journal : `retour` ramène au code quitté qu’il désigne, et non à
 un `previous-sha` plus ancien — y compris à la première utilisation, sans
@@ -124,10 +126,13 @@ refuse si la cible (journal ou `previous-sha`) est absente, invalide ou
 introuvable dans le clone de la VM comme dans le dépôt du poste.
 
 Si la VM n’a pas le commit visé, il est envoyé en paquet git par SSH depuis le
-poste. Le paquet exclut le HEAD du clone de la VM, dont la présence est prouvée
-avant l’envoi ; sans base lisible, ou si l’exclusion vide le paquet, il est
-autonome — une cible déjà fusionnée dans `origin/main` passe donc, comme le
-retour vers un ancêtre absent de la VM.
+poste. Le fichier distant est créé par `mktemp` (racine, mode privé : ni nom
+fixe pré-créable, ni symlink exploitable), puis rendu lisible par le compte
+`ameesh` (`chmod 644` sur la cible — le umask du root distant ne décide pas de
+la lecture), et retiré après le `fetch`. Le paquet exclut le HEAD du clone de la
+VM, dont la présence est prouvée avant l’envoi ; sans base lisible, ou si
+l’exclusion vide le paquet, il est autonome — une cible déjà fusionnée dans
+`origin/main` passe donc, comme le retour vers un ancêtre absent de la VM.
 
 Les migrations de la base commune doivent être appliquées avant l’installation
 du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
