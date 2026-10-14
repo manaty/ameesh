@@ -20,9 +20,12 @@ import json
 import pathlib
 import re
 import tempfile
+import time
 import unittest
+from datetime import datetime, timezone
+from unittest import mock
 
-from ameesh import ci, exploitation, mail, notify, registry, storage, work
+from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, storage, work
 
 from .support import PgTestCase
 
@@ -226,21 +229,69 @@ class RoutageTest(unittest.TestCase):
 
 class FauxApi:
     """L'API GitHub vue par le relevé : exécutions en cours, état d'une
-    exécution, check runs d'une tête."""
+    exécution, check runs d'une tête, et (#845) runners et jobs."""
 
     def __init__(self):
         self.live, self.queued, self.done, self.checks = [], [], {}, {}
+        #: #845 : runners du dépôt, jobs par exécution, liste d'exécutions
+        #: tronquée, panne de l'API des runners
+        self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
+        #: #845 : chemins appelés, pour compter les appels de la garde
+        self.paths: list[str] = []
 
     def __call__(self, path):
+        self.paths.append(path)
+        if "/actions/runs/" in path and "/jobs" in path:
+            run_id = int(path.split("/actions/runs/")[1].split("/")[0])
+            jobs = self.jobs.get(run_id, [])
+            return {"total_count": len(jobs), "jobs": list(jobs)}
+        if "/actions/runners" in path:
+            if self.runners_fail:
+                raise RuntimeError("403 runners: Resource not accessible")
+            return {"total_count": len(self.runners), "runners": list(self.runners)}
         if "/actions/runs?" in path:
-            return {"workflow_runs": list(self.queued if "status=queued" in path
-                                          else self.live)}
+            runs = list(self.queued if "status=queued" in path else self.live)
+            return {"total_count": len(runs) + (1 if self.truncated else 0),
+                    "workflow_runs": runs}
         if "/actions/runs/" in path:
             return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
         if "/check-runs" in path:
             sha = path.split("/commits/")[1].split("/")[0]
             return {"check_runs": self.checks.get(sha, [])}
         raise AssertionError(path)
+
+
+class FauxHorloge:
+    """#845 : l'horloge du relevé, pour espacer les relevés de la garde sans
+    dormir (les bases de temps restent proches de l'horloge réelle, que
+    PostgreSQL garde pour `stuck_since`/`seen_at`)."""
+
+    def __init__(self, t: float | None = None):
+        self.t = time.time() if t is None else float(t)
+
+    def __call__(self) -> float:
+        return self.t
+
+    def avance(self, dt: float) -> None:
+        self.t += float(dt)
+
+
+def iso(t: float) -> str:
+    return datetime.fromtimestamp(float(t), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def runner_view(runner_id, name, *, busy=True, status="online"):
+    return {"id": runner_id, "name": name, "status": status, "busy": busy}
+
+
+def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None):
+    job = {"name": name, "status": status, "runner_name": runner}
+    if job_id is not None:
+        job["id"] = job_id
+    if created_at is not None:
+        job["created_at"] = created_at
+    return job
+
 
 
 def run_view(run_id, sha, branch, *, base="main", message=""):
@@ -254,7 +305,8 @@ def run_view(run_id, sha, branch, *, base="main", message=""):
 class WatcherTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        for table in ("ci_test_failures", "ci_runs"):
+        for table in ("ci_test_failures", "ci_runs", "ci_runner_state", "ci_queue_state",
+                      "ci_guard_scan", "ci_guard_run"):
             self.db.execute("DELETE FROM %s" % table)
         registry.upsert(self.db, "dev-a", harness="claude", host=self.cfg.host)
         registry.upsert(self.db, "dev-b", harness="claude", host=self.cfg.host)
@@ -563,6 +615,480 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([o["to"] for o in out], [None])
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 701)["work_item_id"], humain["id"])
+
+    # -- #845 : la garde de la CI (runners et file) --------------------------
+    def test_garde_runner_busy_sans_job(self):
+        """#845 : un runner busy sans job in_progress à son nom tient un job
+        fantôme ; l'épisode est daté, l'alerte ne se lève qu'après 15 min, et
+        se tait dès que le job revient ou que le runner disparaît."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1"),
+                            runner_view(22, "ameesh-ci-1-2", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.jobs[901] = [job_view("psycopg 1/4", runner="ameesh-ci-1-1")]
+        self.watcher.tick(self.db)
+        st = storage.of(self.db)
+        self.assertEqual(st.ci.stuck_runners(), [])
+        # le job disparaît : l'épisode s'ouvre au relevé suivant (espacé)
+        self.api.jobs[901] = []
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        (row,) = st.ci.stuck_runners()
+        self.assertEqual((row["repo"], row["name"], row["job"]), (DEPOT, "ameesh-ci-1-1", None))
+        # rien avant le seuil, l'alerte après (une par dépôt, non urgente)
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_runner_stuck"], [])
+        (alerte,) = [a for a in exploitation.alerts(
+            self.cfg, self.db,
+            now=float(row["since_ts"]) + exploitation.CI_RUNNER_STUCK_S + 1)
+            if a["type"] == "ci_runner_stuck"]
+        self.assertEqual(alerte["reason"], DEPOT)
+        self.assertIn("ameesh-ci-1-1", alerte["detail"])
+        self.assertIn("ci_runner_stuck", notify.DEFAULT_TYPES)
+        # le job revient : l'épisode se ferme
+        self.api.jobs[901] = [job_view("psycopg 1/4", runner="ameesh-ci-1-1")]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(st.ci.stuck_runners(), [])
+        # un runner retiré du dépôt ne laisse pas d'alerte derrière lui
+        self.api.jobs[901] = []
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(len(st.ci.stuck_runners()), 1)
+        self.api.runners = [runner_view(22, "ameesh-ci-1-2", busy=False)]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(st.ci.stuck_runners(), [])
+
+    def test_garde_file_saturee(self):
+        """#845 : le plus vieux job `queued` (toutes exécutions non conclues)
+        au-delà du SLO de 15 min lève `ci_queue_saturated` ; l'alerte dure tant
+        que la file reste longue, même quand le plus vieux job change (une
+        alerte par dépôt)."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.queued = [run_view(902, "a1" * 20, "main"), run_view(903, "a2" * 20, "main")]
+        self.api.queued[0].update({"status": "queued", "created_at": iso(horloge.t - 1000)})
+        self.api.queued[1].update({"status": "queued", "created_at": iso(horloge.t - 10)})
+        self.api.jobs[902] = [
+            job_view("psql 1/1", status="queued", job_id=9021,
+                     created_at=iso(horloge.t - 1000)),
+            job_view("psycopg 1/1", status="queued", job_id=9022,
+                     created_at=iso(horloge.t - 10))]
+        self.api.jobs[903] = [job_view("psql 1/1", status="queued", job_id=9031,
+                                       created_at=iso(horloge.t - 5))]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (3, 9021))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(alerte["reason"], DEPOT)
+        self.assertIn("15 min queue SLO", alerte["detail"])
+        cle = exploitation.alert_key(alerte)
+        # un autre plus vieux job : même cause, même clé (pas de renvoi)
+        self.api.queued = [run_view(904, "a3" * 20, "main")]
+        self.api.queued[0].update({"status": "queued", "created_at": iso(horloge.t - 2000)})
+        self.api.jobs = {904: [job_view("psql 1/1", status="queued", job_id=9041,
+                                        created_at=iso(horloge.t - 2000))]}
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(exploitation.alert_key(alerte), cle)
+        # file redevenue courte : plus d'alerte, relevé effacé
+        self.api.queued = []
+        self.api.jobs = {}
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_queue_saturated"], [])
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(int(row["queued"]), 0)
+        self.assertIsNone(row["oldest_ts"])
+        self.assertIn("ci_queue_saturated", notify.DEFAULT_TYPES)
+
+    def test_garde_file_compte_les_jobs_des_runs_en_cours(self):
+        """#845 : un run `in_progress` peut encore porter un job `queued` plus
+        ancien que les runs de la file ; la mesure le compte, sinon la file
+        paraîtrait vide alors qu'un job attend depuis plus du SLO."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1")]
+        self.api.live = [run_view(904, "b1" * 20, "main")]
+        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 60)})
+        self.api.jobs[904] = [
+            job_view("psql 1/1", runner="ameesh-ci-1-1", job_id=9041),
+            job_view("psql 2/2", status="queued", job_id=9042,
+                     created_at=iso(horloge.t - 1200))]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9042))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertIn("20 min", alerte["detail"])
+        # le job en cours tient son runner : pas de panne signalée à tort
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_runner_stuck"], [])
+
+    def test_garde_file_ne_vieillit_pas_une_reprise(self):
+        """#845 : une re-exécution garde le `created_at` de son run ; la date
+        qui compte est celle du job en file, sinon une reprise récente d'un run
+        ancien passerait pour une file de plusieurs heures."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        run = run_view(905, "c1" * 20, "main")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 10800)})
+        self.api.queued = [run]
+        self.api.jobs[905] = [job_view("psql 1/1", status="queued", job_id=9051,
+                                       created_at=iso(horloge.t - 30))]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9051))
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                          if a["type"] == "ci_queue_saturated"], [])
+
+    def test_garde_file_compte_un_job_ne_apres_une_annulation_de_part(self):
+        """#845 : une matrice `fail-fast` annule ses parts sans annuler
+        l'exécution ; le job né après cette annulation (ici l'agrégat `tests`)
+        attend réellement un runner et compte dans la file comme dans l'âge.
+        La garde ne déduit pas l'annulation de l'exécution de celle d'un job :
+        un orphelin d'exécution annulée a la même forme et se traite à la
+        source (`if: always() && !cancelled()`), pas par une inférence qui
+        masquerait une file réelle."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        run = run_view(910, "f1" * 20, "lot/3-z")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 1900)})
+        self.api.queued = [run]
+        part = job_view("psycopg 1/4", status="completed",
+                        created_at=iso(horloge.t - 1900))
+        part.update({"conclusion": "cancelled", "completed_at": iso(horloge.t - 1200)})
+        self.api.jobs[910] = [
+            part,
+            job_view("tests", status="queued", job_id=9101,
+                     created_at=iso(horloge.t - 1200)),
+        ]
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9101))
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertIn("20 min", alerte["detail"])
+
+    def test_garde_sautee_si_releve_tronque_ou_trop_large(self):
+        """#845 : un relevé incomplet ne conclut rien — l'épisode précédent
+        reste, il n'est ni défait ni renouvelé (file ET runners gardent leur
+        `seen_at`) — et l'alerte se tait quand le relevé n'est plus assez
+        frais."""
+        horloge = FauxHorloge()
+        logs = []
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1")]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.jobs[901] = []
+        self.watcher.tick(self.db)
+        (row,) = storage.of(self.db).ci.stuck_runners()
+        (file_avant,) = storage.of(self.db).ci.queued_oldest()
+        runner_avant = self.runner_seen_ts(21)
+        self.api.truncated = True
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertTrue(any("incomplete (truncated)" in line for line in logs), logs)
+        self.assertEqual(len(storage.of(self.db).ci.stuck_runners()), 1)
+        self.assertEqual(self.scan_state(), (False, "truncated", 2))
+        self.api.truncated = False
+        self.api.live = [run_view(900 + i, "%040d" % i, "main")
+                         for i in range(ci.GUARD_SCAN_MAX_RUNS + 1)]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertTrue(any("incomplete (too_many_runs)" in line for line in logs), logs)
+        self.assertEqual(self.scan_state()[1], "too_many_runs")
+        (file_apres,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(file_apres["seen_ts"], file_avant["seen_ts"],
+                         "un relevé incomplet a publié la file")
+        self.assertEqual(self.runner_seen_ts(21), runner_avant,
+                         "un relevé incomplet a rafraîchi les runners")
+        # le relevé est périmé : l'alerte ne se lève plus sur un état ancien
+        now = float(row["since_ts"]) + ci.GUARD_SCAN_S + exploitation.CI_GUARD_FRESH_S + 1
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=now)
+                          if a["type"] == "ci_runner_stuck"], [])
+
+    def scan_state(self, repo=DEPOT):
+        """#845 : le dernier relevé de la garde — `(complete, reason, calls)`."""
+        (row,) = self.db.query(
+            "SELECT complete, reason, calls FROM ci_guard_scan WHERE repo = %s", (repo,))
+        return (row["complete"], row["reason"], int(row["calls"]))
+
+    def runner_seen_ts(self, runner_id, repo=DEPOT):
+        """#845 : `seen_at` du dernier relevé pour un runner — témoin qu'un
+        relevé incomplet ne rafraîchit ni ne publie l'état des runners."""
+        (row,) = self.db.query(
+            "SELECT extract(epoch from seen_at)::float8 AS seen_ts"
+            "  FROM ci_runner_state WHERE repo = %s AND runner_id = %s",
+            (repo, int(runner_id)))
+        return row["seen_ts"]
+
+    @staticmethod
+    def est_appel_garde(path: str) -> bool:
+        """#845 : un appel de la garde (listes 100, jobs, runners).
+
+        La liste de suivi des échecs (`watch`, `per_page=50`) et les check
+        runs (`/commits/.../check-runs?per_page=100`) ne comptent pas dans le
+        budget de la garde."""
+        if "per_page=100" not in path:
+            return False
+        return ("/actions/runs?" in path or "/jobs" in path or "/actions/runners" in path)
+
+    def guard_calls(self) -> list[str]:
+        """#845 : les appels de la garde du faux API."""
+        return [p for p in self.api.paths if self.est_appel_garde(p)]
+
+    def test_garde_fenetre_persistee_avant_le_premier_appel(self):
+        """#845 (revue N/P2 2328) : la fenêtre est écrite dans la base AVANT le
+        premier appel HTTP de la garde, et elle est tenue entre deux relevés —
+        un second `notify --once` sur le même dépôt n'appelle pas la garde et
+        ne publie rien avant l'expiration."""
+        horloge = FauxHorloge()
+        logs = []
+        vu: list[bool] = []
+        reel = self.api
+
+        def api_qui_verifie(path):
+            if self.est_appel_garde(path) and not vu:
+                vu.append(bool(self.db.query(
+                    "SELECT 1 FROM ci_guard_scan WHERE repo = %s", (DEPOT,))))
+            return reel(path)
+
+        premier = ci.Watcher(self.cfg_ci, api=api_qui_verifie, clock=horloge,
+                             log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.jobs[901] = []
+        premier.tick(self.db)
+        self.assertEqual(vu, [True], "fenêtre absente avant le premier appel HTTP")
+        self.assertEqual(self.scan_state(), (True, None, 4))
+        second = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.paths.clear()
+        second.tick(self.db)
+        self.assertEqual(self.guard_calls(), [], "le second relevé a appelé la garde")
+        self.assertTrue(any("window held" in line for line in logs), logs)
+        # la fenêtre expirée, le relevé reprend
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.api.paths.clear()
+        second.tick(self.db)
+        self.assertEqual(len(self.guard_calls()), 4)
+        self.assertEqual(self.scan_state()[0], True)
+
+    def test_garde_budget_ne_publie_pas_un_releve_partiel(self):
+        """#845 (revue N/P2 2328 ; arbitrage A) : un relevé qui ne peut pas
+        couvrir toutes les exécutions dans le budget d'appels s'arrête, ne
+        publie RIEN (l'état précédent n'est ni défait ni rafraîchi : file ET
+        runners gardent leur `seen_at`) et date son incomplétude. Avec 63
+        appels pour 60 exécutions, le budget est un garde-fou de dernier
+        recours : le témoin abaisse le plafond dans une portée `mock` (11
+        exécutions, sous les 60 admises) pour l'exercer."""
+        horloge = FauxHorloge()
+        logs = []
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 2000)})
+        self.api.jobs[901] = [job_view("psql 1/1", status="queued", job_id=9011,
+                                       created_at=iso(horloge.t - 2000))]
+        self.watcher.tick(self.db)
+        (avant,) = storage.of(self.db).ci.queued_oldest()
+        runner_avant = self.runner_seen_ts(21)
+        self.assertTrue([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                         if a["type"] == "ci_queue_saturated"],
+                        "la file en attente doit alerter avant le relevé partiel")
+        # 11 exécutions `in_progress` sous un plafond de 12 appels : la
+        # onzième est refusée (2 listes + 10 jobs = 12 appels) ; un relevé
+        # partiel publié effacerait l'alerte à tort.
+        self.api.live = [run_view(910 + i, "%040d" % i, "main") for i in range(11)]
+        for i in range(11):
+            self.api.live[i].update({"status": "in_progress", "created_at": iso(horloge.t)})
+            self.api.jobs[910 + i] = [job_view("psql 1/1", runner="ameesh-ci-1-1",
+                                               job_id=9100 + i)]
+        self.api.jobs.pop(901)
+        horloge.avance(ci.GUARD_SCAN_S)
+        with mock.patch.object(ci, "GUARD_SCAN_MAX_CALLS", 12):
+            self.watcher.tick(self.db)
+        self.assertEqual(self.scan_state(), (False, "budget", 12))
+        self.assertTrue(any("incomplete (budget)" in line for line in logs), logs)
+        (apres,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(apres["seen_ts"], avant["seen_ts"],
+                         "un relevé partiel a publié la file")
+        self.assertEqual(self.runner_seen_ts(21), runner_avant,
+                         "un relevé partiel a rafraîchi les runners")
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 1)
+        borne = float(avant["seen_ts"]) + exploitation.CI_GUARD_FRESH_S
+        self.assertEqual(len([a for a in exploitation.alerts(self.cfg, self.db, now=borne)
+                              if a["type"] == "ci_queue_saturated"]), 1,
+                         "à la borne de fraîcheur, l'état complet précédent fonde encore")
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=borne + 1)
+                          if a["type"] == "ci_queue_saturated"], [])
+
+    def test_garde_60_executions_releve_complet_en_63_appels(self):
+        """#845 (arbitrage A) : le plafond de couverture (60 exécutions non
+        conclues) coûte exactement le budget (63 appels = 2 listes + 60 jobs +
+        1 runners) et publie un relevé complet."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(910 + i, "%040d" % i, "main")
+                         for i in range(ci.GUARD_SCAN_MAX_RUNS)]
+        for i in range(ci.GUARD_SCAN_MAX_RUNS):
+            self.api.jobs[910 + i] = []
+        self.watcher.tick(self.db)
+        attendu = 2 + ci.GUARD_SCAN_MAX_RUNS + 1
+        self.assertEqual(attendu, ci.GUARD_SCAN_MAX_CALLS,
+                         "le budget ne couvre plus le plafond de couverture")
+        self.assertEqual(len(self.guard_calls()), attendu, self.guard_calls())
+        self.assertEqual(self.scan_state(), (True, None, attendu))
+
+    def test_garde_61_executions_releve_incomplet_sans_publication(self):
+        """#845 (arbitrage A) : une exécution de plus que le plafond (61 > 60)
+        arrête le relevé avant tout appel de jobs (`too_many_runs`), ne publie
+        RIEN (file ET runners gardent leur `seen_at`), et l'état complet
+        précédent fonde encore ses alertes à la borne de fraîcheur (1800 s),
+        plus au-delà."""
+        horloge = FauxHorloge()
+        logs = []
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 2000)})
+        self.api.jobs[901] = [job_view("psql 1/1", status="queued", job_id=9011,
+                                       created_at=iso(horloge.t - 2000))]
+        self.watcher.tick(self.db)
+        (file_avant,) = storage.of(self.db).ci.queued_oldest()
+        runner_avant = self.runner_seen_ts(21)
+        # 61 exécutions non conclues : une de plus que le plafond de couverture
+        self.api.live = [run_view(910 + i, "%040d" % i, "main")
+                         for i in range(ci.GUARD_SCAN_MAX_RUNS + 1)]
+        self.api.jobs.pop(901)
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertTrue(any("incomplete (too_many_runs)" in line for line in logs), logs)
+        self.assertEqual(self.scan_state(), (False, "too_many_runs", 2))
+        (file_apres,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(file_apres["seen_ts"], file_avant["seen_ts"],
+                         "un relevé incomplet a publié la file")
+        self.assertEqual(self.runner_seen_ts(21), runner_avant,
+                         "un relevé incomplet a rafraîchi les runners")
+        borne = float(file_avant["seen_ts"]) + exploitation.CI_GUARD_FRESH_S
+        self.assertEqual(len([a for a in exploitation.alerts(self.cfg, self.db, now=borne)
+                              if a["type"] == "ci_queue_saturated"]), 1,
+                         "à 1800 s, l'état complet précédent fonde encore l'alerte")
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=borne + 1)
+                          if a["type"] == "ci_queue_saturated"], [])
+
+    def test_garde_relit_une_execution_queued_dont_un_job_demarre(self):
+        """#845 (R1 finale cx3, B1) : un run reste `queued` tant qu'un de ses
+        jobs attend, même quand un autre job tourne (mesure fondatrice #828) —
+        le relevé suivant ne peut donc PAS réutiliser l'instantané : le job
+        passé `in_progress` et le job neuf resté en file sont relus, pas servis
+        par le cache."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        run = run_view(906, "a6" * 20, "main")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 1000)})
+        self.api.queued = [run]
+        self.api.jobs[906] = [job_view("psql 1/1", status="queued", job_id=9061,
+                                       created_at=iso(horloge.t - 1000))]
+        self.watcher.tick(self.db)
+        self.assertEqual(len(self.guard_calls()), 4)
+        # le job 9061 démarre alors que le run reste `queued` (9062 attend) :
+        # l'instantané du premier relevé est périmé.
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.api.paths.clear()
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1")]
+        self.api.jobs[906] = [
+            job_view("psql 1/1", runner="ameesh-ci-1-1", job_id=9061),
+            job_view("psycopg 1/1", status="queued", job_id=9062,
+                     created_at=iso(horloge.t - 10)),
+        ]
+        self.watcher.tick(self.db)
+        st = storage.of(self.db)
+        (row,) = st.ci.queued_oldest()
+        # un seul constat : le relevé doit relire (4 appels), la file ne doit
+        # garder que 9062, et le runner qui tient 9061 ne doit pas être « stuck ».
+        self.assertEqual(
+            (len(self.guard_calls()), int(row["queued"]), int(row["oldest_id"]),
+             [r["name"] for r in st.ci.stuck_runners()]),
+            (4, 1, 9062, []), self.guard_calls())
+
+    def test_garde_fenetre_atomique_entre_connexions(self):
+        """#845 (revue N/P2 2328) : la revendication de fenêtre est atomique —
+        quatre connexions qui la demandent ensemble n'en gagnent qu'une."""
+        import threading
+        now = time.time()
+        dbs = [self.db] + [db_mod.connect(self.cfg) for _ in range(3)]
+        for extra in dbs[1:]:
+            self.addCleanup(extra.close)
+        resultats: list[bool] = []
+        barriere = threading.Barrier(len(dbs))
+        verrou = threading.Lock()
+
+        def revendique(db):
+            st = storage.of(db)
+            barriere.wait(timeout=30)
+            gagne = bool(st.ci.claim_guard_scan(DEPOT, now=now, window_s=ci.GUARD_SCAN_S))
+            with verrou:
+                resultats.append(gagne)
+
+        threads = [threading.Thread(target=revendique, args=(db,)) for db in dbs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(sorted(resultats), [False, False, False, True])
+
+    def test_garde_ne_casse_pas_le_releve(self):
+        """#845 : une erreur de la garde (jeton sans droit runners, GitHub) est
+        journalisée et n'empêche ni les échecs, ni les verdicts."""
+        logs = []
+        self.api.runners_fail = True
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=FauxHorloge(),
+                                  log=logs.append)
+        sha = "c" * 40
+        self.api.live = [run_view(201, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=201)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("failures", "dev-a")])
+        self.assertTrue(any("guard failed" in line for line in logs), logs)
+        self.assertEqual(storage.of(self.db).ci.stuck_runners(), [])
+
+    def test_garde_erreur_ne_publie_rien(self):
+        """#845 (arbitrage A) : une erreur du relevé (jeton sans droit runners,
+        GitHub) ne publie RIEN — file ET runners gardent leur `seen_at` — et
+        l'incomplétude est datée (`failed`)."""
+        horloge = FauxHorloge()
+        logs = []
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 2000)})
+        self.api.jobs[901] = [job_view("psql 1/1", status="queued", job_id=9011,
+                                       created_at=iso(horloge.t - 2000))]
+        self.watcher.tick(self.db)
+        (file_avant,) = storage.of(self.db).ci.queued_oldest()
+        runner_avant = self.runner_seen_ts(21)
+        self.api.runners_fail = True
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertTrue(any("guard failed" in line for line in logs), logs)
+        # 2 listes + 1 jobs + l'appel runners qui échoue (compté, puis levé)
+        self.assertEqual(self.scan_state(), (False, "failed", 4))
+        (file_apres,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(file_apres["seen_ts"], file_avant["seen_ts"],
+                         "une erreur du relevé a publié la file")
+        self.assertEqual(self.runner_seen_ts(21), runner_avant,
+                         "une erreur du relevé a rafraîchi les runners")
 
 
 if __name__ == "__main__":
