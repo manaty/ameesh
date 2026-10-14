@@ -1,0 +1,97 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index de733120e..6dff73894 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -212,18 +212,29 @@ jobs:
+           python-version: "3.12"
+           cache: pip
+           cache-dependency-path: pyproject.toml
+-      # environnement Python en cache : la clé suit pyproject.toml et le type de
+-      # runner (un venv de runner hébergé pointe vers /opt/hostedtoolcache)
++      # environnement Python en cache : la clé suit pyproject.toml et le runner
++      # qui l'a construit (#932 — un venv de runner auto-hébergé porte un lien
++      # absolu vers /home/runner/r<X>/_work/_tool/Python/... : la clé par
++      # `runner.name` empêche un runner de restaurer le venv d'un autre ; les
++      # runners hébergés, au cache commun /opt/hostedtoolcache, gardent le leur).
+       - id: venv
+         uses: actions/cache@v4
+         with:
+           path: .venv-ci
+-          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
++          key: venv-${{ runner.os }}-${{ runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
++      # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
++      # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
++      # importer ses dépendances, sinon il est reconstruit (#932).
+       - name: dépendances (pilote psycopg)
+-        if: steps.venv.outputs.cache-hit != 'true'
+         run: |
+-          python -m venv .venv-ci
+-          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
++          if [ "${{ steps.venv.outputs.cache-hit }}" = "true" ] \
++             && .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
++            echo "venv restauré du cache : valide"
++          else
++            rm -rf .venv-ci
++            python -m venv .venv-ci
++            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
++          fi
+       - &base
+         name: base jetable (sans fsync) et client psql
+         run: |
+diff --git a/tests/test_l932_ci_venv_cache.py b/tests/test_l932_ci_venv_cache.py
+new file mode 100644
+index 000000000..4bb84e4d4
+--- /dev/null
++++ b/tests/test_l932_ci_venv_cache.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#932 : le cache du venv de CI est par runner, et un venv restauré est vérifié
++avant de servir.
++
++Sans base : lecture du workflow `.github/workflows/tests.yml`. Le venv `.venv-ci`
++d'un runner auto-hébergé contient un lien absolu vers le Python de ce runner
++(`/home/runner/r<X>/_work/_tool/Python/...`) : restauré par un autre runner, il
++sort en exit 127 (run de la PR #618, part psycopg 1/4, 50 s). Deux gardes : clé
++de cache par `runner.name`, et contrôle du venv restauré (import des
++dépendances) qui le reconstruit s'il est inutilisable.
++"""
++from __future__ import annotations
++
++import pathlib
++import re
++import unittest
++
++REPO = pathlib.Path(__file__).resolve().parent.parent
++WORKFLOW = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
++
++
++class VenvCacheTest(unittest.TestCase):
++
++    def test_cle_de_cache_par_runner(self):
++        m = re.search(r"key:\s*venv-([^\n]+)", WORKFLOW)
++        self.assertIsNotNone(m, "clé de cache du venv introuvable")
++        key = m.group(1)
++        self.assertIn("runner.name", key)
++        self.assertNotIn("runner.environment", key)
++        self.assertIn("hashFiles('pyproject.toml')", key)
++        self.assertIn("steps.py.outputs.python-version", key)
++
++    def test_venv_restaure_verifie_avant_usage(self):
++        # le pas « dépendances » n'est plus sauté sur un cache-hit : il valide
++        # le venv restauré (import des dépendances) et le reconstruit sinon.
++        self.assertNotIn("if: steps.venv.outputs.cache-hit != 'true'", WORKFLOW)
++        m = re.search(r"name: dépendances \(pilote psycopg\)\n(.*?)\n      - &base",
++                      WORKFLOW, re.S)
++        self.assertIsNotNone(m, "pas « dépendances » introuvable")
++        body = m.group(1)
++        self.assertIn("cache-hit", body)
++        self.assertIn("import psycopg, cryptography, psutil", body)
++        self.assertIn("rm -rf .venv-ci", body)
++        self.assertIn("python -m venv .venv-ci", body)
++
++    def test_part_utilise_le_venv(self):
++        self.assertIn(".venv-ci/bin/python scripts/test-parts.py run", WORKFLOW)
++
++
++if __name__ == "__main__":
++    unittest.main()

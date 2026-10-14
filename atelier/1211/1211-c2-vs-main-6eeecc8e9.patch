@@ -1,0 +1,1373 @@
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 210dcf30f..517f0ac5a 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -6,25 +6,45 @@
+ # L116 — la suite est découpée en parts parallèles par scripts/test-parts.py
+ # (par module, équilibré par tests/parts/durees.json), chaque part avec son
+ # propre Postgres :
+-#   - psycopg : la suite complète, en 4 parts, sur chaque PR et chaque push ;
+-#   - psql    : sur une PR, seulement les modules « pilote »
+-#               (tests/parts/pilote-psql.txt), en 3 parts (#947 : huit jobs se
+-#               partagent chaque hôte auto-hébergé, une part unique de ~24 min
+-#               au repos atteignait le plafond de 30 min sous saturation) ;
+-#               la suite complète, en 6 parts, sur push vers main ou
+-#               release/*, et à la main (workflow_dispatch).
++#   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
++#               en une à quatre parts selon l'estimation ; la suite complète,
++#               en 4 parts, sur push vers main, integration/** ou release/**,
++#               et sur une PR de release (source ou cible release/** ou
++#               integration/**) ;
++#   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
++#               et le contrat, plus la liste « always » déclenchée (#749), en
++#               une à trois parts (#947 : huit jobs se partagent chaque hôte
++#               auto-hébergé, une part unique de ~24 min au repos atteignait le
++#               plafond de 30 min sous saturation) ; la suite complète, en
++#               6 parts, sur push vers main, integration/** ou release/**, sur
++#               une PR de release (sans liste pilote) et à la main
++#               (workflow_dispatch).
+ # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+ #
+-# L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
+-# seule ligne `version = "…"`) ne relance pas la suite : `main` l'a déjà
+-# validée pour ce contenu. Le job « changements » le détecte
++# L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
++# toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
++# migrations, objets globaux du cluster), avec repli sur la suite complète
++# quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
++# La suite complète tourne sur main, release/** et la branche d'intégration du
++# paquet (§12) : une PR de lot n'en déclenche plus, mais une PR de release
++# (source ou cible release/** ou integration/**), comme un push sur ces
++# branches, garde la suite complète, les deux pilotes, sans voie version/doc
++# ni liste pilote psql — y compris dans le plan de repli. Les règles de
++# refusion (a : delta de main disjoint, b : migrations seules) viendront
++# ensuite.
++#
++# L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
++# seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
++# déjà validée pour ce contenu. Le job « changements » le détecte
+ # (scripts/version-only.py) ; les parts sont alors sautées et « tests » reste
+-# vert. Au moindre doute, la suite tourne ; jamais sur un push ni à la main.
++# vert. Au moindre doute, la suite tourne ; jamais sur un push, à la main, ni
++# sur une PR de release.
+ #
+-# L161a — même chose pour une PR de documentation seule (docs/, site/, *.md
+-# hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
++# L161a — même chose pour une PR de lot de documentation seule (docs/, site/,
++# *.md hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
+ # (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
+-# doc ». Une exécution de main en cours n'est jamais annulée par la suivante.
++# doc » ; une PR de release garde la suite complète. Une exécution de main en
++# cours n'est jamais annulée par la suivante.
+ # #824 — décision owner signée #17605 du 13/10/2026 : un seul run de main
+ # reste en attente ; une fusion plus récente remplace ce run en attente et
+ # valide aussi les fusions intermédiaires qu'elle contient.
+@@ -38,7 +58,8 @@
+ # (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flow.py).
+ # Les modules de test touchés par les fichiers changés (--since HEAD^1 : la
+ # cible pour une PR, le commit précédent sur main) passent en premier dans
+-# chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
++# chaque part. Rien n'est sauté sur main ; sur une branche de lot, le plan
++# décide (L1211).
+ #
+ # L161f — the `plan` job reads the measured map (cache `carte-<sha>`, written
+ # by .github/workflows/carte.yml) once for the whole run and writes plan.json
+@@ -46,12 +67,15 @@
+ # impacted by changed blocks, files or tables, P2 recent failure, P3 the
+ # rest), the parts and their modules. Every part runs from that same plan
+ # (`--plan`), impacted first; the matrices come from the plan (fromJSON), and
+-# a driver with no part is skipped. Phase 1: nothing is skipped beyond the
+-# version-only and documentation-only cases above. Map missing, stale or
+-# unusable: the L161b order, full suite. The `bilan` job (never required)
+-# counts the leaks (failures of modules the map did not select) and the
+-# provisional green (P0 and P1 green in every part), kept as the `leaks`
+-# artifact for the two-week review (L161i).
++# a driver with no part is skipped. On a lot branch (L1211), only the impacted
++# modules and the contract list run; the rest of the suite runs on main,
++# release/** and the package integration branch, and any doubt (no map, stale
++# or unsure selection, changed lines without a test, test infrastructure)
++# falls back to the full suite. Map missing, stale or unusable: the L161b
++# order, full suite. The `bilan` job (never required) counts the leaks
++# (failures of modules the map did not select) and the provisional green (P0
++# and P1 green in every part), kept as the `leaks` artifact for the two-week
++# review (L161i).
+ #
+ # L161c — pendant la part, `ci-flow.py publish` (arrière-plan) tient le check
+ # run « tests (flux) <part> » de la tête poussée : chaque échec y entre dès
+@@ -62,7 +86,7 @@ name: tests
+ 
+ on:
+   push:
+-    branches: [main, "release/**"]
++    branches: [main, "release/**", "integration/**"]
+   pull_request:
+   workflow_dispatch:
+ 
+@@ -92,7 +116,8 @@ env:
+ # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
+ jobs:
+   # L157, L161a, L161f : nature of the change (version or documentation only,
+-  # merge commit against its target) and the plan of the run, from the map
++  # lot PR only; merge commit against its target), the branch context
++  # (release PRs keep the full suite) and the plan of the run, from the map
+   plan:
+     name: plan
+     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+@@ -128,10 +153,17 @@ jobs:
+           restore-keys: carte-
+       - id: plan
+         name: plan of the run
++        # #1237 (N1 of #1211): a branch name travels through the environment,
++        # never interpolated into the script — the merge gate does not run a
++        # `$(…)` written in a ref.
++        env:
++          BASE_REF: ${{ github.base_ref }}
++          HEAD_REF: ${{ github.head_ref }}
+         run: |
+           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
+             --event "${{ github.event_name }}" \
+             --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
++            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
+             --github-output "$GITHUB_OUTPUT" \
+             --summary "$GITHUB_STEP_SUMMARY" --annotations
+       - uses: actions/upload-artifact@v4
+@@ -185,18 +217,29 @@ jobs:
+           python-version: "3.12"
+           cache: pip
+           cache-dependency-path: pyproject.toml
+-      # environnement Python en cache : la clé suit pyproject.toml et le type de
+-      # runner (un venv de runner hébergé pointe vers /opt/hostedtoolcache)
++      # environnement Python en cache : la clé suit pyproject.toml et le runner
++      # qui l'a construit (#932 — un venv de runner auto-hébergé porte un lien
++      # absolu vers /home/runner/r<X>/_work/_tool/Python/... : la clé par
++      # `runner.name` empêche un runner de restaurer le venv d'un autre ; les
++      # runners hébergés, au cache commun /opt/hostedtoolcache, gardent le leur).
+       - id: venv
+         uses: actions/cache@v4
+         with:
+           path: .venv-ci
+-          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
++          key: venv-${{ runner.os }}-${{ runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
++      # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
++      # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
++      # importer ses dépendances, sinon il est reconstruit (#932).
+       - name: dépendances (pilote psycopg)
+-        if: steps.venv.outputs.cache-hit != 'true'
+         run: |
+-          python -m venv .venv-ci
+-          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
++          if [ "${{ steps.venv.outputs.cache-hit }}" = "true" ] \
++             && .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
++            echo "venv restauré du cache : valide"
++          else
++            rm -rf .venv-ci
++            python -m venv .venv-ci
++            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
++          fi
+       - &base
+         name: base jetable (sans fsync) et client psql
+         run: |
+@@ -267,9 +310,12 @@ jobs:
+     strategy:
+       fail-fast: false
+       matrix:
+-        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt),
+-        # en 3 parts (scripts/test-plan.py, PARTS) : sous saturation, une part
+-        # unique atteignait le plafond de 30 min (#947)
++        # sur une PR de lot (L1211) : les modules « pilote » parmi les
++        # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
++        # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
++        # lot_part_count), trois au plus (#947 : sous saturation, une part
++        # unique atteignait le plafond de 30 min) ; suite complète en 6 parts
++        # sur push et sur une PR de release (sans liste pilote).
+         part: ${{ fromJSON(needs.plan.outputs.psql) }}
+     services:
+       postgres:
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index a36f47adf..34d7797af 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -14,17 +14,27 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion
+   `docs/design/decisions/0018-vitesse-des-agents.md`.
+ - **Tests** : la suite tourne sur un vrai Postgres avec les deux pilotes ;
+   `scripts/test.sh` en local (ou `scripts/test-parallele.sh -n 4`, en parts
+-  parallèles), l'intégration continue sur chaque PR : psycopg complet et psql
+-  sur les modules de `tests/parts/pilote-psql.txt`, en 3 parts pour rester sous
+-  le plafond de 30 min des hôtes auto-hébergés mutualisés (#947) ; le psql
+-  complet tourne sur `main` et `release/*`. Un module de test qui touche la
+-  couche base ou un comportement propre à un pilote s'ajoute à cette liste. Une PR qui ne change
++  parallèles), l'intégration continue sur chaque PR : les tests impactés et le
++  contrat (`tests/parts/toujours.txt` : droits, rôles, migrations), en une à
++  quatre parts psycopg et une à trois parts psql pour rester sous les plafonds
++  des hôtes auto-hébergés mutualisés (#947, L1211) ; la suite complète tourne
++  sur `main`, `release/*` et `integration/*`, et remplace la sélection dès
++  qu'elle ne peut pas décider. Une **PR de release** — source ou cible sous
++  `release/*` ou `integration/*` — garde la suite complète, les deux pilotes,
++  sans voie version seule ni documentation seule ni liste pilote psql, y
++  compris dans le plan de repli (canon §3) ; le plan reçoit pour cela les
++  branches source et cible (`--base-ref`, `--head-ref`). Un module de test qui
++  touche la couche base ou un comportement propre à un pilote s'ajoute à
++  `tests/parts/pilote-psql.txt` ;
++  un test de contrat (droits, rôles, migrations, objet global du cluster)
++  s'ajoute à `tests/parts/toujours.txt`. Une PR de lot qui ne change
+   **que le numéro de version** (`pyproject.toml` seul, la seule ligne
+   `version = "…"`) ne relance pas la suite : `main` l'a déjà validée pour ce
+   contenu ; le contrôle « tests » reste vert (`scripts/version-only.py`, L157).
+ - **PR de documentation seule** (L161a) : si chaque fichier changé est sous
+   `docs/` ou `site/`, ou un `*.md` hors de `src/`, `tests/`, `.github/` et
+-  `examples/`, la CI ne passe que les tests qui lisent la documentation,
++  `examples/`, la CI d'une PR de lot ne passe que les tests qui lisent la
++  documentation,
+   sans base (« lecteurs de la doc », moins d'une minute). Un test qui ouvre
+   un fichier de `docs/` ou `site/` se déclare dans
+   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
+diff --git a/README.md b/README.md
+index 4b8680f3b..37767562e 100644
+--- a/README.md
++++ b/README.md
+@@ -364,19 +364,27 @@ scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwawa
+ ```
+ 
+ CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
+-on the measured durations of `tests/parts/durees.json`): on a pull request,
+-`psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
+-`tests/parts/pilote-psql.txt`, in 3 parts so that each one stays under the
+-30-minute job cap on the shared self-hosted hosts (#947); the full `psql` suite
+-(6 parts) runs on pushes to `main` and `release/*`. The `tests` job aggregates
+-the parts. Each part streams its results, one JSON line per test (`--flow`, schema
++on the measured durations of `tests/parts/durees.json`): on a lot pull request,
++`psycopg` runs the impacted modules and the contract list
++(`tests/parts/toujours.txt`, L1211) in one to four parts, and `psql` the driver
++modules of `tests/parts/pilote-psql.txt` among them, in one to three parts so
++that each one stays under the job cap on the shared self-hosted hosts (#947);
++the full suite (4 `psycopg` parts, 6 `psql` parts) runs on pushes to `main`,
++`release/*` and `integration/*` (§12), and on any pull request whose source or
++target is one of those branches (a release PR keeps the full suite under both
++drivers, without the version/documentation fast lanes or the psql pilot list).
++The `tests` job aggregates the parts.
++Each part streams its results, one JSON line per test (`--flow`, schema
+ `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
+ the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
+ test → code map once per run (`scripts/test-plan.py`, L161f) and every part
+-runs from that plan: the test modules impacted by the change (changed code
+-blocks, data files, directories, tables) run first, nothing is skipped; map
+-missing or stale, the order falls back to the modules whose text names a
+-changed file.
++runs from that plan: on `main`, the test modules impacted by the change
++(changed code blocks, data files, directories, tables) run first, nothing is
++skipped; on a lot branch, only the impacted modules and the contract run, and
++any doubt (map missing or stale, an unsure selection, a changed block without a
++test, test infrastructure, a file removed outside documentation) falls back to
++the full suite. The workflow passes the source and target branches
++(`--base-ref`, `--head-ref`) so the plan can tell a lot PR from a release one.
+ 
+ 158 tests against the local container, run twice (`psql`, then `psycopg` with
+ `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index ee349bdcc..483da1cdc 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -5502,7 +5502,8 @@ nomme un fichier changé (module `ameesh.x`, chemin, ou nom de fichier unique
+ dans le dépôt) (P1), les plus courts d'abord ; le reste suit dans l'ordre
+ alphabétique. Les fichiers changés sont ceux du commit testé face à son
+ premier parent (`--since HEAD^1`) : la cible pour une PR, le commit précédent
+-sur main. Rien n'est sauté et le découpage en parts ne change pas. En local :
++sur main. Dans ce mode, rien n'est sauté et le découpage en parts ne change
++pas. En local :
+ 
+ ```
+ python scripts/test-parts.py run --parts 4 --part 1 --driver psycopg \
+@@ -5511,7 +5512,13 @@ python scripts/ci-flow.py summary /tmp/flux.jsonl
+ ```
+ 
+ C'est une heuristique textuelle ; la carte mesurée du lien test → code
+-(L161e) la remplacera.
++(L161e) la remplacera. Sur une PR de lot, le plan (L161f) ne retient en plus
++que les modules impactés et le contrat (L1211) : `--since` ne décide plus de
++ce qui tourne, seulement le plan. Une PR dont la source ou la cible est sous
++`release/**` ou `integration/**` est une PR de release : elle garde la suite
++complète, les deux pilotes, sans voie version seule ni documentation seule ni
++liste pilote psql — le workflow transmet les branches (`--base-ref`,
++`--head-ref`), et le plan de repli suit la même règle.
+ 
+ ## Échecs de CI au courrier de l'agent du lot (L161c)
+ 
+@@ -5694,13 +5701,27 @@ touched a table, or it is unknown to the map).
+   `truncate`), whose tables are
+   unknown, or an existing migration rewritten, impacts every database test.
+ 
+-**Phase 1: nothing is skipped on code.** The selection only orders the
+-suite. The fallback stays the full suite (and stays the rule on `main`): any
+-doubt means "run everything", and the plan says why it is unsure:
++**Lot branches: impacted + contract (L1211, canon §3).** On a lot pull request
++— neither its source nor its target under `release/**` or the package
++integration branch — only the impacted modules (P0, P1) and the contract list
++(`tests/parts/toujours.txt`: droits, rôles, migrations, objets globaux du
++cluster) run; the full suite runs on `main`, `release/**` and the package
++integration branch (§12).
++
++**Release pull requests keep the full suite (canon §3).** A pull request whose
++source or target is `release/**` or the integration branch runs the full suite
++under both drivers, like the push to those branches, whatever the map says: no
++version-only or documentation-only fast lane (they are lot-PR lanes), no psql
++pilot list, and the same rule in the fallback plan. The workflow passes the
++branch context (`--base-ref`, `--head-ref`; L1211); the plan records it under
++`refs` and `release`.
++
++Any doubt means "run everything" on a lot branch, and the plan says
++why it is unsure:
+ 
+ * map missing, unreadable, older than 48 h, or its commit not an ancestor of
+   HEAD: the L161b order (modules whose text names a changed file since
+-  `HEAD^1`);
++  `HEAD^1`); the plan then also runs the full suite on a lot branch;
+ * the diff is taken **from the map commit**, not from the merge base:
+   whatever changed on main since the map counts as changed, so the selection
+   widens, never narrows;
+@@ -5709,13 +5730,29 @@ doubt means "run everything", and the plan says why it is unsure:
+   L161b heuristic for that file and marks the plan unsure; test
+   infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+   `.github/`, `pyproject.toml` beyond its version line) too;
++* a file **removed** outside documentation: the map knows the readers it
++  measured, never the ones it cannot see (an import by a computed name, a
++  config read by the code, a template); `--no-renames` makes a rename a
++  removal plus an addition, so a rename is a doubt too;
++* the selection is not safe: map older than 24 h, a new block unknown to the
++  map, a changed line without a test, test infrastructure, a file removed
++  outside documentation (the plan's `phase2_safe`, whose reason is in the
++  summary);
++* the contract list is empty or unreadable: nothing would guarantee the
++  rights, roles and migrations tests;
+ * `scripts/test-plan.py` never fails the run on a bad map: any error gives a
+   fallback plan (full suite, L116 split).
+ 
+-The plan also records whether a phase 2 selection ("impacted only on pull
+-requests", decided by the owner at the L161i review) would have been safe:
+-selection sure, map younger than 24 h, no new block unknown to the map, no
+-test infrastructure changed, no changed lines without a test. It is recorded, never applied.
++A **configuration** file follows its measured readers, like any data file: a
++change there runs the tests the map saw read it. Only the configuration the
++tests themselves run under — `pyproject.toml` beyond its version line and
++`.github/**` — forces the full suite (test infrastructure).
++
++On `main`, every module still runs: P0, then P1, then P2, then P3. The plan
++also records whether an impacted-only selection was safe (the `phase2_safe`
++criterion above): the owner decided it at the review of lot #1211, and it is
++applied since, with the full suite kept on `main`, `release/**`, the package
++integration branch and every release pull request.
+ 
+ **Changed lines without a test.** An existing block that changed and that no
+ test executes is listed in the `plan` job summary and annotated on the PR
+diff --git a/docs/design/etudes/l161-tests-par-impact.md b/docs/design/etudes/l161-tests-par-impact.md
+index 26188ba80..db919a904 100644
+--- a/docs/design/etudes/l161-tests-par-impact.md
++++ b/docs/design/etudes/l161-tests-par-impact.md
+@@ -358,10 +358,11 @@ They are triggered as soon as a migration, `db.py` or `deploy/sql` changes.
+ | Event | Change | What runs |
+ |---|---|---|
+ | push to main, `release/**`, tag, manual | everything | full suite, both drivers, impacted first; **never skipped, never cancelled** by the next push |
+-| PR | documentation only: files under `docs/`, `site/`, `examples/` or `*.md` outside the package | only the tests that read these files: declared until the map exists (`test_l33_chatbot` for `docs/design` and `site/docs`, `test_canon` for `examples/canon`), measured afterwards; under a minute |
+-| PR | version only: only the `version =` line of `pyproject.toml` | `test_version` and package build (`pip wheel . --no-deps`), under a minute |
++| PR | documentation only, lot branch: files under `docs/`, `site/`, `examples/` or `*.md` outside the package | only the tests that read these files: declared until the map exists (`test_l33_chatbot` for `docs/design` and `site/docs`, `test_canon` for `examples/canon`), measured afterwards; under a minute |
++| PR | version only, lot branch: only the `version =` line of `pyproject.toml` | `test_version` and package build (`pip wheel . --no-deps`), under a minute |
+ | PR | test foundation or CI (`tests/support.py`, `tests/fakebin/`, `scripts/test-parts.py`, `.github/`, `pyproject.toml` dependencies), file unknown to the map, stale map | everything, impacted first |
+-| PR | code, general case | **phase 1**: impacted first, then the rest; **phase 2**, if the review justifies it: impacted only on PRs, the rest on main |
++| PR, source or target `release/**` or the integration branch | any change (release PR) | full suite, both drivers, no version/documentation lane and no psql pilot list — including in the fallback plan (canon §3) |
++| PR, lot branch | code, general case | **phase 1**: impacted first, then the rest; **phase 2**: impacted only on lot PRs, the rest on main — **applied since 14/10/2026** (owner decision, canon §3, lot #1211: impacted plus the contract list, full suite on main, `release/**` and the package integration branch, and on release PRs) |
+ 
+ **Nexlink.** There, the push to `agent/**` stands in for the PR, and
+ `develop` for main. Proposed exception, for the owner to decide: on the
+@@ -383,6 +384,24 @@ Phase 2 only comes if:
+ * and the selection is "safe": map less than 24 h old, no modified block
+   unknown to the map, no foundation file.
+ 
++The owner applied it ahead of that review on 14/10/2026 (canon §3, lot
++#1211), after the CI queue passed 100 pending runs; the two conditions above
++remain the safety net, applied per run by `scripts/test-plan.py`
++(`lot_selection`, `phase2_safe`) rather than once for all: any doubt gives
++the full suite — including a file **removed** outside documentation, since
++the map knows only the readers it measured (`--no-renames`: a rename is a
++removal plus an addition) — and the contract list
++(`tests/parts/toujours.txt`) always runs on a lot branch. A **release PR**
++(source or target under `release/**` or the integration branch) never takes
++the selection, the version/documentation lanes or the psql pilot list: it
++keeps the full suite under both drivers, in the plan as in its fallback. A
++**configuration**
++file follows its measured readers, like any data file; only `pyproject.toml`
++beyond its `version` line and `.github/**`, the configuration the tests
++themselves run under, force the full suite (test infrastructure). The leak
++count keeps its value: it measures what the selection misses on the runs
++where the full suite does run.
++
+ A failure on main then goes to the agent of the merged lot (section 3).
+ 
+ **Free signal.** A modified block that **no test executes** is reported to
+diff --git a/scripts/test-parts.py b/scripts/test-parts.py
+index 9665360c5..5379a4978 100755
+--- a/scripts/test-parts.py
++++ b/scripts/test-parts.py
+@@ -20,7 +20,9 @@ Un module absent de la table (nouveau) est pesé par son nombre de tests
+ repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
+ 
+ `--list` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
+-pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR. La liste
++pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
++plan de repli le demande par `pilot_list` ; une PR de release garde la suite
++complète, scripts/test-plan.py). La liste
+ est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
+ refusée.
+ 
+@@ -57,9 +59,13 @@ L161f — **plan**: with `--plan plan.json` (written once per CI run by
+ their classes from the plan: every part reads the same split, computed once
+ from the map. `--parts`, `--list`, `--since` and `--map` are then
+ ignored; a plan without a module list for the part (fallback plan) gives
+-the L116 split. With `--flow`, the part writes an `impacted` event once its
+-P0 and P1 modules are done (`statut`: `vert` or `rouge`): the provisional
+-green, when every part says `vert`.
++the L116 split. On a lot branch (L1211), the plan holds only the impacted
++modules and the contract list: the part runs them, the rest of the suite
++runs on main, `release/**` and the package integration branch; a release
++pull request (same branches, source or target) keeps the full suite. With
++`--flow`, the part writes an `impacted` event once its P0 and P1 modules are
++done (`statut`: `vert` or `rouge`): the provisional green, when every part
++says `vert`.
+ """
+ from __future__ import annotations
+ 
+diff --git a/scripts/test-plan.py b/scripts/test-plan.py
+index 95422e417..097b5fe0a 100644
+--- a/scripts/test-plan.py
++++ b/scripts/test-plan.py
+@@ -4,6 +4,7 @@
+ 
+     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                               [--base SHA] [--ref REF]
++                              [--base-ref B] [--head-ref H]
+                               [--github-output F] [--summary F] [--annotations]
+     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
+                                [--summary F]
+@@ -25,10 +26,26 @@ so the split never differs between parts.
+ * P2 — failed under measure in the last 7 days (map history);
+ * P3 — the rest.
+ 
+-**Phase 1: nothing is skipped.** Every part runs P0, P1 (shortest first),
+-P2, then P3 (alphabetical); only the order changes. The plan also says
+-whether a phase 2 selection ("impacted only", lot L161i) would have been
+-safe for this change; it is recorded, never applied.
++**Lot branches: impacted + contract (L1211, canon §3).** On a pull request
++whose source and target are lot branches, only the impacted modules (P0, P1)
++and the contract list (`tests/parts/toujours.txt`: droits, rôles, migrations,
++objets globaux du cluster) run; any doubt — no map, a stale or unsure
++selection, a changed block without a test, test infrastructure, a removed
++file outside documentation, an empty contract list — gives the full suite
++(`lot_selection`). On `main` every module runs, P0 and
++P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
++driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
++matrix.
++
++**Release pull requests keep the full suite (canon §3).** A pull request
++whose source or target is `release/**` or the package integration branch
++(§12) is a release PR: like the `push` to those branches, it runs the full
++suite under both drivers (`PARTS` in full), with no version-only or
++documentation-only fast lane and without the psql pilot list — the branch
++context comes from the workflow (`--base-ref`, `--head-ref`, L1211). The
++same holds for the fallback plan, so an unreadable map never narrows a
++release to the pilot list. Only the full suite prepares the merge of a
++release.
+ 
+ **Documentation-only** (L161a): a pull request whose whole diff is
+ documentation, and a push to `main` whose whole pushed range (`--base`,
+@@ -49,6 +66,9 @@ outside `src/ameesh`, a non-documentation file no test reads, a syntax
+ error) uses the textual heuristic for that file and marks the plan unsure;
+ test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+ `.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
++A file removed outside documentation marks it unsure as well: the map knows
++the readers it measured, never the ones it cannot see (an import by a
++computed name, a config read by the code).
+ Any error while reading the map gives the fallback plan, never a failure.
+ 
+ **Changed lines without a test**: an existing block whose fingerprint
+@@ -75,6 +95,7 @@ import collections
+ import datetime
+ import importlib.util
+ import json
++import math
+ import os
+ import pathlib
+ import re
+@@ -101,7 +122,18 @@ RECENT_FAILURE_DAYS = 7
+ #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
+ #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
+ #: saturé) ; la suite psql complète reste en six parts.
++#: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
++#: impactés et le contrat : une part par pilote suffit, et une part de plus par
++#: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
+ PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
++#: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
++#: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
++#: comme dans celui de 45 min de psql.
++PR_TARGET_PART_S = 300
++#: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
++#: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
++#: version/doc ni liste pilote psql.
++RELEASE_PREFIXES = ("release/", "integration/")
+ #: entries listed in the job summary, per category
+ SUMMARY_LIMIT = 25
+ 
+@@ -233,6 +265,7 @@ class Impact:
+         self.unsure: list[str] = []          # why the map cannot judge everything
+         self.textual: list[str] = []         # files left to the L161b heuristic
+         self.foundation: list[str] = []
++        self.removed: list[str] = []         # files removed outside documentation
+ 
+     def hit(self, modules, reason: str) -> None:
+         for m in modules:
+@@ -378,6 +411,8 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
+     if status in ("A", "D"):
+         listers, where = _dir_listers(card, path, card["commit"], repo)
+         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
++    # a removal outside documentation is already a doubt, raised by `judge`:
++    # only a removed document stays quiet here (the docs lane)
+     if not readers and not listers and not is_doc(path) and status != "D":
+         impact.doubt(f"{path}: read by no measured test", path)
+ 
+@@ -391,6 +426,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
+         if m not in known_modules:
+             impact.p0[m] = "unknown to the map"
+     for status, path in changes:
++        # a removal has no new blocks to judge, and the map only knows the
++        # readers it measured: an import by a computed name, a config read by
++        # the code, a template — the removal is a doubt, never a silent
++        # selection (R2 bureau, B1). `--no-renames`: a rename is D + A here.
++        if status == "D" and not is_doc(path):
++            impact.removed.append(path)
++            impact.unsure.append(f"file removed: {path}")
+         # a file read as data (a .py, a test module, a migration as well): its
+         # readers, whatever the kind of file and even when its blocks did not change
+         impact.hit(card.get("donnees", {}).get(path, ()), path)
+@@ -477,14 +519,38 @@ def textual(modules: list[str], files: list[str]) -> dict[str, str]:
+ 
+ # -- the plan -------------------------------------------------------------
+ 
++def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
++    """Why the impacted-only selection would not be safe for this change
++    (L1211): the plan then runs the full suite rather than decide on a doubt."""
++    if impact is not None and impact.removed:
++        return f"file removed: {impact.removed[0]}"
++    if not out["sure"]:
++        return out["unsure"][0] if out["unsure"] else "selection unsure"
++    if age is None:
++        return "map without a generation date"
++    if age > PHASE2_MAX_AGE_H:
++        return f"map older than {PHASE2_MAX_AGE_H} h ({age:.0f} h)"
++    if impact is None:
++        return "selection unsure"
++    if impact.unknown_blocks:
++        return f"{len(impact.unknown_blocks)} new block(s) unknown to the map"
++    if impact.foundation:
++        return f"test infrastructure changed: {impact.foundation[0]}"
++    if impact.untested:
++        return f"{len(impact.untested)} changed block(s) without a test"
++    return "selection unsafe"
++
++
+ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
+              base_fallback: str = "HEAD^1", head: str = "HEAD",
+              repo: pathlib.Path = REPO) -> dict:
+     """Classes of every module, and what the plan knows about its own safety."""
+     always = read_list(ALWAYS_FILE, modules)
+     problem, age = map_problem(card, now, head, repo)
+-    out = {"map": None, "sure": False, "phase2_safe": False, "unsure": [],
+-           "untested": [], "unknown_blocks": [], "foundation": [], "changed": 0}
++    out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
++           "unsure": [], "contract": list(always),
++           "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
++           "changed": 0}
+     if card is not None:
+         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
+                       "age_h": None if age is None else round(age, 1),
+@@ -518,12 +584,13 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
+                 classes[m] = ("P1", p1[m])
+         out.update(unsure=impact.unsure, untested=impact.untested,
+                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
+-                   sure=not impact.unsure)
++                   removed=impact.removed, sure=not impact.unsure)
+         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
+                               and not impact.unknown_blocks and not impact.foundation
+-                              and not impact.untested)
++                              and not impact.untested and not impact.removed)
+     changes = changes or []
+     out["changed"] = len(changes)
++    out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
+     triggered = always_hits(changes, always)
+     #: #749 : la liste declenchee est publiee pour que le pilote psql d'une PR
+     #: la rejoigne (make_plan), au lieu d'attendre la suite complete de main.
+@@ -569,6 +636,68 @@ def split(modules: list[str], driver: str, n: int, card: dict | None,
+     return result
+ 
+ 
++def _branch(ref: str | None) -> str:
++    """A branch name, from `GITHUB_BASE_REF`/`GITHUB_HEAD_REF` or `refs/heads/…`."""
++    ref = ref or ""
++    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
++
++
++def _env_ref(name: str, value: str | None) -> str:
++    """The explicit branch ref, or the environment's (`GITHUB_*`)."""
++    return os.environ.get(name, "") if value is None else value
++
++
++def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
++    """Why this pull request is a release one (canon §3), or "".
++
++    A source or target branch under `release/**` or `integration/**` is a
++    release PR: the full suite, both drivers, no version/documentation fast
++    lane and no psql pilot list — the target of a lot PR, `main`, keeps the
++    selection. The reason goes to the plan and the summary.
++    """
++    for role, ref in (("target", _branch(base_ref)), ("source", _branch(head_ref))):
++        if ref.startswith(RELEASE_PREFIXES):
++            return (f"{role} branch {ref}: release/** and integration/** run the "
++                    f"full suite (canon §3)")
++    return ""
++
++
++def lot_selection(event: str, state: dict, modules: list[str],
++                  classes: dict[str, tuple[str, str]],
++                  release: str = "") -> tuple[list[str] | None, str]:
++    """Modules a lot branch runs (L1211): impacted plus contract.
++
++    `None` means the full suite: an event other than a pull request, a
++    release pull request (`release`, `release_pr`), or any doubt the plan
++    cannot decide through — no usable map, a selection that is not safe
++    (stale map, a new block, test infrastructure, changed lines without a
++    test), an empty contract list. The reason goes to the summary.
++    """
++    if event != "pull_request":
++        return None, "main, release/** and the integration branch run the full suite"
++    if release:
++        return None, release
++    contract = [m for m in state.get("contract", []) if m in modules]
++    if not contract:
++        return None, "contract list (tests/parts/toujours.txt) empty or unreadable"
++    if not (state.get("map") and state["map"].get("used")):
++        unsure = state.get("unsure") or ["no map"]
++        return None, f"map not usable ({unsure[0]})"
++    if not state.get("phase2_safe"):
++        return None, f"selection unsure ({state.get('phase2_why') or 'no reason'})"
++    return sorted({m for m in modules if classes[m][0] in ("P0", "P1")}
++                  | set(contract)), ""
++
++
++def lot_part_count(driver: str, modules: list[str], card: dict | None) -> int:
++    """Parts of a lot branch for `driver` (L1211): one, plus one per
++    `PR_TARGET_PART_S` of estimate; `make_plan` caps it at `PARTS`."""
++    if not modules:
++        return 1
++    estimate = sum(weights(modules, driver, card).values())
++    return max(1, math.ceil(estimate / PR_TARGET_PART_S))
++
++
+ #: the branch whose documentation-only pushes take the fast lane (L161a)
+ DOC_PUSH_REF = "main"
+ #: git's null object id: `github.event.before` of a branch created by the push
+@@ -637,12 +766,17 @@ def doc_readers(classes: dict, card: dict,
+ 
+ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
+               head: str = "HEAD", repo: pathlib.Path = REPO,
+-              base: str = "HEAD^1", ref: str = "") -> dict:
++              base: str = "HEAD^1", ref: str = "",
++              base_ref: str | None = None, head_ref: str | None = None) -> dict:
+     now = now or datetime.datetime.now(datetime.timezone.utc)
++    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
++    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
++    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
+     modules = parts.modules()
+     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
+             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
+-            "tested": _rev(head, repo),
++            "tested": _rev(head, repo), "release": release,
++            "refs": {"base": base_ref, "head": head_ref},
+             **nature(event, base=base, head=head, repo=repo, ref=ref)}
+     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo))
+     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+@@ -650,7 +784,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
+     #: et orphelins), a rejoindre au pilote psql sur une PR.
+     always = [m for m in plan.get("always", []) if m in modules]
+     plan["doc_readers"] = []
+-    if plan["docs_only"]:
++    if plan["docs_only"] and not release:
+         # the fast lane needs a map that judged everything: a missing, stale or
+         # unusable map, or an unsure selection, runs the full suite
+         full = None
+@@ -665,22 +799,47 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
+                         f"({', '.join(db_readers)}): full suite")
+         if full:
+             plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
++    if release:
++        #: canon §3 : une PR de release passe la suite complète, les deux
++        #: pilotes, sans voie version seule ni documentation seule.
++        plan["version_only"] = plan["docs_only"] = False
++        plan["doc_readers"] = []
++        plan["why"] = release
+     skip = plan["version_only"] or plan["docs_only"]
+     pr = event == "pull_request"
++    #: L1211 : la sélection impactés+contrat est réservée aux PR de lot ; une
++    #: PR de release garde la suite complète, y compris dans le repli.
++    lot_pr = pr and not release
++    #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
++    #: tout doute rend la suite complète (lot_selection). La sélection se
++    #: contente d'une part par pilote tant que l'estimation le permet.
++    selection, why = ((None, "") if skip
++                      else lot_selection(event, plan, modules, classes, release))
++    chosen_set = None if selection is None else set(selection)
++    contract = [m for m in plan.get("contract", []) if m in modules]
+     plan["parts"] = {}
+     for driver, (n_pr, n_other) in PARTS.items():
+         selected = modules
+-        if driver == "psql" and pr:
++        if driver == "psql" and lot_pr:
+             selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
+                                        always)
+-        plan["parts"][driver] = [] if skip else split(
+-            selected, driver, n_pr if pr else n_other, card, classes)
++        if chosen_set is not None:
++            selected = [m for m in selected if m in chosen_set]
++        n = n_pr if lot_pr else n_other
++        if chosen_set is not None:
++            n = min(n, lot_part_count(driver, selected, card))
++        plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
+     every = [m for m in modules]
+     weighed = weights(every, "psycopg", card)
+     chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
+-    plan["selection"] = {"modules": len(every), "impacted": len(chosen),
+-                         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
+-                         "total_estimate_s": round(sum(weighed.values()), 1)}
++    ran = sorted({m for ps in plan["parts"].values() for p in ps for m in p["modules"]})
++    plan["selection"] = {
++        "mode": "skipped" if skip else ("impacted" if chosen_set is not None else "full"),
++        "why": plan["why"] if skip else why,
++        "modules": len(every), "impacted": len(chosen), "contract": len(contract),
++        "selected": len(ran), "skipped": len(every) - len(ran),
++        "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
++        "total_estimate_s": round(sum(weighed.values()), 1)}
+     return plan
+ 
+ 
+@@ -691,25 +850,36 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
+         return ""
+ 
+ 
+-def fallback_plan(event: str, error: str) -> dict:
++def fallback_plan(event: str, error: str, base_ref: str | None = None,
++                  head_ref: str | None = None) -> dict:
+     """The plan when planning itself failed: full suite, alphabetical order."""
+-    modules = parts.modules()
++    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
++    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
++    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
+     pr = event == "pull_request"
++    #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
++    #: jamais la liste pilote psql d'une PR de lot.
++    lot_pr = pr and not release
++    why = "planning failed" + (f"; {release}" if release else "")
++    modules = parts.modules()
+     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
+-            "version_only": False, "docs_only": False, "why": "planning failed",
+-            "map": None, "sure": False, "phase2_safe": False,
++            "version_only": False, "docs_only": False, "why": why,
++            "release": release, "refs": {"base": base_ref, "head": head_ref},
++            "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
+             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
+-            "unknown_blocks": [], "foundation": [], "changed": 0, "doc_readers": [],
+-            "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
++            "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
++            "doc_readers": [],
++            "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+     for driver, (n_pr, n_other) in PARTS.items():
+-        n = n_pr if pr else n_other
++        n = n_pr if lot_pr else n_other
+         # no module list: scripts/test-parts.py splits the suite itself (L116)
+         plan["parts"][driver] = [
+             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
+-             "pilot_list": driver == "psql" and pr, "estimate_s": 0}
++             "pilot_list": driver == "psql" and lot_pr, "estimate_s": 0}
+             for i in range(1, n + 1)]
+-    plan["selection"] = {"modules": len(modules), "impacted": 0, "impacted_estimate_s": 0,
+-                         "total_estimate_s": 0}
++    plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
++                         "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
++                         "impacted_estimate_s": 0, "total_estimate_s": 0}
+     return plan
+ 
+ 
+@@ -754,9 +924,19 @@ def summary(plan: dict) -> str:
+     lines.append(f"* {plan['changed']} file(s) changed since the "
+                  f"{'map commit' if m and m['used'] else 'parent commit'}; impacted (P0, P1): "
+                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
+-                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg); phase 1: nothing skipped")
+-    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; phase 2 safe: "
+-                 f"{'yes' if plan['phase2_safe'] else 'no'}")
++                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
++    if sel.get("mode") == "impacted":
++        lines.append(f"* lot branch (L1211): impacted + {sel['contract']} contract module(s), "
++                     f"{sel['selected']} module(s) run, {sel['skipped']} left to main, "
++                     f"release/** and the integration branch")
++    elif sel.get("mode") == "skipped":
++        lines.append("* parts skipped (see above)")
++    else:
++        lines.append(f"* full suite: {sel['selected']} module(s) run"
++                     + (f" ({sel['why']})" if sel.get("why") else ""))
++    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; impacted-only safe: "
++                 f"{'yes' if plan['phase2_safe'] else 'no'}"
++                 + (f" ({plan['phase2_why']})" if plan.get("phase2_why") else ""))
+     for reason in plan["unsure"][:SUMMARY_LIMIT]:
+         lines.append(f"  * {reason}")
+     by_class = collections.defaultdict(list)
+@@ -897,6 +1077,10 @@ def main(argv: list[str] | None = None) -> int:
+     p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                    help="github.ref; a documentation-only push takes the fast lane "
+                         "on main only")
++    p.add_argument("--base-ref", default=None,
++                   help="target branch of a pull request (default: $GITHUB_BASE_REF)")
++    p.add_argument("--head-ref", default=None,
++                   help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
+     p.add_argument("--github-output", help="appends the job outputs to this file")
+     p.add_argument("--summary", help="appends the Markdown summary to this file")
+     p.add_argument("--annotations", action="store_true",
+@@ -915,10 +1099,12 @@ def main(argv: list[str] | None = None) -> int:
+         if card is None and args.map:
+             print(f"map: {why}", file=sys.stderr)
+         try:
+-            plan = make_plan(args.event, card, base=args.base, ref=args.ref)
++            plan = make_plan(args.event, card, base=args.base, ref=args.ref,
++                             base_ref=args.base_ref, head_ref=args.head_ref)
+         except Exception as exc:  # planning must never block the suite
+             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
+-            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}")
++            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
++                                 base_ref=args.base_ref, head_ref=args.head_ref)
+         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
+                                           + "\n", encoding="utf-8")
+         if args.github_output:
+diff --git a/tests/parts/pilote-psql.txt b/tests/parts/pilote-psql.txt
+index b977d1e0b..8fb0d4248 100644
+--- a/tests/parts/pilote-psql.txt
++++ b/tests/parts/pilote-psql.txt
+@@ -1,9 +1,15 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+-# Modules « pilote » : ceux que la CI d'une PR passe AUSSI avec le pilote psql
+-# (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec psycopg
+-# sur la PR, et la suite psql complète tourne sur main, release/* et à la main
+-# (workflow_dispatch). Un module ajouté ici doit exister (scripts/test-parts.py
+-# refuse un nom inconnu).
++# Modules « pilote » : ceux que la CI d'une PR de lot passe AUSSI avec le pilote
++# psql (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec
++# psycopg sur la PR de lot, et la suite psql complète tourne sur main,
++# release/*, integration/*, à la main (workflow_dispatch) et sur une PR de
++# release (source ou cible release/* ou integration/*, sans cette liste). Un
++# module ajouté ici doit exister
++# (scripts/test-parts.py refuse un nom inconnu).
++#
++# L1211 (canon §3) : sur une branche de lot, le pilote psql ne voit que les
++# modules de cette liste retenus par le plan (impactés ou contrat), plus la
++# liste « always » déclenchée (#749).
+ #
+ # Règle : on liste les tests de la couche base (db.py), des migrations et du
+ # stockage (ameesh.storage), et ceux qui exercent un comportement propre à un
+diff --git a/tests/parts/toujours.txt b/tests/parts/toujours.txt
+index 5ff8908a7..5825d6348 100644
+--- a/tests/parts/toujours.txt
++++ b/tests/parts/toujours.txt
+@@ -7,6 +7,15 @@
+ # request the psql driver runs them too when the list is triggered (#749):
+ # what only one driver can see must not wait for the full suite of main.
+ #
++# L1211 (canon §3) : ce sont les tests de contrat. Sur une branche de lot, le
++# sélecteur les exécute tous avec psycopg, déclenchés ou non : droits, rôles et
++# migrations cassent un schéma réel avant que la suite complète de main ne le
++# voie. Sous psql, les quatre modules hors liste pilote (test_339_orphan_settle,
++# test_cluster, test_l31_orphans, test_l50_group_orphan_work_items) ne tournent
++# que si la liste est déclenchée (#749). Le sélecteur se replie sur la suite
++# complète si la liste est illisible ou si la sélection n'est pas sûre
++# (scripts/test-plan.py, lot_selection).
++#
+ # Additive list (L160a): one module per line, its reason in a comment on the
+ # same line, alphabetical order, no duplicate (scripts/test-parts.py refuses
+ # an unsorted list).
+@@ -17,3 +26,4 @@ test_events_attach  # LISTEN/NOTIFY channels, global to the cluster
+ test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (the release red module)
+ test_l50_group_orphan_work_items  # #749: orphan work items of a group reattached, lease contract
+ test_l72_panne_de_base  # database outage and reconnection
++test_migrations  # migrations: application, idempotence, immuabilité (contrat, L1211)
+diff --git a/tests/test_l161f_plan.py b/tests/test_l161f_plan.py
+index e40f8bcf7..a9b88f4ea 100644
+--- a/tests/test_l161f_plan.py
++++ b/tests/test_l161f_plan.py
+@@ -298,6 +298,92 @@ class MapTest(unittest.TestCase):
+         with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
+             return plan.classify(modules, card, NOW, head="HEAD", repo=self.repo.path)
+ 
++    def test_removed_file_is_a_doubt_and_runs_the_full_suite(self):
++        # R2 bureau (B1) : une suppression hors doc ne levait aucun doute
++        # (_python et _data traitaient D à part) ; un fichier lu par aucun test
++        # mesuré ne lançait que le contrat. Le changement D réel passe par
++        # classify/judge et donne la suite complète.
++        self.repo.remove("deploy/install.sh")
++        self.repo.commit()
++        out = self._classify()
++        self.assertFalse(out["phase2_safe"])
++        self.assertIn("file removed: deploy/install.sh", out["phase2_why"])
++        self.assertEqual(out["removed"], ["deploy/install.sh"])
++        # make_plan réel : modules réels (le découpage pèse chaque module),
++        # carte du dépôt jetable pour le diff ; seul `nature` est simulé.
++        mods = parts.modules()
++        card = self.repo.card()
++        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
++        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
++        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
++            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
++                               base_ref="main", head_ref="lot/x")
++        self.assertEqual(p["selection"]["mode"], "full")
++        self.assertIn("file removed: deploy/install.sh", p["selection"]["why"])
++
++    def test_documentation_removed_stays_in_the_fast_lane(self):
++        # une suppression de documentation ne lève pas ce doute : le doute
++        # « fichier supprimé » est réservé à ce que la carte ne peut pas juger
++        self.repo.remove("docs/guide.md")
++        self.repo.commit()
++        out = self._classify()
++        self.assertEqual(out["removed"], [])
++        self.assertNotIn("file removed", out["unsure"])
++
++    def test_release_pull_request_runs_the_full_suite_with_a_safe_map(self):
++        # R1 Codex (B1) : la carte est fraîche et sûre (le bloc modifié est
++        # mesuré, phase2_safe), donc une PR de lot ne lancerait que les
++        # impactés et le contrat ; une PR de release, par sa source ou sa
++        # cible, lance la suite complète, les deux pilotes, sans liste pilote.
++        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
++        self.repo.commit()
++        mods = parts.modules()
++        card = self.repo.card()
++        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
++                           for m in mods}
++        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
++        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
++            for base_ref, head_ref in (("main", "release/1.10.0"),
++                                       ("main", "integration/example"),
++                                       ("release/1.10.0", "lot/fix")):
++                with self.subTest(base=base_ref, head=head_ref):
++                    p = plan.make_plan("pull_request", card, NOW, head="HEAD",
++                                       repo=self.repo.path,
++                                       base_ref=base_ref, head_ref=head_ref)
++                    self.assertTrue(p["phase2_safe"], p["phase2_why"])
++                    self.assertEqual(p["selection"]["mode"], "full")
++                    self.assertIn("release/**", p["selection"]["why"])
++                    self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
++                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
++                    self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
++                    self.assertEqual(
++                        sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
++
++    def test_version_only_pull_request_on_release_runs_the_full_suite(self):
++        # R1 Codex : le même diff (la seule ligne `version` de pyproject.toml)
++        # reste sauté sur une PR de lot, mais garde la suite complète sur une
++        # PR de release.
++        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
++        self.repo.commit()
++        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.1"\n')
++        self.repo.commit()
++        mods = parts.modules()
++        card = self.repo.card()
++        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
++                           for m in mods}
++        lot = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
++                             base_ref="main", head_ref="lot/x")
++        self.assertTrue(lot["version_only"])
++        self.assertEqual(lot["parts"]["psycopg"], [])
++        self.assertEqual(plan.outputs(lot)["code"], "false")
++        release = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
++                                 base_ref="main", head_ref="release/1.10.0")
++        self.assertFalse(release["version_only"])
++        self.assertIn("release/**", release["selection"]["why"])
++        self.assertNotEqual(release["parts"]["psycopg"], [])
++        self.assertEqual(plan.outputs(release)["code"], "true")
++        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
++
+     def test_test_module_read_as_data_selects_its_readers(self):
+         # codex (4): the test-module branch skipped the readers of the file
+         self.repo.write("tests/test_plan.py", "x = 1\n")
+@@ -387,7 +473,7 @@ class MapTest(unittest.TestCase):
+         self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
+                                   "test_events_attach", "test_l31_orphans",
+                                   "test_l50_group_orphan_work_items",
+-                                  "test_l72_panne_de_base"])
++                                  "test_l72_panne_de_base", "test_migrations"])
+ 
+     def test_psql_pr_modules_adds_the_triggered_always_list(self):
+         # #749 : la liste « always » declenchee rejoint le pilote psql d'une PR ;
+@@ -439,7 +525,8 @@ class DocsLaneTest(unittest.TestCase):
+                 mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
+                 mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
+                                   if a and a[0] == plan.PILOT_FILE else []):
+-            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path)
++            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path,
++                                  base_ref="main", head_ref="lot/x")
+ 
+     def assertFullSuite(self, p: dict, why: str) -> None:
+         self.assertFalse(p["docs_only"], p["why"])
+@@ -608,7 +695,7 @@ class PlanTest(unittest.TestCase):
+         self.assertEqual(out["code"], "true")
+ 
+     def test_pull_request_runs_the_pilot_modules_with_psql(self):
+-        p = plan.make_plan("pull_request", None, NOW)
++        p = plan.make_plan("pull_request", None, NOW, base_ref="main", head_ref="lot/x")
+         if p["version_only"] or p["docs_only"]:
+             self.skipTest("the checked out commit is a version or documentation change")
+         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
+@@ -647,7 +734,7 @@ class PlanTest(unittest.TestCase):
+                 "untested": [], "unknown_blocks": [], "foundation": [], "changed": 1,
+                 "always": always,
+                 "classes": {m: list(c) for m, c in classes.items()}}):
+-            p = plan.make_plan("pull_request", card, NOW)
++            p = plan.make_plan("pull_request", card, NOW, base_ref="main", head_ref="lot/x")
+         if p["version_only"] or p["docs_only"]:
+             self.skipTest("the checked out commit is a version or documentation change")
+         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
+@@ -751,6 +838,211 @@ class PlanTest(unittest.TestCase):
+         self.assertIn("psycopg=[1, 2, 3, 4]", (d / "out").read_text(encoding="utf-8"))
+ 
+ 
++class LotBranchTest(unittest.TestCase):
++    """L1211 (canon §3) : une branche de lot ne lance que les tests impactés,
++    plus toujours les tests de contrat, et se replie sur la suite complète
++    quand la sélection ne peut pas décider.
++
++    Témoins du sélecteur et de la porte, sans base : le plan est bâti sur un
++    état `classify` qui vaut carte fraîche et sûre sur la vraie liste des
++    modules, et le workflow porte les déclencheurs et le check requis.
++    """
++
++    def setUp(self):
++        self.mods = parts.modules()
++        self.contract = plan.read_list(plan.ALWAYS_FILE, self.mods)
++        self.pilot = parts.read_list(plan.PILOT_FILE, self.mods)
++
++    def _classes(self, **impacted):
++        classes = {m: ("P3", "") for m in self.mods}
++        for m, why in impacted.items():
++            classes[m] = ("P1", why)
++        return classes
++
++    def _state(self, classes, **kw):
++        state = {
++            "map": {"commit": "c" * 40, "generated": NOW.isoformat(), "age_h": 0.0,
++                    "used": True, "problem": ""},
++            "sure": True, "phase2_safe": True, "phase2_why": "", "unsure": [],
++            "untested": [], "unknown_blocks": [], "foundation": [], "changed": 2,
++            "always": [], "contract": list(self.contract),
++            "classes": {m: list(c) for m, c in classes.items()},
++        }
++        state.update(kw)
++        return state
++
++    def _plan(self, event="pull_request", classes=None, card=None,
++              base_ref="main", head_ref="lot/1211-ci-impactes-contrat",
++              nature_kw=None, **state_kw):
++        state = self._state(classes if classes is not None else self._classes(), **state_kw)
++        nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
++        nature.update(nature_kw or {})
++        with mock.patch.object(plan, "classify", return_value=state), \
++                mock.patch.object(plan, "nature", return_value=dict(nature)):
++            return plan.make_plan(event, card if card is not None else {}, NOW,
++                                  base_ref=base_ref, head_ref=head_ref)
++
++    def _ran(self, p, driver="psycopg"):
++        return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
++
++    def test_lot_branch_runs_impacted_and_contract_only(self):
++        impacted = self.mods[0]
++        p = self._plan(classes=self._classes(**{impacted: "src/ameesh/x.py::f"}))
++        sel = p["selection"]
++        self.assertEqual(sel["mode"], "impacted")
++        self.assertEqual(sel["why"], "")
++        self.assertEqual(sel["contract"], len(self.contract))
++        expected = sorted(set(self.contract) | {impacted})
++        self.assertEqual(self._ran(p), expected)
++        self.assertEqual(sel["selected"], len(expected))
++        self.assertEqual(sel["skipped"], len(self.mods) - len(expected))
++        # le contrat garantit une matrice psycopg non vide : le check requis
++        # « tests » ne peut pas verdir sans qu'une part ait tourné
++        self.assertNotEqual(plan.outputs(p)["psycopg"], "[]")
++        self.assertGreaterEqual(int(plan.outputs(p)["psycopg_parts"]), 1)
++
++    def test_contract_runs_even_when_nothing_is_impacted(self):
++        p = self._plan()
++        self.assertEqual(self._ran(p), sorted(self.contract))
++        self.assertEqual(plan.outputs(p)["psycopg_parts"], "1")
++
++    def test_psql_keeps_the_pilot_subset(self):
++        # le pilote psql d'une PR reste un sous-ensemble de la sélection
++        impacted = self.pilot[0]
++        p = self._plan(classes=self._classes(**{impacted: "x"}))
++        expected = sorted((set(self.pilot) | {impacted})
++                          & (set(self.contract) | {impacted}))
++        self.assertEqual(self._ran(p, "psql"), expected)
++
++    def test_psql_runs_a_triggered_always_module_outside_the_pilot(self):
++        # #749 conservé sous le sélecteur : un module « always » déclenché
++        # rejoint le pilote psql même hors tests/parts/pilote-psql.txt
++        extra = self.contract[0]
++        self.assertNotIn(extra, self.pilot)
++        p = self._plan(classes=self._classes(**{extra: "always list (src/ameesh/runner.py)"}),
++                       always=[extra])
++        self.assertIn(extra, self._ran(p, "psql"))
++
++    def test_any_doubt_runs_the_full_suite(self):
++        cases = {
++            "no map": {"map": None},
++            "map unusable": {"map": {"commit": "c" * 40, "generated": NOW.isoformat(),
++                                     "age_h": 0.0, "used": False, "problem": "map unreadable"}},
++            "unsafe selection": {"phase2_safe": False,
++                                 "phase2_why": "3 changed block(s) without a test"},
++            "empty contract": {"contract": []},
++        }
++        for why, state_kw in cases.items():
++            with self.subTest(why):
++                p = self._plan(**state_kw)
++                self.assertEqual(p["selection"]["mode"], "full", why)
++                self.assertTrue(p["selection"]["why"], why)
++                self.assertEqual(self._ran(p), sorted(self.mods), why)
++
++    def test_full_suite_on_main_release_and_integration(self):
++        for event in ("push", "workflow_dispatch"):
++            with self.subTest(event):
++                p = self._plan(event=event)
++                self.assertEqual(p["selection"]["mode"], "full")
++                self.assertIn("integration", p["selection"]["why"])
++                self.assertEqual(self._ran(p), sorted(self.mods))
++
++    def test_release_pull_request_never_takes_the_impacted_selection(self):
++        # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
++        # décidables), mais une PR dont la source ou la cible est release/**
++        # ou integration/** garde la suite complète, les deux pilotes, sans
++        # liste pilote psql (canon §3).
++        cases = {
++            "source release": {"base_ref": "main", "head_ref": "release/1.10.0"},
++            "source integration": {"base_ref": "main", "head_ref": "integration/1.10.0"},
++            "target release": {"base_ref": "release/1.10.0", "head_ref": "lot/fix"},
++        }
++        impacted = self.mods[0]
++        for why, refs in cases.items():
++            with self.subTest(why):
++                p = self._plan(classes=self._classes(**{impacted: "src/ameesh/x.py::f"}),
++                               **refs)
++                self.assertTrue(p["phase2_safe"])
++                self.assertEqual(p["selection"]["mode"], "full", why)
++                self.assertIn("release/**", p["selection"]["why"])
++                self.assertEqual(self._ran(p), sorted(self.mods), why)
++                self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
++                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
++                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
++                self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
++                self.assertEqual(plan.outputs(p)["code"], "true")
++
++    def test_version_or_documentation_only_release_runs_the_full_suite(self):
++        # R1 Codex : ni la voie version seule ni la voie documentation seule
++        # ne sautent les parts d'une PR de release ; les mêmes PR vers main
++        # (PR de lot) gardent leur voie rapide.
++        for why, nature_kw in (("version", {"version_only": True, "why": "version seule"}),
++                               ("documentation", {"docs_only": True, "why": "doc seule"})):
++            with self.subTest(why):
++                p = self._plan(head_ref="release/1.10.0", nature_kw=nature_kw)
++                self.assertFalse(p["version_only"], why)
++                self.assertFalse(p["docs_only"], why)
++                self.assertIn("release/**", p["why"])
++                self.assertEqual(self._ran(p), sorted(self.mods), why)
++                self.assertEqual(plan.outputs(p)["code"], "true")
++                lot = self._plan(head_ref="lot/x", nature_kw=nature_kw)
++                self.assertEqual(lot["parts"]["psycopg"], [], why)
++                self.assertEqual(plan.outputs(lot)["code"], "false", why)
++
++    def test_fallback_of_a_release_pull_request_keeps_both_pilots_full(self):
++        # R1 Codex : « y compris fallback » — le repli d'une PR de release ne
++        # reprend ni la liste pilote psql ni le découpage d'une PR de lot.
++        p = plan.fallback_plan("pull_request", "boom", base_ref="main",
++                               head_ref="release/1.10.0")
++        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
++        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
++        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
++        self.assertIn("release/**", p["selection"]["why"])
++        lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
++        self.assertEqual(json.loads(plan.outputs(lot)["psql"]), [1, 2, 3])
++        self.assertTrue(any(ps.get("pilot_list") for ps in lot["parts"]["psql"]))
++
++    def test_github_refs_default_to_the_environment(self):
++        # le workflow passe --base-ref/--head-ref ; à défaut (appel direct),
++        # GITHUB_BASE_REF et GITHUB_HEAD_REF portent le contexte (L1211).
++        env = {"GITHUB_BASE_REF": "main", "GITHUB_HEAD_REF": "release/1.10.0"}
++        with mock.patch.dict("os.environ", env):
++            p = self._plan(base_ref=None, head_ref=None)
++        self.assertEqual(p["refs"], {"base": "main", "head": "release/1.10.0"})
++        self.assertEqual(p["selection"]["mode"], "full")
++        self.assertIn("release/**", p["release"])
++
++    def test_summary_names_the_selection(self):
++        p = self._plan(classes=self._classes(**{self.mods[0]: "src/ameesh/x.py::f"}))
++        text = plan.summary(p)
++        self.assertIn("lot branch (L1211)", text)
++        self.assertIn(f"{len(self.contract)} contract module(s)", text)
++        full = self._plan(phase2_safe=False, phase2_why="changed block(s) without a test")
++        text = plan.summary(full)
++        self.assertIn("full suite", text)
++        self.assertIn("changed block(s) without a test", text)
++
++    def test_parts_shrink_to_the_estimate(self):
++        def card(seconds):
++            return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
++                                for m in self.mods}}
++        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
++        # 235 modules × 2 s = 470 s -> deux parts
++        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
++        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
++
++    def test_selected_matrix_never_exceeds_the_parts_cap(self):
++        # un lot très large (60 s par module) reste dans PARTS : quatre parts
++        # psycopg et trois parts psql au plus, comme la suite complète
++        classes = self._classes(**{m: "x" for m in self.mods})
++        p = self._plan(classes=classes, card={"modules": {
++            m: {"durees": {"psycopg": 60.0, "psql": 60.0}} for m in self.mods}})
++        self.assertEqual(p["selection"]["mode"], "impacted")
++        self.assertEqual({ps["of"] for ps in p["parts"]["psycopg"]}, {4})
++        self.assertEqual({ps["of"] for ps in p["parts"]["psql"]}, {3})
++        self.assertEqual(self._ran(p), sorted(self.mods))
++
++
+ def _cases():
+     """Example tests, out of reach of test discovery."""
+ 
+@@ -883,6 +1175,35 @@ class LeaksTest(unittest.TestCase):
+         self.assertEqual(out["not_counted"], 1)
+ 
+ 
++def _run_bodies(text: str) -> list[str]:
++    """Le texte de chaque bloc `run:` de tests.yml (inline ou littéral)."""
++    bodies: list[str] = []
++    lines = text.splitlines()
++    i = 0
++    while i < len(lines):
++        line = lines[i]
++        stripped = line.strip()
++        indent = len(line) - len(line.lstrip(" "))
++        if not stripped.startswith("run:"):
++            i += 1
++            continue
++        inline = stripped[len("run:"):].strip()
++        if inline and inline not in ("|", ">", "|-", ">-", "|+", ">+"):
++            bodies.append(inline)
++            i += 1
++            continue
++        body, j = [], i + 1
++        while j < len(lines):
++            nxt = lines[j]
++            if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= indent:
++                break
++            body.append(nxt)
++            j += 1
++        bodies.append("\n".join(body))
++        i = j
++    return bodies
++
++
+ class WorkflowTest(unittest.TestCase):
+     def setUp(self):
+         self.text = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+@@ -920,6 +1241,31 @@ class WorkflowTest(unittest.TestCase):
+         tests_job = self.text[self.text.index("\n  tests:\n"):]
+         self.assertNotIn("bilan", tests_job.split("steps:")[0])
+ 
++    def test_plan_job_passes_the_branch_context(self):
++        # R1 Codex (B1) : le plan qualifie les PR de release sur leurs
++        # branches source et cible (« release/** » ou « integration/** ») ;
++        # le workflow les lui transmet (L1211). #1237 (N1) : un nom de branche
++        # est choisi par l'auteur de la PR ; il passe par l'environnement et
++        # reste cité dans le script, jamais interpolé dans un `run:`.
++        self.assertIn("BASE_REF: ${{ github.base_ref }}", self.text)
++        self.assertIn("HEAD_REF: ${{ github.head_ref }}", self.text)
++        self.assertIn('--base-ref "$BASE_REF"', self.text)
++        self.assertIn('--head-ref "$HEAD_REF"', self.text)
++        for body in _run_bodies(self.text):
++            self.assertNotIn("github.base_ref", body)
++            self.assertNotIn("github.head_ref", body)
++
++    def test_lot_branch_triggers_and_full_suite_events(self):
++        # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
++        # décide), le push vers la branche d'intégration du paquet, main et
++        # release/** porte la suite complète ; le check requis reste
++        # l'agrégat « tests ».
++        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
++        self.assertIn("\n  pull_request:\n", self.text)
++        self.assertIn("L1211", self.text)
++        self.assertIn("tests/parts/toujours.txt", self.text)
++        self.assertIn("une PR de release", self.text)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_l932_ci_venv_cache.py b/tests/test_l932_ci_venv_cache.py
+new file mode 100644
+index 000000000..4bb84e4d4
+--- /dev/null
++++ b/tests/test_l932_ci_venv_cache.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#932 : le cache du venv de CI est par runner, et un venv restauré est vérifié
++avant de servir.
++
++Sans base : lecture du workflow `.github/workflows/tests.yml`. Le venv `.venv-ci`
++d'un runner auto-hébergé contient un lien absolu vers le Python de ce runner
++(`/home/runner/r<X>/_work/_tool/Python/...`) : restauré par un autre runner, il
++sort en exit 127 (run de la PR #618, part psycopg 1/4, 50 s). Deux gardes : clé
++de cache par `runner.name`, et contrôle du venv restauré (import des
++dépendances) qui le reconstruit s'il est inutilisable.
++"""
++from __future__ import annotations
++
++import pathlib
++import re
++import unittest
++
++REPO = pathlib.Path(__file__).resolve().parent.parent
++WORKFLOW = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
++
++
++class VenvCacheTest(unittest.TestCase):
++
++    def test_cle_de_cache_par_runner(self):
++        m = re.search(r"key:\s*venv-([^\n]+)", WORKFLOW)
++        self.assertIsNotNone(m, "clé de cache du venv introuvable")
++        key = m.group(1)
++        self.assertIn("runner.name", key)
++        self.assertNotIn("runner.environment", key)
++        self.assertIn("hashFiles('pyproject.toml')", key)
++        self.assertIn("steps.py.outputs.python-version", key)
++
++    def test_venv_restaure_verifie_avant_usage(self):
++        # le pas « dépendances » n'est plus sauté sur un cache-hit : il valide
++        # le venv restauré (import des dépendances) et le reconstruit sinon.
++        self.assertNotIn("if: steps.venv.outputs.cache-hit != 'true'", WORKFLOW)
++        m = re.search(r"name: dépendances \(pilote psycopg\)\n(.*?)\n      - &base",
++                      WORKFLOW, re.S)
++        self.assertIsNotNone(m, "pas « dépendances » introuvable")
++        body = m.group(1)
++        self.assertIn("cache-hit", body)
++        self.assertIn("import psycopg, cryptography, psutil", body)
++        self.assertIn("rm -rf .venv-ci", body)
++        self.assertIn("python -m venv .venv-ci", body)
++
++    def test_part_utilise_le_venv(self):
++        self.assertIn(".venv-ci/bin/python scripts/test-parts.py run", WORKFLOW)
++
++
++if __name__ == "__main__":
++    unittest.main()

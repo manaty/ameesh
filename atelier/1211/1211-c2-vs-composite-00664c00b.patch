@@ -1,0 +1,1789 @@
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index e944dddf4..483da1cdc 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -3642,6 +3642,124 @@ if needed. It goes to the lot's assignee, agent or human (`human:…` as the
+ alert's `responsible`), including history-only events after removal of the
+ queue row, whose owner is read from the work item; `merge_blocked` too.
+ 
++## Fusion hors API d'une PR touchant `.github/workflows/**` — `ameesh work merge-pr` (#1003/REL-11)
++
++Incident #562/REL-11 (2026-10-13, nexlink) : la PR de release touchait
++`.github/workflows/**` et `gh pr merge` a été refusé (HTTP 403) parce que le
++jeton de l'hôte n'a pas le scope OAuth `workflow`. La fusion a été faite par
++un commit de fusion local poussé en SSH ; GitHub a marqué la PR `MERGED`. Le
++geste est reproductible, mais il écrit **directement sur la branche cible** :
++il ne doit pas devenir un contournement de ce que l'API vérifie. D'où une
++commande dédiée, avec les mêmes exigences que la porte de fusion plus des
++gardes propres.
++
++```
++ameesh work merge-pr <pr> --head <sha gelé> --lot N [--repo owner/repo]
++                      [--target branche] [--fetch-url URL] [--push-url URL]
++                      [--dry-run] [--json]
++```
++
++**Quand l'utiliser.** D'abord `gh auth status` : si le scope `workflow` est
++là, `gh pr merge` suffit et reste la voie normale. Sinon, et seulement pour
++une PR dont le diff touche `.github/workflows/**` (la commande refuse les
++autres : pour elles, l'API n'a aucune raison de refuser), la commande
++remplace le geste. Elle exige un remote de push **hors jeton** (SSH) :
++`--push-url`, par défaut `git@github.com:owner/repo.git`. La lecture, elle,
++peut rester sur `origin` (lire un workflow ne demande pas le scope).
++
++**L'autorisation vient du lot** (`--lot`, obligatoire) : la commande rejoue
++l'**admission de la file de fusion** (`merge_queue.readiness`) sur ce lot —
++elle ne la réimplémente pas et n'est jamais plus faible qu'elle. Le lot doit
++être **gelé sur `--head`**, sa branche doit être à ce gel sur le distant, la
++cible résolue doit être celle de la commande, et un lot non léger doit porter
++un **verdict de relecture `ok` sur ce même commit** (la classe est lue sur le
++diff gelé). La configuration radar du projet s'applique : ses **cibles
++protégées** (`protected`) sont refusées — une cible protégée est le geste de
++l'orchestrateur, pas de cette commande —, `ci_required` exige la CI verte du
++commit gelé, et les `gates` du projet tournent sur l'arbre fusionné avant le
++push.
++
++**Les gardes, toutes vérifiées avant la moindre écriture** :
++
++1. **une seule identité de dépôt** (#1003 B/P1, R1 delta puis delta cx3) : le
++   checkout, le `--repo` de la PR, `--fetch-url` et `--push-url` désignent le
++   **même** dépôt — clé `owner/repo` pour une URL GitHub, chemin réel pour un
++   transport local — et le checkout porte cette identité (son `origin`). Les
++   deux formes ne se mélangent pas : un transport local (chemin, `file://`)
++   ne se lie pas à une clé GitHub, parce que rien ne prouve que le dépôt
++   local est celui de la PR — la commande refuse, et le geste réel part d'un
++   clone GitHub. La voie opérateur (`ameesh work merge-pr`) n'accepte que
++   `owner/repo` : un chemin local y est refusé avant tout appel (le banc
++   appelle le module directement). Une divergence ou une identité non
++   vérifiable (pas d'`origin`, URL inconnue, `--repo` qui n'est ni
++   `owner/repo` ni un chemin existant) refuse avant la première lecture :
++   depuis un clone de A, `--repo B` avec les remotes de B ne fait pas admettre
++   A par les conditions de B, ni l'inverse, **même quand A et B partagent la
++   base et le gel** ;
++2. l'admission de la file (ci-dessus) : gel, verdict `ok` sur la tête,
++   cible non protégée, CI verte de la PR sur cette tête, `ci_required` ;
++3. la PR est ouverte, non brouillon, sa base est la cible, sa tête est
++   exactement `--head` (le gel relu) ;
++4. son `mergeStateStatus` est `CLEAN`/`HAS_HOOKS` et **tous** ses checks
++   sont terminés et verts : une PR bloquée, en retard (`BEHIND`), brouillon
++   ou dont un check n'est pas vert est refusée — la commande n'affaiblit
++   jamais les checks requis, elle est plus stricte que l'API ;
++5. `refs/pull/<pr>/head` relu sur le dépôt distant vaut `--head` ;
++6. la tête fraîche de la cible est un **ancêtre** du gel (la cible n'a pas
++   bougé depuis la refusion) ;
++7. le `merge --no-ff` local sur cette tête produit un arbre **identique à
++   l'arbre du gel** (`--head^{tree}`) et un commit à deux parents
++   (tête de cible, gel) ; sinon rien n'est poussé ;
++8. **garde fraîche juste avant l'écriture** : la PR est relue une seconde
++   fois (état, tête, base, mergeabilité, checks), l'admission de la file est
++   rejouée sur cette vue, et `refs/pull/<pr>/head` comme la tête de la cible
++   sont relus sur le distant. Toute mutation depuis la construction du commit
++   de fusion arrête le geste sans écrire ;
++9. le push est un compare-and-swap
++   `--force-with-lease=refs/heads/<cible>:<tête lue>` : une cible qui bouge
++   entre la lecture et le push est refusée, jamais `--force` ;
++10. relecture : la PR doit passer `MERGED`, son commit de fusion doit être
++    celui poussé et la cible relue doit pointer dessus. Le lot n'est déclaré
++    fusionné (`ameesh work merged`) qu'après cette relecture ; un échec
++    d'enregistrement n'annule pas la fusion, il est signalé.
++
++**Vérifier sans pousser** : `--dry-run` déroule toutes les gardes, y compris
++la garde fraîche, et construit le commit de fusion sans rien pousser ni
++déclarer. C'est la preuve qu'un relecteur peut exiger sur la tête exacte :
++
++```
++ameesh work merge-pr 763 --head 2df0b80d… --lot 1003 --dry-run --json
++```
++
++**Issue de secours si la commande ne peut pas aboutir** (pas de clé SSH sur
++l'hôte, ou refus de la clé) : la commande s'arrête avant toute écriture et le
++dit. La décision est alors au propriétaire, par ordre de coût :
++
++1. `gh auth refresh -s workflow` — le scope `workflow` sur le jeton de
++   l'hôte ; le plus simple, mais il élargit ce que le jeton partagé peut
++   modifier (fichiers de workflow) ;
++2. un PAT *fine-grained* avec `Workflows: write`, porté par le remote de push
++   (secret d'hôte, jamais dans un dépôt ni un message) ;
++3. une GitHub App avec la permission `Workflows: write` (jeton court, plus
++   lourd à installer) ;
++4. une clé SSH de déploiement (ou une clé de compte) sur l'hôte des agents,
++   en écriture sur le dépôt : aucune permission de jeton élargie, et c'est
++   le chemin que la commande utilise déjà.
++
++Limites, dites sans les masquer : la commande ne remplace pas la protection
++de branche (un push direct ne la consulte pas) — les gardes ci-dessus en
++tiennent lieu, et c'est pour cela qu'elles refusent tout ce qui n'est pas
++strictement vert et à arbre identique. La fenêtre entre la **dernière
++lecture** (garde 7) et le push n'est pas fermable par git seul : le
++compare-and-swap ferme la course sur la **cible**, pas une fermeture de PR ni
++un check devenu rouge dans cet instant. La relecture finale (garde 9) le
++constate — elle ne déclare jamais le lot sur une PR non `MERGED` —, mais un
++push dans cette fenêtre reste possible ; c'est pourquoi la commande se refuse
++aux cibles protégées et exige l'admission de la file. Les fichiers de
++workflow restent relus par un autre modèle (classe sensible, canon §8) :
++cette commande ne change pas les exigences de relecture, elle change le geste
++de fusion.
++
+ ## Courrier en souffrance — refus à l'envoi, alerte, `ameesh mail forward`
+ 
+ Constat du 2026-10-10 sur la base du mesh : 42 messages entre agents jamais
+diff --git a/scripts/ci-flow.py b/scripts/ci-flow.py
+index da0e1e2ca..c3c8ce59a 100755
+--- a/scripts/ci-flow.py
++++ b/scripts/ci-flow.py
+@@ -54,6 +54,12 @@ la part, et une valeur absente ou illisible ne publie rien. `summary` affiche
+ en plus, sur chaque part, la part du plafond consommée à la fin du job
+ (« Plafond du job : … sur N min (P %) »), avec un ⚠ au-delà du seuil : c'est
+ la mesure qui montre la croissance de la suite d'une exécution à l'autre.
++
++#1044 — un nombre non fini (NaN, ±infini, ou un débordement de conversion)
++n'est jamais un nombre : il est refusé comme illisible, avant tout calcul et
++toute écriture. Et quand la part n'a pas de durée finale attestée (interrompue
++sans ligne `fin`), `summary` donne la durée « au moment de l'alerte » et le
++dit, au lieu de la présenter comme une durée de fin de part.
+ """
+ from __future__ import annotations
+ 
+@@ -61,6 +67,7 @@ import argparse
+ import collections
+ import datetime
+ import json
++import math
+ import os
+ import pathlib
+ import sys
+@@ -109,11 +116,13 @@ def _duration(s: float) -> str:
+ 
+ 
+ def _nombre(valeur) -> float | None:
+-    """Un nombre d'option ou d'environnement, ou None s'il est absent ou illisible."""
++    """Un nombre fini d'option, d'environnement ou d'état, ou None s'il est
++    absent, illisible ou non fini (#1044 : NaN, ±infini et débordement)."""
+     try:
+-        return float(valeur)
+-    except (TypeError, ValueError):
++        nombre = float(valeur)
++    except (TypeError, ValueError, OverflowError):
+         return None
++    return nombre if math.isfinite(nombre) else None
+ 
+ 
+ def _minutes(valeur) -> str:
+@@ -208,24 +217,30 @@ def summary(chemins: list[str]) -> str:
+         # #899 : la part du plafond consommée, mesure de la croissance de la suite
+         publication = etat_publication(chemin)
+         plafond = _nombre(publication.get("plafond_min"))
+-        alerte = publication.get("alerte")
+-        alerte = alerte if isinstance(alerte, dict) else None
+-        if plafond:
+-            ecoule = _nombre(publication.get("fin_ecoule_s"))
+-            if ecoule is None and alerte:
+-                ecoule = _nombre(alerte.get("ecoule_s"))
+-            if ecoule is not None:
+-                part_du_plafond = ecoule / (plafond * 60.0)
+-                ligne = ("%sPlafond du job : %s à la fin de la part sur %s min (%.0f %%)"
+-                         % ("⚠ " if alerte or part_du_plafond >= ALERTE_SEUIL else "",
+-                            _duration(ecoule), _minutes(plafond), 100 * part_du_plafond))
+-                if alerte:
+-                    ligne += " — alerte à %d %% publiée dans le check run." % seuil_pourcent(alerte)
+-                elif part_du_plafond >= ALERTE_SEUIL:
+-                    ligne += " — seuil de %d %% atteint." % round(ALERTE_SEUIL * 100)
+-                else:
+-                    ligne += "."
+-                check_output.append(ligne + "\n")
++        alerte = alerte_de(publication)
++        fin_ecoule = _nombre(publication.get("fin_ecoule_s"))
++        ecoule_alerte = _nombre(alerte.get("ecoule_s")) if alerte else None
++        if plafond and fin_ecoule is not None:
++            part_du_plafond = fin_ecoule / (plafond * 60.0)
++            ligne = ("%sPlafond du job : %s à la fin de la part sur %s min (%.0f %%)"
++                     % ("⚠ " if alerte or part_du_plafond >= ALERTE_SEUIL else "",
++                        _duration(fin_ecoule), _minutes(plafond), 100 * part_du_plafond))
++            if alerte:
++                ligne += " — alerte à %d %% publiée dans le check run." % seuil_pourcent(alerte)
++            elif part_du_plafond >= ALERTE_SEUIL:
++                ligne += " — seuil de %d %% atteint." % round(ALERTE_SEUIL * 100)
++            else:
++                ligne += "."
++            check_output.append(ligne + "\n")
++        elif plafond and ecoule_alerte is not None:
++            # #1044 : sans `fin_ecoule_s`, la durée de l'alerte n'atteste pas la
++            # fin de la part (interruption, annulation) : ne pas la présenter
++            # comme telle.
++            part_du_plafond = ecoule_alerte / (plafond * 60.0)
++            check_output.append(
++                "⚠ Plafond du job : %s écoulées au moment de l'alerte sur %s min (%.0f %%)"
++                " — durée finale non attestée (part sans ligne de fin).\n"
++                % (_duration(ecoule_alerte), _minutes(plafond), 100 * part_du_plafond))
+         classes = debut.get("classes", {})
+         touches = [m for m in debut.get("modules", []) if classes.get(m, "P3") != "P3"]
+         impacted = next((e for e in events if e.get("type") == "impacted"), None)
+diff --git a/src/ameesh/merge_pr.py b/src/ameesh/merge_pr.py
+new file mode 100644
+index 000000000..9429e7a71
+--- /dev/null
++++ b/src/ameesh/merge_pr.py
+@@ -0,0 +1,788 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""REL-11 (#1003) — fusion d'une PR touchant `.github/workflows/**` hors API gh.
++
++Pourquoi : GitHub refuse (`gh pr merge`, HTTP 403) la fusion d'une PR dont le
++diff touche `.github/workflows/**` quand le jeton de l'hôte n'a pas le scope
++OAuth `workflow` (incident #562/REL-11 : la PR de release a été fusionnée par
++un commit de fusion local poussé en SSH, la PR est passée MERGED). Le geste
++est reproductible, mais il doit être encadré : il écrit directement sur la
++branche cible, donc il peut contourner ce que l'API vérifie (protection de
++branche, checks requis).
++
++    ameesh work merge-pr <pr> --head <sha gelé> --lot N [--repo owner/repo]
++                          [--target branche] [--fetch-url URL] [--push-url URL]
++                          [--dry-run] [--json]
++
++Le geste, et ses gardes (toutes vérifiées AVANT toute écriture) :
++
++1. **une seule identité de dépôt** (#1003 B/P1, R1 delta puis delta cx3) : le
++   checkout, le `--repo` de la PR, `--fetch-url` et `--push-url` doivent
++   désigner le MÊME dépôt — clé `owner/repo` pour GitHub, chemin réel pour un
++   transport local — et le checkout doit porter cette identité (son `origin`).
++   Les deux formes ne se mélangent pas : un transport local ne prouve pas une
++   clé GitHub (ni l'inverse), c'est le même refus. Une divergence, ou une
++   identité non vérifiable (pas d'`origin`, URL inconnue), refuse avant la
++   première lecture : depuis un clone de A, `--repo B` avec les remotes de B
++   ne peut pas faire admettre A par les conditions de B, ni l'inverse ;
++2. **le lot** (`--lot`, obligatoire) est le porteur de l'autorisation : il doit
++   être gelé sur `--head` et porter un verdict de relecture `ok` sur ce même
++   commit (classe lue par la file : un lot léger en est dispensé). C'est
++   l'admission **de la file de fusion elle-même** (`merge_queue.readiness`)
++   qui est rejouée ici — cible protégée, gel, verdict, classe, CI verte sur la
++   tête gelée — et non une copie : cette voie n'est jamais plus faible que la
++   file ;
++3. **le projet** est résolu par la configuration radar (`merge_queue.
++   radar_project`) : ses conditions (`protected`, `ci_required`, `gates`)
++   s'appliquent. Une cible protégée est refusée (c'est le geste de
++   l'orchestrateur, hors de cette commande) ; `ci_required` exige la CI verte
++   du commit gelé (`radar.commit_ci`), et les `gates` du projet tournent sur
++   l'arbre fusionné avant le push ;
++4. **la PR** est lue par `gh` : elle est ouverte, non brouillon, sa base est
++   la cible, sa tête est le SHA gelé donné, son `mergeStateStatus` est
++   `CLEAN`/`HAS_HOOKS` et tous ses checks sont terminés et verts
++   (`radar.ci_green`) — rien n'est affaibli : une PR bloquée, en retard
++   (`BEHIND`) ou dont un check n'est pas vert est refusée ;
++5. **le diff** est calculé localement (`merge-base` puis `diff --name-only`) :
++   la PR doit toucher au moins un chemin `.github/workflows/**` — cette voie
++   ne remplace donc jamais la fusion par l'API pour les autres PR ;
++6. **le SHA gelé** est relu sur le dépôt distant (`refs/pull/<pr>/head`) et
++   doit être exactement `--head` ;
++7. **la cible n'a pas bougé** : la tête fraîche de la cible est un ancêtre du
++   gel (`merge-base --is-ancestor`) ; sinon rien n'est écrit et il faut
++   refusionner la cible dans la branche, refaire CI et relecture ;
++8. **l'arbre du commit de fusion est identique à l'arbre du gel** : le
++   `merge --no-ff` local doit produire exactement l'arbre relu ; deux
++   parents (tête de cible, gel), message qui nomme la PR et les gardes ;
++9. **garde fraîche juste avant l'écriture** : la PR est relue une seconde
++   fois (état, tête, base, mergeabilité, checks), l'admission de la file est
++   rejouée sur cette vue, et `refs/pull/<pr>/head` comme la tête de la cible
++   sont relus sur le distant. Toute mutation depuis la construction du commit
++   de fusion arrête le geste sans écrire. La fenêtre entre cette dernière
++   lecture et le push n'est pas fermable par git seul : le compare-and-swap
++   ci-dessous ferme la course sur la cible, pas une fermeture de PR ou un
++   check devenu rouge dans cet instant — la relecture finale le constate et
++   ne déclare jamais le lot sur une PR non `MERGED` ;
++10. **le push est un compare-and-swap** : `--force-with-lease=<ref>:<tête>`
++    sur un remote **hors jeton** (SSH) ; si la cible a bougé entre la lecture
++    et le push, git refuse — jamais `--force` ;
++11. **relecture** : la PR est relue jusqu'à `MERGED`, son commit de fusion doit
++    être celui poussé, la tête de la cible relue doit être ce commit ; le lot
++    n'est déclaré fusionné qu'après cette relecture.
++
++An **already `MERGED`** PR is bound by the same link (#1003 N1, P2 blocker):
++its content evidence (`refs/pull/<pr>/head`, ancestor of the target) is not
++enough to declare a lot. `--lot` must carry the freeze of that head, on the
++PR's branch and target; a missing, closed or frozen-elsewhere lot, or one on
++another branch/target, refuses without declaring anything. `--dry-run` never
++declares, `already` included.
++
++Le remote de lecture peut rester celui du jeton (lire un workflow ne demande
++pas le scope) ; seul le push doit être hors jeton. `--dry-run` déroule toutes
++les gardes (y compris la garde fraîche) et construit le commit de fusion sans
++rien pousser ni déclarer : c'est la vérification que la relecture peut exiger
++d'un geste de fusion.
++
++Sans remote hors jeton (pas de clé SSH sur l'hôte), la commande s'arrête
++avant toute écriture et nomme la décision owner : `gh auth refresh -s
++workflow`, PAT fine-grained `Workflows: write`, GitHub App, ou une clé SSH
++de déploiement. Voir docs/EXPLOITATION.md, section « Fusion hors API d'une PR
++touchant .github/workflows/** ».
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++import shutil
++import tempfile
++import time
++
++from . import land, merge_queue, migrations, plan_git, radar, resolutions, work
++from .canon import FETCH_TIMEOUT, GitError
++
++#: le chemin qui fait refuser la fusion par l'API
++WORKFLOW_PREFIX = ".github/workflows/"
++#: identité du commit de fusion, reproductible ; GitHub attribue le push à la
++#: clé SSH, pas à cette identité
++IDENTITY = ("ameesh", "ameesh@localhost")
++#: relecture « PR MERGED » après le push : nombre d'essais et attente
++POLL_S = float(os.environ.get("AMEESH_MERGE_PR_POLL_S", "5"))
++ATTEMPTS = int(os.environ.get("AMEESH_MERGE_PR_ATTEMPTS", "12"))
++#: `git ls-remote`/`rev-parse` courts ; le fetch et le push ont FETCH_TIMEOUT
++SHORT_TIMEOUT = 60.0
++FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
++_HTTPS = re.compile(r"^https?://", re.I)
++#: une URL qui porte des identifiants (`https://user:jeton@…`) : jamais
++#: affichée telle quelle, ni dans un constat ni dans une erreur
++_CREDENTIALS = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@\s]*@")
++#: une clé GitHub nue `owner/repo` (le `--repo` de la PR) : exactement deux
++#: segments, sans espaces ni chemin absolu
++_GITHUB_KEY = re.compile(r"^[^/\s]+/[^/\s]+$")
++
++def _redact(text: str) -> str:
++    """Retire les identifiants d'une URL avant de la citer ou de l'écrire."""
++    return _CREDENTIALS.sub(r"\1***@", text or "")
++
++
++class MergePrError(RuntimeError):
++    """Un geste refusé ou impossible : message actionnable, rien n'est écrit."""
++
++
++# --------------------------------------------------------------------------
++# helpers
++# --------------------------------------------------------------------------
++
++def _json(proc, what: str) -> dict:
++    try:
++        data = json.loads(proc.stdout or "{}")
++    except ValueError as exc:
++        raise MergePrError("%s: sortie illisible (%s)" % (what, exc)) from exc
++    if not isinstance(data, dict):
++        raise MergePrError("%s: sortie inattendue %s" % (what, (proc.stdout or "")[:120]))
++    return data
++
++
++def _run(cwd: str, *args: str, timeout: float = SHORT_TIMEOUT, stdin: bytes | None = None):
++    return resolutions._run(cwd, *args, timeout=timeout, stdin=stdin)
++
++
++def _check(cwd: str, *args: str, timeout: float = SHORT_TIMEOUT) -> str:
++    proc = _run(cwd, *args, timeout=timeout)
++    if proc.returncode != 0:
++        raise MergePrError("git %s: %s" % (args[0] if args else "?",
++                                           _redact(resolutions._err(proc)[-300:])))
++    return resolutions._text(proc)
++
++
++def _out(cwd: str, *args: str, timeout: float = SHORT_TIMEOUT) -> str:
++    proc = _run(cwd, *args, timeout=timeout)
++    return resolutions._text(proc) if proc.returncode == 0 else ""
++
++
++def _same(sha, other) -> bool:
++    return bool(sha) and bool(other) and str(sha).lower() == str(other).lower()
++
++
++def check_push_url(url: str) -> str:
++    """Le remote de push : jamais celui du jeton sur github.com (https), qui
++    est exactement ce qui manque du scope `workflow`."""
++    text = (url or "").strip()
++    if not text:
++        raise MergePrError("no push remote: give --push-url (an SSH remote whose key can "
++                           "write) or fix the token scope and use `gh pr merge`")
++    if _HTTPS.match(text) and migrations.github_repo(text):
++        raise MergePrError(
++            "push URL %s goes through the token (https): that is the path GitHub "
++            "refuses for a workflow PR; give the SSH remote (git@github.com:owner/repo.git)"
++            % _redact(text))
++    return text
++
++
++def check_head(head: str) -> str:
++    text = (head or "").strip().lower()
++    if not FULL_SHA.match(text):
++        raise MergePrError("--head: the full frozen commit (40 hex), not %r" % (head,))
++    return text
++
++
++def _branch_name(target: str) -> str:
++    """`origin/main`, `refs/heads/main`, `main` : le même nom de branche."""
++    text = (target or "").strip()
++    if text.startswith("refs/heads/"):
++        text = text[len("refs/heads/"):]
++    if text.startswith("origin/"):
++        text = text.split("/", 1)[1]
++    return text
++
++
++def _pr_guards(view: dict, pr: int, head: str, target: str) -> None:
++    """Les gardes portées par la vue de la PR, rejouées avant toute écriture."""
++    state = (view.get("state") or "").upper()
++    if state != "OPEN":
++        raise MergePrError("PR #%d is %s, not open: nothing to merge" % (pr, state or "?"))
++    if view.get("isDraft"):
++        raise MergePrError("PR #%d is a draft: mark it ready for review first" % pr)
++    if not _same(view.get("headRefOid"), head):
++        raise MergePrError("PR #%d head moved: it is at %s, the freeze is %s; nothing "
++                           "written — refreeze and re-review the new head"
++                           % (pr, (view.get("headRefOid") or "?")[:12], head[:12]))
++    base = (view.get("baseRefName") or "").strip()
++    if base and _branch_name(base) != _branch_name(target):
++        raise MergePrError("PR #%d targets %s, not %s" % (pr, base, target))
++    merge_state = (view.get("mergeStateStatus") or "").upper()
++    if merge_state not in ("CLEAN", "HAS_HOOKS"):
++        raise MergePrError(
++            "PR #%d is not mergeable now (mergeStateStatus %s): the direct path never "
++            "weakens what the API checks — required checks, reviews or the base state "
++            "must be settled first" % (pr, merge_state or "?"))
++    if not radar.ci_green(view.get("statusCheckRollup") or []):
++        raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
++                           % (pr, head[:12]))
++
++
++def _project_of(cfg, repo: str):
++    """Le projet radar du dépôt, ou None (comme la file : pas de conditions
++    déclarées). Une configuration illisible ou ambiguë refuse, jamais ne
++    suppose l'absence de conditions."""
++    try:
++        return merge_queue.radar_project(cfg, repo)
++    except merge_queue.QueueError as exc:
++        raise MergePrError("cannot read the landing conditions of %s: %s" % (repo, exc)) \
++            from exc
++
++
++def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict) -> dict:
++    """L'admission de la file de fusion, rejouée telle quelle (#1003 B1) :
++    gel, verdict `ok` sur la tête (classe lue sur le diff gelé), cible non
++    protégée, CI verte de la PR sur cette tête, `ci_required` du projet. La
++    clone radar est le dépôt de travail de ce geste : `readiness` y lit la
++    branche du lot sur le distant, jamais dans le checkout de l'auteur."""
++    branch = (view.get("headRefName") or "").strip()
++
++    def ci_status(name: str):
++        if not branch or name != branch:
++            return None
++        return {"number": view.get("number"), "url": view.get("url") or "",
++                "head": (view.get("headRefOid") or "").lower(),
++                "green": radar.ci_green(view.get("statusCheckRollup") or []),
++                "draft": bool(view.get("isDraft"))}
++
++    clone = resolutions.Replayer(repo, owner)
++    try:
++        ready = merge_queue.readiness(db, lot, repo, ci=ci_status, clone=clone,
++                                      project=project, cfg=cfg)
++    except merge_queue.QueueError as exc:
++        raise MergePrError("lot #%d is not admitted by the merge queue: %s" % (lot, exc)) \
++            from exc
++    return ready
++
++
++def _ls_remote_ref(owner: str, url: str, ref: str) -> str:
++    """La valeur d'une ref sur le distant, en minuscules ; "" si illisible."""
++    text = _out(owner, "ls-remote", url, ref)
++    return text.split()[0].lower() if text.split() else ""
++
++
++def _remote_identity(url: str):
++    """L'identité d'un remote (#1003 B/P1) : `("github", owner/repo)` quand
++    l'URL désigne un dépôt GitHub, `("path", chemin réel)` quand c'est un
++    transport local (`file://` compris), None quand elle n'est pas
++    vérifiable — une identité non vérifiable ne s'accepte pas."""
++    text = (url or "").strip()
++    if not text:
++        return None
++    slug = migrations.github_repo(text)
++    if slug:
++        return ("github", migrations.repo_key(slug))
++    path = text[len("file://"):] if text.startswith("file://") else text
++    if os.path.isabs(path) and os.path.exists(path):
++        return ("path", os.path.realpath(path))
++    return None
++
++
++def _slug_identity(slug: str):
++    """L'identité du dépôt que `--repo` désigne : `("path", chemin réel)`
++    quand c'est un chemin local existant, `("github", owner/repo)` quand
++    c'est une clé GitHub nue, None quand elle n'est pas vérifiable. Une
++    identité non vérifiable ne s'accepte pas, et deux formes différentes ne
++    se lient jamais l'une à l'autre : un transport local n'est pas la preuve
++    d'une clé GitHub (R1 delta, cx3, 2026-10-13)."""
++    text = (slug or "").strip()
++    local = _remote_identity(text)
++    if local is not None:
++        return local
++    if _GITHUB_KEY.match(text):
++        return ("github", migrations.repo_key(text))
++    return None
++
++
++def _bind_repo_identity(repo: str, slug: str, fetch_url: str, push_url: str) -> tuple:
++    """Une seule identité de dépôt pour la PR, le lot, l'admission, la lecture
++    et le push (#1003 B/P1).
++
++    Le checkout (`repo`), `--fetch-url` et `--push-url` doivent désigner le
++    MÊME dépôt : clé `owner/repo` pour GitHub, chemin réel pour un transport
++    local. Le `slug` de la PR doit désigner cette même identité, dans la même
++    forme : depuis un clone de A, `--repo B` avec des remotes de A est refusé
++    comme une divergence, même quand A et B partagent les mêmes commits ; un
++    transport local avec une clé GitHub n'est pas vérifiable et refuse aussi.
++    Sans `origin` lisible, rien n'est vérifiable : le geste refuse avant toute
++    lecture de PR, toute admission et toute écriture."""
++    origin_url = plan_git._out(repo, "remote", "get-url", "origin") or ""
++    origin = _remote_identity(origin_url)
++    if origin is None:
++        raise MergePrError(
++            "cannot verify the repository of this checkout (%s): its origin is missing or "
++            "unreadable — run the gesture from the checkout of the repository it merges; "
++            "nothing written" % (_redact(origin_url) or "no origin"))
++    for what, url in (("--fetch-url", fetch_url), ("--push-url", push_url)):
++        ident = _remote_identity(url)
++        if ident is None:
++            raise MergePrError("cannot verify the identity of %s (%s): nothing written"
++                               % (what, _redact(url)))
++        if ident != origin:
++            raise MergePrError(
++                "%s (%s) and this checkout's origin (%s) are not the same repository: the "
++                "lot, its admission, the PR read and the push must be one repository; "
++                "nothing written" % (what, _redact(url), _redact(origin_url)))
++    slug_ident = _slug_identity(slug)
++    if slug_ident is None:
++        raise MergePrError(
++            "cannot verify the repository named by --repo %s: give owner/repo or the "
++            "checkout's real path; nothing written" % (slug,))
++    if slug_ident != origin:
++        raise MergePrError(
++            "--repo %s and this checkout's origin (%s) are not the same repository: the PR "
++            "read by gh and the repository whose guards admit and whose branch is pushed "
++            "must be one; nothing written" % (slug, _redact(origin_url)))
++    return origin
++
++
++def pr_view(slug: str, pr: int, gh=land._gh) -> dict:
++    """La PR lue par `gh` : état, base, tête, mergeabilité, checks."""
++    proc = gh(["pr", "view", str(pr), "--repo", slug, "--json",
++               "number,state,isDraft,baseRefName,headRefOid,headRefName,mergeStateStatus,"
++               "mergeCommit,statusCheckRollup,url,title"], timeout=60.0)
++    if proc.returncode != 0:
++        raise MergePrError("gh pr view #%s: %s"
++                           % (pr, (proc.stderr or proc.stdout or "").strip()[:300]))
++    return _json(proc, "gh pr view #%s" % pr)
++
++
++def message(pr: int, head: str, target: str, tip: str, tree: str, *,
++            title: str = "", head_ref: str = "", lot: int | None = None) -> str:
++    """Le message du commit de fusion : la PR, les gardes, le lot."""
++    subject = "Merge PR #%d%s into %s (fusion hors gh, #1003/REL-11)" % (
++        pr, " from %s" % head_ref if head_ref else "", target)
++    lines = [subject, ""]
++    if title:
++        lines += ["%s (tête %s)." % (title, head[:12]), ""]
++    lines += [
++        "Commit de fusion local : tête gelée == tête de la PR (%s), %s %s ancêtre du gel,"
++        % (head[:12], target, tip[:12]),
++        "arbre du commit de fusion == arbre du gel (%s), push --force-with-lease "
++        "(compare-and-swap)." % tree,
++        "L'API gh refuse la fusion d'une PR touchant %s** sans le scope workflow."
++        % WORKFLOW_PREFIX,
++    ]
++    if lot is not None:
++        lines += ["", "ameesh-work: %d" % lot]
++    return "\n".join(lines) + "\n"
++
++
++def _scratch() -> str:
++    path = tempfile.mkdtemp(prefix="ameesh-merge-pr-")
++    _check(path, "init", "-q")
++    return path
++
++
++def _fetch(owner: str, fetch_url: str, target: str, pr: int) -> tuple[str, str]:
++    """La tête de la cible et la tête de la PR, lues sur le remote de
++    lecture (le ref `refs/pull/<pr>/head` de GitHub, autoritatif)."""
++    proc = _run(owner, "fetch", "--quiet", "--no-tags", fetch_url,
++                "+refs/heads/%s:refs/ameesh/merge-pr/target" % target,
++                "+refs/pull/%d/head:refs/ameesh/merge-pr/head" % pr,
++                timeout=FETCH_TIMEOUT)
++    if proc.returncode != 0:
++        raise MergePrError(
++            "cannot read %s and refs/pull/%d/head from %s (%s): the read remote must "
++            "reach the repository" % (target, pr, _redact(fetch_url),
++                                      _redact(resolutions._err(proc)[-300:])))
++    tip = _check(owner, "rev-parse", "refs/ameesh/merge-pr/target")
++    head = _check(owner, "rev-parse", "refs/ameesh/merge-pr/head")
++    return tip, head
++
++
++def _ls_remote(owner: str, url: str, target: str) -> str:
++    text = _out(owner, "ls-remote", url, "refs/heads/%s" % target)
++    return text.split()[0].lower() if text.split() else ""
++
++
++def _already_lot_links(db, lot: int, head: str, view: dict, target: str, repo: str,
++                       cfg) -> None:
++    """An already-MERGED PR (#1003 N1, P2 blocker): the lot must carry the
++    freeze of this head, on the PR's branch and target, before any declaration.
++
++    A PR merged outside this command never passed the queue admission: linking
++    it by `--lot` alone would close an unrelated lot. Nothing is written here —
++    a missing or different link raises, and `work.merged` is not called. The
++    correct case (lot frozen on the head, same branch, same target) keeps its
++    previous behaviour."""
++    try:
++        row = work.get(db, lot)
++    except Exception as exc:  # noqa: BLE001 - registre illisible : rien n'est déclaré
++        raise MergePrError("lot #%d cannot be read (%s): the merge of an already-MERGED PR "
++                           "is not declared on it" % (lot, type(exc).__name__)) from exc
++    if row is None:
++        raise MergePrError("lot #%d not found: the merge of an already-MERGED PR is not "
++                           "declared on it" % lot)
++    if (row.get("state") or "").strip() == "closed":
++        raise MergePrError("lot #%d is closed (%s): the merge of an already-MERGED PR is not "
++                           "declared on it" % (lot, row.get("close_reason") or "closed"))
++    # N1 review (cx3): the MERGED view must name the frozen head (headRefOid),
++    # not only the fetched ref; a silent view proves nothing.
++    oid = (view.get("headRefOid") or "").strip().lower()
++    if not oid or not _same(oid, head):
++        raise MergePrError("PR #%s head is %s, the freeze is %s: nothing declared"
++                           % (view.get("number") or "?", oid[:12] or "?", head[:12]))
++    try:
++        marks = work.milestones(db, lot)
++    except Exception as exc:  # noqa: BLE001 - registre illisible : rien n'est déclaré
++        raise MergePrError("lot #%d milestones cannot be read (%s): nothing declared"
++                           % (lot, type(exc).__name__)) from exc
++    freeze = plan_git.latest_freeze(marks)
++    frozen = ((freeze or {}).get("sha") or "").strip().lower()
++    if not frozen:
++        raise MergePrError("lot #%d has no frozen commit: the merge of an already-MERGED PR "
++                           "is not declared on it" % lot)
++    if not _same(frozen, head):
++        raise MergePrError("lot #%d is frozen on %s, not on the PR head %s: nothing declared "
++                           "(an already-MERGED PR does not close another lot's freeze)"
++                           % (lot, frozen[:12], head[:12]))
++    branch = (view.get("headRefName") or "").strip()
++    lot_branch = (row.get("branch") or "").strip()
++    if not branch or not lot_branch or lot_branch != branch:
++        raise MergePrError("lot #%d is on branch %s, the PR head branch is %s: nothing "
++                           "declared" % (lot, lot_branch or "?", branch or "?"))
++    project = None
++    if cfg is not None:
++        project = _project_of(cfg, repo)
++    app = (row.get("app") or "").strip()
++    if project is not None and app and app != project.name:
++        raise MergePrError("lot #%d is declared on project %s, %s belongs to project %s: "
++                           "nothing declared" % (lot, app, repo, project.name))
++    expected = (row.get("branch_target") or "").strip()
++    if not expected and project is not None:
++        expected = (getattr(project, "target", "") or "").strip()
++    if not expected:
++        try:
++            expected = (plan_git.default_target(repo) or "").strip()
++        except (GitError, OSError):
++            expected = ""
++    if not expected or _branch_name(expected) != _branch_name(target):
++        raise MergePrError("lot #%d targets %s, the PR targets %s: nothing declared"
++                           % (lot, expected or "?", target))
++
++
++def _already(slug: str, pr: int, head: str, view: dict, *, target: str,
++             fetch_url: str, owner: str) -> dict:
++    """PR déjà MERGED : on vérifie que le gel est bien dans la cible."""
++    tip, fetched = _fetch(owner, fetch_url, target, pr)
++    contains = _run(owner, "merge-base", "--is-ancestor", head, tip).returncode == 0
++    out = {"state": "already" if contains and _same(fetched, head) else "already-unverified",
++           "pr": pr, "url": view.get("url") or "", "target": target, "frozen": head,
++           "tip": tip, "merge": ((view.get("mergeCommit") or {}).get("oid") or "").lower(),
++           "content_verified": contains,
++           "why": "" if contains else
++           "the frozen head %s is not an ancestor of %s %s (squash/rebase merge?): "
++           "check the merged content by hand" % (head[:12], target, tip[:12])}
++    return out
++
++
++# --------------------------------------------------------------------------
++# le geste
++# --------------------------------------------------------------------------
++
++def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None, cfg=None,
++                 project=None, target: str | None = None,
++                 fetch_url: str | None = None, push_url: str | None = None,
++                 gh=land._gh, dry_run: bool = False,
++                 attempts: int | None = None, poll_s: float | None = None,
++                 sleep=time.sleep, work_dir: str | None = None) -> dict:
++    """Fusionne la PR `pr` (tête `head`, lot `lot`) sur `target` par commit
++    local et push compare-and-swap hors jeton, avec les gardes du module —
++    dont l'admission de la file (`merge_queue.readiness`), rejouée avant
++    toute écriture puis une seconde fois juste avant le push. Rien n'est
++    écrit avant la garde fraîche ; `dry_run` s'arrête avant le push. Rend le
++    constat (`state`: merged | already | already-unverified | dry-run |
++    pushed-unverified)."""
++    head = check_head(head)
++    if lot is None:
++        raise MergePrError("--lot is required: the frozen lot carries the freeze and the "
++                           "review verdict this gesture replays, and the merge is declared "
++                           "on it")
++    slug = (slug or "").strip()
++    if not slug:
++        raise MergePrError("no GitHub repository: give --repo owner/repo")
++    slug_ident = _slug_identity(slug)
++    if slug_ident is None:
++        raise MergePrError("cannot verify the repository named by --repo %s: give owner/repo "
++                           "or the checkout's real path; nothing written" % (slug,))
++    if slug_ident[0] == "github":
++        slug = slug_ident[1]
++    fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
++    push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
++    # #1003 B/P1 : une seule identité de dépôt, vérifiée avant la première
++    # lecture ; une divergence n'écrit rien et n'admet rien.
++    _bind_repo_identity(repo, slug, fetch_url, push_url)
++    view = pr_view(slug, pr, gh=gh)
++    branch = (view.get("baseRefName") or "").strip()
++    target = (target or "").strip() or branch
++    try:
++        target = plan_git.check_ref(target, "target")
++    except ValueError as exc:
++        raise MergePrError(str(exc)) from exc
++    if branch and _branch_name(branch) != _branch_name(target):
++        raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
++
++    owner = work_dir or _scratch()
++    temporary = work_dir is None
++    try:
++        state = (view.get("state") or "").upper()
++        if state == "MERGED":
++            # N1 (#1003): an already-MERGED PR does not declare a lot without
++            # the lot/freeze/branch/target link; nothing is written otherwise.
++            _already_lot_links(db, lot, head, view, target, repo, cfg)
++            return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
++                            owner=owner)
++        if project is None:
++            project = _project_of(cfg, repo)
++        _pr_guards(view, pr, head, target)
++        ready = _admission(db, cfg, lot, repo, project, owner, view)
++        if not _same(ready.get("frozen_sha"), head):
++            raise MergePrError("lot #%d is admitted on %s, not on the freeze %s: refreeze and "
++                               "re-review" % (lot, (ready.get("frozen_sha") or "?")[:12],
++                                              head[:12]))
++        if _branch_name(ready.get("target")) != _branch_name(target):
++            raise MergePrError("lot #%d is queued for %s, not %s: merge it on its own target"
++                               % (lot, ready.get("target") or "?", target))
++        api_base = (view.get("baseRefOid") or "").lower()
++        merge_state = (view.get("mergeStateStatus") or "").upper()
++
++        tip, fetched = _fetch(owner, fetch_url, target, pr)
++        if not _same(fetched, head):
++            raise MergePrError("the remote PR head is %s, the freeze is %s: nothing written"
++                               % (fetched[:12], head[:12]))
++        base = _out(owner, "merge-base", tip, head)
++        if not base:
++            raise MergePrError("no common ancestor between %s and %s" % (tip[:12], head[:12]))
++        files = [f for f in _check(owner, "diff", "--name-only", base, head).splitlines()
++                 if f.strip()]
++        touched = [f for f in files if f.startswith(WORKFLOW_PREFIX)]
++        if not touched:
++            raise MergePrError("PR #%d does not touch %s**: use `gh pr merge` (the API), "
++                               "this path is reserved for the workflow-scope refusal"
++                               % (pr, WORKFLOW_PREFIX))
++        if _run(owner, "merge-base", "--is-ancestor", tip, head).returncode != 0:
++            raise MergePrError(
++                "%s moved since the freeze (%s is not an ancestor of %s): nothing written — "
++                "refusion %s into the branch, rerun the exact CI and the review, freeze again"
++                % (target, tip[:12], head[:12], target))
++
++        _check(owner, "checkout", "-q", "--detach", tip)
++        proc = _run(owner, "merge", "--no-ff", "--no-commit", "--quiet", head,
++                    timeout=FETCH_TIMEOUT)
++        if proc.returncode != 0:
++            conflicts = [f for f in resolutions.unmerged(owner)]
++            _run(owner, "merge", "--abort")
++            detail = ", ".join(conflicts[:6]) or _redact(resolutions._err(proc)[-200:])
++            raise MergePrError("the merge of %s on %s is not clean (%s): nothing written"
++                               % (head[:12], tip[:12], detail))
++        tree = _check(owner, "write-tree")
++        frozen_tree = _check(owner, "rev-parse", "%s^{tree}" % head)
++        if tree != frozen_tree:
++            _run(owner, "merge", "--abort")
++            raise MergePrError(
++                "the merge tree %s differs from the frozen tree %s: the merge would not be a "
++                "no-op — nothing written" % (tree[:12], frozen_tree[:12]))
++        text = message(pr, head, target, tip, tree, title=(view.get("title") or ""),
++                       head_ref=(view.get("headRefName") or ""), lot=lot)
++        proc = _run(owner, "-c", "user.name=%s" % IDENTITY[0],
++                    "-c", "user.email=%s" % IDENTITY[1],
++                    "commit", "--quiet", "--no-verify", "-F", "-", stdin=text.encode(),
++                    timeout=SHORT_TIMEOUT)
++        if proc.returncode != 0:
++            raise MergePrError("cannot write the merge commit: %s"
++                               % _redact(resolutions._err(proc)[-300:]))
++        merge_sha = _check(owner, "rev-parse", "HEAD")
++        parents = _check(owner, "rev-list", "--parents", "-n", "1", merge_sha).split()
++        if parents != [merge_sha, tip, head]:
++            raise MergePrError("the merge commit %s does not have (%s, %s) as parents: %s"
++                               % (merge_sha[:12], tip[:12], head[:12], " ".join(parents)))
++        evidence = {"pr": pr, "url": view.get("url") or "", "target": target,
++                    "frozen": head, "tip": tip, "api_base": api_base, "merge": merge_sha,
++                    "tree": tree, "frozen_tree": frozen_tree,
++                    "workflow_files": touched, "changed_files": len(files),
++                    "merge_state": merge_state,
++                    "admission": {"target": ready.get("target") or "",
++                                  "class": ready.get("class") or "",
++                                  "class_why": ready.get("class_why") or ""},
++                    "message": text}
++        # #1003 B1 : les gates du projet radar, sur l'arbre fusionné, comme la
++        # file les fait avant de pousser (aucun gate déclaré : rien à lancer).
++        if project is not None and (getattr(project, "gates", ())
++                                    or getattr(project, "path_gates", ())):
++            checked = land.gates(project, owner, files=files)
++            if not checked["ok"]:
++                _run(owner, "merge", "--abort")
++                raise MergePrError("gate `%s` failed on the merged tree: %s"
++                                   % (checked["gate"], checked["output"]))
++            evidence["gates"] = {"ok": True, "gate": checked["gate"]}
++        # #1003 B2 : garde fraîche juste avant l'écriture — la PR, l'admission
++        # de la file et les deux refs distantes sont relues ; toute mutation
++        # depuis la construction du commit de fusion arrête sans écrire.
++        fresh = pr_view(slug, pr, gh=gh)
++        _pr_guards(fresh, pr, head, target)
++        ready = _admission(db, cfg, lot, repo, project, owner, fresh)
++        if not _same(ready.get("frozen_sha"), head) \
++                or _branch_name(ready.get("target")) != _branch_name(target):
++            raise MergePrError("lot #%d moved during the gesture (admission now %s on %s): "
++                               "nothing written — refreeze and re-review"
++                               % (lot, (ready.get("frozen_sha") or "?")[:12],
++                                  ready.get("target") or "?"))
++        remote_pr = _ls_remote_ref(owner, fetch_url, "refs/pull/%d/head" % pr)
++        if not _same(remote_pr, head):
++            raise MergePrError("the remote PR head is now %s, the freeze is %s: nothing "
++                               "written — refreeze and re-review the new head"
++                               % (remote_pr[:12] or "?", head[:12]))
++        remote_target = _ls_remote(owner, fetch_url, target)
++        if not _same(remote_target, tip):
++            raise MergePrError("%s moved to %s during the gesture (read %s): nothing written "
++                               "— refusion %s into the branch, rerun the exact CI and the "
++                               "review, freeze again"
++                               % (target, remote_target[:12] or "?", tip[:12], target))
++        if dry_run:
++            evidence.update(state="dry-run", pushed=False, remote_tip="")
++            return evidence
++
++        ref = "refs/heads/%s" % target
++        try:
++            proc = _run(owner, "push", "--quiet", "--no-verify",
++                        "--force-with-lease=%s:%s" % (ref, tip), push_url,
++                        "%s:%s" % (merge_sha, ref), timeout=FETCH_TIMEOUT)
++            error = "" if proc.returncode == 0 else _redact(resolutions._err(proc)[-300:])
++        except GitError as exc:  # sortie du push inconnue : relire la cible
++            error = _redact("%s: %s" % (type(exc).__name__, exc))
++        remote_tip = _ls_remote(owner, fetch_url, target)
++        if error and not _same(remote_tip, merge_sha):
++            raise MergePrError("push refused or unreadable (%s); %s is at %s, not %s — nothing "
++                               "was written by this call; read it again before retrying"
++                               % (error, target, remote_tip[:12] or "?", merge_sha[:12]))
++
++        ok, last, final, merged_sha = False, None, "", ""
++        attempts = ATTEMPTS if attempts is None else max(1, int(attempts))
++        poll_s = POLL_S if poll_s is None else max(0.0, float(poll_s))
++        for attempt in range(attempts):
++            last = pr_view(slug, pr, gh=gh)
++            final = (last.get("state") or "").upper()
++            merged_sha = ((last.get("mergeCommit") or {}).get("oid") or "").lower()
++            if final == "MERGED" and _same(merged_sha, merge_sha) \
++                    and _same(remote_tip, merge_sha):
++                ok = True
++                break
++            if attempt + 1 < attempts:
++                sleep(poll_s)
++        remote_tip = _ls_remote(owner, fetch_url, target)
++        evidence.update(state="merged" if ok else "pushed-unverified", pushed=True,
++                        remote_tip=remote_tip, pr_state=final, pr_merge=merged_sha)
++        if not ok:
++            evidence["why"] = (
++                "pushed %s on %s, but the read-back is not conclusive (PR %s, merged commit "
++                "%s, %s tip %s): check the PR and the branch by hand before declaring the lot"
++                % (merge_sha[:12], target, final or "?", merged_sha[:12] or "?",
++                   target, remote_tip[:12] or "?"))
++        return evidence
++    finally:
++        if temporary:
++            shutil.rmtree(owner, ignore_errors=True)
++
++
++# --------------------------------------------------------------------------
++# command line
++# --------------------------------------------------------------------------
++
++def add_parser(work_sub, func) -> None:
++    parser = work_sub.add_parser(
++        "merge-pr", help="merge a PR touching .github/workflows/** when the token lacks the "
++                         "workflow scope (REL-11/#1003): local merge with guards, "
++                         "compare-and-swap push over a non-token remote, read-back")
++    parser.add_argument("pr", type=int)
++    parser.add_argument("--head", required=True,
++                        help="the frozen/reviewed commit, full 40-hex SHA")
++    parser.add_argument("--repo", default=None, help="GitHub owner/repo (default: origin)")
++    parser.add_argument("--target", default=None,
++                        help="target branch (default: the PR base)")
++    parser.add_argument("--fetch-url", default=None,
++                        help="remote read for the PR and the target (default: origin)")
++    parser.add_argument("--push-url", default=None,
++                        help="non-token remote pushed to (default: git@github.com:owner/repo.git)")
++    parser.add_argument("--lot", type=int, required=True,
++                        help="the frozen lot that authorizes the gesture (freeze, review "
++                             "verdict, admission); the merge is declared on it")
++    parser.add_argument("--dry-run", action="store_true",
++                        help="run every guard and build the merge commit; push nothing")
++    parser.add_argument("--json", action="store_true")
++    parser.add_argument("--actor", default="")
++    parser.set_defaults(func=func)
++
++
++def _human(out: dict) -> str:
++    state = out.get("state")
++    if state == "dry-run":
++        return ("PR #%s: guards pass, merge commit %s would be pushed on %s (tree %s == frozen "
++                "tree %s, %s workflow file(s)); nothing pushed"
++                % (out["pr"], out["merge"][:12], out["target"], out["tree"][:12],
++                   out["frozen_tree"][:12], len(out.get("workflow_files") or [])))
++    if state == "already":
++        return ("PR #%s is already MERGED: %s is on %s (%s)"
++                % (out["pr"], out["frozen"][:12], out["target"], out["tip"][:12]))
++    if state == "already-unverified":
++        return "PR #%s is already MERGED but %s" % (out["pr"], out.get("why") or "")
++    if state == "merged":
++        text = ("PR #%s merged: %s on %s (tree %s == frozen tree %s, push --force-with-lease)"
++                % (out["pr"], out["merge"][:12], out["target"], out["tree"][:12],
++                   out["frozen_tree"][:12]))
++        recorded = out.get("recorded")
++        if recorded:
++            text += "; lot #%s declared merged" % out.get("lot")
++        elif out.get("record_warning"):
++            text += "; WARNING lot not declared: %s" % out["record_warning"]
++        return text
++    return "PR #%s: %s" % (out["pr"], out.get("why") or state)
++
++
++def run(cfg, db, args) -> int:
++    import sys
++    try:
++        cwd = os.getcwd()
++        slug = (args.repo or migrations.origin_repo(cwd) or "").strip()
++        if not slug:
++            raise MergePrError("cannot read the GitHub repository from origin: give --repo "
++                               "owner/repo")
++        # la voie opérateur ne fusionne qu'une PR GitHub : un chemin local
++        # n'est pas vérifiable contre un slug GitHub (delta cx3) et la
++        # commande le refuse, plutôt que de laisser `gh` échouer plus loin.
++        slug_ident = _slug_identity(slug)
++        if slug_ident is None:
++            raise MergePrError("cannot verify the repository named by --repo %s: give "
++                               "owner/repo; nothing written" % (slug,))
++        if slug_ident[0] != "github":
++            raise MergePrError("--repo %s is a local transport: this command merges a GitHub "
++                               "PR, give --repo owner/repo; nothing written" % (slug,))
++        origin = plan_git._out(cwd, "remote", "get-url", "origin") or ""
++        fetch_url = args.fetch_url or origin or ("https://github.com/%s.git" % slug)
++        push_url = check_push_url(args.push_url or ("git@github.com:%s.git" % slug))
++        out = direct_merge(slug, args.pr, args.head, lot=args.lot, repo=cwd, db=db, cfg=cfg,
++                           target=args.target, fetch_url=fetch_url, push_url=push_url,
++                           dry_run=args.dry_run)
++        # N1 (#1003): `--dry-run` never declares anything, including on an
++        # already-MERGED PR (the `already` finding is not a write).
++        if out.get("state") in ("merged", "already") and not args.dry_run:
++            out["lot"] = args.lot
++            sha = out.get("merge") or out.get("tip") or ""
++            try:
++                if not sha:
++                    raise MergePrError("no merge commit to declare")
++                out["recorded"] = work.merged(
++                    db, args.lot, sha=sha, actor=args.actor,
++                    note="ameesh work merge-pr %d --head %s (fusion hors gh, "
++                         "#1003/REL-11)" % (args.pr, out["frozen"][:12]))
++            except Exception as exc:  # noqa: BLE001 - la fusion est un fait, jamais défaite
++                out["record_warning"] = "%s: %s" % (type(exc).__name__, str(exc)[:200])
++        print(json.dumps(out, ensure_ascii=False, indent=2) if args.json else _human(out))
++        if out["state"] in ("merged", "already", "dry-run"):
++            return 0
++        return 1 if out["state"] == "already-unverified" else 2
++    except (MergePrError, GitError) as exc:
++        print("error: %s" % exc, file=sys.stderr)
++        return 1
+diff --git a/src/ameesh/mesh_cli.py b/src/ameesh/mesh_cli.py
+index ba826113e..cd7b6f3ae 100644
+--- a/src/ameesh/mesh_cli.py
++++ b/src/ameesh/mesh_cli.py
+@@ -1315,6 +1315,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
+         if args.work_command == "land":   # merge of the head of the queue (L160e2)
+             from . import land
+             return land.run(cfg, db, args)
++        if args.work_command == "merge-pr":   # REL-11 (#1003) : fusion hors API gh
++            from . import merge_pr
++            return merge_pr.run(cfg, db, args)
+         if args.work_command == "add":
+             # L37 (0030, règle 2) : attribution gardée — un assigné non
+             # réveillable est refusé AVANT la création (WorkError, code 1).
+@@ -2478,6 +2481,8 @@ def build_parser() -> argparse.ArgumentParser:
+     merge_queue.add_parser(work_sub, cmd_work)  # merge queue per target (L160e)
+     from . import land
+     land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
++    from . import merge_pr
++    merge_pr.add_parser(work_sub, cmd_work)  # fusion hors API gh (REL-11, #1003)
+ 
+     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
+     cost_sub = p_cost.add_subparsers(dest="cost_command")
+diff --git a/tests/test_1003_merge_pr.py b/tests/test_1003_merge_pr.py
+new file mode 100644
+index 000000000..0f50c001d
+--- /dev/null
++++ b/tests/test_1003_merge_pr.py
+@@ -0,0 +1,646 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#1003 REL-11 : fusion hors API gh d'une PR touchant `.github/workflows/**`.
++
++Le geste est testé sur de vrais dépôts git (un `origin` nu, `refs/pull/<pr>/head`
++comme GitHub) et un faux `gh` : gardes (gel, cible non déplacée, arbre, PR hors
++workflow refusée, mergeabilité et checks), commit de fusion à deux parents,
++push compare-and-swap refusé quand la cible bouge, relecture PR MERGED,
++`--dry-run`, et chemins « déjà fusionnée ».
++"""
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import tempfile
++import time
++import unittest
++from unittest import mock
++
++from ameesh import merge_pr, merge_queue, radar, work
++
++from .test_l160b_radar import _git
++
++
++def _write(repo, path, text):
++    full = os.path.join(repo, path)
++    os.makedirs(os.path.dirname(full), exist_ok=True)
++    with open(full, "w", encoding="utf-8") as fh:
++        fh.write(text)
++
++
++class FakeGh:
++    """`gh pr view` : la vue initiale, puis `fresh` (la garde fraîche juste
++    avant l'écriture, la vue initiale par défaut), puis `later()` pour chaque
++    relecture d'après le push."""
++
++    def __init__(self, first: dict, fresh=None, later=None):
++        self.first, self.fresh, self.later, self.calls = first, fresh, later, []
++
++    def __call__(self, args, *, timeout=60.0):
++        self.calls.append(list(args))
++        rank = len(self.calls)
++        if rank == 1:
++            data = self.first
++        elif rank == 2:
++            data = self.fresh if self.fresh is not None else self.first
++        elif self.later is not None:
++            data = self.later()
++        else:
++            data = self.first
++        return subprocess.CompletedProcess(["gh", *args], 0, json.dumps(data), "")
++
++
++def view(**over):
++    data = {"number": 7, "state": "OPEN", "isDraft": False, "baseRefName": "main",
++            "baseRefOid": "", "headRefOid": "", "headRefName": "lot/7-work",
++            "mergeStateStatus": "CLEAN", "mergeCommit": None, "url": "https://x/7",
++            "title": "le lot", "statusCheckRollup": [
++                {"__typename": "CheckRun", "name": "tests", "status": "COMPLETED",
++                 "conclusion": "SUCCESS"}]}
++    data.update(over)
++    return data
++
++
++class _Base(unittest.TestCase):
++    LOT = 1003
++    BRANCH = "lot/7-work"
++
++    def setUp(self):
++        self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
++        self.addCleanup(shutil.rmtree, self.tmp, True)
++        self.repo = os.path.join(self.tmp, "repo")
++        os.makedirs(self.repo)
++        _git(self.repo, "init", "-q")
++        _write(self.repo, ".github/workflows/ci.yml", "on: push\n")
++        _write(self.repo, "src/app.py", "print('base')\n")
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-q", "-m", "base")
++        _git(self.repo, "branch", "-M", "main")
++        self.base = _git(self.repo, "rev-parse", "main")
++        self.origin = os.path.join(self.tmp, "origin.git")
++        subprocess.run(["git", "clone", "-q", "--bare", self.repo, self.origin],
++                       check=True, capture_output=True)
++        # la branche de la PR : un fichier de workflow ET un fichier de code
++        _git(self.repo, "checkout", "-q", "-b", "lot/7-work")
++        _write(self.repo, ".github/workflows/ci.yml", "on: push\njobs:\n  t:\n    steps: []\n")
++        _write(self.repo, "src/app.py", "print('head')\n")
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-q", "-m", "head")
++        self.head = _git(self.repo, "rev-parse", "HEAD")
++        _git(self.repo, "remote", "add", "origin", self.origin)
++        _git(self.repo, "push", "-q", "origin", "lot/7-work")
++        _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
++        self.slug = self.origin
++        # le banc transporte par chemins locaux : l'identité de la PR est ce
++        # même chemin ; un slug GitHub ne se lierait pas à ce transport (R1
++        # delta cx3)
++        # le lot : gelé et relu sur la tête courante — l'admission de la file
++        # (`readiness`) est la vraie garde, ses lectures de base sont simulées.
++        self.lot = self.LOT
++        self.lot_branch = self.BRANCH
++        self.lot_target = "main"
++        self.lot_marks = []
++        self.ready_marks()
++        for patch in (
++                mock.patch.object(work, "get", side_effect=self._lot_row),
++                mock.patch.object(work, "milestones",
++                                  side_effect=lambda db, n, *a, **kw: list(self.lot_marks))):
++            patch.start()
++            self.addCleanup(patch.stop)
++
++    def _lot_row(self, db, lot, *a, **kw):
++        row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
++               "branch_target": self.lot_target, "title": "le lot", "app": "ameesh"}
++        if getattr(self, "lot_state", None):
++            row["state"] = self.lot_state
++            row["close_reason"] = "abandoned"
++        return row
++
++    def ready_marks(self, head=None, *, verdict="ok", sha=None):
++        """Le lot gelé sur `head` et son verdict ; `sha` déplace le verdict."""
++        head = head or self.head
++        self.lot_marks = [
++            {"id": 1, "kind": "frozen", "sha": head, "at_ts": 1.0},
++            {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha or head,
++             "at_ts": 2.0},
++        ]
++
++    def tip(self, ref="main"):
++        return _git(self.origin, "rev-parse", ref).lower()
++
++    def gh(self, later=None, fresh=None, **over):
++        over.setdefault("headRefOid", self.head)
++        return FakeGh(view(**over), fresh=fresh, later=later)
++
++    def merge(self, gh, slug=None, **kw):
++        kw.setdefault("target", "main")
++        kw.setdefault("fetch_url", self.origin)
++        kw.setdefault("push_url", self.origin)
++        kw.setdefault("attempts", 2)
++        kw.setdefault("poll_s", 0)
++        kw.setdefault("sleep", lambda s: None)
++        kw.setdefault("lot", self.lot)
++        kw.setdefault("repo", self.repo)
++        kw.setdefault("db", None)
++        kw.setdefault("cfg", None)
++        return merge_pr.direct_merge(slug or self.slug, 7, self.head, gh=gh, **kw)
++
++    def move_main(self):
++        """Un commit de plus sur `main` dans l'origin, hors du gel."""
++        mover = os.path.join(self.tmp, "mover")
++        if not os.path.isdir(mover):
++            subprocess.run(["git", "clone", "-q", self.origin, mover], check=True,
++                           capture_output=True)
++        _write(mover, "README.md", "moved %f\n" % time.time())
++        _git(mover, "add", "-A")
++        _git(mover, "commit", "-q", "-m", "moved")
++        _git(mover, "push", "-q", "origin", "main")
++        return _git(self.origin, "rev-parse", "main").lower()
++
++
++class GuardTest(_Base):
++    def test_dry_run_builds_the_merge_commit_without_pushing(self):
++        gh = self.gh()
++        out = self.merge(gh, dry_run=True)
++        self.assertEqual(out["state"], "dry-run", out)
++        self.assertEqual(self.tip(), self.base)          # rien n'a bougé
++        self.assertEqual(out["tree"], out["frozen_tree"])
++        self.assertEqual(out["workflow_files"], [".github/workflows/ci.yml"])
++        self.assertIn("ameesh-work: %d" % self.lot, out["message"])
++        # la vue initiale puis la garde fraîche, aucune relecture d'après push
++        self.assertEqual([c[:2] for c in gh.calls], [["pr", "view"], ["pr", "view"]])
++
++    def test_head_moved_is_refused_before_anything(self):
++        gh = self.gh(headRefOid="a" * 40)
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(gh)
++        self.assertIn("head moved", str(caught.exception))
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_pr_without_workflow_is_refused(self):
++        # une tête qui ne touche pas .github/workflows/** : une branche montée
++        # depuis main, déclarée comme branche du lot (gelée et relue)
++        _git(self.repo, "checkout", "-q", "main")
++        _git(self.repo, "checkout", "-q", "-b", "lot/7-code")
++        _write(self.repo, "src/app.py", "print('code only')\n")
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-q", "-m", "code only")
++        head = _git(self.repo, "rev-parse", "HEAD")
++        _git(self.repo, "push", "-q", "origin", "lot/7-code")
++        _git(self.origin, "update-ref", "refs/pull/7/head", head)
++        self.head = head
++        self.lot_branch = "lot/7-code"
++        self.ready_marks(head)
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(self.gh(headRefName="lot/7-code"))
++        self.assertIn("does not touch .github/workflows/**", str(caught.exception))
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_blocked_pr_is_refused(self):
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(self.gh(mergeStateStatus="BLOCKED"))
++        self.assertIn("mergeStateStatus BLOCKED", str(caught.exception))
++
++    def test_checks_not_green_are_refused(self):
++        rollup = [{"__typename": "CheckRun", "name": "tests", "status": "IN_PROGRESS",
++                   "conclusion": ""}]
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(self.gh(statusCheckRollup=rollup))
++        self.assertIn("not all concluded and green", str(caught.exception))
++
++    def test_draft_is_refused(self):
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(self.gh(isDraft=True))
++        self.assertIn("draft", str(caught.exception))
++
++    def test_target_moved_since_the_freeze_is_refused(self):
++        moved = self.move_main()
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(self.gh())
++        self.assertIn("moved since the freeze", str(caught.exception))
++        self.assertEqual(self.tip(), moved)   # le commit de plus est intact
++
++    def test_a_target_that_moves_before_the_fresh_guard_is_refused(self):
++        gh = self.gh()
++        original = merge_pr.message
++        moved = []
++
++        def side_effect(*a, **kw):
++            moved.append(self.move_main())
++            return original(*a, **kw)
++
++        with mock.patch.object(merge_pr, "message", side_effect=side_effect):
++            with self.assertRaises(merge_pr.MergePrError) as caught:
++                self.merge(gh)
++        self.assertTrue(moved)
++        self.assertIn("during the gesture", str(caught.exception))
++        self.assertEqual(self.tip(), moved[-1])   # rien n'a été écrasé
++
++    def test_a_target_that_moves_after_the_fresh_guard_is_refused_by_the_lease(self):
++        gh = self.gh()
++        original, moved = merge_pr._run, []
++
++        def side_effect(cwd, *args, **kw):
++            if args and args[0] == "push":
++                moved.append(self.move_main())
++            return original(cwd, *args, **kw)
++
++        with mock.patch.object(merge_pr, "_run", side_effect=side_effect):
++            with self.assertRaises(merge_pr.MergePrError) as caught:
++                self.merge(gh)
++        self.assertTrue(moved)
++        self.assertIn("push refused", str(caught.exception))
++        self.assertEqual(self.tip(), moved[-1])   # rien n'a été écrasé
++
++    def test_the_push_url_must_not_be_the_token_path(self):
++        for url in ("https://github.com/o/r.git", "http://github.com/o/r.git"):
++            with self.subTest(url=url):
++                with self.assertRaises(merge_pr.MergePrError) as caught:
++                    merge_pr.check_push_url(url)
++                self.assertIn("token", str(caught.exception))
++        self.assertEqual(merge_pr.check_push_url("git@github.com:o/r.git"),
++                         "git@github.com:o/r.git")
++        self.assertEqual(merge_pr.check_push_url(self.origin), self.origin)
++
++    def test_the_frozen_commit_must_be_a_full_sha(self):
++        for bad in ("", "abc", self.head[:12], "z" * 40):
++            with self.subTest(bad=bad):
++                with self.assertRaises(merge_pr.MergePrError):
++                    merge_pr.check_head(bad)
++        self.assertEqual(merge_pr.check_head(self.head.upper()), self.head)
++
++    def test_the_target_branch_is_validated(self):
++        with self.assertRaises(merge_pr.MergePrError):
++            self.merge(self.gh(), target="..bad")
++
++
++class IdentityTest(_Base):
++    """#1003 B/P1 (R1 delta) : une seule identité de dépôt pour la PR lue, le
++    lot, l'admission, la lecture et le push. Le négatif A/B reprend le témoin
++    de l'auditeur : deux dépôts qui partagent la base et le gel, B protégé
++    (`protected=[main]`) et les remotes du geste sur B — A ne peut pas être
++    admis par les conditions de B, ni l'inverse."""
++
++    def _twin(self):
++        """Un dépôt B avec les MÊMES commits (base et gel) que A."""
++        twin = os.path.join(self.tmp, "twin.git")
++        subprocess.run(["git", "clone", "-q", "--bare", self.repo, twin],
++                       check=True, capture_output=True)
++        _git(twin, "update-ref", "refs/pull/7/head", self.head)
++        return twin
++
++    def test_remotes_of_another_repository_are_refused(self):
++        twin = self._twin()
++        before = _git(twin, "rev-parse", "main").lower()
++        gh = self.gh()
++        with mock.patch.object(merge_pr, "_project_of",
++                               side_effect=AssertionError("admission reached")):
++            with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
++                self.merge(gh, fetch_url=twin, push_url=twin)
++        self.assertEqual(gh.calls, [])                   # rien n'a été lu
++        self.assertEqual(before, _git(twin, "rev-parse", "main").lower())
++        self.assertEqual(self.tip(), self.base)          # rien n'a bougé non plus
++
++    def test_a_local_origin_with_a_github_slug_is_refused_before_any_read(self):
++        """Le cas inverse du témoin R1 (cx3) : une PR de B, protégée, et les
++        remotes de A — refus avant gh, avant la résolution radar et avant
++        toute admission ou écriture."""
++        gh = self.gh()
++        protected_b = radar.Project(name="b", repo=self.repo, github="b/repo",
++                                    protected=("main",))
++        with mock.patch.object(merge_pr.merge_queue, "radar_project",
++                               return_value=protected_b) as resolved, \
++                mock.patch.object(merge_pr.merge_queue, "readiness",
++                                  side_effect=AssertionError("admission reached")):
++            with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
++                self.merge(gh, slug="b/repo")
++        self.assertEqual(gh.calls, [])
++        self.assertEqual(resolved.call_count, 0)
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_pr_of_another_repository_is_refused(self):
++        _git(self.repo, "remote", "set-url", "origin", "https://github.com/a/repo.git")
++        with self.assertRaisesRegex(merge_pr.MergePrError, "not the same repository"):
++            self.merge(self.gh(), slug="b/repo",
++                       fetch_url="https://github.com/a/repo.git",
++                       push_url="git@github.com:a/repo.git")
++
++    def test_a_checkout_without_a_readable_origin_is_refused(self):
++        _git(self.repo, "remote", "remove", "origin")
++        with self.assertRaisesRegex(merge_pr.MergePrError, "cannot verify"):
++            self.merge(self.gh())
++
++    def test_an_unverifiable_remote_is_refused(self):
++        with self.assertRaisesRegex(merge_pr.MergePrError, "cannot verify"):
++            self.merge(self.gh(), fetch_url="somewhere/else")
++
++    def test_the_same_repository_under_another_form_is_accepted(self):
++        out = self.merge(self.gh(), dry_run=True, fetch_url=self.origin + "/")
++        self.assertEqual(out["state"], "dry-run", out)
++
++
++class MergeTest(_Base):
++    def test_merge_pushes_a_two_parent_commit_at_the_frozen_tree(self):
++        gh = self.gh(later=lambda: view(
++            state="MERGED", headRefOid=self.head,
++            mergeCommit={"oid": self.tip()}))
++        out = self.merge(gh)
++        self.assertEqual(out["state"], "merged", out)
++        tip = self.tip()
++        self.assertEqual(tip, out["merge"])
++        self.assertEqual(_git(self.origin, "rev-parse", "main^1").lower(), self.base)
++        self.assertEqual(_git(self.origin, "rev-parse", "main^2").lower(), self.head)
++        self.assertEqual(_git(self.origin, "rev-parse", "main^{tree}").lower(),
++                         out["frozen_tree"])
++        self.assertIn("#1003/REL-11",
++                      _git(self.origin, "log", "-1", "--format=%B", "main"))
++        self.assertTrue(all(c[:2] == ["pr", "view"] for c in gh.calls), gh.calls)
++
++    def test_the_lot_trailer_names_the_lot(self):
++        gh = self.gh()
++        out = self.merge(gh, dry_run=True, lot=1003)
++        self.assertIn("ameesh-work: 1003", out["message"])
++
++    def test_a_read_back_that_stays_open_is_reported_pushed_unverified(self):
++        gh = self.gh(later=lambda: view(headRefOid=self.head))
++        out = self.merge(gh)
++        self.assertEqual(out["state"], "pushed-unverified", out)
++        self.assertTrue(out["pushed"])
++        self.assertIn("check the PR and the branch by hand", out["why"])
++        self.assertEqual(self.tip(), out["merge"])   # le push a bien eu lieu
++
++    def test_the_read_back_must_name_the_pushed_commit(self):
++        gh = self.gh(later=lambda: view(state="MERGED", headRefOid=self.head,
++                                        mergeCommit={"oid": "b" * 40}))
++        out = self.merge(gh)
++        self.assertEqual(out["state"], "pushed-unverified", out)
++        self.assertEqual(out["pr_merge"], "b" * 40)
++
++    def test_an_already_merged_pr_is_verified_without_pushing(self):
++        _git(self.origin, "update-ref", "refs/heads/main", self.head)
++        gh = self.gh(state="MERGED", mergeCommit={"oid": self.head})
++        out = self.merge(gh)
++        self.assertEqual(out["state"], "already", out)
++        self.assertTrue(out["content_verified"])
++        self.assertEqual(self.tip(), self.head)
++        self.assertEqual([c[:2] for c in gh.calls], [["pr", "view"]])
++
++    def test_an_already_merged_pr_whose_head_is_not_in_the_target_is_unverified(self):
++        gh = self.gh(state="MERGED", mergeCommit={"oid": "c" * 40})
++        out = self.merge(gh)
++        self.assertEqual(out["state"], "already-unverified", out)
++        self.assertFalse(out["content_verified"])
++        self.assertEqual(self.tip(), self.base)
++
++    def test_an_already_merged_pr_without_a_freeze_on_its_head_is_refused(self):
++        # N1 (#1003): without the lot's freeze on this head nothing is declared
++        # — a wrong `--lot` does not close an unrelated lot.
++        for marks, needle in (
++                ([], "has no frozen commit"),
++                ([{"id": 1, "kind": "frozen", "sha": "d" * 40, "at_ts": 1.0}],
++                 "is frozen on")):
++            with self.subTest(needle=needle):
++                self.lot_marks = marks
++                with self.assertRaises(merge_pr.MergePrError) as caught:
++                    self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
++                self.assertIn(needle, str(caught.exception))
++        self.assertEqual(self.tip(), self.base)
++
++    def test_an_already_merged_pr_of_another_lot_is_refused(self):
++        # the lot's branch must be the PR's one: two lots do not share a head
++        # by accident.
++        self.lot_branch = "lot/other"
++        with self.assertRaisesRegex(merge_pr.MergePrError, "on branch"):
++            self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
++
++    def test_an_already_merged_pr_on_another_target_is_refused(self):
++        self.lot_target = "release/1"
++        with self.assertRaisesRegex(merge_pr.MergePrError, "targets release/1"):
++            self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
++
++    def test_an_already_merged_view_that_does_not_name_the_head_is_refused(self):
++        with self.assertRaisesRegex(merge_pr.MergePrError, "head is"):
++            self.merge(self.gh(state="MERGED", headRefOid="a" * 40,
++                              mergeCommit={"oid": self.head}))
++
++    def test_an_already_merged_pr_on_a_closed_lot_is_refused(self):
++        # a closed lot is never reopened by an already-MERGED PR: the refusal
++        # precedes `work.merged`, which is not called.
++        self.lot_state = "closed"
++        with self.assertRaisesRegex(merge_pr.MergePrError, "is closed"):
++            self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
++
++    def test_a_closed_pr_is_refused(self):
++        with self.assertRaises(merge_pr.MergePrError) as caught:
++            self.merge(self.gh(state="CLOSED"))
++        self.assertIn("not open", str(caught.exception))
++
++
++class AdmissionGuardTest(_Base):
++    """#1003 B1 : l'admission de la file (`readiness`) est rejouée telle quelle
++    — lot gelé, verdict `ok` sur la tête, cible protégée, cible du lot,
++    `ci_required` — et rien n'est écrit quand elle refuse."""
++
++    def test_the_lot_is_required(self):
++        with self.assertRaisesRegex(merge_pr.MergePrError, "lot is required"):
++            self.merge(self.gh(), lot=None)
++
++    def test_no_verdict_on_the_freeze_is_refused(self):
++        self.lot_marks = [{"id": 1, "kind": "frozen", "sha": self.head, "at_ts": 1.0}]
++        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
++            self.merge(self.gh())
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_blocked_verdict_is_refused(self):
++        self.ready_marks(verdict="blocked")
++        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
++            self.merge(self.gh())
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_verdict_on_another_commit_is_refused(self):
++        self.ready_marks(sha=self.base)
++        with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
++            self.merge(self.gh())
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_branch_that_moved_after_the_freeze_is_refused(self):
++        _write(self.repo, "src/more.py", "x\n")
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-q", "-m", "after freeze")
++        self.head = _git(self.repo, "rev-parse", "HEAD")
++        _git(self.repo, "push", "-q", "origin", self.lot_branch)
++        _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
++        with self.assertRaisesRegex(merge_pr.MergePrError, "not at its freeze"):
++            self.merge(self.gh())
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_protected_target_is_refused(self):
++        project = radar.Project(name="p", repo=self.repo, github="o/r",
++                                protected=("main",))
++        with self.assertRaisesRegex(merge_pr.MergePrError, "protected target"):
++            self.merge(self.gh(), project=project)
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_target_the_lot_is_not_queued_for_is_refused(self):
++        self.lot_target = "develop"
++        with self.assertRaisesRegex(merge_pr.MergePrError, "queued for"):
++            self.merge(self.gh())
++        self.assertEqual(self.tip(), self.base)
++
++    def test_ci_required_red_on_the_frozen_commit_is_refused(self):
++        project = radar.Project(name="p", repo=self.repo, github="o/r", ci_required=True)
++        red = {"runs": 1, "green": False, "pending": [], "failed": ["tests"]}
++        with mock.patch.object(merge_pr.radar, "commit_ci", return_value=red):
++            with self.assertRaisesRegex(merge_pr.MergePrError, "is red"):
++                self.merge(self.gh(), project=project)
++        self.assertEqual(self.tip(), self.base)
++
++
++class FreshGuardTest(_Base):
++    """#1003 B2 : la garde fraîche juste avant l'écriture — toute mutation
++    depuis la construction du commit de fusion arrête sans pousser."""
++
++    def test_a_head_that_moves_after_the_merge_commit_is_refused_before_the_push(self):
++        gh = self.gh(fresh=view(headRefOid="b" * 40))
++        with self.assertRaisesRegex(merge_pr.MergePrError, "head moved"):
++            self.merge(gh)
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_check_that_turns_red_is_refused_before_the_push(self):
++        fresh = view(headRefOid=self.head, statusCheckRollup=[
++            {"__typename": "CheckRun", "name": "tests", "status": "COMPLETED",
++             "conclusion": "FAILURE"}])
++        with self.assertRaisesRegex(merge_pr.MergePrError, "not all concluded and green"):
++            self.merge(self.gh(fresh=fresh))
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_pr_closed_after_the_merge_commit_is_refused_before_the_push(self):
++        with self.assertRaisesRegex(merge_pr.MergePrError, "not open"):
++            self.merge(self.gh(fresh=view(state="CLOSED")))
++        self.assertEqual(self.tip(), self.base)
++
++    def test_a_verdict_withdrawn_after_the_merge_commit_is_refused_before_the_push(self):
++        gh = self.gh()
++        original = merge_pr.message
++
++        def side_effect(*a, **kw):
++            self.ready_marks(verdict="blocked")
++            return original(*a, **kw)
++
++        with mock.patch.object(merge_pr, "message", side_effect=side_effect):
++            with self.assertRaisesRegex(merge_pr.MergePrError, "no review verdict ok"):
++                self.merge(gh)
++        self.assertEqual(self.tip(), self.base)
++
++
++class RunTest(unittest.TestCase):
++    """La ligne de commande : constat, enregistrement du lot, codes de sortie."""
++
++    def args(self, **over):
++        import argparse
++        data = dict(repo="o/r", fetch_url="", push_url="git@github.com:o/r.git",
++                    target=None, pr=7, head="a" * 40, dry_run=False, lot=1003, json=True,
++                    actor="impl-03")
++        data.update(over)
++        return argparse.Namespace(**data)
++
++    def run_with(self, out, args=None, **patches):
++        import contextlib
++        import io
++        args = args or self.args()
++        buf = io.StringIO()
++        with mock.patch.object(merge_pr, "direct_merge", return_value=dict(out)), \
++             mock.patch.object(merge_pr.plan_git, "_out", return_value=""), \
++             mock.patch.object(merge_pr.migrations, "origin_repo", return_value="o/r"), \
++             contextlib.redirect_stdout(buf):
++            code = merge_pr.run(None, None, args)
++        return code, buf.getvalue()
++
++    def test_a_verified_merge_is_declared_on_the_lot(self):
++        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
++               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
++               "tip": "d" * 40}
++        with mock.patch.object(merge_pr.work, "merged",
++                               return_value={"result": "merged"}) as recorded:
++            code, text = self.run_with(out, args=self.args(lot=1003, json=False))
++        self.assertEqual(code, 0)
++        self.assertIn("declared merged", text)
++        self.assertEqual(recorded.call_args.kwargs["sha"], "b" * 40)
++        self.assertEqual(recorded.call_args.kwargs["actor"], "impl-03")
++
++    def test_a_lot_that_cannot_be_declared_does_not_undo_the_merge(self):
++        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
++               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
++               "tip": "d" * 40}
++        patcher = mock.patch.object(merge_pr.work, "merged",
++                                    side_effect=RuntimeError("lot closed"))
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        code, text = self.run_with(out, args=self.args(lot=1003, json=False))
++        self.assertEqual(code, 0)
++        self.assertIn("WARNING lot not declared", text)
++
++    def test_an_already_merged_pr_is_declared_on_its_lot(self):
++        out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
++               "tip": "d" * 40, "target": "main"}
++        with mock.patch.object(merge_pr.work, "merged",
++                               return_value={"result": "merged"}) as recorded:
++            code, _ = self.run_with(out, args=self.args(lot=1003, json=True))
++        self.assertEqual(code, 0)
++        self.assertEqual(recorded.call_args.kwargs["sha"], "b" * 40)
++
++    def test_dry_run_declares_nothing_even_on_an_already_merged_pr(self):
++        # N1 (#1003): `--dry-run` never declares, `already` included.
++        out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
++               "tip": "d" * 40, "target": "main"}
++        with mock.patch.object(merge_pr.work, "merged") as recorded:
++            code, _ = self.run_with(out, args=self.args(dry_run=True, json=True))
++        self.assertEqual(code, 0)
++        recorded.assert_not_called()
++
++    def test_exit_codes_name_the_uncertainty(self):
++        for state, expected in (("pushed-unverified", 2), ("already-unverified", 1)):
++            with self.subTest(state=state):
++                code, _ = self.run_with({"state": state, "pr": 7, "merge": "b" * 40,
++                                         "frozen": "a" * 40, "tip": "d" * 40,
++                                         "target": "main", "why": "x"})
++                self.assertEqual(code, expected)
++
++    def test_a_refusal_exits_one(self):
++        patcher = mock.patch.object(merge_pr, "direct_merge",
++                                    side_effect=merge_pr.MergePrError("refusé"))
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        import contextlib
++        import io
++        buf, err = io.StringIO(), io.StringIO()
++        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
++            code = merge_pr.run(None, None, self.args())
++        self.assertEqual(code, 1)
++        self.assertIn("refusé", err.getvalue())
++
++    def test_the_operator_command_refuses_a_local_transport(self):
++        """La voie opérateur ne fusionne qu'une PR GitHub : un chemin local
++        est refusé avant tout appel, `direct_merge` n'est pas atteint."""
++        import contextlib
++        import io
++        for repo, needle in ((os.getcwd(), "local transport"),
++                             ("not-a-repo", "cannot verify")):
++            with self.subTest(repo=repo):
++                called = []
++                err = io.StringIO()
++                with mock.patch.object(merge_pr, "direct_merge",
++                                       side_effect=lambda *a, **kw: called.append(a)), \
++                        contextlib.redirect_stderr(err):
++                    code = merge_pr.run(None, None, self.args(repo=repo))
++                self.assertEqual(code, 1)
++                self.assertEqual(called, [])
++                self.assertIn(needle, err.getvalue())
++
++    def test_credentials_are_never_printed(self):
++        self.assertEqual(merge_pr._redact("https://user:tok3n@github.com/o/r.git"),
++                         "https://***@github.com/o/r.git")
++        self.assertEqual(merge_pr._redact("git@github.com:o/r.git"),
++                         "git@github.com:o/r.git")
+diff --git a/tests/test_899_alerte_plafond.py b/tests/test_899_alerte_plafond.py
+index 64124c717..1a2a19904 100644
+--- a/tests/test_899_alerte_plafond.py
++++ b/tests/test_899_alerte_plafond.py
+@@ -15,6 +15,12 @@ reste borné (canon §3) ; ce lot ajoute l'alerte côté CI :
+ * `summary` affiche la part du plafond consommée, mesure de la croissance
+   d'une exécution à l'autre.
+ 
++#1044 (suite) — les nombres non finis (NaN, ±infini, débordement de
++conversion) sont refusés comme illisibles pour les deux champs, avant tout
++calcul et toute écriture ; et `summary` étiquette la durée de l'alerte « au
++moment de l'alerte » quand aucune durée finale n'est attestée (part
++interrompue sans ligne `fin`).
++
+ Aucun réveil ni annotation d'échec : `ameesh.ci.events_of` ne lit que les
+ échecs de test, l'alerte ne crée donc pas de courrier (vérifié ici).
+ """
+@@ -121,6 +127,23 @@ class SeuilTest(unittest.TestCase):
+             with self.subTest(debut=debut, plafond=plafond):
+                 self.assertIsNone(ciflux.alerte_plafond(debut, plafond, DEBUT + 100000))
+ 
++    def test_nombres_non_finis_refuses(self):
++        """#1044 N1 : NaN, ±infini et débordement ne sont jamais des nombres."""
++        for valeur in ("nan", "NaN", "inf", "-inf", "Infinity", "1e999", 10 ** 400):
++            with self.subTest(valeur=valeur):
++                self.assertIsNone(ciflux._nombre(valeur))
++        self.assertIsNone(ciflux._nombre(None))
++        self.assertEqual(ciflux._nombre("45"), 45.0)
++        self.assertEqual(ciflux._nombre(30), 30.0)
++
++    def test_alerte_refuse_les_non_finis_des_deux_champs(self):
++        """#1044 N1 : plafond nan n'alerte plus après 10 s, début nan ne lève plus."""
++        for valeur in ("nan", "inf", "-inf", 10 ** 400):
++            with self.subTest(champ="plafond", valeur=valeur):
++                self.assertIsNone(ciflux.alerte_plafond(DEBUT, valeur, DEBUT + 10))
++            with self.subTest(champ="debut", valeur=valeur):
++                self.assertIsNone(ciflux.alerte_plafond(valeur, 30, DEBUT + 10))
++
+     def test_contexte_de_la_part(self):
+         alerte = ciflux.alerte_plafond(DEBUT, 30, DEBUT + 1440,
+                                        ciflux.contexte_de([ev_debut()]))
+@@ -249,6 +272,24 @@ class PublicationTest(unittest.TestCase):
+                                             maintenant=lambda: DEBUT + 1440), 0)
+         self.assertEqual(gh.appels, [])
+ 
++    def test_non_finis_ne_sont_pas_publies_ni_persistes(self):
++        """#1044 N1 : NaN/infini (options ou environnement) : rien n'est calculé
++        ni écrit dans l'état, et le publieur ne lève pas."""
++        gh = FauxGitHub()
++        self.ecrire(ev_debut())
++        env = {ciflux.ENV_PLAFOND: "nan", ciflux.ENV_DEBUT: "inf"}
++        with unittest.mock.patch.dict(os.environ, env, clear=False):
++            self.assertEqual(ciflux.publish(self.args(plafond_min=None, debut=None), gh=gh,
++                                            dormir=lambda _: self.ecrire(ev_fin()),
++                                            horloge=lambda: 0.0,
++                                            maintenant=lambda: DEBUT + 10), 0)
++        self.assertEqual(gh.alertes(), [])
++        self.assertNotIn("plafond_min", self.etat())
++        self.assertNotIn("debut", self.etat())
++        brut = (self.dossier / "flux.jsonl.check").read_text(encoding="utf-8")
++        self.assertNotIn("NaN", brut)
++        self.assertNotIn("Infinity", brut)
++
+ 
+ class ResumeTest(unittest.TestCase):
+     """Le résumé du job donne la part du plafond consommée (la croissance)."""
+@@ -288,6 +329,33 @@ class ResumeTest(unittest.TestCase):
+     def test_resume_sans_etat_inchange(self):
+         self.assertNotIn("Plafond", ciflux.summary([str(self.flux)]))
+ 
++    def test_alerte_sans_fin_n_est_pas_une_duree_finale(self):
++        """#1044 N2 : part interrompue — la durée de l'alerte est étiquetée."""
++        self.etat(plafond_min=30, alerte=alerte_a(1440.0), conclusion="cancelled")
++        texte = ciflux.summary([str(self.flux)])
++        self.assertIn("24 min 00 s écoulées au moment de l'alerte sur 30 min (80 %)", texte)
++        self.assertIn("durée finale non attestée", texte)
++        self.assertNotIn("à la fin de la part", texte)
++
++    def test_duree_finale_attestee_prime_sur_l_alerte(self):
++        """#1044 N2 : avec `fin_ecoule_s`, la mesure finale reste la référence."""
++        self.etat(plafond_min=30, fin_ecoule_s=1500.0, alerte=alerte_a(1440.0),
++                  conclusion="success")
++        texte = ciflux.summary([str(self.flux)])
++        self.assertIn("25 min 00 s à la fin de la part sur 30 min (83 %)", texte)
++        self.assertNotIn("au moment de l'alerte", texte)
++
++    def test_etat_avec_nombres_non_finis_ignore(self):
++        """#1044 N1 : un état hérité avec NaN/infini n'affiche aucun plafond."""
++        (self.dossier / "flux.jsonl.check").write_text(
++            '{"plafond_min": NaN, "fin_ecoule_s": Infinity,'
++            ' "alerte": {"ecoule_s": NaN, "plafond_min": Infinity, "seuil": NaN}}',
++            encoding="utf-8")
++        texte = ciflux.summary([str(self.flux)])
++        self.assertNotIn("Plafond", texte)
++        self.assertNotIn("NaN", texte)
++        self.assertNotIn("Infinity", texte)
++
+ 
+ class WorkflowTest(unittest.TestCase):
+     """Le contrat de la workflow : plafond = timeout-minutes, début mesuré."""
