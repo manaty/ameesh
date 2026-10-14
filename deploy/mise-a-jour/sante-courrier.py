@@ -12,6 +12,11 @@ Read-only checks, then one real delivery probe:
   merely that the unit is active;
 * dead letters (recipient stopped or unknown) are reported, never blocking.
 
+The JSON report (`--json`) is the structured proof consumed by `actif.py`
+(#1323): it names the host and the commit, and carries the probe message, its
+recipient and its delivery delay. A `sans-sonde` verdict never proves a real
+delivery.
+
 Run it on the workstation with the workstation venv, where the mesh
 configuration lives. No secret is read or printed.
 """
@@ -142,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     elif resultat is None:
         verdict = "sans-sonde"
     rapport = {"hote": args.hote, "verdict": verdict, "personas": len(rows),
-               "souffrance": souffrance, "boites_mortes": mortes,
+               "sha": args.sha, "souffrance": souffrance, "boites_mortes": mortes,
                "sonde": resultat, "pourquoi": pourquoi}
     if args.json:
         print(json.dumps(rapport, ensure_ascii=False))

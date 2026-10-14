@@ -118,7 +118,11 @@ arrêt est sûr : un hôte déjà au commit visé n’est pas réinstallé et so
 Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
 `sha`, `precedent`, `detail`) dans
 `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`. Le `detail` de
-l’étape `sante` porte la preuve de la sonde (destinataire, délai, message).
+l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
+verdict, et pour une remise réelle le message de sonde, son destinataire et
+son délai) : c’est la preuve structurée que le signal ci-dessous exige. Un
+verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou `auto` sans persona menée —
+ne prouve aucune remise.
 
 ## Signal « staging actif » (#1323)
 
@@ -132,12 +136,22 @@ rapporteurs déclarés avec `--lots "917 988"` et
 
 Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
 séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
-concernés. Il est borné et idempotent : un seul courrier par rapporteur et par
-commit, même si la séquence est relancée ; l’attestation est réécrite en
-place. Un échec, un retour automatique, une séquence partielle (`--hotes`) ou
-une santé sans sonde de remise réelle (`--sans-sonde`) n’émettent **aucun
-signal de réussite**, et aucune clôture de lot n’est automatique : le
-rapporteur reprend lui-même sa vérification après déploiement.
+concernés. Un échec, un retour automatique, une séquence partielle
+(`--hotes`), un journal d’une autre exécution ou une santé sans sonde de
+remise réelle (`--sans-sonde`, `SONDE_<HOTE>=jamais`, `auto` sans persona
+menée) n’émettent **aucun signal de réussite** : chaque événement de la
+fenêtre doit porter le commit visé, et le message de sonde est relu en base
+(expéditeur système, destinataire, hôte, commit, remise effective). Aucune
+clôture de lot n’est automatique : le rapporteur reprend lui-même sa
+vérification après déploiement.
+
+L’émission est bornée et **idempotente** : un seul courrier par rapporteur et
+par commit, même si la séquence est relancée. La clé d’émission est écrite
+dans l’attestation (champ `emissions`) **avant** l’envoi ; une relance relit
+le courrier déjà déposé portant cette clé et le réconcilie au lieu de le
+renvoyer. Si l’envoi échoue, la clé reste en attente et la relance renvoie
+une seule fois. L’attestation est réécrite en place, par un temporaire unique
+créé en `0600`.
 
 Si le courrier ne part pas (base indisponible), l’attestation reste écrite et
 `staging.sh` le signale : le relais opérateur transmet alors le journal et
@@ -152,7 +166,8 @@ nouvelle ligne ; un sous-ensemble qui contient `pc-smichea` est refusé — le
 poste ne s’installe que dans la séquence complète des quatre hôtes, VM saines
 d’abord),
 `--lots "n …"` et `--rapporteurs "agent …"` (signal « staging actif »),
-`--sans-sonde` (santé sans sonde de courrier),
+`--sans-sonde` (santé sans sonde de courrier — aucun signal « staging
+actif »),
 `--sans-sauvegarde`. Le script exige que `VM` soit l’adresse de
 `manaty-mesh-1` ; `PERSONAS_VM` peut rester vide.
 
