@@ -100,14 +100,17 @@ dans le canon :
 ```
 
 * L'ordre départage les égalités de retard et d'échéance (par exemple deux
-  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
-  primaire.
-* `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
-  dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-  hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
-  sont lues au même endroit, par le mécanisme commun : argument >
-  `AMEESH_CODEX_SESSIONS` > `$CODEX_HOME/sessions` > `~/.codex/sessions` ; un
-  compte déclaré lit `<son CODEX_HOME>/sessions`.
+  comptes jamais utilisés, ou les clés d'API sans jauge), et le premier sert
+  de compte actif par défaut (`account_active`) tant qu'aucun choix n'est
+  écrit.
+* `config_dir` sans `path` : le **dossier par défaut du harnais** (`~/.claude`,
+  `~/.codex`, `~/.dsh`), jamais celui que l'environnement de l'exécuteur
+  désigne (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` hérités) : un compte déclaré
+  n'hérite pas du compte ambiant (L1078). Ses jauges Codex sont lues dans
+  `<dossier>/sessions` ; le primaire des relevés Claude — le seul compte à qui
+  appartiennent les flux sans marqueur, sessions d'avant L30 — est le profil
+  dont le dossier est le dossier par défaut du harnais, jamais le premier de
+  la liste : une liste réduite au seul secondaire ne lui prend pas ses relevés.
 * Contrôles : dossier à l'utilisateur, **0700**, identifiants présents
   (`.credentials.json` pour Claude, `auth.json` pour Codex : présence
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
@@ -168,6 +171,19 @@ passé) compte pour **0 %** : un compte inutilisé dont le dernier relevé date
 d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
 relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
 « codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
+
+Un relevé ne date pas de son écriture : un `rate_limit_event` ne porte aucun
+instant, et le dater au `mtime` du journal faisait passer la dernière mesure
+d'un agent arrêté pour une mesure fraîche (incident du 13/10 : seven_day 67 %
+a écrasé 87 % et l'admission est passée sous le plafond). Chaque relevé Claude
+porte donc sa **provenance** : l'instant de production — le ts du marqueur du
+tour qui l'a publié, absent pour un flux sans marqueur — et le journal
+d'origine. Un relevé dont une fenêtre était déjà close quand le tour a
+commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vaut
+0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
+lecteurs départagent par instant de production, jamais par l'heure
+d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : 0 % utilisé,

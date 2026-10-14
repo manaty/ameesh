@@ -25,12 +25,16 @@ Types de profil :
 
 * `config_dir` : un dossier de configuration du harnais, passé par
   `CLAUDE_CONFIG_DIR` (Claude Code), `CODEX_HOME` (Codex) ou `DSH_HOME`
-  (DeepSeek Harness). Sans `path`, c'est le dossier que le harnais prendrait
-  de lui-même dans l'environnement de l'exécuteur (variable héritée, sinon
-  son dossier par défaut) ; ses jauges y sont lues. Un dossier
+  (DeepSeek Harness). Sans `path`, c'est le **dossier par défaut du harnais**
+  (`~/.claude`, `~/.codex`, `~/.dsh`) — jamais celui que l'environnement de
+  l'exécuteur désigne : un compte déclaré n'hérite pas du compte ambiant
+  (L1078), sans quoi deux profils pouvaient se disputer le même dossier et
+  les mêmes jauges. Ses jauges y sont lues. Un dossier
   déclaré doit appartenir à l'utilisateur et être privé (0700) ; ses
   identifiants doivent être présents (présence seulement : ameesh ne lit
-  jamais leur contenu).
+  jamais leur contenu). Un profil synthétique (hors configuration, nom
+  `(default)` : session d'avant L30, hôte sans comptes déclarés) garde, lui,
+  le dossier de l'environnement de l'exécuteur.
 * `api_key_env` : une clé d'API passée au harnais par une variable
   d'environnement (`env`, par défaut `DEEPSEEK_API_KEY` pour DeepSeek). La clé
   vient d'une variable de l'environnement de l'exécuteur (`key_env`) ou d'un
@@ -169,6 +173,22 @@ def _all_account_keys(key: str) -> set[str]:
         _account_key(ident, key) for ident in harnesses.known_ids()) if value}
 
 
+def _expand_home(path: str, environ=None) -> str:
+    """Résout `~` avec le HOME de `environ` (l'environnement de l'exécuteur),
+    sinon celui du processus : un dossier de compte se lit dans *cet*
+    environnement, et un `~` n'y désigne pas le même utilisateur."""
+    environ = os.environ if environ is None else environ
+    home = environ.get("HOME") or ""
+    if home and (path == "~" or path.startswith("~/")):
+        if path == "~":
+            resolved = home
+        elif home == "/":
+            resolved = "/" + path[2:]
+        else:
+            resolved = home.rstrip("/") + path[1:]
+        return os.path.abspath(resolved)
+    return os.path.abspath(os.path.expanduser(str(path)))
+
 
 class AccountError(ValueError):
     """Configuration des comptes invalide, ou profil inutilisable."""
@@ -200,6 +220,11 @@ class Profile:
     #: pace). Configured per account in the host's `accounts` key; there is no
     #: implicit value, neither by name nor by default folder.
     pace_multiplier: float = 1.0
+    #: Vrai pour un profil issu de la configuration de l'hôte (`parse`) : un
+    #: profil déclaré sans `path` désigne le dossier par défaut du harnais, pas
+    #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
+    #: synthétique (« (default) » : hôte sans comptes, session d'avant L30).
+    declared: bool = False
 
     @property
     def default(self) -> bool:
@@ -209,18 +234,25 @@ class Profile:
     def home(self, environ=None) -> str:
         """Le dossier de configuration effectif du harnais pour ce compte.
 
-        Sans `path` (compte par défaut, ou clé d'API) : celui que le harnais
-        prendrait de lui-même dans l'environnement de l'exécuteur — sa variable
-        (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`) si elle est posée,
-        sinon son dossier par défaut. C'est aussi là que `launch_env` le lance
-        et que ses jauges sont lues (un seul mécanisme).
+        * dossier déclaré (`path`) : ce dossier ;
+        * **compte déclaré sans dossier** : le dossier par défaut du harnais
+          (`~/.claude`, `~/.codex`, `~/.dsh`), jamais la variable de
+          l'environnement de l'exécuteur — un compte déclaré n'hérite pas du
+          compte ambiant (L1078) ;
+        * profil synthétique (hors configuration, `(default)`) ou clé d'API :
+          celui que le harnais prendrait de lui-même dans l'environnement de
+          l'exécuteur — sa variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+          `DSH_HOME`) si elle est posée, sinon son dossier par défaut. C'est
+          aussi là que `launch_env` le lance et que ses jauges sont lues
+          (un seul mécanisme).
         """
         if self.kind == "config_dir" and self.path:
             return self.path
         environ = os.environ if environ is None else environ
+        if self.kind == "config_dir" and self.declared:
+            return _expand_home(default_home_of(self.harness), environ)
         inherited = environ.get(config_env_of(self.harness)) or ""
-        return os.path.abspath(os.path.expanduser(
-            inherited or default_home_of(self.harness)))
+        return _expand_home(inherited or default_home_of(self.harness), environ)
 
     def session_store(self) -> str:
         """Le dossier des sessions du harnais pour ce compte (chemin résolu)."""
@@ -362,7 +394,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
-                pace_multiplier=pace_multiplier,
+                pace_multiplier=pace_multiplier, declared=True,
             ))
         out[harness] = profiles
     return out
@@ -485,9 +517,14 @@ def launch_env(env: dict, declared: dict[str, list[Profile]], profile: Profile |
         env.pop(name, None)
     if profile is not None:
         variable = config_env_of(profile.harness)
-        if variable and profile.path == "" and environ.get(variable):
-            # compte sans dossier déclaré : le dossier hérité de l'exécuteur
-            # pour CE harnais (pas celui d'un autre harnais, ni d'un autre compte)
+        if (variable and profile.path == "" and environ.get(variable)
+                and not (profile.declared and profile.kind == "config_dir")):
+            # profil synthétique ou clé d'API : le dossier hérité de
+            # l'exécuteur pour CE harnais (pas celui d'un autre harnais, ni
+            # d'un autre compte). Un compte déclaré sans dossier, lui, désigne
+            # le dossier par défaut du harnais : la variable reste retirée
+            # (`auth_variables`), donc le harnais prend son dossier par défaut
+            # — jamais celui du compte ambiant (L1078).
             env[variable] = environ[variable]
         apply_env(env, profile, environ)
 
@@ -498,11 +535,13 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     Le profil est **validé ici, au lancement** (dossier 0700 et identifiants
     présents, fichier de clé 0600, variable présente), quel que soit l'état de
     la garde de budget : un profil devenu invalide depuis le choix refuse le
-    tour. `config_dir` : la variable du dossier ; pour le compte par
-    défaut (sans chemin), le dossier hérité de l'exécuteur est conservé par
-    `launch_env`. `api_key_env` : la clé, lue dans la variable de l'exécuteur ou le
-    fichier privé. La clé ne quitte cette fonction que dans `env` ; un échec
-    lève `AccountError` sans jamais citer la clé.
+    tour. `config_dir` : la variable du dossier pour un dossier déclaré ;
+    un compte déclaré sans dossier garde la variable absente (le harnais prend
+    son dossier par défaut, L1078), un profil synthétique garde le dossier
+    hérité de l'exécuteur (`launch_env`). `api_key_env` : la clé, lue dans la
+    variable de l'exécuteur ou le fichier privé. La clé ne quitte cette
+    fonction que dans `env` ; un échec lève `AccountError` sans jamais citer
+    la clé.
     """
     environ = os.environ if environ is None else environ
     problems = check(profile, environ)
@@ -513,7 +552,9 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     if profile.kind == "config_dir":
         if not profile.default and variable:
             env[variable] = profile.path
-        # compte par défaut : `env` garde le dossier hérité (voir `launch_env`)
+        # compte par défaut : la variable du dossier reste absente (profil
+        # déclaré : dossier par défaut du harnais) ou héritée (profil
+        # synthétique, voir `launch_env`)
         return
     if profile.key_file:
         try:
@@ -590,18 +631,52 @@ class Evaluation:
         return not self.hard
 
 
-def gauges_of(book, profile: Profile, items: list[Profile]) -> list:
-    """Les jauges de forfait du compte, lues dans SES journaux."""
+def default_home(harness: str, environ=None) -> str:
+    """Le dossier de configuration par défaut du harnais (`~/.claude`,
+    `~/.codex`, `~/.dsh`), `~` résolu dans `environ` s'il est fourni."""
+    return _expand_home(default_home_of(harness), environ)
+
+
+def primary_of(harness: str, items: list[Profile], environ=None) -> Profile | None:
+    """Le compte « par défaut » du harnais parmi les profils déclarés (L1078).
+
+    C'est celui dont le dossier de configuration est le dossier par défaut du
+    harnais — jamais le premier de la liste, jamais celui que l'environnement
+    de l'exécuteur désigne. Les relevés Claude sans marqueur de compte
+    (sessions d'avant L30) ne sont attribués qu'à lui : une liste réduite au
+    seul secondaire ne les lui prend pas.
+    """
+    cible = os.path.realpath(default_home(harness, environ))
+    for profile in items:
+        if profile.kind != "config_dir":
+            continue
+        if os.path.realpath(profile.home(environ)) == cible:
+            return profile
+    return None
+
+
+def gauges_of(book, profile: Profile, items: list[Profile], environ=None) -> list:
+    """Les jauges de forfait du compte, lues dans SES journaux (L1078).
+
+    Le primaire d'un relevé Claude est le compte **par défaut du harnais**
+    (`primary_of`), pas le premier profil de la liste. Un compte Codex est lu
+    dans son propre dossier de sessions : le dossier par défaut du harnais
+    pour un profil déclaré sans dossier, jamais le `CODEX_HOME` ambiant de
+    l'exécuteur, qui peut être celui d'un autre compte.
+    """
     if profile.harness == "claude":
-        return book.claude_gauges(account=profile.name, primary=items[0].name)
+        primary = primary_of(profile.harness, items, environ)
+        return book.claude_gauges(account=profile.name,
+                                  primary=primary.name if primary is not None else None)
     if profile.harness == "codex":
         # Un seul mécanisme (cost.CostBook) : argument > AMEESH_CODEX_SESSIONS >
-        # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte déclaré a son
-        # CODEX_HOME : ses sessions sont passées en argument. Le compte par
-        # défaut est celui de l'environnement : le mécanisme sans argument.
-        if profile.default:
-            return book.codex_gauges()
-        return book.codex_gauges(sessions=os.path.join(profile.home(), "sessions"))
+        # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte qui désigne un
+        # dossier (déclaré, ou synthétique avec `path`) lit SES sessions ; le
+        # profil synthétique sans dossier garde le mécanisme de l'exécuteur.
+        if profile.declared or profile.path:
+            return book.codex_gauges(
+                sessions=os.path.join(profile.home(environ), "sessions"))
+        return book.codex_gauges()
     return []
 
 
@@ -730,7 +805,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if result.problems:
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
         return result
-    result.gauges = gauges_of(book, profile, items)
+    result.gauges = gauges_of(book, profile, items, environ)
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
