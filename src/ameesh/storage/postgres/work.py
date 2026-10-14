@@ -156,10 +156,6 @@ _DELAYS_SELECT = """
 """
 
 
-class _Refrozen(Exception):
-    """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
-
-
 class WorkItems(interface.WorkItems):
 
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
@@ -974,41 +970,49 @@ class WorkItems(interface.WorkItems):
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
 
         `frozen_id` (revue codex1, P2-1) : le gel examiné doit être le dernier
-        gel du lot. L'UPDATE prend d'abord le verrou de la ligne du lot (en
-        l'attendant au besoin) ; le dernier gel est relu APRÈS, dans une
-        instruction suivante de la même transaction — en READ COMMITTED elle
-        voit tout gel validé pendant l'attente (le sous-select d'une seule
-        instruction verrait l'instantané d'avant l'attente). S'il a changé,
-        la transaction est annulée (None). Un gel ne peut pas s'insérer
-        ensuite : `add_milestone` prend le même verrou de ligne."""
-        try:
-            with self.db.transaction() as tx:
-                rows = tx.query(
-                    """
-                    UPDATE work_items
-                       SET state = 'merged', updated_at = now(), closed_at = NULL,
-                           pr_ref = coalesce(%s, pr_ref)
-                     WHERE id = %s AND state = %s
-                    RETURNING __COLUMNS__
-                    """.replace("__COLUMNS__", ITEM_COLUMNS),
-                    (pr_ref, int(item_id), current))
-                if not rows:
+        gel du lot. Le `SELECT ... FOR UPDATE` prend d'abord le verrou de la
+        ligne du lot (en l'attendant au besoin) ; le dernier gel est relu
+        APRÈS, dans une instruction suivante de la même transaction — en READ
+        COMMITTED elle voit tout gel validé pendant l'attente (le sous-select
+        d'une seule instruction verrait l'instantané d'avant l'attente). S'il
+        a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
+        ensuite : `add_milestone` prend le même verrou de ligne.
+
+        Rien n'est écrit avant ce recontrôle : la fermeture est appelée dans
+        la transaction qui porte aussi le réveil des dépendants (L385 suite),
+        et un `UPDATE` suivi d'un `None` n'était annulé que par SA transaction
+        — sous une transaction englobante, la ligne serait restée modifiée.
+        """
+        with self.db.transaction() as tx:
+            locked = tx.query(
+                "SELECT id FROM work_items WHERE id = %s AND state = %s FOR UPDATE",
+                (int(item_id), current))
+            if not locked:
+                return None
+            if frozen_id is not None:
+                latest = tx.query(
+                    "SELECT id FROM work_item_milestones"
+                    " WHERE work_item_id = %s AND kind = 'frozen'"
+                    " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+                if not latest or int(latest[0]["id"]) != int(frozen_id):
                     return None
-                if frozen_id is not None:
-                    latest = tx.query(
-                        "SELECT id FROM work_item_milestones"
-                        " WHERE work_item_id = %s AND kind = 'frozen'"
-                        " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
-                    if not latest or int(latest[0]["id"]) != int(frozen_id):
-                        raise _Refrozen()
-                WorkItems(tx)._event(int(item_id), "merged", note, actor)
-                tx.query(
-                    "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                    " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
-                    (sha or "", actor or "", note or "", int(item_id)))
-                return rows[0]
-        except _Refrozen:
-            return None
+            rows = tx.query(
+                """
+                UPDATE work_items
+                   SET state = 'merged', updated_at = now(), closed_at = NULL,
+                       pr_ref = coalesce(%s, pr_ref)
+                 WHERE id = %s AND state = %s
+                RETURNING __COLUMNS__
+                """.replace("__COLUMNS__", ITEM_COLUMNS),
+                (pr_ref, int(item_id), current))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), "merged", note, actor)
+            tx.query(
+                "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
+                " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                (sha or "", actor or "", note or "", int(item_id)))
+            return rows[0]
 
     def close(self, item_id, *, current, reason, superseded_by, actor, note) -> dict | None:
         """`current` → `closed` (abandon ou remplacement) si le lot y est encore ;
