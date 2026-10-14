@@ -95,11 +95,15 @@ utilisateur_agents() {
 }
 commande_agents() {
   # Use the runner's systemd EnvironmentFile parser, including literal $/#.
+  # `systemd-run -p` does not expand the `%h` specifier (a transient unit's
+  # properties are not specifier-expanded): it would refuse
+  # `EnvironmentFile=%h/...` as "not absolute" (#1133). Expand $HOME in the
+  # shell, where it is the ameesh home set by `utilisateur_agents`.
   utilisateur_agents bash -c 'set -euo pipefail
     test -r "$HOME/.config/ameesh/env" \
       || { echo "runner environment file unreadable: $HOME/.config/ameesh/env" >&2; exit 1; }
     exec systemd-run --user --pipe --wait --quiet \
-      -p EnvironmentFile=%h/.config/ameesh/env -- "$@"' -- "$@"
+      -p EnvironmentFile="$HOME/.config/ameesh/env" -- "$@"' -- "$@"
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }
