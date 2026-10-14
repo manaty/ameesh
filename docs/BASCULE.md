@@ -723,7 +723,8 @@ only publish**.
    ```bash
    python3 -m venv /tmp/ameesh-l35 && /tmp/ameesh-l35/bin/pip install -q <dépôt ameesh au gel L35>
    git clone -q <url du dépôt du canon> /tmp/canon-l35     # throwaway copy, ~/canon intact
-   AMEESH_CONFIG=/tmp/aucune-config.json /tmp/ameesh-l35/bin/ameesh canon check \
+   printf '{}\n' > /tmp/ameesh-config-vide.json            # chemin explicite = fichier existant (#1127)
+   AMEESH_CONFIG=/tmp/ameesh-config-vide.json /tmp/ameesh-l35/bin/ameesh canon check \
        --canon /tmp/canon-l35 --ref origin/<branche-PR> --host pc-smichea
    #   expected: 0 errors, no host-policy-invalid, admission-cwd-inherited
    #   or host-work-dir-missing
