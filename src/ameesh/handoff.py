@@ -367,7 +367,8 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 if not backlog.lot_fits(dict(item, lot_team=project),
                                         dict(agent, team=project),
                                         auditor=row["name"] in auditors,
-                                        card=auditors.get(row["name"])):
+                                        card=auditors.get(row["name"]),
+                                        others=listing):
                     continue
                 target = row
                 break
