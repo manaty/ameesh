@@ -346,10 +346,13 @@ section « Base distante ».
 Install (or upgrade an existing install, which also pulls psycopg):
 
 ```bash
-python3 -m venv ~/.local/share/ameesh/venv
-~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>
+uv tool install "git+https://github.com/manaty/ameesh@main"   # or a pinned tag/commit
 ameesh doctor          # driver, schema, and — for a remote database — latency
 ```
+
+The older venv route still works:
+`python3 -m venv ~/.local/share/ameesh/venv && ~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>`.
+Platform state and upgrades: [`site/docs/guides/install.md`](site/docs/guides/install.md).
 
 ## Tests
 
