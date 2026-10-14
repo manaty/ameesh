@@ -1,0 +1,84 @@
+{
+  "lot": 1219,
+  "head": "5267b591896593041dc3da007292eb0194922a60",
+  "pr": 990,
+  "branche": "lot/1219-divergence-diagnostic",
+  "classe": "légère (registry.py, tests/ : hors chemins sensibles §8)",
+  "main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "measured_at": "2026-10-14T21:04:12Z",
+  "union_tree": "64c162a37f08d2e1c7f761c4dc62f2e752fc4059",
+  "union_ref": "refs/atelier/1219/union-main-2458ec05",
+  "pieces_ref": "refs/atelier/1219/pieces-main-2458ec05",
+  "fichiers": [
+    {
+      "path": "src/ameesh/registry.py",
+      "head": "a8d72b8143916376f13a8d1af02163bfabdccbac",
+      "union": "a8d72b8143916376f13a8d1af02163bfabdccbac",
+      "main_eq_base": true,
+      "patchid": "89424b56510fedea492db18d1c6704d6867be40a",
+      "patchid_union": "89424b56510fedea492db18d1c6704d6867be40a",
+      "constant": true
+    },
+    {
+      "path": "tests/test_placement.py",
+      "head": "fba75e89911dd1057391f4dd00adeb63c2e4e8c8",
+      "union": "fba75e89911dd1057391f4dd00adeb63c2e4e8c8",
+      "main_eq_base": true,
+      "patchid": "6363bb2d1375d6390bb1266499d8eb4297403a5c",
+      "patchid_union": "6363bb2d1375d6390bb1266499d8eb4297403a5c",
+      "constant": true
+    }
+  ],
+  "sources": [
+    {
+      "kind": "lot-event",
+      "ref": "work:1219#event:16699",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T13:39:16.641789+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 mesh-design : relecture aprèsfusion confiéeàameesh-cx1/Codex, indépendant auteurdev3/DeepSeek, seloncanon2 (classeléger). ObjetPR990/440e38a5, registry.py/test_placement ; confirmercommitfusionetdiffsourceau geste. AuteurfusionneaprèsCIexacteverte+fraîcheur ; lecteurconsigneavisparentdanslajournée,sanssuiterejouée ; siBpostfusion, lotcorrectifprioritaire. Aucunfeu/vertCIinventé."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41394",
+      "actor": "ameesh-dev3",
+      "famille": "DeepSeek (auteur)",
+      "at": "2026-10-14T20:53:44+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Candidature pieces §12 pour les 5 lots qa, mesures sur main 2458ec05."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41489",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T20:57:59+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Disposition : #1219/#1277 candidatures légères reçues pour la préparation APRÈS les gels #1342/#1204, aucun ajout à ces paquets ; unions et CI#1277 conservées à portée, fraîcheur/composition à requalifier au prochain manifeste ; #1247 et #1323 gardent R2 Claude / dépendance #1155 ; réserve Claude #1176 à qualifier au manifeste ; pièces atelier et sources à fournir au préparateur ultérieur, sans nouvelle CI ni changement de tête."
+    },
+    {
+      "kind": "forge",
+      "ref": "pr:1219",
+      "actor": null,
+      "famille": null,
+      "at": null,
+      "sha": "5267b591896593041dc3da007292eb0194922a60",
+      "verdict": "qa",
+      "texte": "PR #990 OPEN mergeStateStatus=BLOCKED tête=5267b5918965 (lecture gh unique au 2026-10-14T21:04:12Z)"
+    },
+    {
+      "kind": "ci",
+      "ref": "ci:38576106489",
+      "actor": null,
+      "famille": null,
+      "at": "2026-10-14T19:27:26Z",
+      "sha": "5267b5918965",
+      "verdict": "cancelled",
+      "texte": "run 38576106489 pull_request completed/cancelled tête 5267b5918965 (lecture gh unique)"
+    }
+  ]
+}

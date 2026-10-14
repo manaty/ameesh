@@ -1,0 +1,12 @@
+MAIN 2458ec053123d3f33644fef1e092fc84cc2773d9
+LOT #1219 branche lot/1219-divergence-diagnostic
+HEAD 5267b591896593041dc3da007292eb0194922a60
+BASE c4fa14a23b07bd4fe07a9d162049774f3e90cb24
+merge-tree rc=0
+64c162a37f08d2e1c7f761c4dc62f2e752fc4059
+
+  src/ameesh/registry.py                                     head=a8d72b8143 union=a8d72b8143 main==base:oui patchid_const=YES
+  tests/test_placement.py                                    head=fba75e8991 union=fba75e8991 main==base:oui patchid_const=YES
+fichiers=2 migrations=0
+
+mesure 2026-10-14T21:04:12Z ; methode patch-id: git diff -U0 <base> <head> -- <f> vs git diff -U0 2458ec053123 <union> -- <f>
