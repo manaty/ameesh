@@ -304,7 +304,7 @@ class EnvoiTest(_Base):
         self.assertIn("acknowledgement", proc.stdout)
         self.assertTrue(self._payload("orch").get("ack"))
         proc = self._envoi("orch", "ok")  # une réponse, peut-être un feu vert
-        self.assertEqual(proc.stdout.strip(), "dropped for: orch")
+        self.assertEqual(proc.stdout.strip(), "delivered to orch")
         self.assertEqual(self._payload("orch"), {})
         proc = self._envoi("orch", "J'ai lu ta note sur le lot 12", "--ack")
         self.assertTrue(self._payload("orch").get("ack"))
