@@ -97,6 +97,11 @@ Quatre `git merge-tree --write-tree`, **aucun conflit** :
   #1204 ; pilote 14/10 06:01Z) : la validation complète unique du paquet, après #1211
   actif, remplace les conditions CI individuelles. Les feux de fusion individuels restent
   subordonnés à la qualification du paquet et au feu final.
+- Sources primaires : recoupement indépendant auditeur 14/10 05:57Z (tentative 38486341746 :
+  macOS SUCCESS sur runner hébergé `1000025835`, 5 parts PostgreSQL annulées sans runner,
+  le FAILURE psycopg du rollup appartient au run 38443445528) ; notes pilote mesh-design
+  05:50Z (R1/feu conservés, tête inchangée) et 06:01Z (mandat du paquet suivant) ; lots
+  #1260 (paquet #364+#987, 06:07Z) et #1002 (suite du N P3).
 
 ## 5. Anciens runs — tous terminaux, tous annulés, aucune preuve
 
