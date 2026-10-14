@@ -37,13 +37,14 @@ P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
 driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
 matrix.
 
-**Lot CI dispatched at freeze (#1343).** `--mode lot` is the
-`workflow_dispatch` run of a frozen lot (canon §3: review first, one CI on the
-frozen head). It runs the same impacted + contract selection, with the same
-doubt-falls-back-to-full rule, and it never takes the version-only (L157) or
-documentation-only (L161a) lane: those are pull-request lanes, so a green
-required check on the frozen commit always means tests ran. `--mode full` is
-the package or hand dispatch: the full suite, both drivers.
+**Lot CI requested at freeze (#1343).** `--mode lot` is the `ci-lot-<sha>`
+request of a frozen lot (canon §3: review first, one CI on the frozen head,
+posed as a `pull_request: labeled` label). It runs the same impacted +
+contract selection, with the same doubt-falls-back-to-full rule, and it never
+takes the version-only (L157) or documentation-only (L161a) lane, so a green
+required check on the frozen head always means tests ran. `--mode full` is the
+`ci-full-<sha>` request (release, package, explicit full): the whole suite,
+both drivers, and no lane that skips the tests either.
 
 **Release pull requests keep the full suite (canon §3).** A pull request
 whose source or target is `release/**` or the package integration branch
@@ -1236,19 +1237,21 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     `auto` (default): inferred from the event, as before — a pull request
     whose source and target are lot branches runs impacted + contract, a
     release pull request and every `push` run the full suite. `lot`: the CI
-    dispatched at freeze (#1343): impacted + contract, never the version-only
-    or documentation-only lane, so a green `tests` on the frozen commit always
-    means the tests ran. `full`: the full suite, for a package or a hand
-    dispatch.
+    requested at freeze (#1343, the `ci-lot-<sha>` label): impacted + contract,
+    never the version-only or documentation-only lane, so a green `tests` on
+    the frozen head always means the tests ran. `full`: the whole suite, for a
+    release or an explicit `--full` request (#1343, `ci-full-<sha>`), never a
+    lane that skips the tests either.
     """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
     release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     if mode == "lot":
-        #: #1343 : un dispatch de lot sur `release/**` ou `integration/**` ne
+        #: #1343 : une demande de lot sur `release/**` ou `integration/**` ne
         #: prend jamais la sélection impactés+contrat — ces branches gardent la
-        #: suite complète, même si le déclencheur s'est trompé de cible.
+        #: suite complète, même si le déclencheur s'est trompé de cible (la
+        #: commande refuse déjà `ci-lot` sur ces refs ; le plan reste sûr).
         release = release or release_pr(None, _branch(ref))
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
@@ -1256,16 +1259,19 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             "tested": _rev(head, repo), "release": release, "mode": mode,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
-    if mode == "lot":
-        #: canon §3 (#1343) : la CI d'un lot au gel ne prend jamais une voie
-        #: qui saute les tests — le contrat tourne au minimum, donc un check
-        #: `tests` vert sur la tête gelée a bien exécuté des tests. Les voies
-        #: version seule (L157) et documentation seule (L161a) restent des
-        #: voies de PR ; ici elles sont éteintes, y compris dans le doute.
+    if mode in ("lot", "full"):
+        #: canon §3 (#1343) : une demande de gel (ci-lot ou ci-full) ne prend
+        #: jamais une voie qui saute les tests — le contrat tourne au minimum,
+        #: donc un check `tests` vert sur la tête gelée a bien exécuté des
+        #: tests. Les voies version seule (L157) et documentation seule (L161a)
+        #: restent des voies de poussée ; ici elles sont éteintes, y compris
+        #: dans le doute.
         plan["version_only"] = plan["docs_only"] = False
-        #: `nature` a répondu « not a pull request » : la raison du dispatch est
-        #: le gel, pas l'événement ; une cible release/** la remplacera plus bas.
-        plan["why"] = "lot CI at freeze: impacted + contract"
+        #: `nature` répond « not a pull request » sur un ancien dispatch : la
+        #: raison de la demande est le gel, pas l'événement ; une cible
+        #: release/** la remplacera plus bas.
+        plan["why"] = ("lot CI at freeze: impacted + contract" if mode == "lot"
+                       else "full CI request: whole suite")
     plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
                          docs_only=bool(plan["docs_only"] and not release)))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
@@ -1599,8 +1605,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--head-ref", default=None,
                    help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
     p.add_argument("--mode", choices=("auto", "lot", "full"), default="auto",
-                   help="auto (event), lot (CI dispatched at freeze: impacted + "
-                        "contract, #1343) or full (package, hand dispatch)")
+                   help="auto (event), lot (ci-lot freeze request: impacted + "
+                        "contract, #1343) or full (ci-full request: whole suite)")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",

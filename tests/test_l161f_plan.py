@@ -1499,14 +1499,14 @@ class LotBranchTest(unittest.TestCase):
 
     def _plan(self, event="pull_request", classes=None, card=None,
               base_ref="main", head_ref="lot/1211-ci-impactes-contrat",
-              nature_kw=None, **state_kw):
+              nature_kw=None, mode="auto", **state_kw):
         state = self._state(classes if classes is not None else self._classes(), **state_kw)
         nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
         nature.update(nature_kw or {})
         with mock.patch.object(plan, "classify", return_value=state), \
                 mock.patch.object(plan, "nature", return_value=dict(nature)):
             return plan.make_plan(event, card if card is not None else {}, NOW,
-                                  base_ref=base_ref, head_ref=head_ref)
+                                  base_ref=base_ref, head_ref=head_ref, mode=mode)
 
     def _ran(self, p, driver="psycopg"):
         return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
@@ -1566,12 +1566,21 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
 
     def test_full_suite_on_main_release_and_integration(self):
-        for event in ("push", "workflow_dispatch"):
-            with self.subTest(event):
-                p = self._plan(event=event)
-                self.assertEqual(p["selection"]["mode"], "full")
-                self.assertIn("integration", p["selection"]["why"])
-                self.assertEqual(self._ran(p), sorted(self.mods))
+        # une poussée sur main/release/integration garde la suite complète.
+        p = self._plan(event="push")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("integration", p["selection"]["why"])
+        self.assertEqual(self._ran(p), sorted(self.mods))
+
+    def test_full_request_on_a_lot_pull_request_runs_the_whole_suite(self):
+        # #1343 : `ci-full-<sha>` (release, paquet, demande explicite) sur une
+        # PR ordinaire garde la suite complète, les deux pilotes.
+        p = self._plan(event="pull_request", mode="full")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertEqual(self._ran(p), sorted(self.mods))
+        self.assertEqual(self._ran(p, "psql"), sorted(self.mods))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
 
     def test_release_pull_request_never_takes_the_impacted_selection(self):
         # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
@@ -1858,10 +1867,10 @@ class WorkflowTest(unittest.TestCase):
 
     def test_plan_job_passes_the_pushed_range(self):
         # #833: a push is planned from github.event.before, not HEAD^1 alone ;
-        # #1343 : un dispatch au gel est planifié depuis le SHA de base passé
-        # par le déclencheur (merge-base avec la cible), jamais HEAD^1.
-        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'workflow_dispatch' && "
-                      "inputs.base || (github.event_name == 'push' && "
+        # #1343 : une demande de gel est planifiée depuis la base du payload
+        # (`pull_request.base.sha`), la composition même du merge-ref vérifié.
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && "
+                      "github.event.pull_request.base.sha || (github.event_name == 'push' && "
                       "github.event.before || 'HEAD^1') }}", self.text)
         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
@@ -1912,44 +1921,59 @@ class WorkflowTest(unittest.TestCase):
 
     def test_no_lot_push_ci_review_first(self):
         # #1343 (canon §3, home 66) : une poussée sur une PR de LOT ne lance
-        # plus rien — la CI part au gel, après les verdicts requis. Seules les
-        # PR dont la cible est release/** ou integration/** gardent la CI ici ;
-        # les poussées main/release/integration gardent la suite complète.
-        self.assertIn('  pull_request:\n    branches: ["release/**", "integration/**"]\n',
-                      self.text)
+        # plus rien — la CI part au gel, par l'étiquette `ci-lot-<sha>` /
+        # `ci-full-<sha>` posée sur la PR (`pull_request` `types: [labeled]`).
+        # Les poussées main/release/integration gardent la suite complète.
+        self.assertIn('  pull_request:\n    types: [labeled]\n    branches: [main, '
+                      '"release/**", "integration/**"]\n', self.text)
         self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        self.assertNotIn("\n  workflow_dispatch:", self.text)
 
-    def test_dispatch_gate_exact_frozen_sha_and_base(self):
-        # #1343 : le dispatch ne teste que le SHA gelé, et le mode lot exige sa
-        # base — un ref bougé ou un SHA sans base rougit le check requis sans
-        # exécuter de tests, jamais un vert sur une autre tête.
-        self.assertIn("workflow_dispatch:\n    inputs:\n", self.text)
-        self.assertIn("options: [lot, full]", self.text)
-        self.assertIn("ref moved: head is", self.text)
-        self.assertIn("mode=lot needs sha", self.text)
-        self.assertIn("mode=lot needs base", self.text)
-        self.assertIn("sha needs base", self.text)
+    def test_label_gate_exact_frozen_sha_and_composition(self):
+        # #1343 : le job plan ne teste que la composition demandée — étiquette
+        # exacte `ci-lot/ci-full-<40hex>`, SHA égal à `pull_request.head.sha`,
+        # checkout = merge-ref composé de la base du payload et de cette tête.
+        # Un refus rougit le check requis sans exécuter de tests, jamais un vert
+        # sur une autre tête.
+        self.assertIn("^ci-(lot|full)-[0-9a-f]{40}$", self.text)
+        self.assertIn("foreign label, nothing run", self.text)
+        self.assertIn('if [ "$sha" != "$head" ]', self.text)
+        self.assertIn("source or target release/** or integration/** requires ci-full-<sha>",
+                      self.text)
+        self.assertIn("the merge-ref base is", self.text)
+        self.assertIn("the merge-ref head is", self.text)
         self.assertIn('--mode "$AMEESH_CI_MODE"', self.text)
 
-    def test_dispatch_aggregate_refuses_a_green_without_tests(self):
-        # #1343 : sur un dispatch, les voies version seule (L157) et
-        # documentation seule (L161a) sont éteintes ; si le plan en produisait
-        # une, l'agrégat requis rougit au lieu de verdir sans tests.
+    def test_label_concurrency_is_distinct_from_a_foreign_label(self):
+        # #1343 : une étiquette étrangère a sa propre concurrency — l'ajouter
+        # n'annule pas un run gelé valide.
+        self.assertIn("format('pr-{0}-{1}', github.event.pull_request.number, "
+                      "github.event.label.name)", self.text)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                      self.text)
+
+    def test_label_aggregate_refuses_a_green_without_tests(self):
+        # #1343 : une demande de gel (étiquette ci-lot/ci-full) ne prend jamais
+        # les voies version seule (L157) ou documentation seule (L161a) ; si le
+        # plan en produisait une, l'agrégat requis rougit au lieu de verdir
+        # sans tests.
         job = self.text[self.text.index("\n  tests:\n"):]
+        self.assertIn('if [ "$CI_EVENT" = "pull_request" ]; then', job)
         self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
         self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
 
-    def test_dispatch_run_name_marks_the_exception(self):
-        # canon §3 : une exception incident/déblocage est explicitement marquée.
+    def test_run_name_carries_the_freeze_request(self):
+        # #1343 : le titre du run porte la PR, l'étiquette (mode et SHA) et la
+        # base, pour que la commande et la preuve de fusion puissent le relire.
         self.assertIn("run-name:", self.text)
-        self.assertIn("exception {0}", self.text)
-        self.assertIn("exception:", self.text)
+        self.assertIn("format(' [PR #{0} {1} base {2}]'", self.text)
+        self.assertIn("github.event.label.name", self.text)
 
 
 class LotFreezePlanTest(unittest.TestCase):
     """#1343 — la CI d'un lot au gel (canon §3) : impactés + contrat sur la
-    tête gelée, jamais une voie qui saute les tests ; release/**, l'intégration
-    et le dispatch `full` gardent la suite complète."""
+    tête demandée par l'étiquette `ci-lot-<sha>`, jamais une voie qui saute les
+    tests ; `ci-full-<sha>` et release/** gardent la suite complète."""
 
     def setUp(self):
         self.repo = _Repo()
@@ -1966,12 +1990,13 @@ class LotFreezePlanTest(unittest.TestCase):
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
         self.repo.commit()
 
-    def _plan(self, mode: str, *, ref: str = "refs/heads/lot/1343-ci-au-gel",
-              nature: dict | None = None) -> dict:
+    def _plan(self, mode: str, *, base_ref: str = "main",
+              head_ref: str = "lot/1343-ci-au-gel", nature: dict | None = None) -> dict:
         nat = nature or {"version_only": False, "docs_only": False, "why": "", "files": []}
         with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
-            return plan.make_plan("workflow_dispatch", self._card(), NOW, head="HEAD",
-                                  repo=self.repo.path, ref=ref, base="HEAD^1", mode=mode)
+            return plan.make_plan("pull_request", self._card(), NOW, head="HEAD",
+                                  repo=self.repo.path, base="HEAD^1", mode=mode,
+                                  base_ref=base_ref, head_ref=head_ref)
 
     def test_gel_selectionne_impactes_et_contrat(self):
         self._code_change()
@@ -1980,12 +2005,12 @@ class LotFreezePlanTest(unittest.TestCase):
         card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [touched]
         nat = {"version_only": False, "docs_only": False, "why": "", "files": []}
         with mock.patch.object(plan, "nature", lambda *a, **k: dict(nat)):
-            p = plan.make_plan("workflow_dispatch", card, NOW, head="HEAD",
-                               repo=self.repo.path, ref="refs/heads/lot/x",
-                               base="HEAD^1", mode="lot")
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD",
+                               repo=self.repo.path, base="HEAD^1", mode="lot",
+                               base_ref="main", head_ref="lot/x")
         self.assertEqual(p["selection"]["mode"], "impacted")
         # la raison du plan est le gel, pas l'événement (`nature` dit « not a
-        # pull request » pour un dispatch) : le plan.json relu le dit.
+        # pull request » pour un ancien dispatch) : le plan.json relu le dit.
         self.assertEqual(p["why"], "lot CI at freeze: impacted + contract")
         ran = [m for ps in p["parts"]["psycopg"] for m in ps["modules"]]
         self.assertIn(touched, ran)
@@ -1996,59 +2021,67 @@ class LotFreezePlanTest(unittest.TestCase):
         self.assertLessEqual(len(p["parts"]["psql"]), 3)
 
     def test_gel_ne_prend_jamais_les_voies_qui_sautent_les_tests(self):
-        # L157 (version seule) et L161a (documentation seule) sont des voies de
-        # PR : au gel, le contrat tourne, donc un check vert veut dire tests.
-        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
-        self.repo.commit()
-        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.1"\n')
-        self.repo.commit()
-        version = self._plan("lot")
-        self.assertFalse(version["version_only"], version["why"])
-        self.assertNotEqual(version["parts"]["psycopg"], [])
-        self.repo.write("docs/x.md", "# x\n")
-        self.repo.commit()
-        doc = self._plan("lot", nature={"version_only": False, "docs_only": True,
-                                        "why": "documentation seule",
-                                        "files": ["docs/x.md"]})
-        self.assertFalse(doc["docs_only"], doc["why"])
-        self.assertEqual(doc["doc_readers"], [])
-        self.assertNotEqual(doc["parts"]["psycopg"], [])
+        # L157 (version seule) et L161a (documentation seule) restent des voies
+        # de poussée : au gel, le contrat tourne, donc un check vert veut dire
+        # que des tests ont tourné.
+        for why, nat in (("version", {"version_only": True, "docs_only": False,
+                                      "why": "version seule",
+                                      "files": ["pyproject.toml"]}),
+                         ("documentation", {"version_only": False, "docs_only": True,
+                                            "why": "documentation seule",
+                                            "files": ["docs/x.md"]})):
+            with self.subTest(why):
+                p = self._plan("lot", nature=nat)
+                self.assertFalse(p["version_only"], p["why"])
+                self.assertFalse(p["docs_only"], p["why"])
+                self.assertEqual(p["doc_readers"], [])
+                self.assertNotEqual(p["parts"]["psycopg"], [])
 
     def test_gel_sur_une_branche_release_garde_la_suite_complete(self):
         self._code_change()
-        p = self._plan("lot", ref="refs/heads/release/1.10.0")
+        p = self._plan("lot", head_ref="release/1.10.0")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertIn("release/**", p["selection"]["why"])
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
-    def test_dispatch_full_garde_la_suite_complete(self):
+    def test_demande_full_garde_la_suite_complete(self):
         self._code_change()
         p = self._plan("full")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
 
+    def test_demande_full_ne_prend_pas_la_voie_version_seule(self):
+        # #1343 : une demande explicite `ci-full-<sha>` ne peut pas verdir par
+        # la voie version seule (L157) — la suite complète tourne.
+        p = self._plan("full", nature={"version_only": True, "docs_only": False,
+                                       "why": "version seule",
+                                       "files": ["pyproject.toml"]})
+        self.assertFalse(p["version_only"], p["why"])
+        self.assertNotEqual(p["parts"]["psycopg"], [])
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+
     def test_repli_d_un_gel_garde_la_forme_du_lot(self):
-        p = plan.fallback_plan("workflow_dispatch", "boom", mode="lot",
-                               ref="refs/heads/lot/x")
+        p = plan.fallback_plan("pull_request", "boom", mode="lot",
+                               base_ref="main", head_ref="lot/x")
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3] * 3)
         self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_repli_d_un_gel_release_garde_la_suite_complete(self):
-        p = plan.fallback_plan("workflow_dispatch", "boom", mode="lot",
-                               ref="refs/heads/release/1.10.0")
+        p = plan.fallback_plan("pull_request", "boom", mode="lot",
+                               base_ref="main", head_ref="release/1.10.0")
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_cli_mode_lot_sans_base_refuse(self):
-        # sans la base du gel, la sélection porterait sur HEAD^1 et manquerait
-        # des modules du lot : la CLI refuse plutôt que de deviner.
+        # sans la base du payload, la sélection porterait sur HEAD^1 et
+        # manquerait des modules du lot : la CLI refuse plutôt que de deviner.
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             code = plan.main(["plan", "--out", str(self.repo.path / "plan.json"),
-                              "--event", "workflow_dispatch", "--mode", "lot"])
+                              "--event", "pull_request", "--mode", "lot"])
         self.assertEqual(code, 2)
         self.assertIn("requires --base", err.getvalue())
         self.assertFalse((self.repo.path / "plan.json").exists())

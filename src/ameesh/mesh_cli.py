@@ -2222,9 +2222,11 @@ def build_parser() -> argparse.ArgumentParser:
                              help="maximum runs shown (default 5)")
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
     p_ci_status.set_defaults(func=cmd_ci)
-    # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis.
+    # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis,
+    # par une étiquette `ci-lot-<sha>`/`ci-full-<sha>` posée sur la PR.
     p_ci_run = ci_sub.add_parser(
-        "run", help="dispatch the CI of a frozen lot, once, on the frozen commit (#1343)")
+        "run", help="request the CI of a frozen lot, once, on the frozen head, "
+                    "by the ci-lot/ci-full label (#1343)")
     p_ci_run.add_argument("id", type=int, help="work item number")
     p_ci_run.add_argument("--sha", default="", help="the frozen commit (default: the "
                           "last `frozen` milestone)")
@@ -2237,15 +2239,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_ci_run.add_argument("--reason", default="",
                           help="why (the exception, the full suite): written to the lot")
     p_ci_run.add_argument("--full", action="store_true",
-                          help="full suite (release, package, hand dispatch), not the "
+                          help="whole suite (release, package, explicit request), not the "
                                "lot selection; requires --reason")
     p_ci_run.add_argument("--force", action="store_true",
-                          help="dispatch again although a run of the frozen commit is "
-                               "already seen (red or cancelled)")
+                          help="request the CI again although this composition already "
+                               "ran, none green (red or cancelled): explicit resumption")
     p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
                           "issue_ref or github.projects)")
     p_ci_run.add_argument("--dry-run", action="store_true",
-                          help="decide and print, dispatch nothing")
+                          help="decide and print, pose no label")
     p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
     p_ci_run.set_defaults(func=cmd_ci)
     p_ci_cancel = ci_sub.add_parser(
