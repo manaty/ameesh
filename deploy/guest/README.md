@@ -13,6 +13,7 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 | `PILOT-ameesh-agents-1.md` | the owner's exact commands and rollback for the first lending host |
 | `ameesh-guard.service`, `ameesh-gate.tmpfiles.conf` | the capacity guard (L159e) and its gate directories, installed by `install-pilot.sh` |
 | `../../src/ameesh/platform/offload_shell.py` | the VM side, installed as `/usr/local/lib/ameesh-guest/ameesh-offload-shell`; standard library only |
+| `ameesh-job-launcher`, `ameesh-job-launcher.py` | the root-owned entry point of a job (L159b2), installed as `/usr/local/lib/ameesh-guest/ameesh-job-launcher` and admitted to the job user by a sudoers rule |
 | `job-postgres.sh` | a throwaway Postgres per job, rootless Podman (`/usr/local/lib/ameesh-guest/job-postgres`) |
 | `profiles/*.json` | what a job gets before its command: dependency cache, variables, hooks (`/etc/ameesh-guest/profiles/`) |
 
@@ -32,6 +33,11 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
    guest CPU quota 75 % of the host, `MemoryHigh` 50 % and `MemoryMax`
    60 % of RAM, one job capped at `MemoryMax / slots`, 1 h per job. Add
    the loopback ports of the VM's own services with `--deny-port`.
+
+   By default the jobs run under their own account (`--job-user`,
+   `ameesh-job`): another UID than the guest's, through the root-owned
+   launcher. `--no-job-user` keeps the legacy layout, where the jobs share
+   the guest's UID.
 3. On the workstation, a `~/.ssh/config` entry (the script prints it), then
    `AMEESH_OFFLOAD_HOST=<alias>` in the runner's environment, and check:
 
@@ -45,9 +51,16 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 * A throwaway checkout of the exact working tree (tracked and untracked
   files, ignored ones excluded), in the same subdirectory as on the
   workstation. Output and exit code come back unchanged.
+* With the job user (the default): a UID of its own. The kernel then denies
+  the job the guest's `/proc` (its nonce and its streams), its HOME, its
+  caches, and any write into the mirrors the guest's own git reads. The two
+  accounts share the `ameesh-jobs` group for what the job must read or
+  write; each phase goes through the root-owned launcher, and the job's own
+  user manager (linger) still owns its slice.
 * `TMPDIR` inside its job folder, on the volume, removed at the end.
-* A transient slice `ameesh-job-<id>.slice` under the guest's user manager,
-  capped by `agent_memory_max`. Everything of the job runs in it: dependency
+* A transient slice `ameesh-job-<id>.slice` under the job's user manager
+  (the guest's without `--job-user`), capped by `agent_memory_max`.
+  Everything of the job runs in it: dependency
   setup, hooks, the command (scope `ameesh-job-<id>.scope`) and its Podman
   containers (`--cgroup-parent $OFFLOAD_SLICE`). The slice is killed when
   the job ends. The whole guest is capped by its `user-<uid>.slice`.
@@ -82,8 +95,16 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 ## Security model (study, section 3)
 
 * `ameesh-guest`: no password, no sudo, no `docker` group, home on the
-  volume (0700). `install.sh` refuses a guest in sudo, wheel, docker, adm,
-  lxd or libvirt.
+  volume (0710, group `ameesh-jobs`). `install.sh` refuses a guest in sudo,
+  wheel, docker, adm, lxd or libvirt.
+* `ameesh-job` (L159b2, the default): the jobs' account, another UID, no
+  password, no sudo, its own home (`$ROOT/home`, 0700, unreadable by the
+  guest) and its own user manager. The guest starts every phase through the
+  root-owned launcher, by a sudoers rule that names that file and that user
+  only; the launcher refuses to run as root. The group `ameesh-jobs` is the
+  one path between the two: the guest keeps the volume and its mirrors
+  (setgid, so the folders it creates keep the group), the job traverses the
+  volume, reads the mirrors and writes only the folders it was granted.
 * SSH: the keys live in a root-owned file (`/etc/ameesh-guest/authorized_keys`,
   `restrict`, `from=`), and an sshd `Match User` block forces
   `ameesh-offload-shell`: four verbs (`put`, `run`, `status`, `cancel`),
@@ -92,14 +113,14 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 * The client's `--env` cannot set `PATH`, `HOME`, `LD_PRELOAD`, `TMPDIR` or
   the job variables; repository, commit, profile and job names are
   validated; `--cwd` stays inside the checkout.
-* Outgoing traffic of the guest's uid (nftables, `ameesh-guest-firewall.service`):
+* Outgoing traffic of both uids (nftables, `ameesh-guest-firewall.service`):
   no listed application port on the loopback, no private network, no
   metadata service (169.254.0.0/16); DNS to the configured resolvers and
   HTTPS out stay open (packages, images). `--allow-net` opens a network.
-* Caps on `user-<uid>.slice`: `CPUWeight=10`, `IOWeight=10`, `CPUQuota`,
-  `MemoryHigh`, `MemoryMax`, no swap, `TasksMax`. The guest cannot raise
-  them. Its processes run with `oom_score_adj` 500 (`choom` in the forced command): the global OOM picks
-  them first.
+* Caps on `user-<uid>.slice` of both accounts: `CPUWeight=10`, `IOWeight=10`,
+  `CPUQuota`, `MemoryHigh`, `MemoryMax`, no swap, `TasksMax`. The guest
+  cannot raise them. Its processes run with `oom_score_adj` 500 (`choom` in
+  the forced command): the global OOM picks them first.
 * Gate: with `--gate file`, no new job unless
   `/run/ameesh-gate/state/state.json` says `available`; a running job is
   killed at the drain deadline, or at once on `stopped`; an unreadable or
@@ -111,7 +132,10 @@ between users. The systemd sandboxing of the study (`ProtectSystem`,
 `ProtectProc=invisible`, `PrivateTmp`…) applies to units (mode a); an SSH
 session is not one, so in mode b1 the guest can still see other users'
 processes and write to the shared `/tmp` (its jobs use `TMPDIR` on the
-volume). `install.sh --check` lists what it can read; mount `/proc` with
+volume). With the job user (the default) the kernel denies the job the
+guest's `/proc`, HOME and caches; with `--no-job-user` the guest's
+`_no_dump` and its `foreign_holders` scan still guard them, as in L159b.
+`install.sh --check` lists what it can read; mount `/proc` with
 `hidepid=invisible` if the VM's command lines carry secrets.
 
 ## Rollback (study 4.3)
