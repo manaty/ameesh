@@ -159,6 +159,17 @@ from .work_dependencies import WorkDependencies
 import abc
 from typing import Any, Callable, Protocol, Sequence
 
+#: §4 (owner 14/10/2026) : début de la note de journal d'un lot RENDU à la file
+#: d'équipe (`work.return_to_queue`, balayage `ameesh work wip`). Un lot
+#: `build` sans assigné n'est prenable QUE s'il a été rendu ainsi : un lot en
+#: cours (prérequis, travail confié par courrier) garde son état sans passer à
+#: la file (le pilote lit ce marqueur dans le journal, `requeued_sql`).
+RETURNED_NOTE = "returned to the queue"
+#: Débuts d'une note d'attribution : la dernière attribution d'un lot porte
+#: l'exception pilote (`work.WIP_EXCEPTION_MARK`), et un retour §4 doit être
+#: POSTÉRIEUR à la dernière attribution pour rendre le lot prenable.
+ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ")
+
 
 class Domain(abc.ABC):
     """Opérations d'un domaine, liées à une connexion ou une transaction."""
@@ -1283,6 +1294,36 @@ class WorkItems(Domain):
         L40 : efface la délégation en cours (issue `annulee`)."""
 
     @abc.abstractmethod
+    def count_builds(self, assignee: str) -> int:
+        """§4 (owner 14/10/2026) : les lots en `build` de l'agent, tous projets
+        confondus."""
+
+    @abc.abstractmethod
+    def assign_capped(self, item_id: int, assignee: str, *, current: str | None,
+                      note: str, actor: str, max_build: int) -> dict | None:
+        """`assign` sous la limite d'en-cours (§4), en UNE transaction : le
+        verrou consultatif de l'agent est pris AVANT le compte de ses lots en
+        `build`, si bien que deux prises simultanées du même agent ne peuvent
+        pas franchir `max_build`. None si le plafond est atteint ou si le lot a
+        bougé."""
+
+    @abc.abstractmethod
+    def unassign(self, item_id: int, *, current: str | None, note: str,
+                 actor: str) -> dict | None:
+        """§4 : rend le lot à la file — assignation retirée si le lot a encore
+        l'assigné `current` et n'est ni fusionné ni fermé, journal dans la même
+        transaction ; None sinon. Branche, tête de branche et jalons ne sont
+        pas touchés ; L40 : la délégation en cours est annulée."""
+
+    @abc.abstractmethod
+    def wip_exceptions(self, item_ids: Sequence[int], marker: str,
+                       prefixes: Sequence[str]) -> list[int]:
+        """§4 : parmi `item_ids`, ceux dont la DERNIÈRE attribution (note
+        commençant par l'un des `prefixes`) porte `marker` — l'exception pilote
+        explicite à la limite d'en-cours. Une réassignation postérieure sans le
+        marqueur l'a retirée."""
+
+    @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
                 paused_prefix: str, note_prefix: str, window_s: float,
                 max_per_window: int, note: str, actor: str) -> dict | None:
@@ -1420,8 +1461,9 @@ class WorkItems(Domain):
     def backlog(self, *, open_only: bool, limit: int) -> list[dict]:
         """Les éléments de la file dans l'ordre de prise (priorité, puis valeur
         décroissante, puis ancienneté). `open_only` : seulement ceux qu'on peut
-        encore prendre (`intake`, sans assigné) ; sinon tous les éléments non
-        terminés."""
+        encore prendre (`intake`, ou `build` RENDU à la file par la limite
+        d'en-cours §4 — `RETURNED_NOTE` postérieur à la dernière attribution —
+        sans assigné) ; sinon tous les éléments non terminés."""
 
     @abc.abstractmethod
     def auto_takes_since(self, seconds: float, note_prefix: str) -> int:
@@ -1431,13 +1473,17 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def unassigned_lots(self, limit: int) -> list[dict]:
-        """L165 : les lots du projet encore à confier (`intake`, sans assigné,
-        hors file d'amélioration), dans l'ordre de prise : priorité, puis
-        dates prévues (début, fin, livraison ; sans date en dernier), puis
-        ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
-        fiche ou de la fiche parente, sinon son application),
-        `pending_decision` (une demande de décision attend sur le lot) et
-        `decision_milestone` (un jalon de décision ouvert y est rattaché).
+        """L165 : les lots du projet encore à confier (`intake`, ou `build`
+        RENDU à la file par la limite d'en-cours §4 : `RETURNED_NOTE` postérieur
+        à la dernière attribution, il garde son état et sa branche —, sans
+        assigné, hors file d'amélioration), dans l'ordre de prise : priorité,
+        puis les `build` avant les `intake` à priorité égale, puis dates prévues
+        (début, fin, livraison ; sans date en dernier), puis ancienneté. Chaque
+        ligne ajoute `lot_team` (équipe du lot, sinon de sa fiche ou de la fiche
+        parente, sinon son application), `pending_decision` (une demande de
+        décision attend sur le lot), `decision_milestone` (un jalon de décision
+        ouvert y est rattaché) et `returned_to_queue` (§4, le lot `build` a été
+        rendu ; `false` pour un `intake`).
         #1193: a lot whose explicit prerequisite is not finished is excluded —
         the ready intake never offers a lot that cannot be started."""
 

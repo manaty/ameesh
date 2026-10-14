@@ -331,9 +331,15 @@ class Operations(interface.Operations):
             " ORDER BY updated_at DESC, id DESC", (name,))
 
     def open_lots_activity(self, limit) -> list[dict]:
+        # §4 : `returned_to_queue` distingue un lot `build` RENDU à la file
+        # (limite d'en-cours) d'un lot en cours sans assigné (prérequis,
+        # travail confié par courrier) — voir `work.requeued_sql`.
+        from .work import REQUEUED_PARAMS, requeued_sql
+
         return self.db.query(
             """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   (w.state = 'build' AND """ + requeued_sql("w") + """) AS returned_to_queue,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
@@ -351,7 +357,7 @@ class Operations(interface.Operations):
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
             """,
-            (int(limit) if limit is not None else None,))
+            REQUEUED_PARAMS + (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
