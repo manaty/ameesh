@@ -27,8 +27,9 @@ instead.
 - Linux, or WSL2, with `bash`;
 - Python **3.9 or later** — `uv` can install one for you;
 - `git`, to install from the repository;
-- a PostgreSQL database reachable from the workstation (a remote database on
-  macOS); `psycopg` comes with the package, so no `psql` binary is required;
+- a PostgreSQL database reachable from the workstation; `psycopg` comes with
+  the package, so no `psql` binary is required (on macOS, not supported yet,
+  only a remote database applies — see the table above);
 - the harness binaries (`claude`, `codex`, `dsh`) are installed separately.
 
 ## 1. Install uv
@@ -63,7 +64,7 @@ uv tool install ~/src/ameesh              # add --editable to follow the clone
 
 ```bash
 ameesh --version      # ameesh 1.10.0
-ameesh doctor         # driver, schema, migrations; --probe also checks the database
+ameesh doctor         # driver, schema, migrations (--probe: one-line light check for container probes)
 ```
 
 The older route still works and installs the same package:
