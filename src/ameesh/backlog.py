@@ -59,6 +59,8 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   `harness:<nom>` désigne son harnais ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
+* un lot avec une dépendance explicite encore ouverte attend son amont ;
+  les dépendances sont revérifiées dans la transaction de prise ;
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
@@ -520,7 +522,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 done = st.work.assign(int(item["id"]), check["assignee"], current=None,
                                       note="%s par %s, au repos" % (LOT_TAKE_NOTE,
                                                                     check["assignee"]),
-                                      actor=SENDER)
+                                      actor=SENDER, ready_only=True)
                 lots.remove(item)
                 if done is None:
                     continue                # pris entre-temps : lot suivant
