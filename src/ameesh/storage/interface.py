@@ -3104,11 +3104,11 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
-        sont plus assignés à leur agent ; rend les lignes supprimées. #794 :
-        la session ACTIVE d'un lot purgé est oubliée au registre dans la même
-        transaction (`session_work_item` = ce lot seulement : un agent passé à
-        un autre lot n'est pas touché), et la ligne rendue porte l'id oublié
-        (`forgotten_session`) pour que l'exécuteur retire son fichier local."""
+        sont plus assignés à leur agent ; rend les lignes supprimées. Ne touche
+        pas au registre : la session ACTIVE d'un lot fini est fermée par
+        l'agent qui la détient, à son tour suivant, sous son bail (#794,
+        revue Claude B1 : ce balayage n'a pas le bail et peut tomber en plein
+        tour)."""
 
 
 # --------------------------------------------------------------------------
