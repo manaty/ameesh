@@ -287,6 +287,30 @@ Le schéma et l'existence du dépôt sont deux contrôles distincts :
 `radar.parse_settings` valide le premier, `git -C <clone> rev-parse
 --show-toplevel` (et `--is-bare-repository` → `false`) le second.
 
+### 3ter. Qualification bureau (14/10 07:33Z) — profil créé, schéma validé
+
+Le bureau a exécuté la préparation du profil dédié sur `pc-smichea` et l'a
+qualifiée (courrier bureau → dev3, 14/10 07:33Z ; preuve
+`outils/183-profile-preparation-20261014.json`) :
+
+| point | état constaté |
+|---|---|
+| profil dédié | `/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json`, mode 0600, créé depuis le socle réel |
+| empreinte | SHA256 `b3b1c32ee4df9bd8933e9a9f37874e455cf0f17c63b1e0e91e1ff7be29357d7e` |
+| `accounts` et non-`radar` | byte-sémantiquement identiques au socle (relevé bureau) |
+| schéma | `radar.parse_settings` du venv exécuteur valide : repo `/home/smichea/development/manaty/nexlink`, cible `develop`, `land: "pr"` ; `main`/release/tags protégés, `develop` libre |
+| drop-in / activation / restart | **aucun** : l'`AMEESH_CONFIG` de l'unité pointe encore le profil partagé |
+| réserves | chemin du socle et ordre du drop-in (`zzz-` après `zz-`) **levées** |
+
+**Reste à faire, et par qui** : écrire le seul drop-in `zzz-radar-nexlink.conf`,
+`daemon-reload` puis `restart` de l'unique unité désignée (§3bis, §4), **dans un
+créneau coordonné avec les déploiements `#1037`/`#1236`** (l'ancien code de porte
+de famille est encore en place), ou qualifier le repli documentaire
+`land: "off"` — décision orchestrateur/pilote, application bureau. Le **diff
+complet est à revoir avant tout nouveau créneau** (exigence bureau) ; la
+validation de schéma **n'est pas un feu** et n'autorise aucune activation par
+elle-même.
+
 ## 4. Runbook d'application (sur décision du bureau)
 
 **Profil dédié** (§3, §3bis) — pas le `critiques-2.json` partagé. `SRC` est le
@@ -491,6 +515,11 @@ Tranché le 13/10 :
    qualification** des pièces corrigées (§3bis) par le bureau ; la **liste
    initiale des PR** est fixée au démarrage par l'orchestrateur Nexlink, hors
    sensibles `915`, `695` et `943` en vol.
+   **Mise à jour 14/10 07:4xZ** : la qualification bureau est arrivée (§3ter) —
+   profil dédié créé (SHA256 `b3b1c32e…`), schéma validé par le venv exécuteur,
+   réserves levées, rien d'appliqué (aucun drop-in, aucun restart). Reste la
+   coordination d'un nouveau créneau avec les déploiements `#1037`/`#1236`, ou
+   la qualification du repli documentaire `land: "off"`.
 7. **Portes** — les deux portes locales suffisent-elles pour le pilote, ou
    faut-il des portes par chemin (`scripts/__tests__/*.test.mjs`) dès le
    premier jour ?
