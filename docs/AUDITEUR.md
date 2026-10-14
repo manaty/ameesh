@@ -34,12 +34,13 @@ qu'il ne fait jamais, et comment il en rend compte.
   (libérer un compte, relever un plafond, confier le travail urgent à un
   autre agent). S'il le fait lui-même, c'est au niveau 3 : il propose ;
 * le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
-  traiter (L132) : « Stale lot: … », « Underused plan: … »,
-  « Idle capacity: … », et leur « Reminder, alert still active … » 6 h plus
-  tard si l'alerte dure (avant la CLI en anglais de L156c : « Lot stagnant »,
-  « Forfait sous-employé », « Capacité au repos », « Relance »). La commande
-  citée est le geste de l'orchestrateur ; l'auditeur vérifie au passage court
-  suivant qu'il a été fait, et sinon le nomme dans son
+  traiter (L132) : « Underused plan: … », « Idle capacity: … », et leur
+  « Reminder, alert still active … » 6 h plus tard si l'alerte dure (avant la
+  CLI en anglais de L156c : « Forfait sous-employé », « Capacité au repos »,
+  « Relance »). Les lots stagnants (`stale_lot`) ne le réveillent plus (L713) :
+  il les lit à sa passe (`ameesh alerts --json`, point 2 de la liste de
+  contrôle). La commande citée est le geste de l'orchestrateur ; l'auditeur
+  vérifie au passage court suivant qu'il a été fait, et sinon le nomme dans son
   rapport (une relance reçue veut dire que rien n'a bougé en 6 h) ;
 * le courrier « Déploiement … », envoyé par l'unité de redémarrage qu'il a
   lancée hors de son tour (voir « Déployer ») ;

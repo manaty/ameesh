@@ -16,7 +16,7 @@ from unittest import mock
 
 from ameesh import radar, work
 
-from .support import SRC, PgTestCase, child_env
+from .support import EMPTY_CONFIG, SRC, PgTestCase, child_env
 
 MIG = "src/ameesh/migrations"
 
@@ -172,7 +172,7 @@ class ConflictsCommandTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def conflicts(self, *args):
-        env = child_env(AMEESH_STATE=self.state, AMEESH_CONFIG="/nonexistent",
+        env = child_env(AMEESH_STATE=self.state, AMEESH_CONFIG=EMPTY_CONFIG,
                         AMEESH_DSN="postgresql://injoignable.invalid/x")
         env["PYTHONPATH"] = SRC
         return subprocess.run([sys.executable, "-m", "ameesh.main", "conflicts", *args],
