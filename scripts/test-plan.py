@@ -24,10 +24,16 @@ so the split never differs between parts.
 * P2 — failed under measure in the last 7 days (map history);
 * P3 — the rest.
 
-**Phase 1: nothing is skipped.** Every part runs P0, P1 (shortest first),
-P2, then P3 (alphabetical); only the order changes. The plan also says
-whether a phase 2 selection ("impacted only", lot L161i) would have been
-safe for this change; it is recorded, never applied.
+**Lot branches: impacted + contract (L1211, canon §3).** On a pull request,
+only the impacted modules (P0, P1) and the contract list
+(`tests/parts/toujours.txt`: droits, rôles, migrations, objets globaux du
+cluster) run; the full suite runs on `main`, `release/**` and the package
+integration branch (§12). Any doubt — no map, a stale or unsure selection, a
+changed block without a test, test infrastructure, an empty contract list —
+gives the full suite (`lot_selection`). On `main` every module runs, P0 and
+P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
+driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
+matrix.
 
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
@@ -65,6 +71,7 @@ import collections
 import datetime
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import re
@@ -91,7 +98,14 @@ RECENT_FAILURE_DAYS = 7
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
 #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
 #: saturé) ; la suite psql complète reste en six parts.
+#: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
+#: impactés et le contrat : une part par pilote suffit, et une part de plus par
+#: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
 PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+#: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
+#: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
+#: comme dans celui de 45 min de psql.
+PR_TARGET_PART_S = 300
 #: entries listed in the job summary, per category
 SUMMARY_LIMIT = 25
 
@@ -467,13 +481,34 @@ def textual(modules: list[str], files: list[str]) -> dict[str, str]:
 
 # -- the plan -------------------------------------------------------------
 
+def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
+    """Why the impacted-only selection would not be safe for this change
+    (L1211): the plan then runs the full suite rather than decide on a doubt."""
+    if not out["sure"]:
+        return out["unsure"][0] if out["unsure"] else "selection unsure"
+    if age is None:
+        return "map without a generation date"
+    if age > PHASE2_MAX_AGE_H:
+        return f"map older than {PHASE2_MAX_AGE_H} h ({age:.0f} h)"
+    if impact is None:
+        return "selection unsure"
+    if impact.unknown_blocks:
+        return f"{len(impact.unknown_blocks)} new block(s) unknown to the map"
+    if impact.foundation:
+        return f"test infrastructure changed: {impact.foundation[0]}"
+    if impact.untested:
+        return f"{len(impact.untested)} changed block(s) without a test"
+    return "selection unsafe"
+
+
 def classify(modules: list[str], card: dict | None, now: datetime.datetime,
              base_fallback: str = "HEAD^1", head: str = "HEAD",
              repo: pathlib.Path = REPO) -> dict:
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
-    out = {"map": None, "sure": False, "phase2_safe": False, "unsure": [],
+    out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
+           "unsure": [], "contract": list(always),
            "untested": [], "unknown_blocks": [], "foundation": [], "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
@@ -514,6 +549,7 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                               and not impact.untested)
     changes = changes or []
     out["changed"] = len(changes)
+    out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
     triggered = always_hits(changes, always)
     #: #749 : la liste declenchee est publiee pour que le pilote psql d'une PR
     #: la rejoigne (make_plan), au lieu d'attendre la suite complete de main.
@@ -557,6 +593,38 @@ def split(modules: list[str], driver: str, n: int, card: dict | None,
                            "modules": parts.order(part, weighed, classes),
                            "estimate_s": round(sum(weighed[m] for m in part), 1)})
     return result
+
+
+def lot_selection(event: str, state: dict, modules: list[str],
+                  classes: dict[str, tuple[str, str]]) -> tuple[list[str] | None, str]:
+    """Modules a lot branch runs (L1211): impacted plus contract.
+
+    `None` means the full suite: an event other than a pull request, or any
+    doubt the plan cannot decide through — no usable map, a selection that is
+    not safe (stale map, a new block, test infrastructure, changed lines
+    without a test), an empty contract list. The reason goes to the summary.
+    """
+    if event != "pull_request":
+        return None, "main, release/** and the integration branch run the full suite"
+    contract = [m for m in state.get("contract", []) if m in modules]
+    if not contract:
+        return None, "contract list (tests/parts/toujours.txt) empty or unreadable"
+    if not (state.get("map") and state["map"].get("used")):
+        unsure = state.get("unsure") or ["no map"]
+        return None, f"map not usable ({unsure[0]})"
+    if not state.get("phase2_safe"):
+        return None, f"selection unsure ({state.get('phase2_why') or 'no reason'})"
+    return sorted({m for m in modules if classes[m][0] in ("P0", "P1")}
+                  | set(contract)), ""
+
+
+def lot_part_count(driver: str, modules: list[str], card: dict | None) -> int:
+    """Parts of a lot branch for `driver` (L1211): one, plus one per
+    `PR_TARGET_PART_S` of estimate; `make_plan` caps it at `PARTS`."""
+    if not modules:
+        return 1
+    estimate = sum(weights(modules, driver, card).values())
+    return max(1, math.ceil(estimate / PR_TARGET_PART_S))
 
 
 def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
@@ -623,20 +691,35 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
+    #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
+    #: tout doute rend la suite complète (lot_selection). La sélection se
+    #: contente d'une part par pilote tant que l'estimation le permet.
+    selection, why = (None, "") if skip else lot_selection(event, plan, modules, classes)
+    chosen_set = None if selection is None else set(selection)
+    contract = [m for m in plan.get("contract", []) if m in modules]
     plan["parts"] = {}
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
         if driver == "psql" and pr:
             selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
                                        always)
-        plan["parts"][driver] = [] if skip else split(
-            selected, driver, n_pr if pr else n_other, card, classes)
+        if chosen_set is not None:
+            selected = [m for m in selected if m in chosen_set]
+        n = n_pr if pr else n_other
+        if chosen_set is not None:
+            n = min(n, lot_part_count(driver, selected, card))
+        plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
     every = [m for m in modules]
     weighed = weights(every, "psycopg", card)
     chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
-    plan["selection"] = {"modules": len(every), "impacted": len(chosen),
-                         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
-                         "total_estimate_s": round(sum(weighed.values()), 1)}
+    ran = sorted({m for ps in plan["parts"].values() for p in ps for m in p["modules"]})
+    plan["selection"] = {
+        "mode": "skipped" if skip else ("impacted" if chosen_set is not None else "full"),
+        "why": plan["why"] if skip else why,
+        "modules": len(every), "impacted": len(chosen), "contract": len(contract),
+        "selected": len(ran), "skipped": len(every) - len(ran),
+        "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
+        "total_estimate_s": round(sum(weighed.values()), 1)}
     return plan
 
 
@@ -653,10 +736,10 @@ def fallback_plan(event: str, error: str) -> dict:
     pr = event == "pull_request"
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
             "version_only": False, "docs_only": False, "why": "planning failed",
-            "map": None, "sure": False, "phase2_safe": False,
+            "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
             "unknown_blocks": [], "foundation": [], "changed": 0, "doc_readers": [],
-            "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+            "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
         n = n_pr if pr else n_other
         # no module list: scripts/test-parts.py splits the suite itself (L116)
@@ -664,8 +747,9 @@ def fallback_plan(event: str, error: str) -> dict:
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
              "pilot_list": driver == "psql" and pr, "estimate_s": 0}
             for i in range(1, n + 1)]
-    plan["selection"] = {"modules": len(modules), "impacted": 0, "impacted_estimate_s": 0,
-                         "total_estimate_s": 0}
+    plan["selection"] = {"mode": "full", "why": "planning failed", "modules": len(modules),
+                         "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
+                         "impacted_estimate_s": 0, "total_estimate_s": 0}
     return plan
 
 
@@ -710,9 +794,19 @@ def summary(plan: dict) -> str:
     lines.append(f"* {plan['changed']} file(s) changed since the "
                  f"{'map commit' if m and m['used'] else 'parent commit'}; impacted (P0, P1): "
                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
-                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg); phase 1: nothing skipped")
-    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; phase 2 safe: "
-                 f"{'yes' if plan['phase2_safe'] else 'no'}")
+                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
+    if sel.get("mode") == "impacted":
+        lines.append(f"* lot branch (L1211): impacted + {sel['contract']} contract module(s), "
+                     f"{sel['selected']} module(s) run, {sel['skipped']} left to main, "
+                     f"release/** and the integration branch")
+    elif sel.get("mode") == "skipped":
+        lines.append("* parts skipped (see above)")
+    else:
+        lines.append(f"* full suite: {sel['selected']} module(s) run"
+                     + (f" ({sel['why']})" if sel.get("why") else ""))
+    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; impacted-only safe: "
+                 f"{'yes' if plan['phase2_safe'] else 'no'}"
+                 + (f" ({plan['phase2_why']})" if plan.get("phase2_why") else ""))
     for reason in plan["unsure"][:SUMMARY_LIMIT]:
         lines.append(f"  * {reason}")
     by_class = collections.defaultdict(list)

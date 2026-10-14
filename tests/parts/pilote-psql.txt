@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Modules « pilote » : ceux que la CI d'une PR passe AUSSI avec le pilote psql
 # (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec psycopg
-# sur la PR, et la suite psql complète tourne sur main, release/* et à la main
-# (workflow_dispatch). Un module ajouté ici doit exister (scripts/test-parts.py
-# refuse un nom inconnu).
+# sur la PR, et la suite psql complète tourne sur main, release/*, integration/*
+# et à la main (workflow_dispatch). Un module ajouté ici doit exister
+# (scripts/test-parts.py refuse un nom inconnu).
+#
+# L1211 (canon §3) : sur une branche de lot, le pilote psql ne voit que les
+# modules de cette liste retenus par le plan (impactés ou contrat), plus la
+# liste « always » déclenchée (#749).
 #
 # Règle : on liste les tests de la couche base (db.py), des migrations et du
 # stockage (ameesh.storage), et ceux qui exercent un comportement propre à un

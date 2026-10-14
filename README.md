@@ -362,18 +362,21 @@ scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwawa
 
 CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
 on the measured durations of `tests/parts/durees.json`): on a pull request,
-`psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
-`tests/parts/pilote-psql.txt`, in 3 parts so that each one stays under the
-30-minute job cap on the shared self-hosted hosts (#947); the full `psql` suite
-(6 parts) runs on pushes to `main` and `release/*`. The `tests` job aggregates
-the parts. Each part streams its results, one JSON line per test (`--flow`, schema
+`psycopg` runs the impacted modules and the contract list
+(`tests/parts/toujours.txt`, L1211) in one to four parts, and `psql` the driver
+modules of `tests/parts/pilote-psql.txt` among them, in one to three parts so
+that each one stays under the job cap on the shared self-hosted hosts (#947);
+the full suite (4 `psycopg` parts, 6 `psql` parts) runs on pushes to `main`,
+`release/*` and `integration/*` (§12). The `tests` job aggregates the parts.
+Each part streams its results, one JSON line per test (`--flow`, schema
 `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
 the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
 test → code map once per run (`scripts/test-plan.py`, L161f) and every part
-runs from that plan: the test modules impacted by the change (changed code
-blocks, data files, directories, tables) run first, nothing is skipped; map
-missing or stale, the order falls back to the modules whose text names a
-changed file.
+runs from that plan: on `main`, the test modules impacted by the change
+(changed code blocks, data files, directories, tables) run first, nothing is
+skipped; on a lot branch, only the impacted modules and the contract run, and
+any doubt (map missing or stale, an unsure selection, a changed block without a
+test, test infrastructure) falls back to the full suite.
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round

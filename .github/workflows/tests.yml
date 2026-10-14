@@ -6,14 +6,25 @@
 # L116 — la suite est découpée en parts parallèles par scripts/test-parts.py
 # (par module, équilibré par tests/parts/durees.json), chaque part avec son
 # propre Postgres :
-#   - psycopg : la suite complète, en 4 parts, sur chaque PR et chaque push ;
-#   - psql    : sur une PR, seulement les modules « pilote »
-#               (tests/parts/pilote-psql.txt), en 3 parts (#947 : huit jobs se
-#               partagent chaque hôte auto-hébergé, une part unique de ~24 min
-#               au repos atteignait le plafond de 30 min sous saturation) ;
-#               la suite complète, en 6 parts, sur push vers main ou
-#               release/*, et à la main (workflow_dispatch).
+#   - psycopg : sur une PR, les tests impactés et le contrat (L1211), en une à
+#               quatre parts selon l'estimation ; la suite complète, en 4 parts,
+#               sur push vers main, integration/** ou release/** ;
+#   - psql    : sur une PR, les modules « pilote » parmi les impactés et le
+#               contrat, plus la liste « always » déclenchée (#749), en une à
+#               trois parts (#947 : huit jobs se partagent chaque hôte
+#               auto-hébergé, une part unique de ~24 min au repos atteignait le
+#               plafond de 30 min sous saturation) ; la suite complète, en
+#               6 parts, sur push vers main, integration/** ou release/**, et à
+#               la main (workflow_dispatch).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#
+# L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
+# toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
+# migrations, objets globaux du cluster), avec repli sur la suite complète
+# quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
+# La suite complète tourne sur main, release/** et la branche d'intégration du
+# paquet (§12) : une PR n'en déclenche plus. Les règles de refusion (a : delta
+# de main disjoint, b : migrations seules) viendront ensuite.
 #
 # L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
 # seule ligne `version = "…"`) ne relance pas la suite : `main` l'a déjà
@@ -34,7 +45,8 @@
 # (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flow.py).
 # Les modules de test touchés par les fichiers changés (--since HEAD^1 : la
 # cible pour une PR, le commit précédent sur main) passent en premier dans
-# chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
+# chaque part. Rien n'est sauté sur main ; sur une branche de lot, le plan
+# décide (L1211).
 #
 # L161f — the `plan` job reads the measured map (cache `carte-<sha>`, written
 # by .github/workflows/carte.yml) once for the whole run and writes plan.json
@@ -42,12 +54,15 @@
 # impacted by changed blocks, files or tables, P2 recent failure, P3 the
 # rest), the parts and their modules. Every part runs from that same plan
 # (`--plan`), impacted first; the matrices come from the plan (fromJSON), and
-# a driver with no part is skipped. Phase 1: nothing is skipped beyond the
-# version-only and documentation-only cases above. Map missing, stale or
-# unusable: the L161b order, full suite. The `bilan` job (never required)
-# counts the leaks (failures of modules the map did not select) and the
-# provisional green (P0 and P1 green in every part), kept as the `leaks`
-# artifact for the two-week review (L161i).
+# a driver with no part is skipped. On a lot branch (L1211), only the impacted
+# modules and the contract list run; the rest of the suite runs on main,
+# release/** and the package integration branch, and any doubt (no map, stale
+# or unsure selection, changed lines without a test, test infrastructure)
+# falls back to the full suite. Map missing, stale or unusable: the L161b
+# order, full suite. The `bilan` job (never required) counts the leaks
+# (failures of modules the map did not select) and the provisional green (P0
+# and P1 green in every part), kept as the `leaks` artifact for the two-week
+# review (L161i).
 #
 # L161c — pendant la part, `ci-flow.py publish` (arrière-plan) tient le check
 # run « tests (flux) <part> » de la tête poussée : chaque échec y entre dès
@@ -58,7 +73,7 @@ name: tests
 
 on:
   push:
-    branches: [main, "release/**"]
+    branches: [main, "release/**", "integration/**"]
   pull_request:
   workflow_dispatch:
 
@@ -248,9 +263,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt),
-        # en 3 parts (scripts/test-plan.py, PARTS) : sous saturation, une part
-        # unique atteignait le plafond de 30 min (#947)
+        # sur une PR (L1211) : les modules « pilote » parmi les impactés et le
+        # contrat, plus la liste « always » déclenchée (#749) ; une part, deux
+        # ou trois selon l'estimation (scripts/test-plan.py, lot_part_count),
+        # trois au plus (#947 : sous saturation, une part unique atteignait le
+        # plafond de 30 min) ; suite complète en 6 parts sur push.
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:

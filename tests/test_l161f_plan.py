@@ -387,7 +387,7 @@ class MapTest(unittest.TestCase):
         self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
                                   "test_events_attach", "test_l31_orphans",
                                   "test_l50_group_orphan_work_items",
-                                  "test_l72_panne_de_base"])
+                                  "test_l72_panne_de_base", "test_migrations"])
 
     def test_psql_pr_modules_adds_the_triggered_always_list(self):
         # #749 : la liste « always » declenchee rejoint le pilote psql d'une PR ;
@@ -677,6 +677,142 @@ class PlanTest(unittest.TestCase):
         self.assertIn("psycopg=[1, 2, 3, 4]", (d / "out").read_text(encoding="utf-8"))
 
 
+class LotBranchTest(unittest.TestCase):
+    """L1211 (canon §3) : une branche de lot ne lance que les tests impactés,
+    plus toujours les tests de contrat, et se replie sur la suite complète
+    quand la sélection ne peut pas décider.
+
+    Témoins du sélecteur et de la porte, sans base : le plan est bâti sur un
+    état `classify` qui vaut carte fraîche et sûre sur la vraie liste des
+    modules, et le workflow porte les déclencheurs et le check requis.
+    """
+
+    def setUp(self):
+        self.mods = parts.modules()
+        self.contract = plan.read_list(plan.ALWAYS_FILE, self.mods)
+        self.pilot = parts.read_list(plan.PILOT_FILE, self.mods)
+
+    def _classes(self, **impacted):
+        classes = {m: ("P3", "") for m in self.mods}
+        for m, why in impacted.items():
+            classes[m] = ("P1", why)
+        return classes
+
+    def _state(self, classes, **kw):
+        state = {
+            "map": {"commit": "c" * 40, "generated": NOW.isoformat(), "age_h": 0.0,
+                    "used": True, "problem": ""},
+            "sure": True, "phase2_safe": True, "phase2_why": "", "unsure": [],
+            "untested": [], "unknown_blocks": [], "foundation": [], "changed": 2,
+            "always": [], "contract": list(self.contract),
+            "classes": {m: list(c) for m, c in classes.items()},
+        }
+        state.update(kw)
+        return state
+
+    def _plan(self, event="pull_request", classes=None, card=None, **state_kw):
+        state = self._state(classes if classes is not None else self._classes(), **state_kw)
+        nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "classify", return_value=state), \
+                mock.patch.object(plan, "nature", return_value=dict(nature)):
+            return plan.make_plan(event, card if card is not None else {}, NOW)
+
+    def _ran(self, p, driver="psycopg"):
+        return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
+
+    def test_lot_branch_runs_impacted_and_contract_only(self):
+        impacted = self.mods[0]
+        p = self._plan(classes=self._classes(**{impacted: "src/ameesh/x.py::f"}))
+        sel = p["selection"]
+        self.assertEqual(sel["mode"], "impacted")
+        self.assertEqual(sel["why"], "")
+        self.assertEqual(sel["contract"], len(self.contract))
+        expected = sorted(set(self.contract) | {impacted})
+        self.assertEqual(self._ran(p), expected)
+        self.assertEqual(sel["selected"], len(expected))
+        self.assertEqual(sel["skipped"], len(self.mods) - len(expected))
+        # le contrat garantit une matrice psycopg non vide : le check requis
+        # « tests » ne peut pas verdir sans qu'une part ait tourné
+        self.assertNotEqual(plan.outputs(p)["psycopg"], "[]")
+        self.assertGreaterEqual(int(plan.outputs(p)["psycopg_parts"]), 1)
+
+    def test_contract_runs_even_when_nothing_is_impacted(self):
+        p = self._plan()
+        self.assertEqual(self._ran(p), sorted(self.contract))
+        self.assertEqual(plan.outputs(p)["psycopg_parts"], "1")
+
+    def test_psql_keeps_the_pilot_subset(self):
+        # le pilote psql d'une PR reste un sous-ensemble de la sélection
+        impacted = self.pilot[0]
+        p = self._plan(classes=self._classes(**{impacted: "x"}))
+        expected = sorted((set(self.pilot) | {impacted})
+                          & (set(self.contract) | {impacted}))
+        self.assertEqual(self._ran(p, "psql"), expected)
+
+    def test_psql_runs_a_triggered_always_module_outside_the_pilot(self):
+        # #749 conservé sous le sélecteur : un module « always » déclenché
+        # rejoint le pilote psql même hors tests/parts/pilote-psql.txt
+        extra = self.contract[0]
+        self.assertNotIn(extra, self.pilot)
+        p = self._plan(classes=self._classes(**{extra: "always list (src/ameesh/runner.py)"}),
+                       always=[extra])
+        self.assertIn(extra, self._ran(p, "psql"))
+
+    def test_any_doubt_runs_the_full_suite(self):
+        cases = {
+            "no map": {"map": None},
+            "map unusable": {"map": {"commit": "c" * 40, "generated": NOW.isoformat(),
+                                     "age_h": 0.0, "used": False, "problem": "map unreadable"}},
+            "unsafe selection": {"phase2_safe": False,
+                                 "phase2_why": "3 changed block(s) without a test"},
+            "empty contract": {"contract": []},
+        }
+        for why, state_kw in cases.items():
+            with self.subTest(why):
+                p = self._plan(**state_kw)
+                self.assertEqual(p["selection"]["mode"], "full", why)
+                self.assertTrue(p["selection"]["why"], why)
+                self.assertEqual(self._ran(p), sorted(self.mods), why)
+
+    def test_full_suite_on_main_release_and_integration(self):
+        for event in ("push", "workflow_dispatch"):
+            with self.subTest(event):
+                p = self._plan(event=event)
+                self.assertEqual(p["selection"]["mode"], "full")
+                self.assertIn("integration", p["selection"]["why"])
+                self.assertEqual(self._ran(p), sorted(self.mods))
+
+    def test_summary_names_the_selection(self):
+        p = self._plan(classes=self._classes(**{self.mods[0]: "src/ameesh/x.py::f"}))
+        text = plan.summary(p)
+        self.assertIn("lot branch (L1211)", text)
+        self.assertIn(f"{len(self.contract)} contract module(s)", text)
+        full = self._plan(phase2_safe=False, phase2_why="changed block(s) without a test")
+        text = plan.summary(full)
+        self.assertIn("full suite", text)
+        self.assertIn("changed block(s) without a test", text)
+
+    def test_parts_shrink_to_the_estimate(self):
+        def card(seconds):
+            return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
+                                for m in self.mods}}
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
+        # 235 modules × 2 s = 470 s -> deux parts
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
+        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
+
+    def test_selected_matrix_never_exceeds_the_parts_cap(self):
+        # un lot très large (60 s par module) reste dans PARTS : quatre parts
+        # psycopg et trois parts psql au plus, comme la suite complète
+        classes = self._classes(**{m: "x" for m in self.mods})
+        p = self._plan(classes=classes, card={"modules": {
+            m: {"durees": {"psycopg": 60.0, "psql": 60.0}} for m in self.mods}})
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        self.assertEqual({ps["of"] for ps in p["parts"]["psycopg"]}, {4})
+        self.assertEqual({ps["of"] for ps in p["parts"]["psql"]}, {3})
+        self.assertEqual(self._ran(p), sorted(self.mods))
+
+
 def _cases():
     """Example tests, out of reach of test discovery."""
 
@@ -839,6 +975,15 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("name: leaks", job)
         tests_job = self.text[self.text.index("\n  tests:\n"):]
         self.assertNotIn("bilan", tests_job.split("steps:")[0])
+
+    def test_lot_branch_triggers_and_full_suite_events(self):
+        # L1211 : la PR garde la CI (impactés + contrat, le sélecteur décide),
+        # le push vers la branche d'intégration du paquet, main et release/**
+        # porte la suite complète ; le check requis reste l'agrégat « tests ».
+        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        self.assertIn("\n  pull_request:\n", self.text)
+        self.assertIn("L1211", self.text)
+        self.assertIn("tests/parts/toujours.txt", self.text)
 
 
 if __name__ == "__main__":

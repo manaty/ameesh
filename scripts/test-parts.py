@@ -57,9 +57,12 @@ L161f — **plan**: with `--plan plan.json` (written once per CI run by
 their classes from the plan: every part reads the same split, computed once
 from the map. `--parts`, `--list`, `--since` and `--map` are then
 ignored; a plan without a module list for the part (fallback plan) gives
-the L116 split. With `--flow`, the part writes an `impacted` event once its
-P0 and P1 modules are done (`statut`: `vert` or `rouge`): the provisional
-green, when every part says `vert`.
+the L116 split. On a lot branch (L1211), the plan holds only the impacted
+modules and the contract list: the part runs them, the rest of the suite
+runs on main, `release/**` and the package integration branch. With
+`--flow`, the part writes an `impacted` event once its P0 and P1 modules are
+done (`statut`: `vert` or `rouge`): the provisional green, when every part
+says `vert`.
 """
 from __future__ import annotations
 
