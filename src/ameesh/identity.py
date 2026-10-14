@@ -135,6 +135,31 @@ def resolve_binding(cfg: Config, db=None, *, harness: str | None = None,
     return Binding(name=name, source="explicit", ok=True)
 
 
+#: L244 (#420) : sources acceptées pour signer un geste de droits — le bail du
+#: runner (le plus fort), ou une liaison de session explicite (L41). Une simple
+#: variable `AGENT_MAIL_NAME` (source `explicit`) est auto-déclarée.
+BOUND_SOURCES = ("runner", "session")
+
+
+def require_bound(cfg: Config, db=None, *, what: str = "this command",
+                  sources: tuple[str, ...] = BOUND_SOURCES) -> Binding:
+    """L'identité liée qu'exige un geste de droits (L244, #420).
+
+    Refuse une identité absente, un bail qui ne correspond pas, ou une source
+    seulement explicite : une signature de droits ne se contente pas d'un nom
+    auto-déclaré."""
+    binding = resolve_binding(cfg, db)
+    if not binding.name or not binding.ok or binding.source not in sources:
+        if binding.name and not binding.ok:
+            reason = binding.reason or "identity does not match a live lease"
+        elif binding.name:
+            reason = "identity %s is %s, not bound" % (binding.name, binding.source)
+        else:
+            reason = binding.reason or "no bound session identity"
+        raise ValueError("%s requires a bound session identity (%s)" % (what, reason))
+    return binding
+
+
 _UNBOUND = ("AGENT_MAIL_NAME not set (the runner sets it for the harness) and no "
             "session binding (ameesh mail bind)")
 

@@ -43,7 +43,7 @@ import uuid
 
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import budget as budget_mod, db as db_mod, fil, identity, mail, registry, sentinel, storage
+from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import persona_memory as memory_mod
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
@@ -138,6 +138,11 @@ def log_async(message: str) -> None:
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
 EXIT_REVOKED = 6
+#: L790 : le paquet installé a changé sous ce processus — sortie dédiée pour
+#: que l'exécuteur se remplace entre deux tours (même invocation) ; si le
+#: remplacement direct échoue, le code non nul fait relancer le service
+#: (`Restart=on-failure`).
+EXIT_RESTART = 75
 #: L159f : tant que la porte d'hôte n'est pas fixée (canon pas encore lu en
 #: entier), le sync du canon est réessayé à ce pas (secondes)
 GATE_SETTLE_RETRY_S = 30
@@ -3368,6 +3373,15 @@ class AgentWorker(threading.Thread):
                                     status_text="runner shutting down: instruction put back "
                                                 "in the queue")
             return False
+        if getattr(self.runner, "restart_for_stale", False):
+            # L790 : le paquet a changé entre le choix du tour et son lancement
+            # — rien ne part sur le code périmé ; une consigne déjà prise
+            # repart en attente, le tour est refusé sans compter comme échec.
+            if registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch):
+                registry.set_status(self.db, self.name, "queued",
+                                    status_text="outdated runner: instruction put back "
+                                                "in the queue")
+            return False
         if self.runner.gate_holds():
             # L159f : l'hôte se retire entre le choix du tour et son lancement —
             # une consigne déjà prise repart en attente, rien n'est lancé.
@@ -4496,6 +4510,12 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if self.runner.draining.is_set():
                     break  # drainage : le tour d'avant est fini, aucun autre ne part
+                if getattr(self.runner, "restart_for_stale", False):
+                    # L790 : code périmé constaté — le tour d'avant est fini,
+                    # aucun autre ne part ; le bail est rendu par le `finally`,
+                    # la boucle principale se remplace ensuite.
+                    log("[%s] outdated runner: no new turn, lease released" % self.name)
+                    break
                 if self.runner.gate_holds():
                     # L159f : porte d'hôte fermée — le bail est rendu (finally)
                     self._leave_for_host()
@@ -4700,6 +4720,13 @@ class Runner:
         self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
+        #: L790 : le paquet a changé sous ce processus (voir
+        #: `canon_sync_once`) — plus aucune réclamation (`sweep`), les workers
+        #: sortent entre deux tours et la boucle principale se remplace
+        #: (`run`).
+        self.restart_for_stale = False
+        #: les workers au repos ont été réveillés une fois pour sortir (L790)
+        self._stale_woken = False
         #: L109 : exécuteur médié — pas de base, le serveur du mesh par
         #: `/api/exec/v1` (`storage.remote`). Synchronisation du canon, relevé
         #: des soldes, échéance des délégations et déplacement entre hôtes
@@ -5046,6 +5073,8 @@ class Runner:
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
         if self.draining.is_set():
             return  # drainage : aucun nouvel agent, aucun nouveau tour
+        if getattr(self, "restart_for_stale", False):
+            return  # L790 : code périmé — plus de réclamation, on redémarre
         if not self._gate_settled.is_set():
             return  # L159f : hôte prêteur ou non, su au premier `canon sync`
         if not getattr(self, "mediated", False):
@@ -5345,6 +5374,27 @@ class Runner:
                   "its background work finish (at most %ds), then stop; a second "
                   "signal stops immediately" % (signum, int(self.drain_seconds)))
 
+    def _stale_restart_ready(self) -> bool:
+        """L790 : le redémarrage attend la fin du dernier tour et du fond.
+
+        Dès que `canon_sync_once` a constaté un code périmé, `sweep` ne
+        réclame plus : ici on réveille les workers au repos pour qu'ils
+        sortent entre deux tours (même geste que le drainage, sans interrompre
+        un tour en cours), puis on ne rend vrai que lorsque plus rien n'écrit —
+        même critère que le drainage, sans sa borne."""
+        if not getattr(self, "restart_for_stale", False):
+            return False
+        with self.lock:
+            workers = list(self.workers.items())
+        if not getattr(self, "_stale_woken", False):
+            # hors du chemin de `shutdown` : les workers au repos attendent
+            # leur propre événement, pas `wake_all` (celui de la boucle)
+            self._stale_woken = True
+            for _nom, worker in workers:
+                worker.wake.set()
+        vivants = [name for name, worker in workers if worker.is_alive()]
+        return not vivants and not self.background.running_count()
+
     def _drained(self) -> bool:
         """Drainage en cours : vrai quand l'exécuteur peut s'arrêter — plus
         aucun worker vivant (chacun sort après son tour) ni travail de fond en
@@ -5420,6 +5470,9 @@ class Runner:
         `canon_sync.sync` ; un canon illisible enregistre l'état `unreadable`,
         ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
         cours. Un échec — canon, git, base — est journalisé et rend `False`.
+        L780 : un exécuteur plus vieux que le paquet installé saute la passe
+        sans rien écrire (canon_state, responsables et placements restent au
+        dernier passage valide) et demande un redémarrage entre deux tours.
         """
         if getattr(self, "mediated", False):
             return True  # L109 : le canon est synchronisé par le serveur
@@ -5428,6 +5481,32 @@ class Runner:
         self._canon_complete = not entries
         if not entries:
             return True
+        # L780 : livraison sous ce processus (paquet mis à jour, arbre source
+        # tiré) — l'ancien code, validateur de descripteurs compris, ne juge
+        # plus le canon. Rien n'est écrit ni fermé : l'état reste au dernier
+        # passage valide, la porte d'hôte reste fermée, la passe est signalée
+        # une fois, et le remède est un redémarrage entre deux tours.
+        stale = harnesses.stale_reason()
+        if stale:
+            self._canon_complete = False
+            # L790 : le remède est un redémarrage ; on le demande ici, sans
+            # attendre un humain. `sweep` cesse de réclamer, la boucle
+            # principale se remplace dès que le dernier tour (et le fond) est
+            # fini — les tours en cours ne sont pas interrompus.
+            self.restart_for_stale = True
+            wake = getattr(self, "wake_all", None)
+            if wake is not None:
+                wake.set()
+            if not getattr(self, "_stale_reported", False):
+                self._stale_reported = True
+                log_async("canon sync skipped: outdated runner (%s) — restarting "
+                          "between turns" % stale)
+                note = getattr(self, "_fil_note", None)
+                if note is not None:
+                    note("outdated runner: %s; canon_state unchanged and no new claim "
+                         "until an automatic restart between turns" % stale,
+                         meta={"kind": "runner-outdated"})
+            return False
         db = None
         ok = True
         try:
@@ -6761,6 +6840,7 @@ class Runner:
         self.report_boot_orphans()
         self.settle_dead_turns()
         reprise = Reprise(self.db_retry_max)
+        code = 0
         try:
             while not self.stop.is_set():
                 if self._sigterm_drained():
@@ -6768,6 +6848,12 @@ class Runner:
                     break
                 if self.draining.is_set() and self._drained():
                     break  # `shutdown` rend les baux et arrête ce qui resterait
+                if self._stale_restart_ready():
+                    # L790 : paquet changé sous ce processus — on se remplace
+                    # entre deux tours (plus aucun tour ni fond en cours).
+                    log_async("outdated runner: restarting between turns")
+                    code = EXIT_RESTART
+                    break
                 try:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
@@ -6811,9 +6897,11 @@ class Runner:
                 self.wake_all.clear()
         finally:
             self.shutdown()
-        # L114 (interface `ameesh-executor/1`, §7) : 6 = exécuteur révoqué,
-        # le lanceur efface le volume et ne relance pas sans nouveau code
-        return EXIT_REVOKED if getattr(self, "revoked", False) else 0
+        if getattr(self, "revoked", False):
+            # L114 (interface `ameesh-executor/1`, §7) : 6 = exécuteur révoqué,
+            # le lanceur efface le volume et ne relance pas sans nouveau code
+            return EXIT_REVOKED
+        return code
 
 
 # --------------------------------------------------------------------------
@@ -7551,7 +7639,6 @@ def main(argv: list[str] | None = None) -> int:
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
         code = runner.run()  # son `finally` rend les baux (shutdown)
-        return code
     finally:
         try:
             db.close()
@@ -7559,6 +7646,59 @@ def main(argv: list[str] | None = None) -> int:
             # Incontournable, même sur exception, après la remise des baux : aucun
             # fil démon ne doit écrire pendant la finalisation (SIGABRT, 2026-10-05).
             _sortie_sure(code, runner.stopped_threads if runner is not None else ())
+    # L790 : le paquet installé a changé sous ce processus. Baux rendus, base
+    # fermée et journal vidé par le `finally` ci-dessus : on rejoue l'invocation
+    # telle quelle (mêmes options, même identité) pour reprendre le code neuf,
+    # sans attendre un humain. Si le remplacement direct échoue, le code 75
+    # sort en échec et le service (`Restart=on-failure`) relance l'exécuteur.
+    if code == EXIT_RESTART:
+        _restart_with_installed_code()
+    return code
+
+
+def _restart_argv() -> list[str]:
+    """L790 : l'invocation à rejouer, mode d'appel préservé.
+
+    `sys.argv[0]` ne dit pas le mode : sous `python -m ameesh.runner`, il porte
+    le chemin du module (`…/runner.py`), et rejouer `[sys.executable, argv[0]]`
+    lance le fichier seul — ses imports relatifs le refusent. `sys.orig_argv`
+    (3.10+) garde la ligne de commande réelle : `-m ameesh.runner`, `-m ameesh
+    run`, options de l'exécuteur et options de l'interpréteur comprises. On ne
+    reprend de l'interpréteur que `sys.executable` : chemin absolu, `execv` ne
+    cherche pas dans `PATH`.
+
+    Sans `orig_argv` (3.9), le mode est indéterminable sous `-m` : on ne devine
+    pas — la liste vide fait sortir en `EXIT_RESTART`, et le service
+    (`Restart=on-failure`) relance l'exécuteur."""
+    orig = getattr(sys, "orig_argv", None)
+    if orig:
+        return [sys.executable] + list(orig[1:])
+    if __package__:
+        return []
+    return [sys.executable] + list(sys.argv)
+
+
+def _restart_with_installed_code() -> bool:
+    """L790 : rejoue l'invocation de l'exécuteur, entre deux tours.
+
+    `os.execv` remplace l'image du processus : le code neuf reprend la main
+    avec les mêmes arguments et le même environnement, sans passer par un
+    superviseur. Rend `False` si le remplacement échoue, ou si le mode d'appel
+    n'est pas rejouable (l'appelant sort alors en `EXIT_RESTART`, que le
+    service relance)."""
+    argv = _restart_argv()
+    if not argv:
+        print("agent-runner: outdated code — invocation mode not replayable "
+              "(python < 3.10): the service must restart it", file=sys.stderr, flush=True)
+        return False
+    print("agent-runner: outdated code — restarting with the installed package",
+          file=sys.stderr, flush=True)
+    try:
+        os.execv(argv[0], argv)
+    except OSError as exc:
+        print("agent-runner: restart failed: %s" % exc, file=sys.stderr, flush=True)
+        return False
+    return True
 
 
 if __name__ == "__main__":
