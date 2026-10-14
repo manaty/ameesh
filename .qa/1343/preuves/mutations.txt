@@ -1,0 +1,24 @@
+# 1343 — temoins de discrimination : chaque garde mutee fait rougir son temoin
+# sha du candidat : d1d875c89168fe1fb92059cae5b331ccbe3ef750
+== P1 relecture sous verrou
+   exit=1
+   rouges: test_un_gel_deplace_sous_le_verrou_recule, test_un_verdict_bloque_sous_le_verrou_recule
+== P2-2 check/mode/force
+   exit=1
+   rouges: test_force_repare_le_check_rouge_sous_le_verrou
+== P2-3 run visible materialise
+   exit=1
+   rouges: test_un_run_rouge_visible_ne_tient_plus_la_reservation
+== P2-4 couverture des modes
+   exit=1
+   rouges: test_la_reservation_full_couvre_la_demande_lot, test_une_reservation_full_couvre_la_demande_lot
+
+mutations: 4/4 detectees
+restauration: exit=0, rouges=—
+# apres restauration :
+..................................................................................
+----------------------------------------------------------------------
+Ran 82 tests in 0.059s
+
+OK
+restauration-exit:0

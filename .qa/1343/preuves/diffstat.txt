@@ -1,0 +1,10 @@
+ .github/workflows/tests.yml      |  186 ++++++-
+ docs/EXPLOITATION.md             |   54 ++
+ scripts/test-plan.py             |  131 ++++-
+ src/ameesh/ci.py                 | 1005 +++++++++++++++++++++++++++++++++
+ src/ameesh/mesh_cli.py           |   42 ++
+ tests/test_l161a_ci_sans_code.py |    7 +-
+ tests/test_l161f_plan.py         |  202 ++++++-
+ tests/test_l161g_ci_gel.py       | 1141 ++++++++++++++++++++++++++++++++++++++
+ 8 files changed, 2705 insertions(+), 63 deletions(-)
+diffstat-exit:0
