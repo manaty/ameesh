@@ -35,6 +35,7 @@ AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     lease_owner, lease_epoch,
+    extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from created_at)::float8        as created_ts,
@@ -48,7 +49,11 @@ AGENT_COLUMNS = """
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
-    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake
+    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake,
+    -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
+    -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
+    -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
+    session_harness, session_cwd, session_origin
 """
 
 
@@ -311,6 +316,29 @@ class Agents(interface.Agents):
         sql += " ORDER BY last_seen"
         return self.db.query(sql, tuple(params))
 
+    def note_unleased(self, name, host, error) -> bool:
+        if not error.startswith("lease_not_taken: "):
+            raise ValueError("unleased diagnostic must start with lease_not_taken: ")
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, host, mode, status, lease_owner, lease_expires_at,
+                       last_error
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET last_error = %s, updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name AND verrou.host = %s
+               AND verrou.mode = 'execute'
+               AND verrou.status IN ('idle', 'queued', 'dead')
+               AND (verrou.lease_owner IS NULL OR verrou.lease_expires_at IS NULL
+                    OR verrou.lease_expires_at <= clock_timestamp())
+               AND verrou.last_error IS DISTINCT FROM %s
+            RETURNING r.name
+            """, (name, error, host, error))
+        return bool(rows)
+
     def mark_event_wake(self, name) -> None:
         self.db.execute(
             "UPDATE agent_registry SET last_event_at = now(), updated_at = now() WHERE name = %s",
@@ -471,6 +499,9 @@ class Leases(interface.Leases):
                        THEN NULL
                        ELSE r.current_prompt END,
                    status           = CASE WHEN r.status = 'dead' THEN 'idle' ELSE r.status END,
+                   last_error       = CASE
+                       WHEN starts_with(coalesce(r.last_error, ''), 'lease_not_taken: ')
+                       THEN NULL ELSE r.last_error END,
                    updated_at       = now()
               FROM verrou
              WHERE r.name = verrou.name

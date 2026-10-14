@@ -157,7 +157,11 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
                "visibility_ok", "visibility_diagnostic",
-               "placement_ok", "placement_diagnostic", "placement_ref", "projects")
+               "placement_ok", "placement_diagnostic", "placement_ref", "projects",
+               # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
+               # persistés pour le garde SQL du rôle QA. Le vocabulaire est
+               # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
+               "roles")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -1146,7 +1150,7 @@ def _same(row: dict, values: dict) -> bool:
         if key == "budget_usd":
             old = None if old is None else float(old)
             new = None if new is None else float(new)
-        if key in ("capabilities", "projects"):
+        if key in ("capabilities", "projects", "roles"):
             old = None if old is None else list(old)
         if old != new:
             return False
@@ -1307,6 +1311,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # stays the primary one for the readers of a single project
             "team": agent.team,
             "projects": agent.effective_projects,
+            # L244 (#420): les rôles déclarés, vocable des fiches (L242c, #414),
+            # pour que le garde SQL du verdict QA les lise au registre.
+            "roles": agent.roles,
             "provider": agent.provider,
             "credential_mode": admission.credential_mode or agent.credential_mode,
             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute

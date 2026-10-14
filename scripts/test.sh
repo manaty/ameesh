@@ -16,8 +16,11 @@ cd "$(dirname "$0")/.."
 export AMEESH_TEST_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.0.0.1:55432/agent_mesh}}
 export AMEESH_REQUIRE_DB=1
 # jamais la configuration de l'hôte (~/.config/ameesh/config.json) : sur un
-# poste basculé, elle fixerait canon, fils et hôte sous les tests
-export AMEESH_CONFIG="$PWD/.config-absente-pour-les-tests.json"
+# poste basculé, elle fixerait canon, fils et hôte sous les tests. Fichier VIDE
+# mais existant : un chemin explicite absent est refusé (#1127).
+AMEESH_CONFIG="$(mktemp "${TMPDIR:-/tmp}/ameesh-config-vide-XXXXXX")"
+printf '{}\n' > "$AMEESH_CONFIG"
+export AMEESH_CONFIG
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 # aucun réseau dans les tests : ni clé de fournisseur, ni relevé de solde (L26)
 unset DEEPSEEK_API_KEY AMEESH_DEEPSEEK_API_BASE

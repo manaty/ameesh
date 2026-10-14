@@ -22,7 +22,7 @@ from ameesh import background, capacity_guard, config as config_mod, host_gate, 
 from ameesh import relocation, storage
 from ameesh.runner import AgentWorker
 
-from .support import REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase
 
 GOLDEN = os.path.join(REPO, "tests", "dore", "capacity_guard")
 
@@ -80,8 +80,16 @@ class ContractAgreementTest(unittest.TestCase):
 
 
 class DefaultsTest(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        # Gate choices in each case model a fresh process.
+        for name in ("_guest_identity", "_native_identity"):
+            patch = mock.patch.object(host_gate, name, False)
+            patch.start()
+            self.addCleanup(patch.stop)
+
     def cfg(self, **kw):
-        return config_mod.Config(**kw)
+        return config_mod.Config(**dict({"runner_id": "guest-test"}, **kw))
 
     def test_a_lending_host_has_a_closed_file_gate(self):
         self.assertEqual(host_gate.gate_kind(self.cfg(), lending=True), "file")
@@ -90,14 +98,14 @@ class DefaultsTest(unittest.TestCase):
                          (capacity_guard.STATE_PATH, capacity_guard.ACK_PATH, "stopped", True))
 
     def test_a_classic_host_has_no_gate_unless_configured(self):
-        self.assertIsNone(host_gate.from_config(self.cfg(), lending=False))
+        self.assertIsNone(host_gate.from_config(self.cfg(runner_id="native-test"), lending=False))
         gate = host_gate.from_config(self.cfg(host_gate="file"), lending=False)
         self.assertEqual((gate.fallback, gate.lending), ("available", False))
         gate = host_gate.from_config(self.cfg(host_gate="file", host_gate_fallback="stopped"))
         self.assertTrue(gate.lending)  # closed by default: freshness of a lending host
 
     def test_none_disables_even_on_a_lending_host(self):
-        self.assertIsNone(host_gate.from_config(self.cfg(host_gate="none"), lending=True))
+        self.assertIsNone(host_gate.from_config(self.cfg(runner_id="native-test", host_gate="none"), lending=True))
 
     def test_drain_seconds(self):
         self.assertEqual(host_gate.drain_seconds(self.cfg()), 90.0)
@@ -111,7 +119,7 @@ class DefaultsTest(unittest.TestCase):
         self.assertEqual(capacity_guard.ACK_PATH, "/run/ameesh-gate/ack/ack.json")
 
     def test_environment(self):
-        env = {"AMEESH_CONFIG": "/nulle-part.json", "AMEESH_HOST_GATE": "File",
+        env = {"AMEESH_CONFIG": EMPTY_CONFIG, "AMEESH_HOST_GATE": "File",
                "AMEESH_HOST_GATE_FALLBACK": "stopped", "AMEESH_HOST_GATE_DRAIN": "45",
                "AMEESH_HOST_GATE_PATH": "/g/state/state.json"}
         cfg = config_mod.load(env=env)

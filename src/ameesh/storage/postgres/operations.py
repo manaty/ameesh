@@ -89,6 +89,7 @@ class Operations(interface.Operations):
                    r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
                    r.last_error,  -- L106 : le détail de « hôte non prêt »
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
@@ -229,7 +230,23 @@ class Operations(interface.Operations):
                    cwd = coalesce(%s::text, r.cwd),
                    session_id = %s,
                    session_account = %s::text,
+                   -- #1037 : la session adoptée est connue AVANT tout tour ;
+                   -- son ouverture est celle du harnais adopté (le déclencheur
+                   -- de 0384 garde les trois tant que origin = session).
+                   session_harness = %s,
+                   session_cwd = coalesce(%s::text, r.cwd),
+                   session_origin = %s,
                    session_work_item = NULL,
+                   -- #1037 : un changement de harnais DÉCLARÉ emporte les
+                   -- réglages du harnais précédent : les garder ferait lancer
+                   -- le nouveau harnais avec le modèle, l'effort ou le tier de
+                   -- l'ancien (r.harness = la valeur d'avant l'UPDATE).
+                   model = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                                THEN NULL ELSE r.model END,
+                   effort = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                                 THEN NULL ELSE r.effort END,
+                   tier = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                               THEN NULL ELSE r.tier END,
                    session_reset_at = clock_timestamp(),
                    pending_prompt = concat_ws(E'\\n\\n', %s::text,
                                               r.current_prompt, r.pending_prompt),
@@ -248,7 +265,8 @@ class Operations(interface.Operations):
             RETURNING r.name, verrou.session_id AS previous_session,
                       verrou.mode AS previous_mode, verrou.harness AS previous_harness
             """,
-            (name, harness, host, cwd, session_id, session_account, prompt, status_text),
+            (name, harness, host, cwd, session_id, session_account, harness, cwd,
+             session_id, harness, harness, harness, prompt, status_text),
         )
         return rows[0] if rows else None
 

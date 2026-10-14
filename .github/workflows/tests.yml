@@ -8,8 +8,11 @@
 # propre Postgres :
 #   - psycopg : la suite complète, en 4 parts, sur chaque PR et chaque push ;
 #   - psql    : sur une PR, seulement les modules « pilote »
-#               (tests/parts/pilote-psql.txt) ; la suite complète, en 6 parts,
-#               sur push vers main ou release/*, et à la main (workflow_dispatch).
+#               (tests/parts/pilote-psql.txt), en 3 parts (#947 : huit jobs se
+#               partagent chaque hôte auto-hébergé, une part unique de ~24 min
+#               au repos atteignait le plafond de 30 min sous saturation) ;
+#               la suite complète, en 6 parts, sur push vers main ou
+#               release/*, et à la main (workflow_dispatch).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
@@ -21,8 +24,14 @@
 # L161a — même chose pour une PR de documentation seule (docs/, site/, *.md
 # hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
 # (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
-# doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
-# fusion garde son verdict.
+# doc ». Une exécution de main en cours n'est jamais annulée par la suivante.
+# #824 — décision owner signée #17605 du 13/10/2026 : un seul run de main
+# reste en attente ; une fusion plus récente remplace ce run en attente et
+# valide aussi les fusions intermédiaires qu'elle contient.
+#
+# #833 — le filtre s'applique aussi à une poussée vers main, sur le diff de
+# toute la poussée (`github.event.before` → tête, jamais HEAD^1 seul). Une
+# poussée vers release/** ou une histoire réécrite garde la suite complète.
 #
 # L161b — chaque part écrit ses résultats au fil de l'eau (--flow, JSON lignes,
 # un test par ligne, schéma ameesh-test-event/1), publiés en artefact
@@ -57,11 +66,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-# une exécution de PR dépassée (nouveau commit sur la PR) est annulée ; hors
-# PR, chaque exécution a son propre groupe : ni annulée, ni écartée en attente
-# (GitHub n'en garde qu'une en attente par groupe), même sans cancel-in-progress
+# Une PR dépassée est annulée. Les pushes de main partagent un groupe :
+# GitHub garde un run en cours et un seul en attente, remplacé par le suivant.
+# Release et dispatch gardent un groupe par exécution (périmètre gelé).
 concurrency:
-  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -88,6 +97,13 @@ jobs:
     name: plan
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    env:
+      # #833 : sur une poussée, le diff va du commit d'avant la poussée
+      # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
+      # La référence distingue main (filtre doc) des branches release (suite
+      # complète, quel que soit le contenu).
+      AMEESH_CI_BASE: ${{ github.event_name == 'push' && github.event.before || 'HEAD^1' }}
+      AMEESH_CI_REF: ${{ github.ref }}
     outputs:
       version_only: ${{ steps.plan.outputs.version_only }}
       docs_only: ${{ steps.plan.outputs.docs_only }}
@@ -114,13 +130,15 @@ jobs:
         name: plan of the run
         run: |
           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
-            --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT" \
+            --event "${{ github.event_name }}" \
+            --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
+            --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - uses: actions/upload-artifact@v4
         with:
           name: plan
           path: plan.json
-          retention-days: 14
+          retention-days: 3
 
   psycopg:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
@@ -151,7 +169,12 @@ jobs:
     env:
       AMEESH_DRIVER: psycopg
       FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+      # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899)
+      AMEESH_PLAFOND_MIN: "30"
     steps:
+      - &debut
+        name: début du job (mesure du plafond, #899)
+        run: echo "AMEESH_JOB_DEBUT=$(date -u +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - &dsn
         name: port de la base jetable
@@ -201,6 +224,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           nohup python3 scripts/ci-flow.py publish "$RUNNER_TEMP/flux.jsonl" --name "$FLUX_NOM"
+          --plafond-min "$AMEESH_PLAFOND_MIN" --debut "$AMEESH_JOB_DEBUT"
           > "$RUNNER_TEMP/publier.log" 2>&1 &
       - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
         run: >-
@@ -225,18 +249,27 @@ jobs:
           name: flux-psycopg-${{ matrix.part }}
           path: ${{ runner.temp }}/flux.jsonl
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
 
   psql:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     needs: plan
     if: needs.plan.outputs.psql != '[]'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
+    # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
+    # elle était annulée par le plafond de 30 min sans échec de test (PR #640,
+    # run 38381239685). 45 min laisse la marge sous charge et reste un plafond
+    # borné (§3 du processus de lot : aucun job ne retient un runner des heures).
+    # psycopg garde 30 min : ses parts tournent en 6-8 min, même à 3× plus lent
+    # elles tiennent dans le plafond.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt)
+        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt),
+        # en 3 parts (scripts/test-plan.py, PARTS) : sous saturation, une part
+        # unique atteignait le plafond de 30 min (#947)
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
@@ -256,7 +289,11 @@ jobs:
     env:
       AMEESH_DRIVER: psql
       FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
+      # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899) ;
+      # 45 depuis #880, qui a relevé le plafond de la part psql sous saturation.
+      AMEESH_PLAFOND_MIN: "45"
     steps:
+      - *debut
       - uses: actions/checkout@v4
       - *dsn
       - uses: actions/setup-python@v5
@@ -279,7 +316,7 @@ jobs:
           name: flux-psql-${{ matrix.part }}
           path: ${{ runner.temp }}/flux.jsonl
           if-no-files-found: ignore
-          retention-days: 14
+          retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
 
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
@@ -348,7 +385,7 @@ jobs:
         with:
           name: leaks
           path: leaks.json
-          retention-days: 90
+          retention-days: 15  # the two-week tally (L161i)
 
   # L158: a PR that changes the version number carries the number its content
   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
@@ -386,8 +423,11 @@ jobs:
           echo "macOS   : ${{ needs.platform-macos.result }}"
           echo "version : ${{ needs.version.result }}"
           test "${{ needs.plan.result }}" = success
-          # L158: on a PR, the version number check passes (skipped elsewhere)
-          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; }
+          # L158: on a PR, the version number check passes (skipped elsewhere).
+          # #940 : sous `bash -e`, l'échec de la branche gauche du `&&` interne
+          # est exempté et le groupe rend 1 sans faire sortir le script — le job
+          # concluait SUCCESS. Sortie explicite après le repli légitime.
+          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; } || exit 1
           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
             exit 0
@@ -398,7 +438,9 @@ jobs:
             exit 0
           fi
           # code changed: psycopg always runs (an empty matrix, e.g. tests moved to
-          # a subfolder, is an error); psql may be skipped when the plan gave it no part
+          # a subfolder, is an error); psql may be skipped when the plan gave it no part.
+          # #940 : même piège que ci-dessus ; un psql en échec ou annulé (parts non
+          # vides) doit rougir le check requis, jamais conclure SUCCESS.
           test "${{ needs.psycopg.result }}" = success
-          test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
+          test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; } || exit 1
           test "${{ needs.platform-macos.result }}" = success
