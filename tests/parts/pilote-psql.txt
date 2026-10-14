@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Modules « pilote » : ceux que la CI d'une PR passe AUSSI avec le pilote psql
-# (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec psycopg
-# sur la PR, et la suite psql complète tourne sur main, release/* et à la main
-# (workflow_dispatch). Un module ajouté ici doit exister (scripts/test-parts.py
-# refuse un nom inconnu).
+# Modules « pilote » : ceux que la CI d'une PR de lot passe AUSSI avec le pilote
+# psql (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec
+# psycopg sur la PR de lot, et la suite psql complète tourne sur main,
+# release/*, integration/*, à la main (workflow_dispatch) et sur une PR de
+# release (source ou cible release/* ou integration/*, sans cette liste). Un
+# module ajouté ici doit exister
+# (scripts/test-parts.py refuse un nom inconnu).
+#
+# L1211 (canon §3) : sur une branche de lot, le pilote psql ne voit que les
+# modules de cette liste retenus par le plan (impactés ou contrat), plus la
+# liste « always » déclenchée (#749).
 #
 # Règle : on liste les tests de la couche base (db.py), des migrations et du
 # stockage (ameesh.storage), et ceux qui exercent un comportement propre à un
@@ -14,6 +20,7 @@
 # une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
 # deux endroits différents du fichier, sans conflit.
 
+test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
