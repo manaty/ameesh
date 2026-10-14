@@ -75,6 +75,23 @@ foundation still marks the plan unsure, and the version-only exemption of
 A file removed outside documentation marks it unsure as well: the map knows
 the readers it measured, never the ones it cannot see (an import by a
 computed name, a config read by the code).
+
+**A block without a measure does not force the full suite** (#1339). A new
+block (a file the map does not know, a function or a class it has never
+seen) and a changed block no test executes are covered as soon as one test
+loads their file: the modules the map measured on it, or — for a file the
+map does not know — the tests the import graph reaches (`src/ameesh/**`
+and `tests/**` at HEAD; a test that imports a changed module which imports
+the new file counts, through that module's measured importers). Those tests
+join the impacted ones for a new file and for a changed block without a
+test: neither has a measured caller. A new block of a file the map knows
+keeps the measured selection (its caller for a plain function, every
+importer when the module itself counts). The selection falls back to the
+full suite only when no test loads such a file: its blocks are then neither
+measured nor imported (`phase2_why` names it). A dynamic import
+(`importlib.import_module`) leaves no static edge, so a file that no test
+imports keeps the full suite.
+
 Any error while reading the map gives the fallback plan, never a failure.
 
 **Changed lines without a test**: an existing block whose fingerprint
@@ -247,6 +264,145 @@ def existed(path: str, rev: str, repo: pathlib.Path = REPO) -> bool:
     return True
 
 
+# -- static imports (#1339) -----------------------------------------------
+
+def _dotted(path: str) -> str:
+    """Dotted module name of a repository Python file, `""` outside the two
+    measured packages: `src/ameesh/x/y.py` → `ameesh.x.y`, `tests/test_a.py` →
+    `tests.test_a`; an `__init__.py` names its package."""
+    p = pathlib.PurePosixPath(path)
+    if p.suffix != ".py":
+        return ""
+    parts = list(p.parts)
+    if parts[:2] == ["src", "ameesh"]:
+        parts = parts[1:]
+    elif parts[:1] != ["tests"]:
+        return ""
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def _module_files(name: str, known: set[str]) -> set[str]:
+    """The repository files a dotted name may designate: the module itself, its
+    package `__init__` and every parent package (importing a submodule runs
+    each of them). `known` limits the result to the files of this tree."""
+    if not name:
+        return set()
+    parts = name.split(".")
+    root = "src" if parts[0] == "ameesh" else ""
+    found: set[str] = set()
+    for i in range(1, len(parts) + 1):
+        base = "/".join(([root] if root else []) + parts[:i])
+        for candidate in (f"{base}.py", f"{base}/__init__.py"):
+            if candidate in known:
+                found.add(candidate)
+    return found
+
+
+def _imported_files(source: str, path: str, known: set[str]) -> set[str]:
+    """The repository files `source` imports (any depth: a lazy import or one
+    under `TYPE_CHECKING` still counts — a superset is safe). Only `ameesh.*`
+    and `tests.*` names are resolved; a syntax error leaves no edge."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    dotted = _dotted(path)
+    if pathlib.PurePosixPath(path).name == "__init__.py":
+        package = dotted
+    else:
+        package = dotted.rsplit(".", 1)[0] if "." in dotted else ""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                base = package
+                for _ in range(node.level - 1):
+                    base = base.rsplit(".", 1)[0] if "." in base else ""
+                module = f"{base}.{module}" if module else base
+            if module:
+                names.add(module)
+                names.update(f"{module}.{alias.name}" for alias in node.names
+                             if alias.name != "*")
+    return {f for name in names if name.split(".")[0] in ("ameesh", "tests")
+            for f in _module_files(name, known)}
+
+
+def _tree_python_files(head: str, repo: pathlib.Path) -> list[str]:
+    """Python files of the measured packages at `head` (git, not the working
+    tree: a documentation plan judges its base as well)."""
+    try:
+        out = _git(repo, "ls-tree", "-r", "--name-only", head)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return sorted(p for p in out.splitlines()
+                  if p.endswith(".py")
+                  and (p.startswith("src/ameesh/") or p.startswith("tests/")))
+
+
+def _tree_sources(head: str, paths: list[str], repo: pathlib.Path) -> dict[str, str]:
+    """Content of `paths` at `head`, in one `git cat-file --batch` call."""
+    if not paths:
+        return {}
+    try:
+        proc = subprocess.run(["git", "cat-file", "--batch"], cwd=repo, check=True,
+                              input="".join(f"{head}:{p}\n" for p in paths).encode(),
+                              capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    out, pos, sources = proc.stdout, 0, {}
+    for path in paths:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        header = out[pos:end].split()
+        pos = end + 1
+        if len(header) == 2 and header[1] == b"missing":
+            continue  # a missing object: `--batch` prints `<name> missing`
+        if len(header) != 3:
+            break
+        try:
+            size = int(header[2])
+        except ValueError:
+            break
+        chunk = out[pos:pos + size]
+        if header[1] == b"blob":
+            sources[path] = chunk.decode("utf-8", "replace")
+        pos += size + 1
+    return sources
+
+
+def _import_graph(head: str, repo: pathlib.Path) -> dict[str, set[str]]:
+    """Reverse static import graph at `head`: for each file, the files whose
+    source imports it. A dynamic import (`importlib.import_module`) leaves no
+    edge: a new file no test imports keeps the full suite (#1339)."""
+    files = _tree_python_files(head, repo)
+    known = set(files)
+    reverse: dict[str, set[str]] = {}
+    for path, source in _tree_sources(head, files, repo).items():
+        for target in _imported_files(source, path, known):
+            if target != path:
+                reverse.setdefault(target, set()).add(path)
+    return reverse
+
+
+def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
+    """`path` and every file that imports it, directly or not."""
+    seen, stack = {path}, [path]
+    while stack:
+        for source in reverse.get(stack.pop(), ()):
+            if source not in seen:
+                seen.add(source)
+                stack.append(source)
+    return seen
+
+
 # -- the map --------------------------------------------------------------
 
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
@@ -297,6 +453,10 @@ class Impact:
         self.textual: list[str] = []         # files left to the L161b heuristic
         self.foundation: list[str] = []
         self.removed: list[str] = []         # files removed outside documentation
+        #: #1339 : blocs sans mesure couverts par les tests qui importent leur
+        #: fichier (fichier → modules), et fichiers qu'aucun test n'importe
+        self.importers: dict[str, list[str]] = {}
+        self.uncovered: list[str] = []
 
     def hit(self, modules, reason: str) -> None:
         for m in modules:
@@ -307,6 +467,63 @@ class Impact:
             self.unsure.append(reason)
         if path and path not in self.textual:
             self.textual.append(path)
+
+
+def _measured_importers(card: dict, path: str, modules: list[str]) -> set[str]:
+    """Test modules the map saw load `path`: any block of the file executed by
+    a test means that test imported it (a subprocess run included)."""
+    found: set[str] = set()
+    for info in card.get("blocs", {}).get(path, {}).values():
+        found |= set(info.get("modules", ()))
+    return found & set(modules)
+
+
+def _reaching_tests(card: dict, path: str, modules: list[str],
+                    reverse: dict[str, set[str]]) -> set[str]:
+    """Tests that load `path` at HEAD: those that reach it through the static
+    import graph, plus, for every file of that closure, the tests the map
+    measured on it — a test that imports a changed module which imports the
+    new one (#1339)."""
+    reached = _reverse_closure(reverse, path)
+    found = {m for m in modules if f"tests/{m}.py" in reached}
+    for source in reached:
+        found |= _measured_importers(card, source, modules)
+    return found
+
+
+def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
+                        head: str, repo: pathlib.Path) -> None:
+    """#1339 : un bloc nouveau ou modifié sans couverture mesurée ne force plus
+    la suite complète dès qu'un test charge son fichier.
+
+    Le doute se lève si les tests qui importent le fichier — les modules
+    mesurés dessus, ou pour un fichier inconnu de la carte ceux du graphe
+    d'import — ne sont pas vides. Ils rejoignent les impactés pour un fichier
+    nouveau (aucune mesure ne peut le nommer) et pour un bloc modifié sans
+    test (`untested`, aucun appelant mesuré) ; pour un nouveau bloc d'un
+    fichier connu, le mécanisme mesuré les a déjà nommés (l'appelant d'une
+    fonction simple, tous les importateurs quand le module compte). Sans
+    aucun test importateur, le doute reste et `uncovered` porte le fichier.
+    """
+    unknown_files = {b.split("::", 1)[0] for b in impact.unknown_blocks}
+    untested_files = {u["file"] for u in impact.untested}
+    targets = sorted(unknown_files | untested_files)
+    if not targets:
+        return
+    added = {f for f in unknown_files if f not in card.get("blocs", {})} | untested_files
+    reverse: dict[str, set[str]] | None = None
+    for path in targets:
+        found = _measured_importers(card, path, modules)
+        if not found:
+            if reverse is None:
+                reverse = _import_graph(head, repo)
+            found = _reaching_tests(card, path, modules, reverse)
+        if not found:
+            impact.uncovered.append(path)
+        elif path in added:
+            for m in sorted(found):
+                impact.p1.setdefault(m, f"{path} (imported)")
+            impact.importers[path] = sorted(found)
 
 
 def _db_modules(card: dict) -> set[str]:
@@ -513,6 +730,9 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
             _migration(card, impact, status, path, head, repo)
         else:
             _data(card, impact, status, path, repo)
+    #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
+    #: leur fichier, pas par la suite complète.
+    _resolve_unmeasured(card, impact, modules, head, repo)
     return impact
 
 
@@ -583,12 +803,13 @@ def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
         return f"map older than {PHASE2_MAX_AGE_H} h ({age:.0f} h)"
     if impact is None:
         return "selection unsure"
-    if impact.unknown_blocks:
-        return f"{len(impact.unknown_blocks)} new block(s) unknown to the map"
+    if impact.uncovered:
+        # #1339 : le bloc sans mesure ne force plus la suite complète dès
+        # qu'un test importe son fichier ; sans importateur, si.
+        return (f"{len(impact.uncovered)} file(s) with unmeasured blocks no test "
+                f"imports: {impact.uncovered[0]}")
     if impact.foundation:
         return f"test infrastructure changed: {impact.foundation[0]}"
-    if impact.untested:
-        return f"{len(impact.untested)} changed block(s) without a test"
     return "selection unsafe"
 
 
@@ -601,7 +822,7 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
            "unsure": [], "contract": list(always),
            "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
-           "changed": 0}
+           "importers": {}, "uncovered": [], "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
@@ -665,10 +886,11 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 classes[m] = ("P1", p1[m])
         out.update(unsure=impact.unsure, untested=impact.untested,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
-                   removed=impact.removed, sure=not impact.unsure)
+                   removed=impact.removed, importers=impact.importers,
+                   uncovered=impact.uncovered, sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
-                              and not impact.unknown_blocks and not impact.foundation
-                              and not impact.untested and not impact.removed)
+                              and not impact.uncovered and not impact.foundation
+                              and not impact.removed)
     changes = changes or []
     out["changed"] = len(changes)
     out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
@@ -751,8 +973,8 @@ def lot_selection(event: str, state: dict, modules: list[str],
     `None` means the full suite: an event other than a pull request, a
     release pull request (`release`, `release_pr`), or any doubt the plan
     cannot decide through — no usable map, a selection that is not safe
-    (stale map, a new block, test infrastructure, changed lines without a
-    test), an empty contract list. The reason goes to the summary.
+    (stale map, unmeasured blocks no test imports, test infrastructure, a
+    removed file), an empty contract list. The reason goes to the summary.
     """
     if event != "pull_request":
         return None, "main, release/** and the integration branch run the full suite"
@@ -952,6 +1174,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
             "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
+            "importers": {}, "uncovered": [],
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
@@ -1036,6 +1259,12 @@ def summary(plan: dict) -> str:
     if plan["unknown_blocks"]:
         lines.append("* new blocks, unknown to the map: " + _listing(
             [f"`{b}`" for b in plan["unknown_blocks"]]))
+    if plan.get("importers"):
+        lines.append("* unmeasured blocks covered by their importers: " + _listing(
+            [f"`{f}` ({len(ms)} module(s))" for f, ms in sorted(plan["importers"].items())]))
+    if plan.get("uncovered"):
+        lines.append("* **unmeasured blocks no test imports**: " + _listing(
+            [f"`{f}`" for f in plan["uncovered"]]))
     return "\n".join(lines) + "\n"
 
 

@@ -136,13 +136,18 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(impact.unsure, [])
         self.assertEqual(impact.untested, [])
 
-    def test_changed_lines_without_a_test(self):
+    def test_changed_lines_without_a_test_run_their_importers(self):
+        # #1339 : un bloc modifié qu'aucun test n'exécute ne force plus la
+        # suite complète : les tests qui importent son fichier le couvrent et
+        # rejoignent les impactés ; le bloc reste listé (lignes sans test).
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
         self.repo.commit()
         impact = self.repo.judge()
-        self.assertEqual(impact.p1, {})
+        self.assertEqual(impact.p1, {m: "src/ameesh/code.py (imported)"
+                                     for m in ("test_a", "test_b", "test_c")})
         self.assertEqual(impact.untested, [{"file": "src/ameesh/code.py", "block": "untested",
                                             "lines": [10, 10]}])
+        self.assertEqual(impact.uncovered, [])
 
     def test_module_level_change_impacts_every_importer(self):
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("LIMIT = 3", "LIMIT = 4"))
@@ -280,17 +285,122 @@ class MapTest(unittest.TestCase):
         with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
             return plan.classify(mods, self.repo.card(), NOW, head="HEAD", repo=self.repo.path)
 
-    def test_phase2_unsafe_with_changed_lines_without_a_test(self):
-        # L161f review (4)
+    def test_phase2_safe_with_changed_lines_without_a_test(self):
+        # L161f review (4), #1339 : le bloc modifié sans test est couvert par
+        # les tests qui importent son fichier (test_a, test_b, test_c) : la
+        # sélection impactés+contrat suffit, le bloc reste listé.
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
         self.repo.commit()
         out = self._classify()
         self.assertTrue(out["sure"])
         self.assertEqual([u["block"] for u in out["untested"]], ["untested"])
-        self.assertFalse(out["phase2_safe"])
+        self.assertTrue(out["phase2_safe"], out["phase2_why"])
+        self.assertEqual(set(out["importers"]["src/ameesh/code.py"]),
+                         {"test_a", "test_b", "test_c"})
+        self.assertTrue(all(out["classes"][m][0] == "P1" for m in ("test_a", "test_b", "test_c")))
         self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
         self.repo.commit()
         self.assertTrue(self._classify()["phase2_safe"])
+
+    def test_phase2_safe_with_a_new_plain_function(self):
+        # #1339 : une fonction simple nouvelle reste trouvée par son appelant
+        # modifié ; le fichier est importé, donc plus de suite complète, et
+        # aucun importateur n'est ajouté (le mécanisme mesuré suffit).
+        code = CODE_V1.replace("    return x + 1\n", "    return helper(x)\n") \
+            + "\n\ndef helper(x):\n    return x + 1\n"
+        self.repo.write("src/ameesh/code.py", code)
+        self.repo.commit()
+        out = self._classify()
+        self.assertIn("src/ameesh/code.py::helper", out["unknown_blocks"])
+        self.assertTrue(out["phase2_safe"], out["phase2_why"])
+        self.assertEqual(out["importers"], {})
+        self.assertEqual(out["classes"]["test_a"], ["P1", "src/ameesh/code.py::used"])
+
+    def test_phase2_unsafe_when_no_test_imports_the_changed_file(self):
+        # #1339 : sans aucun test importateur (la carte n'a mesuré personne sur
+        # ce fichier et le graphe d'import n'en trouve aucun), le doute reste :
+        # suite complète, et le fichier est nommé.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
+        self.repo.commit()
+        card = self.repo.card()
+        for info in card["blocs"]["src/ameesh/code.py"].values():
+            info["modules"] = []
+        out = self._classify_with(card, ["test_a", "test_b", "test_c", "test_db"])
+        self.assertTrue(out["sure"])
+        self.assertEqual(out["uncovered"], ["src/ameesh/code.py"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test imports: src/ameesh/code.py", out["phase2_why"])
+        self.assertEqual(out["classes"]["test_a"], ["P3", ""])
+
+    def test_new_file_is_covered_by_the_test_that_imports_it(self):
+        # #1339 : un fichier nouveau, inconnu de la carte, est couvert par le
+        # test du lot qui l'importe (graphe d'import statique) ; la suite
+        # complète n'est plus forcée.
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write("tests/test_new.py", "from ameesh.new import thing\n")
+        self.repo.commit()
+        impact = self.repo.judge(("test_a", "test_b", "test_c", "test_db", "test_new"))
+        self.assertIn("src/ameesh/new.py::thing", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, [])
+        self.assertEqual(impact.importers, {"src/ameesh/new.py": ["test_new"]})
+        self.assertEqual(impact.p1["test_new"], "src/ameesh/new.py (imported)")
+
+    def test_new_file_no_test_imports_keeps_the_doubt(self):
+        # #1339 : un fichier nouveau que rien n'importe (import dynamique
+        # compris : aucune arête statique) garde la suite complète.
+        self.repo.write("src/ameesh/orphan.py", "def thing():\n    return 1\n")
+        self.repo.commit()
+        impact = self.repo.judge()
+        self.assertIn("src/ameesh/orphan.py::thing", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/orphan.py"])
+        self.assertEqual(impact.importers, {})
+
+    def test_new_file_reached_through_a_changed_importer(self):
+        # #1339 : le graphe relie le fichier nouveau au module modifié qui
+        # l'importe ; les tests que la carte a mesurés sur ce module (ici un
+        # lancement en sous-processus, sans import statique du fichier)
+        # couvrent le bloc, sans import direct dans le test.
+        self.repo.write("src/ameesh/cli.py", "VALUE = 1\n")
+        self.repo.base = self.repo.commit()
+        infos, _ = map_mod.blocks("VALUE = 1\n")
+        card = self.repo.card()
+        card["blocs"]["src/ameesh/cli.py"] = {n: {**i, "modules": ["test_cli"]}
+                                              for n, i in infos.items()}
+        card["modules"]["test_cli"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write("src/ameesh/cli.py", "from ameesh.new import thing\n\nVALUE = thing()\n")
+        self.repo.commit()
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            ["test_a", "test_b", "test_c", "test_db", "test_cli"],
+                            "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new.py::thing", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, [])
+        self.assertEqual(impact.importers, {"src/ameesh/new.py": ["test_cli"]})
+
+    def test_new_file_plan_stays_impacted(self):
+        # #1339, bout en bout : la PR d'un lot qui ajoute un module et son test
+        # ne bascule plus en suite complète pour le seul bloc nouveau ; le test
+        # nouveau (P0) et le contrat suffisent, le fichier est couvert par son
+        # importateur. Noms de modules réels : le découpage lit leurs fichiers.
+        real = sorted(parts.modules())
+        mods, fresh = real[:5], real[0]
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write(f"tests/{fresh}.py", "from ameesh.new import thing\n")
+        self.repo.commit()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)), \
+                mock.patch.object(plan.parts, "modules", lambda *a: list(mods)), \
+                mock.patch.object(plan, "read_list",
+                                  lambda path, *a, **k: [mods[1]]
+                                  if path == plan.ALWAYS_FILE else []):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/x")
+        self.assertTrue(p["phase2_safe"], p["phase2_why"])
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        self.assertEqual(p["classes"][fresh][0], "P0")
+        self.assertEqual(p["importers"], {"src/ameesh/new.py": [fresh]})
 
     def _classify_with(self, card: dict, modules: list[str]) -> dict:
         for m in modules:
@@ -491,6 +601,59 @@ class MapTest(unittest.TestCase):
                 return {k: v["empreinte"] for k, v in blocks.items()}
             self.assertEqual(prints(plan._without_new_functions(source, set())),
                              prints(map_mod.blocks(source)[0]), f)
+
+
+class ImportGraphTest(unittest.TestCase):
+    """#1339 : le graphe d'import statique qui couvre un fichier inconnu de la
+    carte. Résolution des noms, imports relatifs et paresseux compris ; le
+    graphe est lu dans git (tête jugée, pas l'arbre de travail)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def test_dotted_names(self):
+        self.assertEqual(plan._dotted("src/ameesh/db.py"), "ameesh.db")
+        self.assertEqual(plan._dotted("src/ameesh/storage/__init__.py"), "ameesh.storage")
+        self.assertEqual(plan._dotted("tests/test_a.py"), "tests.test_a")
+        self.assertEqual(plan._dotted("scripts/tool.py"), "")
+        self.assertEqual(plan._dotted("docs/guide.md"), "")
+
+    def test_resolution_absolute_relative_and_tests(self):
+        known = {"src/ameesh/db.py", "src/ameesh/__init__.py",
+                 "src/ameesh/storage/__init__.py", "src/ameesh/storage/work.py",
+                 "tests/support.py", "tests/__init__.py"}
+        cases = {
+            "src/ameesh/x.py": ("import ameesh.db\n", "src/ameesh/db.py"),
+            "src/ameesh/y.py": ("from ameesh import db\n", "src/ameesh/db.py"),
+            "src/ameesh/storage/z.py": ("from . import work\n", "src/ameesh/storage/work.py"),
+            "src/ameesh/storage/z2.py": ("from .work import connect\n",
+                                         "src/ameesh/storage/work.py"),
+            "src/ameesh/storage/z3.py": ("from .. import db\n", "src/ameesh/db.py"),
+            "src/ameesh/storage/__init__.py": ("from . import work\n",
+                                               "src/ameesh/storage/work.py"),
+            "tests/test_a.py": ("from tests.support import PgTestCase\n", "tests/support.py"),
+            "tests/test_b.py": ("def f():\n    import ameesh.db\n", "src/ameesh/db.py"),
+            "tests/test_c.py": ("from ameesh.db import *\n", "src/ameesh/db.py"),
+        }
+        for path, (source, target) in cases.items():
+            with self.subTest(path):
+                self.assertIn(target, plan._imported_files(source, path, known))
+        for source in ("import os\nimport json\n", "def broken(:\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_d.py", known), set())
+
+    def test_import_graph_reaches_the_test_through_the_changed_module(self):
+        self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
+        self.repo.write("src/ameesh/cli.py", "from ameesh.new import thing\n")
+        self.repo.write("tests/test_cli.py", "import ameesh.cli\n")
+        self.repo.write("tests/test_other.py", "import json\n")
+        self.repo.commit()
+        reverse = plan._import_graph("HEAD", self.repo.path)
+        self.assertEqual(plan._reverse_closure(reverse, "src/ameesh/new.py"),
+                         {"src/ameesh/new.py", "src/ameesh/cli.py", "tests/test_cli.py"})
+        self.assertEqual(plan._reverse_closure(reverse, "tests/test_other.py"),
+                         {"tests/test_other.py"})
 
 
 class DocsLaneTest(unittest.TestCase):
