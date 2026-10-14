@@ -31,6 +31,10 @@ delta** ; portée de la ligne primaire **limitée à `src/`, `deploy/`, `bin/`**
 `-U0`, **11 blobs composés**, **revérifiée en première main au §4ter**. La préparation
 reste locale : **aucun GO global, aucun gel, aucune CI** ; qualification/admission et
 avis de composition restent au pilote.
+Complément 14/10 20:52Z (mail cx2, qualification auditeur 22:49 Paris = 20:49Z) :
+complément manquant désormais **précisément borné** et attestation bureau à intégrer
+avant nouvelle revue — détail au **§8** ; aucun nouveau mandat, aucun GO global, gel, CI
+ni push.
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -313,6 +317,15 @@ réjeu individuel.
 - Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4/§4ter).
 - Reconstruction sur main `2458ec05` : **revérifiée au §4ter**, à rejouer au geste de gel
   sur la main réelle ; pièces cx2 remises au pilote/auditeur.
+- **Qualification auditeur (22:49 Paris = 20:49Z, mail cx2 20:52Z)** : les avis Claude
+  historiques et QA DeepSeek sur l'initial Codex restent **conservés dans leur portée** ;
+  le complément manquant est **précisément borné** — Claude B1–B4 initiaux, signature,
+  S1–S3, K1, K3, plus le **témoin 0711** ; bootstrap B1QA/K2 final déjà fermés.
+  L'**attestation bureau existante est à intégrer avant nouvelle revue** ; à défaut, un
+  binôme ciblé est proposé au pilote (kit `Work/ameesh-cx2-1260-complement-claude`).
+  Preuve auditeur déclarée : `auditeur/state/evidence/1260-364-coverage-20261014/REPORT.md`
+  (7293 o, SHA256 `00e324f4…`), 6/6 conformes — sous la main de cx2, non revérifiable
+  depuis `ameesh-agents-2`. **Aucun nouveau mandat.**
 
 ## 9. Réversibilité
 
