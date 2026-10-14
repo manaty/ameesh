@@ -1310,6 +1310,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
         blocked = unremovable > quota
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
+        credited: set = set()          # #1190: dry-run inodes already freed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
             if blocked or counted <= quota:
@@ -1327,6 +1328,12 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     uncounted.add(path)
                 continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
+                continue
+            inode = (st.st_dev, st.st_ino)
+            if dry_run and inode in credited:
+                # #1190: separate cache walks yield the inode again, but its
+                # names would already be gone. Mirror apply's `gone` case.
+                counted -= size
                 continue
             # #500: a candidate whose deletion is refused (path no longer in
             # the root, or unlink failed) is reclassified as unremovable and
@@ -1418,6 +1425,8 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 total -= size
                 counted -= size
                 evicted += size
+                if dry_run:
+                    credited.add(inode)
             else:
                 # #530: every name the walk saw is gone, but the inode still
                 # has one it did not see (a protected subtree, another managed
