@@ -245,11 +245,12 @@ class CiRunnersTest(unittest.TestCase):
             os.chmod(full, mode)
         return full
 
-    def run_script(self, *args, busy=False):
+    def run_script(self, *args, busy=False, **env_extra):
         env = dict(os.environ, CI_RUNNERS_TEST_HOST=self.host,
                    PATH=os.path.join(self.host, "bin") + os.pathsep + os.environ["PATH"])
         if busy:
             env["CI_RUNNERS_TEST_BUSY"] = "1"
+        env.update({name: str(value) for name, value in env_extra.items()})
         return subprocess.run(["bash", SCRIPT, "--dry-run", *args],
                               capture_output=True, text=True, env=env)
 
@@ -639,10 +640,15 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn(TOOLS + "/ci-runner-gate", res.stdout)
 
     def test_check_reports_the_gate_and_the_wrapper(self):
-        for n in (1, 2):
+        # C1 (#1256 R1 amont) : l'URL passée à `config.sh --url` se relit dans
+        # `gitHubUrl` ; `serverUrl` porte le tenant Actions, jamais le dépôt.
+        for n, repo in ((1, "https://github.com/manaty/ameesh"),
+                        (2, "https://github.com/manaty/ameesh.git/")):
             self.write("srv/ameesh-guest/ci/r%d/.runner" % n,
                        json.dumps({"agentName": "ameesh-nxl-ci-3-%d" % n,
-                                   "serverUrl": "https://github.com/manaty/ameesh"}))
+                                   "gitHubUrl": repo,
+                                   "serverUrl": "https://pipelines.actions."
+                                                "githubusercontent.com/t/"}))
             self.write("srv/ameesh-guest/ci/r%d/.credentials" % n, "{}\n", mode=0o600)
         res = self.run_script("--check")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -650,6 +656,57 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("wrapper: %s/ci-runner-gate is missing" % TOOLS,
                       res.stdout)
         self.assertIn("check: every line ok", res.stdout)
+
+    def test_check_refuses_a_runner_of_another_repository(self):
+        # C1 : un `serverUrl` qui nomme le dépôt ne prouve rien ; c'est le
+        # `gitHubUrl` (l'URL de `config.sh --url`) qui fait foi.
+        self.write("srv/ameesh-guest/ci/r1/.runner",
+                   json.dumps({"agentName": "ameesh-nxl-ci-3-1",
+                               "gitHubUrl": "https://github.com/other/repo",
+                               "serverUrl": "https://github.com/manaty/ameesh"}))
+        self.write("srv/ameesh-guest/ci/r1/.credentials", "{}\n", mode=0o600)
+        res = self.run_script("--check", "--count", "1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("r1: .runner unreadable or registered on another repository",
+                      res.stderr)
+
+    def gate_document(self, state="stopped"):
+        return self.write("run/ameesh-gate/state/state.json", json.dumps(
+            {"schema": "ameesh-host-state/1", "state": state, "seq": 3,
+             "expires_ts": time.time() + 90, "guard": {"mode": "enforce"}}))
+
+    def registered(self, n):
+        self.write("srv/ameesh-guest/ci/r%d/.runner" % n,
+                   json.dumps({"agentName": "ameesh-nxl-ci-3-%d" % n,
+                               "gitHubUrl": "https://github.com/manaty/ameesh",
+                               "serverUrl": "https://pipelines.actions."
+                                            "githubusercontent.com/t/"}))
+        self.write("srv/ameesh-guest/ci/r%d/.credentials" % n, "{}\n", mode=0o600)
+
+    def test_check_accepts_the_wrapper_waiting_for_a_closed_gate(self):
+        # C2 : le wrapper arrête son child puis reste actif à attendre la
+        # réouverture ; une unité active sans processus runner n'est pas une
+        # désobéissance.
+        self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.gate_document()
+        for n in (1, 2):
+            self.registered(n)
+        res = self.run_script("--check", CI_RUNNERS_TEST_ACTIVE="1,2")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("state: stopped", res.stdout)
+        self.assertIn("the wrapper waits for the gate", res.stdout)
+
+    def test_check_refuses_a_runner_alive_after_the_stop_delay(self):
+        # C2 : au-delà du délai d'arrêt du wrapper, un processus runner vivant
+        # sous une unité active n'est plus un drainage, c'est une désobéissance.
+        self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.gate_document()
+        self.registered(1)
+        res = self.run_script("--check", "--count", "1",
+                              CI_RUNNERS_TEST_ACTIVE="1",
+                              CI_RUNNERS_TEST_CHILD="1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("still runs after the wrapper's stop delay", res.stderr)
 
     def test_the_documented_offer_counts_jobs(self):
         # le brouillon de fiche d'hôte du plan est lu par le contrat : le
