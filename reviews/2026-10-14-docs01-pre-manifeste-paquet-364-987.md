@@ -21,6 +21,16 @@ Révisé 14/10 07:2xZ (mail cx2 07:21Z) : **ligne primaire retrouvée** pour #26
 (session `11783f10…`, modèle `claude-opus-5-5`, résultats `is_error:false`) — §5, §7.3 et
 §8 actualisés ; cette pièce est citée **sous la main de cx2** et n'est pas revérifiable
 depuis `ameesh-agents-2`.
+Révisé 14/10 20:5xZ (mails cx2 #41296/#41297, 20:46/20:49Z) : **corrections de
+qualification** — auteur #364 **mixte : Codex initial + DeepSeek correctifs** ; **R1
+Claude #2436 + événement #7173 = NO-GO complet** ; **verdict QA terminal #7954 + #7963 =
+NO-GO 2 B / 1 P2**, #2647 **incomplet** ; fermetures #2696/#2739 **bornées à leur
+delta** ; portée de la ligne primaire **limitée à `src/`, `deploy/`, `bin/`** — et
+**nouvelle reconstruction cx2 sur main `2458ec05`** (#1211 fusionnée le 14/10
+13:15:41Z) : union **`35f8827f…`**, 2 ordres propres, 77 fichiers, 77/77 patch-ids
+`-U0`, **11 blobs composés**, **revérifiée en première main au §4ter**. La préparation
+reste locale : **aucun GO global, aucun gel, aucune CI** ; qualification/admission et
+avis de composition restent au pilote.
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -28,18 +38,21 @@ n'est ni élargi ni touché.
 
 ## 1. Base, porte, périmètre
 
-- Base de tous les calculs : `main = 7305957e88b7f511c2e853e64a6573f8e574832e` (#833
-  fusionné à 06:07Z), relevé 14/10 06:1xZ.
+- Base **historique** des calculs du §4 : `main =
+  7305957e88b7f511c2e853e64a6573f8e574832e` (#833 fusionné à 06:07Z), relevé 14/10
+  06:1xZ. Depuis, la porte #1211 est franchie et main a avancé : **état courant =
+  `2458ec053123d3f33644fef1e092fc84cc2773d9`** au 14/10 20:23:12Z (#1339/PR #1024), sur
+  lequel porte la reconstruction du **§4ter**.
 - **Cœur du paquet : #364 + #987.** Compagnons **candidats**, non inclus par défaut :
   #974 (après #364) et #1002 (après #987), inclus seulement si leurs avis/dépendances
   sont qualifiés avant le gel. #1257 (cause racine carte, impl-06) reste suivi à part.
   Le « paquet à six lots » cité par le corps #1260 désigne **#1204, déjà gelé** ; #1260
   n'ajoute aucun sixième lot (correction cx2, 14/10 06:17Z).
-- **Porte #1211** : non active. PR #923, tête
-  `39f51fd9d0105b21911adb1d56c7df67fc3876eb` inchangée ; delta propre = 10 fichiers depuis
-  le merge-base `229434d7b27353c042c968fec4989a3afd90edcc` ; `merge-tree` main × #1211 =
-  **deux conflits** (`tests.yml`, `scripts/test-plan.py`) à résoudre avant activation
-  (mesh-design 06:10Z, préparation locale binôme, sans CI aveugle).
+- **Porte #1211 : satisfaite.** PR #923 **fusionnée le 14/10 13:15:41Z**
+  (`acd8a0f09637824bbe3c974d28540aff7d897a9d`, ancêtre de main `2458ec05` — vérifié en
+  première main). Les conflits annoncés à 06:10Z (`tests.yml`, `scripts/test-plan.py`)
+  sont donc résolus par la fusion ; les calculs d'union du §4 (base `7305957e`) deviennent
+  **historiques**.
 - Les quatre têtes candidates sont **inchangées** au relevé (`git ls-remote`), aucun
   close/reopen, aucun réarmement.
 
@@ -89,7 +102,7 @@ n'est ni élargi ni touché.
 | `docs/L232B-PRIVATE-BACKUPS.md` | `3868cd378a34f678a4f77f9e42d1c3e8d736e0d9` | `85046ee487181d9f0a18d971205f33347e4a5bf9` |
 | `docs/L232B-RELEASE-CONTROLLER.md` | `a9ffa79b592ad216812c7d3bd51f72ee59f2f61d` | `5491edf4c5ee26b184856504ed1d2e4248911049` |
 
-## 4. Unions provisoires sur main 7305957e (revérifiées en première main)
+## 4. Unions provisoires sur main 7305957e (historique ; état courant au §4ter)
 
 | étape | rc | arbre après l'étape | fichiers vs main |
 |---|---|---|---|
@@ -111,7 +124,8 @@ n'est ni élargi ni touché.
   `src/ameesh/cli.py`, `src/ameesh/storage/postgres/registry.py`,
   `tests/parts/pilote-psql.txt`, `tests/support.py`, `tests/test_cluster.py`,
   `tests/test_l56_role_executor.py` ; **1/4 pour #987** (`.github/workflows/tests.yml`) ;
-  **0/3 pour #1002**. Ces 10 fichiers sont à relire au gel (delta composé, §12).
+  **0/3 pour #1002**. Ces 10 fichiers (jeu historique sur `7305957e`) sont à relire au
+  gel ; sur main `2458ec05` le jeu composé passe à **11 blobs** — §4ter.
 - **Patch-ids** : #974 2/2, #987 4/4, #1002 3/3, #364 **70/73 en diff standard et 73/73
   en `-U0`** : les 3 écarts standard (`deploy/sql/role-module-writers.sql`,
   `tests/support.py`, `tests/test_cluster.py`) sont des **contextes** différents, les
@@ -134,6 +148,37 @@ n'est ni élargi ni touché.
 - **#974 et #1002 restent candidats, exclus par défaut** : inclusion seulement si
   qualifiés avant le gel, comme au §1.
 
+## 4ter. Reconstruction sur main `2458ec05` (cx2 ; revérifiée en première main)
+
+Base **`main = 2458ec053123d3f33644fef1e092fc84cc2773d9`** (#1339/PR #1024 fusionnée
+14/10 20:23:12Z ; #1211 fusionnée 14/10 13:15:41Z). Reconstruction locale annoncée par
+cx2 (mails #41296/#41297, 20:46/20:49Z) : branche `prep/1260-main-2458ec05-364-987
+@60ce27f2…`, **arbre `35f8827f…`**. Contrôle refait ici, sans pousser de branche ni
+lancer de CI :
+
+- **Deux ordres** (`main`+#987→#364 et `main`+#364→#987), `merge-tree --write-tree`
+  **rc=0 aux quatre étapes** : arbre final **identique dans les deux ordres —
+  `35f8827f0906a25c0f0b7f61997889ebe1a9a113`** (annonce cx2 confirmée).
+- Delta vs main = **exactement 77 fichiers** (73 #364 ∪ 4 #987), aucun étranger.
+- **Patch-ids** : #364 **70/73 standard, 73/73 en `-U0`** ; #987 **4/4** dans les deux
+  formes. Les 3 écarts standard sont les mêmes contextes qu'au §4
+  (`deploy/sql/role-module-writers.sql`, `tests/support.py`, `tests/test_cluster.py`).
+- **11 blobs composés** (union ≠ tête du lot) — 10 pour #364 :
+  `deploy/sql/role-executor.sql` `a309ffd3…`, `deploy/sql/role-module-writers.sql`
+  `8294030c…`, `deploy/sql/role-superviseur.sql` `d010d12b…`, `docs/BASCULE.md`
+  `1212bc71…`, `src/ameesh/cli.py` `48ec19c0…`,
+  `src/ameesh/storage/postgres/registry.py` `71971474…`, `tests/parts/pilote-psql.txt`
+  `5ca8e266…`, `tests/support.py` `660c442a…`, `tests/test_cluster.py` `fec5af4e…`,
+  `tests/test_l56_role_executor.py` `10db514c…` ; et 1 pour #987,
+  `.github/workflows/tests.yml` `db22d384…`. Ce jeu diffère du §4 (main a avancé) :
+  `docs/BASCULE.md` s'y ajoute, et les blobs d'union de `tests.yml` et de `cli.py`
+  changent. À relire dans le delta composé au gel.
+- Pièces déclarées par cx2, remises au pilote/auditeur et **non revérifiables depuis
+  `ameesh-agents-2`** : rapport
+  `/home/smichea/Work/ameesh-cx2-1260-actualisation-main-2458ec05.md`, manifeste JSON et
+  preuve à côté (sous la main de cx2). **Aucun GO global, aucun gel, aucune CI** : la
+  qualification/admission et les avis de composition restent au pilote (§7).
+
 ## 5. Classes, avis, familles, feux
 
 Identifiants **primaires** relevés en première main le 14/10 06:2xZ : jalons d'avis
@@ -143,10 +188,16 @@ indiqué ; ils ne valent pas GO complet nouveau du futur paquet et restent à qu
 gel sur la main exacte (§7, point 3).
 
 - **#364** — sensible prod + SQL (migration 0417, `deploy/sql/role-*.sql`, `deploy/**`,
-  concurrence des fences). Auteur **mty-amh-impl-04** (harnais **DeepSeek**). Jalons :
-  - **#2436** — auditeur, **Claude**, **blocked**, 13/10 14:37:26Z, sur `febbf0ad…` : R1
-    **partiel** (volets contrôleur/SSH/santé) ; volets SQL et sauvegardes annoncés sur la
-    même tête dans le même tour.
+  concurrence des fences). Auteur **mixte** : contributions **initiales Codex**
+  (`ameesh-cx2`, harnais `codex_exec`, session `01a13383-c197-7fc3-a565-4f93e930c9a7`,
+  modèle `gpt-6.1-sol`, créations `b8a5b1a8`/617, `0ebb7559`/821, `2240a271`/1011 et
+  chaîne antérieure), puis **correctifs DeepSeek** (`mty-amh-impl-04`). La désignation
+  « auteur DeepSeek » seule était fausse (correction cx2, 14/10 20:46Z ; réserve déjà
+  posée par mesh-design le 14/10 14:12Z). Jalons :
+  - **#2436** — auditeur, **Claude**, **blocked**, 13/10 14:37:26Z, sur `febbf0ad…`, avec
+    l'événement **#7173** : **R1 complet, NO-GO** — contrôleur/SSH/santé *puis* SQL et
+    sauvegardes sur la même tête (5 P1 / 6 P2 / 8 n, note #1260 cx2, 14/10 14:20Z). Ni un
+    GO ni un simple avis partiel.
   - **#2638** — auditeur, **Codex**, **blocked**, 13/10 16:15:45Z, sur `5270b1e9…` :
     second tour R1, K2 (P2) restant ; rapport
     `docs/reviews/2026-10-13-364-r2-auditeur.md` @ `00f1cd5c3` (branche
@@ -154,16 +205,20 @@ gel sur la main exacte (§7, point 3).
     qualification de famille des autres avis**, « notamment si l'auteur initial du lot
     est compté Codex ».
   - **#2647** — **mty-amh-qa-01**, **DeepSeek**, **blocked**, 13/10 16:21:57Z, sur
-    `5270b1e9…` : R2 0 B / 1 P2 (K2).
+    `5270b1e9…` : avis **incomplet** (0 B / 1 P2 K2) ; **il ne vaut pas verdict terminal**.
+  - **Verdict QA terminal** — pièces **#7954 + #7963** (session QA DeepSeek
+    `3e02129a-ba39-47b4-91c9-f29128320db2`), sur `5270b1e9…` : **NO-GO 2 B / 1 P2**.
+    Aucune fermeture QA sur `6db727ac`/`90aae667` (note #1260 cx2, 14/10 14:35–14:39Z).
   - **#2696** — **bureau**, **Claude**, **ok**, 13/10 16:45:24Z, sur `6db727ac…` : R2
     delta 0 B / 1 N (les inventaires antérieurs au changement, sans `source_bytes`, sont
-    refusés à la restauration).
+    refusés à la restauration) ; **fermeture bornée à ce delta** — elle ne clôt pas les
+    autres items, la note ne cite pas explicitement le témoin 0711.
   - **#2713** — **ameesh-cx1**, **Codex**, **blocked**, 13/10 16:56:01Z, sur `6db727ac…` :
     R1 0 B / 1 P2 nouveau (capacité lue sans parents protégés ni `O_NOFOLLOW`/`fstat`).
   - **#2727** — **ameesh-cx1**, **Codex**, **ok**, 13/10 17:02:47Z, sur `90aae667…` :
     binôme ciblé, P2 levé, 0 B/N/n nouveaux (commentaire PR #693 `6150849386`).
   - **#2739** — **bureau**, **Claude**, **ok**, 13/10 17:08:39Z, sur `90aae667` : R2
-    delta `6db727ac..90aae667` 0 B / 0 N.
+    delta `6db727ac..90aae667` 0 B / 0 N ; **fermeture bornée à ce delta**.
   - **Ligne primaire des jalons #2696/#2739** (retrouvée en première main par
     **ameesh-cx2**, 14/10 07:21Z, sur l'hôte bureau) :
     `~/.claude/projects/-home-smichea-Work/11783f10-5492-408f-988b-8c1035bec79b.jsonl` —
@@ -176,10 +231,13 @@ gel sur la main exacte (§7, point 3).
     pc-smichea, liée 13/10 16:29:29Z, révoquée 13/10 20:39:44Z ; sa fenêtre couvre #2696
     (16:45Z) et #2739 (17:08Z). L'exécution réelle et le modèle sont donc **attestés par
     la ligne primaire**, sous la main de cx2 (hashes des quatre lignes et détail :
-    `~/Work/ameesh-cx2-1260-recoupage.md`, hôte bureau, et note #1260 de cx2). Pièce
-    **non revérifiable depuis `ameesh-agents-2`** (`/home/smichea` absent) ; auteur,
-    indépendance et couverture finale du paquet restent à qualifier par le pilote au gel
-    (§7, point 3).
+    `~/Work/ameesh-cx2-1260-recoupage.md`, hôte bureau, et note #1260 de cx2). Les
+    commandes `2893`/`2896` de cette session lisent le delta `5270b1e9..6db727ac` et
+    **leur portée est limitée à `src/`, `deploy/`, `bin/`** : elles **ne couvrent pas
+    explicitement** les correctifs antérieurs ni le témoin 0711 (précision cx2, 14/10
+    20:49Z). Pièce **non revérifiable depuis `ameesh-agents-2`** (`/home/smichea` absent) ;
+    auteur, indépendance et couverture finale du paquet restent à qualifier par le pilote
+    au gel (§7, point 3).
   - **Feu historique** : `work_item_events` **#8263**, pilote mesh-design, 13/10
     17:17:39Z — FEU PILOTE conditionnel sur `90aae667…` : CI exacte verte sur cette tête,
     **toutes parts psql/psycopg COMPLETED/SUCCESS, aucune annulée** (#940), tête
@@ -220,16 +278,20 @@ réjeu individuel.
 
 ## 7. Conditions de gel (canon §12)
 
-1. **#1211 active** (PR #923 fusionnée) et ses deux conflits avec #833 résolus.
-2. **main fraîche** : refaire les unions ; revérifier les patch-ids du **cœur** (73 pour
-   #364 + 4 pour #987) ; n'ajouter 3 (#1002) + 2 (#974) que si les compagnons sont
-   qualifiés et inclus ; relire les **10 fichiers adaptés** du §4 et les
-   **2 recouvrements #1211** (`tests.yml`, `tests/parts/pilote-psql.txt`) ; tout écart =
-   arrêt et signalement.
-3. **Qualification pilote** : classes réelles, familles/sources des avis (y compris la
-   réserve de famille du rapport auditeur `00f1cd5c` et la ligne primaire du jalon #2739,
-   retrouvée par cx2, §5), dépendances, inclusion ou exclusion motivée des compagnons
-   (#974, #1002) ; #1257 à part.
+1. **#1211 active** — **satisfait** : PR #923 fusionnée le 14/10 13:15:41Z, ancêtre de
+   main `2458ec05`.
+2. **main fraîche au geste** : l'état vérifié au 14/10 20:5xZ est le §4ter
+   (`35f8827f…`, 77 fichiers, 77/77 patch-ids `-U0`, 11 blobs composés) ; rejouer l'union
+   sur la main du geste, revérifier les patch-ids du **cœur** (73 pour #364 + 4 pour
+   #987) ; n'ajouter 3 (#1002) + 2 (#974) que si les compagnons sont qualifiés et inclus ;
+   relire les **11 blobs composés** du §4ter (dont `tests.yml` et
+   `tests/parts/pilote-psql.txt`) ; tout écart = arrêt et signalement.
+3. **Qualification pilote** : classes réelles, familles/sources des avis — auteur #364
+   **mixte Codex/DeepSeek**, **R1 Claude NO-GO (#2436+#7173)**, **QA terminale NO-GO
+   (#7954+#7963)**, fermetures #2696/#2739 **bornées**, portée de la ligne primaire
+   **limitée à `src/`, `deploy/`, `bin/`** (§5) —, dépendances, inclusion ou exclusion
+   motivée des compagnons (#974, #1002) ; #1257 à part. Aucun GO global à inventer : la
+   pièce de préparation ne le porte pas.
 4. **Nouveau gel** : branche d'intégration distincte de `39df7c316c9e` + manifeste final
    (cette pièce en entrée).
 5. **Une seule validation complète** `workflow_dispatch` sur le gel : 4 parts psycopg +
@@ -244,9 +306,13 @@ réjeu individuel.
 - Jalon #2739 : binding `#26` = harnais `claude` (bureau) enregistré, et **ligne primaire
   retrouvée par cx2** (14/10 07:21Z) : session `11783f10…`, modèle `claude-opus-5-5`,
   résultats `is_error:false` pour #2696 et #2739 (§5) — l'exécution réelle est attestée
-  sous la main de cx2, **non revérifiable depuis `ameesh-agents-2`**. Reste au pilote :
-  qualification auteur/indépendance/couverture finale du paquet (§7, point 3).
-- Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4).
+  sous la main de cx2, **non revérifiable depuis `ameesh-agents-2`** ; portée limitée à
+  `src/`, `deploy/`, `bin/`, sans couvrir explicitement les correctifs antérieurs ni le
+  témoin 0711. Reste au pilote : qualification auteur/indépendance/couverture finale du
+  paquet (§7, point 3).
+- Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4/§4ter).
+- Reconstruction sur main `2458ec05` : **revérifiée au §4ter**, à rejouer au geste de gel
+  sur la main réelle ; pièces cx2 remises au pilote/auditeur.
 
 ## 9. Réversibilité
 
@@ -255,7 +321,8 @@ réjeu individuel.
   aucun close/reopen ; aucun run CI ; aucune fusion de main dans une branche de lot.
 - Cette branche ne porte que ce document ; suppression :
   `git push origin --delete prep/paquet-364-987`.
-- Les objets d'union sont locaux (`git commit-tree`), non poussés.
+- Les objets d'union (§4, §4bis, §4ter) sont locaux (`git merge-tree`/`git commit-tree`),
+  non poussés ; aucun run CI, aucune poussée de code.
 
 ## Annexe A — reproduction
 
