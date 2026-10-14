@@ -571,13 +571,17 @@ def _inside(target: str, real: str, is_dir: bool) -> bool:
 
 
 def holders(path: str, needle: str | None = None, exclude=(), *,
-            mapped: bool = False) -> list[dict]:
+            mapped: bool = False, session: bool = False) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
-    `exclude`). #248 : avec `mapped`, aussi l'exécutable et les fichiers
-    projetés en mémoire (module natif `.node`, binaire electron). Chaque
-    détenteur : `{"pid", "why", "cmd"}`.
+    `exclude`). Avec `session`, `needle` est un identifiant de session : seule
+    une reprise en cours le nomme (l'argument d'un sélecteur de session,
+    `codex resume <id>`, `claude --resume <id>`, `dsh --session-id <id>`,
+    séparé ou lié par `=`) ; le même identifiant CITÉ dans un brief, un
+    message ou un chemin n'est pas un détenteur (#1283). #248 : avec `mapped`,
+    aussi l'exécutable et les fichiers projetés en mémoire (module natif
+    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd"}`.
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, ou si l'OS
@@ -588,22 +592,47 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
     exclude = set(int(p) for p in exclude)
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped, session)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude, mapped)
+        return _holders_proc(real, is_dir, needle, exclude, mapped, session)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
 
 
-def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | None:
-    if not hit and needle and pid not in exclude and any(needle in a for a in argv[1:]):
-        hit = "session id on the command line"
+#: Sélecteurs de session d'une ligne de commande : l'argument qui les suit
+#: (ou leur valeur liée par `=`) est une reprise en cours. Un identifiant cité
+#: ailleurs dans un argv — brief JSON, message, chemin — n'en est pas une
+#: (#1283 : un dsh réel dont le brief citait l'id d'une session fictive était
+#: vu comme détenteur et faisait échouer les tests d'adoption).
+SESSION_SELECTORS = ("resume", "--resume", "-r", "--session-id")
+
+
+def _session_argument(argv: list[str], needle: str) -> bool:
+    """`needle` est-il l'argument d'une reprise, et non une simple citation ?"""
+    for index, arg in enumerate(argv[1:], start=1):
+        if arg == needle and argv[index - 1] in SESSION_SELECTORS:
+            return True
+        flag, sep, value = arg.partition("=")
+        if sep and value == needle and flag in SESSION_SELECTORS:
+            return True
+    return False
+
+
+def _verdict(pid: int, hit: str, argv: list[str], needle, exclude,
+             session: bool = False) -> dict | None:
+    if not hit and needle and pid not in exclude:
+        if session:
+            if _session_argument(argv, needle):
+                hit = "session id on the command line"
+        elif any(needle in a for a in argv[1:]):
+            hit = "session id on the command line"
     if hit:
         return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160]}
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
+                    session=False) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
@@ -643,7 +672,7 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
                     argv = []
         except ps.NoSuchProcess:
             continue
-        row = _verdict(pid, hit, argv, needle, exclude)
+        row = _verdict(pid, hit, argv, needle, exclude, session)
         if row:
             found.append(row)
     return found
@@ -670,7 +699,7 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     return ""
 
 
-def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -710,7 +739,7 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
                 argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
         except OSError:
             argv = []
-        row = _verdict(int(pid), hit, argv, needle, exclude)
+        row = _verdict(int(pid), hit, argv, needle, exclude, session)
         if row:
             found.append(row)
     return found
