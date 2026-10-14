@@ -1,20 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#762 : les deux résidus P3 de la revue codex post-fusion de #550 (#530).
+"""#762: the two leftover P3 findings of the post-merge codex review of #550 (#530).
 
-1. le dry-run de `menage` compte comme non supprimables les noms d'un inode
-   qu'il supprimerait en réalité, et annonce une passe bloquée alors que la
-   passe réelle évince le bloc (`housekeeping.py`, P2 du verdict) ;
-2. quand la table des montages est redevenue lisible mais que la liste
-   s'arrête à la limite de marche, l'épisode `tmp_unscanned` redémarre avec un
-   nouveau `since` au lieu de continuer celui ouvert par la passe
-   `mounts_unreadable` (`housekeeping.py`, `tmp_episode`).
+1. the `menage` dry-run counts as unremovable the names of an inode it would
+   actually remove, and reports a blocked pass while the real pass evicts the
+   block (`housekeeping.py`, verdict P2);
+2. when the mount table is readable again but the listing stops at the walk
+   limit, the `tmp_unscanned` episode restarts with a new `since` instead of
+   continuing the one opened by the `mounts_unreadable` pass
+   (`housekeeping.py`, `tmp_episode`).
 
-Le troisième point — le test de crédit des liens durs qui passait aussi sur
-l'ancien code — est corrigé dans `test_530_housekeeping_followups.py`, où ce
-test vit.
+The third point — the hard-link credit test that also passed on the old code —
+is fixed in `test_530_housekeeping_followups.py`, where that test lives.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -45,8 +45,27 @@ def _write(path: str, size: int = B, age_s: float = 3 * HOUR) -> None:
         os.utime(path, (at, at))
 
 
+#: the real `os.scandir`, captured before `DryRunTest.setUp` patches it: the
+#: helper below must call it, not the patched attribute (infinite recursion).
+_REAL_SCANDIR = os.scandir
+
+
+@contextlib.contextmanager
+def _sorted_scandir(path: str):
+    """`os.scandir`, entries sorted by name: a deterministic walk order.
+
+    #762 N2 (bureau/Claude review): `_files` walks with a LIFO stack, so the
+    effective order is the reverse of what `os.scandir` returns — creation
+    order on tmpfs, hash order on ext4. Pinning it sorted keeps a dry-run
+    against apply comparison from depending on the machine (canon §3: a test
+    that depends on the filesystem is a defect of the test, fixed at source).
+    """
+    with _REAL_SCANDIR(path) as it:
+        yield iter(sorted(it, key=lambda entry: entry.name))
+
+
 class DryRunTest(unittest.TestCase):
-    """Point 1 : le dry-run annonce ce que la passe ferait, liens durs compris."""
+    """Point 1: the dry-run announces what the pass would do, hard links included."""
 
     def setUp(self) -> None:
         self.base = tempfile.mkdtemp(prefix="t762-")
@@ -54,16 +73,19 @@ class DryRunTest(unittest.TestCase):
         self.root = os.path.join(self.base, "tmp")
         menage._ensure_root(self.root)
         self.mine = os.path.join(self.root, "codex3")
+        patcher = mock.patch("os.scandir", side_effect=_sorted_scandir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _fields(self, result: dict) -> tuple:
         return (result["files"], result["evicted"], result["unremovable"],
                 result["blocked"], result["after"])
 
     def test_dry_run_credits_the_names_it_would_remove(self):
-        # deux noms du même inode, tous deux dans la marche : la passe les
-        # retire tous les deux et crédite le bloc une fois ; le dry-run doit
-        # annoncer la même chose au lieu de compter le bloc comme
-        # non supprimable et bloqué (#762 P2)
+        # two names of the same inode, both inside the walk: the pass removes
+        # both and credits the block once; the dry-run must announce the same
+        # instead of counting the block as unremovable and reporting a blocked
+        # pass (#762 P2)
         first = os.path.join(self.mine, "a")
         _write(first, size=5)                    # 5 bytes: one 4096 block
         os.link(first, os.path.join(self.mine, "b"))
@@ -77,9 +99,9 @@ class DryRunTest(unittest.TestCase):
         self.assertFalse(any(os.path.exists(p) for p in names))
 
     def test_dry_run_does_not_credit_a_name_outside_the_walk(self):
-        # un nom dans la marche, un autre hors de la racine gérée : l'inode
-        # survit à la passe, rien n'est libéré ; le dry-run doit prédire la
-        # comptabilité `unremovable`, pas créditer le bloc
+        # one name inside the walk, another outside the managed root: the inode
+        # survives the pass, nothing is freed; the dry-run must predict the
+        # `unremovable` accounting, not credit the block
         inside = os.path.join(self.mine, "a")
         _write(inside, size=5)
         keep = os.path.join(self.base, "keep")
@@ -95,10 +117,10 @@ class DryRunTest(unittest.TestCase):
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
                      "root ignores the directory permissions")
     def test_dry_run_predicts_a_name_it_cannot_unlink(self):
-        # un nom dans un dossier inscriptible, l'autre dans un dossier en
-        # lecture seule : la passe réelle refuse le second et s'arrête sans
-        # créditer le bloc ; le dry-run doit prédire ce refus (mêmes champs),
-        # pas annoncer une éviction qu'il ne ferait pas
+        # one name in a writable directory, the other in a read-only one: the
+        # real pass refuses the second and stops without crediting the block;
+        # the dry-run must predict that refusal (same fields), not announce an
+        # eviction it would not perform
         first = os.path.join(self.mine, "w", "a")
         _write(first, size=5)
         readonly = os.path.join(self.mine, "r")
@@ -117,7 +139,7 @@ class DryRunTest(unittest.TestCase):
 
 
 class EpisodeTest(PgTestCase):
-    """Point 2 : `mounts_unreadable` → `truncated`, un seul épisode `tmp_unscanned`."""
+    """Point 2: `mounts_unreadable` -> `truncated`, a single `tmp_unscanned` episode."""
 
     def setUp(self) -> None:
         super().setUp()
