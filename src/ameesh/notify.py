@@ -105,6 +105,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #1268 : un agent critique enchaîne les échecs de tour réels
+                 "critical_turn_failures",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
@@ -192,13 +194,16 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    # #1268 : deux échecs de tour réels d'affilée sur un agent critique
+    "critical_turn_failures": "critical agent failing turns",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing", "critical_budget_pause", "owner_key_registered",
+                "credential_failing", "critical_budget_pause", "critical_turn_failures",
+                "owner_key_registered",
                 "land_uncertain", "db_connections_high")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui

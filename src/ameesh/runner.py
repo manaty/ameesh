@@ -44,6 +44,7 @@ import uuid
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, identity, mail, registry, sentinel, storage
+from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
@@ -337,6 +338,18 @@ class AgentWorker(threading.Thread):
         #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
         self.fast_failure = False
         self.fast_failures = 0
+        #: #1268 : série d'échecs de tour **réels** (hors hôte, auth, bail,
+        #: session fille), remise à zéro par un succès ; marquée dans
+        #: `status_text` et lue par l'alerte `critical_turn_failures`. Relue de
+        #: la ligne : elle survit au redémarrage de l'exécuteur.
+        from . import exploitation as exploitation_mod
+        self.failure_streak = exploitation_mod.failure_streak(agent.get("status_text"))
+        #: #1270 : épisode de débit/quota fournisseur, relu de la ligne comme la
+        #: série d'échecs — la reprise cadencée survit au redémarrage.
+        etat_debit = rate_limit_mod.state(agent.get("status_text"))
+        self.rate_limit = etat_debit["kind"] if etat_debit else None
+        self.rate_limit_streak = etat_debit["streak"] if etat_debit else 0
+        self.rate_limit_since = etat_debit["since"] if etat_debit else 0.0
         self.last_activity = time.monotonic()
         #: #408 : dernière lecture des lots actionnables (règle 1)
         self._lot_wake_checked = float("-inf")
@@ -3572,6 +3585,36 @@ class AgentWorker(threading.Thread):
             return spec, []
         return dict(spec, prompt=note + spec["prompt"]), dits
 
+    def modele_du_tour(self, harness: str, adapter, *, emprunte: bool) -> str:
+        """Le modèle passé au harnais du tour (0019) : vide si le harnais est
+        emprunté (L242b), vide aussi quand le réglage appartient positivement à
+        la famille d'un **autre** harnais (#1268 : ligne de registre héritée
+        d'une bascule, #1037 — la passer ferait un 400 côté fournisseur) ;
+        sinon le réglage de l'agent, ou le défaut livré par le descripteur
+        (DeepSeek, L60). Un identifiant de famille inconnue n'est jamais
+        refusé : on ne devine pas."""
+        model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
+        if model and cost_mod.foreign_harness_model(harness, model):
+            vu = self.__dict__.get("_foreign_model_seen")
+            if vu != model:
+                self._foreign_model_seen = model
+                log_async("[%s] model %s ignored for harness %s: it belongs to another "
+                          "harness's family (stale registry setting); the harness default "
+                          "is used" % (self.name, model, harness))
+                self._fil_note(
+                    "Model %s was ignored for harness %s: it belongs to another "
+                    "harness's family (stale registry setting, #1268). The harness "
+                    "default is used for this turn." % (model, harness),
+                    meta={"action": "modele-etranger", "modele": model, "harnais": harness})
+            model = ""
+        if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
+            # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
+            # du descripteur est passé explicitement. Le modèle du tour est
+            # alors connu (grand livre au bon tarif, jamais « inconnu ») au
+            # lieu de dépendre du profil local du harnais.
+            model = adapter.spec.defaults["model"]
+        return model
+
     def _run_turn(self, spec: dict) -> bool:
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
@@ -3603,13 +3646,7 @@ class AgentWorker(threading.Thread):
         resume = self._ouverture()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
-        model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
-        if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
-            # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
-            # du descripteur est passé explicitement. Le modèle du tour est
-            # alors connu (grand livre au bon tarif, jamais « inconnu ») au
-            # lieu de dépendre du profil local du harnais.
-            model = adapter.spec.defaults["model"]
+        model = self.modele_du_tour(harness, adapter, emprunte=emprunte)
         effort = "" if emprunte else (self._state_read("effort")
                                       or self.agent.get("effort") or "")
         # Tier (L26) : passé par le descripteur du harnais (Codex :
@@ -4274,18 +4311,60 @@ class AgentWorker(threading.Thread):
                 self.fast_failure = False
                 self._avec_reprise("child session discarded",
                                    self._ecarte_session_fille, session)
+            # #1270 : un 429 de débit (ou un quota fournisseur) n'est pas un
+            # échec rapide — il attend puis reprend seul, à délais cadencés ;
+            # le quota est distingué du débit passager et la garde comptable
+            # (L226b) reste seule juge du budget. Un échec d'une autre cause
+            # efface l'épisode.
+            genre = rate_limit_mod.classify(
+                error, self.last_final,
+                auth_failure.stderr_tail(stderr_path, start=stderr_debut))
+            if genre:
+                self.fast_failure = False
+                if genre == self.rate_limit:
+                    self.rate_limit_streak += 1
+                else:
+                    self.rate_limit = genre
+                    self.rate_limit_streak = 1
+                    self.rate_limit_since = time.time()
+            else:
+                self.rate_limit = None
+                self.rate_limit_streak = 0
+                self.rate_limit_since = 0.0
         if self._session_en_attente is not None:
             self._avec_reprise("turn session", self._enregistre_session)
         if ok and clos:
             self._turn_closed(cloture or "cap", duration)
         elif ok:
             self._note_courrier_borne(turn_id, duration)
+        # #1268 : série d'échecs de tour **réels** (les échecs classés — hôte,
+        # authentification, bail, session fille — sont rendus plus haut et ne
+        # comptent pas) ; un succès la remet à zéro, la pause budget réécrit
+        # `status_text` sans marqueur.
+        if ok:
+            self.failure_streak = 0
+            self.rate_limit, self.rate_limit_streak, self.rate_limit_since = None, 0, 0.0
+        else:
+            self.failure_streak += 1
+        texte_fin = ("%s in %ds%s" % (shown, int(duration), "" if ok else " (failed)")
+                     + (" (closed: %s)" % cloture.split(":")[0]
+                        if ok and clos and cloture else ""))
+        if not ok and self.rate_limit:
+            # #1270 : l'épisode de débit est écrit dans le statut — visible
+            # dans `ameesh list`/`show`, relu après un redémarrage, et lu par
+            # l'alerte #1268 (seuil de 15 min).
+            texte_fin = rate_limit_mod.status_text(
+                texte_fin, self.rate_limit, self.rate_limit_streak,
+                self.rate_limit_since, rate_limit_mod.delay(self.rate_limit_streak))
+        if not ok and self.failure_streak:
+            from . import exploitation as exploitation_mod
+            texte_fin = exploitation_mod.turn_failure_status_text(
+                texte_fin, self.failure_streak,
+                critical=account_turn.is_critical(self))
         self._avec_reprise(
             "end of turn", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,
-            status=status,
-            status_text="%s in %ds%s" % (shown, int(duration), "" if ok else " (failed)")
-            + (" (closed: %s)" % cloture.split(":")[0] if ok and clos and cloture else ""),
+            status=status, status_text=texte_fin,
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
@@ -4382,12 +4461,21 @@ class AgentWorker(threading.Thread):
 
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec
-        rapide consécutif, bornée par `failure_backoff_max` (L48)."""
+        consécutif, bornée par `failure_backoff_max` (L48).
+
+        #1268 : la série d'échecs **réels** compte aussi (pas seulement les
+        échecs rapides) — un harnais qui échoue lentement ne doit pas être
+        relancé toutes les 5 s sans fin."""
+        if self.rate_limit:
+            # #1270 : débit/quota fournisseur — reprise cadencée (1, 2, 5,
+            # 10 min), jamais l'arrêt L48.
+            return rate_limit_mod.delay(self.rate_limit_streak)
         base = self.runner.failure_backoff
-        if self.fast_failures <= 1:
+        n = max(self.fast_failures, self.failure_streak)
+        if n <= 1:
             return base
         return min(self.runner.failure_backoff_max,
-                   base * (2 ** (self.fast_failures - 1)))
+                   base * (2 ** (n - 1)))
 
     def _sync_memory(self) -> None:
         """Transport the persona session's memory changes at turn end, in the background."""

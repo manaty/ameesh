@@ -417,6 +417,27 @@ PRICE_FAMILY = {
 }
 
 
+def foreign_harness_model(harness: str, model: str | None) -> bool:
+    """Le modèle nommé appartient-il **positivement** à la famille d'un autre
+    harnais ? (#1268)
+
+    Garde de lancement : une ligne de registre héritée d'une bascule de harnais
+    (#1037) peut porter `model=claude-…` avec `harness=codex` ; passer ce modèle
+    au harnais du tour provoque un 400 côté fournisseur (incident orchestrateur
+    du 14/10). On ne refuse jamais sur une supposition : un identifiant dont
+    aucune famille n'est reconnue n'est pas étranger.
+    """
+    nom = str(model or "").strip().lower()
+    if not nom:
+        return False
+    for harnais, prefixes in PRICE_FAMILY.items():
+        if harnais == harness:
+            continue
+        if any(nom.startswith(prefixe) for prefixe in prefixes):
+            return True
+    return False
+
+
 #: suffixes qu'un harnais ajoute à l'identifiant d'un modèle sans en changer
 #: le tarif : variante de contexte (`claude-opus-4-6[1m]`), instantané daté
 #: (`claude-haiku-4-5-20251001`)
