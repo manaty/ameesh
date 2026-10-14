@@ -172,10 +172,11 @@ class StagingTest(unittest.TestCase):
                         FAKE_STATE=str(self.state),
                         PATH=str(self.bin) + os.pathsep + base.get('PATH', ''),
                         TMPDIR=str(bacs['tmp']),
-                        # jamais la configuration, l'etat ni le DSN reels : le
-                        # repli de config.load() (AGENT_MESH_CONFIG, config
-                        # historique, alias *_DATABASE_URL) est retire par le
-                        # filtre, le DSN restant est injoignable, et toute
+                        # jamais la configuration, l'etat ni le DSN reels : les
+                        # replis de config.load() (AGENT_MESH_CONFIG, alias
+                        # *_DATABASE_URL) sont retires par le filtre ; le chemin
+                        # explicite absent est en plus refuse avant connexion
+                        # (#1127), le DSN restant est injoignable, et toute
                         # ecriture irait sous le bac (incident du 14/10 02:0xZ ;
                         # consigne mesh-design 02:21 ; precision auditeur 02:26).
                         AMEESH_CONFIG=str(self.root / 'config-absente.json'),
@@ -234,20 +235,24 @@ class StagingTest(unittest.TestCase):
                 self.assertIn(cle, ENV_BAC, 'variable heritee : %s' % cle)
 
     def test_le_filtre_ecarte_les_replis_du_runner(self):
-        """Temoin de non-recidive (#1195) : l'absence de AMEESH_CONFIG ne
-        suffit pas -- le repli AGENT_MESH_CONFIG lit un fichier reel, et les
-        alias ``*_DATABASE_URL`` supplantent le DSN par defaut. Le banc ne les
-        herite plus (temoins 1-2 : sans filtre ; temoin 3 : avec)."""
+        """Temoin de non-recidive (#1195) : un banc qui herite du runner garde
+        l'alias AGENT_MESH_CONFIG -- qui lit un fichier reel -- et les alias
+        ``*_DATABASE_URL`` -- qui supplantent le DSN. Le banc ne les herite plus
+        (temoins 1-2 : sans filtre ; temoin 3 : avec). Le chemin explicite
+        absent du banc est en plus refuse par config.load avant connexion
+        (#1127), et l'alias perime ne fait pas foi devant un fichier nomme."""
         from ameesh import config
-        absente = str(self.root / 'config-absente.json')
+        vide = self.root / 'config-vide.json'
+        vide.write_text('{}')
         piege = self.root / 'piege.json'
         piege.write_text(json.dumps({'dsn': 'postgresql://piege@127.0.0.1/piege'}))
-        # 1. le repli AGENT_MESH_CONFIG lit le fichier malgre AMEESH_CONFIG absent
-        repli = {'AMEESH_CONFIG': absente, 'AGENT_MESH_CONFIG': str(piege)}
+        # 1. sans AMEESH_CONFIG, l'alias AGENT_MESH_CONFIG lit un fichier reel
+        repli = {'AGENT_MESH_CONFIG': str(piege)}
         self.assertEqual(config.load(dict(repli)).dsn,
                          'postgresql://piege@127.0.0.1/piege')
-        # 2. les alias *_DATABASE_URL sont acceptes
-        alias = {'AMEESH_CONFIG': absente,
+        # 2. les alias *_DATABASE_URL supplantent le DSN, meme quand un fichier
+        #    de config vide est nomme explicitement
+        alias = {'AMEESH_CONFIG': str(vide),
                  'AMEESH_DATABASE_URL': 'postgresql://alias@127.0.0.1/alias',
                  'AGENT_MESH_DATABASE_URL': 'postgresql://alias@127.0.0.1/alias'}
         self.assertEqual(config.load(dict(alias)).dsn,
