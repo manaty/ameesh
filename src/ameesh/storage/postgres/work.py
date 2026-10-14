@@ -1054,9 +1054,14 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
 
-    def backlog(self, *, open_only, limit) -> list[dict]:
+    def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:
         where = ("state = 'intake' AND assignee IS NULL" if open_only
                  else "state NOT IN %s" % _CLOSED)
+        if ready_only:
+            where += (" AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
+                      "                      JOIN work_items b ON b.id = d.blocker_id"
+                      "                     WHERE d.work_item_id = work_items.id"
+                      "                       AND b.state NOT IN %s)" % _CLOSED)
         return self.db.query(
             "SELECT %s FROM work_items WHERE type = 'improvement' AND %s"
             " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
