@@ -10,17 +10,43 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy/mise-a-jour'
+
+#: variables du runner qui supplanteraient le HOME, la config ou l'etat
+#: temporaires : jamais heritees par le banc (incident du 14/10 02:0xZ,
+#: consigne mesh-design 02:21).
+ENV_PREFIXES = ('AMEESH_', 'AGENT_MESH_', 'AGENT_MAIL_')
+ENV_EXTRA = ('XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME')
+#: DSN volontairement injoignable : une commande qui sort des stubs echoue
+#: immediatement au lieu d'ecrire sur la base commune du mesh.
+DSN_REFUSE = 'postgresql://refuse:refuse@127.0.0.1:1/refuse_1155'
+#: variables du bac a sable : les seules AMEESH_*/AGENT_* admises dans l'env.
+ENV_BAC = ('AMEESH_CONFIG', 'AMEESH_DSN', 'AGENT_MESH_DSN', 'AMEESH_SCHEMA',
+           'AGENT_MESH_SCHEMA', 'AMEESH_STATE', 'AGENT_MESH_STATE',
+           'AMEESH_THREADS', 'AGENT_MAIL_STATE', 'AGENT_MAIL_CONFIG')
+
+
+def env_isole(environ=None):
+    """Environnement du banc, debarrasse des reglages du runner qui
+    supplanteraient le HOME, la config, l'etat ou le DSN reels (incident du
+    14/10 02:0xZ ; replis AGENT_MESH_CONFIG, config historique et alias
+    ``*_DATABASE_URL`` releves par l'auditeur le 14/10 02:26)."""
+    source = os.environ if environ is None else environ
+    return {k: v for k, v in source.items()
+            if not k.startswith(ENV_PREFIXES) and k not in ENV_EXTRA}
 
 #: a stub deploy script: logs the call, fails once on a scenario line
 STUB = r'''#!/usr/bin/env bash
 set -euo pipefail
 state=${FAKE_STATE:?}
+printf 'stub %s %s\n' "$0" "$*" >> "$state/calls.log"
 host=pc-smichea
 if [ "$(basename "$0")" = vm.sh ]; then
   if [ "${1:-}" = agents ]; then
@@ -45,6 +71,7 @@ exit 0
 VENV_PYTHON = r'''#!/usr/bin/env bash
 set -euo pipefail
 state=${FAKE_STATE:?}
+printf 'stub %s %s\n' "$0" "$*" >> "$state/calls.log"
 printf 'venv-python %s\n' "$*" >> "$state/calls.log"
 if [ "${1:-}" = "-" ]; then exit 0; fi   # notification
 hote=""; precedent=""
@@ -64,6 +91,7 @@ echo "courrier $hote : ok"
 VENV_AMEESH = r'''#!/usr/bin/env bash
 set -euo pipefail
 state=${FAKE_STATE:?}
+printf 'stub %s %s\n' "$0" "$*" >> "$state/calls.log"
 printf 'venv-ameesh %s\n' "$*" >> "$state/calls.log"
 if grep -qx "ko=harness" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=harness" "$state/scenario" > "$state/scenario.tmp" || true
@@ -77,6 +105,7 @@ exit 0
 #: read-only ssh probes (installed sha, previous sha) find nothing: the stubs
 #: above own every remote gesture.
 SSH = r'''#!/usr/bin/env bash
+printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 exit 255
 '''
@@ -134,13 +163,29 @@ class StagingTest(unittest.TestCase):
                        check=True, capture_output=True, env=env)
         self.sha = subprocess.run(run + ['rev-parse', 'HEAD'], check=True,
                                   capture_output=True, text=True).stdout.strip()
-        self.env = dict(os.environ, HOME=str(self.home), BASCULE_ENV=str(self.config),
+        base = env_isole()
+        bacs = {}
+        for nom in ('etat', 'fils', 'v0', 'config', 'tmp'):
+            bacs[nom] = self.root / nom
+            bacs[nom].mkdir()
+        self.env = dict(base, HOME=str(self.home), BASCULE_ENV=str(self.config),
                         FAKE_STATE=str(self.state),
-                        PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
-                        # jamais la configuration reelle : si un chemin retombait
-                        # sur le venv de l'hote, config.load() echoue au lieu de
-                        # lire la base du mesh (incident du 14/10 02:0xZ).
+                        PATH=str(self.bin) + os.pathsep + base.get('PATH', ''),
+                        TMPDIR=str(bacs['tmp']),
+                        # jamais la configuration, l'etat ni le DSN reels : le
+                        # repli de config.load() (AGENT_MESH_CONFIG, config
+                        # historique, alias *_DATABASE_URL) est retire par le
+                        # filtre, le DSN restant est injoignable, et toute
+                        # ecriture irait sous le bac (incident du 14/10 02:0xZ ;
+                        # consigne mesh-design 02:21 ; precision auditeur 02:26).
                         AMEESH_CONFIG=str(self.root / 'config-absente.json'),
+                        AMEESH_STATE=str(bacs['etat']),
+                        AGENT_MESH_STATE=str(bacs['etat']),
+                        AMEESH_THREADS=str(bacs['fils']),
+                        AGENT_MAIL_STATE=str(bacs['v0']),
+                        AGENT_MAIL_CONFIG=str(bacs['config']),
+                        AMEESH_DSN=DSN_REFUSE, AGENT_MESH_DSN=DSN_REFUSE,
+                        AMEESH_SCHEMA='refuse_1155', AGENT_MESH_SCHEMA='refuse_1155',
                         GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@invalid',
                         GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@invalid')
 
@@ -150,12 +195,70 @@ class StagingTest(unittest.TestCase):
 
     def run_staging(self, *args, env=None):
         env = env or self.env
-        # garde-fou : le staging de test ne doit jamais lire le HOME reel
+        # garde-fous : le staging de test ne doit jamais lire le HOME, la
+        # config, l'etat ni le DSN reels.
         self.assertEqual(env.get('HOME'), str(self.home))
         self.assertFalse(Path(env.get('AMEESH_CONFIG', '')).exists())
-        return subprocess.run(['bash', str(self.script_dir / 'staging.sh'), *args],
-                              env=env, capture_output=True, text=True,
-                              timeout=180)
+        for nom in ('AMEESH_STATE', 'AGENT_MESH_STATE', 'AMEESH_THREADS',
+                    'AGENT_MAIL_STATE', 'AGENT_MAIL_CONFIG'):
+            self.assertTrue(str(env.get(nom, '')).startswith(str(self.root)), nom)
+        self.assertEqual(env.get('AMEESH_DSN'), DSN_REFUSE)
+        p = subprocess.run(['bash', str(self.script_dir / 'staging.sh'), *args],
+                           env=env, capture_output=True, text=True,
+                           timeout=180)
+        self.assert_no_escape()
+        return p
+
+    def assert_no_escape(self):
+        """Tout executable trace doit etre un stub du bac a sable : le banc
+        echoue si une commande sort des stubs ou de la config temporaire."""
+        for line in self.calls():
+            if line.startswith('stub '):
+                chemin = line.split(' ', 2)[1]
+                self.assertTrue(chemin.startswith(str(self.root)),
+                                'executable hors bac a sable : %s' % line)
+
+    def test_environment_is_isolated(self):
+        """Aucun reglage herite du runner ne peut atteindre le mesh reel."""
+        env = self.env
+        for nom in ENV_BAC:
+            self.assertIn(nom, env, nom)
+        self.assertFalse(Path(env['AMEESH_CONFIG']).exists())
+        for nom in ('AMEESH_STATE', 'AGENT_MESH_STATE', 'AMEESH_THREADS',
+                    'AGENT_MAIL_STATE', 'AGENT_MAIL_CONFIG'):
+            self.assertTrue(env[nom].startswith(str(self.root)), nom)
+        for nom in ('AMEESH_DSN', 'AGENT_MESH_DSN'):
+            self.assertEqual(env[nom], DSN_REFUSE, nom)
+        for cle in env:
+            if cle.startswith(ENV_PREFIXES):
+                self.assertIn(cle, ENV_BAC, 'variable heritee : %s' % cle)
+
+    def test_le_filtre_ecarte_les_replis_du_runner(self):
+        """Temoin de non-recidive (#1195) : l'absence de AMEESH_CONFIG ne
+        suffit pas -- le repli AGENT_MESH_CONFIG lit un fichier reel, et les
+        alias ``*_DATABASE_URL`` supplantent le DSN par defaut. Le banc ne les
+        herite plus (temoins 1-2 : sans filtre ; temoin 3 : avec)."""
+        from ameesh import config
+        absente = str(self.root / 'config-absente.json')
+        piege = self.root / 'piege.json'
+        piege.write_text(json.dumps({'dsn': 'postgresql://piege@127.0.0.1/piege'}))
+        # 1. le repli AGENT_MESH_CONFIG lit le fichier malgre AMEESH_CONFIG absent
+        repli = {'AMEESH_CONFIG': absente, 'AGENT_MESH_CONFIG': str(piege)}
+        self.assertEqual(config.load(dict(repli)).dsn,
+                         'postgresql://piege@127.0.0.1/piege')
+        # 2. les alias *_DATABASE_URL sont acceptes
+        alias = {'AMEESH_CONFIG': absente,
+                 'AMEESH_DATABASE_URL': 'postgresql://alias@127.0.0.1/alias',
+                 'AGENT_MESH_DATABASE_URL': 'postgresql://alias@127.0.0.1/alias'}
+        self.assertEqual(config.load(dict(alias)).dsn,
+                         'postgresql://alias@127.0.0.1/alias')
+        # 3. le filtre du banc les ecarte tous
+        herite = dict(repli, **alias)
+        herite.update({'AMEESH_STATE': '/home/ameesh/.local/state/ameesh',
+                       'AGENT_MAIL_STATE': '/home/ameesh/.local/state/agent-mail',
+                       'XDG_STATE_HOME': '/home/ameesh/.local/state',
+                       'PATH': '/usr/bin'})
+        self.assertEqual(env_isole(herite), {'PATH': '/usr/bin'})
 
     def calls(self):
         return (self.state / 'calls.log').read_text().splitlines()
@@ -283,6 +386,11 @@ class StagingTest(unittest.TestCase):
         (self.home / '.local/share/ameesh').mkdir(parents=True, exist_ok=True)
         (self.home / ('.local/share/ameesh/src-%s' % court)).mkdir()
         (self.home / '.local/share/ameesh/src-current').symlink_to('src-%s' % court)
+        # N2 : la trace doit nommer la cible de retour conservee, pas la cible
+        # courante.
+        journal = self.home / '.local/state/ameesh/mise-a-jour'
+        journal.mkdir(parents=True)
+        (journal / 'precedent').write_text('src-deadbee\n')
         p = self.run_staging()
         self.assertEqual(p.returncode, 0, p.stderr)
         actions = self.actions()
@@ -292,16 +400,31 @@ class StagingTest(unittest.TestCase):
         self.assertTrue(any(t['hote'] == 'pc-smichea' and t['etape'] == 'installer'
                             and 'deja installe' in (t['detail'] or '')
                             for t in self.traces()))
+        self.assertTrue(any(t['hote'] == 'pc-smichea' and t['etape'] == 'installer'
+                            and t['precedent'] == 'src-deadbee'
+                            for t in self.traces()))
 
-    def test_subset_keeps_canonical_order(self):
-        p = self.run_staging('--hotes', 'pc-smichea ameesh-agents-1', '--sans-sonde')
+    def test_subset_keeps_canonical_order_without_poste(self):
+        p = self.run_staging('--hotes', 'ameesh-agents-2 ameesh-agents-1', '--sans-sonde')
         self.assertEqual(p.returncode, 0, p.stderr)
-        hosted = [h for h, _ in self.actions()]
-        self.assertEqual(hosted[:4], ['ameesh-agents-1', 'pc-smichea', 'pc-smichea',
-                                      'pc-smichea'])
-        self.assertNotIn(('ameesh-agents-2', 'verifier'), self.actions())
-        self.assertNotIn(('manaty-mesh-1', 'installer'), self.actions())
-        self.assertIn(('pc-smichea', 'installer'), self.actions())
+        installes = [h for h, a in self.actions() if a == 'installer']
+        self.assertEqual(installes, ['ameesh-agents-1', 'ameesh-agents-2'])
+        self.assertNotIn(('pc-smichea', 'installer'), self.actions())
+        self.assertNotIn(('pc-smichea', 'redemarrer'), self.actions())
+        self.assertNotIn('manaty-mesh-1', [h for h, _ in self.actions()])
+        migrations = [l for l in self.calls() if 'action=migrer' in l]
+        self.assertEqual(len(migrations), 1)
+        self.assertIn('--additif-seulement %s' % self.sha, migrations[0])
+
+    def test_subset_with_poste_is_refused(self):
+        """canon §14 : le poste ne se met a jour qu'apres les trois VM saines ;
+        un sous-ensemble qui l'inclut n'en apporte aucune preuve (avis R1 B4)."""
+        for sous_ensemble in ('pc-smichea', 'pc-smichea ameesh-agents-1'):
+            with self.subTest(sous_ensemble):
+                p = self.run_staging('--hotes', sous_ensemble)
+                self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                self.assertIn('sequence complete des quatre hotes', p.stderr)
+                self.assertEqual(self.calls(), [])
 
     def test_topology_is_required_and_consistent(self):
         cases = {
@@ -337,6 +460,155 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
 
 
+class PosteMigrerTest(unittest.TestCase):
+    """Contrat reel du dispatcher de poste.sh (avis R1 B1/B2) : HOME en bac,
+    venv factice, depot git reel local ; aucune base, aucun hote, aucun envoi."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1155-poste-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.git_env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@invalid',
+                            GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@invalid')
+        self.home = self.root / 'home'; self.home.mkdir()
+        self.repo = self.root / 'repo'
+        script = self.repo / 'deploy/mise-a-jour/poste.sh'
+        script.parent.mkdir(parents=True)
+        shutil.copy2(DEPLOY / 'poste.sh', script)
+        dsn = self.repo / 'src/ameesh/dsn.py'
+        dsn.parent.mkdir(parents=True)
+        shutil.copy2(ROOT / 'src/ameesh/dsn.py', dsn)
+        self.git('init', '-q')
+        self.git('config', 'user.email', 't@invalid')
+        self.git('config', 'user.name', 't')
+        (self.repo / 'marque').write_text('base\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'base')
+        self.premier = self.git('rev-parse', 'HEAD').stdout.strip()
+        (self.repo / 'marque').write_text('base\ntete\n')
+        self.git('add', 'marque')
+        self.git('commit', '-qm', 'tete')
+        self.tete = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.partage = self.home / '.local/share/ameesh'
+        self.venv = self.partage / 'venv/bin'
+        self.venv.mkdir(parents=True)
+        stub = self.venv / 'python'
+        stub.write_text('#!/usr/bin/env bash\n'
+                        'printf "venv %s | PYTHONPATH=%s\\n" "$*" "${PYTHONPATH:-}" '
+                        '>> "${FAKE_LOG:?}"\n')
+        stub.chmod(0o755)
+        self.log = self.root / 'venv.log'; self.log.touch()
+        self.config = self.home / '.config/ameesh/config.json'
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text(json.dumps({'dsn': 'postgresql://u:p@127.0.0.1:1/x'}))
+        self.bascule = self.root / 'bascule.env'
+        self.bascule.write_text('VM=10.77.0.2\n')
+        (self.root / 'run').mkdir()
+        self.env = dict(self.git_env, HOME=str(self.home), BASCULE_ENV=str(self.bascule),
+                        FAKE_LOG=str(self.log), XDG_RUNTIME_DIR=str(self.root / 'run'))
+
+    def git(self, *args):
+        return subprocess.run(['git', '-C', str(self.repo), *args],
+                              capture_output=True, text=True, check=True, env=self.git_env)
+
+    def run_poste(self, *args):
+        self.log.write_text('')
+        return subprocess.run(['bash', str(self.repo / 'deploy/mise-a-jour/poste.sh'), *args],
+                              env=self.env, capture_output=True, text=True, timeout=60)
+
+    def test_dispatcher_forwards_the_ref(self):
+        """B1 : migrer REF doit migrer REF, pas HEAD du depot."""
+        p = self.run_poste('migrer', self.premier)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        lignes = self.log.read_text().splitlines()
+        self.assertTrue(any('migrate --dry-run' in l for l in lignes), lignes)
+        self.assertTrue(any('migrate --additive-only' in l for l in lignes), lignes)
+        self.assertTrue(any(('src-%s' % self.premier[:7]) in l for l in lignes), lignes)
+        self.assertFalse(any(('src-%s' % self.tete[:7]) in l for l in lignes), lignes)
+
+    def test_additive_guard_forced_on_a_reprise(self):
+        """B2 : sur une cible deja installee, --additif-seulement garde le refus."""
+        (self.partage / ('src-%s' % self.tete[:7])).mkdir()
+        (self.partage / 'src-current').symlink_to('src-%s' % self.tete[:7])
+        p = self.run_poste('migrer', self.tete)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn('déjà installé', p.stdout)
+        self.assertFalse(any('migrate --additive-only' in l
+                             for l in self.log.read_text().splitlines()))
+        p = self.run_poste('migrer', '--additif-seulement', self.tete)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertTrue(any('migrate --additive-only' in l
+                            for l in self.log.read_text().splitlines()))
+
+
+class PaquetGitTest(unittest.TestCase):
+    """Contrat reel du paquet git (avis R1 B3) : deux depots isoles et un
+    destinataire en retard ; l'ancienne exclusion (origin/main) produisait un
+    paquet vide quand la cible etait un ancetre de main."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1155-paquet-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.origin = self.root / 'origin.git'
+        self.poste = self.root / 'poste'
+        self.vm = self.root / 'vm'
+        self.env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@invalid',
+                        GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@invalid')
+        self.git(str(self.root), 'init', '-q', '--bare', '-b', 'main', str(self.origin))
+        self.git(str(self.root), 'clone', '-q', str(self.origin), str(self.poste))
+        self.shas = []
+        for contenu in ('a\n', 'b\n', 'c\n'):
+            (self.poste / 'marque').write_text(contenu)
+            self.git(str(self.poste), 'add', 'marque')
+            self.git(str(self.poste), 'commit', '-qm', contenu.strip())
+            self.shas.append(self.git(str(self.poste), 'rev-parse', 'HEAD').stdout.strip())
+        self.git(str(self.poste), 'push', '-q', 'origin', 'main')
+        self.a, self.b, self.c = self.shas
+        self.git(str(self.root), 'clone', '-q', str(self.origin), str(self.vm))
+        self.git(str(self.vm), 'checkout', '-q', self.a)  # destinataire en retard
+
+    def git(self, cwd, *args, check=True):
+        return subprocess.run(['git', '-C', cwd, *args], capture_output=True,
+                              text=True, env=self.env, check=check)
+
+    def test_old_exclusion_makes_an_empty_bundle(self):
+        out = self.root / 'vide.bundle'
+        self.git(str(self.poste), 'update-ref', 'refs/tmp/vide', self.c)
+        r = self.git(str(self.poste), 'bundle', 'create', '-q', str(out),
+                     'refs/tmp/vide', '^origin/main', check=False)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('empty bundle', r.stderr)
+
+    def test_bundle_for_a_lagging_vm(self):
+        out = self.root / 'paquet.bundle'
+        r = subprocess.run(['bash', str(DEPLOY / 'paquet-git.sh'), str(self.poste),
+                            'refs/mise-a-jour/test', self.c, str(out), self.a],
+                           capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.git(str(self.vm), 'fetch', '-q', str(out), 'refs/mise-a-jour/test')
+        self.git(str(self.vm), 'cat-file', '-e', '%s^{commit}' % self.c)
+        r = self.git(str(self.poste), 'rev-parse', '--verify', 'refs/mise-a-jour/test',
+                     check=False)
+        self.assertNotEqual(r.returncode, 0, 'reference temporaire non retiree')
+
+    def test_bundle_without_base_for_an_empty_repo(self):
+        vide = self.root / 'vide-depot'
+        self.git(str(self.root), 'init', '-q', '-b', 'main', str(vide))
+        out = self.root / 'complet.bundle'
+        r = subprocess.run(['bash', str(DEPLOY / 'paquet-git.sh'), str(self.poste),
+                            'refs/mise-a-jour/test', self.b, str(out)],
+                           capture_output=True, text=True, env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.git(str(vide), 'fetch', '-q', str(out), 'refs/mise-a-jour/test')
+        self.git(str(vide), 'cat-file', '-e', '%s^{commit}' % self.b)
+
+    def test_vm_sh_delegates_bundle_creation(self):
+        source = (DEPLOY / 'vm.sh').read_text()
+        self.assertEqual(source.count('paquet-git.sh'), 2, source)
+        self.assertNotIn('bundle create', source)
+
+
 class SanteCourrierTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -360,6 +632,18 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertEqual(self.mod.choose(rows, 'auto', now)[0]['name'], 'a')
         self.assertEqual(self.mod.choose(rows, 'jamais', now), (None, 'sonde desactivee'))
         self.assertEqual(self.mod.choose([], 'auto', now)[0], None)
+
+    def test_dead_letters_include_stopped_personas(self):
+        """N1 : une boite morte d'une persona arretee de l'hote est rapportee."""
+        db = object()
+        arrets = [{'name': 'a', 'host': 'h', 'status': 'stopped'},
+                  {'name': 'b', 'host': 'autre', 'status': 'idle'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=arrets), \
+             mock.patch.object(self.mod.storage, 'of') as of:
+            of.return_value.mailbox.dead_letters.return_value = [
+                {'recipient': 'a', 'n': 2}, {'recipient': 'b', 'n': 1}]
+            self.assertEqual(self.mod.dead_letters(db, 'h'),
+                             [{'destinataire': 'a', 'n': 2}])
 
     def test_choose_explicit_target_must_exist(self):
         with self.assertRaises(SystemExit):

@@ -66,10 +66,15 @@ def stuck(db, rows: list[dict], souffrance: float, now: float) -> list[dict]:
     return out
 
 
-def dead_letters(db, rows: list[dict]) -> list[dict]:
-    """Dead mailboxes among this host's personas (stopped or unknown: none
-    here, they are filtered by name)."""
-    noms = {r["name"] for r in rows}
+def toutes_personas(db, hote: str) -> list[dict]:
+    """Toutes les personas placees sur ``hote``, meme arretees : une boite
+    morte d'une persona arretee doit apparaitre (avis R1 N1)."""
+    return [r for r in registry.overview(db) if r.get("host") == hote]
+
+
+def dead_letters(db, hote: str) -> list[dict]:
+    """Dead mailboxes among this host's personas, stopped ones included."""
+    noms = {r["name"] for r in toutes_personas(db, hote)}
     out = []
     for letter in storage.of(db).mailbox.dead_letters():
         if letter.get("recipient") in noms:
@@ -125,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
         now = time.time()
         rows = personas(conn, args.hote)
         souffrance = stuck(conn, rows, args.souffrance, now)
-        mortes = dead_letters(conn, rows)
+        mortes = dead_letters(conn, args.hote)
         cible, pourquoi = choose(rows, args.sonde, now)
         resultat = probe(conn, cible, args.sha, args.attente) if cible is not None else None
     finally:

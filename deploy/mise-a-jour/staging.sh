@@ -27,6 +27,11 @@
 # SOUFFRANCE_COURRIER (900 s), NOTIF_STAGING (mesh-design), ATTENTE_MAX
 # (vm.sh/poste.sh).
 #
+# --hotes limite la sequence a un sous-ensemble, dans l'ordre canonique. Le
+# poste ne peut pas y figurer sans les trois VM : le canon §14 exige des VM
+# saines avant toute modification du poste, et un sous-ensemble n'en apporte
+# aucune preuve.
+#
 # Etapes : verifier chaque hote (lecture seule) ; sauvegarder puis migrer REF
 # (additif seulement, base partagee) ; puis, hote par hote dans l'ordre
 # ci-dessus : installer, [poste] role, redemarrer, controler, sante (unites,
@@ -37,7 +42,8 @@
 # commit vise ne le reinstallle pas (le previous-sha reste le bon).
 #
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
-# precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl.
+# precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
+# `precedent` nomme la version que « retour » reinstalle reellement.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -146,6 +152,16 @@ if [ -n "$HOTES_FILTRE" ]; then
   HOTES=("${EFFECTIFS[@]}")
 fi
 [ ${#HOTES[@]} -gt 0 ] || { echo "--hotes : liste vide" >&2; exit 2; }
+# canon §14 : le poste ne se met a jour qu'apres des VM saines. Un
+# sous-ensemble qui l'inclut sans les trois VM n'apporte aucune preuve de
+# sante : refus (avis R1 B4).
+case " $HOTES_FILTRE " in
+  *" pc-smichea "*)
+    if [ ${#HOTES[@]} -ne ${#ORDRE[@]} ]; then
+      echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2
+      exit 2
+    fi ;;
+esac
 
 # VM sert aussi a poste.sh (migrations, sauvegarde) : la topologie et VM
 # doivent dire la meme chose.
@@ -224,10 +240,10 @@ sha_installe() {
     serveur) ssh_lire "${CIBLE[$nom]}" "git -C /opt/ameesh/src rev-parse HEAD" 2>/dev/null ;;
   esac || true
 }
-precedent_de() {  # previous-sha de l'hote avant toute installation
+precedent_retour() {  # commit que « retour » reinstalle reellement
   local nom=$1
   case "$(mode_de "$nom")" in
-    poste) readlink "$PARTAGE/src-current" 2>/dev/null | sed -n 's/^src-//p' ;;
+    poste) cat "$TRAVAIL/precedent" 2>/dev/null ;;
     agents) ssh_lire "${CIBLE[$nom]}" \
       "cat /home/ameesh/.local/share/ameesh/previous-sha" 2>/dev/null ;;
     serveur) ssh_lire "${CIBLE[$nom]}" "cat /opt/ameesh/precedent" 2>/dev/null ;;
@@ -321,19 +337,23 @@ if [ "$SAUVER" = 1 ]; then
 fi
 
 etape "migrations de $SHA_TRAVE (additives seulement, base partagee)"
-"$POSTE_SH" migrer "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
+"$POSTE_SH" migrer --additif-seulement "$SHA" || { echo "migrations en echec : aucune installation" >&2; exit 1; }
 trace poste migrations ok "migrations de $SHA_TRAVE passees avant toute installation"
 
 # --- sequence par hote ----------------------------------------------------
 for nom in "${HOTES[@]}"; do
-  PRECEDENT=$(precedent_de "$nom" || true)
   installe=$(sha_installe "$nom" || true)
   # le poste publie un nom court (src-<7>) ; les VM un SHA complet : comparer
   # le prefixe installe au prefixe correspondant de la cible.
   if [ -n "$installe" ] && [ "$installe" = "${SHA:0:${#installe}}" ]; then
+    # rien n'est reinstallé : « retour » rejouerait le previous-sha conserve,
+    # pas la version courante (avis R1 N2).
+    PRECEDENT=$(precedent_retour "$nom" || true)
     etape "$nom : deja au commit $SHA_TRAVE — installation ignoree (previous-sha preserve)"
     trace "$nom" installer ok "deja installe (${installe:0:9})"
   else
+    # l'installateur enregistre la version courante comme cible de retour.
+    PRECEDENT=$installe
     etape "$nom : installer $SHA_TRAVE"
     exec_hote "$nom" installer "$SHA" || echec_hote "$nom" installer "installation en echec"
     trace "$nom" installer ok "installe ${SHA_TRAVE} (precedent ${PRECEDENT:-inconnu})"

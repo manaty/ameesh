@@ -288,13 +288,16 @@ exiger_migrations_agents() {  # $1 : commit, $2 : ce qu'on s'apprête à faire
 # Garantit que le commit $1 est dans le dépôt de la VM, en envoyant au besoin
 # un paquet git depuis le poste (même mécanisme que le serveur).
 recevoir_agents() {
-  local sha=$1
+  local sha=$1 base
   utilisateur_agents git -C "$SRC_AGENTS" cat-file -e "$sha^{commit}" 2>/dev/null && return 0
   etape "la VM n'a pas ce commit : envoi d'un paquet git"
-  git -C "$DEPOT" update-ref refs/mise-a-jour/agents "$sha"
-  git -C "$DEPOT" bundle create -q "$TRAVAIL/ameesh-agents.bundle" refs/mise-a-jour/agents \
-    $(git -C "$DEPOT" for-each-ref --format='^%(objectname)' refs/remotes/origin/main)
-  git -C "$DEPOT" update-ref -d refs/mise-a-jour/agents
+  # exclusions calculees sur les objets presents sur la VM (jamais origin/main,
+  # dont la cible du staging est justement un ancetre : paquet vide, rc 128 ;
+  # avis R1 B3).
+  base=$(utilisateur_agents git -C "$SRC_AGENTS" rev-parse --verify HEAD 2>/dev/null || true)
+  "$ICI/paquet-git.sh" "$DEPOT" refs/mise-a-jour/agents "$sha" \
+    "$TRAVAIL/ameesh-agents.bundle" "$base" \
+    || { rm -f "$TRAVAIL/ameesh-agents.bundle"; return 1; }
   scp -q -o BatchMode=yes "$TRAVAIL/ameesh-agents.bundle" "$AGENTS_SSH:$BUNDLE_AGENTS" \
     || { rm -f "$TRAVAIL/ameesh-agents.bundle"; return 1; }
   utilisateur_agents git -C "$SRC_AGENTS" fetch -q "$BUNDLE_AGENTS" refs/mise-a-jour/agents \
@@ -388,17 +391,18 @@ verifier() {
 }
 
 installer() {
-  local ref=${1:-HEAD} sha
+  local ref=${1:-HEAD} sha base
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
   etape "commit visé : ${sha:0:9} ($ref)"
   ssh_vm "set -e; git -C $SRC rev-parse HEAD > $PRECEDENT; echo \"précédent : \$(cut -c1-9 $PRECEDENT)\"
     git -C $SRC fetch -q origin || echo 'origine injoignable : paquet du poste'"
   if ! ssh_vm "git -C $SRC cat-file -e '$sha^{commit}'" 2>/dev/null; then
     etape "le serveur n'a pas ce commit : envoi d'un paquet git"
-    git -C "$DEPOT" update-ref refs/mise-a-jour/vm "$sha"
-    git -C "$DEPOT" bundle create -q "$TRAVAIL/ameesh.bundle" refs/mise-a-jour/vm \
-      $(git -C "$DEPOT" for-each-ref --format='^%(objectname)' refs/remotes/origin/main)
-    git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm
+    # meme regle que pour les agents : exclusions depuis le destinataire.
+    base=$(ssh_vm "git -C $SRC rev-parse --verify HEAD" 2>/dev/null || true)
+    "$ICI/paquet-git.sh" "$DEPOT" refs/mise-a-jour/vm "$sha" \
+      "$TRAVAIL/ameesh.bundle" "$base" \
+      || { rm -f "$TRAVAIL/ameesh.bundle"; return 1; }
     scp -q -o BatchMode=yes "$TRAVAIL/ameesh.bundle" "root@$VM:/tmp/ameesh.bundle"
     ssh_vm "set -e; git -C $SRC fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm; rm -f /tmp/ameesh.bundle"
     rm -f "$TRAVAIL/ameesh.bundle"

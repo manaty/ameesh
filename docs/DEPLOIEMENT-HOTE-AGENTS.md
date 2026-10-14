@@ -72,7 +72,10 @@ migrations de REF (lues dans le dépôt du poste, comparées à
 `schema_migrations` sur la VM avec l’environnement du runner) : lancer
 d’abord `poste.sh migrer REF`, qui n’applique que des migrations additives
 avant l’installation. Le commit visé est déposé sur la VM en paquet git par
-SSH s’il y manque, puis extrait dans `src-<court>` et installé dans le venv
+SSH s’il y manque (`paquet-git.sh` : les exclusions se calculent sur les objets
+déjà présents chez le destinataire, jamais sur `origin/main`, dont la cible
+staging est justement un ancêtre), puis extrait dans `src-<court>` et installé
+dans le venv
 (`--no-deps` d’abord, dépendances ensuite) ; le commit courant est écrit dans
 `previous-sha` avant toute modification. `agents retour` réinstalle le commit
 de `previous-sha`, redémarre puis contrôle ; il refuse sans précédent
@@ -94,8 +97,10 @@ deploy/mise-a-jour/staging.sh <REF>       # commit, branche ou étiquette
 
 Déroulé : `verifier` en lecture seule sur les quatre hôtes ; `sauvegarder`
 puis `migrer` sur le poste (migrations **additives** seulement, la base est
-commune) ; puis, hôte par hôte, `installer`, `redemarrer`, `controler` et la
-santé. La santé d’un hôte est celle du canon §14 : unités redémarrées et baux
+commune ; `poste.sh migrer --additif-seulement REF` garde ce refus même quand
+le poste est déjà à la cible) ; puis, hôte par hôte, `installer`, `redemarrer`,
+`controler` et la santé. La santé d’un hôte est celle du canon §14 : unités
+redémarrées et baux
 repris (`controler`), `ameesh doctor --harness` vert pour le poste, et une
 sonde de courrier réelle remise à une persona menée de l’hôte
 (`deploy/mise-a-jour/sante-courrier.py`) — elle prouve la chaîne
@@ -117,8 +122,10 @@ Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
 `HOTES_STAGING` (BASCULE_ENV) déclare la topologie, une entrée par hôte, dans
 l’ordre canonique ; `SONDE_<HOTE>` (majuscules, `-` et `.` remplacés par `_`)
 fixe la persona sondée, par défaut la première persona menée de l’hôte.
-Options : `--hotes "nom …"` (sous-ensemble, ordre canonique conservé, le
-poste reste en dernier), `--sans-sonde` (santé sans sonde de courrier),
+Options : `--hotes "nom …"` (sous-ensemble, ordre canonique conservé ; un
+sous-ensemble qui contient `pc-smichea` est refusé — le poste ne s’installe
+que dans la séquence complète des quatre hôtes, VM saines d’abord),
+`--sans-sonde` (santé sans sonde de courrier),
 `--sans-sauvegarde`. Le script exige que `VM` soit l’adresse de
 `manaty-mesh-1` ; `PERSONAS_VM` peut rester vide.
 
