@@ -3,6 +3,9 @@
 Task-oriented pages. Each one uses only commands that exist in the CLI; see the
 [CLI reference](../reference/cli.md) for every option.
 
+- [Install on a workstation](install.md): install ameesh as a tool with `uv`
+  from the Git repository or a clone, on Linux, macOS and Windows through
+  WSL2, and the platform state of v1.10.0.
 - [Write a canon](write-a-canon.md): declare humans, hosts, agents and
   placements, check and sync them; add a second canon on the same host.
 - [Run the demo](run-the-demo.md): the v1 scenario on the bench, step by step.
