@@ -65,7 +65,13 @@ default) and the plan is marked unsure. A file the map cannot judge (Python
 outside `src/ameesh`, a non-documentation file no test reads, a syntax
 error) uses the textual heuristic for that file and marks the plan unsure;
 test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
-`.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
+`.github/`, `pyproject.toml` beyond its version line) marks it unsure too,
+unless the target already changed it since the map and the branch does not
+change it itself (the merge base with the target to the head): the target's
+own full suite validated that change, and a late map must never send every
+lot branch back to the full suite (#1314). The branch's own change to the
+foundation still marks the plan unsure, and the version-only exemption of
+`pyproject.toml` (L157) is judged on that own range.
 A file removed outside documentation marks it unsure as well: the map knows
 the readers it measured, never the ones it cannot see (an import by a
 computed name, a config read by the code).
@@ -198,6 +204,31 @@ def is_ancestor(commit: str, head: str = "HEAD", repo: pathlib.Path = REPO) -> b
     except (OSError, subprocess.CalledProcessError):
         return False
     return True
+
+
+def is_merge_commit(head: str = "HEAD", repo: pathlib.Path = REPO) -> bool:
+    """True when `head` is a merge commit: two parents or more."""
+    try:
+        parents = _git(repo, "rev-list", "--parents", "-n", "1", head).split()
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return len(parents) > 2
+
+
+def own_changes(base: str, head: str = "HEAD",
+                repo: pathlib.Path = REPO) -> set[str] | None:
+    """Paths this branch changes itself: the base it merges (its target's tip,
+    `HEAD^1` of the merge commit GitHub tested) to its head.
+
+    `HEAD^1` is that base only on a pull request's merge commit; on a plain
+    commit it is the branch's previous commit, and its diff would not cover the
+    whole branch: the range is then refused, and the caller keeps its
+    conservative doubt. None as well when the diff cannot be read.
+    """
+    if base == "HEAD^1" and not is_merge_commit(head, repo):
+        return None
+    changes = changed_files(base, head, repo)
+    return None if changes is None else {path for _, path in changes}
 
 
 def show(path: str, rev: str = "HEAD", repo: pathlib.Path = REPO) -> str | None:
@@ -418,8 +449,20 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
 
 
 def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
-          head: str = "HEAD", repo: pathlib.Path = REPO) -> Impact:
-    """The impact of `changes` (since the map commit) on the test modules."""
+          head: str = "HEAD", repo: pathlib.Path = REPO,
+          own: set[str] | None = None, own_base: str | None = None) -> Impact:
+    """The impact of `changes` (since the map commit) on the test modules.
+
+    `own` is the set of paths the branch itself changes — `own_base` (the base
+    it merges, `HEAD^1` of a pull request's merge commit) to `head` — and
+    `None` when that range cannot be read or is not trustworthy. A file of the
+    CI foundation (`is_foundation`) that the target already changed since the
+    map commit, and that this branch does not change, raises no doubt: the
+    target's own full suite validated it, and a late map must not send every
+    lot branch back to the full suite (#1314). The version-only exemption of
+    `pyproject.toml` (L157) is judged on that same own range, so a target
+    change to the file no longer breaks it.
+    """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
     for m in modules:
@@ -447,7 +490,15 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
                                     f"{where})")
             continue
         if is_foundation(path):
-            if path == "pyproject.toml" and _version_line_only(head, card["commit"], repo):
+            # #1314 : un fichier du socle déjà changé par la cible depuis la
+            # carte ne compte que s'il diffère entre la base de fusion et la
+            # tête du lot ; sinon une carte en retard ferait retomber toute
+            # branche de lot sur la suite complète.
+            if own is not None and path not in own:
+                impact.hit(card.get("donnees", {}).get(path, ()), path)
+                continue
+            version_base = own_base if own is not None else card["commit"]
+            if path == "pyproject.toml" and _version_line_only(head, version_base, repo):
                 impact.hit(card.get("donnees", {}).get(path, ()), path)
                 continue
             impact.foundation.append(path)
@@ -543,7 +594,7 @@ def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
 
 def classify(modules: list[str], card: dict | None, now: datetime.datetime,
              base_fallback: str = "HEAD^1", head: str = "HEAD",
-             repo: pathlib.Path = REPO) -> dict:
+             repo: pathlib.Path = REPO, *, docs_only: bool = False) -> dict:
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
@@ -557,13 +608,43 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                       "used": not problem, "problem": problem}
     impact = None
     if not problem:
-        changes = changed_files(card["commit"], head, repo)
+        # A documentation-only range has already been checked by nature().
+        # CI changes on its base do not belong to that range; use the map to
+        # find readers of its documents, not to rejudge the base's code.
+        diff_base = base_fallback if docs_only else card["commit"]
+        changes = changed_files(diff_base, head, repo)
         if changes is None:
-            problem = f"diff from map commit {card['commit'][:12]} unreadable"
+            kind = "documentation base" if docs_only else "map commit"
+            problem = f"diff from {kind} {diff_base[:12]} unreadable"
             out["map"]["used"], out["map"]["problem"] = False, problem
         else:
+            # #1314 : le range propre de la branche (base de fusion → tête)
+            # distingue ses changements de ceux déjà portés par la cible. Pour
+            # la voie documentation, `changes` est déjà ce range ; s'il est
+            # illisible ou non fiable (HEAD^1 hors commit de fusion), le doute
+            # du socle est conservé (repli sûr).
+            own_paths = ({path for _, path in changes} if docs_only
+                         else own_changes(base_fallback, head, repo))
             try:
-                impact = judge(card, changes, modules, head, repo)
+                impact = judge(card, changes, modules, head, repo, own=own_paths,
+                               own_base=base_fallback)
+                if docs_only:
+                    inherited = changed_files(card["commit"], base_fallback, repo)
+                    if inherited is None:
+                        raise ValueError("documentation base diff unreadable")
+                    baseline = judge(card, inherited, modules, base_fallback, repo)
+                    # Keep readers that changed on the base: the old map may
+                    # not yet record their new documentation dependencies.
+                    impact.p0.update(baseline.p0)
+                    for module, reason in baseline.p1.items():
+                        impact.p1.setdefault(module, reason)
+                    infrastructure = {f"test infrastructure changed: {path}"
+                                      for path in baseline.foundation}
+                    for reason in baseline.unsure:
+                        if reason not in infrastructure:
+                            impact.doubt(reason)
+                    if baseline.unknown_blocks or baseline.untested:
+                        impact.doubt("documentation base contains unmeasured code")
             except Exception as exc:  # any doubt: fallback, never a failed plan
                 problem = f"map unusable ({type(exc).__name__}: {exc})"
                 out["map"]["used"], out["map"]["problem"] = False, problem
@@ -778,20 +859,23 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
             "tested": _rev(head, repo), "release": release,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
-    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo))
+    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
+                         docs_only=bool(plan["docs_only"] and not release)))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     #: #749 : modules « always » declenches par le diff (contrat de base, baux
     #: et orphelins), a rejoindre au pilote psql sur une PR.
     always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
     if plan["docs_only"] and not release:
-        # the fast lane needs a map that judged everything: a missing, stale or
-        # unusable map, or an unsure selection, runs the full suite
+        # The fast lane needs a usable map and a sure judgement of the actual
+        # documentation range. Missing readers or a bad map keep the full suite.
         full = None
         if not (plan["map"] and plan["map"]["used"]):
-            full = f"documentation, map not usable ({plan['unsure'][0]}): full suite"
+            reason = next(iter(plan["unsure"]), "map unusable")
+            full = f"documentation, map not usable ({reason}): full suite"
         elif not plan["sure"]:
-            full = f"documentation, selection unsure ({plan['unsure'][0]}): full suite"
+            reason = next(iter(plan["unsure"]), "selection unsure")
+            full = f"documentation, selection unsure ({reason}): full suite"
         else:
             plan["doc_readers"], db_readers = doc_readers(plan["classes"], card, modules)
             if db_readers:  # doc-readers has no Postgres: the full parts run them

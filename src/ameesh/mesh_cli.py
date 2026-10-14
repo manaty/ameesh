@@ -1345,7 +1345,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
-                note=introduced)
+                note=introduced, parent_lot=args.parent_lot)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -2335,6 +2335,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--budget", type=float, default=None)
     pw_add.add_argument("--actor", default="")
     pw_add.add_argument("--package", default=None, help="WorkPackage card of the work item (L29)")
+    pw_add.add_argument("--parent-lot", type=int, default=None, metavar="LOT",
+                        help="#1193: parent of a suite lot: its blocking prerequisite, linked "
+                             "with the creation (unknown parent refused)")
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")
