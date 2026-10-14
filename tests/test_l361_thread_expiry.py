@@ -416,7 +416,11 @@ class MediatedHostTest(TransportTest):
         self.assertEqual([c[0] for c in db.storage.threads.mock_calls], ["recount"])
         logged.assert_called_once()
         self.assertIn("1 entr", logged.call_args.args[0])
-        self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600))
+        # r8/l361b: le throttle quotidien se compte sur l'horloge monotone ; sans
+        # `clock` explicite le temoin dependait de la duree de vie de la machine
+        # (monotonic > 86400 s -> la deuxieme passe n'etait plus retenue).
+        self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600,
+                                                            clock=3600.0))
 
     def test_runner_says_the_missing_index_once_per_pass(self):
         cfg = self.mediated_cfg()
