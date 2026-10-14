@@ -13,6 +13,7 @@ import time
 from unittest import mock
 
 from ameesh import backlog, handoff, notify, progress, registry, storage, work, wip
+from ameesh.db import DbError
 from ameesh.storage import interface
 
 from .support import PgTestCase
@@ -293,6 +294,127 @@ class RestitutionTest(_Base):
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["assignee"], item["branch"], item["state"]),
                          ("dev2", "lot/rendu", "build"))
+
+
+class CourseSurLeCompteTest(_Base):
+    """cx1 R2 (#1053) : le recensement des lots d'un agent verrouille TOUTES
+    ses lignes `build` (id croissant : ordre stable) AVANT de lire les
+    exceptions. Sans cela, une réattribution d'un AUTRE lot compté pendant le
+    compte écrit une note d'attribution sans marqueur : son exception s'efface
+    sous la lecture, le lot est compté « libre » et le balayage rend un lot qui
+    n'est plus du surplus."""
+
+    #: le verrou du compte tient jusqu'à son COMMIT : le geste concurrent est
+    #: TOUJOURS bloqué, ce délai ne fait qu'écourter l'attente du témoin
+    LOCK_TIMEOUT = "300ms"
+
+    def _compte_sous_geste(self, candidat, cible, geste):
+        """Le compte de surplus de `candidat`, avec `geste(tx)` exécuté depuis
+        une AUTRE session au premier appel de `_wip_exception_locked` pour
+        `cible` — donc après la lecture du recensement, avant celle de son
+        exception. Le geste part dans sa propre transaction avec un
+        `lock_timeout` court : il aboutit si la ligne n'est pas verrouillée,
+        sinon il est bloqué (SQLSTATE 55P03). Rend `(rendu, out, autre)` ;
+        `out` porte `tente`, `bloque` et l'erreur, `autre` reste ouverte pour
+        rejouer le geste après le compte (fermeture automatique en fin de
+        test)."""
+        st = storage.of(self.db)
+        real = type(st.work)._wip_exception_locked
+        autre = self.connect()
+        self.addCleanup(autre.close)
+        out: dict = {"tente": False, "bloque": None, "erreur": None}
+
+        def hook(self_, item_id, marker, prefixes):
+            if not out["tente"] and int(item_id) == int(cible):
+                out["tente"] = True
+                try:
+                    with autre.transaction() as tx:
+                        tx.execute("SET LOCAL lock_timeout = '%s'" % self.LOCK_TIMEOUT)
+                        geste(tx)
+                    out["bloque"] = False
+                except Exception as exc:      # la ligne est tenue par le compte
+                    out["bloque"] = True
+                    out["erreur"] = exc
+            return real(self_, item_id, marker, prefixes)
+
+        with mock.patch.object(type(st.work), "_wip_exception_locked", hook):
+            rendu = self.surplus(candidat)
+        return rendu, out, autre
+
+    def assertGesteBloque(self, out):
+        """Le geste a été bloqué par le verrou du compte, jamais par autre
+        chose : le code SQLSTATE tranche (55P03, lock_not_available)."""
+        self.assertTrue(out["tente"], "le geste n'a pas été déclenché")
+        self.assertIsInstance(out["erreur"], DbError, out["erreur"])
+        self.assertEqual(out["erreur"].sqlstate, "55P03", str(out["erreur"]))
+        self.assertTrue(out["bloque"])
+
+    def test_la_reaffectation_d_un_autre_lot_excepte_ne_rend_pas_le_candidat(self):
+        """Le témoin de cx1 : A/B/C chez dev1, B excepté (A et C libres = 2,
+        aucun surplus). B est réattribué à dev2 pendant le compte de A : sans
+        le verrou de B, sa note sans marqueur efface son exception, le compte
+        voit 3 lots libres et rend A — que dev1 n'aurait plus eu à rendre."""
+        self.agent("dev1")
+        self.agent("dev2")
+        lots = [self.build(self.lot("occupé %d" % i, assignee="dev1"))
+                for i in range(3)]
+        a, b = lots[0], lots[1]
+        work.assign(self.db, b["id"], "dev1", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        rendu, out, autre = self._compte_sous_geste(
+            a["id"], b["id"],
+            lambda tx: work.assign(tx, b["id"], "dev2", actor="human:proprio",
+                                   cfg=self.cfg))
+        self.assertGesteBloque(out)
+        # B garde son exception pendant le compte : A n'est pas du surplus
+        self.assertIsNone(rendu)
+        self.assertEqual(work.get(self.db, a["id"])["assignee"], "dev1")
+        # le compte fini, la réattribution passe : dev1 garde A et C (2, plafond)
+        work.assign(autre, b["id"], "dev2", actor="human:proprio", cfg=self.cfg)
+        self.assertEqual(work.get(self.db, b["id"])["assignee"], "dev2")
+        self.assertEqual(self.builds_of("dev1"), 2)
+
+    def test_la_mise_en_qa_d_un_autre_lot_est_serialisee_par_le_compte(self):
+        """A/B/C chez dev1, tous libres : le passage en `qa` de B attend la fin
+        du compte. Le compte voit donc encore B en `build` (3 libres) et A,
+        moins récemment actif, est bien du surplus."""
+        self.agent("dev1")
+        lots = [self.build(self.lot("occupé %d" % i, assignee="dev1"))
+                for i in range(3)]
+        a, b = lots[0], lots[1]
+        rendu, out, _ = self._compte_sous_geste(
+            a["id"], b["id"],
+            lambda tx: work.move(tx, b["id"], "qa", note="en revue", actor="dev1"))
+        self.assertGesteBloque(out)
+        self.assertIsNotNone(rendu)
+        self.assertEqual(rendu["id"], a["id"])
+        # après le compte, le geste passe : B en revue ne compte plus
+        work.move(self.db, b["id"], "qa", note="en revue", actor="dev1")
+        self.assertEqual(work.get(self.db, b["id"])["state"], "qa")
+        self.assertEqual(self.builds_of("dev1"), 1)
+
+    def test_une_exception_posee_sur_un_autre_lot_attend_la_fin_du_compte(self):
+        """A/B/C chez dev1, tous libres. Le pilote pose une exception sur C
+        pendant le compte de A : le geste attend, le compte voit C encore
+        libre (3 libres, A est du surplus) ; l'exception s'applique ensuite."""
+        self.agent("dev1")
+        lots = [self.build(self.lot("occupé %d" % i, assignee="dev1"))
+                for i in range(3)]
+        a, c = lots[0], lots[2]
+        rendu, out, _ = self._compte_sous_geste(
+            a["id"], c["id"],
+            lambda tx: work.assign(tx, c["id"], "dev1", actor="human:proprio",
+                                   cfg=self.cfg, wip_exception="reprise urgente"))
+        self.assertGesteBloque(out)
+        self.assertIsNotNone(rendu)
+        self.assertEqual(rendu["id"], a["id"])
+        # le compte fini, l'exception passe : C protégé, dev1 garde B et C
+        work.assign(self.db, c["id"], "dev1", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        st = storage.of(self.db).work
+        self.assertEqual(st.wip_exceptions([c["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [c["id"]])
+        self.assertEqual(self.builds_of("dev1"), 2)
 
 
 class BrancheSeuleTest(_Base):

@@ -447,35 +447,33 @@ class WorkItems(interface.WorkItems):
         """§4 : restitution du SURPLUS d'un agent, sous les gardes
         transactionnelles. Le verrou consultatif de l'agent est pris AVANT
         toute relecture (les prises `assign_capped` et les autres balayages du
-        même agent attendent), puis la ligne du lot est verrouillée
-        (`FOR NO KEY UPDATE` : toute attribution — assign, délégation, prise,
-        reprise — passe par un UPDATE de cette ligne) et relue : le lot doit
-        être encore en `build`, encore assigné à `current`, sans exception
-        pilote (`marker` dans la note de sa dernière attribution, `prefixes`).
-        Les lots en `build` de l'agent SANS exception sont recensés sous ce
-        verrou ; il en faut plus de `max_build` pour rendre celui-ci. None
-        sinon (rien n'est écrit) : deux balayages concurrents ne rendent jamais
-        plus que le surplus, et un lot passé en `qa`, repris ou doté d'une
-        exception entre la lecture et l'écriture n'est pas rendu."""
+        même agent attendent), puis TOUTES les lignes `build` de l'agent sont
+        verrouillées (`FOR NO KEY UPDATE`, id croissant : ordre stable) AVANT
+        de lire la moindre exception. Le candidat doit faire partie de ces
+        lignes : encore en `build`, encore assigné à `current`. Les exceptions
+        pilote (`marker` dans la note de la dernière attribution, `prefixes`)
+        sont alors lues sur un ensemble immobile : toute attribution — assign,
+        délégation, prise, reprise, pose d'exception — passe par un UPDATE de
+        la ligne du lot et attend donc la fin du compte. Il faut plus de
+        `max_build` lots sans exception pour rendre celui-ci. None sinon (rien
+        n'est écrit) : deux balayages concurrents ne rendent jamais plus que le
+        surplus, et la réattribution d'un AUTRE lot compté ne peut pas effacer
+        son exception sous la lecture (elle rendrait un lot qui n'est plus du
+        surplus)."""
         agent = str(current)
         with self.db.transaction() as tx:
             work = WorkItems(tx)
             tx.query(_WIP_LOCK, (_WIP_LOCK_PREFIX + agent,))
-            rows = tx.query(
-                "SELECT id, state, assignee FROM work_items WHERE id = %s"
-                " FOR NO KEY UPDATE", (int(item_id),))
-            if not rows:
-                return None
-            row = rows[0]
-            if row["state"] != "build" or (row.get("assignee") or "") != agent:
+            builds = tx.query(
+                "SELECT id FROM work_items WHERE assignee = %s AND state = 'build'"
+                " ORDER BY id FOR NO KEY UPDATE", (agent,))
+            ids = [int(r["id"]) for r in builds]
+            if int(item_id) not in ids:
                 return None
             if work._wip_exception_locked(int(item_id), marker, prefixes):
                 return None
-            builds = tx.query(
-                "SELECT id FROM work_items WHERE assignee = %s AND state = 'build'"
-                " ORDER BY id", (agent,))
-            free = [int(r["id"]) for r in builds
-                    if not work._wip_exception_locked(int(r["id"]), marker, prefixes)]
+            free = [i for i in ids
+                    if not work._wip_exception_locked(i, marker, prefixes)]
             if len(free) <= int(max_build):
                 return None
             return work._unassign_locked(item_id, agent, note, actor)

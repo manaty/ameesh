@@ -1334,16 +1334,20 @@ class WorkItems(Domain):
                          actor: str) -> dict | None:
         """§4 : restitution du SURPLUS d'un agent, sous les gardes
         transactionnelles — le verrou consultatif de l'agent (`assign_capped`)
-        est pris AVANT toute relecture, la ligne du lot est verrouillée
-        (`FOR NO KEY UPDATE`) puis relue : le lot doit être encore en `build`,
-        encore assigné à `current`, sans exception pilote (`marker` dans la note
-        de sa dernière attribution, `prefixes`) ; l'agent doit encore dépasser
-        `max_build` lots en `build` SANS exception, recensés sous le verrou.
-        None sinon, rien n'est écrit : deux balayages concurrents ne peuvent
-        donc pas rendre plus que le surplus, et un lot passé en `qa`, repris ou
-        doté d'une exception entre la lecture et l'écriture n'est pas rendu.
-        Journal et annulation de la délégation en cours dans la même
-        transaction (comme `unassign`)."""
+        est pris AVANT toute relecture, puis TOUTES les lignes `build` de
+        l'agent sont verrouillées (`FOR NO KEY UPDATE`, id croissant : ordre
+        stable) AVANT de lire la moindre exception. Le candidat doit faire
+        partie de ces lignes : encore en `build`, encore assigné à `current`,
+        sans exception pilote (`marker` dans la note de sa dernière
+        attribution, `prefixes`) ; l'agent doit encore dépasser `max_build`
+        lots en `build` SANS exception, recensés sous ces verrous. None sinon,
+        rien n'est écrit : deux balayages concurrents ne peuvent donc pas
+        rendre plus que le surplus, aucun geste sur un AUTRE lot compté
+        (réattribution ou exception, qui passent par un UPDATE de sa ligne) ne
+        peut se glisser dans le compte, et un lot passé en `qa`, repris ou doté
+        d'une exception avant la lecture n'est pas rendu. Journal et annulation
+        de la délégation en cours dans la même transaction (comme
+        `unassign`)."""
 
     @abc.abstractmethod
     def wip_exceptions(self, item_ids: Sequence[int], marker: str,
