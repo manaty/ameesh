@@ -269,11 +269,15 @@ class IdentiteTest(unittest.TestCase):
         self.assertFalse(account_turn.is_critical(types.SimpleNamespace(name="x", agent={})))
 
     def test_configuration(self):
-        cfg = config.load({"AMEESH_CONFIG": "/nonexistent", "AMEESH_CRITICAL_AGENTS":
-                           "orchestrateur, mesh-design"})
-        self.assertEqual(cfg.critical_agents, ("orchestrateur", "mesh-design"))
         import json
         import tempfile
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as vide:
+            vide.write("{}\n")
+        self.addCleanup(os.unlink, vide.name)
+        cfg = config.load({"AMEESH_CONFIG": vide.name, "AMEESH_CRITICAL_AGENTS":
+                           "orchestrateur, mesh-design"})
+        self.assertEqual(cfg.critical_agents, ("orchestrateur", "mesh-design"))
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
             json.dump({"critical_agents": ["auditeur", "mesh-design"]}, fh)
         self.addCleanup(os.unlink, fh.name)
