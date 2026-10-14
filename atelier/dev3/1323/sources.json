@@ -1,0 +1,186 @@
+{
+  "lot": 1323,
+  "head": "e111e0dbbd73d36f172a90d08e634ae49be32627",
+  "pr": 1013,
+  "branche": "lot/1323-staging-signal-actif",
+  "classe": "prod (deploy/mise-a-jour/**, docs d'exploitation : §8/§2 : deux avis de familles différentes, chacune autre que l'auteur)",
+  "main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "measured_at": "2026-10-14T21:04:12Z",
+  "union_tree": "de077519ba5d3d3672c1f4179f11376b6078d9da",
+  "union_ref": "refs/atelier/1323/union-main-2458ec05",
+  "pieces_ref": "refs/atelier/1323/pieces-main-2458ec05",
+  "fichiers": [
+    {
+      "path": "deploy/mise-a-jour/actif.py",
+      "head": "cb142561bb787f38c0727b416771ca06b45984b7",
+      "union": "cb142561bb787f38c0727b416771ca06b45984b7",
+      "main_eq_base": false,
+      "patchid": "aeab64f968c629c34f46f53a42beb354f066f2f5",
+      "patchid_union": "aeab64f968c629c34f46f53a42beb354f066f2f5",
+      "constant": true
+    },
+    {
+      "path": "deploy/mise-a-jour/paquet-git.sh",
+      "head": "f2a6d62465fa978c74948525077995e0d8147d83",
+      "union": "f2a6d62465fa978c74948525077995e0d8147d83",
+      "main_eq_base": false,
+      "patchid": "7f76704017f90fd065573c010c95518946b93b9f",
+      "patchid_union": "7f76704017f90fd065573c010c95518946b93b9f",
+      "constant": true
+    },
+    {
+      "path": "deploy/mise-a-jour/poste.sh",
+      "head": "b741bb4f047011c4a9c536cc83a49c879f86392e",
+      "union": "b741bb4f047011c4a9c536cc83a49c879f86392e",
+      "main_eq_base": true,
+      "patchid": "a1a4f53b8d6e37f156ac993282906dde7815fdd4",
+      "patchid_union": "a1a4f53b8d6e37f156ac993282906dde7815fdd4",
+      "constant": true
+    },
+    {
+      "path": "deploy/mise-a-jour/sante-courrier.py",
+      "head": "afa1941fc83183988b1b6020c6bea1a2114e2e23",
+      "union": "afa1941fc83183988b1b6020c6bea1a2114e2e23",
+      "main_eq_base": false,
+      "patchid": "d314a90c558cdc0aef522566faad6d345be757b6",
+      "patchid_union": "d314a90c558cdc0aef522566faad6d345be757b6",
+      "constant": true
+    },
+    {
+      "path": "deploy/mise-a-jour/staging.sh",
+      "head": "53fccedfef68af2581cf6db0017644d3ec0549c1",
+      "union": "53fccedfef68af2581cf6db0017644d3ec0549c1",
+      "main_eq_base": false,
+      "patchid": "326794bc42ea543ce6824e5b352515ea2878b34d",
+      "patchid_union": "326794bc42ea543ce6824e5b352515ea2878b34d",
+      "constant": true
+    },
+    {
+      "path": "deploy/mise-a-jour/vm.sh",
+      "head": "fd742feb70f9ac3d6d01abc5041080a5b1cf1800",
+      "union": "fd742feb70f9ac3d6d01abc5041080a5b1cf1800",
+      "main_eq_base": true,
+      "patchid": "f897725e5beb5f45d11d930b5f5cccb5bfeff894",
+      "patchid_union": "f897725e5beb5f45d11d930b5f5cccb5bfeff894",
+      "constant": true
+    },
+    {
+      "path": "docs/DEPLOIEMENT-HOTE-AGENTS.md",
+      "head": "a6795254a4c01da90e2eaf3107d99b3f138a67dc",
+      "union": "a6795254a4c01da90e2eaf3107d99b3f138a67dc",
+      "main_eq_base": true,
+      "patchid": "833142b7c6da817160dcc43463bf627f611dcaf5",
+      "patchid_union": "833142b7c6da817160dcc43463bf627f611dcaf5",
+      "constant": true
+    },
+    {
+      "path": "tests/test_1155_staging.py",
+      "head": "9482540a6dabc21b8bca942a80acdea237c39dd7",
+      "union": "9482540a6dabc21b8bca942a80acdea237c39dd7",
+      "main_eq_base": false,
+      "patchid": "26d9e2e95fd963c396cdf54cffe0447b6d1322b9",
+      "patchid_union": "26d9e2e95fd963c396cdf54cffe0447b6d1322b9",
+      "constant": true
+    },
+    {
+      "path": "tests/test_1323_actif.py",
+      "head": "7aa958c255ad7d75a11f2481d87c953cae29f6b9",
+      "union": "7aa958c255ad7d75a11f2481d87c953cae29f6b9",
+      "main_eq_base": false,
+      "patchid": "8dfc5915b90db66b20da3b6f81797d0238513b9d",
+      "patchid_union": "8dfc5915b90db66b20da3b6f81797d0238513b9d",
+      "constant": true
+    },
+    {
+      "path": "tests/test_503_agent_host.py",
+      "head": "693912eeaae89adc13e12bd88fe81bf82a769fe4",
+      "union": "693912eeaae89adc13e12bd88fe81bf82a769fe4",
+      "main_eq_base": true,
+      "patchid": "dc0c28ff0481f619d80558685cf1d9edb33a820d",
+      "patchid_union": "dc0c28ff0481f619d80558685cf1d9edb33a820d",
+      "constant": true
+    }
+  ],
+  "sources": [
+    {
+      "kind": "lot-event",
+      "ref": "work:1323#event:18051",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T16:54:05.985574+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "R1 delta Codex cx1 14/10 : GO 0B/1N(P3) sur e111e0dbbd73d36f172a90d08e634ae49be32627, tête forge revérifiée identique, base1155 inchangée. Rapport https://github.com/manaty/ameesh/pull/1013#issuecomment-6173626059 . B3 levé : sonde indépendante envoi réussi + échec sauvegarde +600 courriers intercalés => recherche500/1000, réconciliation, un seul envoi ; plafond20000 => rc5/marque inchangée/aucun renvoi ; historique injoignable => rc4/marque inchangée/aucun renvoi ; absence exhaustive => une reprise. B1/B2/N1 levés sur a08 conservés. N/P3 nouveau : doc annonce rc5 pour base injoignable mais code retourne4/libellé non émis, harmonisation en suite nonbloquante demandée auteur. Aucun rejeu suite auteur ni base/courrier/hôte réel. R2Claude réelle sur tête corrigée,1155, composition/CI applicab"
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1323#event:17992",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T16:42:50.293886+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "R1 delta Codex sur tête forge exacte a08ac44471a51a108254ef2aaeaa7f19ad045787 : NO GO, B3/P2 idempotence subsiste. Rapport https://github.com/manaty/ameesh/pull/1013#issuecomment-6173409780 . B1/B2/N1 levés sur les cas signalés. Témoin indépendant : envoi puis échec sauvegarde finale rc4, marque emissions durable/notifies vide ; 500 courriers ultérieurs masquent le dépôt dans mail.history(limit=500), relance rc0 et deuxième envoi même clé. deja_emis réel exercé ; aucun courrier/base/hôte réel, aucune suite auteur rejouée. Préserver émission ambiguë et aucun renvoi si absence non prouvée, ou recherche durable exacte/unicité. R2 Claude/#1155/CI composition/feu pilote restent dus."
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1323#event:17854",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T16:26:51.974428+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 mesh-design, portes routées après source auteur37789 + rectificatif18:21 : candidatPR1013/b75091a1e1c6a38c2893c0f181b3b40c3b1285d8, base1155. R1Codexcx1 déjàdemandée auteur, R2Claude native inscrite1098 aprèsR1 recevable, deuxavis horsfamilleDeepSeek auteur surdelta completdeploy. Dépendance1155 vérifiée. Compositionmain après1155 puisCIapplicable/feunominatif/activation au prochain déploiementautorisé et vérificationdocs01 restentdistincts ; aucunefusionni gestehôte autorisés par ce routage. Relaisbureau transitoire journal+attestation pour917/988, paspolling."
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1323#event:17831",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T16:25:18.844726+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "R1 indépendante Codex cx1 sur tête exacte b75091a1e1c6a38c2893c0f181b3b40c3b1285d8 (base1155, auteurDeepSeek), forge revérifiée : NO GO 3B/1N. Rapport https://github.com/manaty/ameesh/pull/1013#issuecomment-6173070053 . B1/P1 actif.py165 aide argparse %Y non échappée : Python3.14.7 lève ValueError dès add_argument, outil inutilisable. B2/P1 actif.py96–116 + staging.sh311–317/430 : verdicts ok sans valider preuve sonde réelle ni SHA journal ; producteur sante-courrier retourne0/sans-sonde si SONDE_HOTE=jamais ou auto sans persona ; trois sondes indépendantes (nonpassee/detailabsent/journalSHAétranger) chacune rc0+attestation+courrier simulé. B3/P2 bloquant sensible ameesh : envoi avant sauvegarde notifies, erreur écriture puis relance =2courriers simulés mêmeSHA/rapporteur. N1/P3 tmp créé06"
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41394",
+      "actor": "ameesh-dev3",
+      "famille": "DeepSeek (auteur)",
+      "at": "2026-10-14T20:53:44+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Candidature pieces §12 pour les 5 lots qa, mesures sur main 2458ec05."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41489",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T20:57:59+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Disposition : #1219/#1277 candidatures légères reçues pour la préparation APRÈS les gels #1342/#1204, aucun ajout à ces paquets ; unions et CI#1277 conservées à portée, fraîcheur/composition à requalifier au prochain manifeste ; #1247 et #1323 gardent R2 Claude / dépendance #1155 ; réserve Claude #1176 à qualifier au manifeste ; pièces atelier et sources à fournir au préparateur ultérieur, sans nouvelle CI ni changement de tête."
+    },
+    {
+      "kind": "forge",
+      "ref": "pr:1323",
+      "actor": null,
+      "famille": null,
+      "at": null,
+      "sha": "e111e0dbbd73d36f172a90d08e634ae49be32627",
+      "verdict": "qa",
+      "texte": "PR #1013 OPEN mergeStateStatus=CLEAN tête=e111e0dbbd73 (lecture gh unique au 2026-10-14T21:04:12Z)"
+    },
+    {
+      "kind": "ci",
+      "ref": "ci:38601398209",
+      "actor": null,
+      "famille": null,
+      "at": "2026-10-14T17:25:22Z",
+      "sha": "e111e0dbbd73",
+      "verdict": "success",
+      "texte": "run 38601398209 pull_request completed/success tête e111e0dbbd73 (lecture gh unique)"
+    }
+  ]
+}

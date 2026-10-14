@@ -1,0 +1,30 @@
+MAIN 2458ec053123d3f33644fef1e092fc84cc2773d9
+LOT #1323 branche lot/1323-staging-signal-actif
+HEAD e111e0dbbd73d36f172a90d08e634ae49be32627
+BASE c4fa14a23b07bd4fe07a9d162049774f3e90cb24
+merge-tree rc=0
+de077519ba5d3d3672c1f4179f11376b6078d9da
+
+  deploy/mise-a-jour/actif.py                                head=cb142561bb union=cb142561bb main==base:NON patchid_const=YES
+  deploy/mise-a-jour/paquet-git.sh                           head=f2a6d62465 union=f2a6d62465 main==base:NON patchid_const=YES
+  deploy/mise-a-jour/poste.sh                                head=b741bb4f04 union=b741bb4f04 main==base:oui patchid_const=YES
+  deploy/mise-a-jour/sante-courrier.py                       head=afa1941fc8 union=afa1941fc8 main==base:NON patchid_const=YES
+  deploy/mise-a-jour/staging.sh                              head=53fccedfef union=53fccedfef main==base:NON patchid_const=YES
+  deploy/mise-a-jour/vm.sh                                   head=fd742feb70 union=fd742feb70 main==base:oui patchid_const=YES
+  docs/DEPLOIEMENT-HOTE-AGENTS.md                            head=a6795254a4 union=a6795254a4 main==base:oui patchid_const=YES
+  tests/test_1155_staging.py                                 head=9482540a6d union=9482540a6d main==base:NON patchid_const=YES
+  tests/test_1323_actif.py                                   head=7aa958c255 union=7aa958c255 main==base:NON patchid_const=YES
+  tests/test_503_agent_host.py                               head=693912eeaa union=693912eeaa main==base:oui patchid_const=YES
+fichiers=10 migrations=0
+
+DELTA PROPRE de #1323 vs sa base de PR 092e0647ee1346bac65b35eeb30566991ae7f3f2 (lot/1155, NON fusionnee) :
+  deploy/mise-a-jour/actif.py                                head=cb142561bb union=cb142561bb union==head:oui
+  deploy/mise-a-jour/sante-courrier.py                       head=afa1941fc8 union=afa1941fc8 union==head:oui
+  deploy/mise-a-jour/staging.sh                              head=53fccedfef union=53fccedfef union==head:oui
+  docs/DEPLOIEMENT-HOTE-AGENTS.md                            head=a6795254a4 union=a6795254a4 union==head:oui
+  tests/test_1323_actif.py                                   head=7aa958c255 union=7aa958c255 union==head:oui
+  fichiers propres=5 ; l'egalite de patch-id face a l'union n'est pas mesurable
+  tant que #1155 n'est pas dans main (l'union empile #1155 + #1323) : la mesure valide
+  est le delta empile vs c4fa14a2 ci-dessus (10/10 patch-ids constants).
+
+mesure 2026-10-14T21:04:12Z ; methode patch-id: git diff -U0 <base> <head> -- <f> vs git diff -U0 2458ec053123 <union> -- <f>
