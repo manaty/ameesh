@@ -17,6 +17,10 @@ binding `session_bindings`) ; ces avis **delta/historiques** ne valent pas GO co
 nouveau et la qualification de famille reste réservée au pilote. Précision cx2 (mail
 06:32Z) : le binding **enregistre** un harnais Claude ; il ne prouve ni l'exécution réelle
 ni le modèle, à qualifier sur la ligne primaire (registre ≠ preuve réelle, canon §11).
+Révisé 14/10 07:2xZ (mail cx2 07:21Z) : **ligne primaire retrouvée** pour #2696/#2739
+(session `11783f10…`, modèle `claude-opus-5-5`, résultats `is_error:false`) — §5, §7.3 et
+§8 actualisés ; cette pièce est citée **sous la main de cx2** et n'est pas revérifiable
+depuis `ameesh-agents-2`.
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -160,12 +164,22 @@ gel sur la main exacte (§7, point 3).
     binôme ciblé, P2 levé, 0 B/N/n nouveaux (commentaire PR #693 `6150849386`).
   - **#2739** — **bureau**, **Claude**, **ok**, 13/10 17:08:39Z, sur `90aae667` : R2
     delta `6db727ac..90aae667` 0 B / 0 N.
-  - **Session primaire du jalon #2739** : `session_bindings` **#26** — session
+  - **Ligne primaire des jalons #2696/#2739** (retrouvée en première main par
+    **ameesh-cx2**, 14/10 07:21Z, sur l'hôte bureau) :
+    `~/.claude/projects/-home-smichea-Work/11783f10-5492-408f-988b-8c1035bec79b.jsonl` —
+    jalon `2696` : assistant `2900`, 13/10 16:45:22.571Z, modèle **`claude-opus-5-5`**,
+    `toolu_011yBjm9aryaPzEcWRNv3KnF`, résultat `2908` 16:45:30.628Z `is_error:false` →
+    `milestone364ok` ; jalon `2739` : assistant `2992`, 17:08:38.151Z, même modèle,
+    `toolu_017qxw1pnhk6fA7T1uH7vyKR`, résultat `2994` 17:08:44.530Z `is_error:false` →
+    `milestone364ok`. Binding `session_bindings` **#26** — session
     `11783f10-5492-408f-988b-8c1035bec79b`, harnais **claude**, agent **bureau**, hôte
     pc-smichea, liée 13/10 16:29:29Z, révoquée 13/10 20:39:44Z ; sa fenêtre couvre #2696
-    (16:45Z) et #2739 (17:08Z). Le binding **enregistre un harnais Claude** ;
-    **l'exécution réelle et le modèle restent à qualifier sur la ligne primaire**, demandée
-    au bureau (registre ≠ preuve réelle, canon §11).
+    (16:45Z) et #2739 (17:08Z). L'exécution réelle et le modèle sont donc **attestés par
+    la ligne primaire**, sous la main de cx2 (hashes des quatre lignes et détail :
+    `~/Work/ameesh-cx2-1260-recoupage.md`, hôte bureau, et note #1260 de cx2). Pièce
+    **non revérifiable depuis `ameesh-agents-2`** (`/home/smichea` absent) ; auteur,
+    indépendance et couverture finale du paquet restent à qualifier par le pilote au gel
+    (§7, point 3).
   - **Feu historique** : `work_item_events` **#8263**, pilote mesh-design, 13/10
     17:17:39Z — FEU PILOTE conditionnel sur `90aae667…` : CI exacte verte sur cette tête,
     **toutes parts psql/psycopg COMPLETED/SUCCESS, aucune annulée** (#940), tête
@@ -213,9 +227,9 @@ réjeu individuel.
    **2 recouvrements #1211** (`tests.yml`, `tests/parts/pilote-psql.txt`) ; tout écart =
    arrêt et signalement.
 3. **Qualification pilote** : classes réelles, familles/sources des avis (y compris la
-   réserve de famille du rapport auditeur `00f1cd5c` et la ligne primaire du jalon #2739),
-   dépendances, inclusion ou exclusion motivée des compagnons (#974, #1002) ; #1257 à
-   part.
+   réserve de famille du rapport auditeur `00f1cd5c` et la ligne primaire du jalon #2739,
+   retrouvée par cx2, §5), dépendances, inclusion ou exclusion motivée des compagnons
+   (#974, #1002) ; #1257 à part.
 4. **Nouveau gel** : branche d'intégration distincte de `39df7c316c9e` + manifeste final
    (cette pièce en entrée).
 5. **Une seule validation complète** `workflow_dispatch` sur le gel : 4 parts psycopg +
@@ -227,8 +241,11 @@ réjeu individuel.
 
 - #1002 : `waiting` à réconcilier (R1 déjà GO).
 - #974 : avis/feu propres non rendus ; PR à retarget après #364.
-- Jalon #2739 : binding `#26` = harnais `claude` (bureau) enregistré ; **exécution réelle
-  et modèle exact à qualifier sur la ligne primaire**, demandée au bureau (§5).
+- Jalon #2739 : binding `#26` = harnais `claude` (bureau) enregistré, et **ligne primaire
+  retrouvée par cx2** (14/10 07:21Z) : session `11783f10…`, modèle `claude-opus-5-5`,
+  résultats `is_error:false` pour #2696 et #2739 (§5) — l'exécution réelle est attestée
+  sous la main de cx2, **non revérifiable depuis `ameesh-agents-2`**. Reste au pilote :
+  qualification auteur/indépendance/couverture finale du paquet (§7, point 3).
 - Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4).
 
 ## 9. Réversibilité
