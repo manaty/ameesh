@@ -1,0 +1,60 @@
+{
+  "work": 499,
+  "reviewer": "auditeur",
+  "harness": "codex",
+  "old_candidate": "89c4255a21f1170d894d3163410f6fb680df7af4",
+  "head": "02d39819cf0bafb946ad63dec5971610aa18fc5a",
+  "main": "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac",
+  "parents": [
+    "3eb38d3fc3ca3cf880ffd42fe67a21df64bcb028",
+    "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac"
+  ],
+  "tree": "d48f1fec60df60f080422476f0e30a137f42fe65",
+  "automatic_merge_tree_exact": true,
+  "files": [
+    "docs/CONVERSATIONS.md",
+    "docs/EXECUTEUR-MEDIEE.md",
+    "src/ameesh/fil.py",
+    "src/ameesh/mediated_executor/__init__.py",
+    "src/ameesh/mediated_executor/contract.json",
+    "src/ameesh/runner.py",
+    "src/ameesh/storage/interface.py",
+    "src/ameesh/storage/postgres/threads.py",
+    "tests/golden/generate_executor.py",
+    "tests/golden/mediated_executor/identity.json",
+    "tests/golden/mediated_executor/threads.json",
+    "tests/test_l107_executor_contract.py",
+    "tests/test_l361_thread_expiry.py"
+  ],
+  "constant_blobs_vs_old": [
+    "docs/CONVERSATIONS.md",
+    "docs/EXECUTEUR-MEDIEE.md",
+    "src/ameesh/fil.py",
+    "src/ameesh/mediated_executor/__init__.py",
+    "src/ameesh/mediated_executor/contract.json",
+    "src/ameesh/storage/interface.py",
+    "src/ameesh/storage/postgres/threads.py",
+    "tests/golden/generate_executor.py",
+    "tests/golden/mediated_executor/identity.json",
+    "tests/golden/mediated_executor/threads.json",
+    "tests/test_l107_executor_contract.py",
+    "tests/test_l361_thread_expiry.py"
+  ],
+  "patch_id": "32d8d4b7bd4baae44b6439150ae9cbf762130c75",
+  "lot_methods_ast_identical_vs_old": [
+    "expire_threads_once",
+    "_start_thread_expiry_notice",
+    "start_housekeeping_poll",
+    "housekeeping_once"
+  ],
+  "main_methods_ast_identical_vs_main": [
+    "run",
+    "shutdown",
+    "_stale_restart_ready",
+    "sweep",
+    "canon_sync_once"
+  ],
+  "diff_check": "passed",
+  "test_suites_replayed": false,
+  "primary_old_artifact": "analyses/499-review-report.md is partial on 59132c25, not a final R1 on 89c4255a; no historical final R1 invented."
+}
