@@ -558,8 +558,12 @@ class AgentWorker(threading.Thread):
         """La session à reprendre : celle du registre, sinon le fichier local.
 
         Un fichier local **antérieur** au dernier oubli de session
-        (`session_reset_ts`, posé par `ameesh restart` appliqué sans bail)
-        n'est pas repris : il est effacé (L26).
+        (`session_reset_ts`, posé par `ameesh restart` appliqué sans bail, et
+        par tout `clear_session`, #794) n'est jamais repris. Le retrait du
+        fichier est un nettoyage au mieux : la décision ne dépend pas de sa
+        réussite, sinon un `unlink` refusé (PermissionError) ferait
+        ressusciter l'ancienne session — sur ce worker comme sur un worker
+        recréé, qui relit `session_reset_ts` au registre.
         """
         session = (self.agent or {}).get("session_id")
         if session:
@@ -568,10 +572,14 @@ class AgentWorker(threading.Thread):
         reset = (self.agent or {}).get("session_reset_ts")
         if fichier and reset:
             try:
-                if os.stat(self._path("session")).st_mtime <= float(reset):
-                    os.unlink(self._path("session"))
-                    return None
+                perime = os.stat(self._path("session")).st_mtime <= float(reset)
             except OSError:
+                return None
+            if perime:
+                try:
+                    os.unlink(self._path("session"))
+                except OSError:
+                    pass
                 return None
         return fichier
 
@@ -1734,8 +1742,10 @@ class AgentWorker(threading.Thread):
         sa session) ; seulement en politique `par-lot` (les politiques `jamais`
         et `taille` gardent leur session longue) ; jamais pendant un tour, et
         l'oubli est fencé par le bail, comme `_forget_lotless_session`. Le
-        fichier local qui portait la session est retiré, sinon
-        `current_session` la relirait. Rend True si la session a été fermée.
+        fichier local qui portait la session est retiré dans la foulée ; s'il
+        ne peut pas l'être (PermissionError), l'oubli tient quand même :
+        `session_reset_at` est posé sous le bail, donc `current_session` ne le
+        relit pas, worker recréé compris. Rend True si la session a été fermée.
         """
         if self.proc is not None or self.session_policy() != "par-lot":
             return False
@@ -1764,8 +1774,15 @@ class AgentWorker(threading.Thread):
             return False
         try:
             os.unlink(self._path("session"))
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            # P2 bloquant du contrôle bureau (14/10) : le fichier reste, mais
+            # l'oubli est durable — `session_reset_at` vient d'être posé dans
+            # la même écriture fencée, donc `current_session` ne le relira pas
+            # (worker recréé compris).
+            log_async("[%s] local session file not removed (%s): already stale "
+                      "after the reset" % (self.name, exc))
         self.agent = registry.get(self.db, self.name) or self.agent
         self._reset_session_counts()
         self._state_note("session_harness", "")
@@ -1800,8 +1817,9 @@ class AgentWorker(threading.Thread):
         Elle a été ouverte par un tour dont le lot était inconnu (reprise,
         veille, courrier ambigu) : l'adopter pour un lot ferait porter à ce
         lot le contexte d'un autre. Oubli fencé par le bail, comme une
-        rotation ; le fichier local suit, sinon `current_session` le relirait.
-        """
+        rotation ; le fichier local est retiré dans la foulée, et s'il ne peut
+        pas l'être, le `session_reset_at` posé sous le bail le rend périmé
+        (#794)."""
         session = self.current_session()
         try:
             oubliee = registry.clear_session(self.db, self.name, self.runner.runner_id,
@@ -1815,8 +1833,14 @@ class AgentWorker(threading.Thread):
             return False
         try:
             os.unlink(self._path("session"))
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            # #794 : même oubli durable que la session d'un lot fini — le
+            # fichier non retiré est antérieur au reset posé par l'écriture
+            # fencée, donc jamais repris.
+            log_async("[%s] local session file not removed (%s): already stale "
+                      "after the reset" % (self.name, exc))
         self.agent = registry.get(self.db, self.name) or self.agent
         self._reset_session_counts()
         self._state_note("session_harness", "")

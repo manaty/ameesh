@@ -694,7 +694,14 @@ class Leases(interface.Leases):
     @track_change("rotation")
     def clear_session(self, name, owner, epoch) -> bool:
         """Fencé par un bail valide : verrou pris d'abord, échéance
-        recontrôlée avec `clock_timestamp()` dans l'écriture."""
+        recontrôlée avec `clock_timestamp()` dans l'écriture.
+
+        L'oubli est **durable** : `session_reset_at` est posé dans la même
+        écriture (#794, contrôle bureau du 14/10). Un fichier local que l'agent
+        n'a pas pu retirer (PermissionError) reste ainsi antérieur au dernier
+        oubli, donc `AgentWorker.current_session` ne le reprend pas — y compris
+        sur un worker recréé, qui relit ce champ au registre.
+        """
         rows = self.db.query(
             """
             WITH verrou AS (
@@ -702,7 +709,8 @@ class Leases(interface.Leases):
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
-               SET session_id = NULL, session_work_item = NULL, updated_at = now()
+               SET session_id = NULL, session_work_item = NULL,
+                   session_reset_at = clock_timestamp(), updated_at = now()
               FROM verrou
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s

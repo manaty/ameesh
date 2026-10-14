@@ -321,7 +321,9 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def clear_session(self, name: str, owner: str, epoch: int) -> bool:
-        """Oublie la session, fencé par un bail valide."""
+        """Oublie la session, fencé par un bail valide ; l'oubli est durable
+        (`session_reset_at` posé dans la même écriture), pour qu'un fichier
+        local non retiré ne ressuscite pas la session (#794)."""
 
     @abc.abstractmethod
     def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
