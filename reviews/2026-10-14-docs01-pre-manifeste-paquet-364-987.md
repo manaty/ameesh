@@ -6,7 +6,8 @@ consolidées : impl-04 `review/impl04-364-piece-constante @627baee0c`
 (`reviews/2026-10-14-364-piece-constante.md`) et impl-05
 `review/impl05-piece-987-paquet-suivant @39e3f2ded`
 (`reviews/2026-10-14-impl05-piece-987-paquet-suivant.md`). Les chiffres d'union de cette
-pièce sont revérifiés en première main (§4).
+pièce sont revérifiés en première main (§4). Révisé 14/10 06:1xZ : recoupement indépendant
+ameesh-cx2 (06:15Z) intégré (§4bis).
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -94,14 +95,27 @@ n'est ni élargi ni touché.
   `tests/parts/pilote-psql.txt`, `tests/support.py`, `tests/test_cluster.py`,
   `tests/test_l56_role_executor.py` ; **1/4 pour #987** (`.github/workflows/tests.yml`) ;
   **0/3 pour #1002**. Ces 10 fichiers sont à relire au gel (delta composé, §12).
-- **Patch-ids constants** : #974 2/2, #987 4/4, #1002 3/3, #364 **70/73**. Les 3 non
-  constants (`deploy/sql/role-module-writers.sql`, `tests/support.py`,
-  `tests/test_cluster.py`) sont dans les 9 adaptés ; l'union garde les deux contributions
-  (union → tête = exactement le delta de main sur ces fichiers).
+- **Patch-ids** : #974 2/2, #987 4/4, #1002 3/3, #364 **70/73 en diff standard et 73/73
+  en `-U0`** : les 3 écarts standard (`deploy/sql/role-module-writers.sql`,
+  `tests/support.py`, `tests/test_cluster.py`) sont des **contextes** différents, les
+  lignes changées sont identiques ; l'union garde les deux contributions (union → tête =
+  exactement le delta de main sur ces fichiers).
 - **Recouvrement avec #1211** (à refaire sur la main exacte après activation) :
   `.github/workflows/tests.yml` (#987/#1002) et `tests/parts/pilote-psql.txt` (#364).
 - Objets d'union **locaux** (`git commit-tree`), non poussés ; aucune branche de lot
   modifiée (ni rebase, ni merge de main dedans).
+
+## 4bis. Recoupement indépendant (ameesh-cx2, 14/10 06:15Z)
+
+- Mêmes arbres, obtenus séparément : union #364 `64264ca6…` puis #987 `4b65a177…` ;
+  ordre inverse #987 → #364 = **exactement `4b65a177`** ; delta 77 fichiers = 73 + 4,
+  aucun étranger ni manquant.
+- Blobs #364 constants **64/73** (les 9 adaptés du §4) ; `tests.yml` composé
+  `00b374d7dbd3…`, identique à l'annexe B.
+- Patch-id `-U0` : **73/73** pour #364 (les 3 écarts standard sont des contextes) ;
+  #987 4/4 dans les deux formes.
+- **#974 et #1002 restent candidats, exclus par défaut** : inclusion seulement si
+  qualifiés avant le gel, comme au §1.
 
 ## 5. Classes, avis, familles, feux
 
@@ -109,7 +123,11 @@ n'est ni élargi ni touché.
   concurrence des fences). Auteur **DeepSeek** (impl-04). Deux avis non-DeepSeek de
   familles distinctes : ameesh-cx1 **Codex**, PR #693 commentaire 6150849386, 13/10
   17:02:35Z, GO 0 B / 0 N / 0 n sur le delta `6db727ac..90aae667` ; bureau **Claude**,
-  verdict ok 17:08Z sur `90aae667`. Feu pilote mesh-design 13/10 17:17Z, conditionnel :
+  verdict ok 17:08Z sur `90aae667`. **Réserve de traçabilité** (recoupement cx2) : le GO
+  cx1 ne porte que sur le delta et ne remplace pas les relectures antérieures du reste du
+  lot ; le verdict Claude est attesté par le feu pilote 17:17Z mais sa **session primaire
+  reste à sourcer** (canon §11) — à qualifier au gel, sans prétendre à une relecture
+  complète nouvelle. Feu pilote mesh-design 13/10 17:17Z, conditionnel :
   CI exacte verte sur la tête, **toutes parts psql/psycopg exécutées, aucune annulée**
   (#940), tête inchangée, fusion auteur `--match-head-commit`. **Non satisfait** (§6).
 - **#974** — légère (2 docs). Auteur dev3. Aucun avis ni feu propre au relevé ; PR
