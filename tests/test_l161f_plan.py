@@ -316,7 +316,8 @@ class MapTest(unittest.TestCase):
         card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
         docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
         with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
-            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path)
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/x")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertIn("file removed: deploy/install.sh", p["selection"]["why"])
 
@@ -328,6 +329,60 @@ class MapTest(unittest.TestCase):
         out = self._classify()
         self.assertEqual(out["removed"], [])
         self.assertNotIn("file removed", out["unsure"])
+
+    def test_release_pull_request_runs_the_full_suite_with_a_safe_map(self):
+        # R1 Codex (B1) : la carte est fraîche et sûre (le bloc modifié est
+        # mesuré, phase2_safe), donc une PR de lot ne lancerait que les
+        # impactés et le contrat ; une PR de release, par sa source ou sa
+        # cible, lance la suite complète, les deux pilotes, sans liste pilote.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in mods}
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            for base_ref, head_ref in (("main", "release/1.10.0"),
+                                       ("main", "integration/example"),
+                                       ("release/1.10.0", "lot/fix")):
+                with self.subTest(base=base_ref, head=head_ref):
+                    p = plan.make_plan("pull_request", card, NOW, head="HEAD",
+                                       repo=self.repo.path,
+                                       base_ref=base_ref, head_ref=head_ref)
+                    self.assertTrue(p["phase2_safe"], p["phase2_why"])
+                    self.assertEqual(p["selection"]["mode"], "full")
+                    self.assertIn("release/**", p["selection"]["why"])
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+                    self.assertEqual(
+                        sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
+
+    def test_version_only_pull_request_on_release_runs_the_full_suite(self):
+        # R1 Codex : le même diff (la seule ligne `version` de pyproject.toml)
+        # reste sauté sur une PR de lot, mais garde la suite complète sur une
+        # PR de release.
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.0"\n')
+        self.repo.commit()
+        self.repo.write("pyproject.toml", '[project]\nname = "t"\nversion = "1.0.1"\n')
+        self.repo.commit()
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in mods}
+        lot = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                             base_ref="main", head_ref="lot/x")
+        self.assertTrue(lot["version_only"])
+        self.assertEqual(lot["parts"]["psycopg"], [])
+        self.assertEqual(plan.outputs(lot)["code"], "false")
+        release = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                                 base_ref="main", head_ref="release/1.10.0")
+        self.assertFalse(release["version_only"])
+        self.assertIn("release/**", release["selection"]["why"])
+        self.assertNotEqual(release["parts"]["psycopg"], [])
+        self.assertEqual(plan.outputs(release)["code"], "true")
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -470,7 +525,8 @@ class DocsLaneTest(unittest.TestCase):
                 mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
                 mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
                                   if a and a[0] == plan.PILOT_FILE else []):
-            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path)
+            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path,
+                                  base_ref="main", head_ref="lot/x")
 
     def assertFullSuite(self, p: dict, why: str) -> None:
         self.assertFalse(p["docs_only"], p["why"])
@@ -565,7 +621,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
-        p = plan.make_plan("pull_request", None, NOW)
+        p = plan.make_plan("pull_request", None, NOW, base_ref="main", head_ref="lot/x")
         if p["version_only"] or p["docs_only"]:
             self.skipTest("the checked out commit is a version or documentation change")
         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
@@ -604,7 +660,7 @@ class PlanTest(unittest.TestCase):
                 "untested": [], "unknown_blocks": [], "foundation": [], "changed": 1,
                 "always": always,
                 "classes": {m: list(c) for m, c in classes.items()}}):
-            p = plan.make_plan("pull_request", card, NOW)
+            p = plan.make_plan("pull_request", card, NOW, base_ref="main", head_ref="lot/x")
         if p["version_only"] or p["docs_only"]:
             self.skipTest("the checked out commit is a version or documentation change")
         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
@@ -741,12 +797,16 @@ class LotBranchTest(unittest.TestCase):
         state.update(kw)
         return state
 
-    def _plan(self, event="pull_request", classes=None, card=None, **state_kw):
+    def _plan(self, event="pull_request", classes=None, card=None,
+              base_ref="main", head_ref="lot/1211-ci-impactes-contrat",
+              nature_kw=None, **state_kw):
         state = self._state(classes if classes is not None else self._classes(), **state_kw)
         nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        nature.update(nature_kw or {})
         with mock.patch.object(plan, "classify", return_value=state), \
                 mock.patch.object(plan, "nature", return_value=dict(nature)):
-            return plan.make_plan(event, card if card is not None else {}, NOW)
+            return plan.make_plan(event, card if card is not None else {}, NOW,
+                                  base_ref=base_ref, head_ref=head_ref)
 
     def _ran(self, p, driver="psycopg"):
         return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
@@ -812,6 +872,71 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(p["selection"]["mode"], "full")
                 self.assertIn("integration", p["selection"]["why"])
                 self.assertEqual(self._ran(p), sorted(self.mods))
+
+    def test_release_pull_request_never_takes_the_impacted_selection(self):
+        # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
+        # décidables), mais une PR dont la source ou la cible est release/**
+        # ou integration/** garde la suite complète, les deux pilotes, sans
+        # liste pilote psql (canon §3).
+        cases = {
+            "source release": {"base_ref": "main", "head_ref": "release/1.10.0"},
+            "source integration": {"base_ref": "main", "head_ref": "integration/1.10.0"},
+            "target release": {"base_ref": "release/1.10.0", "head_ref": "lot/fix"},
+        }
+        impacted = self.mods[0]
+        for why, refs in cases.items():
+            with self.subTest(why):
+                p = self._plan(classes=self._classes(**{impacted: "src/ameesh/x.py::f"}),
+                               **refs)
+                self.assertTrue(p["phase2_safe"])
+                self.assertEqual(p["selection"]["mode"], "full", why)
+                self.assertIn("release/**", p["selection"]["why"])
+                self.assertEqual(self._ran(p), sorted(self.mods), why)
+                self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+                self.assertEqual(plan.outputs(p)["code"], "true")
+
+    def test_version_or_documentation_only_release_runs_the_full_suite(self):
+        # R1 Codex : ni la voie version seule ni la voie documentation seule
+        # ne sautent les parts d'une PR de release ; les mêmes PR vers main
+        # (PR de lot) gardent leur voie rapide.
+        for why, nature_kw in (("version", {"version_only": True, "why": "version seule"}),
+                               ("documentation", {"docs_only": True, "why": "doc seule"})):
+            with self.subTest(why):
+                p = self._plan(head_ref="release/1.10.0", nature_kw=nature_kw)
+                self.assertFalse(p["version_only"], why)
+                self.assertFalse(p["docs_only"], why)
+                self.assertIn("release/**", p["why"])
+                self.assertEqual(self._ran(p), sorted(self.mods), why)
+                self.assertEqual(plan.outputs(p)["code"], "true")
+                lot = self._plan(head_ref="lot/x", nature_kw=nature_kw)
+                self.assertEqual(lot["parts"]["psycopg"], [], why)
+                self.assertEqual(plan.outputs(lot)["code"], "false", why)
+
+    def test_fallback_of_a_release_pull_request_keeps_both_pilots_full(self):
+        # R1 Codex : « y compris fallback » — le repli d'une PR de release ne
+        # reprend ni la liste pilote psql ni le découpage d'une PR de lot.
+        p = plan.fallback_plan("pull_request", "boom", base_ref="main",
+                               head_ref="release/1.10.0")
+        self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+        self.assertIn("release/**", p["selection"]["why"])
+        lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
+        self.assertEqual(json.loads(plan.outputs(lot)["psql"]), [1, 2, 3])
+        self.assertTrue(any(ps.get("pilot_list") for ps in lot["parts"]["psql"]))
+
+    def test_github_refs_default_to_the_environment(self):
+        # le workflow passe --base-ref/--head-ref ; à défaut (appel direct),
+        # GITHUB_BASE_REF et GITHUB_HEAD_REF portent le contexte (L1211).
+        env = {"GITHUB_BASE_REF": "main", "GITHUB_HEAD_REF": "release/1.10.0"}
+        with mock.patch.dict("os.environ", env):
+            p = self._plan(base_ref=None, head_ref=None)
+        self.assertEqual(p["refs"], {"base": "main", "head": "release/1.10.0"})
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("release/**", p["release"])
 
     def test_summary_names_the_selection(self):
         p = self._plan(classes=self._classes(**{self.mods[0]: "src/ameesh/x.py::f"}))
@@ -1007,14 +1132,23 @@ class WorkflowTest(unittest.TestCase):
         tests_job = self.text[self.text.index("\n  tests:\n"):]
         self.assertNotIn("bilan", tests_job.split("steps:")[0])
 
+    def test_plan_job_passes_the_branch_context(self):
+        # R1 Codex (B1) : le plan qualifie les PR de release sur leurs
+        # branches source et cible (« release/** » ou « integration/** ») ;
+        # le workflow les lui transmet (L1211).
+        self.assertIn('--base-ref "${{ github.base_ref }}"', self.text)
+        self.assertIn('--head-ref "${{ github.head_ref }}"', self.text)
+
     def test_lot_branch_triggers_and_full_suite_events(self):
-        # L1211 : la PR garde la CI (impactés + contrat, le sélecteur décide),
-        # le push vers la branche d'intégration du paquet, main et release/**
-        # porte la suite complète ; le check requis reste l'agrégat « tests ».
+        # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
+        # décide), le push vers la branche d'intégration du paquet, main et
+        # release/** porte la suite complète ; le check requis reste
+        # l'agrégat « tests ».
         self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
         self.assertIn("\n  pull_request:\n", self.text)
         self.assertIn("L1211", self.text)
         self.assertIn("tests/parts/toujours.txt", self.text)
+        self.assertIn("une PR de release", self.text)
 
 
 if __name__ == "__main__":

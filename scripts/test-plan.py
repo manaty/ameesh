@@ -3,6 +3,7 @@
 """Test plan from the measured test → code map (L161f).
 
     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                              [--base-ref B] [--head-ref H]
                               [--github-output F] [--summary F] [--annotations]
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
@@ -24,17 +25,26 @@ so the split never differs between parts.
 * P2 — failed under measure in the last 7 days (map history);
 * P3 — the rest.
 
-**Lot branches: impacted + contract (L1211, canon §3).** On a pull request,
-only the impacted modules (P0, P1) and the contract list
-(`tests/parts/toujours.txt`: droits, rôles, migrations, objets globaux du
-cluster) run; the full suite runs on `main`, `release/**` and the package
-integration branch (§12). Any doubt — no map, a stale or unsure selection, a
-changed block without a test, test infrastructure, a removed file outside
-documentation, an empty contract list — gives the full suite
+**Lot branches: impacted + contract (L1211, canon §3).** On a pull request
+whose source and target are lot branches, only the impacted modules (P0, P1)
+and the contract list (`tests/parts/toujours.txt`: droits, rôles, migrations,
+objets globaux du cluster) run; any doubt — no map, a stale or unsure
+selection, a changed block without a test, test infrastructure, a removed
+file outside documentation, an empty contract list — gives the full suite
 (`lot_selection`). On `main` every module runs, P0 and
 P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
 driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
 matrix.
+
+**Release pull requests keep the full suite (canon §3).** A pull request
+whose source or target is `release/**` or the package integration branch
+(§12) is a release PR: like the `push` to those branches, it runs the full
+suite under both drivers (`PARTS` in full), with no version-only or
+documentation-only fast lane and without the psql pilot list — the branch
+context comes from the workflow (`--base-ref`, `--head-ref`, L1211). The
+same holds for the fallback plan, so an unreadable map never narrows a
+release to the pilot list. Only the full suite prepares the merge of a
+release.
 
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
@@ -110,6 +120,10 @@ PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
 #: comme dans celui de 45 min de psql.
 PR_TARGET_PART_S = 300
+#: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
+#: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
+#: version/doc ni liste pilote psql.
+RELEASE_PREFIXES = ("release/", "integration/")
 #: entries listed in the job summary, per category
 SUMMARY_LIMIT = 25
 
@@ -612,17 +626,47 @@ def split(modules: list[str], driver: str, n: int, card: dict | None,
     return result
 
 
+def _branch(ref: str | None) -> str:
+    """A branch name, from `GITHUB_BASE_REF`/`GITHUB_HEAD_REF` or `refs/heads/…`."""
+    ref = ref or ""
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
+def _env_ref(name: str, value: str | None) -> str:
+    """The explicit branch ref, or the environment's (`GITHUB_*`)."""
+    return os.environ.get(name, "") if value is None else value
+
+
+def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
+    """Why this pull request is a release one (canon §3), or "".
+
+    A source or target branch under `release/**` or `integration/**` is a
+    release PR: the full suite, both drivers, no version/documentation fast
+    lane and no psql pilot list — the target of a lot PR, `main`, keeps the
+    selection. The reason goes to the plan and the summary.
+    """
+    for role, ref in (("target", _branch(base_ref)), ("source", _branch(head_ref))):
+        if ref.startswith(RELEASE_PREFIXES):
+            return (f"{role} branch {ref}: release/** and integration/** run the "
+                    f"full suite (canon §3)")
+    return ""
+
+
 def lot_selection(event: str, state: dict, modules: list[str],
-                  classes: dict[str, tuple[str, str]]) -> tuple[list[str] | None, str]:
+                  classes: dict[str, tuple[str, str]],
+                  release: str = "") -> tuple[list[str] | None, str]:
     """Modules a lot branch runs (L1211): impacted plus contract.
 
-    `None` means the full suite: an event other than a pull request, or any
-    doubt the plan cannot decide through — no usable map, a selection that is
-    not safe (stale map, a new block, test infrastructure, changed lines
-    without a test), an empty contract list. The reason goes to the summary.
+    `None` means the full suite: an event other than a pull request, a
+    release pull request (`release`, `release_pr`), or any doubt the plan
+    cannot decide through — no usable map, a selection that is not safe
+    (stale map, a new block, test infrastructure, changed lines without a
+    test), an empty contract list. The reason goes to the summary.
     """
     if event != "pull_request":
         return None, "main, release/** and the integration branch run the full suite"
+    if release:
+        return None, release
     contract = [m for m in state.get("contract", []) if m in modules]
     if not contract:
         return None, "contract list (tests/parts/toujours.txt) empty or unreadable"
@@ -679,19 +723,25 @@ def doc_readers(classes: dict, card: dict,
 
 
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
-              head: str = "HEAD", repo: pathlib.Path = REPO) -> dict:
+              head: str = "HEAD", repo: pathlib.Path = REPO,
+              base_ref: str | None = None, head_ref: str | None = None) -> dict:
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
-            "tested": _rev(head, repo), **nature(event, head=head, repo=repo)}
+            "tested": _rev(head, repo), "release": release,
+            "refs": {"base": base_ref, "head": head_ref},
+            **nature(event, head=head, repo=repo)}
     plan.update(classify(modules, card, now, head=head, repo=repo))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     #: #749 : modules « always » declenches par le diff (contrat de base, baux
     #: et orphelins), a rejoindre au pilote psql sur une PR.
     always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
-    if plan["docs_only"]:
+    if plan["docs_only"] and not release:
         # the fast lane needs a map that judged everything: a missing, stale or
         # unusable map, or an unsure selection, runs the full suite
         full = None
@@ -706,23 +756,33 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
                         f"({', '.join(db_readers)}): full suite")
         if full:
             plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
+    if release:
+        #: canon §3 : une PR de release passe la suite complète, les deux
+        #: pilotes, sans voie version seule ni documentation seule.
+        plan["version_only"] = plan["docs_only"] = False
+        plan["doc_readers"] = []
+        plan["why"] = release
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
+    #: L1211 : la sélection impactés+contrat est réservée aux PR de lot ; une
+    #: PR de release garde la suite complète, y compris dans le repli.
+    lot_pr = pr and not release
     #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
     #: tout doute rend la suite complète (lot_selection). La sélection se
     #: contente d'une part par pilote tant que l'estimation le permet.
-    selection, why = (None, "") if skip else lot_selection(event, plan, modules, classes)
+    selection, why = ((None, "") if skip
+                      else lot_selection(event, plan, modules, classes, release))
     chosen_set = None if selection is None else set(selection)
     contract = [m for m in plan.get("contract", []) if m in modules]
     plan["parts"] = {}
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
-        if driver == "psql" and pr:
+        if driver == "psql" and lot_pr:
             selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
                                        always)
         if chosen_set is not None:
             selected = [m for m in selected if m in chosen_set]
-        n = n_pr if pr else n_other
+        n = n_pr if lot_pr else n_other
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
         plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
@@ -747,25 +807,34 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
         return ""
 
 
-def fallback_plan(event: str, error: str) -> dict:
+def fallback_plan(event: str, error: str, base_ref: str | None = None,
+                  head_ref: str | None = None) -> dict:
     """The plan when planning itself failed: full suite, alphabetical order."""
-    modules = parts.modules()
+    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     pr = event == "pull_request"
+    #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
+    #: jamais la liste pilote psql d'une PR de lot.
+    lot_pr = pr and not release
+    why = "planning failed" + (f"; {release}" if release else "")
+    modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
-            "version_only": False, "docs_only": False, "why": "planning failed",
+            "version_only": False, "docs_only": False, "why": why,
+            "release": release, "refs": {"base": base_ref, "head": head_ref},
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
             "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
-        n = n_pr if pr else n_other
+        n = n_pr if lot_pr else n_other
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
-             "pilot_list": driver == "psql" and pr, "estimate_s": 0}
+             "pilot_list": driver == "psql" and lot_pr, "estimate_s": 0}
             for i in range(1, n + 1)]
-    plan["selection"] = {"mode": "full", "why": "planning failed", "modules": len(modules),
+    plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
                          "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
                          "impacted_estimate_s": 0, "total_estimate_s": 0}
     return plan
@@ -959,6 +1028,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
+    p.add_argument("--base-ref", default=None,
+                   help="target branch of a pull request (default: $GITHUB_BASE_REF)")
+    p.add_argument("--head-ref", default=None,
+                   help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -977,10 +1050,11 @@ def main(argv: list[str] | None = None) -> int:
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
-            plan = make_plan(args.event, card)
+            plan = make_plan(args.event, card, base_ref=args.base_ref, head_ref=args.head_ref)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
-            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}")
+            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
+                                 base_ref=args.base_ref, head_ref=args.head_ref)
         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
                                           + "\n", encoding="utf-8")
         if args.github_output:

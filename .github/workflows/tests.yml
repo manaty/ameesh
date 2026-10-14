@@ -6,16 +6,19 @@
 # L116 — la suite est découpée en parts parallèles par scripts/test-parts.py
 # (par module, équilibré par tests/parts/durees.json), chaque part avec son
 # propre Postgres :
-#   - psycopg : sur une PR, les tests impactés et le contrat (L1211), en une à
-#               quatre parts selon l'estimation ; la suite complète, en 4 parts,
-#               sur push vers main, integration/** ou release/** ;
-#   - psql    : sur une PR, les modules « pilote » parmi les impactés et le
-#               contrat, plus la liste « always » déclenchée (#749), en une à
-#               trois parts (#947 : huit jobs se partagent chaque hôte
+#   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
+#               en une à quatre parts selon l'estimation ; la suite complète,
+#               en 4 parts, sur push vers main, integration/** ou release/**,
+#               et sur une PR de release (source ou cible release/** ou
+#               integration/**) ;
+#   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
+#               et le contrat, plus la liste « always » déclenchée (#749), en
+#               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main, integration/** ou release/**, et à
-#               la main (workflow_dispatch).
+#               6 parts, sur push vers main, integration/** ou release/**, sur
+#               une PR de release (sans liste pilote) et à la main
+#               (workflow_dispatch).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
@@ -23,19 +26,25 @@
 # migrations, objets globaux du cluster), avec repli sur la suite complète
 # quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
 # La suite complète tourne sur main, release/** et la branche d'intégration du
-# paquet (§12) : une PR n'en déclenche plus. Les règles de refusion (a : delta
-# de main disjoint, b : migrations seules) viendront ensuite.
+# paquet (§12) : une PR de lot n'en déclenche plus, mais une PR de release
+# (source ou cible release/** ou integration/**), comme un push sur ces
+# branches, garde la suite complète, les deux pilotes, sans voie version/doc
+# ni liste pilote psql — y compris dans le plan de repli. Les règles de
+# refusion (a : delta de main disjoint, b : migrations seules) viendront
+# ensuite.
 #
-# L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
-# seule ligne `version = "…"`) ne relance pas la suite : `main` l'a déjà
-# validée pour ce contenu. Le job « changements » le détecte
+# L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
+# seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
+# déjà validée pour ce contenu. Le job « changements » le détecte
 # (scripts/version-only.py) ; les parts sont alors sautées et « tests » reste
-# vert. Au moindre doute, la suite tourne ; jamais sur un push ni à la main.
+# vert. Au moindre doute, la suite tourne ; jamais sur un push, à la main, ni
+# sur une PR de release.
 #
-# L161a — même chose pour une PR de documentation seule (docs/, site/, *.md
-# hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
+# L161a — même chose pour une PR de lot de documentation seule (docs/, site/,
+# *.md hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
 # (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
-# doc ». Une exécution de main en cours n'est jamais annulée par la suivante.
+# doc » ; une PR de release garde la suite complète. Une exécution de main en
+# cours n'est jamais annulée par la suivante.
 # #824 — décision owner signée #17605 du 13/10/2026 : un seul run de main
 # reste en attente ; une fusion plus récente remplace ce run en attente et
 # valide aussi les fusions intermédiaires qu'elle contient.
@@ -103,7 +112,8 @@ env:
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
-  # merge commit against its target) and the plan of the run, from the map
+  # lot PR only; merge commit against its target), the branch context
+  # (release PRs keep the full suite) and the plan of the run, from the map
   plan:
     name: plan
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
@@ -134,7 +144,9 @@ jobs:
         name: plan of the run
         run: |
           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
-            --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT" \
+            --event "${{ github.event_name }}" \
+            --base-ref "${{ github.base_ref }}" --head-ref "${{ github.head_ref }}" \
+            --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - uses: actions/upload-artifact@v4
         with:
@@ -263,11 +275,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # sur une PR (L1211) : les modules « pilote » parmi les impactés et le
-        # contrat, plus la liste « always » déclenchée (#749) ; une part, deux
-        # ou trois selon l'estimation (scripts/test-plan.py, lot_part_count),
-        # trois au plus (#947 : sous saturation, une part unique atteignait le
-        # plafond de 30 min) ; suite complète en 6 parts sur push.
+        # sur une PR de lot (L1211) : les modules « pilote » parmi les
+        # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
+        # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
+        # lot_part_count), trois au plus (#947 : sous saturation, une part
+        # unique atteignait le plafond de 30 min) ; suite complète en 6 parts
+        # sur push et sur une PR de release (sans liste pilote).
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:

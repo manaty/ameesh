@@ -361,13 +361,16 @@ scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwawa
 ```
 
 CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
-on the measured durations of `tests/parts/durees.json`): on a pull request,
+on the measured durations of `tests/parts/durees.json`): on a lot pull request,
 `psycopg` runs the impacted modules and the contract list
 (`tests/parts/toujours.txt`, L1211) in one to four parts, and `psql` the driver
 modules of `tests/parts/pilote-psql.txt` among them, in one to three parts so
 that each one stays under the job cap on the shared self-hosted hosts (#947);
 the full suite (4 `psycopg` parts, 6 `psql` parts) runs on pushes to `main`,
-`release/*` and `integration/*` (§12). The `tests` job aggregates the parts.
+`release/*` and `integration/*` (§12), and on any pull request whose source or
+target is one of those branches (a release PR keeps the full suite under both
+drivers, without the version/documentation fast lanes or the psql pilot list).
+The `tests` job aggregates the parts.
 Each part streams its results, one JSON line per test (`--flow`, schema
 `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
 the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
@@ -377,7 +380,8 @@ runs from that plan: on `main`, the test modules impacted by the change
 skipped; on a lot branch, only the impacted modules and the contract run, and
 any doubt (map missing or stale, an unsure selection, a changed block without a
 test, test infrastructure, a file removed outside documentation) falls back to
-the full suite.
+the full suite. The workflow passes the source and target branches
+(`--base-ref`, `--head-ref`) so the plan can tell a lot PR from a release one.
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
