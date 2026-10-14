@@ -9,22 +9,24 @@ sous-utilisation se trompaient et la frise restait vide.
 * Un orchestrateur (même détection que `orchestrator_held`, L94 :
   déclaré, rôle au canon, ou agent qui a confié des lots) qui écrit à un
   agent SANS lot ouvert est averti (sortie d'erreur et fil du message).
-* `--lot <id|réf>` : le lot est rattaché au destinataire, et lui est
-  assigné s'il ne l'est pas déjà, par l'attribution gardée (L37). Un lot
-  qui appartient à un AUTRE agent n'est jamais repris en silence : le
-  courrier d'un relecteur sur le lot de l'auteur ne doit pas le lui voler.
-  #859 : un lot DÉJÀ assigné à un agent ne se réattribue que sur un rôle
-  déclaré (canon ou `AMEESH_ALERT_ORCHESTRATORS`, `is_orchestrator` avec
-  `history=False`) ou d'un humain ; l'historique de distribution (L94) ne
-  suffit pas — un agent qui a confié un lot ne peut pas, par un `--lot`,
-  donner le sien ni celui d'un autre. Un lot SANS assigné reste
-  distribuable par l'historique (le bureau distribue ainsi, canon §4).
+* `--lot <id|réf>` : le lot est rattaché au fil, et assigné au destinataire
+  par l'attribution gardée (L37) quand il n'a pas d'agent assigné (libre ou
+  tenu par un humain). Un lot déjà tenu par un AGENT n'est jamais remis par
+  la seule étiquette du courrier : ni celui d'un autre (le courrier d'un
+  relecteur ne vole pas le lot de l'auteur), ni celui de l'expéditeur
+  lui-même (#1066, incident #1046 : un courrier d'information a emporté le
+  lot qu'il citait). Un rôle déclaré n'y change rien (#859) : la remise est
+  un geste explicite, `ameesh work assign`. Un lot SANS agent assigné reste
+  distribuable par l'historique de distribution (L94 ; le bureau distribue
+  ainsi, canon §4).
 * `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
 désigne aucun lot connu reste une simple étiquette du fil, comme avant.
 Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
 lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
+Correctif du 2026-10-13 (#1066) : la remise implicite du lot tenu par
+l'expéditeur lui-même est refusée comme celle du lot d'un autre agent.
 """
 from __future__ import annotations
 
@@ -75,23 +77,6 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
                                         history=history)
     except Exception:
         return False
-
-
-def _may_reassign(cfg, db, sender: str) -> bool:
-    """#859 : qui peut réattribuer par courrier un lot DÉJÀ assigné à un agent.
-    Un humain (préfixe `human:` ou nom connu de la configuration ou du canon),
-    ou un agent dont le RÔLE est déclaré orchestrateur (fiche du canon,
-    `AMEESH_ALERT_ORCHESTRATORS`). L'historique de distribution (L94) ne suffit
-    pas : sinon tout agent ayant confié un lot reprendrait ceux des autres."""
-    name = (sender or "").strip()
-    if name.startswith(work_mod.HUMAN_PREFIX):
-        return True
-    try:
-        if work_mod.known_human(db, name, cfg):
-            return True
-    except Exception:
-        pass
-    return is_orchestrator(cfg, db, name, history=False)
 
 
 def resolve_lot(db, ref: str) -> dict | None:
@@ -194,28 +179,26 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             else:
                 current = (item.get("assignee") or "").strip()
                 if current != recipient:
-                    # #859 : un lot déjà tenu par un AGENT ne se réattribue
-                    # par un `--lot` que sur un rôle déclaré (ou d'un humain).
-                    # L'historique de distribution (L94) ne donne que le droit
-                    # de confier un lot encore libre ; il ne permet pas de
-                    # donner le sien ni de reprendre celui d'un autre.
-                    bloque = (bool(current)
-                              and not current.startswith(work_mod.HUMAN_PREFIX)
-                              and not _may_reassign(cfg, db, sender))
-                    if bloque:
-                        out["warnings"].append(
-                            "lot #%d is already assigned to %s: not reassigned to %s "
-                            "by mail (--lot hands an unassigned lot; to hand it "
-                            "over: ameesh work assign %d %s)"
-                            % (int(item["id"]), current, recipient, int(item["id"]),
-                               recipient))
-                    elif current and current != sender \
-                            and not current.startswith(work_mod.HUMAN_PREFIX):
-                        out["warnings"].append(
-                            "lot #%d belongs to %s: not reassigned to %s (to "
-                            "take it over: ameesh work assign %d %s)"
-                            % (int(item["id"]), current, recipient, int(item["id"]),
-                               recipient))
+                    # #1066 (incident #1046) : un lot déjà tenu par un AGENT
+                    # ne se remet pas par la seule étiquette `--lot` — ni
+                    # celui d'un autre (le courrier d'un relecteur ne vole pas
+                    # le lot de l'auteur), ni celui de l'expéditeur lui-même.
+                    # #859 : un rôle déclaré n'y change rien ; un lot encore
+                    # libre reste distribuable par l'historique (L94). La
+                    # remise est un geste explicite (`ameesh work assign`).
+                    if current and not current.startswith(work_mod.HUMAN_PREFIX):
+                        if current == sender:
+                            out["warnings"].append(
+                                "lot #%d is yours: linked without reassignment to %s "
+                                "(to hand it over: ameesh work assign %d %s)"
+                                % (int(item["id"]), recipient, int(item["id"]),
+                                   recipient))
+                        else:
+                            out["warnings"].append(
+                                "lot #%d belongs to %s: not reassigned to %s (to "
+                                "take it over: ameesh work assign %d %s)"
+                                % (int(item["id"]), current, recipient, int(item["id"]),
+                                   recipient))
                     else:
                         done = work_mod.assign(db, int(item["id"]), recipient, actor=sender,
                                                cfg=cfg)

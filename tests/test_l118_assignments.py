@@ -86,9 +86,10 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
     def test_historique_ne_reassigne_pas_un_lot_deja_assigne(self):
-        # #859 : un agent qui a confié des lots (historique L94, comme le
-        # bureau) n'est pas orchestrateur pour autant : son `--lot` ne
-        # réattribue pas un lot DÉJÀ assigné.
+        # #859/#1066 : un agent qui a confié des lots (historique L94, comme
+        # le bureau) n'est pas orchestrateur pour autant : son `--lot` ne
+        # réattribue pas un lot DÉJÀ tenu par un agent — ici le sien, que
+        # #1066 protège comme celui d'un autre.
         self.agent("dist")
         autre = work.add(self.db, title="à distribuer")
         work.assign(self.db, int(autre["id"]), "dev1", actor="dist")
@@ -99,7 +100,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("dev2", "Pour information sur ce lot.", "--from", "dist",
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("already assigned to dist: not reassigned", proc.stderr)
+        self.assertIn("is yours: linked without reassignment to dev2", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dist")
         # l'historique garde le droit de confier un lot SANS assigné (le
         # bureau distribue ainsi, canon §4) : rien ne change de ce côté.
@@ -107,6 +108,22 @@ class MailLinksLotsTest(_Base):
         proc = self.send("dev2", "À toi.", "--from", "dist", "--lot", str(libre["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, libre["id"])["assignee"], "dev2")
+
+    def test_lot_tenu_par_l_expediteur_n_est_pas_remis_par_l_etiquette(self):
+        # #1066 (incident #1046) : un orchestrateur qui TIENT un lot et écrit
+        # au pilote en citant `--lot` comme étiquette de fil ne lui remet pas
+        # le lot — la remise est un geste explicite (`ameesh work assign`).
+        lot = work.add(self.db, title="goldens de l'exécuteur médié", assignee="orch")
+        proc = self.send("dev1", "Où en est ce lot ?", "--from", "orch", "--lot",
+                         str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("is yours: linked without reassignment to dev1", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "orch")
+        # le message part quand même, rattaché au fil du lot
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+        # la remise explicite, elle, aboutit
+        work.assign(self.db, lot["id"], "dev1", actor="orch")
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
     def test_new_lot_cree_et_assigne(self):
         proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
