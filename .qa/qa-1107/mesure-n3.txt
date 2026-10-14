@@ -1,0 +1,9 @@
+lots ouverts (hors backlog) : 328
+agents (listing)            : 48  (84.2 ms)
+open_lots_activity          : 328 lots  (35.5 ms)
+lot_events                  : 4255 lignes (75.9 ms)
+lot_milestones              : 778 lignes (16.8 ms)
+lot_actions                 : 0 lignes (4.5 ms)
+stagnation.describe         : 328 lots decrits (221.6 ms)
+_slo_breaches (passe)       : 90 alertes (478.2 ms)
+somme des lectures seules   : 132.7 ms (35.5 + 75.9 + 16.8 + 4.5)
