@@ -1,0 +1,1957 @@
+diff --git a/deploy/sql/role-superviseur.sql b/deploy/sql/role-superviseur.sql
+index 9b4c91ee5..d39d8c1e7 100644
+--- a/deploy/sql/role-superviseur.sql
++++ b/deploy/sql/role-superviseur.sql
+@@ -478,7 +478,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
+     -- est un CONTENU)
+     ('ci_runs', ARRAY[
+         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
+-        'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
++        'status', 'superseded_by', 'url', 'workflow', 'first_seen_at', 'concluded_at',
+         'urgent_message_id', 'verdict_message_id'
+     ]),
+     ('ci_test_failures', ARRAY[
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index 97b6d1c39..5bcd0260f 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -3800,7 +3800,9 @@ une vue d'ameesh ne notifie personne.
+ ```json
+ {
+   "github": {
+-    "projects": {"web": "acme/web", "app": {"repo": "acme/app"}},
++    "projects": {"web": "acme/web",
++                 "app": {"repo": "acme/app",
++                         "workflows": ["backend-suite.yml", "sql-invariant.yml"]}},
+     "host": "serveur-1",
+     "interval": 300,
+     "exclude_terms": ["Globex"]
+@@ -3808,7 +3810,10 @@ une vue d'ameesh ne notifie personne.
+ }
+ ```
+ 
+-* `projects` : projet → dépôt `owner/repo` ;
++* `projects` : projet → dépôt `owner/repo` ; la forme longue accepte
++  `workflows`, la liste des fichiers de workflow que le veilleur de CI suit
++  dans ce dépôt (L161c, #1110) — sans elle, il découvre les workflows actifs
++  du dépôt ;
+ * `host` : l'**hôte désigné**, le seul qui mène la projection automatique
+   (aucun doublon d'un hôte à l'autre) ; sans lui, seule la commande tourne ;
+ * `interval` : secondes entre deux tours complets d'un projet (défaut 300,
+@@ -5421,9 +5426,47 @@ croissance de la suite d'une exécution à l'autre.
+ 
+ **Côté ameesh.** `ameesh notify`, sur l'hôte désigné par `github.host` (le
+ même que pour les issues des lots, L126 ; aucune clé nouvelle), relève à chaque
+-passage les exécutions en cours ou en attente du workflow `tests.yml` de chaque dépôt de
+-`github.projects` (une requête par dépôt, puis une par exécution suivie).
+-Chaque exécution est rattachée à un lot : par sa branche
++passage les exécutions **non conclues** des workflows suivis de chaque dépôt de
++`github.projects` (une requête par état et par dépôt, puis une par exécution
++suivie) : `in_progress`, `queued`, mais aussi `requested`, `waiting` et
++`pending` (#1161) — une exécution qui attend son groupe de concurrence n'a
++sinon ni ligne, ni supersession, ni verdict, ni réveil. Les workflows suivis
++d'un dépôt sont ceux que déclare
++`github.projects.<projet>.workflows` (forme longue `{"repo": …,
++"workflows": ["backend-suite.yml", …]}`) ; sans liste déclarée, le relevé
++découvre les workflows **actifs** du dépôt (`actions/workflows`, en cache une
++heure) et suit ceux du dépôt — le défaut L161 `tests.yml` seul quand le dépôt
++le publie, tous les workflows actifs sinon. Un dépôt dont les suites portent
++d'autres noms (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est donc
++plus ignoré en silence (#1110) ; un workflow déclaré mais absent du dépôt est
++signalé dans le journal. Chaque exécution garde son fichier de workflow : le
++verdict nomme la suite et, quand d'autres workflows de la même tête tournent
++encore, le dit — un vert de `backend-suite.yml` n'est pas « la CI est verte ».
++Une exécution d'une tête supplantée qui n'a pas démarré (`queued` ou
++`pending`) retient le groupe de concurrence de la tête courante, qui reste
++`pending` : le relevé l'annule par l'API (#1161), **jamais** sur `main`, sur
++`release/…` ni sur la tête courante. L'annulation ne sort pas du groupe : il
++faut la **même PR**, le **même dépôt source** (`head_repository`) et le **même
++fichier de workflow** — les groupes des workflows d'ameesh sont
++`format('pr-{0}', pull_request.number)`, et une poussée simple (`event: push`,
++groupe `github.run_id` ou `github.ref`) n'est jamais celle d'une PR ; sans
++cette preuve, rien n'est annulé. L'antériorité se prouve par la **date
++d'essai** (`run_started_at`), pas par l'`id` : un rerun garde son `id` et
++augmente `run_attempt`, si bien qu'un essai 2 lancé après l'essai 1 d'une
++nouvelle tête est conservé ; une date incertaine conserve aussi l'exécution.
++Le jeton `gh` de l'hôte
++`github.host` doit donc porter `actions: write` ; une erreur de l'API est
++journalisée et ne conclut rien, et l'écriture est idempotente (une exécution
++déjà conclue n'est pas annulée). Une exécution de PR restée `pending` plus de
++cinq minutes est signalée à l'assigné du lot : au plus un message par
++exécution et par vie du service (`ci_runs` ne porte pas ce message, l'additif
++#1161 reste sans migration).
++Une exécution courte peut naître et finir entre deux passages sans jamais être
++vue « en cours » : un **rattrapage borné** (exécutions terminées depuis moins
++d'une heure) les découvre, rend leur verdict et réveille l'agent, une seule
++fois ; l'exécution d'une tête déjà remplacée sur la même branche est écartée
++(pas de verdict périmé), et un workflow conclu dans le même passage n'est pas
++cité comme encore en cours. Chaque exécution est rattachée à un lot : par sa branche
+ (`work_items.branch`), sinon par la ligne `ameesh-work: <id>` de son commit de
+ tête (une fusion dans main). Les messages partent de `ameesh` vers l'assigné
+ du lot, dans le fil du lot (L125) :
+@@ -5432,20 +5475,24 @@ du lot, dans le fil du lot (L125) :
+ |---|---|
+ | premier échec de la tête | urgent (un seul par exécution) : test, part, extrait (40 lignes au plus), commande pour le rejouer, lien ; **passif** (`ci_passif`, sans réveil) tant qu'aucune exécution conclue de la base n'a été relevée, par exemple juste après le déploiement, car l'échec est peut-être hérité |
+ | échecs suivants | événement ordinaire, un par relevé (regroupé par la fenêtre du courrier) |
+-| fin de l'exécution | verdict ordinaire : verte, ou rouge avec la liste ; rien si annulée |
++| fin de l'exécution | verdict ordinaire : verte, ou rouge avec la liste ; rien si annulée ; il nomme le workflow et les autres workflows de la même tête encore en cours |
+ | test qui échouait déjà sur la base | **rouge hérité** : jamais d'urgent ni de message à l'auteur, une ligne dans le verdict |
+-| nouvelle poussée sur la branche | l'exécution précédente, en cours ou déjà annulée, est remplacée ; ses messages **non encore remis** sont retirés sans être montrés (`meta.retire`), un message déjà remis reste |
+-
+-La base du rouge hérité est la cible de la PR (sinon main) : sa dernière
+-exécution conclue relevée. Une exécution rouge sur main envoie l'urgent à
+-l'assigné du lot fusionné (sauf rouge hérité de la fusion précédente) et lève
+-l'alerte `ci_main_red` (poussée par défaut, urgente ; elle bloque les
+-déploiements), résolue quand main repasse au vert : tant que main reste rouge,
+-c'est la même alerte, d'une exécution rouge à la suivante.
+-
+-Le relevé garde sa mémoire dans `ci_runs` et `ci_test_failures` (migration
+-0055) : une ligne par exécution suivie et une par test en échec, jamais une
+-par réussite. Pour un lot :
++| exécution de PR bloquée en `pending` | message ordinaire à l'assigné au-delà de cinq minutes, une fois par exécution et par service ; les exécutions non démarrées du même groupe (même PR, dépôt source et workflow) dont l'essai est prouvé antérieur sont annulées (jamais `main`, `release/…` ni la tête courante) |
++| nouvelle poussée sur la branche | l'exécution précédente, en cours ou déjà annulée, est remplacée ; ses messages **non encore remis** sont retirés sans être montrés (`meta.retire`), un message déjà remis reste ; les workflows d'une même tête gardent chacun leur statut |
++
++La base du rouge hérité est la cible de la PR (sinon main) : la dernière
++exécution conclue relevée **du même workflow** (la migration 0433 nomme les
++lignes antérieures, toutes de l'ancien filtre global `tests.yml`) — deux suites
++étrangères ne se comparent jamais. Une exécution rouge sur main envoie l'urgent à l'assigné
++du lot fusionné (sauf rouge hérité de la fusion précédente) et lève l'alerte
++`ci_main_red` (poussée par défaut, urgente ; elle bloque les déploiements),
++**par workflow et sur la dernière tête conclue** : le succès d'une autre suite
++de la même tête ne masque pas l'échec ; l'alerte est résolue quand cette suite
++repasse au vert sur une tête plus récente.
++
++Le relevé garde sa mémoire dans `ci_runs` et `ci_test_failures` (migrations
++0055, 0433) : une ligne par exécution suivie (avec son workflow) et une par
++test en échec, jamais une par réussite. Pour un lot :
+ 
+ ```
+ ameesh ci status <lot> [--limit N] [--json]     # schéma ameesh-ci-status/1
+diff --git a/src/ameesh/ci.py b/src/ameesh/ci.py
+index 2b9c1219f..2de3dee12 100644
+--- a/src/ameesh/ci.py
++++ b/src/ameesh/ci.py
+@@ -10,14 +10,34 @@ test en échec au schéma `ameesh-test-event/1` (L161b). `ameesh notify`, sur
+ l'hôte que désigne `github.host` (comme les issues des lots, L126), fait à
+ chaque passage un relevé (`Watcher.tick`) :
+ 
+-1. les exécutions en cours ou en attente du workflow des tests (`WORKFLOWS`) de chaque dépôt
+-   de `github.projects` (une requête par dépôt) ; chacune est rattachée à un
+-   lot : par sa branche (`work_items.branch`, L118), sinon par la ligne
+-   `ameesh-work: <id>` de son commit de tête (une fusion dans main) ;
++1. les exécutions en cours ou en attente des workflows suivis de chaque dépôt
++   de `github.projects` (une requête par dépôt) ; les workflows suivis d'un
++   dépôt sont ceux que déclare `github.projects.<projet>.workflows`, sinon —
++   quand le dépôt ne publie pas `tests.yml` — les workflows actifs découverts
++   (`actions/workflows`) : un dépôt dont les suites portent d'autres noms
++   (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est plus ignoré en
++   silence (#1110). Chaque exécution porte son fichier de workflow, pour que
++   le verdict nomme la suite concernée ; chacune est rattachée à un lot : par
++   sa branche (`work_items.branch`, L118), sinon par la ligne
++   `ameesh-work: <id>` de son commit de tête (une fusion dans main) ; une
++   exécution courte peut naître et finir entre deux passages sans jamais être
++   vue « en cours » : un rattrapage borné des exécutions récemment terminées
++   les découvre, rend leur verdict et réveille l'agent — une seule fois, et
++   jamais pour une tête déjà remplacée (#1110). Tous les états non conclus
++   sont lus, `pending` compris (#1161) : une exécution qui attend un groupe de
++   concurrence derrière une exécution supplantée n'a sinon ni ligne, ni
++   verdict, ni réveil ;
+ 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
+    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
+    pas encore reçus sont retirés sans être montrés ; un message déjà remis
+-   reste, car l'agent a pu agir ;
++   reste, car l'agent a pu agir ; les exécutions non démarrées (`queued`,
++   `pending`) du **même groupe de concurrence** — même PR, même dépôt source,
++   même workflow — dont l'essai est prouvé antérieur à celui de la tête
++   courante sont annulées : jamais sur `main`, sur `release/…`, sur la tête
++   courante, ni sur un essai plus récent (un rerun garde son `id` et augmente
++   `run_attempt` ; sans date d'essai, rien n'est annulé) (#1161) ; une
++   exécution de PR restée `pending` plus de cinq minutes est signalée à
++   l'assigné ;
+ 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
+    chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
+ 4. une exécution qui n'est plus en cours est conclue : verdict.
+@@ -32,7 +52,9 @@ L125 :
+ * échecs suivants : un événement ordinaire par relevé (regroupé par la
+   fenêtre de 90 s du courrier) ;
+ * verdict (vert, ou rouge avec la liste) : un événement ordinaire ; rien pour
+-  une exécution annulée ou remplacée ;
++  une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
++  d'autres workflows de la même tête tournent encore, le dit — un vert de
++  `backend-suite.yml` n'est pas « la CI est verte » ;
+ * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
+   de la base (la cible de la PR, sinon main ; pour main, l'exécution
+   précédente de main) n'est jamais imputé à l'auteur : pas d'urgent, une ligne
+@@ -48,15 +70,37 @@ from __future__ import annotations
+ 
+ import json
+ import time
++from datetime import datetime
+ 
+ from . import storage
+ 
+-#: workflows dont les exécutions sont suivies (nom du fichier)
++#: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
++#: workflow des tests L161 : comportement historique, compatible ameesh.
++#: Un dépôt qui ne le publie pas fait l'objet d'une découverte (#1110).
+ WORKFLOWS = ("tests.yml",)
++#: découverte des workflows d'un dépôt : durée de validité du cache, et délai
++#: avant de réessayer après un échec de l'API
++DISCOVERY_TTL = 3600.0
++DISCOVERY_RETRY = 300.0
+ #: états GitHub d'une exécution pas encore conclue que le relevé lit : une
+ #: exécution en attente d'un runner est vue dès la poussée, avant que
+-#: l'exécution qu'elle remplace soit annulée
+-LIVE_STATUSES = ("in_progress", "queued")
++#: l'exécution qu'elle remplace soit annulée. `pending` — l'exécution attend
++#: son groupe de concurrence (#1161) — est un état non conclu comme les
++#: autres : sans lui, un run bloqué derrière une exécution supplantée reste
++#: invisible, et n'a ni ligne, ni supersession, ni verdict, ni réveil. Les
++#: filtres `requested` et `waiting` sont acceptés par l'API (relevé du
++#: 14/10/2026 : aucun run dans ces états) ; ils sont lus comme les autres.
++LIVE_STATUSES = ("in_progress", "queued", "requested", "waiting", "pending")
++#: états GitHub d'une exécution qui n'a pas démarré : les seuls que le relevé
++#: annule quand une tête plus récente l'a supplantée (#1161)
++CANCELLABLE_STATUSES = ("queued", "pending")
++#: délai au-delà duquel une exécution de PR restée `pending` est signalée à
++#: l'assigné du lot (#1161)
++PENDING_ALERT = 300.0
++#: rattrapage borné des exécutions terminées entre deux passages (#1110) : on
++#: ne remonte pas plus loin que cette fenêtre, pour ne pas rendre de verdicts
++#: anciens après une longue interruption du veilleur
++CATCHUP_WINDOW = 3600.0
+ #: préfixe du nom des check runs publiés par `scripts/ci-flow.py publish`
+ CHECK_PREFIX = "tests (flux)"
+ SCHEMA = "ameesh-test-event/1"
+@@ -82,6 +126,100 @@ class CiError(RuntimeError):
+ # lecture des check runs
+ # --------------------------------------------------------------------------
+ 
++def workflow_of(path: str | None) -> str:
++    """Le fichier de workflow d'une exécution (`…/backend-suite.yml`), ou ""."""
++    return str(path or "").rsplit("/", 1)[-1].strip()
++
++
++def _iso_ts(text: str | None) -> float | None:
++    """Un horodatage ISO 8601 GitHub en secondes epoch, ou `None`."""
++    text = str(text or "").strip()
++    if not text:
++        return None
++    try:
++        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
++    except ValueError:
++        return None
++
++
++def updated_ts(run: dict) -> float | None:
++    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
++    `None` s'il est absent ou illisible."""
++    return _iso_ts(run.get("updated_at") or run.get("created_at") or "")
++
++
++def attempt_ts(run: dict) -> float | None:
++    """L'horodatage du dernier essai d'une exécution (ISO 8601), ou `None` :
++    l'âge d'une exécution qui attend, et la seule preuve d'antériorité entre
++    deux exécutions (#1161). `run_started_at` date l'essai courant — un rerun
++    garde son `run_id`, augmente `run_attempt` et repart à cette date ;
++    `created_at` ne date que le premier essai, donc pour un rerun sans
++    `run_started_at` la date est incertaine et rend `None`."""
++    if int(run.get("run_attempt") or 1) > 1:
++        return _iso_ts(run.get("run_started_at") or "")
++    return _iso_ts(run.get("run_started_at") or run.get("created_at") or "")
++
++
++def protected_branch(branch: str) -> bool:
++    """Une branche que le relevé ne supplante ni n'annule jamais : branche de
++    base (`main`) ou branche de release (`release/…`, canon §2) — #1161."""
++    branch = (branch or "").strip()
++    return branch in BASE_BRANCHES or branch.startswith("release/")
++
++
++def pull_request_run(run: dict) -> bool:
++    """Une exécution de PR : les seules que le relevé annule ou signale
++    (#1161) — une poussée sur la branche de base d'un autre dépôt (`develop`)
++    ou sur une étiquette n'est jamais une PR."""
++    return bool(run.get("pull_requests")) \
++        or (run.get("event") or "").startswith("pull_request")
++
++
++def pr_identity(run: dict) -> tuple[str, tuple[int, ...]] | None:
++    """(dépôt source, numéro(s) de PR) d'une exécution de PR, ou `None` sans
++    preuve. Le groupe de concurrence des workflows d'ameesh est
++    `format('pr-{0}', pull_request.number)` : deux PR de même nom de branche,
++    dans deux dépôts source distincts, ne se supplantent pas (#1161)."""
++    prs = [pr for pr in (run.get("pull_requests") or ()) if isinstance(pr, dict)]
++    numbers = tuple(sorted({int(pr["number"]) for pr in prs
++                            if pr.get("number") is not None}))
++    if not numbers:
++        return None
++    source = str((run.get("head_repository") or {}).get("full_name") or "").strip()
++    if not source:
++        for pr in prs:
++            source = str(((pr.get("head") or {}).get("repo") or {}).get("full_name")
++                         or "").strip()
++            if source:
++                break
++    if not source:
++        return None
++    return (source, numbers)
++
++
++def run_group(run: dict) -> tuple | None:
++    """La clé du groupe de concurrence d'une exécution : (dépôt source,
++    numéro(s) de PR, fichier de workflow). GitHub évalue `concurrency.group`
++    dans le fichier de workflow : deux exécutions ne partagent un groupe que si
++    la PR, son dépôt source et le workflow sont les mêmes. `None` sans cette
++    preuve — le relevé n'annule alors rien (#1161)."""
++    identity = pr_identity(run)
++    if identity is None:
++        return None
++    path = str(run.get("path") or "").strip()
++    return identity + (path or workflow_of(run.get("path")),)
++
++
++def proven_older(candidate: dict, successor: dict) -> bool:
++    """Le candidat est-il **prouvé** antérieur au successeur (#1161) ? L'ordre
++    des `id` ne le prouve pas : un rerun garde son `id` et augmente
++    `run_attempt`, si bien qu'une exécution d'`id` plus petit peut être le
++    dernier essai lancé. Seules deux dates d'essai strictement ordonnées le
++    prouvent ; une date incertaine conserve l'exécution."""
++    before, after = attempt_ts(candidate), attempt_ts(successor)
++    return before is not None and after is not None and before < after
++
++
+ def events_of(check_runs, run_id: int) -> list[dict]:
+     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
+     la sortie des check runs « tests (flux) » d'une tête."""
+@@ -156,8 +294,13 @@ def _short(sha: str) -> str:
+ 
+ def _head(run: dict, lot: dict | None) -> str:
+     where = "lot #%d \"%s\"" % (lot["id"], lot.get("title") or "") if lot else "no lot"
+-    return "CI of %s, head %s on %s (%s)" % (where, _short(run["head_sha"]), run["branch"],
+-                                          run.get("url") or "run %s" % run["run_id"])
++    workflow = workflow_of(run.get("workflow") or run.get("path"))
++    attempt = int(run.get("run_attempt") or 1)
++    return "CI of %s%s, head %s on %s%s (%s)" % (
++        where, " (%s)" % workflow if workflow else "",
++        _short(run["head_sha"]), run["branch"],
++        ", attempt %d" % attempt if attempt > 1 else "",
++        run.get("url") or "run %s" % run["run_id"])
+ 
+ 
+ def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
+@@ -195,30 +338,60 @@ def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bo
+     return "\n".join(lines)
+ 
+ 
+-def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict]) -> str:
+-    """Le message de fin d'une exécution."""
++def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
++                 pending: list[dict] | None = None) -> str:
++    """Le message de fin d'une exécution. `pending` : les autres workflows de
++    la même tête encore en cours — le verdict les nomme, pour qu'un vert d'une
++    suite ne soit pas pris pour un vert de toute la CI (#1110)."""
+     head = _head(run, lot)
+     own = [f for f in failures if not f.get("inherited")]
+     inherited = [f for f in failures if f.get("inherited")]
++    others = sorted({workflow_of(r.get("workflow") or r.get("path")) or "?"
++                     for r in pending or ()
++                     if int(r.get("run_id") or 0) != int(run.get("run_id") or 0)})
+     if status == "success" and not failures:
+-        return "%s: green." % head
+-    lines = []
+-    if status == "success":
+-        lines.append("%s: green, despite failures seen along the way "
+-                     "(retried or tolerated)." % head)
+-    elif not own and inherited:
+-        lines.append("%s: red, but only failures inherited from %s (already red "
+-                     "before your push): nothing is charged to you."
+-                     % (head, run.get("base") or "main"))
+-    elif not failures:
+-        lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
+-                     "timeout or another job): see the run." % head)
++        first = "%s: green." % head
+     else:
+-        lines.append("%s: red, %d failure(s)%s." % (
+-            head, len(own), ", and %d inherited from the base" % len(inherited) if inherited else ""))
+-    lines.append("")
+-    lines += _failure_lines(own + inherited, detail=False)
+-    return "\n".join(lines).rstrip()
++        lines = []
++        if status == "success":
++            lines.append("%s: green, despite failures seen along the way "
++                         "(retried or tolerated)." % head)
++        elif not own and inherited:
++            lines.append("%s: red, but only failures inherited from %s (already red "
++                         "before your push): nothing is charged to you."
++                         % (head, run.get("base") or "main"))
++        elif not failures:
++            lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
++                         "timeout or another job): see the run." % head)
++        else:
++            inherited_note = (", and %d inherited from the base" % len(inherited)
++                              if inherited else "")
++            lines.append("%s: red, %d failure(s)%s." % (head, len(own), inherited_note))
++        lines.append("")
++        lines += _failure_lines(own + inherited, detail=False)
++        first = "\n".join(lines).rstrip()
++    if others:
++        first += ("\n\nOther workflow(s) of this head are still running: %s — their "
++                  "verdicts will follow." % ", ".join(others))
++    return first
++
++
++def pending_text(run: dict, lot: dict | None, waited: float, cancelled: list[int]) -> str:
++    """Le message d'une exécution de PR restée `pending` : elle attend son
++    groupe de concurrence. `cancelled` : les exécutions supplantées non
++    démarrées que le relevé vient d'annuler pour le libérer (#1161)."""
++    head = _head(run, lot)
++    lines = ["%s: pending for %d min — the run is waiting for its concurrency "
++             "group." % (head, max(1, int(waited // 60)))]
++    if cancelled:
++        lines.append("Superseded run(s) of an earlier head were holding it: %s "
++                     "cancelled." % ", ".join(str(i) for i in cancelled))
++    else:
++        lines.append("No superseded run of this pull request can be cancelled: the "
++                     "group is held elsewhere; the run starts when it frees.")
++    lines += ["", "No need to wait for the CI in your turn (gh pr checks --watch): "
++                  "ameesh tells you."]
++    return "\n".join(lines)
+ 
+ 
+ def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
+@@ -267,23 +440,128 @@ class Watcher:
+     journalisée une fois par passage et n'arrête ni les autres dépôts, ni
+     les alertes."""
+ 
+-    def __init__(self, cfg, *, api=None, log=None, clock=None, dry_run: bool = False):
++    def __init__(self, cfg, *, api=None, cancel=None, log=None, clock=None,
++                 dry_run: bool = False):
+         self.cfg = cfg
+         self.api = api
++        #: l'écriture d'annulation GitHub (`repos/<repo>/actions/runs/<id>/cancel`) ;
++        #: None : `gh api -X POST` en production, jamais en test sans le dire
++        self.cancel = cancel
+         self.log = log or (lambda _text: None)
+         self.clock = clock or time.time
+         self.dry_run = bool(dry_run)
+-
+-    def repos(self) -> list[str]:
++        #: découverte des workflows par dépôt : (horodatage, ttl, noms)
++        self._workflows_cache: dict[str, tuple] = {}
++        #: avertissements déjà journalisés par ce passage de service
++        self._warned_workflows: set = set()
++        #: têtes de branche déjà en échec de lecture (une fois par service)
++        self._warned_branches: set = set()
++        #: exécutions `pending` déjà signalées (une fois par service : la
++        #: mémoire de `ci_runs` ne porte pas ce message, additif sans migration)
++        self._pending_alerted: set = set()
++
++    def settings(self):
++        """Les réglages `github` validés, ou None (déjà journalisé)."""
+         from . import plan_github
+         try:
+-            settings = plan_github.settings_of(self.cfg)
++            return plan_github.settings_of(self.cfg)
+         except plan_github.SettingsError:
++            return None
++
++    def repos(self) -> list[str]:
++        settings = self.settings()
++        if settings is None:
+             return []  # déjà journalisé par la projection des issues
+         if not settings.projects or settings.host != getattr(self.cfg, "host", None):
+             return []
+         return sorted(set(settings.projects.values()))
+ 
++    def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
++        """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
++        l'API ne répond pas. Le résultat est gardé : une découverte par heure,
++        une nouvelle tentative après un échec."""
++        now = float(self.clock())
++        cached = self._workflows_cache.get(repo)
++        if cached is not None and now - cached[0] < cached[1]:
++            return cached[2]
++        ttl, found = DISCOVERY_TTL, None
++        try:
++            data = self.api("repos/%s/actions/workflows?per_page=100" % repo) or {}
++            files = []
++            for item in data.get("workflows") or ():
++                if str(item.get("state") or "active") != "active":
++                    continue
++                name = workflow_of(item.get("path"))
++                if name and name not in files:
++                    files.append(name)
++            found = tuple(sorted(files))
++        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
++            ttl = DISCOVERY_RETRY
++            self.log("CI %s: workflow discovery failed (%s)"
++                     % (repo, " ".join(str(exc).split())[:200]))
++        self._workflows_cache[repo] = (now, ttl, found)
++        return found
++
++    def followed_workflows(self, repo: str) -> tuple[str, ...]:
++        """Les workflows suivis d'un dépôt : la liste déclarée
++        (`github.projects.<projet>.workflows`) si elle existe, sinon le défaut
++        L161 tant que le dépôt publie `tests.yml`, sinon les workflows actifs
++        découverts — un dépôt dont les suites portent d'autres noms n'est
++        jamais ignoré en silence (#1110)."""
++        settings = self.settings()
++        declared = settings.workflows_for(repo) if settings else None
++        found = self.discovered_workflows(repo)
++        if declared is not None:
++            missing = tuple(w for w in declared if found is not None and w not in found)
++            if missing and (repo, missing) not in self._warned_workflows:
++                self._warned_workflows.add((repo, missing))
++                self.log("CI %s: workflow(s) declared in github.projects but absent "
++                         "from the repository: %s" % (repo, ", ".join(missing)))
++            return declared
++        if not found:
++            return WORKFLOWS
++        if WORKFLOWS[0] in found:
++            return WORKFLOWS
++        return found
++
++    def branch_head(self, repo: str, branch: str) -> str | None:
++        """La tête de `branch` selon GitHub, ou None (API muette, branche
++        disparue) : elle prouve quelle exécution de la branche n'est pas
++        supplantée, avant toute annulation (#1161)."""
++        try:
++            data = self.api("repos/%s/branches/%s" % (repo, branch)) or {}
++        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
++            if (repo, branch) not in self._warned_branches:
++                self._warned_branches.add((repo, branch))
++                self.log("CI %s: head of branch %s unreadable (%s)"
++                         % (repo, branch, " ".join(str(exc).split())[:200]))
++            return None
++        sha = str(((data.get("commit") or {}).get("sha")) or "").strip()
++        return sha or None
++
++    def cancel_run(self, repo: str, run_id: int) -> bool:
++        """Annule une exécution GitHub **non démarrée** (`queued`/`pending`)
++        dont l'essai est prouvé antérieur à celui de la tête courante du même
++        groupe de concurrence : elle retient la tête courante (#1161).
++        Idempotent : une exécution déjà conclue n'est pas annulée ; une erreur
++        de l'API est journalisée et rend False, sans toucher à la base ni
++        rendre de verdict."""
++        try:
++            run = self.api("repos/%s/actions/runs/%s" % (repo, run_id)) or {}
++            if (run.get("status") or "") not in CANCELLABLE_STATUSES:
++                return False
++            if self.cancel is None:
++                from . import plan_github
++                plan_github._json(plan_github.Gh(), [
++                    "api", "-X", "POST", "repos/%s/actions/runs/%s/cancel" % (repo, run_id)])
++            else:
++                self.cancel(repo, int(run_id))
++            return True
++        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
++            self.log("CI %s: cancel of run %s failed (%s)"
++                     % (repo, run_id, " ".join(str(exc).split())[:200]))
++            return False
++
+     def tick(self, db) -> list[dict]:
+         """Un relevé de chaque dépôt ; rend les envois et retraits."""
+         repos = self.repos()
+@@ -302,20 +580,84 @@ class Watcher:
+     # -- un dépôt --------------------------------------------------------------
+     def watch(self, db, repo: str) -> list[dict]:
+         st = storage.of(db)
++        followed = set(self.followed_workflows(repo))
+         live = {}
+         for status in LIVE_STATUSES:
+             data = self.api("repos/%s/actions/runs?status=%s&per_page=50" % (repo, status)) or {}
+             for r in data.get("workflow_runs") or ():
+-                if str(r.get("path") or "").rsplit("/", 1)[-1] in WORKFLOWS:
++                if workflow_of(r.get("path")) in followed:
+                     live.setdefault(int(r["id"]), r)
+         lots = [r for r in st.work.open_for_sweep(500) if r.get("branch")]
+         out: list[dict] = []
+         for run_id in sorted(live):
+             out += self._follow(db, repo, live[run_id], lots)
+-        for row in st.ci.running(repo):
++        # les exécutions de PR bloquées en `pending` : les exécutions non
++        # démarrées d'une tête supplantée retiennent le groupe de concurrence,
++        # elles sont annulées ; la tête courante qui attend est signalée (#1161)
++        out += self._unblock(db, repo, live, lots)
++        # les exécutions courtes, nées et finies entre deux passages, n'ont
++        # jamais été vues « en cours » : rattrapage borné (#1110)
++        out += self._catch_up(db, repo, lots, followed)
++        # les lignes que ce passage conclut sont figées AVANT les envois : le
++        # verdict d'un workflow ne cite pas comme « encore en cours » un
++        # workflow conclu dans le même passage (#1110)
++        running = st.ci.running(repo)
++        finishing: dict[int, dict] = {}
++        for row in running:
++            if int(row["run_id"]) in live:
++                continue
++            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
++            if (run.get("status") or "") == "completed":
++                finishing[int(row["run_id"])] = run
++        for row in running:
++            out += self._failures(db, repo, row)
++            run = finishing.get(int(row["run_id"]))
++            if run is None:
++                continue
++            others = [r for r in running if int(r["run_id"]) not in finishing
++                      and int(r["run_id"]) != int(row["run_id"])
++                      and r.get("head_sha") == row.get("head_sha")
++                      and r.get("branch") == row.get("branch")]
++            out += self._conclude(db, repo, row, run=run, pending=others)
++        return out
++
++    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
++        """Les exécutions terminées entre deux passages (#1110) : une exécution
++        courte n'est jamais vue « en cours », donc jamais conclue sans ce
++        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
++        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
++        la même branche est ignorée (pas de verdict périmé)."""
++        st = storage.of(db)
++        data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
++        runs = list(data.get("workflow_runs") or ())
++        # les exécutions que ce passage conclut (relevé normal compris) sont
++        # figées AVANT les envois : un verdict du rattrapage ne cite pas comme
++        # « encore en cours » un workflow conclu dans le même passage (#1110)
++        settled = {int(r["id"]) for r in runs}
++        now = float(self.clock())
++        out: list[dict] = []
++        for run in runs:
++            if workflow_of(run.get("path")) not in followed:
++                continue
++            run_id = int(run["id"])
++            if st.ci.run(repo, run_id) is not None:
++                continue
++            updated = updated_ts(run)
++            if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
++                continue
++            head = run.get("head_sha") or ""
++            branch = run.get("head_branch") or ""
++            if st.ci.head_replaced(repo, branch, head, run_id):
++                continue
++            out += self._follow(db, repo, run, lots)
++            row = st.ci.run(repo, run_id)
++            if row is None or (run.get("status") or "") != "completed":
++                continue
+             out += self._failures(db, repo, row)
+-            if int(row["run_id"]) not in live:
+-                out += self._conclude(db, repo, row)
++            pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
++                       and r.get("branch") == branch
++                       and int(r["run_id"]) not in settled]
++            out += self._conclude(db, repo, row, run=run, pending=pending)
+         return out
+ 
+     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
+@@ -329,7 +671,7 @@ class Watcher:
+         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
+                        branch=run.get("head_branch") or "", event=run.get("event") or "",
+                        base=base_of(run), work_item_id=lot_of_run(run, lots),
+-                       url=run.get("html_url"))
++                       url=run.get("html_url"), workflow=workflow_of(run.get("path")))
+         branch = run.get("head_branch") or ""
+         if not branch or branch in BASE_BRANCHES:
+             return []
+@@ -345,6 +687,99 @@ class Watcher:
+                             "by": run.get("head_sha"), "withdrawn": withdrawn})
+         return out
+ 
++    def _unblock(self, db, repo: str, live: dict[int, dict], lots: list[dict]) -> list[dict]:
++        """Les exécutions de PR qui attendent leur groupe de concurrence
++        (#1161). Un groupe — même PR, même dépôt source, même workflow — est
++        retenu par les exécutions non démarrées d'un essai antérieur : le
++        relevé les annule, jamais `main`, `release/…`, jamais la tête courante,
++        jamais un essai dont l'antériorité n'est pas prouvée (un rerun reste,
++        #901). La tête courante restée `pending` au-delà de PENDING_ALERT est
++        signalée à l'assigné du lot."""
++        groups: dict[tuple, list[dict]] = {}
++        for run in live.values():
++            branch = run.get("head_branch") or ""
++            if not branch or protected_branch(branch) or not pull_request_run(run):
++                continue
++            key = run_group(run)
++            if key is None:
++                continue  # PR, dépôt source ou workflow non prouvés : jamais annulé
++            groups.setdefault(key, []).append(run)
++        now = float(self.clock())
++        out: list[dict] = []
++        heads: dict[str, str | None] = {}
++        for key in sorted(groups):
++            runs = groups[key]
++            branch = runs[0].get("head_branch") or ""
++            if len({r.get("head_sha") or "" for r in runs}) < 2 \
++                    and not any((r.get("status") or "") == "pending" for r in runs):
++                continue  # une seule tête visible : rien à libérer ni à signaler
++            if branch not in heads:
++                heads[branch] = self.branch_head(repo, branch)
++            head = heads[branch]
++            if not head:
++                continue  # tête courante non prouvée : ni annulation, ni signal
++            successors = [r for r in runs if (r.get("head_sha") or "") == head]
++            if not successors:
++                continue  # aucun essai de la tête courante dans ce groupe
++            successor = max(successors,
++                            key=lambda r: (attempt_ts(r) or 0.0, int(r["id"])))
++            cancelled: list[int] = []
++            for run in sorted(runs, key=lambda r: int(r["id"])):
++                if (run.get("head_sha") or "") == head:
++                    continue
++                if (run.get("status") or "") not in CANCELLABLE_STATUSES:
++                    continue
++                if not proven_older(run, successor):
++                    continue  # antériorité non prouvée : l'exécution est conservée
++                run_id = int(run["id"])
++                if self.cancel_run(repo, run_id):
++                    cancelled.append(run_id)
++                    out.append({"action": "cancelled", "repo": repo, "run_id": run_id,
++                                "head_sha": run.get("head_sha"), "branch": branch,
++                                "for": int(successor["id"]), "by": head})
++            for run in sorted(runs, key=lambda r: int(r["id"])):
++                if (run.get("status") or "") != "pending" \
++                        or (run.get("head_sha") or "") != head:
++                    continue  # une tête supplantée qui attend : annulée ci-dessus
++                out += self._alert_pending(db, repo, run, lots, cancelled, now)
++        return out
++
++    def _alert_pending(self, db, repo: str, run: dict, lots: list[dict],
++                       cancelled: list[int], now: float) -> list[dict]:
++        """Signale à l'assigné une exécution de la tête courante restée
++        `pending` plus de PENDING_ALERT (groupe de concurrence, #1161) : une
++        fois par exécution et par vie du service — `ci_runs` ne porte pas ce
++        message, l'additif #1161 reste sans migration."""
++        from . import work
++        key = (repo, int(run["id"]))
++        if key in self._pending_alerted:
++            return []
++        started = attempt_ts(run)
++        if started is None or now - started < PENDING_ALERT:
++            return []
++        self._pending_alerted.add(key)
++        waited = now - started
++        item_id = lot_of_run(run, lots)
++        lot = work.get(db, int(item_id)) if item_id else None
++        to = recipient_of(lot)
++        if not to:
++            return [{"action": "pending", "repo": repo, "run_id": int(run["id"]),
++                     "to": None, "waited_s": int(waited), "cancelled": list(cancelled)}]
++        # la forme des lignes `ci_runs` : `branch`, `run_id`, `url` — les textes
++        # lisent l'exécution comme le reste du relevé
++        view = dict(run, run_id=int(run["id"]), branch=run.get("head_branch") or "",
++                    url=run.get("html_url") or run.get("url"),
++                    workflow=workflow_of(run.get("path")))
++        text = pending_text(view, lot, waited, cancelled)
++        payload = {"ci": {"repo": repo, "run_id": int(run["id"]),
++                          "head_sha": run.get("head_sha"), "branch": run.get("head_branch"),
++                          "kind": "pending", "workflow": workflow_of(run.get("path")),
++                          "waited_s": int(waited), "cancelled": list(cancelled)}}
++        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
++        return [{"action": "pending", "repo": repo, "run_id": int(run["id"]), "to": to,
++                 "waited_s": int(waited), "cancelled": list(cancelled),
++                 "message_id": message_id}]
++
+     def _failures(self, db, repo: str, row: dict) -> list[dict]:
+         """Les échecs nouveaux d'une exécution suivie, et leur message."""
+         from . import work
+@@ -354,7 +789,9 @@ class Watcher:
+         events = events_of(checks.get("check_runs"), int(row["run_id"]))
+         if not events:
+             return []
+-        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0])
++        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
++                                        workflow=row.get("workflow")
++                                        or workflow_of(row.get("path")))
+         if reference and int(reference["run_id"]) == int(row["run_id"]):
+             reference = {}
+         # aucune exécution conclue de la base relevée (juste après le
+@@ -388,6 +825,7 @@ class Watcher:
+                              detail=False)
+         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
+                           "branch": row["branch"], "kind": "failure",
++                          "workflow": row.get("workflow") or workflow_of(row.get("path")),
+                           "tests": [f["test"] for f in own]}}
+         if unknown_base:
+             payload["ci_passif"] = True
+@@ -401,11 +839,15 @@ class Watcher:
+                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
+                  "message_id": message_id}]
+ 
+-    def _conclude(self, db, repo: str, row: dict) -> list[dict]:
+-        """Une exécution qui n'est plus en cours : son verdict."""
++    def _conclude(self, db, repo: str, row: dict, *, run: dict | None = None,
++                  pending: list[dict] | None = None) -> list[dict]:
++        """Une exécution qui n'est plus en cours : son verdict. `run` : son
++        dernier état GitHub, déjà relevé ; `pending` : les autres workflows de
++        la même tête encore en cours, que le verdict nomme."""
+         from . import work
+         st = storage.of(db)
+-        run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
++        if run is None:
++            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+         if (run.get("status") or "") != "completed":
+             return []  # en attente d'un runner, ou relancée : au prochain relevé
+         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+@@ -420,9 +862,15 @@ class Watcher:
+         if not to:
+             return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
+                      "status": status, "to": None}]
+-        text = verdict_text(row, lot, status, failures)
++        # le verdict situe la suite : fichier du workflow et attempt du dernier
++        # état GitHub, quand la ligne ne les porte pas encore (#901, #1110)
++        view = dict(row, run_attempt=run.get("run_attempt") or row.get("run_attempt") or 1,
++                    path=run.get("path") or row.get("path") or "")
++        text = verdict_text(view, lot, status, failures, pending=pending)
+         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
+                           "branch": row["branch"], "kind": "verdict", "status": status,
++                          "workflow": view.get("workflow") or workflow_of(view.get("path")),
++                          "attempt": int(view.get("run_attempt") or 1),
+                           "failures": len([f for f in failures if not f.get("inherited")]),
+                           "inherited": len([f for f in failures if f.get("inherited")])}}
+         message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
+@@ -437,10 +885,15 @@ def describe(record: dict) -> str:
+     if record["action"] == "superseded":
+         return "%s superseded by %s; %d unread message(s) withdrawn" % (
+             where, _short(record.get("by") or ""), len(record.get("withdrawn") or ()))
++    if record["action"] == "cancelled":
++        return "%s: superseded run cancelled to free the concurrency group (for run %s)" % (
++            where, record.get("for"))
+     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
+         if record.get("to") else "(no recipient)"
+     if record["action"] == "failures":
+         return "%s: %d failure(s) %s" % (where, len(record.get("tests") or ()), to)
++    if record["action"] == "pending":
++        return "%s: pending %d min %s" % (where, int(record.get("waited_s") or 0) // 60, to)
+     return "%s: verdict %s %s" % (where, record.get("status"), to)
+ 
+ 
+@@ -449,7 +902,9 @@ def describe(record: dict) -> str:
+ # --------------------------------------------------------------------------
+ 
+ def main_red(db) -> list[dict]:
+-    """Les dernières exécutions conclues des branches de base qui sont rouges :
++    """Les dernières exécutions conclues des branches de base qui sont rouges,
++    **par workflow** : sur la dernière tête conclue de la branche, un succès
++    d'une suite ne masque pas l'échec d'une autre (#1110).
+     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
+     st = storage.of(db)
+     out = []
+@@ -497,8 +952,9 @@ def render_status(report: dict) -> list[str]:
+             state += " by %s" % _short(run["superseded_by"])
+         own = [f for f in run["failures"] if not f.get("inherited")]
+         inherited = len(run["failures"]) - len(own)
+-        lines.append("  %s  %s  %s  %s%s%s" % (
+-            local_time(run["first_seen_ts"]), _short(run["head_sha"]), state,
++        lines.append("  %s  %s  %s  %s  %s%s%s" % (
++            local_time(run["first_seen_ts"]), _short(run["head_sha"]),
++            run.get("workflow") or "—", state,
+             "%d failure(s)" % len(own), ", %d inherited" % inherited if inherited else "",
+             "  %s" % run["url"] if run.get("url") else ""))
+         for f in own[:10]:
+diff --git a/src/ameesh/exploitation.py b/src/ameesh/exploitation.py
+index 52bd2f55f..282f05364 100644
+--- a/src/ameesh/exploitation.py
++++ b/src/ameesh/exploitation.py
+@@ -642,24 +642,29 @@ def _credentials(db, now: float, warn_s: float | None = None) -> list[dict]:
+ 
+ 
+ def _ci_main_red(db) -> list[dict]:
+-    """`ci_main_red` (L161c) : la dernière exécution conclue de la CI sur une
+-    branche de base (main) est rouge, d'après le relevé de `ameesh notify`
+-    (`ci.main_red`). Elle bloque les déploiements : poussée au responsable
+-    humain, au nom de l'assigné du lot fusionné (ligne `ameesh-work:`)."""
++    """`ci_main_red` (L161c) : une exécution conclue de la CI sur la dernière
++    tête d'une branche de base (main) est rouge, d'après le relevé de
++    `ameesh notify` (`ci.main_red`), **par workflow** : un succès d'une autre
++    suite de la même tête ne masque pas l'échec. Elle bloque les déploiements :
++    poussée au responsable humain, au nom de l'assigné du lot fusionné (ligne
++    `ameesh-work:`)."""
+     from . import ci, work
+     out = []
+     for run in ci.main_red(db):
+         lot = work.get(db, int(run["work_item_id"])) if run.get("work_item_id") else None
+         tests = run.get("tests") or []
++        workflow = run.get("workflow") or ""
+         out.append(_alert(
+             "ci_main_red", (lot or {}).get("assignee") or None, run.get("concluded_ts"),
+             len(tests), 0,
+-            "CI red on %s (%s, head %s)%s%s" % (
+-                run["branch"], run["repo"], (run.get("head_sha") or "")[:10],
++            "CI red on %s (%s%s, head %s)%s%s" % (
++                run["branch"], run["repo"], ", %s" % workflow if workflow else "",
++                (run.get("head_sha") or "")[:10],
+                 " : " + ", ".join(tests[:5]) + (" …" if len(tests) > 5 else "") if tests
+                 else "", " — %s" % run["url"] if run.get("url") else ""),
+             lot=int(run["work_item_id"]) if run.get("work_item_id") else None,
+-            title=(lot or {}).get("title"), reason="%s:%s" % (run["repo"], run["branch"])))
++            title=(lot or {}).get("title"),
++            reason="%s:%s:%s" % (run["repo"], run["branch"], workflow)))
+     return out
+ 
+ 
+diff --git a/src/ameesh/mediated_executor/contract.json b/src/ameesh/mediated_executor/contract.json
+index d34eafe01..414966f29 100644
+--- a/src/ameesh/mediated_executor/contract.json
++++ b/src/ameesh/mediated_executor/contract.json
+@@ -3773,7 +3773,7 @@
+   }
+  ],
+  "refused": {
+-  "interface_total": 385,
++  "interface_total": 386,
+   "reasons": {
+    "accounts": "hors du sous-ensemble de l'exécuteur médié",
+    "action_source": "autorité (0012)",
+@@ -3916,6 +3916,7 @@
+     "conclude",
+     "failures",
+     "for_lot",
++    "head_replaced",
+     "latest_concluded",
+     "message_ids",
+     "open_run",
+diff --git a/src/ameesh/migrations/0433_ci_runs_workflow.sql b/src/ameesh/migrations/0433_ci_runs_workflow.sql
+new file mode 100644
+index 000000000..a11ef1b8f
+--- /dev/null
++++ b/src/ameesh/migrations/0433_ci_runs_workflow.sql
+@@ -0,0 +1,27 @@
++-- SPDX-License-Identifier: AGPL-3.0-only
++-- 0433_ci_runs_workflow — #1110 : une exécution suivie porte son workflow.
++--
++-- Le relevé de CI ne suivait qu'un nom de workflow, `tests.yml`, pour tous les
++-- dépôts de `github.projects`. Un dépôt dont les suites portent d'autres noms
++-- (nexlink : `backend-suite.yml`, `website-suite.yml`, `scripts-suite.yml`,
++-- `sql-invariant.yml`…) n'était donc jamais relevé : ni suivi des exécutions,
++-- ni verdict, ni réveil de l'agent en fin de CI.
++--
++-- Le suivi devient une liste par projet (`github.projects.<projet>.workflows`),
++-- découverte par défaut dans le dépôt quand `tests.yml` n'y est pas publié.
++-- `ci_runs.workflow` porte le fichier du workflow de chaque exécution : le
++-- verdict nomme la suite concernée (un vert de `backend-suite.yml` n'est pas
++-- « la CI est verte ») et `ameesh ci status` distingue les workflows d'une
++-- même tête. Plusieurs exécutions d'une même tête gardent chacune leur ligne
++-- et leur statut.
++--
++-- Additif : une colonne avec défaut, aucun retrait, aucune contrainte
++-- resserrée. Les lignes déjà relevées ne pouvaient être que des exécutions de
++-- `tests.yml` (le filtre global d'avant #1110) : elles sont nommées, pour que
++-- la référence du rouge hérité (`base_failures`) ne compare jamais deux suites
++-- étrangères.
++
++alter table ci_runs
++    add column if not exists workflow text not null default '';
++
++update ci_runs set workflow = 'tests.yml' where workflow = '';
+diff --git a/src/ameesh/plan_github.py b/src/ameesh/plan_github.py
+index cec07ad74..17126bdef 100644
+--- a/src/ameesh/plan_github.py
++++ b/src/ameesh/plan_github.py
+@@ -786,7 +786,11 @@ BODY_MAX = 30000
+ SUMMARY_MAX = 300
+ #: clé `github` de la configuration de l'hôte : clés admises, cadence
+ SETTINGS_KEYS = ("projects", "host", "interval", "exclude_terms")
+-PROJECT_KEYS = ("repo",)
++#: forme longue d'un projet : `repo`, et les workflows suivis par le veilleur
++#: de CI (#1110, `ci.Watcher`)
++PROJECT_KEYS = ("repo", "workflows")
++#: suffixes admis pour un fichier de workflow (`.github/workflows/…`)
++WORKFLOW_SUFFIXES = (".yml", ".yaml")
+ DEFAULT_INTERVAL = 300.0
+ MIN_INTERVAL = 60.0
+ #: cache de la visibilité d'un dépôt (secondes) ; un dépôt illisible vaut
+@@ -837,6 +841,9 @@ class Settings:
+     interval: float = DEFAULT_INTERVAL
+     #: termes que l'organisation ne publie jamais (noms de clients…), sans casse
+     exclude_terms: tuple = ()
++    #: {dépôt: (fichiers de workflow, …)} — les workflows que le veilleur de CI
++    #: suit dans ce dépôt (#1110) ; sans entrée, il découvre ceux du dépôt
++    workflows: dict = field(default_factory=dict)
+ 
+     def project_name(self, project: str | None) -> str | None:
+         """Le nom configuré d'un projet (sans casse), ou None."""
+@@ -849,6 +856,14 @@ class Settings:
+         name = self.project_name(project)
+         return self.projects[name] if name else None
+ 
++    def workflows_for(self, repo: str | None) -> tuple | None:
++        """Les workflows déclarés pour un dépôt, ou None (découverte)."""
++        key = (repo or "").strip().casefold()
++        if not key:
++            return None
++        return next((tuple(files) for name, files in self.workflows.items()
++                     if name.casefold() == key), None)
++
+ 
+ def parse_settings(raw) -> Settings:
+     """Valide la clé `github` (SettingsError : message actionnable)."""
+@@ -865,6 +880,7 @@ def parse_settings(raw) -> Settings:
+     if not isinstance(declared, dict):
+         raise SettingsError("`github.projects`: object {\"project\": \"owner/repo\"} expected")
+     projects: dict = {}
++    workflows: dict = {}
+     for name, value in declared.items():
+         name = str(name).strip()
+         where = "`github.projects.%s`" % name
+@@ -872,15 +888,33 @@ def parse_settings(raw) -> Settings:
+             raise SettingsError("`github.projects`: empty project name")
+         if any(other.casefold() == name.casefold() for other in projects):
+             raise SettingsError("%s: project declared twice (case-insensitive)" % where)
++        files = None
+         if isinstance(value, dict):
+             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
+             if extra:
+                 raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
+                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
++            files = value.get("workflows")
+             value = value.get("repo")
+         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
+             raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
+         projects[name] = value.strip()
++        if files is not None:
++            where = "%s.workflows" % where
++            if not isinstance(files, list) or not files:
++                raise SettingsError("%s: non-empty list of workflow file names expected" % where)
++            names = []
++            for item in files:
++                if not isinstance(item, str) or not item.strip():
++                    raise SettingsError("%s: workflow file name expected, not %r" % (where, item))
++                filename = item.strip().rsplit("/", 1)[-1]
++                if not filename.endswith(WORKFLOW_SUFFIXES):
++                    raise SettingsError("%s: %r is not a workflow file name (…%s)"
++                                        % (where, item, "/".join(WORKFLOW_SUFFIXES)))
++                if filename not in names:
++                    names.append(filename)
++            key = projects[name]
++            workflows[key] = tuple(dict.fromkeys(workflows.get(key, ()) + tuple(names)))
+     host = raw.get("host")
+     if host is not None and not isinstance(host, str):
+         raise SettingsError("`github.host`: host name expected")
+@@ -895,7 +929,8 @@ def parse_settings(raw) -> Settings:
+         raise SettingsError("`github.exclude_terms`: list of non-empty terms expected")
+     return Settings(projects=projects, host=(host or "").strip() or None,
+                     interval=float(interval),
+-                    exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)))
++                    exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
++                    workflows=workflows)
+ 
+ 
+ def settings_of(cfg) -> Settings:
+diff --git a/src/ameesh/storage/interface.py b/src/ameesh/storage/interface.py
+index 656ed14b3..47abcc240 100644
+--- a/src/ameesh/storage/interface.py
++++ b/src/ameesh/storage/interface.py
+@@ -2809,8 +2809,10 @@ class CiResults(Domain):
+ 
+     @abc.abstractmethod
+     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
+-                 base: str, work_item_id: int | None, url: str | None) -> dict:
+-        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
++                 base: str, work_item_id: int | None, url: str | None,
++                 workflow: str = "") -> dict:
++        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend.
++        `workflow` : le fichier de workflow qui l'a produite (#1110)."""
+ 
+     @abc.abstractmethod
+     def running(self, repo: str) -> list[dict]:
+@@ -2846,9 +2848,12 @@ class CiResults(Domain):
+         """Note le message qui a signalé ces échecs (`(part, test)`)."""
+ 
+     @abc.abstractmethod
+-    def base_failures(self, repo: str, branch: str) -> dict:
+-        """Dernière exécution conclue (verte ou rouge) de `branch` :
+-        `{run_id, head_sha, tests}` (tests en échec), ou {} sans exécution."""
++    def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
++        """Dernière exécution conclue (verte ou rouge) de `branch` **pour ce
++        workflow** : `{run_id, head_sha, tests}` (tests en échec), ou {} sans
++        exécution. Le workflow évite de comparer deux suites étrangères ; les
++        lignes antérieures à la migration 0433, toutes de l'ancien filtre
++        global `tests.yml`, y sont nommées."""
+ 
+     @abc.abstractmethod
+     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
+@@ -2860,8 +2865,14 @@ class CiResults(Domain):
+ 
+     @abc.abstractmethod
+     def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
+-        """Par dépôt et par branche parmi `branches`, la dernière exécution
+-        conclue verte ou rouge."""
++        """Par dépôt, branche et workflow, sur la dernière tête conclue de la
++        branche, l'exécution conclue verte ou rouge la plus récente."""
++
++    @abc.abstractmethod
++    def head_replaced(self, repo: str, branch: str, head_sha: str, run_id: int) -> bool:
++        """Vrai si une autre tête de cette branche a été vue après cette
++        exécution (une exécution de `run_id` supérieur) : son verdict serait
++        périmé."""
+ 
+ 
+ class Handoffs(Domain):
+diff --git a/src/ameesh/storage/postgres/ci.py b/src/ameesh/storage/postgres/ci.py
+index 9b1310167..ac4a5a3aa 100644
+--- a/src/ameesh/storage/postgres/ci.py
++++ b/src/ameesh/storage/postgres/ci.py
+@@ -9,6 +9,7 @@ from .. import interface
+ 
+ RUN_COLUMNS = """
+     repo, run_id, head_sha, branch, event, base, work_item_id, status, superseded_by, url,
++    workflow,
+     extract(epoch from first_seen_at)::float8 AS first_seen_ts,
+     extract(epoch from concluded_at)::float8 AS concluded_ts,
+     urgent_message_id, verdict_message_id
+@@ -33,17 +34,20 @@ class CiResults(interface.CiResults):
+         return rows[0] if rows else None
+ 
+     def open_run(self, repo, run_id, *, head_sha, branch, event, base, work_item_id,
+-                 url) -> dict:
++                 url, workflow="") -> dict:
+         rows = self.db.query(
+             """
+-            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id, url)
+-            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
++            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id,
++                                 url, workflow)
++            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
+             ON CONFLICT (repo, run_id) DO UPDATE
+-               SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id)
++               SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id),
++                   workflow = coalesce(nullif(excluded.workflow, ''), ci_runs.workflow)
+             RETURNING %s
+             """ % RUN_COLUMNS,
+             (repo, int(run_id), head_sha, branch, event or "", base or "main",
+-             int(work_item_id) if work_item_id is not None else None, url))
++             int(work_item_id) if work_item_id is not None else None, url,
++             workflow or ""))
+         return rows[0]
+ 
+     def running(self, repo) -> list[dict]:
+@@ -107,18 +111,21 @@ class CiResults(interface.CiResults):
+                 " WHERE repo = %s AND run_id = %s AND part = %s AND test = %s",
+                 (int(message_id), repo, int(run_id), part, test))
+ 
+-    def base_failures(self, repo, branch) -> dict:
++    def base_failures(self, repo, branch, *, workflow="") -> dict:
++        # strictement la même suite : les lignes antérieures à la migration
++        # 0433, toutes de `tests.yml`, y sont nommées (#1110, R1 P2-2)
+         rows = self.db.query(
+             """
+             WITH last AS (
+                 SELECT run_id, head_sha FROM ci_runs
+                  WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
++                   AND workflow = %s
+                  ORDER BY concluded_at DESC, run_id DESC LIMIT 1
+             )
+             SELECT last.run_id, last.head_sha, f.test
+               FROM last LEFT JOIN ci_test_failures f
+                 ON f.repo = %s AND f.run_id = last.run_id
+-            """, (repo, branch, repo))
++            """, (repo, branch, workflow or "", repo))
+         if not rows:
+             return {}
+         return {"run_id": rows[0]["run_id"], "head_sha": rows[0]["head_sha"],
+@@ -144,14 +151,31 @@ class CiResults(interface.CiResults):
+             " ORDER BY first_seen_at DESC, run_id DESC LIMIT %%s" % RUN_COLUMNS,
+             (int(work_item_id), int(limit)))
+ 
++    def head_replaced(self, repo, branch, head_sha, run_id) -> bool:
++        rows = self.db.query(
++            """
++            SELECT 1 FROM ci_runs
++             WHERE repo = %s AND branch = %s AND head_sha <> %s AND run_id > %s
++             LIMIT 1
++            """, (repo, branch, head_sha or "", int(run_id)))
++        return bool(rows)
++
+     def latest_concluded(self, branches) -> list[dict]:
+         if not branches:
+             return []
+         return self.db.query(
+             """
+-            SELECT DISTINCT ON (repo, branch) %s
++            WITH current AS (
++                SELECT DISTINCT ON (repo, branch) repo, branch, head_sha
++                  FROM ci_runs
++                 WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
++                   AND status IN ('success', 'failure')
++                 ORDER BY repo, branch, run_id DESC
++            )
++            SELECT DISTINCT ON (repo, branch, workflow) %s
+               FROM ci_runs
+-             WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
++             WHERE (repo, branch, head_sha) IN
++                   (SELECT repo, branch, head_sha FROM current)
+                AND status IN ('success', 'failure')
+-             ORDER BY repo, branch, concluded_at DESC, run_id DESC
++             ORDER BY repo, branch, workflow, concluded_at DESC, run_id DESC
+             """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
+diff --git a/tests/parts/pilote-psql.txt b/tests/parts/pilote-psql.txt
+index b977d1e0b..47c19faed 100644
+--- a/tests/parts/pilote-psql.txt
++++ b/tests/parts/pilote-psql.txt
+@@ -35,6 +35,7 @@ test_l160d_resolutions  # stockage : résolutions préparées (text[] passé en
+ test_l160e2_land  # stockage : bail de fusion par cible (upsert conditionnel, intervalle lié en secondes, époque) (L160e2)
+ test_l160e_merge_queue  # stockage : file de fusion (upsert, rang NULL à l'éjection, booléen lié, jointure work_items) (L160e)
+ test_l160g_migration_reservations  # L160g: atomic legacy imports and repository-scoped radar
++test_l161c_failures_realtime  # stockage : ci_runs/ci_test_failures, migration 0433, verdicts multi-workflows (#1110)
+ test_l162_tmpfs  # stockage : signalements de /tmp filtrés par `kind` (housekeeping.recent, L162)
+ test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS sur décisions et jalons (booléens) (L165)
+ test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
+diff --git a/tests/test_l126_issues.py b/tests/test_l126_issues.py
+index 6d5e488b9..9328af636 100644
+--- a/tests/test_l126_issues.py
++++ b/tests/test_l126_issues.py
+@@ -54,6 +54,20 @@ class SettingsTest(unittest.TestCase):
+         cfg = dataclasses.make_dataclass("Cfg", [("github", dict)])(github={})
+         self.assertEqual(plan_github.settings_of(cfg), plan_github.Settings())
+ 
++    def test_workflows_declares(self):
++        """#1110 : les workflows suivis d'un dépôt se déclarent par projet."""
++        settings = plan_github.parse_settings({"projects": {"app": {
++            "repo": PRIVATE,
++            "workflows": [".github/workflows/backend-suite.yml", "sql-invariant.yaml",
++                          "backend-suite.yml"]}}})
++        self.assertEqual(settings.workflows_for(PRIVATE),
++                         ("backend-suite.yml", "sql-invariant.yaml"))
++        self.assertEqual(settings.workflows_for(PRIVATE.upper()), settings.workflows_for(PRIVATE))
++        self.assertIsNone(settings.workflows_for(PUBLIC))
++        self.assertIsNone(settings.workflows_for(""))
++        # forme courte : aucune liste déclarée, le veilleur découvre
++        self.assertIsNone(plan_github.parse_settings(SETTINGS).workflows_for(PUBLIC))
++
+     def test_refus(self):
+         for raw, needle in (
+             ([], "JSON object"),
+@@ -68,6 +82,11 @@ class SettingsTest(unittest.TestCase):
+             ({"exclude_terms": "Globex"}, "list"),
+             ({"exclude_terms": [""]}, "list"),
+             ({"host": 3}, "host name"),
++            ({"projects": {"web": {"repo": PUBLIC, "workflows": []}}}, "non-empty"),
++            ({"projects": {"web": {"repo": PUBLIC, "workflows": "tests.yml"}}}, "non-empty"),
++            ({"projects": {"web": {"repo": PUBLIC, "workflows": [""]}}}, "workflow file name"),
++            ({"projects": {"web": {"repo": PUBLIC, "workflows": ["tests.exe"]}}},
++             "not a workflow file name"),
+         ):
+             with self.subTest(raw=raw):
+                 with self.assertRaises(plan_github.SettingsError) as ctx:
+diff --git a/tests/test_l161c_failures_realtime.py b/tests/test_l161c_failures_realtime.py
+index 7ba19ec1c..e41a43a1d 100644
+--- a/tests/test_l161c_failures_realtime.py
++++ b/tests/test_l161c_failures_realtime.py
+@@ -225,30 +225,94 @@ class RoutageTest(unittest.TestCase):
+ # --------------------------------------------------------------------------
+ 
+ class FauxApi:
+-    """L'API GitHub vue par le relevé : exécutions en cours, état d'une
+-    exécution, check runs d'une tête."""
++    """L'API GitHub vue par le relevé : workflows publiés par le dépôt
++    (découverte, #1110), exécutions par état — `pending` compris (#1161) —,
++    tête d'une branche, état d'une exécution, check runs d'une tête, et
++    l'écriture d'annulation."""
+ 
+     def __init__(self):
+-        self.live, self.queued, self.done, self.checks = [], [], {}, {}
++        self.live, self.queued, self.pending, self.done, self.checks = [], [], [], {}, {}
++        #: exécutions terminées (rattrapage borné #1110)
++        self.terminated = []
++        #: fichiers de workflow que le dépôt publie (découverte #1110)
++        self.workflows = ["tests.yml"]
++        #: tête de branche rendue par l'API (#1161)
++        self.branches = {}
++        #: annulations demandées (#1161), et l'erreur que l'écriture rend
++        self.cancels, self.cancel_error = [], None
++
++    def cancel(self, repo, run_id):
++        """L'écriture d'annulation (#1161) : l'exécution quitte les listes
++        vivantes et devient terminée annulée, comme chez GitHub."""
++        if self.cancel_error:
++            raise self.cancel_error
++        self.cancels.append((repo, int(run_id)))
++        for bucket in (self.live, self.queued, self.pending):
++            for run in list(bucket):
++                if int(run["id"]) == int(run_id):
++                    bucket.remove(run)
++        self.done[int(run_id)] = {"status": "completed", "conclusion": "cancelled"}
++
++    def _status_runs(self, path):
++        for status, bucket in (("queued", self.queued), ("pending", self.pending),
++                               ("in_progress", self.live)):
++            if "status=%s" % status in path:
++                return list(bucket)
++        return []  # requested, waiting : aucun run dans ces états
+ 
+     def __call__(self, path):
+         if "/actions/runs?" in path:
+-            return {"workflow_runs": list(self.queued if "status=queued" in path
+-                                          else self.live)}
++            if "status=completed" in path:
++                return {"workflow_runs": list(self.terminated)}
++            return {"workflow_runs": self._status_runs(path)}
++        if "/actions/workflows" in path:
++            return {"workflows": [item if isinstance(item, dict) else
++                                  {"path": ".github/workflows/%s" % item, "state": "active"}
++                                  for item in self.workflows]}
++        if "/branches/" in path:
++            return {"commit": {"sha": self.branches.get(path.split("/branches/", 1)[1], "")}}
+         if "/actions/runs/" in path:
+-            return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
++            run_id = int(path.rsplit("/", 1)[1])
++            if run_id in self.done:
++                return self.done[run_id]
++            for bucket in (self.live, self.queued, self.pending):
++                for run in bucket:
++                    if int(run["id"]) == run_id:
++                        return run
++            return {"status": "in_progress"}
+         if "/check-runs" in path:
+             sha = path.split("/commits/")[1].split("/")[0]
+             return {"check_runs": self.checks.get(sha, [])}
+         raise AssertionError(path)
+ 
+ 
+-def run_view(run_id, sha, branch, *, base="main", message=""):
+-    return {"id": run_id, "head_sha": sha, "head_branch": branch, "event": "pull_request"
+-            if branch != "main" else "push", "path": ".github/workflows/tests.yml",
++def run_view(run_id, sha, branch, *, base="main", message="", workflow="tests.yml",
++             attempt=1, updated_at=None, status=None, created_at=None,
++             run_started_at=None, pr=1, source=DEPOT):
++    pull_request = branch != "main" and pr is not None
++    view = {"id": run_id, "head_sha": sha, "head_branch": branch,
++            "event": "pull_request" if pull_request else "push",
++            "path": ".github/workflows/%s" % workflow,
++            "run_attempt": attempt,
++            "head_repository": {"full_name": source},
+             "html_url": "https://github.com/%s/actions/runs/%d" % (DEPOT, run_id),
+-            "pull_requests": [{"base": {"ref": base}}] if branch != "main" else [],
++            "pull_requests": [{"number": pr, "base": {"ref": base}}] if pull_request else [],
+             "head_commit": {"message": message}}
++    if updated_at:
++        view["updated_at"] = updated_at
++    if created_at:
++        view["created_at"] = created_at
++    if run_started_at:
++        view["run_started_at"] = run_started_at
++    if status:
++        view["status"] = status
++    return view
++
++
++def completed(path, conclusion, attempt=1):
++    """L'état GitHub d'une exécution conclue (relevé par `_conclude`)."""
++    return {"status": "completed", "conclusion": conclusion, "path": path,
++            "run_attempt": attempt}
+ 
+ 
+ class WatcherTest(PgTestCase):
+@@ -263,11 +327,12 @@ class WatcherTest(PgTestCase):
+         self.cfg_ci = dataclasses.replace(
+             self.cfg, github={"projects": {"ameesh": DEPOT}, "host": self.cfg.host})
+         self.api = FauxApi()
+-        self.watcher = ci.Watcher(self.cfg_ci, api=self.api)
++        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel)
+         # une exécution verte de main déjà relevée : la référence du rouge hérité
++        # (nommée `tests.yml` : la migration 0433 nomme les lignes antérieures)
+         st = storage.of(self.db)
+         st.ci.open_run(DEPOT, 100, head_sha="0" * 40, branch="main", event="push",
+-                       base="main", work_item_id=None, url=None)
++                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+         st.ci.conclude(DEPOT, 100, "success")
+ 
+     def mails(self, to):
+@@ -276,10 +341,14 @@ class WatcherTest(PgTestCase):
+             "SELECT id, kind, body, payload, work_item_id, delivered_at FROM agent_mailbox"
+             " WHERE recipient = %s AND sender = %s ORDER BY id", (to, work.SYSTEM_SENDER))
+ 
++    def payload_of(self, message):
++        payload = message["payload"]
++        return payload if isinstance(payload, dict) else json.loads(payload)
++
+     def test_pas_l_hote_designe(self):
+         cfg = dataclasses.replace(self.cfg, github={"projects": {"ameesh": DEPOT},
+                                                     "host": "ailleurs"})
+-        self.assertEqual(ci.Watcher(cfg, api=self.api).repos(), [])
++        self.assertEqual(ci.Watcher(cfg, api=self.api, cancel=self.api.cancel).repos(), [])
+         self.assertEqual(self.watcher.repos(), [DEPOT])
+ 
+     def test_urgent_puis_ordinaire_puis_verdict(self):
+@@ -453,6 +522,252 @@ class WatcherTest(PgTestCase):
+         self.watcher.tick(self.db)
+         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 422)["status"], "running")
+ 
++    def test_pending_lu_suivi_et_conclu(self):
++        # #1161 : une exécution bloquée en `pending` (groupe de concurrence non
++        # obtenu) est lue dès la poussée, garde une seule ligne quand elle
++        # repasse `queued`, puis reçoit son verdict et son réveil
++        sha = "e1" * 20
++        self.api.pending = [run_view(601, sha, "lot/1-un", status="pending")]
++        self.assertEqual(self.watcher.tick(self.db), [])
++        row = storage.of(self.db).ci.run(DEPOT, 601)
++        self.assertEqual((row["status"], row["work_item_id"]), ("running", self.lot["id"]))
++        compteur = "SELECT count(*) AS n FROM ci_runs WHERE run_id = 601"
++        self.assertEqual(self.db.query(compteur)[0]["n"], 1)
++        # relue `pending` : rien de neuf, pas de doublon
++        self.assertEqual(self.watcher.tick(self.db), [])
++        self.assertEqual(self.db.query(compteur)[0]["n"], 1)
++        # la même exécution passe `queued` : toujours une seule ligne
++        self.api.pending = []
++        self.api.queued = [run_view(601, sha, "lot/1-un", status="queued")]
++        self.assertEqual(self.watcher.tick(self.db), [])
++        self.assertEqual(self.db.query(compteur)[0]["n"], 1)
++        # conclusion : verdict et réveil, une fois
++        self.api.queued = []
++        self.api.done[601] = completed(".github/workflows/tests.yml", "success")
++        out = self.watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["status"]) for o in out],
++                         [("verdict", "success")])
++        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 601)["status"], "success")
++        self.assertEqual(len(self.mails("dev-a")), 1)
++
++    def test_pending_annule_les_executions_supplantees(self):
++        # #1161 : le groupe de concurrence est retenu par une exécution non
++        # démarrée d'un essai antérieur ; le relevé l'annule, jamais la tête
++        # courante, et l'écriture est idempotente
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: 1_000_000.0)
++        vieille, neuve = "f1" * 20, "f2" * 20
++        self.api.queued = [run_view(611, vieille, "lot/1-un", status="queued",
++                                    created_at="2026-10-14T06:00:00Z")]
++        self.assertEqual(watcher.tick(self.db), [])
++        self.api.pending = [run_view(612, neuve, "lot/1-un", status="pending",
++                                     created_at="2026-10-14T06:05:00Z")]
++        self.api.branches["lot/1-un"] = neuve
++        out = watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["run_id"]) for o in out],
++                         [("superseded", 611), ("cancelled", 611)])
++        self.assertIn("cancelled to free", "\n".join(ci.describe(o) for o in out))
++        self.assertEqual(self.api.cancels, [(DEPOT, 611)])
++        st = storage.of(self.db)
++        self.assertEqual(st.ci.run(DEPOT, 611)["status"], "superseded")
++        self.assertEqual(st.ci.run(DEPOT, 612)["status"], "running")
++        # l'exécution annulée n'est plus vivante : rien à refaire, aucun doublon
++        self.assertEqual([o for o in watcher.tick(self.db)
++                          if o["action"] == "cancelled"], [])
++        self.assertEqual(self.api.cancels, [(DEPOT, 611)])
++
++    def test_annulation_reservee_au_meme_groupe(self):
++        # #1161 (R1 B1) : jamais `main`, jamais `release/…`, jamais la tête
++        # courante, jamais une poussée simple, une autre PR, un autre dépôt
++        # source ou un autre workflow — le groupe d'abord (même PR, même
++        # dépôt source, même fichier de workflow)
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: 1_000_000.0)
++        vieille, neuve = "1a" * 20, "1b" * 20
++        ancienne, recente = "2026-10-14T06:00:00Z", "2026-10-14T06:05:00Z"
++        # `main` et `release/…` : jamais touchées
++        self.api.queued = [run_view(621, "1c" * 20, "main", status="queued",
++                                    created_at=ancienne)]
++        self.api.pending = [run_view(622, "1d" * 20, "main", status="pending",
++                                     created_at=recente)]
++        self.api.branches["main"] = "1d" * 20
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        self.api.queued = [run_view(623, "1e" * 20, "release/v1.10.0", status="queued",
++                                    created_at=ancienne)]
++        self.api.pending = [run_view(624, "1f" * 20, "release/v1.10.0", status="pending",
++                                     created_at=recente)]
++        self.api.branches["release/v1.10.0"] = "1f" * 20
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        # la tête courante : deux essais de la même tête, aucun n'est annulé
++        self.api.queued = [run_view(631, neuve, "lot/1-un", status="queued",
++                                    created_at=ancienne)]
++        self.api.pending = [run_view(632, neuve, "lot/1-un", status="pending",
++                                     created_at=recente)]
++        self.api.branches["lot/1-un"] = neuve
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        # une poussée simple (sans PR) : son groupe n'est pas celui de la PR
++        self.api.queued = [run_view(641, vieille, "lot/1-un", status="queued", pr=None,
++                                    created_at=ancienne)]
++        self.api.pending = [run_view(642, neuve, "lot/1-un", status="pending",
++                                     created_at=recente)]
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        # même branche, une autre PR : deux groupes
++        self.api.queued = [run_view(643, vieille, "lot/1-un", status="queued", pr=2,
++                                    created_at=ancienne)]
++        self.api.pending = [run_view(644, neuve, "lot/1-un", status="pending", pr=1,
++                                     created_at=recente)]
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        # même PR, un autre dépôt source : deux groupes
++        self.api.queued = [run_view(645, vieille, "lot/1-un", status="queued",
++                                    source="fork/ameesh", created_at=ancienne)]
++        self.api.pending = [run_view(646, neuve, "lot/1-un", status="pending",
++                                     source=DEPOT, created_at=recente)]
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++
++    def test_annulation_ne_traverse_pas_les_workflows(self):
++        # #1161 (R1 B1) : le groupe s'évalue dans le fichier de workflow — un
++        # ancien `website-suite.yml` sans successeur de son workflow n'est pas
++        # annulé par la tête `tests.yml`, et l'est quand son workflow a son
++        # propre successeur sur la tête courante
++        cfg = dataclasses.replace(self.cfg, github={
++            "projects": {"ameesh": {"repo": DEPOT,
++                                    "workflows": ["tests.yml", "website-suite.yml"]}},
++            "host": self.cfg.host})
++        watcher = ci.Watcher(cfg, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: 1_000_000.0)
++        vieille, neuve = "1a" * 20, "1b" * 20
++        ancienne, recente = "2026-10-14T06:00:00Z", "2026-10-14T06:05:00Z"
++        self.api.queued = [run_view(647, vieille, "lot/1-un", status="queued",
++                                    workflow="website-suite.yml", created_at=ancienne)]
++        self.api.pending = [run_view(648, neuve, "lot/1-un", status="pending",
++                                     workflow="tests.yml", created_at=recente)]
++        self.api.branches["lot/1-un"] = neuve
++        watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        self.api.pending.append(run_view(649, neuve, "lot/1-un", status="pending",
++                                         workflow="website-suite.yml",
++                                         created_at=recente))
++        out = watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [(DEPOT, 647)])
++        self.assertIn(("cancelled", 647), [(o["action"], o["run_id"]) for o in out])
++
++    def test_rerun_essai_2_date_et_non_id(self):
++        # #1161 (R1 B2) : un rerun garde son `id` et augmente `run_attempt` ;
++        # l'ordre des `id` ne prouve pas l'antériorité. L'essai 2 lancé après
++        # l'essai 1 de la nouvelle tête est conservé, l'essai antérieur est
++        # annulé, et une date d'essai incertaine conserve l'exécution
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: 1_000_000.0)
++        ancienne, courante = "2a" * 20, "2b" * 20
++        self.api.queued = [run_view(611, ancienne, "lot/1-un", status="queued",
++                                    attempt=2, run_started_at="2026-10-14T08:00:00Z")]
++        self.api.pending = [run_view(612, courante, "lot/1-un", status="pending",
++                                     created_at="2026-10-14T07:00:00Z")]
++        self.api.branches["lot/1-un"] = courante
++        out = watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [])
++        self.assertNotIn("cancelled", [o["action"] for o in out])
++        # le même essai, antérieur à la nouvelle tête, est annulé
++        self.api.queued = [run_view(613, ancienne, "lot/1-un", status="queued",
++                                    created_at="2026-10-14T06:00:00Z")]
++        self.api.pending = [run_view(614, courante, "lot/1-un", status="pending",
++                                     created_at="2026-10-14T06:05:00Z")]
++        out = watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [(DEPOT, 613)])
++        self.assertIn(("cancelled", 613), [(o["action"], o["run_id"]) for o in out])
++        # une date d'essai incertaine (aucune date) : conservée
++        self.api.queued = [run_view(615, ancienne, "lot/1-un", status="queued")]
++        self.api.pending = [run_view(616, courante, "lot/1-un", status="pending",
++                                     created_at="2026-10-14T06:05:00Z")]
++        out = watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [(DEPOT, 613)])
++        self.assertNotIn("cancelled", [o["action"] for o in out])
++        # un rerun sans date d'essai (seul `created_at` du premier essai) :
++        # date incertaine, conservé
++        self.api.queued = [run_view(617, ancienne, "lot/1-un", status="queued",
++                                    attempt=2, created_at="2026-10-14T05:00:00Z")]
++        self.api.pending = [run_view(618, courante, "lot/1-un", status="pending",
++                                     created_at="2026-10-14T06:05:00Z")]
++        out = watcher.tick(self.db)
++        self.assertEqual(self.api.cancels, [(DEPOT, 613)])
++        self.assertNotIn("cancelled", [o["action"] for o in out])
++
++    def test_erreur_d_annulation_sans_faux_verdict(self):
++        # #1161 : une erreur de l'API d'annulation est journalisée ; elle ne
++        # conclut rien, ne retire rien et laisse la nouvelle exécution suivie
++        journal = []
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             log=journal.append, clock=lambda: 1_000_000.0)
++        vieille, neuve = "3a" * 20, "3b" * 20
++        self.api.queued = [run_view(651, vieille, "lot/1-un", status="queued",
++                                    created_at="2026-10-14T06:00:00Z")]
++        watcher.tick(self.db)
++        self.api.pending = [run_view(652, neuve, "lot/1-un", status="pending",
++                                     created_at="2026-10-14T06:05:00Z")]
++        self.api.branches["lot/1-un"] = neuve
++        self.api.cancel_error = RuntimeError("boom")
++        out = watcher.tick(self.db)
++        self.assertEqual([o["action"] for o in out], ["superseded"])
++        self.assertTrue(any("cancel of run 651 failed" in line for line in journal))
++        st = storage.of(self.db)
++        self.assertEqual(st.ci.run(DEPOT, 651)["status"], "superseded")
++        self.assertEqual(st.ci.run(DEPOT, 652)["status"], "running")
++        self.assertEqual(self.mails("dev-a"), [])
++
++    def test_pending_signale_apres_cinq_minutes(self):
++        # #1161 : une exécution de la tête courante restée `pending` au-delà du
++        # délai est signalée à l'assigné du lot, une seule fois par service
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: 1_000_000.0)
++        sha = "4a" * 20
++        self.api.pending = [run_view(661, sha, "lot/1-un", status="pending",
++                                     created_at="1970-01-12T13:39:40+00:00")]
++        self.api.branches["lot/1-un"] = sha
++        out = watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["to"], o["waited_s"], o["cancelled"]) for o in out],
++                         [("pending", "dev-a", 420, [])])
++        self.assertIn("pending 7 min", "\n".join(ci.describe(o) for o in out))
++        (m,) = self.mails("dev-a")
++        self.assertIn("pending for 7 min", m["body"])
++        self.assertIn("held elsewhere", m["body"])
++        self.assertFalse(mail.is_urgent(m))
++        self.assertEqual(self.payload_of(m)["ci"]["kind"], "pending")
++        # déjà signalée : le passage suivant ne double pas le message
++        self.assertEqual(watcher.tick(self.db), [])
++        self.assertEqual(len(self.mails("dev-a")), 1)
++        # une exécution `queued` de la même tête (attente de runner, banale)
++        # n'est jamais signalée : seul `pending` attend un groupe
++        self.api.pending = []
++        self.api.queued = [run_view(662, sha, "lot/1-un", status="queued",
++                                    created_at="1970-01-12T13:39:40+00:00")]
++        self.assertEqual(watcher.tick(self.db), [])
++        self.assertEqual(len(self.mails("dev-a")), 1)
++
++    def test_pending_signale_et_debloque(self):
++        # #1161 : quand une exécution supplantée non démarrée retient le
++        # groupe, elle est annulée et le signalement le dit
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: 1_000_000.0)
++        vieille, neuve = "5a" * 20, "5b" * 20
++        self.api.queued = [run_view(671, vieille, "lot/1-un", status="queued",
++                                    created_at="1970-01-12T13:39:00+00:00")]
++        watcher.tick(self.db)
++        self.api.pending = [run_view(672, neuve, "lot/1-un", status="pending",
++                                     created_at="1970-01-12T13:39:40+00:00")]
++        self.api.branches["lot/1-un"] = neuve
++        out = watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["run_id"]) for o in out],
++                         [("superseded", 671), ("cancelled", 671), ("pending", 672)])
++        (m,) = self.mails("dev-a")
++        self.assertIn("671 cancelled", m["body"])
++        self.assertEqual(self.payload_of(m)["ci"]["cancelled"], [671])
++
+     def test_sans_base_relevee_passif(self):
+         # relecture (4) : aucune exécution conclue de main relevée, l'échec
+         # est peut-être hérité : message passif, jamais urgent
+@@ -521,6 +836,331 @@ class WatcherTest(PgTestCase):
+         self.assertEqual([o["to"] for o in out], [None])
+         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 701)["work_item_id"], humain["id"])
+ 
++    # -- #1110 : workflows suivis par projet/dépôt ---------------------------
++    def test_workflows_decouverts_sans_tests_yml(self):
++        """Un dépôt sans `tests.yml` (nexlink) voit ses suites découvertes,
++        suivies, et l'auteur réveillé à la fin exacte du workflow."""
++        repo = "manaty/nexlink"
++        cfg = dataclasses.replace(self.cfg, github={"projects": {"nexlink": repo},
++                                                    "host": self.cfg.host})
++        api = FauxApi()
++        api.workflows = ["backend-suite.yml", "sql-invariant.yml"]
++        watcher = ci.Watcher(cfg, api=api, cancel=api.cancel)
++        sha = "9" * 40
++        api.live = [run_view(901, sha, "lot/1-un", workflow="backend-suite.yml")]
++        self.assertEqual(watcher.tick(self.db), [])
++        row = storage.of(self.db).ci.run(repo, 901)
++        self.assertEqual((row["workflow"], row["work_item_id"]),
++                         ("backend-suite.yml", self.lot["id"]))
++        api.live = []
++        api.done[901] = completed(".github/workflows/backend-suite.yml", "success")
++        out = watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["status"], o["to"]) for o in out],
++                         [("verdict", "success", "dev-a")])
++        (message,) = self.mails("dev-a")
++        self.assertIn("(backend-suite.yml)", message["body"])
++        self.assertIn(": green.", message["body"])
++        payload = self.payload_of(message)["ci"]
++        self.assertEqual((payload["workflow"], payload["attempt"]),
++                         ("backend-suite.yml", 1))
++
++    def test_defaut_ameesh_tests_yml_seul(self):
++        """Un dépôt qui publie `tests.yml` garde le défaut L161 : ce seul
++        workflow, même quand d'autres sont actifs."""
++        self.api.workflows = ["tests.yml", "ui.yml"]
++        self.api.live = [run_view(910, "a" * 40, "lot/1-un", workflow="ui.yml"),
++                         run_view(911, "b" * 40, "lot/1-un", workflow="tests.yml")]
++        self.watcher.tick(self.db)
++        st = storage.of(self.db)
++        self.assertIsNone(st.ci.run(DEPOT, 910))
++        self.assertEqual(st.ci.run(DEPOT, 911)["workflow"], "tests.yml")
++
++    def test_liste_declaree_prime_sur_la_decouverte(self):
++        cfg = dataclasses.replace(self.cfg, github={
++            "projects": {"ameesh": {"repo": DEPOT, "workflows": ["backend-suite.yml"]}},
++            "host": self.cfg.host})
++        api = FauxApi()
++        api.workflows = ["backend-suite.yml", "website-suite.yml"]
++        watcher = ci.Watcher(cfg, api=api, cancel=api.cancel)
++        api.live = [run_view(920, "c" * 40, "lot/1-un", workflow="backend-suite.yml"),
++                    run_view(921, "d" * 40, "lot/1-un", workflow="website-suite.yml")]
++        watcher.tick(self.db)
++        st = storage.of(self.db)
++        self.assertEqual(st.ci.run(DEPOT, 920)["workflow"], "backend-suite.yml")
++        self.assertIsNone(st.ci.run(DEPOT, 921))
++
++    def test_workflow_declare_absent_et_desactive(self):
++        """Un workflow déclaré mais absent du dépôt est signalé une fois ; un
++        workflow désactivé n'est pas découvert."""
++        journal = []
++        cfg = dataclasses.replace(self.cfg, github={
++            "projects": {"ameesh": {"repo": DEPOT, "workflows": ["disparu.yml"]}},
++            "host": self.cfg.host})
++        api = FauxApi()
++        api.workflows = ["tests.yml", {"path": ".github/workflows/eteint.yml",
++                                       "state": "disabled_manually"}]
++        watcher = ci.Watcher(cfg, api=api, cancel=api.cancel, log=journal.append)
++        api.live = [run_view(930, "e" * 40, "lot/1-un", workflow="eteint.yml")]
++        watcher.tick(self.db)
++        watcher.tick(self.db)
++        self.assertEqual([line for line in journal if "disparu.yml" in line],
++                         ["CI %s: workflow(s) declared in github.projects but absent "
++                          "from the repository: disparu.yml" % DEPOT])
++        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 930))
++
++    def test_multi_workflows_meme_tete_statuts_et_verdicts(self):
++        """Deux workflows d'une même tête gardent chacun leur ligne ; le
++        verdict nomme la suite et les autres workflows encore en cours."""
++        api = self.api
++        api.workflows = ["backend-suite.yml", "website-suite.yml"]
++        sha = "f" * 40
++        api.live = [run_view(940, sha, "lot/1-un", workflow="backend-suite.yml"),
++                    run_view(941, sha, "lot/1-un", workflow="website-suite.yml")]
++        self.assertEqual(self.watcher.tick(self.db), [])
++        st = storage.of(self.db)
++        self.assertEqual((st.ci.run(DEPOT, 940)["status"], st.ci.run(DEPOT, 941)["status"]),
++                         ("running", "running"))
++        # backend-suite finit verte, website-suite tourne encore : pas de vert
++        # global prématuré, le verdict nomme la suite et l'autre workflow
++        api.live = [run_view(941, sha, "lot/1-un", workflow="website-suite.yml")]
++        api.done[940] = completed(".github/workflows/backend-suite.yml", "success")
++        out = self.watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "success")])
++        (message,) = self.mails("dev-a")
++        self.assertIn("(backend-suite.yml)", message["body"])
++        self.assertIn("still running: website-suite.yml", message["body"])
++        # website-suite finit rouge : son verdict, une seule fois
++        api.live = []
++        api.done[941] = completed(".github/workflows/website-suite.yml", "failure")
++        api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=941)])]
++        out = self.watcher.tick(self.db)
++        self.assertEqual([(o["action"], o.get("status")) for o in out],
++                         [("failures", None), ("verdict", "failure")])
++        mails = self.mails("dev-a")
++        self.assertEqual(len(mails), 3)  # urgent, verdict backend, verdict website
++        self.assertIn("(website-suite.yml)", mails[-1]["body"])
++        self.assertNotIn("still running", mails[-1]["body"])
++        # relire ne renvoie rien : ni doublon, ni rejeu
++        self.assertEqual(self.watcher.tick(self.db), [])
++        self.assertEqual(len(self.mails("dev-a")), 3)
++        report = ci.status_of(self.db, self.lot["id"])
++        self.assertEqual({run["workflow"] for run in report["runs"]},
++                         {"backend-suite.yml", "website-suite.yml"})
++        texte = "\n".join(ci.render_status(report))
++        self.assertIn("backend-suite.yml", texte)
++        self.assertIn("website-suite.yml", texte)
++
++    def test_nouvelle_tete_remplace_tous_les_workflows(self):
++        """Une poussée remplace les workflows de l'ancienne tête ; celui qui
++        conclut après coup n'envoie rien (pas de rejeu périmé)."""
++        api = self.api
++        api.workflows = ["backend-suite.yml", "website-suite.yml"]
++        old, new = "1" * 40, "2" * 40
++        api.live = [run_view(950, old, "lot/1-un", workflow="backend-suite.yml"),
++                    run_view(951, old, "lot/1-un", workflow="website-suite.yml")]
++        self.watcher.tick(self.db)
++        api.live = [run_view(952, new, "lot/1-un", workflow="backend-suite.yml")]
++        self.watcher.tick(self.db)
++        st = storage.of(self.db)
++        self.assertEqual(st.ci.run(DEPOT, 950)["status"], "superseded")
++        self.assertEqual(st.ci.run(DEPOT, 951)["status"], "superseded")
++        api.done[951] = completed(".github/workflows/website-suite.yml", "success")
++        self.assertEqual(self.watcher.tick(self.db), [])
++        self.assertEqual(self.mails("dev-a"), [])
++
++    def test_verdict_porte_l_attempt(self):
++        """Le verdict situe la suite et l'attempt relancé (#901, #1110)."""
++        self.api.workflows = ["backend-suite.yml"]
++        sha = "3" * 40
++        self.api.live = [run_view(960, sha, "lot/1-un", workflow="backend-suite.yml")]
++        self.watcher.tick(self.db)
++        self.api.live = []
++        self.api.done[960] = completed(".github/workflows/backend-suite.yml", "success",
++                                       attempt=2)
++        self.watcher.tick(self.db)
++        (message,) = self.mails("dev-a")
++        self.assertIn("(backend-suite.yml)", message["body"])
++        self.assertIn("attempt 2", message["body"])
++        self.assertEqual(self.payload_of(message)["ci"]["attempt"], 2)
++
++    # -- #1110 R1 auditeur : rattrapage et rouge par workflow ----------------
++    #: horloge fixe des témoins de rattrapage (aucune dépendance à l'horloge
++    #: réelle) : 1 000 000 s après l'epoch, soit 1970-01-12T13:46:40Z
++    NOW = 1_000_000.0
++    AT_NOW = "1970-01-12T13:46:40+00:00"
++
++    def terminated(self, run_id, sha, branch, *, conclusion, workflow="tests.yml",
++                   updated_at=None):
++        """Une exécution terminée telle que la liste `status=completed` la rend."""
++        return dict(run_view(run_id, sha, branch, workflow=workflow,
++                             updated_at=updated_at or self.AT_NOW),
++                    status="completed", conclusion=conclusion)
++
++    def test_execution_courte_terminee_avant_le_premier_passage(self):
++        """#1110 P2-1 : une exécution née et finie entre deux passages n'a
++        jamais été vue « en cours » ; le rattrapage la découvre terminée, rend
++        son verdict et réveille l'agent — une seule fois."""
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: self.NOW)
++        sha = "a1" * 20
++        self.api.terminated = [self.terminated(970, sha, "lot/1-un",
++                                               conclusion="failure")]
++        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
++                                                   execution=970)])]
++        out = watcher.tick(self.db)
++        self.assertEqual([(o["action"], o.get("status"), o.get("urgent")) for o in out],
++                         [("failures", None, True), ("verdict", "failure", None)])
++        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 970)["status"], "failure")
++        mails = self.mails("dev-a")
++        self.assertEqual(len(mails), 2)  # urgent puis verdict
++        self.assertIn("tests.test_a.T.test_1", mails[0]["body"])
++        self.assertIn("red, 1 failure(s)", mails[-1]["body"])
++        # le passage suivant ne double rien
++        self.assertEqual(watcher.tick(self.db), [])
++        self.assertEqual(len(self.mails("dev-a")), 2)
++
++    def test_rattrapage_borne_et_sans_verdict_perime(self):
++        """#1110 P2-1 : le rattrapage est borné (une exécution trop ancienne
++        est ignorée) et une tête déjà remplacée ne rend pas de verdict."""
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: self.NOW)
++        vieille, neuve = "b1" * 20, "b2" * 20
++        self.api.live = [run_view(980, neuve, "lot/1-un")]
++        watcher.tick(self.db)
++        self.api.live = []
++        self.api.terminated = [
++            self.terminated(979, vieille, "lot/1-un", conclusion="failure"),
++            self.terminated(978, "b3" * 20, "lot/1-un", conclusion="failure",
++                            updated_at="1970-01-12T11:46:40+00:00")]  # hors fenêtre
++        self.assertEqual(watcher.tick(self.db), [])
++        st = storage.of(self.db)
++        self.assertIsNone(st.ci.run(DEPOT, 979))
++        self.assertIsNone(st.ci.run(DEPOT, 978))
++        self.assertEqual(self.mails("dev-a"), [])
++
++    def test_main_rouge_par_workflow(self):
++        """#1110 P2-2 : sur la même tête de main, un succès d'une autre suite
++        ne masque pas l'échec de `backend-suite.yml`."""
++        st = storage.of(self.db)
++        sha = "c1" * 20
++        for run_id, workflow, conclusion in ((990, "backend-suite.yml", "failure"),
++                                             (991, "scripts-suite.yml", "success")):
++            st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main", event="push",
++                           base="main", work_item_id=None, url=None, workflow=workflow)
++            if conclusion == "failure":
++                st.ci.add_failure(DEPOT, run_id, part="psql 1/1",
++                                  test="tests.test_a.T.test_1", module="tests.test_a",
++                                  status="echec", inherited=False, excerpt="", replay="",
++                                  duration_s=None, failed_at=None)
++            st.ci.conclude(DEPOT, run_id, conclusion)
++        self.assertEqual([(r["run_id"], r["workflow"], r["tests"]) for r in
++                          ci.main_red(self.db)],
++                         [(990, "backend-suite.yml", ["tests.test_a.T.test_1"])])
++        alertes = [a for a in exploitation.alerts(self.cfg, self.db)
++                   if a["type"] == "ci_main_red"]
++        self.assertEqual(len(alertes), 1)
++        self.assertIn("backend-suite.yml", alertes[0]["detail"])
++
++    def test_rouge_herite_par_workflow(self):
++        """#1110 P2-2 : le rouge hérité se compare à la même suite ; l'échec
++        d'une autre suite de la base ne rend pas le test « hérité »."""
++        st = storage.of(self.db)
++        base_sha = "d1" * 20
++        for run_id, workflow, conclusion in ((994, "backend-suite.yml", "success"),
++                                             (995, "scripts-suite.yml", "failure")):
++            st.ci.open_run(DEPOT, run_id, head_sha=base_sha, branch="main", event="push",
++                           base="main", work_item_id=None, url=None, workflow=workflow)
++            if conclusion == "failure":
++                st.ci.add_failure(DEPOT, run_id, part="psql 1/1",
++                                  test="tests.test_a.T.test_1", module="tests.test_a",
++                                  status="echec", inherited=False, excerpt="", replay="",
++                                  duration_s=None, failed_at=None)
++            st.ci.conclude(DEPOT, run_id, conclusion)
++        # l'exécution du lot, même suite que le vert de la base : l'échec est
++        # neuf (pas hérité du rouge d'une autre suite), donc urgent et nominatif
++        self.api.workflows = ["backend-suite.yml"]
++        sha = "d2" * 20
++        self.api.live = [run_view(996, sha, "lot/1-un", workflow="backend-suite.yml")]
++        self.watcher.tick(self.db)
++        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
++                                                   execution=996)])]
++        out = self.watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", True)])
++        (message,) = self.mails("dev-a")
++        self.assertIn("tests.test_a.T.test_1", message["body"])
++        self.assertNotIn("inherited", self.payload_of(message).get("ci_passif", ""))
++
++    def test_pending_ne_cite_que_la_meme_tete(self):
++        """#1110 P3 : le verdict ne cite comme « encore en cours » que les
++        workflows de la même tête, pas ceux d'un autre lot."""
++        self.api.workflows = ["backend-suite.yml", "website-suite.yml"]
++        sha_a, sha_b = "e1" * 20, "e2" * 20
++        work.add(self.db, title="L2 : autre", branch="lot/2-autre", assignee="dev-b")
++        self.api.live = [run_view(1001, sha_a, "lot/1-un", workflow="backend-suite.yml"),
++                         run_view(1002, sha_b, "lot/2-autre",
++                                  workflow="website-suite.yml")]
++        self.watcher.tick(self.db)
++        self.api.live = [run_view(1002, sha_b, "lot/2-autre", workflow="website-suite.yml")]
++        self.api.done[1001] = completed(".github/workflows/backend-suite.yml", "success")
++        out = self.watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "success")])
++        (message,) = self.mails("dev-a")
++        self.assertIn("(backend-suite.yml)", message["body"])
++        self.assertNotIn("still running", message["body"])
++
++    def test_rattrapage_ne_cite_pas_un_workflow_conclu_du_meme_passage(self):
++        """#1110 P3 : un workflow de la même tête, terminé dans le même
++        passage, n'est pas annoncé « encore en cours » par le rattrapage."""
++        self.api.workflows = ["backend-suite.yml", "website-suite.yml"]
++        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
++                             clock=lambda: self.NOW)
++        sha = "f1" * 20
++        # passage 1 : le backend est vu en cours (ligne `running` en base)
++        self.api.live = [run_view(1010, sha, "lot/1-un", workflow="backend-suite.yml")]
++        watcher.tick(self.db)
++        # passage 2 : les deux suites de la même tête sont terminées ; le
++        # website, plus court, n'a jamais été vu en cours (rattrapage)
++        self.api.live = []
++        self.api.done[1010] = completed(".github/workflows/backend-suite.yml", "success")
++        self.api.terminated = [
++            self.terminated(1011, sha, "lot/1-un", conclusion="success",
++                            workflow="website-suite.yml"),
++            self.terminated(1010, sha, "lot/1-un", conclusion="success",
++                            workflow="backend-suite.yml")]
++        out = watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["run_id"], o["status"]) for o in out],
++                         [("verdict", 1011, "success"), ("verdict", 1010, "success")])
++        bodies = [m["body"] for m in self.mails("dev-a")]
++        self.assertEqual(len(bodies), 2)
++        self.assertFalse([b for b in bodies if "still running" in b])
++
++    def test_reference_stricte_par_workflow(self):
++        """#1110 P2-2 : une ligne sans workflow (écrite avant 0433 par un
++        ancien processus) ne sert pas de référence à une autre suite : l'échec
++        n'est pas classé hérité au nom d'une suite étrangère."""
++        st = storage.of(self.db)
++        sha_main = "0" * 40  # la ligne verte `tests.yml` du setUp
++        st.ci.open_run(DEPOT, 993, head_sha=sha_main, branch="main", event="push",
++                       base="main", work_item_id=None, url=None)  # sans workflow
++        st.ci.add_failure(DEPOT, 993, part="psql 1/1", test="tests.test_a.T.test_1",
++                          module="tests.test_a", status="echec", inherited=False,
++                          excerpt="", replay="", duration_s=None, failed_at=None)
++        st.ci.conclude(DEPOT, 993, "failure")
++        # une exécution backend du lot échoue sur le même test : la ligne sans
++        # workflow n'est pas une référence backend, l'échec est passif (base
++        # inconnue), jamais « hérité » d'une autre suite
++        self.api.workflows = ["backend-suite.yml"]
++        sha = "0a" * 20
++        self.api.live = [run_view(997, sha, "lot/1-un", workflow="backend-suite.yml")]
++        self.watcher.tick(self.db)
++        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
++                                                   execution=997)])]
++        out = self.watcher.tick(self.db)
++        self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", False)])
++        (message,) = self.mails("dev-a")
++        self.assertTrue(self.payload_of(message).get("ci_passif"))
++        self.assertFalse(st.ci.failures(DEPOT, 997)[0]["inherited"])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
