@@ -122,9 +122,11 @@ Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
 `HOTES_STAGING` (BASCULE_ENV) déclare la topologie, une entrée par hôte, dans
 l’ordre canonique ; `SONDE_<HOTE>` (majuscules, `-` et `.` remplacés par `_`)
 fixe la persona sondée, par défaut la première persona menée de l’hôte.
-Options : `--hotes "nom …"` (sous-ensemble, ordre canonique conservé ; un
-sous-ensemble qui contient `pc-smichea` est refusé — le poste ne s’installe
-que dans la séquence complète des quatre hôtes, VM saines d’abord),
+Options : `--hotes "nom …"` (sous-ensemble, ordre canonique conservé ; noms
+normalisés — un seul exemplaire par hôte, séparateurs espace, tabulation ou
+nouvelle ligne ; un sous-ensemble qui contient `pc-smichea` est refusé — le
+poste ne s’installe que dans la séquence complète des quatre hôtes, VM saines
+d’abord),
 `--sans-sonde` (santé sans sonde de courrier),
 `--sans-sauvegarde`. Le script exige que `VM` soit l’adresse de
 `manaty-mesh-1` ; `PERSONAS_VM` peut rester vide.

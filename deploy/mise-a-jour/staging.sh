@@ -27,10 +27,11 @@
 # SOUFFRANCE_COURRIER (900 s), NOTIF_STAGING (mesh-design), ATTENTE_MAX
 # (vm.sh/poste.sh).
 #
-# --hotes limite la sequence a un sous-ensemble, dans l'ordre canonique. Le
-# poste ne peut pas y figurer sans les trois VM : le canon §14 exige des VM
-# saines avant toute modification du poste, et un sous-ensemble n'en apporte
-# aucune preuve.
+# --hotes limite la sequence a un sous-ensemble, dans l'ordre canonique. Les
+# noms sont normalises : un seul exemplaire par hote, quel que soit le
+# separateur (espace, tabulation, nouvelle ligne). Le poste ne peut pas y
+# figurer sans les trois VM : le canon §14 exige des VM saines avant toute
+# modification du poste, et un sous-ensemble n'en apporte aucune preuve.
 #
 # Etapes : verifier chaque hote (lecture seule) ; sauvegarder puis migrer REF
 # (additif seulement, base partagee) ; puis, hote par hote dans l'ordre
@@ -109,6 +110,7 @@ var_sonde_de() { printf 'SONDE_%s\n' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')";
 # --- topologie ------------------------------------------------------------
 declare -A CIBLE=()
 declare -A FICHIER_HOTE=()
+declare -A CHOISI=()   #: selection normalisee de --hotes (un nom = une entree)
 HOTES=()
 if [ -z "${HOTES_STAGING:-}" ]; then
   echo "HOTES_STAGING absent de $BASCULE_ENV : declarer les quatre hotes" >&2
@@ -139,29 +141,33 @@ for nom in "${ORDRE[@]}"; do [ -n "${CIBLE[$nom]:-}" ] && HOTES+=("$nom"); done
 [ "${HOTES[-1]}" = pc-smichea ] || { echo "HOTES_STAGING : pc-smichea doit etre present" >&2; exit 2; }
 
 if [ -n "$HOTES_FILTRE" ]; then
-  EFFECTIFS=()
-  for nom in "${HOTES[@]}"; do
-    for choisi in $HOTES_FILTRE; do
-      [ "$nom" = "$choisi" ] && EFFECTIFS+=("$nom")
-    done
-  done
+  # Selection normalisee : un nom connu compte une seule fois, quel que soit
+  # le separateur (espace, tabulation, nouvelle ligne) ; le globbing est
+  # desactive pour que chaque mot soit compare tel quel. « pc-smichea » repete
+  # quatre fois ne peut donc plus tenir lieu des trois VM (avis R1 B4).
+  set -f
   for choisi in $HOTES_FILTRE; do
     [ -n "${CIBLE[$choisi]:-}" ] \
       || { echo "--hotes : « $choisi » n'est pas dans HOTES_STAGING" >&2; exit 2; }
+    CHOISI[$choisi]=1
   done
-  HOTES=("${EFFECTIFS[@]}")
+  set +f
+  HOTES=()
+  for nom in "${ORDRE[@]}"; do
+    [ -n "${CHOISI[$nom]:-}" ] && HOTES+=("$nom")
+  done
+  # canon §14 : le poste ne se met a jour qu'apres des VM saines. Le controle
+  # porte sur la selection normalisee, jamais sur la chaine brute : le case
+  # sur espaces litteraux etait contourne par tabulation, nouvelle ligne et
+  # doublons (avis R1 B4).
+  if [ -n "${CHOISI[pc-smichea]:-}" ]; then
+    for nom in "${ORDRE[@]}"; do
+      [ -n "${CHOISI[$nom]:-}" ] \
+        || { echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2; exit 2; }
+    done
+  fi
 fi
 [ ${#HOTES[@]} -gt 0 ] || { echo "--hotes : liste vide" >&2; exit 2; }
-# canon §14 : le poste ne se met a jour qu'apres des VM saines. Un
-# sous-ensemble qui l'inclut sans les trois VM n'apporte aucune preuve de
-# sante : refus (avis R1 B4).
-case " $HOTES_FILTRE " in
-  *" pc-smichea "*)
-    if [ ${#HOTES[@]} -ne ${#ORDRE[@]} ]; then
-      echo "--hotes : pc-smichea ne se met a jour que dans la sequence complete des quatre hotes (canon §14 : VM saines d'abord)" >&2
-      exit 2
-    fi ;;
-esac
 
 # VM sert aussi a poste.sh (migrations, sauvegarde) : la topologie et VM
 # doivent dire la meme chose.

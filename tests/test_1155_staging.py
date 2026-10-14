@@ -418,13 +418,32 @@ class StagingTest(unittest.TestCase):
 
     def test_subset_with_poste_is_refused(self):
         """canon §14 : le poste ne se met a jour qu'apres les trois VM saines ;
-        un sous-ensemble qui l'inclut n'en apporte aucune preuve (avis R1 B4)."""
-        for sous_ensemble in ('pc-smichea', 'pc-smichea ameesh-agents-1'):
-            with self.subTest(sous_ensemble):
+        un sous-ensemble qui l'inclut n'en apporte aucune preuve (avis R1 B4).
+        Le refus porte sur la selection normalisee : les doublons ne comptent
+        pas, et tabulation/nouvelle ligne ne contournent plus le controle."""
+        cas = {
+            'poste seul': 'pc-smichea',
+            'poste puis une VM': 'pc-smichea ameesh-agents-1',
+            'poste repete quatre fois (zero VM)':
+                'pc-smichea pc-smichea pc-smichea pc-smichea',
+            'VM + tabulation + poste': 'ameesh-agents-1\tpc-smichea',
+            'VM + nouvelle ligne + poste': 'ameesh-agents-1\npc-smichea',
+        }
+        for nom, sous_ensemble in cas.items():
+            with self.subTest(nom):
                 p = self.run_staging('--hotes', sous_ensemble)
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn('sequence complete des quatre hotes', p.stderr)
                 self.assertEqual(self.calls(), [])
+
+    def test_subset_deduplicates_host_names(self):
+        """Selection unique : un nom repete ne fait pas rejouer l'hote."""
+        p = self.run_staging('--hotes',
+                             'ameesh-agents-2 ameesh-agents-1 ameesh-agents-2',
+                             '--sans-sonde')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        installes = [h for h, a in self.actions() if a == 'installer']
+        self.assertEqual(installes, ['ameesh-agents-1', 'ameesh-agents-2'])
 
     def test_topology_is_required_and_consistent(self):
         cases = {
