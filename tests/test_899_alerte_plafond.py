@@ -15,6 +15,12 @@ reste borné (canon §3) ; ce lot ajoute l'alerte côté CI :
 * `summary` affiche la part du plafond consommée, mesure de la croissance
   d'une exécution à l'autre.
 
+#1044 (suite) — les nombres non finis (NaN, ±infini, débordement de
+conversion) sont refusés comme illisibles pour les deux champs, avant tout
+calcul et toute écriture ; et `summary` étiquette la durée de l'alerte « au
+moment de l'alerte » quand aucune durée finale n'est attestée (part
+interrompue sans ligne `fin`).
+
 Aucun réveil ni annotation d'échec : `ameesh.ci.events_of` ne lit que les
 échecs de test, l'alerte ne crée donc pas de courrier (vérifié ici).
 """
@@ -120,6 +126,23 @@ class SeuilTest(unittest.TestCase):
                                ("", ""), ("bientôt", "quarante"), (DEBUT, 0)):
             with self.subTest(debut=debut, plafond=plafond):
                 self.assertIsNone(ciflux.alerte_plafond(debut, plafond, DEBUT + 100000))
+
+    def test_nombres_non_finis_refuses(self):
+        """#1044 N1 : NaN, ±infini et débordement ne sont jamais des nombres."""
+        for valeur in ("nan", "NaN", "inf", "-inf", "Infinity", "1e999", 10 ** 400):
+            with self.subTest(valeur=valeur):
+                self.assertIsNone(ciflux._nombre(valeur))
+        self.assertIsNone(ciflux._nombre(None))
+        self.assertEqual(ciflux._nombre("45"), 45.0)
+        self.assertEqual(ciflux._nombre(30), 30.0)
+
+    def test_alerte_refuse_les_non_finis_des_deux_champs(self):
+        """#1044 N1 : plafond nan n'alerte plus après 10 s, début nan ne lève plus."""
+        for valeur in ("nan", "inf", "-inf", 10 ** 400):
+            with self.subTest(champ="plafond", valeur=valeur):
+                self.assertIsNone(ciflux.alerte_plafond(DEBUT, valeur, DEBUT + 10))
+            with self.subTest(champ="debut", valeur=valeur):
+                self.assertIsNone(ciflux.alerte_plafond(valeur, 30, DEBUT + 10))
 
     def test_contexte_de_la_part(self):
         alerte = ciflux.alerte_plafond(DEBUT, 30, DEBUT + 1440,
@@ -249,6 +272,24 @@ class PublicationTest(unittest.TestCase):
                                             maintenant=lambda: DEBUT + 1440), 0)
         self.assertEqual(gh.appels, [])
 
+    def test_non_finis_ne_sont_pas_publies_ni_persistes(self):
+        """#1044 N1 : NaN/infini (options ou environnement) : rien n'est calculé
+        ni écrit dans l'état, et le publieur ne lève pas."""
+        gh = FauxGitHub()
+        self.ecrire(ev_debut())
+        env = {ciflux.ENV_PLAFOND: "nan", ciflux.ENV_DEBUT: "inf"}
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            self.assertEqual(ciflux.publish(self.args(plafond_min=None, debut=None), gh=gh,
+                                            dormir=lambda _: self.ecrire(ev_fin()),
+                                            horloge=lambda: 0.0,
+                                            maintenant=lambda: DEBUT + 10), 0)
+        self.assertEqual(gh.alertes(), [])
+        self.assertNotIn("plafond_min", self.etat())
+        self.assertNotIn("debut", self.etat())
+        brut = (self.dossier / "flux.jsonl.check").read_text(encoding="utf-8")
+        self.assertNotIn("NaN", brut)
+        self.assertNotIn("Infinity", brut)
+
 
 class ResumeTest(unittest.TestCase):
     """Le résumé du job donne la part du plafond consommée (la croissance)."""
@@ -287,6 +328,33 @@ class ResumeTest(unittest.TestCase):
 
     def test_resume_sans_etat_inchange(self):
         self.assertNotIn("Plafond", ciflux.summary([str(self.flux)]))
+
+    def test_alerte_sans_fin_n_est_pas_une_duree_finale(self):
+        """#1044 N2 : part interrompue — la durée de l'alerte est étiquetée."""
+        self.etat(plafond_min=30, alerte=alerte_a(1440.0), conclusion="cancelled")
+        texte = ciflux.summary([str(self.flux)])
+        self.assertIn("24 min 00 s écoulées au moment de l'alerte sur 30 min (80 %)", texte)
+        self.assertIn("durée finale non attestée", texte)
+        self.assertNotIn("à la fin de la part", texte)
+
+    def test_duree_finale_attestee_prime_sur_l_alerte(self):
+        """#1044 N2 : avec `fin_ecoule_s`, la mesure finale reste la référence."""
+        self.etat(plafond_min=30, fin_ecoule_s=1500.0, alerte=alerte_a(1440.0),
+                  conclusion="success")
+        texte = ciflux.summary([str(self.flux)])
+        self.assertIn("25 min 00 s à la fin de la part sur 30 min (83 %)", texte)
+        self.assertNotIn("au moment de l'alerte", texte)
+
+    def test_etat_avec_nombres_non_finis_ignore(self):
+        """#1044 N1 : un état hérité avec NaN/infini n'affiche aucun plafond."""
+        (self.dossier / "flux.jsonl.check").write_text(
+            '{"plafond_min": NaN, "fin_ecoule_s": Infinity,'
+            ' "alerte": {"ecoule_s": NaN, "plafond_min": Infinity, "seuil": NaN}}',
+            encoding="utf-8")
+        texte = ciflux.summary([str(self.flux)])
+        self.assertNotIn("Plafond", texte)
+        self.assertNotIn("NaN", texte)
+        self.assertNotIn("Infinity", texte)
 
 
 class WorkflowTest(unittest.TestCase):
