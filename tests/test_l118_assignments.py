@@ -173,7 +173,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",
                          "--estimate", "1h")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("message not dropped", proc.stderr)
+        self.assertIn("message not delivered", proc.stderr)
         self.assertEqual(self.unread("inconnu"), [])
         self.assertEqual(work.list_items(self.db), [])
 
