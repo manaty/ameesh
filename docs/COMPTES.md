@@ -629,9 +629,13 @@ counted amount next to the estimate.
 **A budget pause is shown as one.** The pause reason starts with the account
 that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
 all claude accounts at threshold — …". It is the agent's `status_text`
-("budget : pause (…) until 14:20; …"). An account held by several windows
-frees when the last of them resets: the label names that window, and the
-date when it is not today ("until 14/10 09:00"). Without declared accounts the
+("budget : pause (…) until 14:20; …"). The announced time is the real one: a
+window held by the pace alone frees when the elapsed part catches up with the
+usage (the guard is re-evaluated on every turn, #898), while a usage at the
+pace ceiling (90 %, less the reserve kept for critical agents) only falls back
+at the window reset. An account held by several windows frees with the last of
+them: the label names that window, and the date when it is not today ("until
+14/10 09:00"). Without declared accounts the
 account is `(default)`, the harness's own. `ameesh progress` and the alerts read
 `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
 

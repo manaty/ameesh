@@ -650,7 +650,9 @@ class Evaluation:
     profile: Profile
     reason: str = ""                     #: '' = sous le seuil
     gauges: list = field(default_factory=list)
-    until: float | None = None           #: heure de libération si au seuil (#777)
+    until: float | None = None           #: heure de libération si au seuil
+                                         #: (#777) : croisement du rythme ou
+                                         #: remise à zéro (#898)
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
@@ -971,8 +973,10 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         if reserve and not hard:
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
         # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
-        # plus longtemps ; #777 : à l'heure où elle libère vraiment ; #1176 :
-        # le relèvement de fin de fenêtre peut la libérer avant la remise à zéro.
+        # plus longtemps ; #777, #898 : à l'heure où elle libère vraiment —
+        # croisement du rythme, ou remise à zéro quand il ne rattrape plus ;
+        # #1176 : le relèvement de fin de fenêtre peut la libérer avant la
+        # remise à zéro.
         result.until, late = _release(profile, depasses, hard, now,
                                       RESERVE if reserve else 0.0, result.ceilings)
         if late is not None:
