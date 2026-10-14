@@ -301,6 +301,30 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("--agent-units", res.stderr)
 
+    def test_the_disk_floor_is_qualified_per_host(self):
+        # #1256 : le plancher fixe de 15 GiB refuse la ci-3 mesurée (8.95 GiB
+        # libres). Il est donc qualifié par l'opérateur (--disk-floor-mib),
+        # jamais contourné en silence : sous le plancher demandé, --prepare
+        # refuse, et la valeur est validée.
+        res = self.run_script("--prepare", "--host", "ci-3",
+                              "--disk-floor-mib", "999999")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("999999 MiB floor", res.stderr)
+        self.assertIn("--disk-floor-mib", res.stderr)
+        res = self.run_script("--prepare", "--host", "ci-3", "--disk-floor-mib", "1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        res = self.run_script("--prepare", "--host", "ci-3", "--disk-floor-mib", "0")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("positive", res.stderr)
+        res = self.run_script("--prepare", "--host", "ci-3", "--disk-floor-mib", "12x")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("invalid --disk-floor-mib", res.stderr)
+        # au-delà de 1 TiB, l'arithmétique déborderait : refusé, pas replié
+        res = self.run_script("--prepare", "--host", "ci-3",
+                              "--disk-floor-mib", "999999999999999999999")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("1048576 MiB", res.stderr)
+
     def test_register_never_prints_the_token(self):
         secret = "ghs_" + "x" * 32
         self.write("root/reg.token", secret + "\n", mode=0o600)
@@ -450,6 +474,15 @@ class CiRunnersTest(unittest.TestCase):
         self.assertEqual(reclaim["busy_units"], ["actions.runner.*"])
         # l'application garde au moins un runner : l'invité s'arrête avant
         self.assertLess(reclaim["busy_max"], 4)
+        # #1256 : chiffres qualifiés sur la ci-3 mesurée (8.95 GiB libres),
+        # pas l'offre initiale (30 GiB / 10 GiB) que l'hôte ne peut pas tenir
+        self.assertEqual(offer["disk_max"], 4 * 2 ** 30)
+        self.assertEqual(reclaim["disk_free_min"], 5 * 2 ** 30)
+        # le plancher de préparation du plan suit la réserve du garde
+        with open(PLAN, encoding="utf-8") as fh:
+            plan = fh.read()
+        self.assertIn("--prepare --count 1 --disk-floor-mib 6144", plan)
+        self.assertNotIn("disk_max: 30GiB", plan)
 
 
 if __name__ == "__main__":
