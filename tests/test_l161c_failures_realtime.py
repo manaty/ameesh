@@ -553,6 +553,49 @@ class WatcherTest(PgTestCase):
         self.assertEqual(alerte["lot"], self.lot["id"])
         self.assertEqual(exploitation.alert_key(alerte), cle)
 
+    def test_attente_d_un_runner_separee_sans_double_alerte(self):
+        # #747 : 1 h 24 d'attente lue comme « psql bloqué 2 h 20 »
+        import time as _time
+        now = 1_800_000_000
+        self.enterContext(mock.patch("time.time", return_value=now))
+        cree = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(now - 30 * 60))
+        vue = dict(run_view(801, "9" * 40, "lot/1-un"), status="queued", created_at=cree)
+        self.api.queued = [vue]
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertIsNone(row["started_ts"])
+        self.assertEqual(row["created_ts"], now - 30 * 60)
+        self.assertEqual(ci.wait_text(row, now), "queued 30 min")
+        (attente,) = ci.queue_starved(self.db, now)
+        self.assertEqual((attente["repo"], attente["count"]), (DEPOT, 1))
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_queue_starved"], [])
+        self.assertNotIn("ci_queue_starved", notify.DEFAULT_TYPES)
+        # démarrée : l'attente est figée, la vue ne compte plus ce run
+        self.api.queued, self.api.live = [], [dict(vue, status="in_progress")]
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertIsNotNone(row["started_ts"])
+        # PostgreSQL a sa propre horloge : fixer le démarrage de la fixture
+        # après avoir vérifié que le relevé l'a bien enregistré.
+        self.db.execute("UPDATE ci_runs SET started_at = to_timestamp(%s)"
+                        " WHERE repo = %s AND run_id = %s", (now, DEPOT, 801))
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertEqual(row["started_ts"], now)
+        self.assertEqual(ci.wait_text(row, now + 60), "queued 30 min, ran 1 min")
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_queue_starved"], [])
+        report = ci.status_of(self.db, self.lot["id"])
+        self.assertIn("(queued 30 min, ran 0 min)", "\n".join(ci.render_status(report)))
+
+    def test_attente_courte_sans_alerte(self):
+        vue = dict(run_view(802, "a1" * 20, "lot/1-un"), status="queued")
+        self.api.queued = [vue]
+        self.watcher.tick(self.db)
+        self.assertEqual(ci.queue_starved(self.db, storage.of(self.db).ci.run(
+            DEPOT, 802)["first_seen_ts"] + 60), [])
+
     def test_extrait_illisible_part_sans_extrait(self):
         sha = "7" * 40
         self.api.live = [run_view(601, sha, "lot/1-un")]

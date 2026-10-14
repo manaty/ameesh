@@ -808,26 +808,41 @@ class ShellTest(OffloadBase):
         self.assertIn(b"unknown commit", res.stderr)  # unknown commit first: nothing runs
         self.assertIn(b"invalid job id", self.shell("status ../x").stderr)
 
+    def wait_for_job_state(self, state: str, what: str, timeout: float) -> list[dict]:
+        """The jobs once one of them is in `state`. Fails with the observed
+        jobs if `timeout` elapses: a silent timeout used to let the test go on
+        with no running job at all on a loaded runner (canon §3: no assertion
+        on a fixed delay of the host)."""
+        deadline = time.time() + timeout
+        while True:
+            jobs = self.status_jobs()
+            if any(j.get("state") == state for j in jobs):
+                return jobs
+            if time.time() >= deadline:
+                self.fail("%s: no job in state %r after %.0f s (jobs: %s)"
+                          % (what, state, timeout, jobs))
+            time.sleep(0.2)
+
     def test_slots_queue_status_and_cancel(self):
         self.config["slots"] = 1
+        # the first job runs until cancelled: its admission (checkout, profile
+        # cache, hooks) may take tens of seconds on a loaded runner, and a
+        # fixed sleep would expire before the assertions
+        self.config["max_job_seconds"] = 300
         self.save_config()
-        first = subprocess.Popen([AMEESH, "offload", "run", "--", "sleep", "30"],
+        first = subprocess.Popen([AMEESH, "offload", "run", "--", "sleep", "300"],
                                  cwd=self.repo, env=self.env(), stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         self.addCleanup(first.kill)
-        deadline = time.time() + 20
-        while time.time() < deadline and not any(
-                j.get("state") == "running" for j in self.status_jobs()):
-            time.sleep(0.2)
+        self.wait_for_job_state("running", "first job admitted", timeout=120)
         second = subprocess.Popen([AMEESH, "offload", "run", "--", "echo", "second"],
                                   cwd=self.repo, env=self.env(), stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
         self.addCleanup(second.kill)
-        deadline = time.time() + 20
-        while time.time() < deadline and not any(
-                j.get("state") == "waiting" for j in self.status_jobs()):
-            time.sleep(0.2)
-        (job,) = [j for j in self.status_jobs() if j.get("state") == "running"]
+        jobs = self.wait_for_job_state("waiting", "second job queued", timeout=60)
+        running = [j for j in jobs if j.get("state") == "running"]
+        self.assertEqual(len(running), 1, jobs)
+        job = running[0]
         res = self.offload("cancel", job["job"])
         self.assertEqual(res.returncode, 0, res.stderr)
         out, err = first.communicate(timeout=20)

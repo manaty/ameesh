@@ -12,6 +12,8 @@ RUN_COLUMNS = """
     repo, run_id, head_sha, branch, event, base, work_item_id, status, superseded_by, url,
     extract(epoch from first_seen_at)::float8 AS first_seen_ts,
     extract(epoch from concluded_at)::float8 AS concluded_ts,
+    extract(epoch from created_at)::float8 AS created_ts,
+    extract(epoch from started_at)::float8 AS started_ts,
     urgent_message_id, verdict_message_id
 """
 
@@ -34,18 +36,32 @@ class CiResults(interface.CiResults):
         return rows[0] if rows else None
 
     def open_run(self, repo, run_id, *, head_sha, branch, event, base, work_item_id,
-                 url) -> dict:
+                 url, created_at=None) -> dict:
         rows = self.db.query(
             """
-            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id, url)
-            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
+            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id, url,
+                                 created_at)
+            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s::timestamptz)
             ON CONFLICT (repo, run_id) DO UPDATE
                SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id)
             RETURNING %s
             """ % RUN_COLUMNS,
             (repo, int(run_id), head_sha, branch, event or "", base or "main",
-             int(work_item_id) if work_item_id is not None else None, url))
+             int(work_item_id) if work_item_id is not None else None, url,
+             created_at or None))
         return rows[0]
+
+    def mark_started(self, repo, run_ids) -> None:
+        if not run_ids:
+            return
+        self.db.execute(
+            "UPDATE ci_runs SET started_at = now() WHERE repo = %%s AND run_id IN (%s)"
+            " AND started_at IS NULL" % _ints(run_ids), (repo,))
+
+    def queued(self) -> list[dict]:
+        return self.db.query(
+            "SELECT %s FROM ci_runs WHERE status = 'running' AND started_at IS NULL"
+            " ORDER BY coalesce(created_at, first_seen_at), run_id" % RUN_COLUMNS)
 
     def running(self, repo) -> list[dict]:
         return self.db.query(

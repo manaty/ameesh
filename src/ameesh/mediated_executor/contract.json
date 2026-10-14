@@ -3773,7 +3773,7 @@
   }
  ],
  "refused": {
-  "interface_total": 394,
+  "interface_total": 396,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3920,12 +3920,14 @@
     "for_lot",
     "guard_runs",
     "latest_concluded",
+    "mark_started",
     "message_ids",
     "observe_guard_run",
     "observe_queue",
     "observe_runners",
     "open_run",
     "prune_guard_runs",
+    "queued",
     "queued_oldest",
     "run",
     "running",
