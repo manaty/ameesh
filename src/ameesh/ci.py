@@ -56,7 +56,6 @@ Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas enco
 """
 from __future__ import annotations
 
-import datetime
 import json
 import re
 import secrets
@@ -629,11 +628,15 @@ PR_RUN_RE = re.compile(
     r"base (?P<base>[0-9a-f]{40})\]")
 #: la marque de demande dans le journal du lot : `reserve` prend le verrou de
 #: la ligne, `applied` la referme sur une étiquette posée, `released` sur un
-#: refus. Le motif ne dépend pas du texte qui suit.
+#: refus. Le motif ne dépend pas du texte qui suit. Une marque `applied` porte
+#: `seen=<id>` (P2-3) : le plus grand identifiant d'exécution connu avant sa
+#: pose, seule corrélation fiable avec le run qu'elle a produit (les horloges
+#: de la base et de GitHub ne se comparent pas : la seconde contre la fraction).
 REQUEST_RE = re.compile(
     r"^ci-label (?P<state>reserve|applied|released) pr=(?P<pr>\d+) "
     r"label=(?P<label>ci-(?:lot|full)-[0-9a-f]{40}) sha=(?P<sha>[0-9a-f]{40}) "
-    r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})\b")
+    r"base=(?P<base>[0-9a-f]{40}) mode=(?P<mode>lot|full) token=(?P<token>[0-9a-f]{16})"
+    r"(?: seen=(?P<seen>\d+))?\b")
 #: l'acteur du `GITHUB_TOKEN` d'Actions : ses étiquettes ne déclenchent rien
 ACTIONS_BOT = "github-actions[bot]"
 
@@ -884,9 +887,12 @@ def _latest_check(api, repo: str, sha: str) -> dict | None:
 
 
 def _request_note(state: str, number: int, label: str, sha: str, base: str,
-                  mode: str, token: str, text: str = "") -> str:
+                  mode: str, token: str, text: str = "",
+                  seen: int | None = None) -> str:
     marker = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
               % (state, number, label, sha, base, mode, token))
+    if seen is not None:
+        marker += " seen=%d" % seen
     return "%s: %s" % (marker, text.strip()) if text.strip() else marker
 
 
@@ -902,42 +908,60 @@ def request_events(db, item_id: int, *, limit: int = 200) -> list[dict]:
                     "pr": int(m.group("pr")), "label": m.group("label"),
                     "sha": m.group("sha"), "base": m.group("base"),
                     "mode": m.group("mode"), "token": m.group("token"),
+                    "seen": int(m.group("seen")) if m.group("seen") is not None else None,
                     "ts": float(ev.get("created_ts") or 0.0)})
     return sorted(out, key=lambda e: e["id"])
 
 
-def _run_ts(row: dict) -> float:
-    """L'instant de création d'une exécution (epoch), 0.0 s'il est illisible."""
-    raw = str(row.get("created_at") or row.get("run_started_at") or "")
+def _run_id(row: dict) -> int:
+    """L'identifiant entier d'une exécution, 0 s'il est illisible (P2-3)."""
     try:
-        return datetime.datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
+        return int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _materialized(mark: dict, runs: list[int]) -> bool:
+    """Une exécution visible matérialise-t-elle cette marque (P2-3) ?
+
+    Chaque marque `applied` enregistre `seen=` : le plus grand identifiant
+    d'exécution connu avant sa pose. Les identifiants des exécutions GitHub
+    croissent avec le temps : un run d'identifiant supérieur n'a pu naître
+    qu'après elle, donc la demande a produit son exécution et ne tient plus la
+    clé. Une marque sans `seen=` (écrite avant #1343) n'est pas corrélable :
+    elle tient la clé jusqu'au `ttl`, jamais libérée par une comparaison entre
+    l'horloge de la base (marque, fractionnaire) et celle de GitHub (run, à la
+    seconde) — c'est cette comparaison qui bloquait la reprise d'un run rouge
+    né dans la même seconde que sa marque.
+    """
+    seen = mark.get("seen")
+    if seen is None:
+        return False
+    return any(ident > seen for ident in runs)
 
 
 def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token: str, *,
                        now: float, ttl: float = RESERVE_TTL_S,
-                       after: float = 0.0) -> dict | None:
-    """La marque `applied` fraîche d'un autre porteur, ou None (P2 R1).
+                       runs: tuple = ()) -> dict | None:
+    """La marque `applied` fraîche d'un autre porteur, ou None (P2 R1/P2-3).
 
     Une étiquette posée mais pas encore visible comme exécution dans l'API
     GitHub tient la clé le temps du `ttl` ; `released` (demande refusée), les
-    marques périmées et celles qui précèdent l'exécution visible (`after`) ne
-    tiennent pas — une exécution visible matérialise la demande. La couverture
-    des modes suit celle des exécutions (§ `_covers`) : un `full` réservé
-    couvre une demande `lot` de la même composition, l'inverse non. Appelé sous
-    le verrou de la ligne du lot, il lit les marques commitées des autres
-    processus ; le porteur courant est exclu (`token`).
+    marques périmées et celles que matérialise une exécution visible
+    (`_materialized`) ne tiennent pas. `runs` porte les identifiants des
+    exécutions visibles de la composition : la marque est libérée par
+    corrélation d'identifiants, jamais par une comparaison d'horloges. La
+    couverture des modes suit celle des exécutions (§ `_covers`) : un `full`
+    réservé couvre une demande `lot` de la même composition, l'inverse non.
+    Appelé sous le verrou de la ligne du lot, il lit les marques commitées des
+    autres processus ; le porteur courant est exclu (`token`).
     """
     key = [e for e in events
            if e["sha"] == sha and e["base"] == base and _covers(e["mode"], mode)
            and e["state"] == "applied" and e["token"] != token]
-    if not key:
-        return None
-    last = key[-1]
-    if now - last["ts"] >= ttl or last["ts"] < after:
-        return None
-    return last
+    held = [e for e in key
+            if now - e["ts"] < ttl and not _materialized(e, runs)]
+    return held[-1] if held else None
 
 
 def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
@@ -1297,7 +1321,10 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
     avis delta R1), et recule si un run est visible, si la PR a bougé, si un
     autre a déjà posé l'étiquette ou si l'autorisation a changé. Le verrou ne
     survit pas au processus tué (ROLLBACK) : le suivant reprend, sans attente
-    ni marque périmée.
+    ni marque périmée. La marque `applied` enregistre `seen=` (plus grand
+    identifiant d'exécution connu avant la pose) : c'est cette corrélation, et
+    non une comparaison d'horloges, qui libère la reprise d'un run rouge dès
+    que son exécution est visible (P2-3).
 
     La sérialisation par verrou de ligne vaut pour une connexion directe. Sur
     une connexion d'exécuteur médiée (`storage.is_remote`, L109), la phase
@@ -1315,13 +1342,21 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
     number, label = decision["pr"], decision["label"]
 
     def critical(tx) -> dict:
-        def note(state: str, text: str = "") -> None:
+        def note(state: str, text: str = "", seen: int | None = None) -> None:
             work.note(tx, int(item_id),
-                      _request_note(state, number, label, sha, base, mode, token, text))
+                      _request_note(state, number, label, sha, base, mode, token, text,
+                                    seen=seen))
 
         note("reserve", "freeze CI requested")
-        runs = [r for r in _pr_runs(api, decision["repo"], number, sha, decision["branch"])
-                if r["base"] == base and _covers(r["mode"], mode)]
+        known = _pr_runs(api, decision["repo"], number, sha, decision["branch"])
+        #: P2-3 : le plus grand identifiant d'exécution déjà connu avant la pose
+        #: est la marque de l'instant ; le run de cette demande, créé après,
+        #: portera un identifiant supérieur. La marque `applied` l'enregistre
+        #: (`seen=`) et la reprise d'un run rouge se libère par cette
+        #: corrélation, sans jamais comparer l'horodatage (base, fractionnaire)
+        #: au `created_at` du run (GitHub, à la seconde).
+        watermark = max((_run_id(r["row"]) for r in known), default=0)
+        runs = [r for r in known if r["base"] == base and _covers(r["mode"], mode)]
         live = [r for r in runs if r["status"] in OPEN_STATUSES]
         green = [r for r in runs if r["status"] == "completed" and r["conclusion"] == "success"]
         if live:
@@ -1356,11 +1391,13 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
             return {"requested": False, "action": "refuse",
                     "why": "a %s request of this composition already ran, none green: "
                            "--force to request the CI again" % runs[-1]["mode"]}
-        #: avis delta R1 : une marque antérieure au run visible est matérialisée par lui
-        #: (run rouge court) ; seule une demande encore invisible tient la clé.
-        visible = max((_run_ts(r["row"]) for r in runs), default=0.0)
+        #: P2 R1/P2-3 : une marque que matérialise une exécution visible (run
+        #: rouge court) ne tient plus la clé ; seule une demande encore
+        #: invisible tient, et la corrélation est l'identifiant du run, pas
+        #: l'horloge.
         held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
-                                  now=time.time(), after=visible)
+                                  now=time.time(),
+                                  runs=tuple(_run_id(r["row"]) for r in runs))
         if held:
             note("released", "another request (token %s) already holds this composition"
                  % held["token"])
@@ -1401,7 +1438,7 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
             text += " — replaced %s" % ", ".join(posed["dropped"])
         if posed["failed"]:
             text += " — warnings: %s" % "; ".join(posed["failed"])
-        note("applied", text)
+        note("applied", text, seen=watermark)
         return {"requested": True, "action": "request", "run": {},
                 "dropped": posed["dropped"], "warnings": posed["failed"]}
 

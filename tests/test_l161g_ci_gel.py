@@ -130,22 +130,31 @@ def check_run(ident: int = 900, *, name: str = "tests", statut: str = "completed
 
 def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
            token: str = "0" * 16, pr: int = PR, label: str | None = None,
-           ident: int = 1, ts: float | None = None, texte: str = "") -> dict:
-    """Un événement `ci-label` du journal du lot, comme `work.events` le rend."""
+           ident: int = 1, ts: float | None = None, texte: str = "",
+           seen: int | None = 0) -> dict:
+    """Un événement `ci-label` du journal du lot, comme `work.events` le rend.
+
+    `seen` est le plus grand identifiant d'exécution connu avant la pose
+    (P2-3) ; `None` écrit une marque d'avant #1343, sans corrélation.
+    """
     label = label or "ci-%s-%s" % (mode, sha)
     note = ("ci-label %s pr=%d label=%s sha=%s base=%s mode=%s token=%s"
             % (state, pr, label, sha, base, mode, token))
+    if seen is not None:
+        note += " seen=%d" % seen
     if texte:
         note += ": " + texte
     return {"id": ident, "note": note, "created_ts": time.time() if ts is None else ts}
 
 
 def porte(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
-          token: str = "0" * 16, ident: int = 1, ts: float | None = None) -> dict:
+          token: str = "0" * 16, ident: int = 1, ts: float | None = None,
+          seen: int | None = 0) -> dict:
     """Une marque déjà parsée, comme `ci.request_events` la rend."""
     return {"id": ident, "state": state, "pr": PR,
             "label": "ci-%s-%s" % (mode, sha), "sha": sha, "base": base,
-            "mode": mode, "token": token, "ts": time.time() if ts is None else ts}
+            "mode": mode, "token": token, "seen": seen,
+            "ts": time.time() if ts is None else ts}
 
 
 class FakeTx:
@@ -699,30 +708,55 @@ class GelPlanTest(GelTestCase):
 
 
 class ReservationTest(unittest.TestCase):
-    """`ci.reservation_holder` : la clé d'une demande pas encore visible (P2 R1).
+    """`ci.reservation_holder` : la clé d'une demande pas encore visible (P2 R1/P2-3).
 
     R1 delta : la réservation suit la couverture des modes (un `full` couvre
-    le `lot`) et une marque antérieure à l'exécution visible est matérialisée
-    par elle — le `--force` d'un run rouge court peut repartir.
+    le `lot`). P2-3 : une marque est matérialisée par toute exécution visible
+    d'identifiant supérieur au sien (`seen=`) — jamais par une comparaison
+    d'horloges — et une marque sans `seen=` (écrite avant #1343) tient la clé
+    jusqu'au `ttl`.
     """
 
     def test_la_reservation_full_couvre_la_demande_lot(self):
         now = time.time()
-        full = [porte("applied", mode="full", token="6" * 16)]
+        full = [porte("applied", mode="full", token="6" * 16, seen=0)]
         self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "lot", "", now=now))
         self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "full", "", now=now))
-        lot = [porte("applied", mode="lot", token="6" * 16)]
+        lot = [porte("applied", mode="lot", token="6" * 16, seen=0)]
         self.assertIsNone(ci.reservation_holder(lot, GEL, BASE, "full", "", now=now))
         self.assertIsNotNone(ci.reservation_holder(lot, GEL, BASE, "lot", "", now=now))
 
-    def test_une_marque_anterieure_au_run_visible_ne_tient_pas(self):
+    def test_une_execution_superieure_materialise_la_marque(self):
         now = time.time()
-        avant = [porte("applied", token="7" * 16, ts=now - 300)]
+        avant = [porte("applied", token="7" * 16, seen=4, ts=now - 300)]
         self.assertIsNone(ci.reservation_holder(avant, GEL, BASE, "lot", "",
-                                                now=now, after=now - 60))
-        apres = [porte("applied", token="7" * 16, ts=now)]
+                                                now=now, runs=[12]))
+        apres = [porte("applied", token="7" * 16, seen=12, ts=now)]
         self.assertIsNotNone(ci.reservation_holder(apres, GEL, BASE, "lot", "",
-                                                   now=now, after=now - 60))
+                                                   now=now, runs=[12]))
+
+    def test_la_meme_seconde_ne_decide_pas(self):
+        # P2-3 : la marque (horodatage base, fractionnaire) et le run (GitHub,
+        # à la seconde) sont contemporains ; seul l'identifiant tranche — la
+        # marque du run rouge 12 (`seen=0`) est matérialisée, celle d'une
+        # demande faite après ce run (`seen=12`) tient la clé.
+        t = 1802563200.0
+        rouge = [porte("applied", token="7" * 16, seen=0, ts=t + 0.125)]
+        self.assertIsNone(ci.reservation_holder(rouge, GEL, BASE, "lot", "",
+                                                now=t + 120, runs=[12]))
+        invisible = [porte("applied", token="8" * 16, seen=12, ts=t + 0.125)]
+        self.assertIsNotNone(ci.reservation_holder(invisible, GEL, BASE, "lot", "",
+                                                   now=t + 120, runs=[12]))
+
+    def test_une_marque_sans_watermark_tient_jusqu_au_ttl(self):
+        # une marque d'avant #1343 n'est pas corrélable : elle tient la clé
+        # jusqu'au `ttl` (borne), jamais libérée par une horloge.
+        now = time.time()
+        legacy = [porte("applied", token="9" * 16, seen=None, ts=now)]
+        self.assertIsNotNone(ci.reservation_holder(legacy, GEL, BASE, "lot", "",
+                                                   now=now, runs=[12]))
+        self.assertIsNone(ci.reservation_holder(legacy, GEL, BASE, "lot", "",
+                                                now=now + ci.RESERVE_TTL_S, runs=[12]))
 
 
 class CancelPlanTest(GelTestCase):
@@ -1020,33 +1054,76 @@ class RequestTest(GelTestCase):
         self.assertEqual(gh.poses(), [LABEL])
         self.assertEqual(len(self.marques("applied")), 1, notes)
 
-    def test_un_run_rouge_visible_ne_tient_plus_la_reservation(self):
-        # P2 delta : après un run rouge court, la marque `applied` de ce run
-        # tient encore la clé quinze minutes ; `--force` doit repartir — la
-        # marque antérieure au run visible est matérialisée par lui.
+    def test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde(self):
+        # P2-3 : la marque `applied` de la demande (horodatage DB fractionnaire)
+        # et le run rouge qu'elle a produit (`created_at` GitHub à la seconde)
+        # sont contemporains ; la corrélation par identifiant d'exécution libère
+        # la reprise `--force`, que la comparaison d'horloges bloquait.
         self.gele()
         t = time.time()
-        self.events.append(marque("applied", token="4" * 16, ts=t - 300))
-        api = Github(runs=[label_run(12, conclusion="failure", created=t - 60)])
-        gh = Gh()
-        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
-            **{**vars(self.args), "force": True}))
+        self.events.append(marque("applied", token="4" * 16, ts=t + 0.125, seen=0))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t)])
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+                **{**vars(self.args), "force": True}))
         self.assertEqual(code, 0)
         self.assertEqual(gh.poses(), [LABEL])
-        self.assertEqual(len(self.marques("applied")), 1, notes)
+        applied = self.marques("applied")
+        self.assertEqual(len(applied), 1, notes)
+        # la nouvelle marque enregistre le run déjà connu avant sa pose (P2-3)
+        self.assertIn("seen=12", applied[0])
 
     def test_une_marque_posterieure_au_run_visible_tient_la_cle(self):
-        # P2 delta, garde : une marque d'un autre hôte postérieure au run
-        # visible n'est pas matérialisée par lui ; elle tient toujours la clé.
+        # P2-3, garde : une demande faite après le run rouge visible (`seen=12`)
+        # n'est pas matérialisée par lui, même si sa marque et le run sont
+        # datés de la même seconde ; seule une exécution d'identifiant
+        # supérieur la libérerait.
         self.gele()
         t = time.time()
-        self.events.append(marque("applied", token="5" * 16, ts=t))
-        api = Github(runs=[label_run(12, conclusion="failure", created=t - 60)])
+        self.events.append(marque("applied", token="5" * 16, ts=t + 0.125, seen=12))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t)])
         gh = Gh()
         code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
             **{**vars(self.args), "force": True}))
         self.assertEqual(code, 0)
         self.assertEqual(gh.poses(), [])
+        self.assertTrue(any("already holds" in n for n in notes), notes)
+
+    def test_une_marque_sans_watermark_tient_la_cle(self):
+        # P2-3, transition : une marque écrite avant #1343 (`seen=` absent)
+        # n'est pas corrélable ; elle tient la clé jusqu'au `ttl` plutôt que
+        # d'être libérée par une comparaison d'horloges.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", token="6" * 16, ts=t + 0.125, seen=None))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t)])
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [])
+        self.assertTrue(any("already holds" in n for n in notes), notes)
+
+    def test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas(self):
+        # P2-3, garde de bout en bout : le premier `--force` repose sur le run
+        # rouge 12 et sa marque enregistre `seen=12` ; tant que le nouveau run
+        # n'est pas visible, un second `--force` recule — une demande encore
+        # invisible n'est jamais libérée par le run qui l'a précédée.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", token="4" * 16, ts=t + 0.125, seen=0))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t)])
+        force = argparse.Namespace(**{**vars(self.args), "force": True})
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            gh = Gh()
+            code, _notes = self.run_cmd(api, gh, args=force)
+            self.assertEqual(code, 0)
+            self.assertEqual(gh.poses(), [LABEL])
+            self.assertIn("seen=12", self.marques("applied")[-1])
+            code, notes = self.run_cmd(api, gh, args=force)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL], "la reprise invisible ne repose pas")
         self.assertTrue(any("already holds" in n for n in notes), notes)
 
     def test_une_reservation_full_couvre_la_demande_lot(self):
