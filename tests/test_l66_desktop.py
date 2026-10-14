@@ -146,9 +146,18 @@ class PlatformNotifyTest(_Banc):
         self.assertIn("L67", str(ctx.exception))
 
     def test_wsl_detecte(self):
-        self.assertTrue(pnotify.is_wsl({"WSL_DISTRO_NAME": "Ubuntu"}))
-        self.assertTrue(pnotify.is_wsl({"WSL_INTEROP": "/run/WSL/7_interop"}))
-        self.assertIsInstance(pnotify.is_wsl({}), bool)
+        """Independant de la machine : `is_wsl` ne vaut que si l'OS est Linux.
+
+        Le job macOS execute cette classe entiere ; sans SYSTEM epingle, les
+        variables WSL de l'environnement de test ne suffisaient pas.
+        """
+        with mock.patch.object(pnotify, "SYSTEM", "linux"):
+            self.assertTrue(pnotify.is_wsl({"WSL_DISTRO_NAME": "Ubuntu"}))
+            self.assertTrue(pnotify.is_wsl({"WSL_INTEROP": "/run/WSL/7_interop"}))
+            self.assertIsInstance(pnotify.is_wsl({}), bool)
+        with mock.patch.object(pnotify, "SYSTEM", "macos"):
+            self.assertFalse(pnotify.is_wsl({"WSL_DISTRO_NAME": "Ubuntu"}))
+            self.assertFalse(pnotify.is_wsl({"WSL_INTEROP": "/run/WSL/7_interop"}))
 
     def test_surcharge_explicite_sans_repli(self):
         env = {"PATH": os.environ.get("PATH", ""),
