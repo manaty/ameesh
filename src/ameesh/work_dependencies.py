@@ -50,12 +50,19 @@ def grouped(db, item_ids):
 # --------------------------------------------------------------------------
 
 def released_by(db, blocker_id) -> list[dict]:
-    """Lots ouverts dont cette fermeture lève l'attente (lecture d'après commit).
+    """Lots ouverts dont la fermeture de `blocker_id` lève l'attente.
 
-    Un dépendant n'est rendu que s'il ne lui reste AUCUNE attente une fois le
-    blocage fermé : aucune arête bloquante, aucun engagement ouvert, aucun
-    début planifié futur — la même vérité que `planned_wait`. Les lots fermés,
-    fusionnés ou sans arête vers `blocker_id` n'en font jamais partie.
+    Lecture faite DANS la transaction de fermeture, après l'écriture de la
+    transition (et sous le verrou de graphe) : un dépendant n'est rendu que
+    s'il ne lui reste AUCUNE attente une fois le blocage fermé — aucune arête
+    bloquante, aucun engagement ouvert, aucun début planifié futur, la même
+    vérité que `planned_wait`. Les lots fermés, fusionnés ou sans arête vers
+    `blocker_id` n'en font jamais partie.
+
+    C'est le caractère « dernière attente » qui rend le réveil idempotent :
+    tant qu'un autre bloqueur tient, la fermeture ne rend personne ; la
+    fermeture qui suit, sérialisée par le verrou de graphe, est la seule à
+    voir l'attente tomber. Aucun marqueur à poser, aucun doublon à déduire.
     """
     st = storage.of(db)
     blocker_id = int(blocker_id)
@@ -75,6 +82,20 @@ def released_by(db, blocker_id) -> list[dict]:
     return [r for r in candidates if int(r["id"]) not in waits]
 
 
+def lock(db) -> None:
+    """Prend le verrou de graphe des dépendances dans la transaction courante.
+
+    À appeler par toute fermeture de lot, avant de lire `released_by` : deux
+    fermetures concurrentes (B et C, tous deux attendus par D) décident alors
+    l'une APRÈS l'autre. Sans lui, chacune lit l'autre bloqueur encore ouvert
+    et aucune ne réveille D (réveil perdu) ; ou, en lisant après coup, les
+    deux voient la libération et D reçoit deux courriers (doublon). Le verrou
+    est celui des éditions de graphe (`add`/`remove`), tenu jusqu'au commit :
+    la décision et le courrier qu'elle produit ne se séparent pas.
+    """
+    storage.of(db).work_dependencies.lock()
+
+
 def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
     """Le corps court et factuel d'un réveil de dépendance."""
     lot = int(row["id"])
@@ -89,24 +110,26 @@ def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
             % (int(blocker_id), why, lot, title))
 
 
-def notify_released(db, blocker_id, *, blocker_state, blocker_reason="") -> list[dict]:
+def notify_released(db, blocker_id, *, blocker_state, blocker_reason="",
+                    after_commit=None) -> list[dict]:
     """Dépose un courrier durable à l'agent de chaque dépendant libéré.
 
-    Appelé APRÈS le commit de la fermeture : rien n'est annoncé tant que l'état
-    n'est pas réel. Le message est un `event` ordinaire porté par le lot
-    dépendant : le runner existant réveille l'agent par LISTEN/NOTIFY, sans
-    sondage ni session neuve ; un agent arrêté à la main reçoit le courrier à
-    sa reprise, rien ne le redémarre. Ne lève jamais : la fermeture est le
-    fait, la notification un plus ; un échec est signalé et laissé visible.
+    Appelé DANS la transaction qui ferme le bloqueur, après l'écriture de la
+    transition : le courrier est committé avec elle. Il n'existe donc aucune
+    fenêtre « fermeture commise, réveil non écrit » — un échec d'écriture
+    annule la fermeture entière, et la reprise (relevé suivant, seconde
+    commande) refait les deux. Le message est un `event` ordinaire porté par
+    le lot dépendant : le runner existant réveille l'agent par LISTEN/NOTIFY,
+    sans sondage ni session neuve ; un agent arrêté à la main reçoit le
+    courrier à sa reprise, rien ne le redémarre.
+
+    Ne rattrape AUCUNE erreur : avaler l'échec ici committerait la fermeture
+    sans son réveil, précisément le défaut que ce chemin doit exclure. Le fil
+    lisible est écrit après le commit (`after_commit`, appelé par l'appelant).
     Rend une ligne par courrier déposé (`lot`, `to`, `message_id`)."""
-    from . import fil, mail
+    from . import mail
     out: list[dict] = []
-    try:
-        rows = released_by(db, blocker_id)
-    except Exception as exc:  # noqa: BLE001
-        fil.warn("dependents of lot #%s not read (%s: %s)"
-                 % (blocker_id, type(exc).__name__, str(exc)[:160]))
-        return out
+    rows = released_by(db, blocker_id)
     for row in rows:
         to = (row.get("assignee") or "").strip()
         if not to or to.startswith(work.HUMAN_PREFIX):
@@ -116,14 +139,9 @@ def notify_released(db, blocker_id, *, blocker_state, blocker_reason="") -> list
         charge = {"dependent": lot, "blocker": int(blocker_id), "blocker_state": blocker_state}
         if blocker_reason:
             charge["blocker_reason"] = blocker_reason
-        try:
-            message_id = mail.send(
-                db, work.SYSTEM_SENDER, to, body, kind="event", work_item_id=str(lot),
-                payload={"dependency": charge})
-        except Exception as exc:  # noqa: BLE001
-            fil.warn("dependents of lot #%s: wake for #%d to %s not sent (%s: %s)"
-                     % (blocker_id, lot, to, type(exc).__name__, str(exc)[:160]))
-            continue
+        message_id = mail.send(
+            db, work.SYSTEM_SENDER, to, body, kind="event", work_item_id=str(lot),
+            payload={"dependency": charge}, after_commit=after_commit)
         out.append({"lot": lot, "to": to, "message_id": message_id})
     return out
 

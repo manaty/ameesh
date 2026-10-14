@@ -163,8 +163,11 @@ class ReleasedWakeTest(PgTestCase):
 
     Le réveil est un courrier durable (`kind=event`) porté par le lot
     dépendant : le runner existant s'en sert tel quel, aucun sondage ni
-    session neuve. Il part APRÈS le commit de la fermeture, une seule fois,
-    et seulement quand plus aucune attente ne retient le lot.
+    session neuve ; un agent arrêté à la main reste arrêté. Le courrier est
+    écrit DANS la transaction de fermeture, une seule fois, et seulement
+    quand plus aucune attente ne retient le lot : un échec annule la
+    fermeture entière (reprise), et le verrou de graphe empêche deux
+    fermetures concurrentes de se doubler ou de perdre le réveil.
     """
 
     def setUp(self):
@@ -240,26 +243,174 @@ class ReleasedWakeTest(PgTestCase):
         self.assertEqual([r["id"] for r in dependencies.released_by(self.db, self.b)], [self.a])
         self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
 
-    def test_the_wake_is_deposed_only_after_the_closure_commit(self):
+    def test_the_wake_is_written_with_the_closure_in_one_transaction(self):
+        """Le courrier part dans la transaction de fermeture : quand il est
+        écrit, la transition est déjà visible (et elle n'est pas committée
+        sans lui, voir le témoin d'échec)."""
         dependencies.add(self.db, self.a, self.b, actor="test")
         seen = []
         real = mail.send
 
         def spy(db, sender, recipient, body, **kw):
-            seen.append((work.get(self.db, self.b)["state"], recipient, kw.get("kind")))
+            # lu par la MÊME transaction que la fermeture : la transition est
+            # déjà écrite quand le courrier part (et committée avec lui)
+            seen.append((work.get(db, self.b)["state"], recipient, kw.get("kind"),
+                         bool(kw.get("after_commit") is not None)))
             return real(db, sender, recipient, body, **kw)
 
         with mock.patch("ameesh.mail.send", side_effect=spy):
             work.merged(self.db, self.b, sha="b" * 40, actor="git:main")
-        self.assertEqual(seen, [("merged", "dev-a", "event")])
+        self.assertEqual(seen, [("merged", "dev-a", "event", True)])
 
-    def test_a_failed_wake_never_blocks_the_closure(self):
+    def test_a_failed_wake_rolls_back_the_closure_and_a_retry_wakes_once(self):
+        """Adversaire : le courrier échoue après l'écriture de la fermeture.
+
+        Le défaut d'origine committait la fusion sans son réveil, et le rejeu
+        rendait `already` : le réveil était définitivement perdu. Ici la
+        fermeture et le courrier sont une seule transaction — l'échec annule
+        la fusion, la reprise ferme ET réveille, exactement une fois.
+        """
         dependencies.add(self.db, self.a, self.b, actor="test")
         with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
-            done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+            with self.assertRaises(RuntimeError):
+                work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+        self.assertEqual(work.get(self.db, self.b)["state"], "intake")
+        self.assertEqual(self.inbox(), [])
+        done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
         self.assertEqual(done["result"], "merged")
         self.assertEqual(work.get(self.db, self.b)["state"], "merged")
+        [row] = self.inbox()
+        self.assertEqual(mail.message_payload(row)["dependency"],
+                         {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
+        # Rejouer la déclaration, une fois la fusion commise, ne double pas.
+        self.assertEqual(work.merged(self.db, self.b, sha="c" * 40, actor="git:main")["result"],
+                         "already")
+        self.assertEqual(len(self.inbox()), 1)
+
+    def test_a_failed_wake_rolls_back_an_abandoned_closure_too(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
+            with self.assertRaises(RuntimeError):
+                work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(work.get(self.db, self.b)["state"], "intake")
         self.assertEqual(self.inbox(), [])
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        [row] = self.inbox()
+        self.assertIn("was closed (abandoned)", row["body"])
+
+    def test_parallel_closures_wake_the_dependent_exactly_once(self):
+        """Adversaire : B et C ferment en parallèle.
+
+        Sans sérialisation, chaque fermeture peut lire l'autre bloqueur
+        encore ouvert (aucun réveil : perdu) ; ou, en lisant après coup, les
+        deux peuvent voir la libération (deux courriers : doublon). Le verrou
+        de graphe les sérialise : exactement un courrier, quel que soit
+        l'entrelacement — l'assertion ne dépend pas de l'ordonnancement.
+        """
+        for _round in range(3):
+            waiting = work.add(self.db, title="dépendant")["id"]
+            self.assign(waiting, "dev-a")
+            blockers = [work.add(self.db, title="bloqueur %d" % i)["id"] for i in (0, 1)]
+            for blocker in blockers:
+                dependencies.add(self.db, waiting, blocker, actor="test")
+            start = threading.Barrier(2)
+            results, errors = [], []
+
+            def merge(blocker):
+                db = D.connect(self.cfg)
+                try:
+                    start.wait(timeout=5)
+                    results.append(work.merged(db, blocker, sha="e" * 40,
+                                               actor="git:main")["result"])
+                except Exception as exc:  # noqa: BLE001 - remonté par le test
+                    errors.append(exc)
+                finally:
+                    db.close()
+
+            threads = [threading.Thread(target=merge, args=(blocker,), daemon=True)
+                       for blocker in blockers]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results, ["merged", "merged"])
+            [row] = self.inbox()
+            self.assertEqual(mail.message_payload(row)["dependency"]["dependent"], waiting)
+            self.assertEqual(len(self.inbox()), 1)
+            self.db.execute("DELETE FROM agent_mailbox")
+
+    def test_a_closure_holds_the_graph_lock_while_it_decides(self):
+        """Adversaire déterministe du réveil perdu : la première fermeture
+        tient le verrou de graphe sans committer ; la seconde doit l'attendre
+        (observé dans `pg_locks`), donc elle lit le commit de la première et
+        réveille le dépendant, une seule fois. Sans verrou pris par la
+        fermeture, aucune attente n'apparaît : la seconde décide sur un état
+        non commis et le réveil est perdu."""
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        dependencies.add(self.db, self.a, self.c, actor="test")
+        held, release = threading.Event(), threading.Event()
+        errors = []
+
+        def holder():
+            db = D.connect(self.cfg)
+            try:
+                with db.transaction() as tx:
+                    # même clé que le verrou de graphe (primitive existante)
+                    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                               "current_schema() || ':work_dependencies', 0))")
+                    storage.of(tx).work.close(
+                        self.b, current="intake", reason="abandoned", superseded_by=None,
+                        actor="test", note="abandoned")
+                    held.set()
+                    release.wait(timeout=10)
+            except Exception as exc:  # noqa: BLE001 - remonté par le test
+                errors.append(exc)
+            finally:
+                db.close()
+
+        results = []
+
+        def closer():
+            db = D.connect(self.cfg)
+            try:
+                results.append(work.merged(db, self.c, sha="f" * 40, actor="git:main")["result"])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.close()
+
+        thread = threading.Thread(target=holder, daemon=True)
+        thread.start()
+        self.assertTrue(held.wait(timeout=10), "la transaction tenante n'a pas démarré")
+        closer_thread = threading.Thread(target=closer, daemon=True)
+        closer_thread.start()
+        # état (pas durée) : la fermeture attend le verrou de graphe du schéma
+        waiting = False
+        deadline = time.time() + 10
+        while time.time() < deadline and not waiting:
+            waiting = bool(self.db.query(
+                """
+                SELECT 1 FROM pg_locks
+                 WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1
+                   AND classid = ((hashtextextended(current_schema()
+                                    || ':work_dependencies', 0) >> 32)
+                                  & 4294967295)::oid
+                   AND objid = (hashtextextended(current_schema()
+                                  || ':work_dependencies', 0) & 4294967295)::oid
+                """))
+            if not waiting:
+                time.sleep(0.05)
+        release.set()
+        closer_thread.join(timeout=15)
+        thread.join(timeout=15)
+        self.assertFalse(closer_thread.is_alive())
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(waiting, "la fermeture n'attend pas le verrou de graphe")
+        self.assertEqual(results, ["merged"])
+        self.assertEqual(len(self.inbox()), 1)
 
     def test_the_cli_declaration_wakes_too(self):
         dependencies.add(self.db, self.a, self.b, actor="test")

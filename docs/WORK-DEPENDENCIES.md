@@ -47,9 +47,16 @@ prerequisite, open commitment dependency and future planned start are gone,
 `ameesh` deposits a durable `event` mail to the assignee of the waiting lot,
 linked to that lot. The existing runner delivers it (LISTEN/NOTIFY, no polling
 loop, no new session); an agent stopped by hand is not restarted — the message
-waits in its mailbox until it resumes. The mail leaves only after the closure
-is committed, and only once per release: a dependent with another open blocker
-is notified when the last one closes, and an unassigned lot gets no recipient.
+waits in its mailbox until it resumes.
+
+The wake is part of the closure itself: it is written in the same transaction
+as the state change, after it, under the dependency graph lock. So there is no
+window where the lot is merged but the wake is not yet written — if the mail
+cannot be written, the closure is rolled back and the next sweep or command
+retries both. Two concurrent closures (two blockers of the same dependent)
+serialise on that lock, so exactly one of them sees the last wait fall: no lost
+wake, no duplicate. A dependent with another open blocker is notified by the
+closure that closes its last one, and an unassigned lot gets no recipient.
 A closure that proves nothing (abandoned or superseded) says so in the mail:
 the wait is released, but the lot must be reassessed rather than treated as
 delivered.
