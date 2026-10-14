@@ -929,13 +929,14 @@ class RealTargetTest(_Base):
 
 
 class ContentDeliveryTest(_Base):
-    """#1005 : `sync-merges` sans `--target` suit la cible réelle du clone —
-    celle du lot (`branch_target`), sinon `ameesh.target` du dépôt, sinon sa
-    branche par défaut, puis les refs d'intégration — au lieu d'`origin/main`
-    par défaut (cas #560 et #905, restés « waiting for merge » sur `develop`).
+    """#1005 : un lot livré sur la branche d'intégration (`develop`) par une
+    fusion `--no-ff` qui ne cite pas le lot (cas #560 et #905, restés
+    « waiting for merge ») est fermé par le relevé automatique de l'exécuteur
+    (dernier gel ancêtre de la ref) et par `sync-merges` sans `--target`, qui
+    suivent la cible réelle du clone au lieu d'`origin/main` par défaut.
 
-    Le relevé automatique du lot (branche ou citation) n'est pas modifié ici ;
-    le patch-id exact (cherry-pick, rebase, squash) reste le travail de
+    Le relevé automatique borne la preuve à l'ancêtre (une commande git) ; le
+    patch-id exact (cherry-pick, rebase, squash) reste le travail de
     `sync-merges`. Une cible déclarée ne ferme jamais ailleurs."""
 
     def setUp(self):
@@ -986,6 +987,22 @@ class ContentDeliveryTest(_Base):
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
 
+    def test_1005_gel_ancetre_de_develop_ferme_le_lot(self):
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "merged")
+        self.assertEqual(entry["target"], "origin/develop")
+        self.assertEqual(entry["off_target"], "origin/main")
+        self.assertEqual(entry["how"], "content-ancestor")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+        jalon = self.merged_milestone(lot["id"])
+        self.assertEqual(jalon["sha"], sha)
+        self.assertIn("origin/develop", jalon["note"])
+        self.assertIn("declare `git config ameesh.target", jalon["note"])
+
     def test_1005_gel_non_livre_laisse_le_lot_ouvert(self):
         _git(self.repo, "checkout", "-q", "-b", "agent/jamais", "develop")
         sha = self.commit("jamais")
@@ -995,6 +1012,20 @@ class ContentDeliveryTest(_Base):
         entry = self.sync()["results"][0]
         self.assertEqual(entry["result"], "open")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_cible_declaree_contenu_develop_note_sans_fermeture(self):
+        _git(self.repo, "config", plan_git.TARGET_GIT_KEY, "origin/main")
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "off-target")
+        self.assertIn("origin/develop", entry["detail"])
+        self.assertIn("declared target origin/main", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("origin/develop" in (n or "") for n in notes), notes)
+        self.sync()                    # le résidu ne se répète pas
+        self.assertEqual([e["note"] for e in work.events(self.db, lot["id"])], notes)
 
     def test_1005_sync_merges_sans_target_suit_develop(self):
         sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
