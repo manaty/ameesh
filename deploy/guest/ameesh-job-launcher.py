@@ -23,7 +23,20 @@ refuses to run as root, so a misconfigured rule fails closed):
     close --job ID                           kill, then drop the runtime caps
     clean --path DIR                         removes what the job left behind
     check                                    can this launcher work here?
+
+The client's own code (`command`, `setup`) does not run under this launcher:
+it runs under the internal `exec` verb, inside the scope, which strips the
+manager's address from its environment and installs a seccomp filter denying
+`socket(AF_UNIX)` before the payload's first instruction. Removing the
+variables was not enough (B3 of the R1 review of #354): a same-UID payload
+reconstructed `/run/user/<uid>/bus` and asked the manager for a unit outside
+the job's slice. `socketpair(2)` stays allowed (asyncio, multiprocessing), and
+the filter cannot be removed: it is inherited across fork and exec, so the
+payload cannot reach the manager, not even through this launcher. The profile
+hooks (`before`, `after`) are root-owned install-side code (rootless Podman
+needs the manager) and keep it; they are never the payload's own code.
 """
+import errno
 import json
 import os
 import re
@@ -35,13 +48,23 @@ import sys
 CONFIG = "/etc/ameesh-guest/offload.json"
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
-ENV_BIN = "/usr/bin/env"
 JOB_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
 PHASE_RE = re.compile(r"^[a-z][a-z0-9-]{0,15}$")
 #: the phases whose code is the client's own: they keep the process, not the
-#: job's user manager (`systemd-run` needs it, its payload does not)
+#: job's user manager (`systemd-run` needs it, its payload does not), and
+#: they run under the seccomp filter of `exec`
 CLIENT_PHASES = ("command", "setup")
-UNSET_MANAGER = ("-u", "XDG_RUNTIME_DIR", "-u", "DBUS_SESSION_BUS_ADDRESS")
+#: the user manager's address: the launcher itself needs it for `systemd-run`,
+#: the client's code never does
+BUS_ENV = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+#: the filter the payload runs under: `socket(AF_UNIX)` is refused, everything
+#: else (including socketpair) is allowed
+SECCOMP_SO = "libseccomp.so.2"
+AF_UNIX = 1
+SCMP_ACT_ALLOW = 0x7FFF0000
+SCMP_ACT_ERRNO = 0x00050000 | (errno.EAFNOSUPPORT & 0xFFFF)
+SCMP_CMP_EQ = 4
+PR_SET_NO_NEW_PRIVS = 38
 #: the environment of a job, as JSON on stdin: a profile plus the client's
 #: --env, never a secret (the job's own code gets it anyway)
 ENV_MAX = 1 << 20
@@ -85,6 +108,109 @@ def systemctl(*args: str) -> subprocess.CompletedProcess:
                           text=True, check=False)
 
 
+def install_socket_filter() -> None:
+    """Refuse `socket(AF_UNIX)` to this process and everything it starts.
+
+    libseccomp resolves the syscall number for the running architecture; the
+    rule only touches the `socket` syscall, `socketpair` is left alone. The
+    filter cannot be removed (seccomp filters stack, and this process sets
+    no_new_privs): a payload that reaches here can never reach the job's
+    user manager, whatever environment it reconstructs. Raises OSError when
+    the filter cannot be installed, so the caller fails closed."""
+    import ctypes
+
+    class ArgCmp(ctypes.Structure):
+        _fields_ = [("arg", ctypes.c_uint), ("op", ctypes.c_int),
+                    ("datum_a", ctypes.c_uint64), ("datum_b", ctypes.c_uint64)]
+
+    try:
+        lib = ctypes.CDLL(SECCOMP_SO, use_errno=True)
+    except OSError as exc:
+        raise OSError(errno.ENOSYS, "cannot load %s: %s" % (SECCOMP_SO, exc))
+    lib.seccomp_init.restype = ctypes.c_void_p
+    lib.seccomp_init.argtypes = [ctypes.c_uint32]
+    lib.seccomp_release.argtypes = [ctypes.c_void_p]
+    lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_rule_add_array.restype = ctypes.c_int
+    lib.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                           ctypes.c_int, ctypes.c_uint,
+                                           ctypes.POINTER(ArgCmp)]
+    lib.seccomp_load.restype = ctypes.c_int
+    lib.seccomp_load.argtypes = [ctypes.c_void_p]
+
+    ctx = lib.seccomp_init(SCMP_ACT_ALLOW)
+    if not ctx:
+        raise OSError(errno.ENOMEM, "seccomp_init failed")
+    try:
+        nr = lib.seccomp_syscall_resolve_name(b"socket")
+        if nr < 0:
+            raise OSError(errno.ENOSYS, "libseccomp does not know socket(2)")
+        rule = ArgCmp(0, SCMP_CMP_EQ, AF_UNIX, 0)
+        rc = lib.seccomp_rule_add_array(ctx, SCMP_ACT_ERRNO, nr, 1,
+                                        ctypes.byref(rule))
+        if rc != 0:
+            raise OSError(-rc, "seccomp_rule_add_array: %d" % rc)
+        if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_NO_NEW_PRIVS, 1,
+                                                   0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS)")
+        rc = lib.seccomp_load(ctx)
+        if rc != 0:
+            raise OSError(-rc, "seccomp_load: %d" % rc)
+    finally:
+        lib.seccomp_release(ctx)
+
+
+def filter_selftest() -> int:
+    """What the payload will really get, in a child that dies with it: AF_UNIX
+    refused, socketpair (asyncio, multiprocessing) allowed. 0 when the filter
+    works, 1 otherwise: `check` then refuses the job instead of running the
+    client's code unconfined."""
+    pid = os.fork()
+    if pid < 0:
+        return 1
+    if pid == 0:
+        code = 1
+        try:
+            install_socket_filter()
+            import socket
+            try:
+                socket.socket(socket.AF_UNIX)
+            except OSError as exc:
+                if exc.errno != errno.EAFNOSUPPORT:
+                    raise
+            else:
+                raise OSError(0, "AF_UNIX still allowed")
+            left, right = socket.socketpair()
+            left.close()
+            right.close()
+        except BaseException:
+            code = 1
+        else:
+            code = 0
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    return 0 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else 1
+
+
+def cmd_exec(args: list[str]) -> int:
+    """In the scope, just before the client's code: strip the manager's
+    address, install the filter, exec. Fail closed."""
+    if len(args) < 2 or args[0] != "--":
+        return die("usage: exec -- <command...>")
+    for key in BUS_ENV:
+        os.environ.pop(key, None)
+    try:
+        install_socket_filter()
+    except OSError as exc:
+        return die("cannot confine the payload (%s): refusing to run it" % exc, 78)
+    try:
+        os.execvp(args[1], args[1:])
+    except OSError as exc:
+        return die("cannot exec %s: %s" % (args[1], exc), 70)
+    return 70  # unreachable
+
+
 def cmd_check() -> int:
     run_dir = os.environ.get("XDG_RUNTIME_DIR", "")
     if not os.path.isdir(run_dir) or not os.path.exists(os.path.join(run_dir, "bus")):
@@ -93,6 +219,9 @@ def cmd_check() -> int:
     if systemctl("is-system-running").returncode not in (0, 1):
         # 1 = degraded, still usable; anything else means no manager at all
         return die("systemctl --user cannot reach the user manager")
+    if filter_selftest() != 0:
+        return die("the payload's seccomp filter cannot be installed "
+                   "(libseccomp missing?): refusing the job")
     sys.stdout.write("ok\n")
     return 0
 
@@ -184,10 +313,12 @@ def cmd_run(args: list[str]) -> int:
     if phase != "command":
         unit += "-" + phase
     if phase in CLIENT_PHASES:
-        # the client's own code (the command, the dependency setup) does not
-        # get the job's user manager: through it, it could start a unit
-        # outside the job's slice (the README promises the same for L159b)
-        argv = [ENV_BIN, *UNSET_MANAGER, "--"] + argv
+        # the client's own code: systemd-run needs the manager's address in
+        # *its* environment, the payload does not get it, and it runs under
+        # `exec`'s filter, so it cannot ask the manager for a unit outside
+        # the job's slice either (B3 of the R1 review of #354)
+        argv = [sys.executable, "-I", os.path.abspath(__file__), "exec",
+                "--"] + argv
     cmd = [SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect",
            "--slice", slice_name, "--unit", unit, "--"] + argv
     os.execv(SYSTEMD_RUN, cmd)
@@ -195,7 +326,8 @@ def cmd_run(args: list[str]) -> int:
 
 
 VERBS = {"check": cmd_check, "open": cmd_open, "kill": cmd_kill,
-         "close": cmd_close, "clean": cmd_clean, "run": cmd_run}
+         "close": cmd_close, "clean": cmd_clean, "run": cmd_run,
+         "exec": cmd_exec}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -206,7 +338,10 @@ def main(argv: list[str] | None = None) -> int:
         return die("refusing to run as root: the sudoers rule must use (ameesh-job)")
     if not argv or argv[0] not in VERBS:
         return die("allowed verbs: %s" % ", ".join(sorted(VERBS)))
-    runtime_env()
+    if argv[0] != "exec":
+        # `exec` runs inside the scope, on the payload's own environment:
+        # putting the manager's address back is the one thing it must not do
+        runtime_env()
     try:
         return VERBS[argv[0]](argv[1:])
     except ValueError as exc:

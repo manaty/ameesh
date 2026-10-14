@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1029,6 +1030,8 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("%s ALL=(ameesh-job) NOPASSWD: "
                       "/usr/local/lib/ameesh-guest/ameesh-job-launcher" % guest, res.stdout)
         self.assertIn('"executor": "job-user"', res.stdout)
+        self.assertIn('"job_group": "ameesh-jobs"', res.stdout)
+        self.assertIn("usermod -aG ameesh-jobs %s" % guest, res.stdout)
         for sub in ("mirrors", "cache", "jobs"):
             self.assertIn("install -d -m 2750 -o %s -g ameesh-jobs /srv/ameesh-guest/%s"
                           % (guest, sub), res.stdout)
@@ -1186,6 +1189,81 @@ class JobUserExecutorTest(unittest.TestCase):
         ex.grant(tree)
         self.assertEqual(os.stat(outside).st_mode & 0o777, 0o600)
 
+    def test_dir_keeps_the_setgid_of_a_shared_parent(self):
+        # B1 of the #354 R1 review: the explicit chmod of `_dir` must not
+        # clear the setgid bit inherited from the volume, or the next level
+        # down takes the shell's primary group and `grant` (chmod alone)
+        # cannot repair it
+        root = os.path.join(self.tmp, "shared")
+        os.makedirs(root)
+        os.chmod(root, 0o2710)
+        leaf = offload_shell._dir(dict(self.cfg, root=root), "cache", "profile",
+                                  mode=0o750)
+        self.assertEqual(stat.S_IMODE(os.stat(leaf).st_mode), 0o2750)
+        self.assertEqual(os.stat(leaf).st_gid, os.stat(root).st_gid)
+
+    def test_dir_does_not_invent_a_setgid_on_a_private_parent(self):
+        root = os.path.join(self.tmp, "private")
+        os.makedirs(root)
+        os.chmod(root, 0o700)
+        leaf = offload_shell._dir(dict(self.cfg, root=root), "locks", mode=0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(leaf).st_mode), 0o700)
+
+    def test_grant_traverse_leaves_no_group_write(self):
+        # B2 of the #354 R1 review: the job enters its folder, but cannot
+        # create, rename or remove anything in it (meta.json, cancel)
+        job_dir = os.path.join(self.tmp, "job")
+        os.makedirs(job_dir, mode=0o700)
+        offload_shell.JobUserExecutor(self.cfg, self.job_id).grant_traverse(job_dir)
+        mode = os.stat(job_dir).st_mode
+        self.assertTrue(mode & 0o2000)        # setgid kept for work/tmp below
+        self.assertTrue(mode & 0o050)         # group reads and traverses
+        self.assertFalse(mode & 0o020)        # never writes: no planted link
+
+    def test_write_meta_does_not_follow_a_planted_link(self):
+        # the job used to plant meta.json.tmp as a link to a shell file: the
+        # shell wrote through it under its own UID (B2)
+        job_dir = os.path.join(self.tmp, "job")
+        os.makedirs(job_dir)
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("private")
+        os.symlink(victim, os.path.join(job_dir, "meta.json.tmp"))
+        offload_shell._write_meta(os.path.join(job_dir, "meta.json"), {"job": "x"})
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "private")
+        meta = os.path.join(job_dir, "meta.json")
+        self.assertFalse(os.path.islink(meta))
+        with open(meta) as fh:
+            self.assertEqual(json.load(fh), {"job": "x"})
+
+    def test_private_writes_never_follow_a_planted_link(self):
+        # the cancel flag and the cache's `.ready` go through the same helper
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("private")
+        flag = os.path.join(self.tmp, "cancel")
+        os.symlink(victim, flag)
+        offload_shell._write_private(flag)
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "private")
+        self.assertFalse(os.path.islink(flag))
+
+    def test_cancel_does_not_follow_a_planted_link(self):
+        cfg = dict(self.cfg)
+        job_dir = os.path.join(cfg["root"], "jobs", self.job_id)
+        os.makedirs(job_dir)
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("private")
+        os.symlink(victim, os.path.join(job_dir, "cancel"))
+        with open(os.path.join(job_dir, "meta.json"), "w") as fh:
+            json.dump({"job": self.job_id}, fh)   # no live shell to signal
+        self.assertEqual(offload_shell.cmd_cancel(cfg, [self.job_id]), 0)
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "private")
+        self.assertFalse(os.path.islink(os.path.join(job_dir, "cancel")))
+
     def _run(self, phase: str, env: dict) -> int:
         job_dir = os.path.join(self.root, "jobs", self.job_id)
         os.makedirs(job_dir, exist_ok=True)
@@ -1266,19 +1344,90 @@ class JobLauncherTest(unittest.TestCase):
         return execv.call_args[0][1]
 
     @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
-    def test_a_client_phase_does_not_get_the_user_manager(self):
-        # the promise of L159b (README): the command and the dependency setup
-        # cannot ask the job's user manager for a unit outside the job's slice
+    def test_a_client_phase_runs_under_the_filter(self):
+        # B3 of the #354 R1 review: removing the manager's variables was not
+        # enough; the payload now runs under the launcher's `exec`, which
+        # denies socket(AF_UNIX) before its first instruction
         for phase in ("command", "setup"):
             payload = self._execv_cmd(phase)
             payload = payload[payload.index("--") + 1:]
-            self.assertEqual(payload, ["/usr/bin/env", "-u", "XDG_RUNTIME_DIR",
-                                       "-u", "DBUS_SESSION_BUS_ADDRESS", "--",
-                                       "/bin/true"])
+            self.assertEqual(payload[:4], [sys.executable, "-I", self.MODULE,
+                                           "exec"])
+            self.assertEqual(payload[4:], ["--", "/bin/true"])
         for phase in ("before", "after"):
+            # the profile hooks are root-owned install-side code (Podman needs
+            # the manager): they keep it
             payload = self._execv_cmd(phase)
             payload = payload[payload.index("--") + 1:]
             self.assertEqual(payload, ["/bin/true"])
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_filter_refuses_af_unix_even_when_the_bus_is_reconstructed(self):
+        # the exact witness of B3: the payload rebuilds XDG_RUNTIME_DIR and
+        # the bus address, then socket(AF_UNIX) is refused; socketpair stays
+        # allowed (asyncio, multiprocessing), and a child of the payload
+        # inherits the filter, so no child can run the launcher unfiltered
+        child = ("import socket\n"
+                 "try:\n"
+                 "    socket.socket(socket.AF_UNIX)\n"
+                 "    print('child allowed')\n"
+                 "except OSError as exc:\n"
+                 "    print('child', exc.errno)")
+        probe = textwrap.dedent("""\
+            import os, socket, subprocess, sys
+            os.environ["XDG_RUNTIME_DIR"] = "/run/user/UID"
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/UID/bus"
+            try:
+                socket.socket(socket.AF_UNIX)
+            except OSError as exc:
+                print("af_unix", exc.errno)
+            left, right = socket.socketpair()
+            print("socketpair", bool(left))
+            left.close()
+            right.close()
+            print(subprocess.run([sys.executable, "-c", CHILD],
+                                 capture_output=True, text=True).stdout.strip())
+            """).replace("UID", str(os.getuid())).replace("CHILD", repr(child))
+        res = subprocess.run([sys.executable, "-I", self.MODULE, "exec", "--",
+                              sys.executable, "-c", probe],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("af_unix %d" % errno.EAFNOSUPPORT, res.stdout)
+        self.assertIn("socketpair True", res.stdout)
+        self.assertIn("child %d" % errno.EAFNOSUPPORT, res.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_filter_strips_the_manager_address(self):
+        probe = ("import os;print(os.environ.get('XDG_RUNTIME_DIR'),"
+                 "os.environ.get('DBUS_SESSION_BUS_ADDRESS'))")
+        env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000",
+                   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus")
+        res = subprocess.run([sys.executable, "-I", self.MODULE, "exec", "--",
+                              sys.executable, "-c", probe],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.split(), ["None", "None"])
+
+    def test_it_fails_closed_without_an_installable_filter(self):
+        with mock.patch.object(self.launcher, "install_socket_filter",
+                               side_effect=OSError(errno.ENOSYS, "no libseccomp")), \
+                mock.patch.object(self.launcher.os, "execvp") as execvp:
+            self.assertEqual(self.launcher.main(["exec", "--", "/bin/true"]), 78)
+        execvp.assert_not_called()
+
+    def test_the_self_test_refuses_when_the_filter_is_unavailable(self):
+        with mock.patch.object(self.launcher, "install_socket_filter",
+                               side_effect=OSError(errno.ENOSYS, "no libseccomp")):
+            self.assertEqual(self.launcher.filter_selftest(), 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_self_test_passes_with_libseccomp(self):
+        try:
+            import ctypes
+            ctypes.CDLL(self.launcher.SECCOMP_SO)
+        except OSError:
+            self.skipTest("no %s on this host" % self.launcher.SECCOMP_SO)
+        self.assertEqual(self.launcher.filter_selftest(), 0)
 
     def test_it_validates_the_job_and_the_verb(self):
         with self.assertRaises(ValueError):

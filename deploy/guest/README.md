@@ -69,9 +69,13 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   read the session back (`/proc/self/fd/2`) nor write into it once the job
   is over. The `result` line carries an HMAC keyed by the session's nonce.
 * No `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS` for the command and the
-  dependency setup (the repository's code): they cannot ask the user manager
-  for a unit outside the job's slice through them. The profile's hooks keep
-  them (rootless Podman).
+  dependency setup (the repository's code), and no `socket(AF_UNIX)` either:
+  the launcher's `exec` installs a seccomp filter (libseccomp) before the
+  payload's first instruction, so the job cannot reach its own user manager
+  by rebuilding `/run/user/<uid>/bus` and start a unit outside its slice
+  (R1-B3 of #354). `socketpair` stays allowed (asyncio, multiprocessing).
+  The profile's hooks are root-owned install-side code and keep the manager
+  (rootless Podman); an uninstallable filter refuses the job.
 * One supervision for every phase: a cancel, the loss of the SSH session,
   the gate or the job's deadline (counted from its slot) end setup, hooks
   and command alike. The `after` hook still runs (teardown, 2 min at most).
@@ -102,9 +106,13 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   guest) and its own user manager. The guest starts every phase through the
   root-owned launcher, by a sudoers rule that names that file and that user
   only; the launcher refuses to run as root. The group `ameesh-jobs` is the
-  one path between the two: the guest keeps the volume and its mirrors
-  (setgid, so the folders it creates keep the group), the job traverses the
-  volume, reads the mirrors and writes only the folders it was granted.
+  one path between the two: the guest is a member of it (so it can give the
+  job a folder), it keeps the volume and its mirrors (setgid, so the folders
+  it creates keep the group), the job traverses the volume, reads the
+  mirrors and writes only the folders it was granted. A job's own folder is
+  2750: the job enters it and writes `work`/`tmp` (2770) below, but it can
+  neither write nor replace `meta.json` and `cancel`, and the shell never
+  opens those through a link (`O_NOFOLLOW`, R1-B2 of #354).
 * SSH: the keys live in a root-owned file (`/etc/ameesh-guest/authorized_keys`,
   `restrict`, `from=`), and an sshd `Match User` block forces
   `ameesh-offload-shell`: four verbs (`put`, `run`, `status`, `cancel`),

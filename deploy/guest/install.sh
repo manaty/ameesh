@@ -215,6 +215,18 @@ if [ "$MODE" = check ]; then
     else
       echo "FAIL $SUDOERS is missing or refused by visudo"; status=1
     fi
+    if id -nG "$GUEST" | tr ' ' '\n' | grep -qx "$JOB_GROUP"; then
+      echo "ok   $GUEST is in $JOB_GROUP (it can grant the job its folders)"
+    else
+      echo "FAIL $GUEST is not in $JOB_GROUP"; status=1
+    fi
+    if runuser -u "$JOB_USER" -- python3 -c \
+         'import ctypes; ctypes.CDLL("libseccomp.so.2")' >/dev/null 2>&1; then
+      echo "ok   libseccomp for the payload's socket filter"
+    else
+      echo "FAIL libseccomp.so.2 missing: the job cannot be confined (R1-B3 of #354)"
+      status=1
+    fi
     # the job must write nothing the shell's own git reads, and read nothing
     # of the shell's private state; it does read the mirrors (by design)
     if runuser -u "$JOB_USER" -- test -w "$ROOT/mirrors" 2>/dev/null; then
@@ -355,6 +367,10 @@ if [ "$JOB_MODE" = 1 ]; then
         --gid "$JOB_GROUP" --comment "ameesh offloaded jobs (L159b2)" "$JOB_USER"
   fi
   run usermod -p '*' "$JOB_USER"
+  # the shell joins the shared group: it can then chgrp the folders it
+  # creates for a job (setgid inheritance alone breaks on a folder made
+  # outside a setgid parent, R1-B1 of #354)
+  run usermod -aG "$JOB_GROUP" "$GUEST"
   check_no_power_groups "$JOB_USER"
   juid=$(job_uid)
   add_subids "$JOB_USER"
@@ -362,8 +378,8 @@ fi
 
 # the shared group: the job traverses the volume and reads the mirrors, the
 # shell keeps them; everything the job may write is granted job by job. The
-# setgid bit keeps that group on the directories the shell creates later (the
-# shell is not a member of the group, so it cannot chgrp them itself).
+# shell is a member of the group (usermod -aG above), so it can chgrp what it
+# creates; the setgid bit keeps that group on the folders it makes later.
 if [ "$JOB_MODE" = 1 ]; then
   run install -d -m 2710 -o "$GUEST" -g "$JOB_GROUP" "$ROOT"
   for sub in mirrors cache jobs; do
@@ -426,6 +442,7 @@ executor_json='"executor": "user-scope"'
 if [ "$JOB_MODE" = 1 ]; then
   executor_json='"executor": "job-user",
   "job_user": "'"$JOB_USER"'",
+  "job_group": "'"$JOB_GROUP"'",
   "job_home": "'"$ROOT"'/home",
   "launcher": "'"$LAUNCHER_BIN"'"'
 fi

@@ -45,7 +45,9 @@ Each job runs:
   for the whole job (from its slot) end setup, hooks and command alike;
 * with a private TMPDIR inside the job directory, removed at the end;
 * without XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS for the command and the
-  setup (the client's code): the profile's own hooks keep them (rootless
+  setup (the client's code), and under a seccomp filter that refuses
+  `socket(AF_UNIX)` (job-user executor, B3 of the #354 R1 review): the
+  profile's own hooks, root-owned install-side code, keep both (rootless
   podman);
 * killed whole at the end: its slice, and the process group of each phase
   (without `scope`); what survives anyway only writes into closed pipes;
@@ -196,6 +198,9 @@ def load_config(path: str) -> dict:
                          % (cfg["executor"], ", ".join(EXECUTORS)))
     if cfg["executor"] == EXECUTOR_JOB_USER:
         cfg.setdefault("job_user", "ameesh-job")
+        #: the group shared with the job: the shell is a member of it, so it
+        #: can give the job the folders it must write (install.sh)
+        cfg.setdefault("job_group", "ameesh-jobs")
         cfg.setdefault("job_home", os.path.join(root, "home"))
         cfg.setdefault("launcher", "/usr/local/lib/ameesh-guest/ameesh-job-launcher")
     return cfg
@@ -208,8 +213,13 @@ def _dir(cfg: dict, *parts: str, mode: int = 0o700) -> str:
     if fresh:
         # makedirs applies the umask; the job's traversal of a directory the
         # shell has just made (L159b2: cache entries, job folders) must not
-        # depend on it
+        # depend on it. Keep the parent's setgid bit: without it the next
+        # level down takes the shell's primary group instead of the shared
+        # group, and `grant` (chmod only, the shell cannot chgrp what it does
+        # not own as a member) cannot repair it (B1 of the #354 R1 review).
         try:
+            if os.stat(os.path.dirname(path)).st_mode & stat.S_ISGID:
+                mode |= stat.S_ISGID
             os.chmod(path, mode)
         except OSError:
             pass
@@ -521,16 +531,42 @@ def prune_mirror(cfg: dict, mirror: str) -> None:
 # jobs
 # --------------------------------------------------------------------------
 
+def _open_private(path: str, flags: int = os.O_WRONLY | os.O_CREAT | os.O_TRUNC) -> int:
+    """A file of the shell's own state: the job must never be able to make the
+    shell write *through* a link it planted there (B2 of the #354 R1 review).
+    O_NOFOLLOW refuses the link; O_EXCL refuses a re-planted entry."""
+    flags |= os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno not in (errno.ELOOP, errno.EEXIST):
+            raise
+    # a link (or a stale entry) is in the way: remove the entry itself, never
+    # its target, then create ours exclusively
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return os.open(path, flags | os.O_EXCL, 0o600)
+
+
+def _write_private(path: str, data: str = "") -> None:
+    with os.fdopen(_open_private(path), "w", encoding="utf-8") as fh:
+        fh.write(data)
+
+
 def _write_meta(path: str, meta: dict) -> None:
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with os.fdopen(_open_private(tmp), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, sort_keys=True)
     os.replace(tmp, path)
 
 
 def _read_meta(job_dir: str) -> dict | None:
     try:
-        with open(os.path.join(job_dir, "meta.json"), encoding="utf-8") as fh:
+        fd = os.open(os.path.join(job_dir, "meta.json"),
+                     os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(fd, encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, ValueError):
         return None
@@ -756,6 +792,12 @@ class Executor:
     def grant(self, path: str) -> None:
         """A path the shell just made: let the job write it and its tree."""
 
+    def grant_traverse(self, path: str) -> None:
+        """A path of the shell's own state that the job must only enter (its
+        job folder): group read and traverse, never group write, so nothing
+        the job plants there can be followed by the shell (B2 of the #354 R1
+        review)."""
+
     def clean(self, path: str) -> None:
         """Remove a path the job may have filled in."""
         shutil.rmtree(path, ignore_errors=True)
@@ -828,8 +870,21 @@ class JobUserExecutor(Executor):
         return str(self.cfg["job_user"])
 
     @property
+    def group(self) -> str:
+        return str(self.cfg.get("job_group") or "ameesh-jobs")
+
+    @property
     def home(self) -> str:
         return str(self.cfg.get("job_home") or self.cfg["root"])
+
+    def _gid(self) -> int | None:
+        import grp
+        try:
+            return grp.getgrnam(self.group).gr_gid
+        except KeyError:
+            # an install.sh older than the shared group: the setgid
+            # inheritance still gives the job what it was granted
+            return None
 
     @property
     def launcher(self) -> str:
@@ -888,9 +943,13 @@ class JobUserExecutor(Executor):
     def grant(self, path: str) -> None:
         """The shell owns what it has just made (checkout, job folder, cache
         entry): add the group's write bit and the setgid bit, so the job can
-        build there and its own files keep the shared group."""
+        build there and its own files keep the shared group. The group is set
+        explicitly where the shell is a member of it (install.sh): setgid
+        inheritance alone breaks on a folder the shell did not create under a
+        setgid parent (B1 of the #354 R1 review)."""
+        gid = self._gid()
         try:
-            _grant_one(path)
+            _grant_one(path, gid)
         except OSError:
             return
         if not os.path.isdir(path):
@@ -898,9 +957,27 @@ class JobUserExecutor(Executor):
         for base, dirs, files in os.walk(path):
             for name in dirs + files:
                 try:
-                    _grant_one(os.path.join(base, name))
+                    _grant_one(os.path.join(base, name), gid)
                 except OSError:
                     pass
+
+    def grant_traverse(self, path: str) -> None:
+        """The job's own folder: it enters it (`work`, `tmp` are granted
+        below) but cannot create, rename or remove anything *in* it, so
+        `meta.json` and `cancel` stay out of its reach."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return
+        gid = self._gid()
+        try:
+            os.chmod(path, stat.S_IMODE(st.st_mode) | 0o050 | stat.S_ISGID)
+            if gid is not None:
+                os.chown(path, -1, gid)
+        except OSError:
+            return
 
     def clean(self, path: str) -> None:
         """The job may have left files the shell cannot enter (0700): the
@@ -920,7 +997,7 @@ def _uid_of(user: str) -> int:
         raise Refused("no such job user %r (run deploy/guest/install.sh)" % user) from None
 
 
-def _grant_one(path: str) -> None:
+def _grant_one(path: str, gid: int | None = None) -> None:
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
         return                                    # never chmod a link's target
@@ -930,6 +1007,13 @@ def _grant_one(path: str) -> None:
     elif mode & 0o100:
         mode |= 0o010                             # runnable, so group-runnable
     os.chmod(path, mode)
+    if gid is not None and st.st_gid != gid:
+        try:
+            # the shell is a member of the shared group (install.sh); a
+            # non-member falls back to the setgid inheritance
+            os.chown(path, -1, gid, follow_symlinks=False)
+        except (NotImplementedError, OSError):
+            pass
 
 
 def make_executor(cfg: dict, job_id: str) -> Executor:
@@ -1106,7 +1190,7 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
     base = _dir(job.cfg, "cache", profile_name, mode=0o750)
     key = _lock_hash(work, profile)
     final = os.path.join(base, key)
-    fd = os.open(final + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fd = _open_private(final + ".lock", os.O_RDWR | os.O_CREAT)
     try:
         # another job may be building it: wait, still supervised
         while True:
@@ -1120,6 +1204,10 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
         ready = os.path.join(final, ".ready")
         if os.path.exists(ready):
             os.utime(final)
+            # a cache built before the shared group (or by an interrupted
+            # install) may still carry the shell's primary group: the job
+            # must be able to write it (B1 of the #354 R1 review)
+            job.executor.grant(final)
             return final
         emit("setup", {"profile": profile_name, "cache": key})
         # built in place (a venv records its own path); `.ready` marks a
@@ -1135,7 +1223,7 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
         if rc != 0:
             job.executor.clean(final)
             raise Refused("profile %s: setup failed (exit %d)" % (profile_name, rc))
-        open(ready, "w").close()
+        _write_private(ready)
         return final
     finally:
         os.close(fd)
@@ -1240,7 +1328,10 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
     prune_orphans(cfg)
     job_dir = os.path.join(_dir(cfg, "jobs", mode=0o750), job_id)
     os.makedirs(job_dir, mode=0o700)
-    executor.grant(job_dir)
+    # the job enters its folder, but only `work` and `tmp` below are writable
+    # by it: meta.json and the cancel flag stay out of its reach, so it cannot
+    # plant the links the shell would follow (B2 of the #354 R1 review)
+    executor.grant_traverse(job_dir)
     meta_path = os.path.join(job_dir, "meta.json")
     meta = {"job": job_id, "state": "waiting", "repo": req["repo"], "commit": req["commit"],
             "profile": req["profile"], "argv": req["argv"], "created_ts": int(started),
@@ -1416,7 +1507,7 @@ def _journal(cfg: dict, entry: dict) -> None:
         # 0600: with a job user (L159b2) the volume is traversable by the
         # shared group, and every job's command lines stay the shell's alone
         fd = os.open(os.path.join(cfg["root"], "jobs.jsonl"),
-                     os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, sort_keys=True) + "\n")
     except OSError:
@@ -1452,7 +1543,7 @@ def cmd_cancel(cfg: dict, args: list[str]) -> int:
     meta = _read_meta(job_dir)
     if meta is None:
         raise Refused("no job %s" % args[0])
-    open(os.path.join(job_dir, "cancel"), "w").close()
+    _write_private(os.path.join(job_dir, "cancel"))
     _signal_shell(meta, signal.SIGTERM)  # never a process that reused the PID
     sys.stdout.write("cancelled %s\n" % args[0])
     return 0
