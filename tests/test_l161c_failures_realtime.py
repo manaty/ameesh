@@ -566,8 +566,6 @@ class WatcherTest(PgTestCase):
         self.assertIsNone(row["started_ts"])
         self.assertEqual(row["created_ts"], now - 30 * 60)
         self.assertEqual(ci.wait_text(row, now), "queued 30 min")
-        (attente,) = ci.queue_starved(self.db, now)
-        self.assertEqual((attente["repo"], attente["count"]), (DEPOT, 1))
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
                           if a["type"] == "ci_queue_starved"], [])
         self.assertNotIn("ci_queue_starved", notify.DEFAULT_TYPES)
@@ -590,11 +588,16 @@ class WatcherTest(PgTestCase):
         self.assertIn("(queued 30 min, ran 0 min)", "\n".join(ci.render_status(report)))
 
     def test_attente_courte_sans_alerte(self):
+        # N747 : la clé `ci_queue_starved` est retirée — seule la garde #845
+        # (`ci_queue_saturated`, en jobs) porte la capacité ; une attente
+        # courte ne lève rien et la clé morte ne doit pas revenir.
         vue = dict(run_view(802, "a1" * 20, "lot/1-un"), status="queued")
         self.api.queued = [vue]
         self.watcher.tick(self.db)
-        self.assertEqual(ci.queue_starved(self.db, storage.of(self.db).ci.run(
-            DEPOT, 802)["first_seen_ts"] + 60), [])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_queue_starved"], [])
+        self.assertNotIn("ci_queue_starved", exploitation.ALERT_TYPES)
+        self.assertNotIn("ci_queue_starved", notify.DEFAULT_TYPES)
 
     def test_extrait_illisible_part_sans_extrait(self):
         sha = "7" * 40

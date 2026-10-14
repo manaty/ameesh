@@ -102,8 +102,6 @@ GUARD_PER_PAGE = 100
 #: la fraîcheur (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre
 #: d'appels réellement consommés est journalisé dans `ci_guard_scan`.
 GUARD_SCAN_MAX_CALLS = 63
-#: #747 : seuil de la vue des exécutions suivies en attente (sans notification)
-QUEUE_STARVED_S = 20 * 60.0
 
 
 class _GuardBudget(RuntimeError):
@@ -683,22 +681,6 @@ def main_red(db) -> list[dict]:
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
     return out
-
-
-def queue_starved(db, now: float, threshold_s: float = QUEUE_STARVED_S) -> list[dict]:
-    """#747 : par dépôt, les exécutions suivies qui attendent un runner depuis
-    plus de `threshold_s` (créées chez GitHub, jamais vues démarrées) :
-    `{repo, count, oldest_ts, oldest_run_id, url}`."""
-    out: dict[str, dict] = {}
-    for row in storage.of(db).ci.queued():
-        since = row.get("created_ts") or row["first_seen_ts"]
-        if now - float(since) < threshold_s:
-            continue
-        entry = out.setdefault(row["repo"], {"repo": row["repo"], "count": 0,
-                                             "oldest_ts": since, "oldest_run_id": row["run_id"],
-                                             "url": row.get("url")})
-        entry["count"] += 1
-    return list(out.values())
 
 
 def wait_text(run: dict, now: float) -> str:

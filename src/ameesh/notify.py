@@ -94,7 +94,6 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #845 : la garde de la CI — runner busy sans job (panne) et
                  # file au-delà du SLO de 15 min (capacité)
                  "ci_runner_stuck", "ci_queue_saturated",
-                 # #747 : la CI attend un runner depuis plus de 20 min
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
                  # L225 : des tours sans tarif au barème échappent à la dépense

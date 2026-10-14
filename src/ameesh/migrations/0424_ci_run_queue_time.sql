@@ -6,7 +6,8 @@
 -- conclusion, so queue and run time could not be told apart. `created_at` is
 -- GitHub's creation of the run; `started_at` is the first relevé that saw it
 -- `in_progress` (precise to one `ameesh notify` pass). A `running` row
--- without `started_at` is still waiting: `ameesh ci status` shows the wait,
--- and the `ci_queue_starved` alert fires past its threshold.
+-- without `started_at` is still waiting: `ameesh ci status` shows the wait.
+-- The capacity alert belongs to the API guard (#845, `ci_queue_saturated`,
+-- measured in queued jobs per repo); #747 raises no alert of its own.
 alter table ci_runs add column if not exists created_at timestamptz;
 alter table ci_runs add column if not exists started_at timestamptz;
