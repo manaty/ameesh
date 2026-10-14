@@ -135,10 +135,11 @@ class BriefsTest(unittest.TestCase):
 
     def test_stale_lot_sans_assigne_suit_l_equipe_du_lot(self):
         # #917 : sans assigné, le brief va aux orchestrateurs de l'équipe du lot,
-        # pas à ceux de toutes les équipes.
+        # pas à ceux de toutes les équipes. L713 : l'auditeur ne reçoit plus les
+        # stale_lot par courrier, même sans assigné (il les lit à sa passe).
         alert = dict(STALE, agent=None, lot_team="b")
         briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
-        self.assertEqual(sorted(briefs), ["auditeur", "orch-b"])
+        self.assertEqual(sorted(briefs), ["orch-b"])
         alert = dict(STALE, lot_team="b")               # assigné sans équipe : le lot tranche
         self.assertEqual(sorted(alert_briefs.briefs(alert, _listing(("orch", "a"),
                                                                     ("orch-b", "b"),
