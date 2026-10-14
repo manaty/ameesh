@@ -289,3 +289,44 @@ liste des exclusions (#748, #963, #775) et des points de suivi (§5).
   la suite complète unique (#1211 : suite complète sur `integration/**`, 4 parts psycopg +
   6 parts psql, sans dispatch manuel). Le vert `39df7c316` (run `38504851830`) reste la
   preuve historique du contenu des lots : aucun transfert au nouvel arbre (§5, canon §12).
+
+## 12. Addendum du 14/10 17:0xZ — verdict terminal vert du gel `276e6ec56`, union rejouée sur main `96a795fb2`
+
+- **Verdict terminal du run unique `38575804888`** (poussée du gel `276e6ec56` sur
+  `integration/vague-suivante-1204`) : **succès**, `head_sha = 276e6ec56`, `completed` à
+  16:51:39Z (créé 13:54:29Z, événement `push`). 26 jobs : 24 succès + 2 sautés planifiés
+  (`version number`, `lecteurs de la doc`) ; **4/4 psycopg et 6/6 psql** exécutés, leurs
+  10 flux verts, `plateforme macOS` vert, et les deux contrôles requis `tests`
+  (16:49:10Z) et `bilan des impactés` (16:51:38Z) verts. Aucune part annulée : c'est la
+  suite complète du contenu gelé, sous le modèle #1211.
+- **Avancée de main** : `c4fa14a2` → `96a795fb2` (merges `e33d365ab` #537/#724,
+  `6678ed2c5` #914/#1193, `96a795fb2` #989/#1187), delta 15 fichiers depuis la base.
+  Intersection avec les 11 fichiers de la vague : **`docs/EXPLOITATION.md` seule**
+  (historique main #790/#828), auto-fusionnée ; les 10 autres fichiers ne sont pas
+  touchés par main.
+- **Union rejouée** : commit `7a31a8bbe6e86c31192e1c2ced98bd62bdeba657`, arbre
+  `fe2cc5d582d95895089d797e292f0184bc19e1ef`, parents `96a795fb2` + `276e6ec56`
+  (avance rapide possible depuis le gel courant). `git merge` rc=0, aucun conflit : main
+  n'a touché ni `index.md` ni le bloc #1048.
+- **Constance** : delta union vs main = exactement les 11 fichiers de la vague ; 10/11
+  blobs **identiques** au gel `276e6ec56` (EXECUTEUR `a906548c`, index `fb7635f9`,
+  l243 `15b721dc`, manifeste `de0801b0`, hermeticity-lint `f3ea2d0e`, chat `69e638a9`,
+  lecteurs-doc `88d67794`, test_hermeticity `ee1bc3f1`, l107 `f7bdee0f`, l79 `5fd448e9`) ;
+  seul `docs/EXPLOITATION.md` diffère : `cbe2dc83` = main `f3a1b02d` + bloc #1048,
+  +18/−0 vs main, patch-id `5dde7542` (contexte) / `7f7e77d5` (`-U0`) **identique au
+  patch du gel**. `index.md` : 0 marqueur de conflit, L243 puis L244 présentes, les deux
+  études l243/l244 sont dans l'arbre.
+- **Témoins sur l'arbre d'union** (`AMEESH_REQUIRE_DB=0`, 10 modules) : **200 tests OK,
+  5 sautés** — lecteurs de la doc + garde L161a, `test_l107_executor_contract` 20/20
+  (compteurs du contrat réellement intégré : 63 opérations / 322 refusées / 385
+  interface, témoin vert), `test_hermeticity_lint`, `test_l79_chat_terminal` ;
+  lint d'herméticité `--diff 96a795fb2` : 0 constat (H0 0, H1 0, H2 0, H3 0), rc=0.
+  Mêmes totaux que la composition qualifiée (§6).
+- **Gel candidat** : le commit qui porte cet addendum (documentation seule ; les 10 blobs
+  des lots revérifiés constants après ce commit) remplace `276e6ec56` comme arbre à
+  qualifier. Le vert `38575804888` reste la preuve historique du contenu des lots et du
+  manifeste ; **aucun vert n'est transféré** au nouvel arbre (canon §12).
+- **Aucun geste distant** : pas de poussée sur `integration/vague-suivante-1204`, pas de
+  CI lancée, pas de fusion, aucun élargissement des branches gelées. Reprise :
+  qualification pilote de cette union, puis poussée ff (déclenche la suite complète
+  unique sous #1211) et feu fusion ; le staging suit la procédure dédiée.
