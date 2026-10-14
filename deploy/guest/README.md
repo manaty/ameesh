@@ -79,6 +79,11 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   (asyncio, multiprocessing). The profile's hooks are root-owned install-side
   code and keep the manager (rootless Podman); an uninstallable filter
   refuses the job.
+* `kernel.yama.ptrace_scope` at 1 at least (`/etc/sysctl.d/50-ameesh-guest.conf`,
+  never lowered; Debian ships 0): the job shares its UID with its own user
+  manager and the hooks, which keep the bus; without Yama the payload could
+  trace them (`ptrace`, `/proc/<pid>/mem`) and act through them (B4 of the
+  #354 R3 reading). `--check` verifies it; a kernel without Yama is refused.
 * One supervision for every phase: a cancel, the loss of the SSH session,
   the gate or the job's deadline (counted from its slot) end setup, hooks
   and command alike. The `after` hook still runs (teardown, 2 min at most).

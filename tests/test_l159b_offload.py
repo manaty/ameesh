@@ -1032,6 +1032,10 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn('"executor": "job-user"', res.stdout)
         self.assertIn('"job_group": "ameesh-jobs"', res.stdout)
         self.assertIn("usermod -aG ameesh-jobs %s" % guest, res.stdout)
+        # B4 of the #354 R3 reading: the payload may not trace its user
+        # manager nor the hooks (same UID); raised to 1 at least, never lowered
+        self.assertRegex(res.stdout, r"kernel\.yama\.ptrace_scope = [123]\n")
+        self.assertRegex(res.stdout, r"\+ sysctl -q -w kernel\.yama\.ptrace_scope=[123]\n")
         for sub in ("mirrors", "cache", "jobs"):
             self.assertIn("install -d -m 2750 -o %s -g ameesh-jobs /srv/ameesh-guest/%s"
                           % (guest, sub), res.stdout)
@@ -1051,6 +1055,7 @@ class InstallScriptTest(unittest.TestCase):
                       res.stdout)
         self.assertNotIn("ameesh-jobs", res.stdout)
         self.assertNotIn("ameesh-job-launcher", res.stdout)
+        self.assertNotIn("ptrace_scope", res.stdout)
         self.assertNotIn("No such file", res.stderr)
 
     def _assert_standalone(self, path):

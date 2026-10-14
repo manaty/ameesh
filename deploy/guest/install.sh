@@ -36,7 +36,10 @@
 #     own home and its own user manager), a root-owned launcher admitted by a
 #     sudoers rule, and a shared group: the job reads the shell's mirrors but
 #     cannot write them, and it reads neither the shell's /proc, nor its HOME,
-#     nor its caches (reviews r5/r7 of #213);
+#     nor its caches (reviews r5/r7 of #213); kernel.yama.ptrace_scope
+#     raised to 1 (never lowered): the job shares its UID with its own user
+#     manager and the profile hooks, which the payload must not trace
+#     (B4 of the #354 R3 reading);
 #   * ameesh-offload-shell (root-owned) as the forced command of the keys,
 #     through an sshd Match block: no shell, no forwarding, no tty;
 #   * caps on user-UID.slice (guest and job user): CPUWeight/IOWeight 10,
@@ -58,6 +61,8 @@ LIB=/usr/local/lib/ameesh-guest
 SHELL_BIN=$LIB/ameesh-offload-shell
 LAUNCHER_BIN=$LIB/ameesh-job-launcher
 SUDOERS=/etc/sudoers.d/ameesh-guest-job
+SYSCTL_CONF=/etc/sysctl.d/50-ameesh-guest.conf
+YAMA=/proc/sys/kernel/yama/ptrace_scope
 SSHD_DROPIN=/etc/ssh/sshd_config.d/50-ameesh-guest.conf
 FW_UNIT=/etc/systemd/system/ameesh-guest-firewall.service
 JOB_USER=ameesh-job
@@ -220,6 +225,15 @@ if [ "$MODE" = check ]; then
     else
       echo "FAIL $GUEST is not in $JOB_GROUP"; status=1
     fi
+    # the payload shares its UID with its user manager and the hooks, which
+    # keep the manager's bus: at 0, it could trace them (ptrace, /proc/PID/mem)
+    if [ "$(cat "$YAMA" 2>/dev/null || echo 0)" -ge 1 ]; then
+      echo "ok   kernel.yama.ptrace_scope=$(cat "$YAMA")"
+    else
+      echo "FAIL kernel.yama.ptrace_scope is 0 or Yama is missing: the job can trace"
+      echo "     its user manager and the hooks (B4 of the #354 R3 reading)"
+      status=1
+    fi
     if runuser -u "$JOB_USER" -- python3 -c \
          'import ctypes; ctypes.CDLL("libseccomp.so.2")' >/dev/null 2>&1; then
       echo "ok   libseccomp for the payload's socket filter"
@@ -269,7 +283,7 @@ if [ "$MODE" = uninstall ]; then
   uid=$(id -u "$GUEST" 2>/dev/null || echo "")
   juid=$(id -u "$JOB_USER" 2>/dev/null || echo "")
   say "removing the forced command, launcher, firewall, caps and users"
-  run rm -f "$SSHD_DROPIN" "$SUDOERS"
+  run rm -f "$SSHD_DROPIN" "$SUDOERS" "$SYSCTL_CONF"
   run systemctl reload ssh 2>/dev/null || run systemctl reload sshd || true
   if [ -f "$FW_UNIT" ]; then
     run systemctl disable --now ameesh-guest-firewall.service || true
@@ -432,6 +446,21 @@ EOF
     visudo -cf "$SUDOERS" >/dev/null \
       || { rm -f "$SUDOERS"; die "visudo refused $SUDOERS (removed)"; }
   fi
+  # the job's UID is also its user manager's and the hooks' (both keep the
+  # bus): Yama keeps the payload from tracing them. Raised to 1, never
+  # lowered (2 and 3 stay); Debian ships it at 0 (B4 of the #354 R3 reading)
+  scope=$(cat "$YAMA" 2>/dev/null || true)
+  if [ -z "$scope" ]; then
+    [ "$DRY" = 1 ] || die "no $YAMA (kernel without Yama): the job could trace its user manager; --no-job-user keeps the legacy layout"
+    scope=1
+  fi
+  [ "$scope" -ge 1 ] || scope=1
+  say "kernel.yama.ptrace_scope=$scope ($SYSCTL_CONF)"
+  put "$SYSCTL_CONF" 0644 root:root <<EOF
+# ameesh-guest (L159b2): the job may not trace its user manager nor the hooks
+kernel.yama.ptrace_scope = $scope
+EOF
+  run sysctl -q -w "kernel.yama.ptrace_scope=$scope"
 fi
 for profile in "$HERE"/profiles/*.json; do
   run install -m 0644 -o root -g root "$profile" "$ETC/profiles/$(basename "$profile")"
