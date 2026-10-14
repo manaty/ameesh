@@ -33,7 +33,7 @@ from ameesh.mediated_executor import gate as P
 from ameesh.mediated_executor import host_gate as H
 from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase, child_env
+from .support import EMPTY_CONFIG, PgTestCase, child_env
 from .test_l43_perimetre_hote import HOST, _Canons, host
 
 GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "mediated_executor", "gate.json")
@@ -450,7 +450,7 @@ else:
 
 class ConfigTest(unittest.TestCase):
     def charge(self, **env):
-        base = child_env(AMEESH_CONFIG="/nonexistent/config.json")
+        base = child_env(AMEESH_CONFIG=EMPTY_CONFIG)
         base.update(env)
         return config_mod.load(env=base)
 
