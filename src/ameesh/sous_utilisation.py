@@ -484,13 +484,21 @@ def is_backlog_item(lot: dict) -> bool:
             and lot.get("state") == "intake")
 
 
-def waiting_project_lots(lots: list) -> list:
+def waiting_project_lots(lots: list, *, db=None) -> list:
     """Les lots du projet ouverts sans assigné (hors file d'amélioration) : du
     travail demandé qui attend qu'on le confie. Tant qu'il y en a, la prise
-    automatique s'abstient (0037) et `idle_capacity` le signale."""
-    return [lot for lot in lots
-            if not (lot.get("assignee") or "").strip()
-            and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+    automatique s'abstient (0037) et `idle_capacity` le signale. Quand la base
+    est fournie, seuls les lots sans dependance explicite ouverte attendent
+    un preneur ; les autres attendent leurs amonts."""
+    waiting = [lot for lot in lots
+               if not (lot.get("assignee") or "").strip()
+               and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+    if not waiting or db is None:
+        return waiting
+    blocked = {int(edge["work_item_id"]) for edge in
+               storage.of(db).work_dependencies.for_items([lot["id"] for lot in waiting])
+               if edge["blocking"]}
+    return [lot for lot in waiting if int(lot["id"]) not in blocked]
 
 
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
@@ -517,7 +525,7 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     if lots is None:
         lots = storage.of(db).operations.open_lots_activity(500)
-    waiting_lots = waiting_project_lots(lots)
+    waiting_lots = waiting_project_lots(lots, db=db)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None
@@ -804,7 +812,7 @@ def backlog_empty(db, listing: list, now: float, *,
     if storage.of(db).work.backlog(open_only=True, limit=1):
         return []
     # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
-    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500)):
+    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db):
         return []
     names = sorted(row["name"] for row in idle)
     return [_alert(
