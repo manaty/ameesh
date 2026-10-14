@@ -262,7 +262,7 @@ class BoutEnBoutTest(PgTestCase):
             proc = self.run_mesh("mail", "send", name,
                                  "Bonjour %s, le lot 7 d'acme-web est à préparer." % name,
                                  "--from", "alice")
-            self.assertIn("dropped for: %s" % name, proc.stdout)
+            self.assertIn("delivered to %s" % name, proc.stdout)
         out = self.run_runner()
         for name in ("orchestre", "relecteur"):
             self.assertIn("lease acquired: %s" % name, out)
@@ -286,7 +286,7 @@ class BoutEnBoutTest(PgTestCase):
     def etape_4_message_et_fil(self) -> None:
         text = ("Relecteur, le lot 7 est prêt : relis la PR %s avant la fusion." % PR)
         proc = self.run_mesh("mail", "send", "relecteur", text, AGENT_MAIL_NAME="orchestre")
-        self.assertIn("dropped for: relecteur", proc.stdout)
+        self.assertIn("delivered to relecteur", proc.stdout)
 
         proc = self.run_mesh("fil", "show", PROJECT)
         self.assertRegex(proc.stdout, r"(?m)^### \S+ — human:alice → agent:orchestre$")
