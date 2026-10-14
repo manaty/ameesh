@@ -8,6 +8,7 @@ locally: real git, real processes, no network, no database.
 from __future__ import annotations
 
 import ast
+import contextlib
 import errno
 import importlib.util
 import io
@@ -1621,6 +1622,56 @@ class JobLauncherTest(unittest.TestCase):
             self.assertEqual(os.listdir(victim), [])
         finally:
             os.chmod(jobs, 0o755)
+
+    def _check_with_scope(self, scope_path: str) -> tuple[int, str, str]:
+        """`main(["check"])` under a fake user manager, with the Yama read
+        pointed at `scope_path`; returns (rc, stdout, stderr)."""
+        run = os.path.join(self.tmp, "run")
+        os.makedirs(os.path.join(run, "bus"), exist_ok=True)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, XDG_RUNTIME_DIR=run), \
+                mock.patch.object(self.launcher, "runtime_env"), \
+                mock.patch.object(self.launcher, "systemctl",
+                                  return_value=subprocess.CompletedProcess([], 0)), \
+                mock.patch.object(self.launcher, "filter_selftest", return_value=0), \
+                mock.patch.object(self.launcher, "YAMA_SCOPE", scope_path), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.launcher.main(["check"])
+        return rc, out.getvalue(), err.getvalue()
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_check_refuses_a_kernel_without_yama(self):
+        # B4 of the Codex reading: yama_scope() renders None when Yama is
+        # missing or unreadable, and `scope is not None and scope < 1`
+        # accepted that case, though install.sh --check and the README refuse
+        # a kernel without Yama; the filter does not block
+        # open(/proc/<pid>/mem), so the launcher must refuse it too
+        absent = os.path.join(self.tmp, "absent")
+        unreadable = os.path.join(self.tmp, "unreadable")
+        os.makedirs(unreadable)  # open() raises OSError, as when it is unreadable
+        garbage = os.path.join(self.tmp, "garbage")
+        with open(garbage, "w") as fh:
+            fh.write("not a number\n")
+        for scope in (absent, unreadable, garbage):
+            with self.subTest(scope=scope):
+                rc, _, err = self._check_with_scope(scope)
+                self.assertEqual(rc, 2)
+                self.assertIn("kernel.yama.ptrace_scope=None", err)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_check_accepts_scope_one_and_refuses_zero(self):
+        zero = os.path.join(self.tmp, "zero")
+        with open(zero, "w") as fh:
+            fh.write("0\n")
+        rc, _, err = self._check_with_scope(zero)
+        self.assertEqual(rc, 2)
+        self.assertIn("kernel.yama.ptrace_scope=0", err)
+        one = os.path.join(self.tmp, "one")
+        with open(one, "w") as fh:
+            fh.write("1\n")
+        rc, out, err = self._check_with_scope(one)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, "ok\n")
 
 
 if __name__ == "__main__":

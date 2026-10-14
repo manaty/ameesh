@@ -408,7 +408,9 @@ def cmd_exec(args: list[str]) -> int:
     return 70  # unreachable
 
 
-def cmd_check() -> int:
+def cmd_check(args: list[str]) -> int:
+    if args:
+        return die("check takes no argument")
     run_dir = os.environ.get("XDG_RUNTIME_DIR", "")
     if not os.path.isdir(run_dir) or not os.path.exists(os.path.join(run_dir, "bus")):
         return die("no systemd user manager for uid %d (loginctl enable-linger?)"
@@ -417,10 +419,13 @@ def cmd_check() -> int:
         # 1 = degraded, still usable; anything else means no manager at all
         return die("systemctl --user cannot reach the user manager")
     scope = yama_scope()
-    if scope is not None and scope < 1:
+    if scope is None or scope < 1:
         # B4 of the #354 R2 review: the payload shares the job user's UID with
-        # the manager and the hooks; Yama is the second lock under the filter
-        return die("kernel.yama.ptrace_scope=%d, expected >= 1 "
+        # the manager and the hooks; Yama is the second lock under the filter.
+        # None means the kernel has no Yama, or it is unreadable: install.sh
+        # --check and the README refuse that kernel, and the filter does not
+        # block open(/proc/<pid>/mem), so the launcher must refuse it too
+        return die("kernel.yama.ptrace_scope=%r, expected >= 1 "
                    "(re-run deploy/guest/install.sh)" % scope)
     if filter_selftest() != 0:
         return die("the payload's seccomp filter cannot be installed "
