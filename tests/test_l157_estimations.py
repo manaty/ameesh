@@ -260,7 +260,7 @@ class EstimatesPgTest(PgTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("applies to a task", proc.stderr)
         work.move(self.db, lot["id"], "build")
-        work.merged(self.db, lot["id"], sha="abcdef1")
+        work.close_merged(self.db, lot["id"], sha="abcdef1")
         with self.assertRaises(estimates.EstimateError):
             estimates.set_estimate(self.db, lot["id"], "1h")
 
@@ -287,7 +287,7 @@ class EstimatesPgTest(PgTestCase):
         création est antidatée avant le début (`estimated_before`)."""
         if work.get(self.db, lot_id)["state"] == "intake":
             work.move(self.db, lot_id, "build")
-        work.merged(self.db, lot_id, sha="abcdef1")
+        work.close_merged(self.db, lot_id, sha="abcdef1")
         self.db.execute(
             "UPDATE work_items SET started_at = now() - make_interval(mins => %s)"
             " WHERE id = %s", (int(started_min_ago), int(lot_id)))
