@@ -245,7 +245,12 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
 # Lecture seule du dépôt, aucun `fetch`. La cible : celle du lot, sinon
 # `git config ameesh.target` du dépôt (une valeur introuvable est une
 # erreur, jamais un repli silencieux sur main), sinon `origin/HEAD`, sinon
-# main.
+# main. #746 : quand ni le lot ni le dépôt ne déclarent de cible et que
+# celle-ci (`origin/HEAD`, figé à la création du clone) ne porte pas la
+# fusion, le relevé essaie les refs d'intégration reconnues à leur nom
+# (`develop`, `main`, `master`, `release/…`) et ferme sur la première qui la
+# porte ; jamais une branche de travail (`agent/`, `lot/`, `review/`…), où
+# une fusion n'est pas une livraison.
 
 #: une branche citée dans un message (`agent/…`)
 CITED_BRANCH_RE = re.compile(r"(?<![\w./-])(agent/[A-Za-z0-9._/-]*[A-Za-z0-9_-])")
@@ -274,6 +279,16 @@ PR_BODY_CACHE_MAX = 5000
 #: clé de configuration git du dépôt qui nomme la cible par défaut
 TARGET_GIT_KEY = "ameesh.target"
 DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
+#: #746 : refs d'intégration du remote `origin` où un lot peut être livré,
+#: quand la cible déclarée (celle du lot ou `ameesh.target`) ne le porte pas.
+#: Liste blanche fermée, essayée dans cet ordre : ni une branche de travail
+#: (`agent/`, `lot/`, `review/`…), ni un autre remote — une fusion citante
+#: dans une branche de travail (empilement) fermerait le lot à tort.
+INTEGRATION_BRANCHES = ("develop", "main", "master")
+#: #746 : préfixes d'intégration admis (`release/1.10.0`)
+INTEGRATION_PREFIXES = ("release/",)
+#: #746 : refs d'intégration essayées au plus par dépôt et par relevé
+MAX_TARGET_CANDIDATES = 8
 #: une ligne `ameesh-work: <id>` désigne un lot précis (message d'un commit de
 #: fusion, ou corps d'une PR : `plan_github`)
 WORK_TRAILER_RE = re.compile(
@@ -322,6 +337,12 @@ def cited_branch(text: str) -> str | None:
     return next(iter(found)) if len(found) == 1 else None
 
 
+def declared_target(repo: str) -> str | None:
+    """La cible déclarée du dépôt (`git config ameesh.target`), ou None :
+    une cible déclarée fait foi, le relevé ne cherche pas ailleurs."""
+    return _out(repo, "config", "--get", TARGET_GIT_KEY) or None
+
+
 def default_target(repo: str) -> str | None:
     """La cible par défaut du dépôt : `git config ameesh.target`, sinon la
     branche par défaut du dépôt distant (`origin/HEAD`), sinon main/master.
@@ -329,7 +350,7 @@ def default_target(repo: str) -> str | None:
     Une cible configurée mais introuvable (faute de frappe, `origin/develop`
     jamais récupérée) lève MergeProbeError : se rabattre sur main ferait
     chercher les fusions au mauvais endroit, sans le dire."""
-    configured = _out(repo, "config", "--get", TARGET_GIT_KEY)
+    configured = declared_target(repo)
     if configured:
         if _commit(repo, configured):
             return configured
@@ -343,6 +364,40 @@ def default_target(repo: str) -> str | None:
         if _commit(repo, candidate):
             return candidate
     return None
+
+
+def integration_branch(name: str) -> bool:
+    """#746 : la ref est-elle une ref d'intégration de la liste blanche
+    (`develop`, `main`, `master`, `release/*`) ? Rien d'autre : ni une
+    branche de travail, ni un autre remote."""
+    low = short_branch(name).lower()
+    return bool(low) and (low in INTEGRATION_BRANCHES
+                          or low.startswith(INTEGRATION_PREFIXES))
+
+
+def target_candidates(repo: str, primary: str | None,
+                      limit: int = MAX_TARGET_CANDIDATES) -> list[str]:
+    """#746 : les refs d'intégration du remote `origin` à essayer après
+    `primary` (la cible par défaut du clone), quand celle-ci ne porte pas la
+    fusion : la liste blanche `INTEGRATION_BRANCHES`, puis `release/*` de la
+    plus récente à la plus ancienne, au plus `limit`.
+
+    Lecture seule, sans fetch ; aucun autre remote, aucune branche de
+    travail : une branche `agent/…` ou `lot/…` née de la cible porte ses
+    commits de fusion sans que le lot y soit livré."""
+    out = _out(repo, "for-each-ref", "--sort=-committerdate",
+               "--format=%(refname:short)", "refs/remotes/origin")
+    prime = short_branch(primary) if primary else None
+    found = []
+    for ref in (out or "").split():
+        name = short_branch(ref)
+        if not name or name == "HEAD" or name == prime:
+            continue
+        if integration_branch(name):
+            found.append(ref)
+    order = {name: i for i, name in enumerate(INTEGRATION_BRANCHES)}
+    found.sort(key=lambda ref: order.get(short_branch(ref), len(order)))
+    return found[:limit]
 
 
 def _tip(repo: str, branch: str) -> str | None:
@@ -568,11 +623,17 @@ def _citation(merge: dict, lot: int, target: str, *, sha: bool = True) -> str:
     """Comment la fusion a été constatée, en clair (compte rendu ; sans le
     commit, `sha=False`, pour la note du lot, qui le porte déjà)."""
     title = (merge["message"].splitlines() or [""])[0].strip()
+    if merge["how"] == "ameesh-work":
+        how = "carries \"ameesh-work: %d\"" % lot
+    elif merge["how"] == "lot-branch":
+        how = "merges the branch lot/%d-…" % lot
+    elif merge["how"] == "message":
+        # #746 : citation à nom entier de la branche du lot (pas de trailer)
+        how = "merges the branch %s" % (merge.get("branch") or "?")
+    else:
+        how = "cites #%d in its title (%s %s)" % (lot, LOT_REF_GIT_KEY, LOT_REF_HASH)
     return "merge commit %sof %s that %s (\"%s\")" % (
-        "%s " % merge["sha"][:12] if sha else "", target,
-        "carries \"ameesh-work: %d\"" % lot if merge["how"] == "ameesh-work"
-        else "merges the branch lot/%d-…" % lot if merge["how"] == "lot-branch"
-        else "cites #%d in its title (%s %s)" % (lot, LOT_REF_GIT_KEY, LOT_REF_HASH),
+        "%s " % merge["sha"][:12] if sha else "", target, how,
         title[:80] + ("…" if len(title) > 80 else ""))
 
 
@@ -670,6 +731,186 @@ def _read_pr_body(pr_body, repo: str, number: int, sweep: dict):
     return body
 
 
+def _off_target_citations(repo: str, lot: int, row: dict, all_merges: list,
+                          *, hash_refs: bool, tips: dict) -> tuple[list, tuple | None]:
+    """#746 : les fusions d'une ref d'intégration essayée HORS cible qui
+    livrent le lot, du plus ancien au plus récent, et la dernière qui se
+    déclare partielle.
+
+    Une fusion ne compte que si elle est postérieure à la création du lot
+    (à `CLOCK_SLACK_S` près) et cite le lot : trailer `ameesh-work: <id>`
+    (ou `#<id>` si le dépôt l'active), ou citation à nom entier de la
+    branche du lot. Un lot à branche enregistrée n'est cité que par une
+    fusion qui a réellement fusionné SA branche (deuxième parent = sa
+    pointe) : une fusion dans une autre branche de travail (empilement)
+    ne ferme pas. `tips` : cache `(dépôt, branche) → pointe`, consulté
+    seulement quand une citation est trouvée."""
+    since = row.get("created_ts")
+    mine = short_branch(row["branch"]) if row.get("branch") else None
+    citing, partial, tip = [], None, None
+    for merge in reversed(all_merges):            # du plus ancien au plus récent
+        if since and merge["ts"] < float(since) - CLOCK_SLACK_S:
+            continue
+        declared_partial = int(lot) in partial_lots(merge["message"])
+        how = cited_lots(merge["message"], hash_refs=hash_refs).get(int(lot))
+        if how == "lot-branch" and mine and merge_branch(merge["message"]) != mine:
+            continue                    # #312 r1 : une autre lot/<id>-… ne compte pas
+        if how is None and mine and _mentions(merge["message"], mine):
+            how = "message"             # la fusion cite la branche enregistrée
+        if how is None and not declared_partial:
+            continue
+        if mine:
+            if tip is None:
+                if (repo, mine) not in tips:
+                    tips[(repo, mine)] = _tip(repo, mine)
+                tip = tips[(repo, mine)]
+            parents = merge.get("parents") or []
+            if len(parents) < 2 or parents[1] != tip:
+                continue
+        if declared_partial:
+            partial = (merge, "merge commit %s declares itself partial "
+                       "(\"ameesh-work-partial: %d\"): lot kept open"
+                       % (merge["sha"][:12], lot))
+            continue
+        citing.append(dict(merge, how=how, branch=mine))
+    return citing, partial
+
+
+def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: str, *,
+                  st, since_all: float | None, hashes: dict, merges: dict, bodies: dict,
+                  sweep: dict, pr_body, dry_run: bool, implicits: dict, tips: dict,
+                  off_target: bool = False) -> dict:
+    """L'examen d'un lot contre UNE cible, extrait de `sync_branches` (#746)
+    pour essayer la cible par défaut puis, si elle ne porte pas la fusion,
+    les refs d'intégration du dépôt.
+
+    `off_target` : la ref n'est ni la cible déclarée ni la cible par défaut ;
+    seule une citation prouve alors la livraison, jamais le seul voisinage
+    de la branche. Rend `{found, branch, implicit, row}` ; lève
+    MergeProbeError/GitError comme l'examen d'origine."""
+    found = None
+    implicit = False
+    if not branch:
+        if lot not in implicits:
+            implicits[lot] = implicit_branch(repo, lot)
+        branch = implicits[lot]
+        implicit = bool(branch)
+    if off_target:
+        found = {"merged": False, "how": None, "ref": None, "ahead": False, "tip": None,
+                 "detail": "no merge commit of %s delivers the lot" % target}
+    elif branch:
+        found = branch_probe(repo, branch, target, seen_head=row.get("branch_head"),
+                             since_ts=row.get("created_ts"))
+    if repo not in hashes:
+        hashes[repo] = lot_ref_hash(repo)
+    if (repo, target) not in merges:
+        merges[(repo, target)] = merge_commits(repo, target, since_all)
+    all_merges = merges[(repo, target)]
+    # L118b : une fusion GitHub de `lot/<id>-…` ne ferme le lot que si
+    # sa PR ne se déclare pas partielle ; la première qui livre tout
+    unreadable = None                # pourquoi une PR reste illisible
+    partial = None                   # la dernière fusion partielle, et pourquoi
+    cited = None
+    if off_target:
+        # #746 : hors cible, une citation (trailer, `#<id>`, nom entier de
+        # la branche) prouve la livraison ; le lot à branche enregistrée
+        # exige en plus que la fusion ait porté SA branche
+        citing, partial = _off_target_citations(repo, lot, row, all_merges,
+                                                hash_refs=hashes[repo], tips=tips)
+    else:
+        citing = merges_citing(all_merges, lot, since_ts=row.get("created_ts"),
+                               hash_refs=hashes[repo])
+        if row.get("branch"):
+            # #312 r1 : une branche enregistrée est seule à compter ; la
+            # fusion d'une autre `lot/<id>-…` ne ferme pas le lot
+            mine = short_branch(row["branch"])
+            citing = [m for m in citing if m["how"] != "lot-branch"
+                      or merge_branch(m["message"]) == mine]
+        # #312 r1 : une fusion locale qui se déclare partielle retient
+        # aussi la preuve par la branche
+        for merge in merges_partial(all_merges, lot, since_ts=row.get("created_ts")):
+            partial = (merge, "merge commit %s declares itself partial "
+                       "(\"ameesh-work-partial: %d\"): lot kept open"
+                       % (merge["sha"][:12], lot))
+    for merge in citing:
+        number = merge_pr_number(merge["message"])
+        if not number:
+            cited = merge
+            break
+        if (repo, number) not in bodies:
+            bodies[(repo, number)] = _read_pr_body(pr_body, repo, number, sweep)
+        body = bodies[(repo, number)]
+        if isinstance(body, GitError):
+            # #312 r1 : une PR plus récente lisible et complète peut
+            # encore fermer le lot
+            unreadable = unreadable or (
+                "PR #%d merged, but its body is unreadable (%s): not closed until "
+                "it says whether it is partial" % (number, body))
+            continue
+        if lot in partial_lots(body):
+            if partial is None or merge["ts"] >= partial[0]["ts"]:
+                partial = (merge, "PR #%d declares itself partial "
+                           "(\"ameesh-work-partial: %d\"): lot kept open"
+                           % (number, lot))
+            continue
+        cited = merge
+        break
+    # une branche enregistrée déjà prouvée fusionnée ferme comme avant
+    # quand le corps est illisible (hôte sans gh) : seule la preuve
+    # implicite attend de savoir ; une fusion partielle retient toujours
+    proven = bool(found and found["merged"] and row.get("branch"))
+    if partial and partial[0]["sha"] != row.get("partial_merge") and not off_target:
+        # #346 r2 : l'instant où le relevé voit la fusion partielle
+        # pour la première fois, à l'horloge de la base ; #403 : le
+        # dry-run juge comme le vrai relevé, sans écrire
+        if not dry_run:
+            st.work.set_partial_seen(lot, partial[0]["sha"])
+        row = dict(row, partial_merge=partial[0]["sha"], partial_seen_ts=None)
+    if partial and found and found["merged"] and found["tip"] \
+            and _moved_past(repo, row.get("branch_head"), row.get("branch_head_ts"),
+                            found["tip"], partial[0], row.get("partial_seen_ts")):
+        # #312 r2 : seule la dernière fusion de la branche compte ; la
+        # branche vue depuis en avance, puis fusionnée (avance rapide),
+        # a livré la suite (L118d : pas une simple avance jusqu'à la cible)
+        partial = None
+    held = partial[1] if partial else unreadable
+    if held and cited is None and (partial or not proven):
+        found = dict(found or {"tip": None, "ahead": False, "ref": None},
+                     merged=False, how="partial", detail=held)
+    elif found is None or not found["merged"]:
+        if cited:
+            found = dict(found or {"tip": None, "ahead": False}, merged=True,
+                         how=cited["how"], ref=cited["sha"],
+                         detail=_citation(cited, lot, target),
+                         note=_citation(cited, lot, target, sha=False))
+        elif found is None:
+            found = {"merged": False, "how": None, "ref": None, "tip": None,
+                     "ahead": False,
+                     "detail": "no merge commit of %s names the lot "
+                               "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
+                               % (target, lot, lot, ", nor \"#%d\" in a title" % lot
+                                  if hashes[repo] else "")}
+    return {"found": found, "branch": branch, "implicit": implicit, "row": row}
+
+
+def _signal_off_target(db, st, lot: int, assignee: str, reg, note: str, key: str,
+                       *, actor: str = "") -> None:
+    """#746 : une citation hors cible (ou une ref illisible) n'est jamais
+    silencieuse : une note au journal du lot et un message dans son fil, une
+    fois par observation (`key`), sans jamais fermer le lot."""
+    from . import fil
+    if any(key in (event.get("note") or "")
+           for event in st.work.events(int(lot), 40)):
+        return
+    try:
+        work_mod.note(db, lot, note, actor=actor)
+    except work_mod.WorkError:
+        return                          # le lot a changé : rien à journaliser
+    fil.record(db.cfg, db, sender=work_mod.SYSTEM_SENDER, recipients=[assignee],
+               text=note, project=fil.project_for(db.cfg, fil.agent_project(reg)),
+               lot=str(lot), meta={"kind": "event"})
+
+
 def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = False,
                   actor: str = "", limit: int = MAX_BRANCH_LOTS, pr_body=None) -> dict:
     """L118 : ferme les lots ouverts dont la fusion dans leur cible est constatée.
@@ -690,7 +931,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     Le corps de cette PR (`pr_body(repo, N)`, défaut : `gh`) est lu : une PR
     qui se déclare partielle (`ameesh-work-partial: <id>`) ne ferme pas le
     lot, et un corps illisible le laisse ouvert (un lot fermé n'est jamais
-    rouvert : on ne ferme pas sans savoir)."""
+    rouvert : on ne ferme pas sans savoir).
+
+    #746 : une cible déclarée — celle du lot (`branch_target`) ou
+    `ameesh.target` du dépôt — fait foi : une fusion constatée ailleurs
+    n'est qu'un résidu signalé (note au lot, message à l'assigné), jamais
+    une fermeture. Quand aucune des deux n'est déclarée et que la cible par
+    défaut (`origin/HEAD`, figé à la création du clone) ne porte pas la
+    fusion, les refs d'intégration du remote (`develop`, `main`, `master`,
+    `release/*`) sont essayées à leur tour : une fusion citante y ferme le
+    lot, avec la ref trouvée dans la note. Aucune autre ref (branche de
+    travail, autre remote), aucun fetch."""
     import os
 
     from . import fil, registry
@@ -702,6 +953,10 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     since_all = min((float(r["created_ts"]) - CLOCK_SLACK_S for r in rows
                      if r.get("created_ts")), default=None)
     targets: dict = {}
+    declared: dict = {}                      # #746 : le dépôt déclare sa cible ?
+    candidates: dict = {}                    # #746 : (dépôt, cible) → refs d'intégration
+    implicits: dict = {}                     # #746 : branche implicite, une fois par lot
+    tips: dict = {}                          # #746 : (dépôt, branche) → pointe
     hashes: dict = {}
     merges: dict = {}
     regs: dict = {}                          # une lecture du registre par assigné
@@ -735,8 +990,12 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         try:
+            # #746 : une cible déclarée — celle du lot, ou `ameesh.target` du
+            # dépôt — fait foi ; sinon la cible par défaut du clone
+            # (`origin/HEAD`, figé à sa création), puis les refs d'intégration
+            # du remote, essayées seulement si elle ne porte pas la fusion.
             if row.get("branch_target"):
-                target = row["branch_target"]
+                primary, explicit = row["branch_target"], True
             else:
                 if repo not in targets:
                     try:
@@ -745,111 +1004,102 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                         targets[repo] = exc
                 if isinstance(targets[repo], MergeProbeError):
                     raise targets[repo]
-                target = targets[repo]
-            if not target:
-                entry.update(result="no-target", detail="no target: `git config %s "
-                             "<branch>` in %s, or --target" % (TARGET_GIT_KEY, repo))
-                results.append(entry)
-                continue
-            entry["target"] = target
-            found = None
-            implicit = False
-            if not branch:
-                branch = implicit_branch(repo, lot)
-                implicit = bool(branch)
-                entry["branch"] = branch
-            if branch:
-                found = branch_probe(repo, branch, target, seen_head=row.get("branch_head"),
-                                     since_ts=row.get("created_ts"))
-            if repo not in hashes:
-                hashes[repo] = lot_ref_hash(repo)
-            if (repo, target) not in merges:
-                merges[(repo, target)] = merge_commits(repo, target, since_all)
-            citing = merges_citing(merges[(repo, target)], lot,
-                                   since_ts=row.get("created_ts"), hash_refs=hashes[repo])
-            if row.get("branch"):
-                # #312 r1 : une branche enregistrée est seule à compter ; la
-                # fusion d'une autre `lot/<id>-…` ne ferme pas le lot
-                mine = short_branch(row["branch"])
-                citing = [m for m in citing if m["how"] != "lot-branch"
-                          or merge_branch(m["message"]) == mine]
-            # L118b : une fusion GitHub de `lot/<id>-…` ne ferme le lot que si
-            # sa PR ne se déclare pas partielle ; la première qui livre tout
-            unreadable = None                # pourquoi une PR reste illisible
-            partial = None                   # la dernière fusion partielle, et pourquoi
-            cited = None
-            # #312 r1 : une fusion locale qui se déclare partielle retient
-            # aussi la preuve par la branche
-            for merge in merges_partial(merges[(repo, target)], lot,
-                                        since_ts=row.get("created_ts")):
-                partial = (merge, "merge commit %s declares itself partial "
-                           "(\"ameesh-work-partial: %d\"): lot kept open"
-                           % (merge["sha"][:12], lot))
-            for merge in citing:
-                number = merge_pr_number(merge["message"])
-                if not number:
-                    cited = merge
+                if not targets[repo]:
+                    entry.update(result="no-target", detail="no target: `git config %s "
+                                 "<branch>` in %s, or --target" % (TARGET_GIT_KEY, repo))
+                    results.append(entry)
+                    continue
+                if repo not in declared:
+                    declared[repo] = bool(declared_target(repo))
+                primary, explicit = targets[repo], declared[repo]
+            # #990 : la liste dépend de la cible primaire, propre au lot — un
+            # cache par dépôt la figerait pour les lots suivants
+            if (repo, primary) not in candidates:
+                candidates[(repo, primary)] = target_candidates(repo, primary)
+            off_refs = candidates[(repo, primary)]
+            # une cible déclarée ne ferme jamais ailleurs : les refs hors
+            # cible n'y sont examinées que pour signaler le résidu
+            to_try = [(primary, False, True)]
+            to_try += [(ref, True, explicit is False) for ref in off_refs]
+            outcome = None                   # l'examen retenu (cible par défaut)
+            off_outcome = None               # une citation hors cible (jamais fermée)
+            partial_off = None               # une fusion partielle hors cible
+            unreadable = []                  # (ref, pourquoi) : le résidu, jamais silencieux
+            for target, off, close in to_try:
+                try:
+                    probe = _sweep_target(
+                        repo, lot, row, branch, target, st=st, since_all=since_all,
+                        hashes=hashes, merges=merges, bodies=bodies, sweep=sweep,
+                        pr_body=pr_body, dry_run=dry_run, implicits=implicits,
+                        tips=tips, off_target=off)
+                except (MergeProbeError, GitError) as exc:
+                    if off:
+                        unreadable.append((target, str(exc)))
+                    elif outcome is None:
+                        outcome = {"error": str(exc), "target": target, "off": off}
+                    continue
+                if probe["found"]["merged"]:
+                    if close:
+                        outcome = dict(probe, target=target, off=off)
+                    else:
+                        off_outcome = dict(probe, target=target, off=off)
                     break
-                if (repo, number) not in bodies:
-                    bodies[(repo, number)] = _read_pr_body(pr_body, repo, number, sweep)
-                body = bodies[(repo, number)]
-                if isinstance(body, GitError):
-                    # #312 r1 : une PR plus récente lisible et complète peut
-                    # encore fermer le lot
-                    unreadable = unreadable or (
-                        "PR #%d merged, but its body is unreadable (%s): not closed until "
-                        "it says whether it is partial" % (number, body))
-                    continue
-                if lot in partial_lots(body):
-                    if partial is None or merge["ts"] >= partial[0]["ts"]:
-                        partial = (merge, "PR #%d declares itself partial "
-                                   "(\"ameesh-work-partial: %d\"): lot kept open"
-                                   % (number, lot))
-                    continue
-                cited = merge
-                break
-            # une branche enregistrée déjà prouvée fusionnée ferme comme avant
-            # quand le corps est illisible (hôte sans gh) : seule la preuve
-            # implicite attend de savoir ; une fusion partielle retient toujours
-            proven = bool(found and found["merged"] and row.get("branch"))
-            if partial and partial[0]["sha"] != row.get("partial_merge"):
-                # #346 r2 : l'instant où le relevé voit la fusion partielle
-                # pour la première fois, à l'horloge de la base ; #403 : le
-                # dry-run juge comme le vrai relevé, sans écrire
-                if not dry_run:
-                    st.work.set_partial_seen(lot, partial[0]["sha"])
-                row = dict(row, partial_merge=partial[0]["sha"], partial_seen_ts=None)
-            if partial and found and found["merged"] and found["tip"] \
-                    and _moved_past(repo, row.get("branch_head"), row.get("branch_head_ts"),
-                                    found["tip"], partial[0], row.get("partial_seen_ts")):
-                # #312 r2 : seule la dernière fusion de la branche compte ; la
-                # branche vue depuis en avance, puis fusionnée (avance rapide),
-                # a livré la suite (L118d : pas une simple avance jusqu'à la cible)
-                partial = None
-            held = partial[1] if partial else unreadable
-            if held and cited is None and (partial or not proven):
-                found = dict(found or {"tip": None, "ahead": False, "ref": None},
-                             merged=False, how="partial", detail=held)
-            elif found is None or not found["merged"]:
-                if cited:
-                    found = dict(found or {"tip": None, "ahead": False}, merged=True,
-                                 how=cited["how"], ref=cited["sha"],
-                                 detail=_citation(cited, lot, target),
-                                 note=_citation(cited, lot, target, sha=False))
-                elif found is None:
-                    found = {"merged": False, "how": None, "ref": None, "tip": None,
-                             "ahead": False,
-                             "detail": "no merge commit of %s names the lot "
-                                       "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
-                                       % (target, lot, lot, ", nor \"#%d\" in a title" % lot
-                                          if hashes[repo] else "")}
+                if off and probe["found"]["how"] == "partial" and partial_off is None:
+                    partial_off = (target, probe["found"]["detail"])
+                if outcome is None:
+                    outcome = dict(probe, target=target, off=off)
         except (MergeProbeError, GitError) as exc:
             entry.update(result="error", detail=str(exc))
             results.append(entry)
             continue
-        entry.update(how=found["how"], ref=found["ref"], detail=found["detail"], result="open",
-                     repo=repo)
+        if outcome.get("error"):
+            entry.update(target=outcome["target"], result="error", detail=outcome["error"])
+            results.append(entry)
+            continue
+        found = outcome["found"]
+        branch = outcome["branch"]
+        implicit = outcome["implicit"]
+        row = outcome["row"]
+        target = outcome["target"]
+        entry.update(branch=branch, target=target, repo=repo, how=found["how"],
+                     ref=found["ref"], detail=found["detail"], result="open")
+        if found["merged"] and outcome["off"]:
+            # #746 : la livraison est constatée hors de la cible par défaut
+            # (clone sans `ameesh.target`, `origin/HEAD` figé) : la note dit
+            # la ref trouvée et quoi déclarer pour l'expliciter
+            entry["off_target"] = primary
+            entry["detail"] = "%s (merged into %s, off the default target %s: declare " \
+                              "`git config %s %s` to make it explicit)" % (
+                                  entry["detail"], target, primary, TARGET_GIT_KEY, target)
         if not found["merged"]:
+            # #746 : le résidu n'est jamais silencieux — une citation sur une
+            # ref d'intégration alors qu'une cible est déclarée, ou une ref
+            # illisible : note au lot et message à l'assigné, jamais de
+            # fermeture
+            note, key = None, None
+            if off_outcome:
+                note = ("merge sweep: %s, but the declared target %s does not carry "
+                        "it; the lot is kept open — declare `git config %s %s` to "
+                        "close it explicitly" % (
+                            off_outcome["found"]["detail"], primary, TARGET_GIT_KEY,
+                            off_outcome["target"]))
+                key = (off_outcome["found"]["ref"] or off_outcome["target"])[:12]
+            elif unreadable:
+                note = ("merge sweep: unreadable integration ref%s %s; the lot is kept "
+                        "open — fix or declare the target (`git config %s <branch>`)" % (
+                            "s" if len(unreadable) > 1 else "",
+                            ", ".join("%s (%s)" % pair for pair in unreadable),
+                            TARGET_GIT_KEY))
+                key = "unreadable integration ref"
+            if note:
+                entry.update(result="off-target", detail=note)
+                if not dry_run:
+                    _signal_off_target(db, st, lot, assignee, reg, note, key,
+                                       actor=actor or "git:%s" % target)
+            elif partial_off:
+                # #746 : une fusion partielle hors cible ne ferme pas, mais
+                # se dit (comme la fusion partielle de la cible)
+                entry.update(how="partial", detail=partial_off[1])
             stale = row.get("branch_head_ts") is None or (
                 row.get("partial_merge") and (row.get("partial_seen_ts") is None
                                               or row["branch_head_ts"] <= row["partial_seen_ts"]))
@@ -875,9 +1125,15 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             source = "the merge sweep, %s" % found["note"]
         else:
             source = "branch %s (%s)" % (branch, found["how"])
+        if outcome["off"]:
+            # #746 : la cible par défaut ne portait pas la fusion ; la ref
+            # trouvée est dite, et quoi déclarer pour l'expliciter
+            source = ("%s — merged into %s, off the default target %s: declare "
+                      "`git config %s %s` to make it explicit"
+                      % (source, target, primary, TARGET_GIT_KEY, target))
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source)
-        entry.update(result=done["result"], detail="%s — %s" % (found["detail"], done["detail"]))
+        entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
         if done["result"] == "merged":
             text = ("Lot #%d \"%s\" delivered: %s (%s, commit %s). Closed by the runner's "
                     "merge sweep."
@@ -885,6 +1141,10 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                        "a merge commit of %s names it" % target if found.get("note")
                        else "branch %s entered %s" % (branch, target),
                        found["how"], (found["ref"] or "?")[:12]))
+            if outcome["off"]:
+                text = ("%s Merged into %s, off the default target %s: declare "
+                        "`git config %s %s` to make it explicit."
+                        % (text, target, primary, TARGET_GIT_KEY, target))
             fil.record(db.cfg, db, sender=work_mod.SYSTEM_SENDER, recipients=[assignee],
                        text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),
                        lot=str(lot), meta={"kind": "event"})

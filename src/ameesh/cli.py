@@ -213,6 +213,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     expires = None
     lot = None
     new_lot = None
+    parent_lot = None
     app = None
     kind = "notify"
     urgent = False
@@ -235,7 +236,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--parent-lot",
+                 "--kind", "--estimate", "--app"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -250,6 +252,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 lot = value
             elif flag == "--new-lot":
                 new_lot = value if value is not None else ""
+            elif flag == "--parent-lot":
+                parent_lot = value if value is not None else ""
             elif flag == "--estimate":
                 estimate = value if value is not None else ""
             elif flag == "--app":
@@ -284,7 +288,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
-              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]]] "
+              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
+              "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
@@ -313,6 +318,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
               "existing one: ameesh work plan <id> --estimate 2h)", file=sys.stderr)
         return 2
+    if parent_lot is not None and new_lot is None:
+        print("--parent-lot goes with --new-lot (the parent of the created suite; for an "
+              "existing lot: ameesh work dependencies <id> --add <parent>)", file=sys.stderr)
+        return 2
+    if parent_lot is not None:
+        number = str(parent_lot).strip().lstrip("#")
+        if not number.isdigit() or int(number) <= 0:
+            print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
+            return 2
+        parent_lot = int(number)
     dest, text = args[0], " ".join(args[1:]).strip()
     binding = None
     if not sender:
@@ -350,7 +365,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         if bk.kind == "pg":
             from . import undeliverable
             if undeliverable.registry_rows(bk.db, [name])[name] is None:
-                print("copy refused: unknown agent: %s (nothing dropped)" % name,
+                print("copy refused: unknown agent: %s (nothing delivered)" % name,
                       file=sys.stderr)
                 return 2
     # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
@@ -400,7 +415,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             notes = undeliverable.check_send(cfg, bk.db, sender=sender, dest=dest, queue=queue,
                                              explicit=explicit, binding=binding)
         except undeliverable.Refused as exc:
-            print("message not dropped — %s" % exc, file=sys.stderr)
+            print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         for note in notes:
             print("warning: %s" % note, file=sys.stderr)
@@ -434,9 +449,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project)
+                estimate=estimate, app=app, new_project=new_project,
+                parent_lot=parent_lot)
         except assignments.AssignmentError as exc:
-            print("message not dropped — %s" % exc, file=sys.stderr)
+            print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]
         for warning in linked["warnings"]:
@@ -463,17 +479,17 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
     if skipped:
-        print("warning: not dropped for %s (%s) — --queue to drop anyway" % (
+        print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
             if len(skipped) > 1 else "stopped: nobody reads its mailbox"), file=sys.stderr)
     if not targets:
         print("no recipient")
     elif signed:
-        print("dropped for: %s (signed %s, expires %s)" % (
+        print("delivered to %s (signed %s, expires %s)" % (
             ", ".join(targets), signed["signature_key"][:12],
             time.strftime("%H:%M", time.localtime(signed["expires_us"] / 1_000_000))))
     else:
-        print("dropped for: " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
+        print("delivered to " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
     return 0
 
 

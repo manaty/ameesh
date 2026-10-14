@@ -127,7 +127,8 @@ def find_session(harness: str, home: str, session_id: str,
 
     * Codex : `<CODEX_HOME>/sessions/AAAA/MM/JJ/rollout-<date>-<id>.jsonl` ;
     * Claude Code : `<CLAUDE_CONFIG_DIR>/projects/<dossier encodé>/<id>.jsonl` ;
-    * DeepSeek Harness : `<DSH_HOME>/sessions/<dossier encodé>/session-<id>/`.
+    * DeepSeek Harness : `<DSH_HOME>/sessions/<dossier encodé>/session-<id>/`
+      (l'identifiant dsh porte déjà le préfixe `session-`).
 
     `strict` (L224, verdict codex #183) : une recherche incomplète (dossier
     illisible) lève `SessionSearchIncomplete` au lieu de répondre None.
@@ -179,7 +180,11 @@ def find_session(harness: str, home: str, session_id: str,
             if _present(candidate, False, strict):
                 return candidate
         elif harness == "deepseek":
-            candidate = os.path.join(root, entry, "session-" + session_id)
+            # dsh ids already carry the prefix (`session-b126155c-…`): adding it
+            # again looked for `session-session-…`, so no DeepSeek session was
+            # ever found and every turn opened a new one on the resume brief
+            name = session_id if session_id.startswith("session-") else "session-" + session_id
+            candidate = os.path.join(root, entry, name)
             if _present(candidate, True, strict):
                 return candidate
     return None
@@ -885,6 +890,21 @@ def _forget_local(cfg: Config, name: str) -> None:
         pass
 
 
+#: #1037 : réglages locaux qui n'ont de sens que sous le harnais déclaré
+_HARNESS_SETTINGS = ("model", "effort", "tier")
+
+
+def _drop_harness_settings(cfg: Config, name: str) -> None:
+    """Efface les réglages locaux du harnais quitté (l'exécuteur les relit
+    avant les colonnes du registre : les garder ferait lancer le nouveau
+    harnais avec le modèle, l'effort ou le tier de l'ancien)."""
+    for cle in _HARNESS_SETTINGS:
+        try:
+            os.unlink(os.path.join(cfg.agent_dir(name), cle))
+        except OSError:
+            pass
+
+
 def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
           account: str | None = None, cwd: str | None = None, brief: str = "",
           chantier: str | None = None, force: bool = False, actor: str = "",
@@ -1003,6 +1023,15 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         session_account=compte, prompt=prompt, status_text=status_text)
     if result is None:
         raise RepriseError("%s: a lease was taken in the meantime; try again" % name)
+    # #1037 : le harnais déclaré a changé — les réglages du précédent
+    # (modèle, effort, tier ; base et état local) ne s'appliquent plus. Le
+    # registre les a effacés dans la même écriture que le harnais ; l'état
+    # local est effacé ici (même hôte seulement : ailleurs, il n'existe pas).
+    quitte = str(result.get("previous_harness") or "")
+    if quitte and quitte != harness:
+        _drop_harness_settings(cfg, name)
+        constats.append("harness %s → %s: model, effort and tier of the former harness "
+                        "dropped (they do not apply to %s)" % (quitte, harness, harness))
     _forget_local(cfg, name)
     # L46 : l'agent adopté est mené par l'exécuteur — ses liaisons de session
     # externes (L41) sont révoquées, sinon une session externe lui volerait
