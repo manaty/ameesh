@@ -3,32 +3,41 @@
 
 Le pilote donne son feu **au gel**, sur la tête exacte du lot
 (`ameesh work fire <lot> --sha <commit>`), avant les relectures : la fusion
-part alors d'elle-même dès que la CI requise est verte, sans attendre le tour
+part alors d'elle-même dès que les portes sont vertes, sans attendre le tour
 d'un agent. Le feu est un jalon (`fire`), révocable par le pilote (`unfire`,
 `ameesh work fire <lot> --withdraw`) ; il ne vaut que pour le gel qu'il cite,
 jamais pour le lot.
 
 À chaque passage (`fire.run_pass`, appelé par le relevé des branches de
-l'exécuteur), pour chaque lot ouvert qui porte un feu :
+l'exécuteur), pour chaque lot ouvert qui porte un feu, **dans cet ordre**
+(#1374, P1 : les verdicts avant la PR, la CI avant la fusion) :
 
 1. la PR est relue ; une PR fusionnée est réconciliée tout de suite
    (`work.close_merged`, et la relecture d'après fusion d'un lot léger) ;
-2. un feu dont la tête a bougé est invalidé (`unfire`, auto-fusion désarmée,
-   assigné réveillé) : le feu est à redonner ;
-3. un feu actif et couvert par le gel courant arme la fusion automatique dès
-   que les portes sont vertes (verdicts de la classe, CI verte sur cette tête,
-   cible non-release) :
-   * projet qui déclare `land` (`radar.projects`, Nexlink) : le lot entre dans
-     la file de fusion (`merge_queue.enter`), l'exécutant l'atterrit ;
-   * sinon (ameesh) : `gh pr merge --auto --match-head-commit <sha>` sur la PR
-     ouverte — ouverte au besoin (`gh pr create`, règles de publication
-     respectées) ;
-4. tant que la fusion n'a pas eu lieu, la tête est revérifiée à chaque
-   passage : `--match-head-commit` ne lie pas durablement le feu, c'est cette
-   relecture qui garantit qu'aucun commit non couvert ne part.
+2. un feu retiré ou dont la tête a bougé est invalidé (`unfire`, auto-fusion
+   résiduelle désarmée, ligne de file retirée, assigné réveillé) : le feu est
+   à redonner ;
+3. **la porte des verdicts** est franchie (`merge_queue.review_gate`) : les
+   avis requis par la classe, rendus sur la tête gelée, indépendants
+   (familles distinctes, aucune celle de l'auteur) et sans blocage non levé.
+   Tant qu'elle n'est pas franchie, aucune PR n'est ouverte, aucune ligne de
+   file n'est écrite et aucune CI n'est déclenchée ;
+4. la PR manquante est alors ouverte (mode GitHub) ou le lot entre dans la
+   file de fusion (`merge_queue.enter`, Nexlink), une fois les portes vertes ;
+5. en mode GitHub, la fusion est **faite par ce passage**, sous
+   `gh pr merge --match-head-commit <sha>` : la tête autorisée est vérifiée au
+   geste effectif, et aucune auto-fusion GitHub n'est laissée armée entre deux
+   passages — GitHub fusionnerait une tête poussée après le feu (P1-4). Une
+   auto-fusion trouvée armée est désarmée avant tout autre geste ;
+6. en mode file, l'atterrissage re-vérifie le feu et les blocages au dernier
+   geste (`fire.land_guard`, sous le bail de `land`).
 
-Une opération par lot est tenue par un bail (`merge_locks`, clé `fire:<lot>`),
-pour que deux hôtes ne désarment pas et ne réarment pas en même temps.
+Toute opération d'un lot — le passage, mais aussi `give` et `withdraw` — est
+tenue par le même bail (`merge_locks`, clé `fire:<lot>`) : les jalons sont
+relus sous le bail, renouvelé et vérifié juste avant chaque geste externe, et
+feu, gel et verdicts sont revalidés juste avant la PR, la file ou la fusion.
+Un détenteur périmé s'arrête (`busy`) au lieu d'agir sur un instantané
+(P1-3, P2-6).
 """
 from __future__ import annotations
 
@@ -45,7 +54,7 @@ MAX_LOTS = 1000
 #: durée du bail d'une opération de feu
 LOCK_TTL_S = 120.0
 #: résultats qu'un passage n'a pas à journaliser
-QUIET = ("idle", "armed", "queued")
+QUIET = ("idle", "armed", "queued", "busy", "withdrawn")
 #: résultats qu'un passage de l'exécuteur dit dans son journal : état changé,
 #: anomalie ou geste à faire. `not-ready` et les `would-*` se répètent à chaque
 #: passage tant que la CI n'est pas verte : les dire serait du bruit.
@@ -138,7 +147,22 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     Refuse un lot terminé, un lot non gelé, un `sha` qui n'est pas un commit,
     ou un `sha` qui n'est pas le gel courant : le feu se donne sur la tête
     exacte, jamais sur un lot (« si la tête change, le feu est à redonner »).
-    """
+
+    Le geste prend le bail du feu (`fire:<lot>`), celui du passage : un
+    passage en cours d'armement ou de fusion ne peut pas ignorer un feu qui
+    arrive, et le feu ne peut pas se poser pendant qu'un autre hôte agit
+    (#1374, P1-3)."""
+    handle = _lock(db, lot)
+    if handle is None:
+        raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
+    try:
+        return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo)
+    finally:
+        _unlock(handle)
+
+
+def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
+                 repo: str | None = None) -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -167,15 +191,22 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
 
 def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None) -> dict:
     """Retire le feu actif d'un lot (jalon `unfire`) : l'auto-fusion est
-    désarmée au passage suivant, rien d'autre n'est annulé."""
-    item = work.get(db, lot)
-    if item is None:
-        raise FireError("lot #%d not found" % lot)
-    fire = active(work.milestones(db, lot))
-    if fire is None:
-        raise FireError("lot #%d carries no active fire: nothing to withdraw" % lot)
-    return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
-                          note=(note or "withdrawn by %s" % actor).strip())
+    désarmée et la ligne de file retirée au passage suivant, rien d'autre n'est
+    annulé. Même bail que le passage (#1374, P1-3)."""
+    handle = _lock(db, lot)
+    if handle is None:
+        raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
+    try:
+        item = work.get(db, lot)
+        if item is None:
+            raise FireError("lot #%d not found" % lot)
+        fire = active(work.milestones(db, lot))
+        if fire is None:
+            raise FireError("lot #%d carries no active fire: nothing to withdraw" % lot)
+        return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
+                              note=(note or "withdrawn by %s" % actor).strip())
+    finally:
+        _unlock(handle)
 
 
 # --------------------------------------------------------------------------
@@ -405,13 +436,18 @@ def _method(project, info: dict) -> str:
     return allowed[0] if allowed else "merge"
 
 
-def _arm_auto(slug: str, status: dict, sha: str, method: str, *, gh) -> tuple:
-    """Arme l'auto-fusion GitHub sur le commit `sha` (idempotent : relu si
-    l'appel échoue). Rend `(ok, detail)`."""
+def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh) -> tuple:
+    """Fusionne la PR **maintenant**, sur la tête exacte `sha` (#1374, P1-4).
+
+    C'est ce geste, et lui seul, qui est lié au feu : `--match-head-commit`
+    est vérifié par GitHub au moment de la fusion, pas à l'armement. Laisser
+    une auto-fusion armée entre deux passages ferait fusionner une tête
+    poussée après le feu (GitHub ne la désarme pas pour un push d'un compte
+    avec droit d'écriture). Rend `(ok, detail)`."""
     proc = gh(["pr", "merge", str(status["number"]), "--repo", slug, "--%s" % method,
-               "--auto", "--match-head-commit", sha], timeout=120.0)
+               "--match-head-commit", sha], timeout=120.0)
     if proc.returncode == 0:
-        return True, "auto-merge armed on %s" % sha[:12]
+        return True, "PR merged on %s" % sha[:12]
     error = (proc.stderr or proc.stdout or "").strip()[:300] or "exit %d" % proc.returncode
     return False, error
 
@@ -430,44 +466,65 @@ def _disarm_auto(slug: str, status: dict, *, gh) -> tuple:
 # les portes de l'auto-fusion (miroir de `merge_queue.readiness`, sans clone)
 # --------------------------------------------------------------------------
 
-def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
-          project, target: str) -> tuple:
-    """Les portes de l'auto-fusion : gel couvert, verdicts de la classe, CI
-    verte sur la tête exacte, cible non-release. Rend `(ok, raison, classe)`.
+def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
+                   project, target: str) -> tuple:
+    """La première porte, celle qui ne doit rien déclencher (#1374, B) : la
+    classe du lot et les **avis requis** sur la tête gelée, comptés et
+    indépendants (`merge_queue.review_gate`). Rend `(ok, raison, classe)`.
 
     Un doute de classe (dépôt inconnu, diff illisible) vaut sensible : le
     verdict reste exigé. Une cible `release/*` (classe release) n'est jamais
-    une auto-fusion : c'est la procédure de release du pilote."""
+    une auto-fusion : c'est la procédure de release du pilote.
+
+    Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
+    un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
     freeze = freeze_of(marks)
     frozen = _norm((freeze or {}).get("sha"))
     head = merge_queue.pinned(repo, frozen) if repo else None
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
                              base=target or None, head=head)
-    light = klass.get("class") == lot_class.LIGHT
-    if not light:
-        if klass.get("class") == lot_class.RELEASE:
-            return False, "class release (%s): the release procedure is the pilot's, not the fire" \
-                % (klass.get("why") or "release"), klass
-        verdict = merge_queue.latest_verdict(marks)
-        if not verdict or verdict.get("verdict") != "ok" \
-                or not same_commit((verdict or {}).get("sha"), frozen, repo):
-            return False, ("no review verdict ok on the freeze %s (class: %s)"
-                           % (frozen[:12], klass.get("class") or "?")), klass
+    if str(klass.get("class") or "") == lot_class.RELEASE:
+        return False, ("class: release (%s) — the release procedure belongs to the pilot: "
+                       "a fire never arms an automatic merge on a release"
+                       % (klass.get("why") or "release")), klass
+    gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass, item=row)
+    if not gate["ok"]:
+        return False, gate["why"], klass
+    return True, "", klass
+
+
+def ready_pr(status: dict, *, target: str, project, frozen: str) -> tuple:
+    """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
+    tête gelée, CI du commit gelé quand le projet l'exige (L160g)."""
     if status.get("draft"):
-        return False, "PR #%s is a draft" % status.get("number"), klass
+        return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
         return False, "PR #%s targets %s, not %s" % (status.get("number"), status["base"],
-                                                     target), klass
+                                                     target)
     if status.get("ci") != "green":
         return False, "the CI of PR #%s is %s on the freeze %s" % (
-            status.get("number"), status.get("ci"), frozen[:12]), klass
+            status.get("number"), status.get("ci"), frozen[:12])
     if project is not None and getattr(project, "ci_required", False):
         try:
             merge_queue._required_ci(project, frozen)
         except merge_queue.QueueError as exc:
-            return False, str(exc), klass
-    return True, "", klass
+            return False, str(exc)
+    return True, ""
+
+
+def ready(cfg, db, row: dict, marks: list, status: dict, *, repo: str | None,
+          project, target: str) -> tuple:
+    """Les deux portes réunies : verdicts puis PR/CI. Rend `(ok, raison,
+    classe)` ; `status` peut être None (aucune PR lue : seule la porte des
+    verdicts est évaluée)."""
+    ok, why, klass = ready_verdicts(cfg, db, row, marks, repo=repo, project=project,
+                                    target=target)
+    if not ok or status is None:
+        return ok, why, klass
+    frozen = _norm((freeze_of(marks) or {}).get("sha"))
+    ok, why = ready_pr(status, target=target, project=project, frozen=frozen)
+    return ok, why, klass
 
 
 # --------------------------------------------------------------------------
@@ -489,6 +546,21 @@ def _unlock(handle) -> None:
         ops.land_unlock(key, owner, epoch)
     except Exception:  # noqa: BLE001 - le bail expire seul
         pass
+
+
+def _renew(handle) -> bool:
+    """Le bail est-il encore le nôtre ? Le renouvelle au passage (#1374, P2-6).
+
+    Appelé juste avant chaque geste externe : plusieurs appels `gh` peuvent
+    dépasser la durée du bail, et un second hôte le reprendrait pendant que le
+    premier continue. Un détenteur périmé rend `busy` et n'agit pas."""
+    if handle is None:          # dry-run, ou test sans bail
+        return True
+    ops, owner, epoch, key = handle
+    try:
+        return ops.land_lock(key, owner, LOCK_TTL_S, epoch=epoch) is not None
+    except Exception:  # noqa: BLE001 - bail illisible : on ne mute pas
+        return False
 
 
 def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str | None,
@@ -543,25 +615,67 @@ def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str
     return out
 
 
+def _fresh(db, lot: int) -> tuple:
+    """Le lot et ses jalons, relus à l'instant (#1374, P1-3) : un instantané
+    pris avant le bail ne vaut pas pour un geste externe."""
+    item = work.get(db, lot)
+    if item is None:
+        return None, []
+    return item, work.milestones(db, lot)
+
+
+def _fire_covers(fire, freeze, repo: str | None = None) -> bool:
+    return bool(fire) and bool(freeze) and same_commit(fire.get("sha"), freeze.get("sha"), repo)
+
+
+def _leave_queue(db, lot: int, *, dry_run: bool = False, handle=None, reason: str = "") -> bool:
+    """Retire la ligne de file d'un lot que le feu n'autorise plus (#1374,
+    P1-2) : sans cela, `land` — qui ne connaît pas le feu — pourrait encore
+    l'atterrir. Rend True si une ligne a été retirée (ou le serait)."""
+    try:
+        entries = {int(r["work_item_id"]) for r in storage.of(db).work.queue()}
+    except Exception:  # noqa: BLE001 - file illisible : le garde de land couvre
+        return False
+    if lot not in entries:
+        return False
+    if dry_run:
+        return True
+    if not _renew(handle):
+        return False
+    try:
+        return bool(merge_queue.leave(db, lot, actor=work.SYSTEM_SENDER,
+                                      reason=reason or "fire withdrawn or invalidated"))
+    except Exception:  # noqa: BLE001 - la ligne sera retirée au passage suivant
+        return False
+
+
 def _invalidate(db, row: dict, marks: list, fire: dict, reason: str, *, status, gh, slug: str,
-                dry_run: bool) -> dict:
-    """Le feu ne couvre plus la tête : `unfire`, désarmement, assigné réveillé."""
+                dry_run: bool, handle=None) -> dict:
+    """Le feu ne couvre plus la tête : `unfire`, auto-fusion résiduelle
+    désarmée, ligne de file retirée, assigné réveillé."""
     lot = int(row["id"])
     out = {"lot": lot, "result": "invalidated", "detail": reason,
            "sha": _norm(fire.get("sha"))}
+    if not _renew(handle):
+        return {"lot": lot, "result": "busy"}
     if dry_run:
         out["result"] = "would-invalidate"
         return out
     work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=work.SYSTEM_SENDER,
                    note="invalidated: %s" % reason)
+    out["queue_left"] = _leave_queue(db, lot, handle=handle, reason=reason)
     if status and status.get("armed"):
-        ok, detail = _disarm_auto(slug, status, gh=gh)
-        out["disarmed"] = ok
-        if not ok:
-            out["detail"] = "%s; disarm failed (%s)" % (reason, detail)
+        if _renew(handle):
+            ok, detail = _disarm_auto(slug, status, gh=gh)
+            out["disarmed"] = ok
+            if not ok:
+                out["detail"] = "%s; disarm failed (%s)" % (reason, detail)
+        else:
+            out["detail"] = "%s; disarm deferred (lease lost, retried at the next pass)" % reason
     _wake(db, row.get("assignee"), lot, (
-        "Fire on lot #%d « %s »: %s. The automatic merge is disarmed; freeze again and have the "
-        "pilot give the fire on the new head." % (lot, row.get("title") or "", reason)),
+        "Fire on lot #%d « %s »: %s. The automatic merge is disarmed and the merge queue entry "
+        "is removed; freeze again and have the pilot give the fire on the new head."
+        % (lot, row.get("title") or "", reason)),
         {"project": row.get("app") or "", "reason": reason})
     _passive(db, fire.get("actor"), lot, (
         "Fire on lot #%d « %s » (%s) is invalidated: %s. It is to be given again on the new head."
@@ -570,12 +684,15 @@ def _invalidate(db, row: dict, marks: list, fire: dict, reason: str, *, status, 
     return out
 
 
-def _disarm(db, row: dict, status: dict, reason: str, *, gh, slug: str, dry_run: bool) -> dict:
+def _disarm(db, row: dict, status: dict, reason: str, *, gh, slug: str, dry_run: bool,
+            handle=None) -> dict:
     lot = int(row["id"])
     out = {"lot": lot, "result": "disarmed", "detail": reason}
     if dry_run:
         out["result"] = "would-disarm"
         return out
+    if not _renew(handle):
+        return {"lot": lot, "result": "busy"}
     ok, detail = _disarm_auto(slug, status, gh=gh)
     out["disarmed"] = ok
     if not ok:
@@ -640,14 +757,44 @@ def _one(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if lock and not dry_run and handle is None:
         return {"lot": lot, "result": "busy"}
     try:
-        return _act(cfg, db, row, marks, gh=gh, dry_run=dry_run, repo=repo, cache=cache)
+        # #1374, P1-3 : les jalons sont relus SOUS le bail. Ceux lus avant (par
+        # le relevé) peuvent dater d'un autre feu, d'un autre gel ou d'un
+        # verdict rendu entre-temps ; un passage ne réarme ni ne fusionne sur
+        # un instantané périmé.
+        fresh_row, fresh_marks = _fresh(db, lot)
+        if fresh_row is None or fresh_row.get("state") in \
+                tuple(work.MERGED_STATES) + ("closed",):
+            return {"lot": lot, "result": "idle", "detail": "lot no longer open"}
+        if not markers(fresh_marks):
+            return {"lot": lot, "result": "idle"}
+        return _act(cfg, db, fresh_row, fresh_marks, gh=gh, dry_run=dry_run, repo=repo,
+                    cache=cache, handle=handle)
     finally:
         if handle is not None:
             _unlock(handle)
 
 
+def _not_ready(db, row: dict, status, out: dict, why: str, *, gh, slug: str,
+               dry_run: bool, handle=None) -> dict:
+    """La porte n'est pas franchie : désarmer une auto-fusion résiduelle (elle
+    pourrait emporter une tête non couverte, P1-4), ne rien déclencher
+    d'autre."""
+    if status is not None and status.get("armed"):
+        if dry_run:
+            out.update(result="would-disarm", detail="fire gates not met: %s" % why)
+            return out
+        disarmed = _disarm(db, row, status, "fire gates not met: %s" % why, gh=gh, slug=slug,
+                           dry_run=dry_run, handle=handle)
+        if disarmed.get("result") in ("busy", "error"):
+            return disarmed
+        out.update(result="disarmed", detail=disarmed.get("detail") or why)
+        return out
+    out.update(result="not-ready", detail=why)
+    return out
+
+
 def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None,
-         cache: dict) -> dict:
+         cache: dict, handle=None) -> dict:
     lot = int(row["id"])
     fire, freeze = active(marks), freeze_of(marks)
     branch = str(row.get("branch") or "")
@@ -674,104 +821,202 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
         return _reconcile(db, row, marks, status, slug=slug, repo=work_repo,
                           target=str(row.get("branch_target") or ""), dry_run=dry_run)
 
-    # 2. sans feu actif : désarmer ce qui aurait pu l'être, et rien d'autre.
+    # 2. sans feu actif : la ligne de file est retirée, l'auto-fusion résiduelle
+    #    désarmée, et rien d'autre (P1-2).
     if fire is None:
+        out["queue_left"] = _leave_queue(db, lot, dry_run=dry_run, handle=handle,
+                                         reason="no active fire on lot #%d" % lot)
         if status is not None and status.get("armed"):
+            if dry_run:
+                out.update(result="would-disarm",
+                           detail="no active fire on lot #%d: auto-merge armed" % lot)
+                return out
             return _disarm(db, row, status,
                            "no active fire on lot #%d (withdrawn or invalidated)" % lot,
-                           gh=gh, slug=slug, dry_run=dry_run)
+                           gh=gh, slug=slug, dry_run=dry_run, handle=handle)
         out.update(result="withdrawn" if markers(marks) else "idle")
         return out
 
     # 3. le feu ne couvre pas le gel courant, ou la tête a bougé : invalidation.
-    if not freeze or not same_commit(fire.get("sha"), (freeze or {}).get("sha"), work_repo):
+    if not _fire_covers(fire, freeze, work_repo):
         return _invalidate(db, row, marks, fire,
                            "the freeze is %s, not the head the fire covers (%s)"
                            % (_norm((freeze or {}).get("sha"))[:12] or "—",
                               _norm(fire.get("sha"))[:12]),
-                           status=status, gh=gh, slug=slug, dry_run=dry_run)
+                           status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
     if status is not None and status.get("head") \
             and not same_commit(status.get("head"), fire.get("sha"), work_repo):
         return _invalidate(db, row, marks, fire,
                            "the PR head moved to %s, the fire covers %s"
                            % (status["head"][:12], _norm(fire.get("sha"))[:12]),
-                           status=status, gh=gh, slug=slug, dry_run=dry_run)
+                           status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
 
     info = _repo_info(slug, gh=gh, cache=cache)
     target = _target(row, project, work_repo, info)
     queue_mode = project is not None and getattr(project, "land", "off") != "off"
-    if not queue_mode and not info.get("allow_auto_merge"):
-        queue_mode = True   # repli : dépôt sans auto-fusion → file de fusion
 
-    # 4. la PR manquante est ouverte (mode GitHub), ou le lot entre en file.
+    # 4. LA PORTE DES VERDICTS, AVANT TOUTE PR, TOUTE FILE ET TOUTE CI (#1374,
+    #    B et P1-1). Le feu peut être enregistré au gel ; rien ne part avant
+    #    les avis requis, indépendants et sans blocage non levé.
+    ok, why, klass = ready_verdicts(cfg, db, row, marks, repo=work_repo, project=project,
+                                    target=target)
+    out["class"] = klass.get("class")
+    if not ok:
+        return _not_ready(db, row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
+                          handle=handle)
+
     if status is not None and status.get("state") == "CLOSED" and not status.get("merged"):
         out.update(result="pr-closed", detail="PR #%s is closed without merge: reopen it"
                    % status.get("number"))
         return out
-    detail = ""
+
+    # 5. file de fusion (projet qui déclare `land`) : entrée quand les avis et
+    #    la CI sont là ; sinon PR ouverte, CI, puis fusion au geste effectif.
     if queue_mode:
+        if not dry_run and not _renew(handle):
+            return {"lot": lot, "result": "busy"}
         return _queue(db, row, marks, fire, project=project, repo=work_repo, target=target,
                       cfg=cfg, dry_run=dry_run, out=out)
     if status is None:
         if dry_run:
             out.update(result="would-open-pr", detail="no PR for %s" % branch)
             return out
-        status, detail = _open_pr(cfg, db, row, slug=slug, target=target, info=info, gh=gh)
-        if status is None:
-            out.update(result="no-pr", detail=detail)
-            return out
-        out.update(pr=status.get("number"), detail=detail)
-        _passive(db, row.get("assignee"), lot,
-                 "Fire on lot #%d « %s »: PR #%s opened by ameesh for %s."
-                 % (lot, row.get("title") or "", status.get("number"), branch),
-                 {"project": row.get("app") or "", "pr": status.get("number")})
-    if status.get("head") and not same_commit(status.get("head"), fire.get("sha"), work_repo):
-        return _invalidate(db, row, marks, fire,
-                           "the PR head moved to %s, the fire covers %s"
-                           % (status["head"][:12], _norm(fire.get("sha"))[:12]),
-                           status=status, gh=gh, slug=slug, dry_run=dry_run)
+        return _open_then_merge(cfg, db, row, marks, fire, out=out, slug=slug, branch=branch,
+                                target=target, info=info, repo=work_repo, project=project,
+                                gh=gh, dry_run=dry_run, handle=handle)
+    return _merge_direct(cfg, db, row, marks, fire, status, out=out, slug=slug, branch=branch,
+                         target=target, info=info, repo=work_repo, project=project, gh=gh,
+                         dry_run=dry_run, handle=handle)
 
-    # 5. les portes du feu (verdicts, CI, cible), puis l'armement.
-    ok, why, klass = ready(cfg, db, row, marks, status, repo=work_repo, project=project,
-                           target=target)
-    out["class"] = klass.get("class")
+
+def _open_then_merge(cfg, db, row: dict, marks: list, fire: dict, *, out: dict, slug: str,
+                     branch: str, target: str, info: dict, repo: str | None, project,
+                     gh, dry_run: bool, handle=None) -> dict:
+    """Ouvre la PR (elle déclenche la CI) seulement après une revalidation du
+    feu, du gel et des verdicts, puis poursuit vers la fusion (#1374, B/P1-3)."""
+    lot = int(row["id"])
+    fresh_row, fresh_marks = _fresh(db, lot)
+    fresh_fire, fresh_freeze = active(fresh_marks), freeze_of(fresh_marks)
+    if fresh_row is None or fresh_fire is None:
+        out.update(result="withdrawn", detail="the fire was withdrawn before the PR was opened")
+        return out
+    if not _fire_covers(fresh_fire, fresh_freeze, repo):
+        return _invalidate(db, fresh_row, fresh_marks, fresh_fire,
+                           "the freeze is %s, not the head the fire covers (%s)"
+                           % (_norm((fresh_freeze or {}).get("sha"))[:12] or "—",
+                              _norm(fresh_fire.get("sha"))[:12]),
+                           status=None, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+    ok, why, _klass = ready_verdicts(cfg, db, fresh_row, fresh_marks, repo=repo,
+                                     project=project, target=target)
     if not ok:
-        if status.get("armed"):
-            return _disarm(db, row, status, "fire gates no longer hold: %s" % why,
-                           gh=gh, slug=slug, dry_run=dry_run)
         out.update(result="not-ready", detail=why)
         return out
-    if status.get("armed"):
-        out.update(result="armed", detail="auto-merge already armed on %s"
-                   % _norm(fire.get("sha"))[:12])
+    if not _renew(handle):
+        return {"lot": lot, "result": "busy"}
+    status, detail = _open_pr(cfg, db, fresh_row, slug=slug, target=target, info=info, gh=gh)
+    if status is None:
+        out.update(result="no-pr", detail=detail)
         return out
-    if dry_run:
-        out.update(result="would-arm", detail="PR #%s, class %s, CI green"
-                   % (status.get("number"), klass.get("class")))
-        return out
-    ok, error = _arm_auto(slug, status, _norm(fire.get("sha")), _method(project, info), gh=gh)
+    out.update(pr=status.get("number"), detail=detail)
+    _passive(db, fresh_row.get("assignee"), lot,
+             "Fire on lot #%d « %s »: PR #%s opened by ameesh for %s."
+             % (lot, fresh_row.get("title") or "", status.get("number"), branch),
+             {"project": fresh_row.get("app") or "", "pr": status.get("number")})
+    if status.get("head") and not same_commit(status.get("head"), fresh_fire.get("sha"), repo):
+        return _invalidate(db, fresh_row, fresh_marks, fresh_fire,
+                           "the PR head moved to %s, the fire covers %s"
+                           % (status["head"][:12], _norm(fresh_fire.get("sha"))[:12]),
+                           status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+    return _merge_direct(cfg, db, fresh_row, fresh_marks, fresh_fire, status, out=out, slug=slug,
+                         branch=branch, target=target, info=info, repo=repo, project=project,
+                         gh=gh, dry_run=dry_run, handle=handle)
+
+
+def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, out: dict,
+                  slug: str, branch: str, target: str, info: dict, repo: str | None, project,
+                  gh, dry_run: bool, handle=None) -> dict:
+    """Les portes de la PR, puis la fusion **maintenant**, sur la tête exacte
+    (#1374, P1-4) : une auto-fusion résiduelle est désarmée d'abord, et le feu,
+    le gel et les verdicts sont relus juste avant le geste (P1-3)."""
+    lot = int(row["id"])
+    frozen = _norm((freeze_of(marks) or {}).get("sha"))
+    ok, why = ready_pr(status, target=target, project=project, frozen=frozen)
     if not ok:
-        # relu : un autre hôte a pu armer entre-temps (idempotence)
+        return _not_ready(db, row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
+                          handle=handle)
+    if status.get("armed"):
+        if dry_run:
+            out.update(result="would-disarm",
+                       detail="auto-merge armed: disarmed before an exact-head merge")
+            return out
+        disarmed = _disarm(db, row, status,
+                           "auto-merge armed outside the fire: disarmed before an exact-head merge",
+                           gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+        if disarmed.get("result") in ("busy", "error"):
+            return disarmed
+        try:
+            status = _pr_status(slug, branch, gh=gh) or status
+        except land.LandError:
+            pass
+        if status.get("merged"):
+            return _reconcile(db, row, marks, status, slug=slug, repo=repo, target=target,
+                              dry_run=dry_run)
+    if dry_run:
+        out.update(result="would-merge", detail="PR #%s, class %s, CI green"
+                   % (status.get("number"), out.get("class") or "?"))
+        return out
+    # revalidation à l'instant du geste : le feu peut avoir été retiré, le gel
+    # rejoué ou un verdict bloqué rendu depuis la lecture initiale.
+    fresh_row, fresh_marks = _fresh(db, lot)
+    fresh_fire, fresh_freeze = active(fresh_marks), freeze_of(fresh_marks)
+    if fresh_row is None or fresh_fire is None:
+        out.update(result="withdrawn", detail="the fire was withdrawn before the merge")
+        return out
+    if not _fire_covers(fresh_fire, fresh_freeze, repo):
+        return _invalidate(db, fresh_row, fresh_marks, fresh_fire,
+                           "the freeze is %s, not the head the fire covers (%s)"
+                           % (_norm((fresh_freeze or {}).get("sha"))[:12] or "—",
+                              _norm(fresh_fire.get("sha"))[:12]),
+                           status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+    ok, why, klass = ready_verdicts(cfg, db, fresh_row, fresh_marks, repo=repo, project=project,
+                                    target=target)
+    if not ok:
+        return _not_ready(db, fresh_row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
+                          handle=handle)
+    head = _norm(fresh_fire.get("sha"))
+    if not _renew(handle):
+        return {"lot": lot, "result": "busy"}
+    ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
+    if ok:
+        out.update(result="merged", detail=error, sha=head)
         try:
             after = _pr_status(slug, branch, gh=gh)
         except land.LandError:
             after = None
-        if after is not None and after.get("armed"):
-            ok, error = True, "already armed by another pass"
-        else:
-            out.update(result="error", error=error)
-            return out
-    out.update(result="armed", detail=error)
-    _passive(db, row.get("assignee"), lot, (
-        "Fire on lot #%d « %s »: automatic merge armed on %s (PR #%s, class %s). It departs "
-        "as soon as the CI is green; a commit pushed after the freeze invalidates the fire."
-        % (lot, row.get("title") or "", _norm(fire.get("sha"))[:12], status.get("number"),
-           klass.get("class") or "?")),
-        {"project": row.get("app") or "", "pr": status.get("number"), "sha": fire.get("sha")})
-    _passive(db, fire.get("actor"), lot,
-             "Fire on lot #%d « %s » is armed on %s (PR #%s)."
-             % (lot, row.get("title") or "", _norm(fire.get("sha"))[:12], status.get("number")),
-             {"project": row.get("app") or "", "pr": status.get("number")})
+        if after is not None and after.get("merged"):
+            return _reconcile(db, fresh_row, fresh_marks, after, slug=slug, repo=repo,
+                              target=target, dry_run=dry_run)
+        _passive(db, fresh_row.get("assignee"), lot, (
+            "Fire on lot #%d « %s »: PR #%s merged on %s (class %s)."
+            % (lot, fresh_row.get("title") or "", status.get("number"), head[:12],
+               klass.get("class") or "?")),
+            {"project": fresh_row.get("app") or "", "pr": status.get("number"), "sha": head})
+        return out
+    # la fusion a échoué : relire la PR avant de conclure
+    try:
+        after = _pr_status(slug, branch, gh=gh)
+    except land.LandError:
+        after = None
+    if after is not None and after.get("merged"):
+        return _reconcile(db, fresh_row, fresh_marks, after, slug=slug, repo=repo, target=target,
+                          dry_run=dry_run)
+    if after is not None and after.get("head") \
+            and not same_commit(after.get("head"), head, repo):
+        return _invalidate(db, fresh_row, fresh_marks, fresh_fire,
+                           "the PR head moved to %s before the merge, the fire covers %s"
+                           % (after["head"][:12], head[:12]),
+                           status=after, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+    out.update(result="error", error=error)
     return out
 
 
@@ -819,6 +1064,45 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
 
 
 # --------------------------------------------------------------------------
+# le dernier geste de l'atterrissage
+# --------------------------------------------------------------------------
+
+def land_guard(db, lot: int, frozen_sha: str, *, repo: str | None = None) -> tuple:
+    """Le dernier contrôle avant le geste d'atterrissage (#1374, P1-2) : un lot
+    qui a porté un feu ne s'atterrit que sous un feu actif couvrant la tête
+    gelée de sa file, et jamais sous un blocage non levé.
+
+    Rend `(ok, raison)`. La garde est appelée par `land` juste avant la poussée
+    ou la fusion de la PR, sous son propre bail : la ligne de file peut avoir
+    été retirée par le passage du feu, mais la course entre les deux reste
+    fermée ici. Sans aucun jalon de feu, la file d'équipe garde son cours : la
+    garde ne concerne que les lots que le feu a autorisés.
+    """
+    lot = int(lot)
+    try:
+        marks = work.milestones(db, lot)
+    except Exception as exc:  # noqa: BLE001 - lecteur illisible : on refuse
+        return False, ("cannot read the fire of lot #%d (%s: %s): landing refused"
+                       % (lot, type(exc).__name__, str(exc)[:120]))
+    if not markers(marks):
+        return True, ""
+    fire = active(marks)
+    if fire is None:
+        return False, ("the fire of lot #%d was withdrawn or invalidated: no automatic landing"
+                       % lot)
+    if not same_commit(fire.get("sha"), frozen_sha, repo):
+        return False, ("the fire of lot #%d covers %s, not the queued freeze %s: freeze and "
+                       "fire again" % (lot, _norm(fire.get("sha"))[:12],
+                                       str(frozen_sha or "")[:12] or "—"))
+    blocked = merge_queue.blocked_verdicts(marks, frozen_sha, repo=repo)
+    if blocked:
+        return False, ("blocked verdict(s) on the freeze %s not lifted: %s: no automatic landing"
+                       % (str(frozen_sha or "")[:12],
+                          ", ".join(sorted(str(m.get("actor") or "?") for m in blocked))))
+    return True, ""
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -843,7 +1127,8 @@ def add_parser(work_sub, func) -> None:
 def run(cfg, db, args) -> int:
     """`ameesh work fire <lot> --sha S | --withdraw | (rien : l'état)`. Le feu
     est un geste de pilote : humain, orchestrateur ou agent de conception
-    (`work.corrector`)."""
+    **déclaré** — `history=False`, comme `pin_authority` (#1374, P1-5) : avoir
+    confié des lots récemment ne donne pas le feu."""
     import json
     import sys
 
@@ -858,13 +1143,14 @@ def run(cfg, db, args) -> int:
         return 1
     try:
         # l'état du feu se lit par tous ; donner ou retirer le feu est le geste
-        # du pilote (humain, orchestrateur ou agent de conception).
+        # du pilote (humain, orchestrateur ou agent de conception), sur un rôle
+        # DÉCLARÉ : un exécutant qui a délégué un lot n'est pas pilote.
         if args.sha or args.withdraw:
             try:
-                actor = work.corrector(cfg, db, args.actor)
+                actor = work.corrector(cfg, db, args.actor, history=False)
             except work.WorkError as exc:
                 print("the fire is the pilot's gesture (a human, an orchestrator or a design "
-                      "agent): %s" % exc, file=sys.stderr)
+                      "agent with a declared role): %s" % exc, file=sys.stderr)
                 return 1
         if args.sha:
             row = give(db, args.id, sha=args.sha, actor=actor, note=args.note, repo=repo)

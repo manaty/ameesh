@@ -143,7 +143,8 @@ class EntryTest(_Base):
         with self.assertRaisesRegex(merge_queue.QueueError, "not frozen"):
             self.enter(1)
         self.ready(1, verdict="blocked")
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        # #1374 : un blocage non levé refuse la file avec sa cause
+        with self.assertRaisesRegex(merge_queue.QueueError, "blocked verdict"):
             self.enter(1)
         old = self.tip(1)
         self.ready(1)
@@ -152,7 +153,7 @@ class EntryTest(_Base):
             self.enter(1)
         self.ready(1)  # frozen again, but the verdict is on the old commit
         self.marks[1][0]["sha"] = old
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
             self.enter(1)
         self.ready(1)
         with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
@@ -266,7 +267,7 @@ class EntryTest(_Base):
                     self.enter(1)
         self.ready(1)
         self.marks[1][0]["sha"] = "lot/1-a"  # a verdict on the branch, not on a commit
-        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
             self.enter(1)
         # a branch named like a commit id is not that commit
         _git(self.repo, "branch", "deadbeef", tip)

@@ -77,6 +77,25 @@ def _passive(db, to, lot: int, text: str, data: dict) -> None:
         pass
 
 
+def _fire_guard(landing) -> dict | None:
+    """#1374, P1-2 : le feu et les blocages sont revalidés au dernier geste.
+
+    Le retrait ou l'invalidation d'un feu retire la ligne de file au passage
+    suivant ; entre les deux, `land` pourrait encore pousser ou fusionner. Sous
+    son bail, juste avant le geste, il redemande l'autorisation : un lot qui a
+    porté un feu ne part que sous un feu actif couvrant le gel de sa file et
+    sans verdict bloqué non levé. Rend l'éjection, ou None si la voie est
+    libre."""
+    from . import fire
+    ok, why = fire.land_guard(landing.db, landing.lot, landing.row.get("frozen_sha") or "",
+                              repo=landing.project.repo)
+    if ok:
+        return None
+    return landing.eject(why, "The fire no longer authorizes this landing: ask the pilot for a "
+                              "fire on the current freeze, or take the lot out of the queue "
+                              "(`ameesh work queue remove %d`)." % landing.lot)
+
+
 # --------------------------------------------------------------------------
 # the merge in the clone
 # --------------------------------------------------------------------------
@@ -650,6 +669,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local":
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
+        stopped = _fire_guard(landing)
+        if stopped is not None:
+            return stopped
         # #194 r6: one atomic push, two compare-and-swaps that the server
         # checks: the target on the base seen, the lease ref on the value this
         # holder wrote — moved to a child commit, so git sends that update
@@ -691,6 +713,9 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             "ameesh work queue add %d." % lot)
     if not landing.held():
         return landing.busy("lease on %s lost before pushing" % landing.key)
+    stopped = _fire_guard(landing)
+    if stopped is not None:
+        return stopped
     # #194 r4: compare and swap on the freeze (see `local`)
     branch_ref = "refs/heads/%s" % row["branch"]
     proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
@@ -811,6 +836,9 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return refused
     if not landing.held():
         return landing.busy("lease lost before merging PR #%s" % status["number"])
+    stopped = _fire_guard(landing)
+    if stopped is not None:
+        return stopped
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     # #194 r8: past this call, the PR may be merged: nothing raises any more,
     # and every outcome is read back from GitHub
