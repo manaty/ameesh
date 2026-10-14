@@ -24,7 +24,10 @@ class BinLaunchersTest(unittest.TestCase):
             env = {k: v for k, v in os.environ.items()
                    if k != "PYTHONPATH" and not k.startswith(("AMEESH_", "AGENT_MESH_"))}
             env["AMEESH_PYTHON"] = sys.executable
-            env["AMEESH_CONFIG"] = os.path.join(tmp, "absente.json")
+            # un chemin explicite doit exister (#1127) : config VIDE, pas absente
+            env["AMEESH_CONFIG"] = os.path.join(tmp, "config-vide.json")
+            with open(env["AMEESH_CONFIG"], "w", encoding="utf-8") as fh:
+                fh.write("{}\n")
             # aucune base : un DSN injoignable ferait échouer un lanceur qui y toucherait
             env["AMEESH_DSN"] = "postgresql://nobody@127.0.0.1:9/none"
             for name in LAUNCHERS:
