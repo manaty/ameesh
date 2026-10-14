@@ -316,7 +316,12 @@ git merge --no-ff agent/claude1-veille -m "Merge #93 COMPUTE-IDLE" -m "ameesh-wo
   ameesh.target origin/develop` (fusions poussées puis récupérées) ou
   `develop` (fusions faites dans ce clone) quand l'équipe n'intègre pas sur
   la branche par défaut. Une cible introuvable est une erreur du relevé,
-  visible dans `ameesh work sync-branches`.
+  visible dans `ameesh work sync-branches`. Sans cible déclarée, le relevé
+  suit la cible réelle du projet (#746) : `develop`, `main`, `master` puis
+  `release/*` sont essayés, et une fusion citante y ferme le lot, la note
+  disant la ref trouvée. Une cible déclarée reste seule à foi : une fusion
+  constatée ailleurs n'est que signalée (note au lot, message à
+  l'assigné), jamais fermée.
 
 Le relevé passe toutes les 5 min dans le dossier de travail de l'assigné :
 le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
