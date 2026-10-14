@@ -10,7 +10,11 @@ pièce sont revérifiés en première main (§4). Révisé 14/10 06:1xZ : recoup
 ameesh-cx2 (06:15Z) intégré (§4bis). Révisé 14/10 06:2xZ (corrections documentaires
 demandées par cx2, 06:17Z) : le **cœur** (#364+#987, arbre `4b65a177…`, 77 fichiers) est
 distingué de la **simulation avec compagnons** (annexe B) ; blobs propres au cœur en
-**annexe C** ; §7 (patch-ids du cœur) et §8 (paquet à six lots = #1204) corrigés.
+**annexe C** ; §7 (patch-ids du cœur) et §8 (paquet à six lots = #1204) corrigés. Révisé
+14/10 06:3xZ (relu et recoupé par cx2, mail 06:24Z) : **§5** consolidé avec les
+identifiants primaires exacts (jalons `work_item_milestones`, feu `work_item_events`,
+binding `session_bindings`) ; ces avis **delta/historiques** ne valent pas GO complet
+nouveau et la qualification de famille reste réservée au pilote.
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -126,29 +130,59 @@ n'est ni élargi ni touché.
 
 ## 5. Classes, avis, familles, feux
 
+Identifiants **primaires** relevés en première main le 14/10 06:2xZ : jalons d'avis
+(`work_item_milestones`), feux (`work_item_events`), binding de session
+(`session_bindings`). Ces avis sont **delta/historiques** — chacun est borné au SHA
+indiqué ; ils ne valent pas GO complet nouveau du futur paquet et restent à qualifier au
+gel sur la main exacte (§7.3).
+
 - **#364** — sensible prod + SQL (migration 0417, `deploy/sql/role-*.sql`, `deploy/**`,
-  concurrence des fences). Auteur **DeepSeek** (impl-04). Deux avis non-DeepSeek de
-  familles distinctes : ameesh-cx1 **Codex**, PR #693 commentaire 6150849386, 13/10
-  17:02:35Z, GO 0 B / 0 N / 0 n sur le delta `6db727ac..90aae667` ; bureau **Claude**,
-  verdict ok 17:08Z sur `90aae667`. **Réserve de traçabilité** (recoupement cx2) : le GO
-  cx1 ne porte que sur le delta et ne remplace pas les relectures antérieures du reste du
-  lot ; le verdict Claude est attesté par le feu pilote 17:17Z mais sa **session primaire
-  reste à sourcer** (canon §11) — à qualifier au gel, sans prétendre à une relecture
-  complète nouvelle. Feu pilote mesh-design 13/10 17:17Z, conditionnel :
-  CI exacte verte sur la tête, **toutes parts psql/psycopg exécutées, aucune annulée**
-  (#940), tête inchangée, fusion auteur `--match-head-commit`. **Non satisfait** (§6).
-- **#974** — légère (2 docs). Auteur dev3. Aucun avis ni feu propre au relevé ; PR
-  empilée sur `lot/l232b`, à retarget sur main après #364. Inclusion seulement si
-  qualifié avant gel.
-- **#987** — sensible hors prod (CI). Auteur **DeepSeek** (impl-05). R1 auditeur **Codex**
-  GO 0 B / 1 N (P3 → #1002) sur `2df0b80d` : image macOS standard, filtre des check runs
-  confirmé, aucun chemin de boucle, **porte de fusion inchangée**. Feu conditionnel
-  mesh-design 13/10 18:13Z (CI exacte verte, toutes parts exécutées, aucune annulée, tête
+  concurrence des fences). Auteur **mty-amh-impl-04** (harnais **DeepSeek**). Jalons :
+  - **#2436** — auditeur, **Claude**, **blocked**, 13/10 14:37:26Z, sur `febbf0ad…` : R1
+    **partiel** (volets contrôleur/SSH/santé) ; volets SQL et sauvegardes annoncés sur la
+    même tête dans le même tour.
+  - **#2638** — auditeur, **Codex**, **blocked**, 13/10 16:15:45Z, sur `5270b1e9…` :
+    second tour R1, K2 (P2) restant ; rapport
+    `docs/reviews/2026-10-13-364-r2-auditeur.md` @ `00f1cd5c3` (branche
+    `origin/review/auditeur-364-r2`). Le rapport **réserve explicitement au pilote la
+    qualification de famille des autres avis**, « notamment si l'auteur initial du lot
+    est compté Codex ».
+  - **#2647** — **mty-amh-qa-01**, **DeepSeek**, **blocked**, 13/10 16:21:57Z, sur
+    `5270b1e9…` : R2 0 B / 1 P2 (K2).
+  - **#2696** — **bureau**, **Claude**, **ok**, 13/10 16:45:24Z, sur `6db727ac…` : R2
+    delta 0 B / 1 N (les inventaires antérieurs au changement, sans `source_bytes`, sont
+    refusés à la restauration).
+  - **#2713** — **ameesh-cx1**, **Codex**, **blocked**, 13/10 16:56:01Z, sur `6db727ac…` :
+    R1 0 B / 1 P2 nouveau (capacité lue sans parents protégés ni `O_NOFOLLOW`/`fstat`).
+  - **#2727** — **ameesh-cx1**, **Codex**, **ok**, 13/10 17:02:47Z, sur `90aae667…` :
+    binôme ciblé, P2 levé, 0 B/N/n nouveaux (commentaire PR #693 `6150849386`).
+  - **#2739** — **bureau**, **Claude**, **ok**, 13/10 17:08:39Z, sur `90aae667` : R2
+    delta `6db727ac..90aae667` 0 B / 0 N.
+  - **Session primaire du jalon #2739** : `session_bindings` **#26** — session
+    `11783f10-5492-408f-988b-8c1035bec79b`, harnais **claude**, agent **bureau**, hôte
+    pc-smichea, liée 13/10 16:29:29Z, révoquée 13/10 20:39:44Z ; sa fenêtre couvre #2696
+    (16:45Z) et #2739 (17:08Z). Le **modèle exact et la ligne primaire restent demandés
+    au bureau** : la famille Claude est établie par le binding, pas la ligne.
+  - **Feu historique** : `work_item_events` **#8263**, pilote mesh-design, 13/10
+    17:17:39Z — FEU PILOTE conditionnel sur `90aae667…` : CI exacte verte sur cette tête,
+    **toutes parts psql/psycopg COMPLETED/SUCCESS, aucune annulée** (#940), tête
+    inchangée, fusion par l'auteur `--match-head-commit`. **Non satisfait** (§6) ; tête
+    déplacée ou avis défavorable = feu caduc.
+- **#974** — légère (2 docs). Auteur dev3. Aucun avis ni feu propre au relevé (seul jalon
+  `requested` #2698, 13/10 16:46:13Z) ; PR empilée sur `lot/l232b`, à retarget sur main
+  après #364. Inclusion seulement si qualifié avant gel.
+- **#987** — sensible hors prod (CI). Auteur **DeepSeek** (impl-05). Jalon **#2824** —
+  auditeur, **Codex**, **ok**, 13/10 18:05:03Z, sur `2df0b80d` : R1 GO 0 B / 1 N (P3 →
+  #1002) ; image macOS standard, filtre des check runs confirmé, aucun chemin de boucle,
+  **porte de fusion inchangée**. Feu `work_item_events` **#8610**, mesh-design 13/10
+  18:13:38Z, conditionnel (CI exacte verte, toutes parts exécutées, aucune annulée, tête
   inchangée). **Non satisfait** (§6) ; le levier macOS est prouvé en conditions réelles
   (job `plateforme macOS` SUCCESS sur runner hébergé `1000025835`, run 38486341746).
-- **#1002** — sensible hors prod (CI). R1 auditeur **Codex** GO 0 B sur `7aaa5650`. Feu
-  conditionnel 13/10 20:33Z, subordonné à #987. Champ `waiting` du lot (« verdict by
-  auditeur ») à réconcilier.
+- **#1002** — sensible hors prod (CI). Jalon **#2873** — auditeur, **Codex**, **ok**,
+  13/10 18:31:01Z, sur `7aaa5650` : R1 delta `2df0b80d..7aaa5650`, 0 B / 0 N nouveau. Feu
+  `work_item_events` **#8744**, mesh-design 13/10 18:33:46Z (20:33 Paris), subordonné à
+  #987 : (1) #763 fusionnée d'abord, (2) CI exacte verte, (3) tête inchangée. Champ
+  `waiting` du lot (« verdict by auditeur ») à réconcilier.
 - **#1257** — cause racine carte (couverture sqlite corrompue), assignée impl-06 ; suivi
   distinct, inclusion seulement si contenu final et avis qualifiés (mandat #1260).
 
@@ -175,8 +209,10 @@ réjeu individuel.
    qualifiés et inclus ; relire les **10 fichiers adaptés** du §4 et les
    **2 recouvrements #1211** (`tests.yml`, `tests/parts/pilote-psql.txt`) ; tout écart =
    arrêt et signalement.
-3. **Qualification pilote** : classes réelles, familles/sources des avis, dépendances,
-   inclusion ou exclusion motivée des compagnons (#974, #1002) ; #1257 à part.
+3. **Qualification pilote** : classes réelles, familles/sources des avis (y compris la
+   réserve de famille du rapport auditeur `00f1cd5c` et la ligne primaire du jalon #2739),
+   dépendances, inclusion ou exclusion motivée des compagnons (#974, #1002) ; #1257 à
+   part.
 4. **Nouveau gel** : branche d'intégration distincte de `39df7c316c9e` + manifeste final
    (cette pièce en entrée).
 5. **Une seule validation complète** `workflow_dispatch` sur le gel : 4 parts psycopg +
@@ -188,6 +224,8 @@ réjeu individuel.
 
 - #1002 : `waiting` à réconcilier (R1 déjà GO).
 - #974 : avis/feu propres non rendus ; PR à retarget après #364.
+- Jalon #2739 : binding `#26` (bureau, claude) retrouvé ; **modèle exact et ligne primaire
+  demandés au bureau** (§5).
 - Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4).
 
 ## 9. Réversibilité
