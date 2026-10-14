@@ -2821,6 +2821,12 @@ class CiResults(Domain):
         """`running` → `status` ; False si elle était déjà conclue."""
 
     @abc.abstractmethod
+    def reopen(self, repo: str, run_id: int) -> bool:
+        """Une exécution conclue que l'API montre de nouveau vivante (relance,
+        même `run_id`) repasse `running` ; False si elle l'était déjà, ou si
+        une tête plus récente l'a remplacée (`superseded`)."""
+
+    @abc.abstractmethod
     def supersede(self, repo: str, branch: str, head_sha: str, run_id: int) -> list[dict]:
         """Les exécutions `running` ou `cancelled` de la branche, plus
         anciennes que `run_id` et sur une autre tête, passent `superseded` ;

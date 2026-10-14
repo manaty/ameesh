@@ -60,6 +60,18 @@ class CiResults(interface.CiResults):
             """, (status, repo, int(run_id)))
         return bool(rows)
 
+    def reopen(self, repo, run_id) -> bool:
+        # relance d'une exécution conclue (même `run_id`, tentative suivante) :
+        # elle revit, sauf si une tête plus récente l'a remplacée
+        rows = self.db.query(
+            """
+            UPDATE ci_runs SET status = 'running', concluded_at = NULL
+             WHERE repo = %s AND run_id = %s
+               AND status IN ('cancelled', 'success', 'failure')
+            RETURNING run_id
+            """, (repo, int(run_id)))
+        return bool(rows)
+
     def supersede(self, repo, branch, head_sha, run_id) -> list[dict]:
         # une exécution annulée avant que la suivante soit vue l'est aussi :
         # ses messages non lus sont alors retirés

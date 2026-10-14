@@ -319,12 +319,19 @@ class Watcher:
         return out
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
-        """Une exécution en cours : enregistrée si nouvelle ; elle remplace
-        les exécutions d'une autre tête sur la même branche (hors base)."""
+        """Une exécution en cours : enregistrée si nouvelle, rouverte si elle
+        a été relancée (même `run_id`) après conclusion ; elle remplace les
+        exécutions d'une autre tête sur la même branche (hors base)."""
         st = storage.of(db)
         run_id = int(run["id"])
         known = st.ci.run(repo, run_id)
         if known is not None:
+            # #1239 : une tentative 2 (annulée puis relancée) n'est plus dans
+            # `running` ; sans réouverture, `watch` ne la conclut jamais et le
+            # verdict est perdu.
+            if st.ci.reopen(repo, run_id):
+                return [{"action": "rerun", "repo": repo, "run_id": run_id,
+                         "head_sha": run.get("head_sha") or ""}]
             return []
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
@@ -437,6 +444,9 @@ def describe(record: dict) -> str:
     if record["action"] == "superseded":
         return "%s superseded by %s; %d unread message(s) withdrawn" % (
             where, _short(record.get("by") or ""), len(record.get("withdrawn") or ()))
+    if record["action"] == "rerun":
+        return "%s: re-run followed (new attempt on %s)" % (
+            where, _short(record.get("head_sha") or ""))
     to = "→ %s%s" % (record["to"], " (urgent)" if record.get("urgent") else "") \
         if record.get("to") else "(no recipient)"
     if record["action"] == "failures":

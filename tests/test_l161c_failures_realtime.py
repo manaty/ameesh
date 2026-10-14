@@ -339,6 +339,44 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self.assertEqual(self.mails("dev-a"), [])
 
+    def test_relance_apres_conclusion_suivie(self):
+        # #1239 : une exécution annulée pendant une fenêtre force-cancel/relance
+        # puis relancée (même `run_id`, deuxième tentative) repasse en suivi et
+        # son verdict est délivré, au lieu d'être perdu.
+        sha = "e1" * 20
+        self.api.live = [run_view(801, sha, "lot/1-un")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.api.live = []
+        self.api.done[801] = {"status": "completed", "conclusion": "cancelled"}
+        out = self.watcher.tick(self.db)  # tentative 1 annulée : aucun message
+        self.assertEqual([(o["status"], o["to"]) for o in out], [("cancelled", None)])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 801)["status"], "cancelled")
+        self.assertEqual(self.mails("dev-a"), [])
+        # relance : la même exécution revit, elle repasse en suivi
+        self.api.live = [run_view(801, sha, "lot/1-un")]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([o["action"] for o in out], ["rerun"])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 801)["status"], "running")
+        # deuxième tentative verte : le verdict est délivré
+        self.api.live = []
+        self.api.done[801] = {"status": "completed", "conclusion": "success"}
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "success")])
+        self.assertIn(": green.", self.mails("dev-a")[0]["body"])
+
+    def test_relance_d_une_execution_remplacee_non_suivie(self):
+        # une tête plus récente a remplacé l'exécution : sa relance reste
+        # ignorée, le verdict d'une tête obsolète n'est pas délivré
+        old, new = "9" * 40, "a0" * 20
+        self.api.live = [run_view(811, old, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live = [run_view(812, new, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 811)["status"], "superseded")
+        self.api.live = [run_view(811, old, "lot/1-un"), run_view(812, new, "lot/1-un")]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 811)["status"], "superseded")
+
     def test_rouge_herite_jamais_impute(self):
         main_sha, sha = "f" * 40, "1" * 40
         commun = "tests.test_c.T.test_casse"
