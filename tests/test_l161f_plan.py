@@ -298,6 +298,37 @@ class MapTest(unittest.TestCase):
         with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
             return plan.classify(modules, card, NOW, head="HEAD", repo=self.repo.path)
 
+    def test_removed_file_is_a_doubt_and_runs_the_full_suite(self):
+        # R2 bureau (B1) : une suppression hors doc ne levait aucun doute
+        # (_python et _data traitaient D à part) ; un fichier lu par aucun test
+        # mesuré ne lançait que le contrat. Le changement D réel passe par
+        # classify/judge et donne la suite complète.
+        self.repo.remove("deploy/install.sh")
+        self.repo.commit()
+        out = self._classify()
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("file removed: deploy/install.sh", out["phase2_why"])
+        self.assertEqual(out["removed"], ["deploy/install.sh"])
+        # make_plan réel : modules réels (le découpage pèse chaque module),
+        # carte du dépôt jetable pour le diff ; seul `nature` est simulé.
+        mods = parts.modules()
+        card = self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path)
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("file removed: deploy/install.sh", p["selection"]["why"])
+
+    def test_documentation_removed_stays_in_the_fast_lane(self):
+        # une suppression de documentation ne lève pas ce doute : le doute
+        # « fichier supprimé » est réservé à ce que la carte ne peut pas juger
+        self.repo.remove("docs/guide.md")
+        self.repo.commit()
+        out = self._classify()
+        self.assertEqual(out["removed"], [])
+        self.assertNotIn("file removed", out["unsure"])
+
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
         self.repo.write("tests/test_plan.py", "x = 1\n")

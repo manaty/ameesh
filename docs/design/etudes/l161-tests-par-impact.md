@@ -387,9 +387,15 @@ The owner applied it ahead of that review on 14/10/2026 (canon §3, lot
 #1211), after the CI queue passed 100 pending runs; the two conditions above
 remain the safety net, applied per run by `scripts/test-plan.py`
 (`lot_selection`, `phase2_safe`) rather than once for all: any doubt gives
-the full suite, and the contract list (`tests/parts/toujours.txt`) always
-runs on a lot branch. The leak count keeps its value: it measures what the
-selection misses on the runs where the full suite does run.
+the full suite — including a file **removed** outside documentation, since
+the map knows only the readers it measured (`--no-renames`: a rename is a
+removal plus an addition) — and the contract list
+(`tests/parts/toujours.txt`) always runs on a lot branch. A **configuration**
+file follows its measured readers, like any data file; only `pyproject.toml`
+beyond its `version` line and `.github/**`, the configuration the tests
+themselves run under, force the full suite (test infrastructure). The leak
+count keeps its value: it measures what the selection misses on the runs
+where the full suite does run.
 
 A failure on main then goes to the agent of the merged lot (section 3).
 

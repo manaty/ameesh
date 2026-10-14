@@ -29,8 +29,9 @@ only the impacted modules (P0, P1) and the contract list
 (`tests/parts/toujours.txt`: droits, rôles, migrations, objets globaux du
 cluster) run; the full suite runs on `main`, `release/**` and the package
 integration branch (§12). Any doubt — no map, a stale or unsure selection, a
-changed block without a test, test infrastructure, an empty contract list —
-gives the full suite (`lot_selection`). On `main` every module runs, P0 and
+changed block without a test, test infrastructure, a removed file outside
+documentation, an empty contract list — gives the full suite
+(`lot_selection`). On `main` every module runs, P0 and
 P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
 driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
 matrix.
@@ -45,6 +46,9 @@ plan is marked unsure. A file the map cannot judge (Python outside
 the textual heuristic for that file and marks the plan unsure; test
 infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
 `.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
+A file removed outside documentation marks it unsure as well: the map knows
+the readers it measured, never the ones it cannot see (an import by a
+computed name, a config read by the code).
 Any error while reading the map gives the fallback plan, never a failure.
 
 **Changed lines without a test**: an existing block whose fingerprint
@@ -237,6 +241,7 @@ class Impact:
         self.unsure: list[str] = []          # why the map cannot judge everything
         self.textual: list[str] = []         # files left to the L161b heuristic
         self.foundation: list[str] = []
+        self.removed: list[str] = []         # files removed outside documentation
 
     def hit(self, modules, reason: str) -> None:
         for m in modules:
@@ -382,6 +387,8 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
     if status in ("A", "D"):
         listers, where = _dir_listers(card, path, card["commit"], repo)
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
+    # a removal outside documentation is already a doubt, raised by `judge`:
+    # only a removed document stays quiet here (the docs lane)
     if not readers and not listers and not is_doc(path) and status != "D":
         impact.doubt(f"{path}: read by no measured test", path)
 
@@ -395,6 +402,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         if m not in known_modules:
             impact.p0[m] = "unknown to the map"
     for status, path in changes:
+        # a removal has no new blocks to judge, and the map only knows the
+        # readers it measured: an import by a computed name, a config read by
+        # the code, a template — the removal is a doubt, never a silent
+        # selection (R2 bureau, B1). `--no-renames`: a rename is D + A here.
+        if status == "D" and not is_doc(path):
+            impact.removed.append(path)
+            impact.unsure.append(f"file removed: {path}")
         # a file read as data (a .py, a test module, a migration as well): its
         # readers, whatever the kind of file and even when its blocks did not change
         impact.hit(card.get("donnees", {}).get(path, ()), path)
@@ -484,6 +498,8 @@ def textual(modules: list[str], files: list[str]) -> dict[str, str]:
 def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
     """Why the impacted-only selection would not be safe for this change
     (L1211): the plan then runs the full suite rather than decide on a doubt."""
+    if impact is not None and impact.removed:
+        return f"file removed: {impact.removed[0]}"
     if not out["sure"]:
         return out["unsure"][0] if out["unsure"] else "selection unsure"
     if age is None:
@@ -509,7 +525,8 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     problem, age = map_problem(card, now, head, repo)
     out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
            "unsure": [], "contract": list(always),
-           "untested": [], "unknown_blocks": [], "foundation": [], "changed": 0}
+           "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
+           "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
@@ -543,10 +560,10 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 classes[m] = ("P1", p1[m])
         out.update(unsure=impact.unsure, untested=impact.untested,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
-                   sure=not impact.unsure)
+                   removed=impact.removed, sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
                               and not impact.unknown_blocks and not impact.foundation
-                              and not impact.untested)
+                              and not impact.untested and not impact.removed)
     changes = changes or []
     out["changed"] = len(changes)
     out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
@@ -738,7 +755,8 @@ def fallback_plan(event: str, error: str) -> dict:
             "version_only": False, "docs_only": False, "why": "planning failed",
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
-            "unknown_blocks": [], "foundation": [], "changed": 0, "doc_readers": [],
+            "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
+            "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
         n = n_pr if pr else n_other

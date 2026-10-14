@@ -376,7 +376,8 @@ runs from that plan: on `main`, the test modules impacted by the change
 (changed code blocks, data files, directories, tables) run first, nothing is
 skipped; on a lot branch, only the impacted modules and the contract run, and
 any doubt (map missing or stale, an unsure selection, a changed block without a
-test, test infrastructure) falls back to the full suite.
+test, test infrastructure, a file removed outside documentation) falls back to
+the full suite.
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
