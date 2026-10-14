@@ -50,6 +50,10 @@ class MedieBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l109-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        self.config_vide = os.path.join(self.tmp, "config-vide.json")
+        with open(self.config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         self.cfg = dataclasses.replace(
             config_mod.Config(), backend="mediated", exec_url="https://mesh.exemple",
             state_dir=os.path.join(self.tmp, "etat"), v0_state=os.path.join(self.tmp, "v0"),
@@ -157,7 +161,7 @@ class GardesTest(MedieBase):
     def test_register_refuse(self):
         from ameesh import runner as runner_mod
         env = {"AMEESH_BACKEND": "mediated", "AMEESH_EXEC_URL": "https://mesh.exemple",
-               "AMEESH_CONFIG": os.path.join(self.tmp, "absent.json")}
+               "AMEESH_CONFIG": self.config_vide}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(runner_mod.main(["register", "x", "dsh"]), 2)
 
@@ -342,8 +346,12 @@ class SessionTest(unittest.TestCase):
         self.responder = self.server.responder
         self.responder.script["leases.state"] = {
             "lease_owner": OWNER, "lease_epoch": 42, "status": "running", "live": True}
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        config_vide = os.path.join(self.tmp, "config-vide.json")
+        with open(config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         env = {
-            "AMEESH_CONFIG": os.path.join(self.tmp, "absent.json"),
+            "AMEESH_CONFIG": config_vide,
             "AMEESH_STATE": os.path.join(self.tmp, "etat"),
             "AGENT_MAIL_STATE": os.path.join(self.tmp, "v0"),
             "AGENT_MAIL_CONFIG": os.path.join(self.tmp, "conf"),

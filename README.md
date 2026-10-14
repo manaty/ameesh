@@ -346,16 +346,22 @@ section « Base distante ».
 Install (or upgrade an existing install, which also pulls psycopg):
 
 ```bash
-python3 -m venv ~/.local/share/ameesh/venv
-~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>
+uv tool install "git+https://github.com/manaty/ameesh@main"   # or a pinned tag/commit
 ameesh doctor          # driver, schema, and — for a remote database — latency
 ```
+
+The older venv route still works:
+`python3 -m venv ~/.local/share/ameesh/venv && ~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>`.
+Platform state and upgrades: [`site/docs/guides/install.md`](site/docs/guides/install.md).
 
 ## Tests
 
 ```bash
 scripts/test.sh                      # starts the container, runs the suite twice
 scripts/test.sh tests.test_runner    # one module
+scripts/test.sh tests.test_runner tests.test_mail   # several modules
+scripts/test.sh -p 'test_runner*.py'  # discovery by filename
+scripts/test.sh -k 'test_stop'        # discovery filtered by test name
 scripts/test.sh tests.test_bout_en_bout   # the v1 end-to-end test (spec §13)
 scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwaway Postgres container each
 ```
