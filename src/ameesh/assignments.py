@@ -13,6 +13,10 @@ sous-utilisation se trompaient et la frise restait vide.
   assigné s'il ne l'est pas déjà, par l'attribution gardée (L37). Un lot
   qui appartient à un AUTRE agent n'est jamais repris en silence : le
   courrier d'un relecteur sur le lot de l'auteur ne doit pas le lui voler.
+  Le pouvoir d'assigner vient d'une **déclaration** d'orchestrateur (rôle
+  au canon ou `AMEESH_ALERT_ORCHESTRATORS`) : avoir déjà confié des lots
+  (L94) suffit pour l'avertissement, pas pour réassigner (#1168, même
+  règle que #740 pour les dates).
 * `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
@@ -102,7 +106,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
     posée sur le lot qui n'en a pas. Lève AssignmentError si l'attribution
-    gardée refuse (rien n'est alors déposé).
+    gardée refuse (rien n'est alors déposé). `orchestrator` dit la détection
+    L94 (déclaration, rôle au canon, ou historique des lots confiés) ; ce
+    n'est pas le droit d'assigner, qui exige une déclaration (#1168).
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -117,18 +123,26 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         has_open = bool(work_mod.open_lots(db, recipient))
         if lot is None and has_open:
             return out
-        if not is_orchestrator(cfg, db, sender):
-            # un `--lot` d'un autre agent n'assigne rien ; mais une étiquette
-            # qui désigne un lot ouvert est rendue par son numéro, pour tout
+        if lot is None:
+            # Aucune assignation en jeu : l'avertissement L94 « destinataire
+            # sans lot » s'adresse aussi à un orchestrateur vu par l'historique
+            # de ses attributions.
+            if not is_orchestrator(cfg, db, sender):
+                return out
+        elif not is_orchestrator(cfg, db, sender, history=False):
+            # #1168 : confier un lot déjà ouvert est un acte d'autorité ; le
+            # pouvoir de réassigner par courrier vient d'une déclaration (rôle
+            # au canon ou `AMEESH_ALERT_ORCHESTRATORS`), pas de l'historique
+            # des lots confiés (L94) — même règle que #740 pour les dates.
+            # Le `--lot` reste une étiquette rendue par son numéro pour tout
             # expéditeur : le fil, l'activité du lot et le lot en cours
             # (`ameesh projects`) la lisent. Sinon, étiquette libre (inchangé).
-            if lot is not None:
-                try:
-                    item = resolve_lot(db, lot)
-                except AssignmentError:
-                    item = None
-                if item is not None:
-                    out.update(lot=item, work_item_id=str(item["id"]))
+            try:
+                item = resolve_lot(db, lot)
+            except AssignmentError:
+                item = None
+            if item is not None:
+                out.update(lot=item, work_item_id=str(item["id"]))
             return out
         out["orchestrator"] = True
     else:

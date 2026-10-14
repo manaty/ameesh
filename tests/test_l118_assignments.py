@@ -126,6 +126,39 @@ class MailLinksLotsTest(_Base):
             self.assertTrue(assignments.is_orchestrator(self.cfg, self.db, "orch"))
             self.assertFalse(assignments.is_orchestrator(self.cfg, self.db, "dev1"))
 
+    def test_historique_d_attributions_ne_donne_pas_le_droit_d_assigner(self):
+        """#1168 : le `--lot` d'un agent qui a déjà confié des lots (historique
+        L94) reste une étiquette ; l'assignation exige une déclaration (rôle au
+        canon ou `AMEESH_ALERT_ORCHESTRATORS`), comme #740 pour les dates."""
+        self.agent("dev3")
+        deja = work.add(self.db, title="déjà confié")
+        work.assign(self.db, deja["id"], "dev3", actor="dev2")
+        with mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": "orch"}):
+            self.assertTrue(assignments.is_orchestrator(self.cfg, self.db, "dev2"))
+        # le lot de dev2, cité dans sa propre question, ne part pas à dev1
+        lot = work.add(self.db, title="question", assignee="dev2")
+        proc = self.send("dev1", "Question : où en est ce lot ?", "--from", "dev2",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev2")
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+        # l'orchestrateur déclaré, lui, assigne toujours (témoin de contrôle)
+        libre = work.add(self.db, title="libre")
+        proc = self.send("dev1", "À toi.", "--from", "orch", "--lot", str(libre["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lot #%d assigned to dev1" % libre["id"], proc.stdout)
+        self.assertEqual(work.get(self.db, libre["id"])["assignee"], "dev1")
+
+    def test_historique_conserve_l_avertissement_destinataire_sans_lot(self):
+        """#1168 : l'historique L94 reste la détection de l'avertissement
+        « destinataire sans lot » — on ne resserre que le droit d'assigner."""
+        self.agent("dev3")
+        deja = work.add(self.db, title="déjà confié")
+        work.assign(self.db, deja["id"], "dev3", actor="dev2")
+        proc = self.send("dev1", "Prends ce chantier.", "--from", "dev2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("dev1 has no open lot", proc.stderr)
+
 
 class BranchMergeTest(_Base):
     """Un lot se ferme quand sa branche entre dans sa cible, avec ou sans PR."""
