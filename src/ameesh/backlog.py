@@ -40,6 +40,8 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
   tout le mesh (plusieurs `ameesh notify` ne se cumulent pas) ;
 * l'attribution est conditionnelle (assigné encore vide) : deux preneurs
   concurrents ne prennent pas le même élément.
+* une dépendance explicite encore ouverte exclut l'élément avant la borne
+  de sélection ; le graphe est revérifié dans la transaction de prise.
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
 sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
@@ -426,7 +428,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     room = 0
     if idle_s > 0 and max_per_hour > 0:
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
-    queue = items(db, open_only=True, limit=200) if room > 0 else []
+    queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
     if not lots and not queue:
         return []
     listing = st.operations.listing() if listing is None else listing
@@ -575,7 +577,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 AUTO_TAKE_NOTE, check["assignee"], item.get("value_score"),
                 item.get("expected_value") or "")
             done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                  note=note, actor=SENDER)
+                                  note=note, actor=SENDER, ready_only=True)
             queue.remove(item)
             if done is None:
                 continue                    # pris entre-temps : élément suivant

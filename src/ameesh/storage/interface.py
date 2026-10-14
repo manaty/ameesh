@@ -1428,11 +1428,13 @@ class WorkItems(Domain):
         `app`: its project (L118c), empty when unknown."""
 
     @abc.abstractmethod
-    def backlog(self, *, open_only: bool, limit: int) -> list[dict]:
+    def backlog(self, *, open_only: bool, limit: int,
+                ready_only: bool = False) -> list[dict]:
         """Les éléments de la file dans l'ordre de prise (priorité, puis valeur
         décroissante, puis ancienneté). `open_only` : seulement ceux qu'on peut
         encore prendre (`intake`, sans assigné) ; sinon tous les éléments non
-        terminés."""
+        terminés. `ready_only` exclut les dépendances ouvertes avant la borne
+        pour la prise automatique ; la liste ordinaire les conserve."""
 
     @abc.abstractmethod
     def auto_takes_since(self, seconds: float, note_prefix: str) -> int:
