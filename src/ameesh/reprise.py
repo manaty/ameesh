@@ -224,11 +224,12 @@ def locate(cfg: Config, harness: str, session_id: str,
 
 def holders(path: str, session_id: str) -> list[dict]:
     """Les processus qui tiennent la session : fichier ouvert (ou dossier
-    ouvert ou courant), ou id de session sur la ligne de commande (`codex
-    resume <id>`, `claude --resume <id>`) — hors ce processus et ses
-    ascendants, dont la ligne de commande porte l'id passé à `ameesh adopt`.
-    Par la couche plateforme (L63) ; les processus illisibles (autre
-    utilisateur, disparus) sont ignorés.
+    ouvert ou courant), ou id de session sur la ligne de commande d'une
+    REPRISE (`codex resume <id>`, `claude --resume <id>`, `dsh --session-id
+    <id>`) — hors ce processus et ses ascendants, dont la ligne de commande
+    porte l'id passé à `ameesh adopt`. L'id simplement CITÉ (brief, message,
+    chemin) ne compte pas (#1283). Par la couche plateforme (L63) ; les
+    processus illisibles (autre utilisateur, disparus) sont ignorés.
 
     Lève `platform.NotAvailable` si l'OS ne permet pas de le vérifier :
     jamais de liste vide qui voudrait dire « personne » sans contrôle.
@@ -237,7 +238,8 @@ def holders(path: str, session_id: str) -> list[dict]:
     écriture ; une session interactive démarrée sans `--resume` n'est donc vue
     que si elle écrit au moment du contrôle.
     """
-    return platform.holders(path, session_id, exclude=platform.ancestry())
+    return platform.holders(path, session_id, exclude=platform.ancestry(),
+                            session=True)
 
 
 def session_cwd(harness: str, path: str) -> str | None:
