@@ -348,6 +348,38 @@ class CouvertureTronqueeTest(unittest.TestCase):
         # le diagnostic d'en-tête nomme la panne, le message de coverage suit
         self.assertIn("en-tête sqlite absent", ignorees[0]["raison"])
 
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_couverture_vide_ignoree_et_nommee(self):
+        """R1 B3 #1257 : un fichier de 0 octet (processus tué avant d'écrire sa
+        mesure) se lit sans erreur et ne porte aucune mesure ; il est une perte
+        conservatrice nommée, pas un processus mesuré à zéro. Le témoin sain de
+        la même part reste mesuré."""
+        from coverage import CoverageData
+        part = self._part()
+        vide = part / "cov" / ".coverage.vide"
+        vide.write_bytes(b"")
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        carte_ = carte.merge([str(part)], "abc")
+        ignorees = carte_["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertEqual(ignorees[0]["part"], "mesure-psycopg-1")
+        self.assertEqual(ignorees[0]["fichier"], ".coverage.vide")
+        self.assertIn("vide (0 octet)", ignorees[0]["raison"])
+        self.assertEqual(carte_["mesure"]["processus"], 1)  # seule la valide
+        modules = {m for blocs in carte_["blocs"].values()
+                   for info in blocs.values() for m in info["modules"]}
+        self.assertIn("test_l1", modules)
+        self.assertIn(".coverage.vide", carte.summary(carte_))
+        # témoin du témoin : sans le fichier vide, la part reste mesurée
+        # normalement (aucune perte, un processus) — le contrôle sain.
+        vide.unlink()
+        saine = carte.merge([str(part)], "abc")
+        self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(saine["mesure"]["processus"], 1)
+
     def test_aucune_couverture_ignoree_sans_corruption(self):
         carte_ = carte.merge([str(self._part())], "abc")
         self.assertEqual(carte_["mesure"]["couverture_ignoree"], [])

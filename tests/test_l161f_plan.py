@@ -588,6 +588,40 @@ class PartialMeasureTest(unittest.TestCase):
         self.assertFalse(out["phase2_safe"])
         self.assertIn("partial measure", out["unsure"][0])
 
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_zero_byte_coverage(self):
+        """R1 B3 #1257 : un fichier de couverture de 0 octet est une perte
+        conservatrice ; la carte est partielle et le plan refuse de juger la
+        sélection (repli suite complète). Le contrôle sain (même part sans le
+        fichier vide) reste utilisable."""
+        from coverage import CoverageData
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage.vide"
+        vide.write_bytes(b"")
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        ignorees = card["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertIn("vide (0 octet)", ignorees[0]["raison"])
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+        # témoin du témoin : sans le fichier vide, la même mesure est utilisable
+        vide.unlink()
+        saine = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
+
 
 class PushLaneTest(unittest.TestCase):
     """nature() on a push: the whole pushed range decides (#833)."""

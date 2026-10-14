@@ -298,7 +298,12 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
     une panne après `read()` (measured_contexts, measured_files,
     contexts_by_lineno) écarte le fichier au lieu de tuer la fusion, et sa
     contribution, construite à part, n'est versée qu'une fois le fichier
-    entièrement exploité (aucune ligne partielle d'un fichier corrompu)."""
+    entièrement exploité (aucune ligne partielle d'un fichier corrompu).
+
+    Un fichier de 0 octet (processus tué avant d'écrire sa mesure) se lit sans
+    erreur mais ne porte aucune mesure : il est écarté comme une perte, jamais
+    compté comme un processus mesuré à zéro (R1 B3 #1257) — sinon la carte
+    paraîtrait complète alors que la contribution du processus manque."""
     lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
     ignorees: list[dict] = []
@@ -314,6 +319,13 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
             contribution: dict = collections.defaultdict(
                 lambda: collections.defaultdict(set))
             try:
+                if os.path.getsize(fichier) == 0:
+                    # R1 B3 (#1257) : un fichier vide ne fait lever aucune
+                    # erreur à coverage et ne rend aucune mesure ; le compter
+                    # comme processus mesuré rendrait la carte complète alors
+                    # que sa contribution est perdue. Perte conservatrice,
+                    # nommée comme les autres.
+                    raise DataError("fichier de couverture vide (0 octet)")
                 donnees = CoverageData(basename=fichier)
                 donnees.read()
                 contextes = donnees.measured_contexts()
