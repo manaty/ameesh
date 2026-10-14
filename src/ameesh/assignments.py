@@ -96,7 +96,8 @@ def resolve_lot(db, ref: str) -> dict | None:
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
-                 force: str | None = None) -> dict:
+                 force: str | None = None,
+                 parent_lot: int | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
@@ -111,11 +112,17 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
 
     #540 : un lot que le destinataire ne peut recevoir (il a déjà un lot non
     démarré) va dans la file d'équipe et le message n'est pas déposé
-    (AssignmentError) ; sauf `force`, la raison d'un `--force` motivé."""
+    (AssignmentError) ; sauf `force`, la raison d'un `--force` motivé.
+
+    #1193: `parent_lot` is the explicit parent of the suite lot created by
+    `new_lot` — the blocking edge is written together with the creation
+    (refused without `new_lot`)."""
     out = {"lot": None, "work_item_id": lot, "assigned": False, "created": False,
            "branch": None, "warnings": [], "orchestrator": False}
     if recipient == "all" or ":" in recipient:
         return out
+    if parent_lot is not None and new_lot is None:
+        raise AssignmentError("--parent-lot goes with --new-lot (the parent of the suite)")
     if new_lot is None:
         # le cas courant (aucune option, destinataire déjà sur un lot) ne lit
         # rien d'autre : la détection d'un orchestrateur peut lire le canon
@@ -157,7 +164,8 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                           if new_project and app is not None else "")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg, branch=branch,
-                                estimate=minutes, note=introduced, force=force)
+                                estimate=minutes, note=introduced, force=force,
+                                parent_lot=parent_lot)
             if item.get("queue_warning"):
                 raise AssignmentError(_queued(item))
             out.update(created=True, assigned=True, branch=item.get("branch"))

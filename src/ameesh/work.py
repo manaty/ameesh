@@ -242,6 +242,7 @@ def add(
     size: str | None = None,
     note: str = "",
     force: str | None = None,
+    parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
 ) -> dict:
@@ -269,14 +270,20 @@ def add(
     raison d'un forçage (`--force "<raison>"`), écrite au journal avec son
     auteur ; vide, aucun forçage. L'exemption du lot d'une demande de
     décision n'est pas un paramètre : `_decision_lot`, interne, réservé à
-    `decisions.ask`."""
+    `decisions.ask`.
+
+    #1193: `parent_lot` is the explicit parent of a suite lot. The blocking
+    edge is written **in the same transaction** as the creation (parent still
+    open), traced in the journal if the parent is already finished; an unknown
+    parent is refused before any creation. No number is ever guessed from the
+    title or the body."""
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,
                    cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
                    estimate=estimate, estimate_source=estimate_source, size=size,
-                   note=note, force=force, mark_item_id=mark_item_id,
-                   mark_note=mark_note, team_queue=True)
+                   note=note, force=force, parent_lot=parent_lot,
+                   mark_item_id=mark_item_id, mark_note=mark_note, team_queue=True)
 
 
 def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
@@ -291,8 +298,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             body="", issue_ref=None, workstream=None, assignee=None, budget_usd=None,
             actor="", package=None, externe=False, cfg=None, branch=None,
             branch_target=None, priority=None, estimate=None, estimate_source=None,
-            size=None, note="", force=None, mark_item_id=None, mark_note="",
-            team_queue: bool) -> dict:
+            size=None, note="", force=None, parent_lot=None, mark_item_id=None,
+            mark_note="", team_queue: bool) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -310,6 +317,15 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
     if priority is not None and priority not in PRIORITIES:
         raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
     queued = None
+    if parent_lot is not None:
+        try:
+            parent_lot = int(parent_lot)
+        except (TypeError, ValueError):
+            raise WorkError("--parent-lot: a lot number, not %r" % (parent_lot,)) from None
+        if parent_lot <= 0:
+            raise WorkError("--parent-lot: a positive lot number")
+        if get(db, parent_lot) is None:
+            raise WorkError("parent lot #%d not found" % parent_lot)
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         check = check_assignee(db, assignee, externe=externe, cfg=cfg)
@@ -334,7 +350,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         if minutes else None, change_size=size or None,
         queued_note=queued and _queued_note(queued, created),
         forced_note=queued and _forced_note(queued, created, force, actor),
-        mark_item_id=mark_item_id, mark_note=mark_note)
+        mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
     if item.get("queued_behind") is not None:
         item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
