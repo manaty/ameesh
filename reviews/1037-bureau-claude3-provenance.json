@@ -1,0 +1,26 @@
+{
+  "session": "b49d637f-8bac-4a13-90af-50c0dcdbd735",
+  "primary_log": "/home/smichea/.claude-tertiary/projects/-home-smichea-development-manaty-ameesh-revue-c3-2/b49d637f-8bac-4a13-90af-50c0dcdbd735.jsonl",
+  "review_sha": "17b3a5d6fa194ac658ed85b6fe083ebe90e1d7d3",
+  "worker": "revue-c3-2-1037",
+  "evidence": [
+    {
+      "kind": "assistant_verdict",
+      "line": 131,
+      "timestamp": "2026-10-14T05:22:13.471Z",
+      "model": "claude-opus-5-5",
+      "tool_id": "toolu_01RWoDBHSyj7YwmaceAQeQLv",
+      "command": "ameesh work milestone 1037 verdict ok --sha 17b3a5d6fa194ac658ed85b6fe083ebe90e1d7d3 --actor bureau --note \"Relecture Claude (bureau, compte Claude 3) : OK sur 17b3a5d6 (tete gelee = tete PR #805). 0 B. Hook sous bail -> upsert harness=None (declaration gardee, cwd suit L61) ; adopt pose session_harness/origin/cwd et purge model/effort/tier si le harnais declare change (base + etat local) ; porte review_lot lit live_harness. Tests rejoues verts : test_1037 (3), L61/L39/L52/L539 (73). 2 N : ameesh show n'affiche pas session_harness ; pas de temoin pour persona_sessions.\"",
+      "line_sha256": "af8418b94d8a79bfc6715729945891643376a9722bd7b436153bd6808aa6826c"
+    },
+    {
+      "kind": "result",
+      "line": 132,
+      "timestamp": "2026-10-14T05:22:17.259Z",
+      "tool_id": "toolu_01RWoDBHSyj7YwmaceAQeQLv",
+      "is_error": false,
+      "content": "milestone verdict added to lot #1037 (ok)",
+      "line_sha256": "7de780a18b52710266bea668d0e79429d6e4177ee7dd8aa25d0dd218dded32f2"
+    }
+  ]
+}
