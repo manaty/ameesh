@@ -103,6 +103,10 @@ LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
 LOT_MIN_AGE_S = 300.0
 #: capacités exigées qui réservent un lot à une attribution explicite
 RESERVED_CAPABILITIES = ("decision", "production")
+#: capacités déclarées qui marquent la classe d'un lot (canon §1/#803) : un lot
+#: qui en exige une n'est tiré que si une autre famille de harnais est au
+#: registre (canon §2). `sensitive` est la variante anglaise de `sensible`.
+CLASS_CAPABILITIES = ("sensible", "sensitive", "production", "decision")
 #: capacité exigée qui désigne un harnais (`harness:codex`)
 HARNESS_PREFIX = "harness:"
 TAKE_WINDOW_S = 3600.0
@@ -211,15 +215,57 @@ def auditor_may_take(item: dict, name: str, card=None) -> bool:
                          + r"|(?:sa|ses|own)\s+(?:fiche|card)", text)
 
 
-def fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
-    """L'élément correspond-il à l'équipe et aux capacités de l'agent ?"""
+def declared_class(item: dict) -> bool:
+    """Le lot déclare-t-il une capacité de classe (sensible/production/decision) ?
+
+    #803 : la classe d'un lot n'est lisible sur le diff gelé qu'à la porte de
+    fusion ; à la prise, c'est le marqueur déclaré qui fait foi (le doute du
+    canon §8 se tranche au gel, pas ici, sinon tout lot `intake` serait
+    sensible). `sensitive` est accepté comme variante de `sensible`.
+    """
+    return bool(set(item.get("required_capabilities") or ())
+                & set(CLASS_CAPABILITIES))
+
+
+def other_family_available(agent: dict, others) -> bool:
+    """Une famille de harnais autre que celle du preneur est-elle au registre ?
+
+    Garde **structurelle** de la classe (#803, canon §2) : elle ne regarde pas
+    la disponibilité d'un relecteur — un relecteur peut revenir, et la
+    relecture croisée joue au moment voulu — mais seulement l'impossibilité de
+    principe d'une relecture par une autre famille (mesh mono-famille). Elle ne
+    mord donc que sur un lot marqué. Sans registre lisible, ou sans harnais
+    connu pour le preneur, on refuse (doute -> sensible).
+    """
+    mine = str((agent or {}).get("harness") or "").strip().lower()
+    if not mine:
+        return False
+    name = (agent or {}).get("name") or ""
+    for row in others or ():
+        if (row.get("name") or "") == name:
+            continue
+        harness = str(row.get("harness") or "").strip().lower()
+        if harness and harness != mine:
+            return True
+    return False
+
+
+def fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
+         others=None) -> bool:
+    """L'élément correspond-il à l'équipe et aux capacités de l'agent ?
+
+    `others` : les lignes du registre, pour la garde structurelle de classe
+    (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
+    """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
     team = (item.get("team") or "").strip()
     if team and team != (agent.get("team") or "").strip():
         return False
     required = set(item.get("required_capabilities") or ())
-    return required <= set(agent.get("capabilities") or ())
+    if not required <= set(agent.get("capabilities") or ()):
+        return False
+    return not declared_class(item) or other_family_available(agent, others)
 
 
 # --------------------------------------------------------------------------
@@ -312,9 +358,14 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
-def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
+def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
+             others=None) -> bool:
     """Le lot est-il de l'équipe de l'agent, et l'agent sait-il le faire ?
-    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent."""
+    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent.
+
+    `others` : les lignes du registre, pour la garde structurelle de classe
+    (#803) — sans elles, un lot marqué n'est pas pris (doute -> sensible).
+    """
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
     team = (agent.get("team") or "").strip()
@@ -323,7 +374,9 @@ def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bo
     have = set(agent.get("capabilities") or ())
     if agent.get("harness"):
         have.add("%s%s" % (HARNESS_PREFIX, agent["harness"]))
-    return set(item.get("required_capabilities") or ()) <= have
+    if not set(item.get("required_capabilities") or ()) <= have:
+        return False
+    return not declared_class(item) or other_family_available(agent, others)
 
 
 def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
@@ -451,7 +504,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             auditors = auditor_mod.cards([agent], canons)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
-                                card=auditors.get(row["name"])):
+                                card=auditors.get(row["name"]), others=listing):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -505,7 +558,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         auditors = auditor_mod.cards([agent], canons)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
-                        card=auditors.get(row["name"])):
+                        card=auditors.get(row["name"]), others=listing):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,

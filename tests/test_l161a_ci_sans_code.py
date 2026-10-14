@@ -85,8 +85,11 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers]", self.text)
         self.assertIn('test "${{ needs.doc-readers.result }}" = success', self.text)
 
-    def test_main_jamais_annulee(self):
-        # hors PR, un groupe par exécution : ni annulée, ni écartée en attente
+    def test_main_en_cours_preservee_et_file_bornee(self):
+        # #824, décision owner #17605 : pushes main regroupés, un seul pending.
+        # Releases/dispatch gardent une identité par run, PR remplacées annulées.
+        self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main'", self.text)
+        self.assertIn("format('pr-{0}', github.event.pull_request.number)", self.text)
         self.assertIn("|| github.run_id }}", self.text)
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.text)
         self.assertNotIn("cancel-in-progress: true", self.text)
