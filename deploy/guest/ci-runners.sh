@@ -61,7 +61,9 @@
 #   --keep-workspaces     with --remove: keep the runner directories (logs)
 #
 # Environment (test seams, dry runs only: nothing is changed by the tests):
-#   CI_RUNNERS_TEST_HOST, CI_RUNNERS_TEST_STATE, CI_RUNNERS_TEST_BUSY
+#   CI_RUNNERS_TEST_HOST, CI_RUNNERS_TEST_STATE, CI_RUNNERS_TEST_BUSY,
+#   CI_RUNNERS_TEST_ACTIVE (active units), CI_RUNNERS_TEST_CHILD (live runner
+#   processes), CI_RUNNERS_TEST_STOP_DELAY
 #
 # Safety, by construction:
 #   * every systemd unit this script writes matches `ameesh-guest-ci@*`; it
@@ -346,7 +348,58 @@ wait_terminal() { # N
   done
   return 1
 }
-unit_state() { host_says systemctl show "ameesh-guest-ci@$1.service" --property="$2" --value 2>/dev/null || true; }
+unit_state() { # N PROPERTY (the test host fakes the states it asserts)
+  if [ -n "$HOSTDIR" ] && [ -n "${CI_RUNNERS_TEST_ACTIVE:-}" ]; then
+    local active=0
+    case ",$CI_RUNNERS_TEST_ACTIVE," in *",$1,"*) active=1 ;; esac
+    case "$2" in
+      ActiveState) [ "$active" = 1 ] && echo active || echo inactive; return ;;
+      UnitFileState) [ "$active" = 1 ] && echo enabled || echo disabled; return ;;
+    esac
+    return
+  fi
+  host_says systemctl show "ameesh-guest-ci@$1.service" --property="$2" --value 2>/dev/null || true
+}
+# C2 de la R1 amont : une unité active n'est pas encore une désobéissance. Le
+# wrapper (`ci-runner-gate.py:supervise`) arrête le child puis reste actif à
+# attendre la réouverture ; seul un processus runner (listener, worker ou
+# run.sh) encore vivant au-delà du délai d'arrêt du wrapper prouve qu'il ne
+# l'arrête pas. Le wrapper lui-même porte `--dir .../ci/rN` : il est exclu.
+runner_child() { # N : un processus runner de l'unité N est vivant
+  if [ -n "$HOSTDIR" ]; then
+    case ",${CI_RUNNERS_TEST_CHILD:-}," in *",$1,"*) return 0 ;; esac
+    return 1
+  fi
+  pgrep -u "$GUEST" -af 'Runner\.(Listener|Worker)|/run\.sh' 2>/dev/null \
+    | grep -q "ci/r$1/"
+}
+runner_stop_delay_s() { # le délai du wrapper : intervalle de veille + grâce
+  if [ -n "$HOSTDIR" ]; then
+    case "${CI_RUNNERS_TEST_STOP_DELAY:-0}" in ''|*[!0-9]*) echo 0 ;; *) echo "$CI_RUNNERS_TEST_STOP_DELAY" ;; esac
+    return
+  fi
+  python3 -I - "$HERE/ci-runner-gate.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ci_runner_gate", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod)
+    print(int(mod.DEFAULT_INTERVAL + mod.DEFAULT_GRACE) + 2)
+except Exception:  # source illisible : la borne dure de l'unité (TimeoutStopSec)
+    print(180)
+PY
+}
+wait_runner_stops() { # N : le processus runner disparaît dans le délai
+  local n=$1 delay deadline
+  delay=$(runner_stop_delay_s)
+  say "r$n: the gate is closed and its runner process is alive; waiting up to ${delay}s for the wrapper to stop it"
+  deadline=$(( $(date +%s) + delay ))
+  while runner_child "$n"; do
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+  return 0
+}
 slice_state() { host_says systemctl show ameesh-guest.slice --property="$1" --value 2>/dev/null || true; }
 
 need_root() { [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo)"; }
@@ -684,12 +737,29 @@ check() {
     printf 'r%s: unit=%s/%s dir=%s\n' "$n" "${state:-?}" "${enabled:-?}" "$dir"
     [ "$state" = active ] && active_runners=$((active_runners + 1)) || true
     if [ -f "$(at "$dir/.runner")" ]; then
-      python3 -I - "$(at "$dir/.runner")" <<'PY' || ko "r$n: .runner unreadable"
+      # C1 (R1 amont #1256) : `config.sh --url` est relu dans `gitHubUrl`
+      # (ConfigurationManager.cs : GitHubUrl=inputUrl, ServerUrl=TenantUrl) ;
+      # `serverUrl` ne nomme que le transport Actions et reste affiché.
+      python3 -I - "$(at "$dir/.runner")" "$REPO_URL" <<'PY' \
+        || ko "r$n: .runner unreadable or registered on another repository"
 import json, sys
+
+
+def normalize(url):
+    url = (url or "").strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    host, _, path = rest.partition("/")
+    return "%s://%s/%s" % (scheme.lower(), host.lower(), path)
+
+
 d = json.load(open(sys.argv[1]))
-print("  name=%s server=%s" % (d.get("agentName"), d.get("serverUrl")))
-if "manaty/ameesh" not in (d.get("serverUrl") or ""):
-    sys.exit(1)
+print("  name=%s repo=%s server=%s"
+      % (d.get("agentName"), d.get("gitHubUrl"), d.get("serverUrl")))
+sys.exit(0 if normalize(d.get("gitHubUrl")) == normalize(sys.argv[2]) else 1)
 PY
       [ -f "$(at "$dir/.credentials")" ] && printf '  credentials: %s\n' \
         "$(stat -c '%a %U:%G' "$(at "$dir/.credentials")" 2>/dev/null || echo '?')" \
@@ -735,10 +805,30 @@ PY
       ko "a guest runner is active without its gate wrapper: nothing obeys the guard"
     fi
   fi
-  # the wrapper stops the runner on a closed or stale gate (R1 #1256): an
-  # active unit with a closed gate means the wrapper is absent or broken
+  # C2 de la R1 amont : le wrapper arrête le child sur une porte fermée ou
+  # périmée (R1 #1256) puis **reste actif** à attendre la réouverture
+  # (`ci-runner-gate.py:supervise`). Une unité active sans processus runner
+  # est donc ce fonctionnement correct ; un processus runner encore vivant
+  # après le délai d'arrêt du wrapper est la désobéissance.
   if [ "$active_runners" != 0 ] && [ "$gate" != available ]; then
-    ko "a guest runner is active while the gate is $gate: the guard is not obeyed"
+    local waiting=0 offender=""
+    for n in $(seq 1 "$COUNT"); do
+      [ "$(unit_state "$n" ActiveState)" = active ] || continue
+      if runner_child "$n"; then
+        if wait_runner_stops "$n"; then
+          say "r$n: the wrapper stopped its runner while the gate is $gate"
+        else
+          offender=$n
+        fi
+      else
+        waiting=$((waiting + 1))
+      fi
+    done
+    if [ -n "$offender" ]; then
+      ko "r$offender still runs after the wrapper's stop delay while the gate is $gate: the guard is not obeyed"
+    elif [ "$waiting" != 0 ]; then
+      echo "note: $waiting guest runner(s) active without their runner process: the wrapper waits for the gate"
+    fi
   fi
   [ "$BAD" = 0 ] || die "$BAD check(s) failed"
   say "check: every line ok"
