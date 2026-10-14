@@ -1,0 +1,7 @@
+{"deployed_package": "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh", "schema_policy": "t_* fixture only", "driver": "psql", "cases": ["test_new_delivery_same_digest_invalidates_prior_qa"]}
+test_new_delivery_same_digest_invalidates_prior_qa (__main__.NexlinkReview.test_new_delivery_same_digest_invalidates_prior_qa) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 8.099s
+
+OK

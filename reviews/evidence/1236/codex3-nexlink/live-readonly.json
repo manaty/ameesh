@@ -1,0 +1,126 @@
+{
+  "roles": [
+    {
+      "name": "codex3",
+      "roles": [
+        "relecture",
+        "implementation",
+        "qa"
+      ],
+      "projects": [
+        "nexlink"
+      ],
+      "team": "nexlink"
+    },
+    {
+      "name": "mty-amh-qa-01",
+      "roles": [
+        "qa"
+      ],
+      "projects": [
+        "ameesh"
+      ],
+      "team": "ameesh"
+    }
+  ],
+  "modules": [
+    {
+      "project": "nexlink",
+      "module": "it",
+      "canon": "",
+      "types": [
+        "release",
+        "publication"
+      ],
+      "schemas": {
+        "qa": {
+          "arrays": [
+            "scope"
+          ],
+          "strings": [
+            "sha256",
+            "verdict",
+            "report"
+          ],
+          "patterns": {
+            "sha256": "^[0-9a-f]{64}$",
+            "verdict": "^(ok|blocked)$"
+          },
+          "actor_role": "qa",
+          "writer_role": "ameesh_it_qa",
+          "binding_kind": "delivery",
+          "subject_field": "sha256",
+          "separation_of_duties": {
+            "assignee": true,
+            "evidence": "proof",
+            "declaration": true
+          }
+        },
+        "proof": {
+          "arrays": [
+            "command"
+          ],
+          "equals": {
+            "exit_code": 0
+          },
+          "strings": [
+            "artifact",
+            "sha256",
+            "output"
+          ],
+          "patterns": {
+            "sha256": "^[0-9a-f]{64}$"
+          },
+          "writer_role": "ameesh_it_proof",
+          "binding_kind": "delivery",
+          "subject_field": "sha256",
+          "runner_bound_actor": true
+        },
+        "delivery": {
+          "strings": [
+            "artifact",
+            "sha256"
+          ],
+          "patterns": {
+            "sha256": "^[0-9a-f]{64}$"
+          },
+          "subject_field": "sha256"
+        }
+      },
+      "rules": [
+        {
+          "types": [
+            "release",
+            "publication"
+          ],
+          "states": [
+            "merged",
+            "promoted"
+          ],
+          "milestones": {
+            "verdict": [
+              "ok"
+            ]
+          },
+          "subject_kind": "delivery",
+          "evidence_kind": "proof"
+        },
+        {
+          "types": [
+            "release",
+            "publication"
+          ],
+          "states": [
+            "promoted"
+          ],
+          "subject_kind": "delivery",
+          "evidence_kind": "qa",
+          "evidence_verdict": "ok"
+        }
+      ]
+    }
+  ],
+  "schema": "public",
+  "driver": "PsycopgDriver",
+  "read_only": true
+}

@@ -1,0 +1,42 @@
+{
+  "probe.py": {
+    "bytes": 4943,
+    "sha256": "20016d085a2d1943eadec7a543462f8200ce78871f67dc83c8cecf64159df56a"
+  },
+  "live-readonly.json": {
+    "bytes": 2579,
+    "sha256": "fce47ede3763e955e46005f2d60fb8d051e81ba4742fd511e699383155b79930"
+  },
+  "deployed-source-proof.json": {
+    "bytes": 1019,
+    "sha256": "492b13c35904b2a03a7c956a60d145b81c1589800c2dc15e925c65124d20f667"
+  },
+  "cleanup-proof-final.json": {
+    "bytes": 160,
+    "sha256": "0f383aa94e1a834980e596c54642553c4bd4bbb59deb71e2d91bd7b36591e784"
+  },
+  "psycopg.log": {
+    "bytes": 1130,
+    "sha256": "ac7f31a2aa72692664d3b5eb576a99635c4c7c167c6bb2127d589cbf12d59265"
+  },
+  "psql.log": {
+    "bytes": 1128,
+    "sha256": "8bbb7e230ee4fcf750d210c07233eadf886513bb455470de376a4126278fe4b7"
+  },
+  "psycopg-stale-audit.log": {
+    "bytes": 453,
+    "sha256": "a76d6bc835aca92680ede4da771cfc64a17524217ee87d54c2fcddd5777d7114"
+  },
+  "psql-stale-audit.log": {
+    "bytes": 450,
+    "sha256": "b85703f2e7b28dae149e77cc21db22bb35afc033bb162a9ac0d4d28926123494"
+  },
+  "preparation-path-error.log": {
+    "bytes": 800,
+    "sha256": "8ab7cf497ed1e5a2909ef7b6d0a70269b442cfaf1e20e1c81858ceee2923550f"
+  },
+  "preparation-immutable-app-error.log": {
+    "bytes": 9723,
+    "sha256": "5e5899df493d8d5bfee9890aee9aaf4c727ec65def8fb0a342cc2c46f1d1ea77"
+  }
+}

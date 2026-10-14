@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 15, in <module>
+    assert (package/name).read_bytes()==(source/'src/ameesh'/name).read_bytes(),name
+           ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/pathlib/__init__.py", line 777, in read_bytes
+    with self.open(mode='rb', buffering=0) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/pathlib/__init__.py", line 771, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/modules/it.py'

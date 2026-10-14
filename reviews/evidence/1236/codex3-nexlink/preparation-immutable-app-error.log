@@ -1,0 +1,144 @@
+{"deployed_package": "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh", "schema_policy": "t_* fixture only", "driver": "psycopg", "cases": ["test_independent_opens_current_and_merged_without_qa", "test_same_assignee_refused", "test_same_delivery_refused", "test_same_proof_refused", "test_role_and_project_scope_refused", "test_new_delivery_same_digest_invalidates_prior_qa"]}
+test_independent_opens_current_and_merged_without_qa (__main__.NexlinkReview.test_independent_opens_current_and_merged_without_qa) ... ERROR
+test_same_assignee_refused (__main__.NexlinkReview.test_same_assignee_refused) ... ERROR
+test_same_delivery_refused (__main__.NexlinkReview.test_same_delivery_refused) ... ERROR
+test_same_proof_refused (__main__.NexlinkReview.test_same_proof_refused) ... ERROR
+test_role_and_project_scope_refused (__main__.NexlinkReview.test_role_and_project_scope_refused) ... ERROR
+test_new_delivery_same_digest_invalidates_prior_qa (__main__.NexlinkReview.test_new_delivery_same_digest_invalidates_prior_qa) ... ERROR
+
+======================================================================
+ERROR: test_independent_opens_current_and_merged_without_qa (__main__.NexlinkReview.test_independent_opens_current_and_merged_without_qa)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1122, in execute
+    cur.execute(sql, tuple(params))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.RaiseException: module work item identity is immutable
+CONTEXT:  PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 21, in setUp
+    self.db.execute("UPDATE work_items SET app='nexlink' WHERE id=%s",(self.lot,))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1127, in execute
+    raise _map_error(exc) from exc
+ameesh.db.DbError: module work item identity is immutable CONTEXT: PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+======================================================================
+ERROR: test_same_assignee_refused (__main__.NexlinkReview.test_same_assignee_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1122, in execute
+    cur.execute(sql, tuple(params))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.RaiseException: module work item identity is immutable
+CONTEXT:  PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 21, in setUp
+    self.db.execute("UPDATE work_items SET app='nexlink' WHERE id=%s",(self.lot,))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1127, in execute
+    raise _map_error(exc) from exc
+ameesh.db.DbError: module work item identity is immutable CONTEXT: PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+======================================================================
+ERROR: test_same_delivery_refused (__main__.NexlinkReview.test_same_delivery_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1122, in execute
+    cur.execute(sql, tuple(params))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.RaiseException: module work item identity is immutable
+CONTEXT:  PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 21, in setUp
+    self.db.execute("UPDATE work_items SET app='nexlink' WHERE id=%s",(self.lot,))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1127, in execute
+    raise _map_error(exc) from exc
+ameesh.db.DbError: module work item identity is immutable CONTEXT: PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+======================================================================
+ERROR: test_same_proof_refused (__main__.NexlinkReview.test_same_proof_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1122, in execute
+    cur.execute(sql, tuple(params))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.RaiseException: module work item identity is immutable
+CONTEXT:  PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 21, in setUp
+    self.db.execute("UPDATE work_items SET app='nexlink' WHERE id=%s",(self.lot,))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1127, in execute
+    raise _map_error(exc) from exc
+ameesh.db.DbError: module work item identity is immutable CONTEXT: PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+======================================================================
+ERROR: test_role_and_project_scope_refused (__main__.NexlinkReview.test_role_and_project_scope_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1122, in execute
+    cur.execute(sql, tuple(params))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.RaiseException: module work item identity is immutable
+CONTEXT:  PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 21, in setUp
+    self.db.execute("UPDATE work_items SET app='nexlink' WHERE id=%s",(self.lot,))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1127, in execute
+    raise _map_error(exc) from exc
+ameesh.db.DbError: module work item identity is immutable CONTEXT: PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+======================================================================
+ERROR: test_new_delivery_same_digest_invalidates_prior_qa (__main__.NexlinkReview.test_new_delivery_same_digest_invalidates_prior_qa)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1122, in execute
+    cur.execute(sql, tuple(params))
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/psycopg/cursor.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.RaiseException: module work item identity is immutable
+CONTEXT:  PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/smichea/.local/state/ameesh/.menage/tmp/codex3~aeca9888/1236-nexlink-review/probe.py", line 21, in setUp
+    self.db.execute("UPDATE work_items SET app='nexlink' WHERE id=%s",(self.lot,))
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh/db.py", line 1127, in execute
+    raise _map_error(exc) from exc
+ameesh.db.DbError: module work item identity is immutable CONTEXT: PL/pgSQL function ameesh_module_work_guard() line 6 at RAISE
+
+----------------------------------------------------------------------
+Ran 6 tests in 3.678s
+
+FAILED (errors=6)

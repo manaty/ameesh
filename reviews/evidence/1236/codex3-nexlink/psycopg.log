@@ -1,0 +1,12 @@
+{"deployed_package": "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh", "schema_policy": "t_* fixture only", "driver": "psycopg", "cases": ["test_independent_opens_current_and_merged_without_qa", "test_same_assignee_refused", "test_same_delivery_refused", "test_same_proof_refused", "test_role_and_project_scope_refused", "test_new_delivery_same_digest_invalidates_prior_qa"]}
+test_independent_opens_current_and_merged_without_qa (__main__.NexlinkReview.test_independent_opens_current_and_merged_without_qa) ... ok
+test_same_assignee_refused (__main__.NexlinkReview.test_same_assignee_refused) ... ok
+test_same_delivery_refused (__main__.NexlinkReview.test_same_delivery_refused) ... ok
+test_same_proof_refused (__main__.NexlinkReview.test_same_proof_refused) ... ok
+test_role_and_project_scope_refused (__main__.NexlinkReview.test_role_and_project_scope_refused) ... ok
+test_new_delivery_same_digest_invalidates_prior_qa (__main__.NexlinkReview.test_new_delivery_same_digest_invalidates_prior_qa) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 2.841s
+
+OK

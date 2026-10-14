@@ -1,0 +1,26 @@
+{
+  "deployed_package": "/home/smichea/.local/share/ameesh/venv/lib/python3.14/site-packages/ameesh",
+  "source_snapshot": "/home/smichea/.local/share/ameesh/src-12408e2",
+  "files": {
+    "work.py": {
+      "sha256": "6c4c7e7f70013d7b78fa1c3c13ac4629fb775bbe42d663d2b7e8ab2636a2463f",
+      "same_snapshot_and_git_12408e2b": true
+    },
+    "modules/it/__init__.py": {
+      "sha256": "23e73605e90fd2547cdd1af426075c654c0988c71f2260e67807718eeac1f520",
+      "same_snapshot_and_git_12408e2b": true
+    },
+    "modules/storage.py": {
+      "sha256": "48ec8bc3681370f742aa00e9b508de36c0787f61ea43b94256d22e203ee0824e",
+      "same_snapshot_and_git_12408e2b": true
+    },
+    "modules/__init__.py": {
+      "sha256": "f277b1a4b08720f6db413b2a3843a092c21befe30f653c342a951e069c9df57c",
+      "same_snapshot_and_git_12408e2b": true
+    },
+    "migrations/0427_qa_role_guard.sql": {
+      "sha256": "e1a74dbe56b34b511be398ed3c664d80f0a72efffc594fad8b8950975aded4a2",
+      "same_snapshot_and_git_12408e2b": true
+    }
+  }
+}
