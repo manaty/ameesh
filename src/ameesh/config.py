@@ -7,6 +7,12 @@ Une seule source de vérité, lue dans cet ordre :
    en alias, comme `agent-mail` pour la commande) ;
 3. les valeurs par défaut.
 
+Le fichier est choisi par `AMEESH_CONFIG` (alias `AGENT_MESH_CONFIG`). Un
+chemin nommé explicitement qui n'existe pas est refusé (« config file not
+found »), jamais remplacé en silence par la config historique (#1127). Sans
+variable explicite, `~/.config/ameesh/config.json` est lu, à défaut
+`~/.config/agent-mesh/config.json`.
+
 Canon (spec §4) : `AMEESH_CANON` (racine du bundle OKF), `AMEESH_CANON_REF`
 (révision canonique), `AMEESH_CANON_UNTRUSTED=1` (canon hors git, tests
 seulement) et `AMEESH_REQUIRE_RESPONSIBLE` (R14 dans `claimable` ; par défaut
@@ -460,10 +466,26 @@ class Config:
 def load(env: dict | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     cfg = Config()
-    legacy_cfg = _expand(env.get("AGENT_MESH_CONFIG") or LEGACY_CONFIG)
-    cfg_path = _expand(env.get("AMEESH_CONFIG") or env.get("AGENT_MESH_CONFIG") or DEFAULT_CONFIG)
-    if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
-        cfg_path = legacy_cfg  # une config agent-mesh existante reste lue
+    # #1127 : une variable explicite nomme un fichier qui doit exister. Un
+    # chemin explicite absent ne se replie plus en silence sur la config
+    # historique : le DSN changeait alors sans le dire, et la sonde de schéma
+    # concluait à tort à un schéma absent. La variable retenue est celle qui
+    # décide du chemin (AMEESH_CONFIG, sinon son alias) : un alias périmé
+    # n'empêche pas la variable courante de faire foi.
+    explicit = next((name for name in ("AMEESH_CONFIG", "AGENT_MESH_CONFIG")
+                     if env.get(name)), "")
+    if explicit:
+        cfg_path = _expand(env[explicit])
+        if not os.path.exists(cfg_path):
+            raise SystemExit("config file not found: %s (%s)"
+                             % (cfg_path, explicit))
+    else:
+        # Repli historique : sans config explicite, une config agent-mesh
+        # existante reste lue (compatibilité du banc et des postes basculés).
+        cfg_path = _expand(DEFAULT_CONFIG)
+        legacy_cfg = _expand(LEGACY_CONFIG)
+        if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
+            cfg_path = legacy_cfg
     raw: dict = {}
     if os.path.exists(cfg_path):
         try:
