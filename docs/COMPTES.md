@@ -246,6 +246,12 @@ lecteurs départagent par instant de production, jamais par l'heure
 d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
 exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
 
+À l'affichage, une jauge Claude sans instant de production — rejeu seul, ou
+flux sans marqueur — porte « non daté : provenance inconnue » : sa valeur
+reste lisible, mais elle n'est pas présentée comme une mesure fraîche. La
+mention ne dit pas « périmé » : aucune preuve de péremption n'est supposée
+(ni âge maximal, ni `mtime`, ni plafond), et l'admission ne change pas.
+
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
 premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire
