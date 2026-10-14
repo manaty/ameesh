@@ -132,6 +132,19 @@ class TableTest(unittest.TestCase):
         self.assertEqual(self.c.interface_total, len(_interface_ops()))
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
 
+    def test_les_compteurs_du_doc_suivent_le_contrat(self):
+        """#1019 : les compteurs cités par docs/EXECUTEUR-MEDIEE.md viennent de
+        contract.json ; ils doivent suivre chaque ajout à l'interface, sans
+        quoi les agents lisent des chiffres périmés."""
+        with open(os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md"), encoding="utf-8") as fh:
+            doc = re.sub(r"\s+", " ", fh.read())
+        refuses = sum(len(methodes) for methodes in self.c.refused.values())
+        for attendu in ("la table fermée des %d opérations et la liste des %d refusées"
+                        % (len(self.c.operations), refuses),
+                        "l'interface entière (%d opérations)" % self.c.interface_total):
+            with self.subTest(fragment=attendu):
+                self.assertIn(attendu, doc)
+
     def test_jamais_d_autorite(self):
         for d in ("approvals", "nonces", "grants", "authenticators", "canon", "packages",
                   "placements", "visibility", "ephemerals", "session_bindings", "action_source"):
