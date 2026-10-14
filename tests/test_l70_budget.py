@@ -22,7 +22,7 @@ from ameesh import db as db_mod
 from ameesh.config import CHANNEL_BUDGET, Config
 from ameesh.runner import AgentWorker, Runner
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 
 PAID = ("deepseek",)
 
@@ -50,7 +50,7 @@ class ResolveTest(unittest.TestCase):
 
     def test_config_charge_note_la_source(self):
         from ameesh import config as config_mod
-        env = {"AMEESH_CONFIG": "/nonexistent/ameesh.json",
+        env = {"AMEESH_CONFIG": EMPTY_CONFIG,
                "AMEESH_BUDGET_USD_PER_DAY": "50"}
         cfg = config_mod.load(env=env)
         self.assertEqual(cfg.budget_usd_per_day, 50.0)
