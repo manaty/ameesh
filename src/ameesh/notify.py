@@ -1563,20 +1563,26 @@ def desktop_probe(cfg, env: dict | None = None) -> tuple[bool, str]:
 
     Rend `(ok, ligne)`. N'envoie rien si aucune route ne porte de canal
     `desktop` : la ligne dit alors ce que cet OS utiliserait, et ce qui
-    manque le cas échéant."""
+    manque le cas échéant — sans KO, car personne n'a demandé d'affichage
+    sur cet hôte (un binaire absent n'y est pas un défaut). Le KO est
+    réservé à une route `desktop` qui existe et dont le backend manque ou
+    échoue."""
     env = dict(os.environ if env is None else env)
     backend, binary, problem = platform_notify.describe(env=env)
     ou = "WSL2" if platform_notify.is_wsl(env) else platform_notify.SYSTEM
-    if problem:
-        return False, "KO — %s" % problem
     try:
         ncfg = parse_config(getattr(cfg, "notify", None))
     except NotifyConfigError as exc:
         return False, "config refused: %s" % exc
     human = desktop_human(ncfg)
     if human is None:
+        if problem:
+            return True, "%s (%s) — unavailable: %s; no `desktop` route configured, nothing sent" % (
+                backend or "desktop", ou, problem)
         return True, "%s (%s) — available; no `desktop` route configured, nothing sent" % (
             backend, ou)
+    if problem:
+        return False, "KO — %s" % problem
     results = send_test(ncfg, human, cfg.host, sender=Sender(env=env), kinds=("desktop",))
     errors = [detail for _name, detail in results if detail]
     if errors:

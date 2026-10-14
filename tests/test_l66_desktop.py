@@ -5,11 +5,13 @@ natif refuse (L67). Sans base, sauf la ligne `desktop` de `doctor
 --notify-test` (schéma de test)."""
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -58,6 +60,12 @@ class _Banc(unittest.TestCase):
         with open(self.log, encoding="utf-8") as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
+    def toast_xml(self, script: str) -> str:
+        """Le XML du toast, decode depuis le base64 porte par le script."""
+        match = re.search(r"FromBase64String\('([A-Za-z0-9+/=]+)'\)", script)
+        self.assertIsNotNone(match, "le script ne porte pas de XML en base64")
+        return base64.b64decode(match.group(1)).decode("utf-8")
+
 
 class PlatformNotifyTest(_Banc):
     def test_macos_osascript(self):
@@ -94,18 +102,35 @@ class PlatformNotifyTest(_Banc):
         self.assertEqual(entry["argv"], ["-NoProfile", "-NonInteractive",
                                          "-Command", "-"])
         script = entry["stdin"]
-        self.assertIn("<text>Titre &amp; &lt;x&gt;</text>", script)
-        # quotes simples doublees pour la chaine PowerShell qui porte le XML
-        self.assertIn("<text>corps ''apostrophe''</text>", script)
-        self.assertIn('<audio silent="true"/>', script)
+        self.assertTrue(script.isascii())
+        self.assertNotIn("\n", script)
+        xml = self.toast_xml(script)
+        self.assertIn("<text>Titre &amp; &lt;x&gt;</text>", xml)
+        self.assertIn("<text>corps 'apostrophe'</text>", xml)
+        self.assertIn('<audio silent="true"/>', xml)
         self.assertIn("CreateToastNotifier", script)
+
+    def test_wsl_toast_texte_hostile_hors_du_script(self):
+        """B2 : aucun texte de l'appelant en clair, script ASCII sur une ligne."""
+        env = dict(self.env, AMEESH_POWERSHELL_BIN=self.fake("powershell.exe"))
+        titre = "alerte ’ ; é —"
+        corps = "ligne 1\nligne 2 ’; Remove-Item C:\\ -Recurse"
+        pnotify.send(titre, corps, env=env, system="linux", wsl=True)
+        script = self.entries()[0]["stdin"]
+        self.assertTrue(script.isascii())
+        self.assertNotIn("\n", script)
+        self.assertNotIn("alerte", script)
+        self.assertNotIn("Remove-Item", script)
+        xml = self.toast_xml(script)
+        self.assertIn("<text>%s</text>" % titre, xml)
+        self.assertIn("<text>%s</text>" % corps, xml)
 
     def test_wsl_toast_urgent(self):
         env = dict(self.env, AMEESH_POWERSHELL_BIN=self.fake("powershell.exe"))
         pnotify.send("t", "c", urgency="critical", env=env, system="linux", wsl=True)
-        script = self.entries()[0]["stdin"]
-        self.assertIn('scenario="urgent"', script)
-        self.assertNotIn("silent", script)
+        xml = self.toast_xml(self.entries()[0]["stdin"])
+        self.assertIn('scenario="urgent"', xml)
+        self.assertNotIn("silent", xml)
 
     def test_wsl_sans_powershell(self):
         env = {"PATH": self.empty}  # aucun backend dans ce PATH
@@ -188,6 +213,14 @@ class DesktopProbeTest(_Banc):
         self.assertIn("no `desktop` route configured", line)
         self.assertEqual(self.entries(), [])
 
+    def test_sans_route_desktop_et_sans_binaire(self):
+        """B1 : pas de route desktop, pas de binaire -> ok, jamais KO."""
+        env = {"PATH": self.empty}
+        ok, line = notify.desktop_probe(self.cfg(), env=env)
+        self.assertTrue(ok)
+        self.assertIn("notify-send not found", line)
+        self.assertIn("no `desktop` route configured, nothing sent", line)
+
     def test_route_desktop_envoie_le_test(self):
         cfg = self.cfg(notify={"default_human": "human:test",
                                "default": ["desktop"]})
@@ -211,7 +244,8 @@ class DesktopProbeTest(_Banc):
             ok, line = notify.desktop_probe(self.cfg(), env=env)
             self.assertTrue(ok)
             self.assertIn("osascript (macos)", line)
-        with mock.patch.object(pnotify, "is_wsl", return_value=True):
+        with mock.patch.object(pnotify, "SYSTEM", "linux"), \
+                mock.patch.object(pnotify, "is_wsl", return_value=True):
             env = dict(self.env, AMEESH_POWERSHELL_BIN=self.fake("powershell.exe"))
             ok, line = notify.desktop_probe(self.cfg(), env=env)
             self.assertTrue(ok)
@@ -230,6 +264,25 @@ class DoctorDesktopTest(PgTestCase):
         self.assertIn("desktop    : KO — backend absent", out.getvalue())
         self.assertEqual(code, 1)
         probe.assert_called_once()
+
+    def test_doctor_ne_ko_pas_sans_route_desktop(self):
+        """B1 : backend absent et aucune route desktop -> la ligne `desktop` est OK.
+
+        Le binaire est rendu introuvable par surcharge explicite (et non par un
+        PATH vide) : le docteur a besoin de `psql` dans le PATH quand le banc
+        tourne sur ce pilote."""
+        absent = os.path.join(self.tmp, "notify-send-absent")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AMEESH_NOTIFY_SEND_BIN": absent}), \
+                mock.patch.object(pnotify, "SYSTEM", "linux"), \
+                mock.patch.object(pnotify, "is_wsl", return_value=False), \
+                contextlib.redirect_stdout(out):
+            cli.cmd_doctor(self.cfg, notify_test=True)
+        lignes = [l for l in out.getvalue().splitlines() if l.startswith("desktop")]
+        self.assertEqual(len(lignes), 1, out.getvalue())
+        self.assertNotIn("KO", lignes[0])
+        self.assertIn("no `desktop` route configured", lignes[0])
+        self.assertIn("notify-send not found", lignes[0])
 
 
 if __name__ == "__main__":

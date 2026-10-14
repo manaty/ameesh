@@ -21,6 +21,7 @@ harnais.
 """
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import subprocess
@@ -96,11 +97,12 @@ def osascript_bin(env: dict) -> str | None:
 
 def powershell_bin(env: dict) -> str | None:
     """`AMEESH_POWERSHELL_BIN` (explicite : sans repli), puis le PATH
-    (`powershell.exe`, puis `pwsh`)."""
+    (`powershell.exe`, puis `pwsh.exe`). `pwsh` sous Linux est exclu : ce
+    PowerShell hors Windows ne charge pas les types WinRT du toast."""
     defini, explicit = _explicit(env, "AMEESH_POWERSHELL_BIN")
     if defini:
         return explicit
-    for name in ("powershell.exe", "pwsh.exe", "pwsh"):
+    for name in ("powershell.exe", "pwsh.exe"):
         found = _which(name, env)
         if found:
             return found
@@ -217,22 +219,28 @@ def _applescript(title, body, urgency: str) -> str:
 def _toast_script(title, body, urgency: str) -> str:
     """Le script PowerShell (lu sur l'entree standard) qui affiche le toast.
 
-    Le texte vient de l'appelant : il est echappe en XML, puis les quotes
-    simples sont doublees pour la chaine PowerShell qui porte le XML."""
+    Le XML du toast est encode en base64 (UTF-8) ; le script lui-meme reste
+    du pur ASCII, sur une seule ligne, sans aucun texte de l'appelant en
+    clair. C'est une exigence de surete : PowerShell traite les apostrophes
+    courbes (U+2018 a U+201B) comme des quotes simples — un « ’ » ecrit par
+    un agent fermerait la chaine et la suite s'executerait — et il lit stdin
+    dans la page de code OEM, qui abime les caracteres non ASCII ('—', 'é')."""
     scenario = ' scenario="urgent"' if urgency == "critical" else ""
     audio = '<audio silent="true"/>' if urgency == "low" else ""
     xml = ('<toast%s><visual><binding template="ToastGeneric"><text>%s</text>'
            '<text>%s</text></binding></visual>%s</toast>'
            % (scenario, _xml_escape(str(title)), _xml_escape(str(body)), audio))
+    payload = base64.b64encode(xml.encode("utf-8")).decode("ascii")
     return (
-        "$ErrorActionPreference = 'Stop'\n"
+        "$ErrorActionPreference = 'Stop';"
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, "
-        "ContentType = WindowsRuntime] | Out-Null\n"
+        "ContentType = WindowsRuntime] | Out-Null;"
         "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, "
-        "ContentType = WindowsRuntime] | Out-Null\n"
-        "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument\n"
-        "$xml.LoadXml('%s')\n"
-        "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)\n"
+        "ContentType = WindowsRuntime] | Out-Null;"
+        "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument;"
+        "$xml.LoadXml([Text.Encoding]::UTF8.GetString("
+        "[Convert]::FromBase64String('%s')));"
+        "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml);"
         "$notifier = [Windows.UI.Notifications.ToastNotificationManager]"
-        "::CreateToastNotifier('%s')\n"
-        "$notifier.Show($toast)\n" % (xml.replace("'", "''"), TOAST_APP_ID))
+        "::CreateToastNotifier('%s');"
+        "$notifier.Show($toast)" % (payload, TOAST_APP_ID))
