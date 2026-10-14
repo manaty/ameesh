@@ -311,9 +311,46 @@ def _rules_unreadable(charge) -> bool:
                for f in (getattr(charge, "load_findings", ()) or ()))
 
 
+def _process_fragment(process) -> tuple[str, str]:
+    """#1372 : le texte d'une fiche Process pour le brief, et son diagnostic.
+
+    La projection courte de la carte, quand elle est lue, REMPLACE le texte
+    entier : la fin du canon (§12, §14…) n'est plus mangée par le début. Sinon
+    le texte entier est gardé (borné plus loin par le budget du bloc) et un
+    diagnostic DIT ce qui manque — jamais de coupe silencieuse."""
+    from . import canon as canon_mod
+    entete = ["### %s" % process.title,
+              "- responsible: %s" % process.responsible,
+              "- updated: %s" % process.updated]
+    if process.expire:
+        entete.append("- expire: %s" % process.expire)
+    proj = (getattr(process, "projection", "") or "").strip()
+    erreur = getattr(process, "projection_error", "") or ""
+    corps = (process.body or "").strip()
+    diag = ""
+    if erreur:
+        diag = ('the card "%s" carries an unusable short projection (%s): its '
+                "whole text is used instead" % (process.title, erreur))
+    elif proj:
+        if _octets(proj) > canon_mod.PROCESS_PROJECTION_MAX:
+            # #1372 : une projection au-delà de son budget est COUPÉE à ce
+            # budget (pas au budget du bloc) : le texte priorisé reste, sa fin
+            # est dite, et `canon check` demande de la raccourcir.
+            diag = ('the short projection of "%s" is too long (%d > %d bytes): '
+                    "cut to its budget" % (process.title, _octets(proj),
+                                           canon_mod.PROCESS_PROJECTION_MAX))
+            proj = _clip(proj, canon_mod.PROCESS_PROJECTION_MAX)
+        corps = proj
+    elif _octets(corps) > canon_mod.PROCESS_BODY_MAX:
+        diag = ('the card "%s" has no short projection (%d bytes of rules): '
+                "the brief keeps what fits" % (process.title, _octets(corps)))
+    return "\n".join(entete) + ("\n\n" + corps if corps else ""), diag
+
+
 def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
-                   host: str = "") -> str:
-    """#538 : le texte des fiches Process du canon DE L'AGENT, prêt pour un brief.
+                   host: str = "") -> tuple[str, list[str]]:
+    """#538 : le texte des fiches Process du canon DE L'AGENT, prêt pour un brief,
+    et les diagnostics de ce qui n'a pas pu être injecté (#1372).
 
     Le canon est celui qui **possède la ligne du registre** de l'agent
     (`canon_id`, la colonne `canon` ; NULL = canon par défaut), comme le rôle
@@ -324,7 +361,7 @@ def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
     Host) ; une fiche invalide n'est jamais injectée. Un canon illisible, ou
     dont la lecture des fiches a échoué, est dit, pas tu."""
     if not getattr(cfg, "canon", None):
-        return ""
+        return "", []
     try:
         from . import canon as canon_mod
         canons = canon_mod.load_configured(cfg)
@@ -333,28 +370,27 @@ def _process_rules(cfg: Config, *, agent: str = "", canon_id: str | None = None,
         owns = [c for c in canons if c.owns(canon_id)]
         charge = next((c for c in owns if agent and c.agent(agent) is not None), None)
         if charge is None:
-            return PROCESS_RULES_UNAVAILABLE if any(_rules_unreadable(c) for c in owns) else ""
+            return ((PROCESS_RULES_UNAVAILABLE, [])
+                    if any(_rules_unreadable(c) for c in owns) else ("", []))
         if _rules_unreadable(charge):
-            return PROCESS_RULES_UNAVAILABLE
+            return PROCESS_RULES_UNAVAILABLE, []
         if charge.untrusted:
-            return ""
+            return "", []
         from . import canon_sync
         if canon_sync.assess(charge, host)[0] != canon_sync.CANON_OK:
-            return ""
+            return "", []
     except Exception:
-        return ""
-    blocs = []
+        return "", []
+    blocs, diagnostics = [], []
     for process in getattr(charge, "processes", ()) or ():
         if not process.valid:
             continue
-        entete = ["### %s" % process.title,
-                  "- responsible: %s" % process.responsible,
-                  "- updated: %s" % process.updated]
-        if process.expire:
-            entete.append("- expire: %s" % process.expire)
-        corps = (process.body or "").strip()
-        blocs.append("\n".join(entete) + ("\n\n" + corps if corps else ""))
-    return "\n\n".join(blocs).strip()
+        texte, diag = _process_fragment(process)
+        if diag:
+            diagnostics.append(diag)
+        if texte:
+            blocs.append(texte)
+    return "\n\n".join(blocs).strip(), diagnostics
 
 
 def _clip_rules(rules: str, place: int) -> str:
@@ -362,30 +398,55 @@ def _clip_rules(rules: str, place: int) -> str:
     return _clip(rules, place) if _octets(rules) > place else rules
 
 
-def _rules_bloc(rules: str, limit: int) -> str:
-    """#538 : le bloc de règles (en-tête, règles, pied) borné à `limit` octets,
-    ou "" quand l'en-tête et le pied n'y tiennent déjà pas."""
+#: #1372 : préfixe des diagnostics de règles posés dans le bloc. Ils viennent
+#: APRÈS l'en-tête du bloc, donc ils survivent à la coupe qui emporte la fin du
+#: texte : la perte de règles est dite, jamais silencieuse.
+RULES_DIAG_PREFIX = "> rules: "
+
+
+def _diag_lines(diagnostics) -> str:
+    """Les diagnostics prêts à poser dans le bloc, ou ""."""
+    lignes = [RULES_DIAG_PREFIX + str(d).strip() for d in (diagnostics or ())]
+    return "\n".join(lignes) + "\n" if lignes else ""
+
+
+def _rules_bloc(rules: str, limit: int, diagnostics=()) -> str:
+    """#538/#1372 : le bloc de règles (en-tête, diagnostics, règles, pied) borné
+    à `limit` octets, ou "" quand l'en-tête et le pied n'y tiennent déjà pas.
+
+    Un diagnostic (#1372) est posé avant les règles ; si le bloc doit couper
+    les règles, une dernière ligne le DIT (et sa place est comptée)."""
     entete, pied = PROCESS_RULES_HEADER + "\n", "\n" + PROCESS_RULES_FOOTER
-    place = limit - _octets(entete) - _octets(pied)
+    diags = list(diagnostics or ())
+    diag = _diag_lines(diags)
+    place = limit - _octets(entete) - _octets(pied) - _octets(diag)
     if place <= 6:
         return ""
-    return entete + _clip_rules(rules, place) + pied
+    if _octets(rules) > place:
+        diags.append("the rules block is cut: %d bytes of rules, the end is not "
+                     "injected" % _octets(rules))
+        diag = _diag_lines(diags)
+        place = limit - _octets(entete) - _octets(pied) - _octets(diag)
+        if place <= 6:
+            return ""
+    return entete + diag + _clip_rules(rules, place) + pied
 
 
 def process_rules_block(cfg: Config, *, agent: str = "", canon_id: str | None = None,
                         host: str = "", limit: int = BRIEF_MAX_BYTES) -> str:
     """#538 : le bloc de règles prêt à ouvrir une session neuve, ou "".
 
-    Le bloc entier (en-tête, règles, pied) tient dans `limit` octets : une
-    première session ne part jamais avec un préfixe non borné (verdict codex
-    #510 r2, P2). Ne lève jamais : une erreur de mise en forme laisse l'appelant
-    sans règles plutôt que d'interrompre l'ouverture de session (revue codex
-    #510 r1, P1)."""
+    Le bloc entier (en-tête, diagnostics, règles, pied) tient dans `limit`
+    octets : une première session ne part jamais avec un préfixe non borné
+    (verdict codex #510 r2, P2). Ne lève jamais : une erreur de mise en forme
+    laisse l'appelant sans règles plutôt que d'interrompre l'ouverture de
+    session (revue codex #510 r1, P1)."""
     try:
-        rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
+        rules, diagnostics = _process_rules(cfg, agent=agent, canon_id=canon_id,
+                                            host=host)
     except Exception:
         return ""
-    return _rules_bloc(rules, limit) if rules else ""
+    return _rules_bloc(rules, limit, diagnostics) if rules else ""
 
 
 def _join_without_rules(avant: str, apres: str) -> str:
@@ -429,14 +490,19 @@ def with_process_rules(cfg: Config, text: str, *, agent: str = "",
     #510 r3, P2). Le texte garde au plus `BRIEF_TEXT_MIN_BYTES` : les règles ne
     l'effacent pas, la consigne d'un brief court reste entière.
 
+    #1372 : la carte peut porter une projection courte, injectée à la place du
+    texte entier ; ce qui n'a pas pu être injecté (projection absente, illisible
+    ou trop longue, bloc coupé) est DIT en tête du bloc.
+
     Ne lève jamais (revue codex #510 r1, P1)."""
     try:
         corps = _strip_process_rules(text)
-        rules = _process_rules(cfg, agent=agent, canon_id=canon_id, host=host)
+        rules, diagnostics = _process_rules(cfg, agent=agent, canon_id=canon_id,
+                                            host=host)
         if not rules:
             return corps
         garde = min(_octets(corps), BRIEF_TEXT_MIN_BYTES)
-        bloc = _rules_bloc(rules, BRIEF_MAX_BYTES - 2 - garde)
+        bloc = _rules_bloc(rules, BRIEF_MAX_BYTES - 2 - garde, diagnostics)
         if not bloc:
             return corps
         reste = BRIEF_MAX_BYTES - _octets(bloc) - 2
