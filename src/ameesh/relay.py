@@ -472,11 +472,16 @@ class UsageMeter:
                 and usage["output_tokens"] >= 0)
 
 
-def price_usage(usage: Usage, harness: str, prices: dict) -> float:
+def price_usage(usage: Usage, harness: str, prices: dict, started: float | None = None,
+                ended: float | None = None) -> float:
     """Coût en dollars : barème × jetons ; un modèle inconnu du barème est
-    facturé au majorant de sa famille (0019 §3, fail-closed)."""
+    facturé au majorant de sa famille (0019 §3, fail-closed). #513 : une
+    requête entièrement en heures creuses (`started` à `ended`) paie le prix
+    creux de son modèle."""
     model = usage.model or ""
     triplet = prices[model] if model in prices else cost_mod.max_price_of(prices, harness)
+    if model in prices:
+        triplet = cost_mod.period_price(prices, model, started, ended) or triplet
     return (usage.billed_input * triplet[0] + usage.cache_read_tokens * triplet[1]
             + usage.output_tokens * triplet[2]) / 1_000_000.0
 
@@ -801,10 +806,10 @@ class Relay:
         pending_all = sum(r["usd"] for r in self._unrecorded)
         pending_mine = sum(r["usd"] for r in self._unrecorded if r["agent"] == identity.agent)
         for window, cap in ((3600, book.hourly_usd), (86400, book.daily_usd)):
-            if cap and cap > 0 and book.spent("all", window, harnesses=paid) + pending_all >= cap:
+            if cap and cap > 0 and book.paid_spent(paid, window) + pending_all >= cap:
                 return "budget du mesh atteint (dépense non encore écrite comprise)"
         for window, cap in (book.agent_limits.get(identity.agent) or {}).items():
-            if cap and cap > 0 and (book.spent(identity.agent, window, harnesses=paid)
+            if cap and cap > 0 and (book.paid_spent(paid, window, identity.agent)
                                     + pending_mine) >= cap:
                 return "budget de l'agent %s atteint (dépense non encore écrite comprise)" \
                     % identity.agent
@@ -845,6 +850,7 @@ class Relay:
             if value:
                 headers[name] = value
         meter = UsageMeter(str(body.get("model") or ""))
+        started = time.time()
         turn = identity.turn or self._turn_header(handler)
         session = (handler.headers.get("x-deepseek-harness-session-id") or "").strip()
         session = session if _TURN_RE.match(session or "-") else ""
@@ -894,7 +900,8 @@ class Relay:
             conn.close()
             if reached and status == 200:
                 billed = settle(meter.usage, request_bytes, int(body.get("max_tokens") or 0))
-                self._record(identity, provider, billed, turn, session or None)
+                self._record(identity, provider, billed, turn, session or None,
+                             started=started)
 
     def _pipe_stream(self, handler, response, meter: UsageMeter) -> None:
         sent = 0
@@ -930,11 +937,12 @@ class Relay:
 
     # -- grand livre --------------------------------------------------------
     def _record(self, identity: Identity, provider: str, usage: Usage, turn: str | None,
-                session: str | None) -> None:
+                session: str | None, started: float | None = None) -> None:
         harness = PROVIDERS[provider]["harness"]
         row = {"agent": identity.agent, "harness": harness, "turn": turn,
                "model": usage.model or None, "session": session,
-               "usd": round(price_usage(usage, harness, self.prices), 6),
+               "usd": round(price_usage(usage, harness, self.prices, started,
+                                        time.time()), 6),
                "input_tokens": usage.billed_input,
                "cached_input_tokens": usage.cache_read_tokens,
                "output_tokens": usage.output_tokens,

@@ -379,6 +379,11 @@ class AnnouncedModelTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #513 : ces tours passent à l'heure réelle ; le prix creux est testé
+        # par test_l513_deepseek_offpeak, ici on facture toujours la pointe
+        periods = mock.patch.dict(cost.PRICE_PERIODS, clear=True)
+        periods.start()
+        self.addCleanup(periods.stop)
         self.name = "annonce"
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM spend_pending WHERE agent = %s", (self.name,))

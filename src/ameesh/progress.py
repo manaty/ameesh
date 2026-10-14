@@ -457,32 +457,6 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
 # budget
 # --------------------------------------------------------------------------
 
-def _effective_pace(gauges: list, accounts: list[dict] | None) -> dict:
-    """{(harnais, fenêtre) : (multiplicateur, plafond effectif)} (#1227 N3).
-
-    `accounts.report` porte le plafond effectif par compte (#1176) ;
-    `book.gauges()` ne nomme pas le compte de son relevé. On ne s'en sert donc
-    que quand un seul compte déclaré du harnais porte la fenêtre : plusieurs
-    comptes, ou aucune information, gardent le défaut (90 %, ×1) — jamais un
-    plafond attribué au hasard.
-    """
-    keys = {(g.harness, g.key) for g in gauges}
-    found: dict = {}
-    for row in accounts or []:
-        harness = row.get("harness")
-        multiplier = float(row.get("pace_multiplier") or 1.0)
-        for gauge in row.get("gauges") or []:
-            key = (harness, gauge.get("key"))
-            if key not in keys:
-                continue
-            ceiling = float(gauge.get("pace_ceiling") or cost_mod.PACE_CEILING)
-            if key in found and found[key] != (multiplier, ceiling):
-                found[key] = None            # plusieurs comptes : ambigu
-            else:
-                found.setdefault(key, (multiplier, ceiling))
-    return found
-
-
 def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
                  paid_harnesses: Iterable[str] | None = None,
                  hourly_cap: float = cost_mod.DEFAULT_HOURLY_USD,
@@ -498,6 +472,13 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     (`balance.compare`). `accounts` : tous les comptes déclarés de l'hôte,
     toutes leurs fenêtres, la capacité perdue à la prochaine remise à zéro et
     le prochain compte choisi (`accounts.report`, L74).
+
+    `plans` : un plan par jauge. Pour un harnais **sans** compte déclaré, la
+    jauge vient de `gauges` et le rythme est nominal (1.0) ; pour un harnais à
+    comptes déclarés, le plan est celui du compte **actif** — sa jauge
+    (`accounts.report`, `_gauges`) et son `pace_multiplier`, jamais un
+    croisement des deux (#1028 P2). Le rendu texte écarte ces harnais, déjà
+    montrés compte par compte.
     """
     # Les harnais payés au token viennent des descripteurs (L16) : plus de liste
     # fermée dans le code. `None` = les relire maintenant.
@@ -534,18 +515,26 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     for bucket in spend.values():
         for key in bucket:
             bucket[key] = round(bucket[key], 6)
-    settings = _effective_pace(gauges, accounts)
-    plans = []
-    for g in gauges:
-        multiplier, ceiling = (settings.get((g.harness, g.key))
-                               or (1.0, cost_mod.PACE_CEILING))
-        plans.append({
-            "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-            "pace_cap": round(g.pace_cap(now, multiplier, ceiling), 4),
-            "elapsed": round(g.elapsed(now), 4),
-            "resets_ts": _round(g.resets_at), "window_s": g.window_s,
-            "exceeded": g.exceeded(now, 0.0, multiplier, ceiling),
-        })
+    # #1075/#1028 : le plan d'un harnais à comptes déclarés est celui de son
+    # compte ACTIF — ses jauges (`accounts.report`, `_gauges`) et son rythme
+    # (`pace_multiplier` du profil). Appliquer le rythme du compte actif aux
+    # jauges du dossier par défaut mélangerait deux comptes : `used`,
+    # `pace_cap` et `exceeded` ne décriraient plus aucun compte (R1 #1028,
+    # P2). Le rendu texte écarte ces harnais, déjà montrés compte par compte ;
+    # le JSON garde la même valeur qu'`accounts.report`.
+    # #1227 N3 : le plafond de rythme lu est le plafond effectif du compte
+    # (`pace_ceiling`, relèvement de fin de fenêtre #1176), pas le 0,90 par
+    # défaut ; il vient du même relevé que la jauge affichée.
+    actifs = {row["harness"]: row for row in (accounts or []) if row.get("active")}
+    plans = [_plan_view(g, now, 1.0, cost_mod.PACE_CEILING)
+             for g in gauges if g.harness not in actifs]
+    for harness, row in actifs.items():
+        multiplicateur = float(row.get("pace_multiplier") or 1.0)
+        plafonds = {item.get("key"): item.get("pace_ceiling")
+                    for item in row.get("gauges") or []}
+        plans.extend(_plan_view(g, now, multiplicateur,
+                                float(plafonds.get(g.key) or cost_mod.PACE_CEILING))
+                     for g in row.get("_gauges") or [])
     return {
         "currency": "USD",
         "paid_harnesses": list(paid),
@@ -555,6 +544,18 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "by_agent": [r for r in by_agent if r["usd"] or r["turns"] or r["failed_turns"]],
         "plans": plans,
         "accounts": [_account_view(row) for row in (accounts or [])],
+    }
+
+
+def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float,
+               ceiling: float = cost_mod.PACE_CEILING) -> dict:
+    """Un plan de `budget.plans` : la jauge, son rythme et son plafond effectif."""
+    return {
+        "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
+        "pace_cap": round(g.pace_cap(now, multiplier, ceiling), 4),
+        "elapsed": round(g.elapsed(now), 4),
+        "resets_ts": _round(g.resets_at), "window_s": g.window_s,
+        "exceeded": g.exceeded(now, 0.0, multiplier, ceiling),
     }
 
 

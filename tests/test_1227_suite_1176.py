@@ -115,21 +115,29 @@ class UntilUnderRaiseTest(unittest.TestCase):
 
 
 class ProgressPaceSettingsTest(unittest.TestCase):
-    """N3 : `progress` lit le plafond effectif du compte déclaré."""
+    """N3 : `progress` lit le plafond effectif du compte déclaré.
 
-    def _account(self, **over):
-        row = {"harness": "codex", "account": "secondaire", "pace_multiplier": 2.0,
-               "gauges": [{"key": "codex-10080min", "pace_ceiling": 0.98,
+    #1227 × #1342 : le plan d'un harnais à comptes déclarés est celui de son
+    compte ACTIF (#1028 P2) ; le plafond effectif (`pace_ceiling`, #1176) se
+    lit sur la même ligne de compte.
+    """
+
+    def _account(self, gauge, **over):
+        """Une ligne d'`accounts.report` : le compte actif porte ses jauges."""
+        row = {"harness": "codex", "account": "secondaire", "active": True,
+               "pace_multiplier": 2.0,
+               "gauges": [{"key": gauge.key, "pace_ceiling": 0.98,
                            "ceiling_reason": accounts.CEILING_REASON_END,
-                           "used": 0.95, "last_used": 0.95, "cap": 0.98,
-                           "elapsed": 0.98, "resets_at": NOW + 3 * HOUR,
-                           "reset_passed": False}]}
+                           "used": gauge.used, "last_used": gauge.used, "cap": 0.98,
+                           "elapsed": gauge.elapsed(NOW), "resets_at": gauge.resets_at,
+                           "reset_passed": False}],
+               "_gauges": [gauge]}
         row.update(over)
         return row
 
     def test_the_effective_ceiling_is_used(self):
         gauge = _gauge(0.95, before_reset=3 * HOUR)
-        b = progress.build_budget([], [gauge], NOW, accounts=[self._account()])
+        b = progress.build_budget([], [gauge], NOW, accounts=[self._account(gauge)])
         plan = b["plans"][0]
         self.assertAlmostEqual(plan["pace_cap"], 0.98)
         self.assertFalse(plan["exceeded"])          # 95 % sous le plafond relevé
@@ -141,11 +149,15 @@ class ProgressPaceSettingsTest(unittest.TestCase):
         self.assertAlmostEqual(plan["pace_cap"], cost.PACE_CEILING)
         self.assertTrue(plan["exceeded"])           # 95 % au-dessus des 90 % par défaut
 
-    def test_two_accounts_disagreeing_keep_the_default(self):
+    def test_declared_accounts_without_an_active_one_keep_the_default(self):
+        # #1028 P2 : deux comptes déclarés qui divergent, aucun actif -> la
+        # jauge et le plafond restent nominaux, jamais ceux d'un compte tiré au
+        # hasard (l'ancien mécanisme #1227 `_effective_pace`).
         gauge = _gauge(0.95, before_reset=3 * HOUR)
-        other = self._account(account="tertiaire")
-        other["gauges"] = [dict(other["gauges"][0], pace_ceiling=0.92, cap=0.90)]
-        b = progress.build_budget([], [gauge], NOW, accounts=[self._account(), other])
+        secondaire = self._account(gauge, active=False, account="secondaire")
+        tertiaire = self._account(gauge, active=False, account="tertiaire")
+        tertiaire["gauges"] = [dict(tertiaire["gauges"][0], pace_ceiling=0.92, cap=0.90)]
+        b = progress.build_budget([], [gauge], NOW, accounts=[secondaire, tertiaire])
         plan = b["plans"][0]
         self.assertAlmostEqual(plan["pace_cap"], cost.PACE_CEILING)
         self.assertTrue(plan["exceeded"])

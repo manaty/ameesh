@@ -634,14 +634,19 @@ change.
 earlier, so that the margin left is for the critical ones:
 
 * on a plan, a non-critical agent stops 10 points below the pace cap
-  (`accounts.RESERVE`). With a 90 % pace cap it stops at 80 %: min(80 %,
-  elapsed), no head start above the linear pace (mesh-design, 2026-10-12).
-  The short window cap, when set, is lowered the same way, and never exceeds
-  min(80 %, elapsed) for a non-critical agent. The fixed caps (50 % of the
-  primary, `cap`, `overage_cap`) are not: they hold for everyone. The reason
-  then says "10 points kept for critical agents". This holds with or without
-  declared accounts. It also holds on a host with no critical agent: the
-  reserve is then simply not used;
+  (`accounts.RESERVE`): `max(min(80 %, elapsed × m), 10 %)` — the pace cap
+  `min(90 %, elapsed × m + 10)` minus the reserve, floored at the 10-point
+  margin. The reserve never blocks the start of a window (#777): while
+  `elapsed × m` is at most the 10-point margin, the threshold is the margin,
+  not `elapsed × m` (the plain reserve subtraction, which would block at
+  1 %); beyond it the threshold follows `elapsed × m`, and the end-of-window
+  cap is 80 % (90 % − 10), not more (mesh-design, 2026-10-12; #1028). The
+  short window cap, when set, is lowered the same way, and never exceeds that
+  threshold for a non-critical agent. The fixed caps (50 % of the primary,
+  `cap`, `overage_cap`) are not: they hold for everyone. The reason then says
+  "10 points kept for critical agents". This holds with or without declared
+  accounts. It also holds on a host with no critical agent: the reserve is
+  then simply not used;
 * on pay-per-token, a non-critical agent stops at `noncritical_hourly_share`
   of the mesh hourly cap. The setting is in the host configuration
   (`AMEESH_NONCRITICAL_HOURLY_SHARE`; between 0 and 1; default 0.75, a

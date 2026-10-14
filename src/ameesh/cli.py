@@ -7,8 +7,10 @@
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
-                                                 from an orchestrator, --lot assigns the work item
-                                                 to the recipient and --new-lot creates it (L118),
+                                                 from a declared orchestrator, --lot hands an
+                                                 unassigned work item to the recipient — an item
+                                                 already assigned to an agent needs a declared
+                                                 role or a human (#859) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
                                                  refused to a name not in the registry (close
@@ -213,6 +215,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     expires = None
     lot = None
     new_lot = None
+    parent_lot = None
     app = None
     kind = "notify"
     urgent = False
@@ -235,7 +238,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--parent-lot",
+                 "--kind", "--estimate", "--app"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -250,6 +254,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 lot = value
             elif flag == "--new-lot":
                 new_lot = value if value is not None else ""
+            elif flag == "--parent-lot":
+                parent_lot = value if value is not None else ""
             elif flag == "--estimate":
                 estimate = value if value is not None else ""
             elif flag == "--app":
@@ -284,7 +290,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
-              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]]] "
+              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
+              "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
@@ -313,6 +320,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
               "existing one: ameesh work plan <id> --estimate 2h)", file=sys.stderr)
         return 2
+    if parent_lot is not None and new_lot is None:
+        print("--parent-lot goes with --new-lot (the parent of the created suite; for an "
+              "existing lot: ameesh work dependencies <id> --add <parent>)", file=sys.stderr)
+        return 2
+    if parent_lot is not None:
+        number = str(parent_lot).strip().lstrip("#")
+        if not number.isdigit() or int(number) <= 0:
+            print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
+            return 2
+        parent_lot = int(number)
     dest, text = args[0], " ".join(args[1:]).strip()
     binding = None
     if not sender:
@@ -434,7 +451,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project)
+                estimate=estimate, app=app, new_project=new_project,
+                parent_lot=parent_lot)
         except assignments.AssignmentError as exc:
             print("message not delivered — %s" % exc, file=sys.stderr)
             return 2

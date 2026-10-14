@@ -832,10 +832,17 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
     non-critical agent): the pace cap, or the short window cap that replaces
-    it, is lowered by `RESERVE`, and never exceeds the pace cap minus
-    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered. #777 :
-    la réserve ne s'applique pas sous `PACE_MARGIN` d'écoulé — le plafond de
-    rythme y vaut `max(écoulé, marge)`, il ne bloque pas le début de fenêtre.
+    it, is lowered by `RESERVE` —
+    `max(min(PACE_CEILING, multiplier × elapsed + PACE_MARGIN) − RESERVE,
+    PACE_MARGIN)` — and the fixed caps are not lowered. #777 : tant que
+    `multiplier × elapsed ≤ RESERVE` (soit `≤ PACE_MARGIN` quand la réserve
+    vaut la marge) la réserve ne s'applique pas, le plafond de rythme y vaut
+    la marge (10 points) et non `multiplier × écoulé + marge − RESERVE` — à
+    8 % d'écoulé avec `multiplier = 2` il vaut 16 % (#1028 P3) ; l'énoncé de
+    la décision du propriétaire (« plafond = max(écoulé, marge) ») décrit ce
+    début de fenêtre. En fin de fenêtre le seuil vaut
+    `PACE_CEILING − RESERVE` (80 %), il ne suit plus `max(écoulé, marge)`
+    (#1028 N1).
 
     `ceilings` (#1176, `pace_ceilings`) : les plafonds effectifs déjà
     calculés pour ce compte ; sans eux, ils le sont ici. Le plafond de rythme
@@ -1448,8 +1455,10 @@ def report(cfg, db, book, *, now: float | None = None,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
-                # #1227 N3 : les lecteurs d'affichage (`progress`) recalculent
-                # le plafond de rythme du compte, pas seulement sa valeur
+                # #1075/#1028 : le rythme du compte, pour les affichages qui
+                # lisent ses jauges hors d'`evaluate` (cost.report, progress) ;
+                # #1227 N3 : ils recalculent aussi son plafond de rythme
+                # (`pace_ceiling`, #1176), pas seulement sa valeur.
                 "pace_multiplier": profile.pace_multiplier,
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
