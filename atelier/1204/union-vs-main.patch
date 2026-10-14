@@ -1,0 +1,1626 @@
+diff --git a/docs/EXECUTEUR-MEDIEE.md b/docs/EXECUTEUR-MEDIEE.md
+index 0d6aca8a2..a906548cf 100644
+--- a/docs/EXECUTEUR-MEDIEE.md
++++ b/docs/EXECUTEUR-MEDIEE.md
+@@ -15,7 +15,7 @@ en silence.
+ 
+ | Fichier | Rôle |
+ |---|---|
+-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 296 refusées |
++| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 322 refusées |
+ | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
+ | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
+ | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
+@@ -63,8 +63,8 @@ Comptes : 63 opérations, dont 25 lectures et 38 écritures. 53 passent par
+ lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
+ servies aussi par `session/op`. Le test
+ vérifie que chaque ligne existe dans `storage.interface` avec la même
+-signature et les mêmes types. Il vérifie aussi que l'interface entière (377
+-opérations après intégration de main et de #330) est classée, admise ou refusée. Toute opération ajoutée à
++signature et les mêmes types. Il vérifie aussi que l'interface entière (385
++opérations) est classée, admise ou refusée. Toute opération ajoutée à
+ l'interface fait donc échouer le test tant qu'elle n'est pas classée.
+ 
+ `turn_resources.running_started_before` est une lecture de portée H :
+@@ -76,12 +76,13 @@ Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
+ qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
+ 
+ Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
+-l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
+-L96), `turn_costs.correct`, `ledger`, `spent_between` (grand livre, L95),
+-`operations.assigners`, `latest_gauges` (sous-utilisation, L94),
+-`hosts.usage` et `turn_resources.get`. Un exécuteur médié ne fait ni ménage
+-local ni passage périodique de ménage : son dossier de travail est effacé en
+-fin de bail.
++l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
++`roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
++`spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
++(sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
++`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
++exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
++dossier de travail est effacé en fin de bail.
+ 
+ Les deux opérations de L31b (`leases.hold_note`, `leases.release_hold` :
+ l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index 97b6d1c39..d4f0d7b88 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -789,6 +789,24 @@ ameesh watch send --agent A                   # one firing: what the timer runs
+   `work move --correct`: a watch makes its agent take a turn every period.
+ * `enable` warns when a hand-written watch (`ameesh-veille-<A>.timer`) is still
+   installed: disable it (`systemctl --user disable --now …`) and remove its files.
++* A hand-written unit (a watch, a merge watcher, a follow-up script) does not
++  get the login `PATH`: `~/.local/bin` is absent, so a bare `ameesh …` dies
++  with `Errno 2` and the wake-up it carried is lost. Call the account's
++  `ameesh` by absolute path (`~` is not expanded either:
++  `/home/<user>/.local/bin/ameesh`), or pin it in the unit
++  (`Environment=PATH=/home/<user>/.local/bin:/usr/local/bin:/usr/bin:/bin`).
++  A hand-written unit carries no agent identity either: `mail send` and
++  `work note` fail with `unbound sender` unless `AGENT_MAIL_NAME=<agent>` is
++  exported. Prefer `ameesh watch enable` when a plain periodic watch fits.
++* A unit written by hand must be **enabled from a file** to survive a reboot: a
++  `systemd-run --user --unit=…` instance is transient (it lives under
++  `/run/user/<uid>/systemd/transient/`), so the next boot forgets the watch and
++  the wake-up it carried is lost without a trace. Write
++  `~/.config/systemd/user/<name>.service`, enable it
++  (`systemctl --user enable --now <name>`, which creates the
++  `default.target.wants/` symlink) and check what is loaded with
++  `systemctl --user show <name> -p FragmentPath --value`;
++  `ameesh watch enable` already writes durable units.
+ 
+ ## Vue par projet — `ameesh projects [--json]` (`ameesh-projects/1`, L62)
+ 
+diff --git a/docs/design/etudes/index.md b/docs/design/etudes/index.md
+index fd5f09828..fb7635f97 100644
+--- a/docs/design/etudes/index.md
++++ b/docs/design/etudes/index.md
+@@ -20,4 +20,5 @@
+ * [Autonomous host provisioning](l232-autonomous-host-provisioning.md) - L232: recoverable agent moves between lots, SSH code and systemd delivery, mesh-store API secrets, per-host OAuth browser approvals, reserved owner decisions and four dated implementation lots.
+ * [Real trial of Hermes with DeepSeek](l153-hermes-deepseek-trial.md) - L153: Hermes Agent and dsh on deepseek-flash, same two tasks, two runs each: tie on fidelity and cost, dsh slightly faster, Hermes about 1.3 GB per host and not wired into ameesh; stay on dsh, Hermes kept as an ACP fallback.
+ * [mergiraf pilot](l160g-mergiraf-pilot.md) - L160g: the syntactic merge driver replayed on 115 conflicting merges of ameesh and Nexlink: 16 fully resolved, 13 wrong results (duplicated additions, lost changes, code that does not compile, markers left in); not adopted, for any language.
++* [Multi-project agents and default naming](l243-projects-and-names.md) - L243 (#419): `projects:` on Agent cards with `team` as the primary project, consumers by membership, default name `<org>-<repo>-<role>-<seq>` with segments from the federation file; lots #435, #810, #811 and #468.
+ * [QA role and QA sign-off](l244-qa-role.md) - L244 (#420): `qa` canon role, `qa` milestone bound to the current delivery in the IT module, separation of duties, opt-in `require_qa` gate, notices to QA holders; lots L244-1 to L244-3 for DeepSeek.
+diff --git a/docs/design/etudes/l243-projects-and-names.md b/docs/design/etudes/l243-projects-and-names.md
+new file mode 100644
+index 000000000..15b721dce
+--- /dev/null
++++ b/docs/design/etudes/l243-projects-and-names.md
+@@ -0,0 +1,136 @@
++---
++type: Study
++title: "Multi-project agents and the default agent naming"
++description: "L243 (lot #419): a `projects:` list on Agent cards, consumers that stop assuming one project per agent, and the default name <org>-<repo>-<role>-<seq>; four implementation lots."
++status: draft
++tags: [canon, agents, projects, naming]
++generated: { by: "mesh-design", at: "2026-10-12" }
++---
++
++# Design for lot #419
++
++Owner validation, 2026-10-12 15:05 (relayed by bureau, #10433):
++- (1) an agent can work on several projects;
++- (2) new agents get the name `<org>-<repo>-<role>-<seq>`;
++- (3) existing agents are renamed, keeping their old names as aliases. This
++  is lot #423 (L243b) and is out of scope here.
++
++## Where we start
++
++An Agent card has a single `team:` (`canon.py`, `Agent.team`). It is synced
++to `agent_registry.team` (migration 0008). About twenty consumers read it, and
++every one of them expects a single string. Most fall back to `chantier`.
++
++- Pick-up: `backlog.lot_fits` and `backlog.fits` compare the lot's team
++  (`coalesce(w.team, package.team, parent.team, w.app)`) with `agent.team`.
++- Orchestrators: `backlog._team_orchestrators`, `alert_briefs._of_teams` and
++  `sous_utilisation` keep the orchestrators whose team is the agent's team.
++- Display: `projects.agent_project` and `fil.agent_project` (plus the
++  `mailbox.PROJECT_SQL` copy of the same rule) give one project per agent.
++  `ameesh projects`, `mesh list` and the threads use it.
++- Work directory: `policy.work_dir(agent.team, agent.title)`.
++
++## (1) `projects:` on Agent cards
++
++```yaml
++title: mty-amh-impl-01
++projects: [ameesh, nexlink]   # first = primary project
++team: ameesh                  # still read when projects: is absent
++```
++
++- **Effective projects.** If `projects:` is present, it is used. Otherwise
++  `[team]`, then `[chantier]`, then `[]`. When both `projects:` and `team:` are
++  set and `team` is not `projects[0]`, the canon check reports
++  `agent-team-mismatch` as an error. A card never carries two truths.
++- **Storage.** A new column `agent_registry.projects text[]` is added, and
++  `projects` joins the `DECLARATIVE` set of `canon_sync`. `team` keeps being
++  written as `projects[0]`, so consumers that need only one value keep reading
++  the primary project unchanged. Nothing reads `chantier` for canon-governed
++  agents any more.
++- **Validation.** An unknown project gives an `agent-project-unknown` warning.
++  A project is known when it appears in the federation's `projects`, in
++  `github.projects` or in a lot's `app`. Duplicates in the list are an error.
++- **Consumers.** Each of these changes from "equal to the team" to "member of
++  `projects`":
++  - pick-up (`lot_fits`, `fits`);
++  - orchestrator selection (`_team_orchestrators`, `alert_briefs`,
++    `sous_utilisation`);
++  - `roadmap --project` for agents;
++  - `progress` (`r.team = %s` becomes `%s = any(r.projects)`).
++
++  In `ameesh projects`, an agent appears in the group of every project it
++  belongs to. Only its primary group carries its cost, so totals are not
++  counted twice; the other groups mark it `(+)`. The `mesh list` project
++  column shows `ameesh+1`.
++- **Threads and mail.** These do not change. A message about a lot goes to the
++  lot's project (`app`/`workstream` first, as today). A message without a lot
++  goes to the sender's primary project.
++- **Pick-up order.** Each turn, a multi-project agent looks at the unassigned
++  lots of all its projects with the existing ordering: priority, then age. The
++  canon can make one project win ties with `project_weight: {nexlink: 2}`.
++  This is deferred until someone needs it; there is no field for it today.
++- **Work directories.** The agent's `cwd` stays the work directory of its
++  primary project. A lot from another project gets its worktree under that
++  project's work root, `policy.work_dir(lot_project, agent)`. Its session is
++  opened there through the per-lot sessions of #408 (L165b, merged:
++  `agent_lot_sessions`, migration 0384), which store `cwd` per (agent, lot).
++  Until #811 is merged, a multi-project agent only picks up lots from its
++  primary project automatically. Lots from other projects must then be
++  assigned to it explicitly.
++
++## (2) Default name `<org>-<repo>-<role>-<seq>`
++
++- **Segments.** They are declared in the canon's federation file, so each
++  organisation chooses its own:
++
++  ```yaml
++  extensions:
++    ameesh:
++      naming:
++        org: mty
++        projects: {ameesh: amh, nexlink: nxl}
++        roles: {implementer: impl, designer: conc, qa: qa, reviewer: rev,
++                orchestrator: orch, operator: ops}
++  ```
++
++  The segments are lower-case `[a-z0-9]{2,6}`. When a project has no short
++  name, its name is used truncated to 6 characters. Role keys are the roles of
++  #414 (L242c, home#25). A role with no short name is refused, so a name is
++  never guessed.
++- **Form.** A single-project agent is named `mty-amh-impl-01`. A
++  multi-project agent drops the repo segment: `mty-impl-01`. The sequence has
++  two digits (three after 99). It counts per prefix, and a number is never
++  reused: retired names stay reserved, because mail, threads and lots keep
++  referring to them. The harness is never part of the name. `NAME_RE` already
++  accepts these names.
++- **Generator.** `ameesh canon agent name --role implementer
++  [--project ameesh …]` prints the next free name. The candidates are checked
++  against every card, every registry row (including stopped agents) and every
++  alias (#423). `canon agent spawn` uses the same generator when no name is
++  given.
++- **Check.** A new card whose title does not follow the convention gets an
++  `agent-name-convention` warning, not an error. Existing names stay valid
++  until #423, and an organisation without a `naming:` block gets no warning at
++  all.
++
++## Lots
++
++Implementation goes to DeepSeek agents, at the owner's request of 12/10
++14:46. Every PR is reviewed by Codex. Durations are design estimates.
++
++| Lot | Content | Depends on | Estimate | State (13/10) |
++|---|---|---|---|---|
++| #435 | Card field, validation (`agent-team-mismatch`, `agent-project-unknown`), migration `projects text[]` (0388), sync with `team = projects[0]`, both drivers and grants | — | 3 h | merged |
++| #810 | Consumers: pick-up, orchestrators, alert briefs, idle-capacity briefs, `roadmap --project`, `progress`, `ameesh projects` and `mesh list` display | #435 | 3 h | intake |
++| #811 | Work directory per lot project, session `cwd` taken from the lot (`agent_lot_sessions`) | #810 | 2 h | intake |
++| #468 | `naming:` block, generator `canon agent name`, `spawn` without a name, `agent-name-convention` warning, reserved retired names | #414 | 3 h | merged |
++
++#423 (renaming with aliases) uses the names of #468 and adds the alias layer.
++
++## Out of scope
++
++- Renaming the existing agents: #423.
++- Per-project budgets for one multi-project agent. Today the cost is counted
++  in the primary project.
++- Weighting pick-up between projects (`project_weight`). Deferred until there
++  is a need.
+diff --git a/reviews/2026-10-14-1204-manifeste-vague-suivante.md b/reviews/2026-10-14-1204-manifeste-vague-suivante.md
+new file mode 100644
+index 000000000..904b748b9
+--- /dev/null
++++ b/reviews/2026-10-14-1204-manifeste-vague-suivante.md
+@@ -0,0 +1,262 @@
++# Vague suivante — manifeste de composition (préparation #1204)
++
++mty-amh-docs-01, 14/10/2026 ~03:1xZ ; corrigé 14/10 ~03:10Z sur qualification du pilote
++(mesh-design, 14/10 03:06Z). Mandat : lot #1204 (mesh-design, source canon
++`processus/lots.md` §12, suite #1112). Départ : contre-épreuve docs-01
++`review/docs01-vague-suivante-d8de2a583 @1f250d328`. **Préparation et gel : aucun feu de
++fusion ni de déploiement ; la CI complète se lance une seule fois, en `workflow_dispatch`
++sur le SHA gelé de cette branche (§7).**
++
++## 1. Base et gel
++
++- Base : `64b22e2ee5c5dc43477dee51db23edc182cf6eb1` (arbre
++  `174b262a54de0bb147e07652d7aabd5b5eeaa42a`), vérifiée par `git fetch` juste avant la
++  composition. Elle contient #1112 (`afa32932e`), puis #1018, #672, #749, #713, #824.
++- Branche de préparation : `integration/vague-suivante-1204`, partie de cette base.
++- Têtes des neuf candidats **inchangées** au relevé qui suit (elles l'étaient aussi sur
++  les deux bases précédentes) : la qualification `@ae4097789` reste lisible, seule la
++  base a bougé.
++- Cette composition **remplace** l'arbre `8d530d2bc782` de `@1f250d328` (périmé après
++  #672/#749) : mêmes règles, base neuve, exclusions du mandat appliquées.
++- Gel final : le SHA de tête de `integration/vague-suivante-1204` après le commit de
++  correction de ce manifeste (documentation seule ; les 10 blobs des lots sont
++  revérifiés constants après ce commit, §6). Le run CI unique s'épingle à ce SHA.
++
++## 2. Composition (ordre, SHA, arbres)
++
++| # | lot | PR | tête gelée | merge-base | merge commit | arbre après l'étape |
++|---|---|---|---|---|---|---|
++| 1 | #287 | 672 | `a2e3c60de1815ace352968e36247af2610751d18` | `b132d5d4397efdd7ba05e7682bdbf68eab61703e` | `2fb32898ff60d734b0b6383f95ed4a4acc73f63e` | `45859018e8c7f9e29b736cf5322be65152797043` |
++| 2 | #419 | 402 | `79ebee0636f6002d0b947fc85e62e09f39659abe` | `7f1e7b5f001d3614a94b3038bed99d4b2f7eb367` | `ecaaa78f714bdc3bf404b88cfb1ff45e05325d5d` | `fea054a468473a2a166e067b2a645d49190dbb24` |
++| 3 | #857 | 700 | `c1d3271c82bad1273b7035313cc3bb0ba53338cb` | `afa32932e72c459bf1d23314912647b23b306b73` | `945469aab0ea359c4f1efc29af59c0cb51b7cb6b` | `3fbfb61b2681dd7aab60621230a204f8e32d90c8` |
++| 4 | #1019 | 791 | `9dfcb03e146d9e206efa3dcb4c03fc6a340e0efe` | `b85777c1e3e757b9ba0caa8cef49b0db1558b251` | `10aa2a2b3a1d75c22473b60b6517d5ecec3a70a4` | `e0f0cf643ab6018b77768c16afc8d2484050d55b` |
++| 5 | #1038 | 806 | `5bc72a02e9addbbec861b288e38f74e94f2e7866` | `b85777c1e3e757b9ba0caa8cef49b0db1558b251` | `c1d1cf81c25f37c2c1090696f03259e4e1e6c0c0` | `e52ff7c42425e0cc962a4a47fb835ebc3f257e28` |
++| 6 | #1048 | 808 | `1e7475317f839a762bb9d894d26a1cc1853e7d06` | `b85777c1e3e757b9ba0caa8cef49b0db1558b251` | `8a7cdee154c368c7564c1de8b5e11ce31825d65e` | **`b6606f0bc9f91db77e678ac12b9dd5a5e78538ef`** |
++
++- **Arbre du paquet (lots) : `b6606f0bc9f91db77e678ac12b9dd5a5e78538ef`**, tête
++  `8a7cdee154c368c7564c1de8b5e11ce31825d65e`. Le commit qui porte ce manifeste (et sa
++  correction sur go pilote) est ajouté **après** la composition (documentation seule) :
++  c'est le SHA gelé sur lequel la CI unique tourne, sans changer le contenu des lots.
++- Aucun conflit : les six fusions sont propres (`git merge --no-ff`), y compris les deux
++  fichiers partagés (`docs/EXECUTEUR-MEDIEE.md` par #1019 puis #1038 ;
++  `docs/EXPLOITATION.md` par main puis #1048).
++- Le delta complet base → arbre du paquet est **exactement 10 fichiers**, ceux des lots
++  inclus (aucun fichier étranger).
++
++## 3. Lots inclus (classe, dépendances, avis, contenus)
++
++Les avis sont datés en UTC. Famille = harnais réellement exécuté (canon §11) ; la session
++n'est citée que lorsqu'elle est consignée dans le registre ou le fil.
++
++### #287 — `ameesh chat <agent>` (PR 672, tête `a2e3c60de181`)
++
++- Classe : **sensible hors prod** — vie privée (`src/ameesh/chat.py`), donc une relecture
++  par une autre famille + feu du pilote.
++- Dépendances : #880, #925 fusionnés (contenu dans la base) — satisfaites.
++- R1 : mty-amh-impl-02, **famille DeepSeek** (agent indépendant, autre chantier), GO 0 B /
++  1 N P3 (tours dupliqués à l'affichage) + 2 remarques, 13/10 12:39Z, sur `a2e3c60` ;
++  16 tests purs verts sur la tête, exercice réel en lecture seule. N1 → lot de suite #887.
++- Feu pilote : mesh-design (Codex), 13/10 12:47Z (14:47 CEST) — « fusion des CI exacte
++  verte sur a2e3c60 », accordé explicitement au titre du repli **18855a**.
++- Contenu intégré : `src/ameesh/chat.py` `69e638a9fb42a9f1afb2ce59eeaeb314aeb1ca91` ;
++  `tests/test_l79_chat_terminal.py` `5fd448e98a112ebb8d0c0969e1c1d694dcbf3a9a` — blobs
++  **identiques** à la tête relue (constance).
++- Famille de la R1 — **tranché par le pilote (14/10 03:06Z), réserve levée** : l'avis et
++  le feu sont conservés comme **historiques** sur `a2e3c60` ; ils ont été acquis sous la
++  décision 18855a quand le repli s'appliquait, les blobs relus sont exactement constants
++  (ci-dessus) et **aucun nouvel avis n'est donné sous le repli actuel**. Voir §5.1.
++
++### #419 — L243 projets et noms, étude (PR 402, tête `79ebee0636f6`)
++
++- Classe : **légère** (deux fichiers `docs/design/etudes/`).
++- Dépendances : #843, #854, #880, #925 — satisfaites ; #843 est vérifiée **par contenu**
++  sur la base finale (`os.replace` présent dans `tests/test_476_ownership_races.py` de
++  main), comme l'exigeait la décision pilote du 13/10 23:20Z.
++- Relecture d'auteur : docs-01 (DeepSeek), verdict N 0 B, 13/10 11:43Z sur `f31a947b69`
++  — même famille que l'auteur, ne compte pas comme avis « autre famille » ; non requise
++  avant fusion pour un lot léger (§2).
++- Contenu intégré : `docs/design/etudes/index.md`
++  `0b3e711e17fd4f2fca527c1fc5aad032a51d4998` ; `docs/design/etudes/l243-projects-and-names.md`
++  `15b721dcec7f58e530139ad12192310e3fffd205` — blobs identiques à la tête (constance).
++- Relecture d'après fusion (autre famille) : due, §5.3.
++
++### #857 — exemption du lint d'herméticité (PR 700, tête `c1d3271c82ba`)
++
++- Classe : **sensible hors prod** — `scripts/test*` (CI), un avis d'une autre famille.
++- Dépendances : #707, #880, #925 — satisfaites.
++- R1 : auditeur, **famille Codex**, GO 0 B / 0 N sur le delta `e962ba6..0d4c65d`, conservé
++  au gel `c1d3271c82ba` après contrôle indépendant des deux deltas (patch-id stable
++  `90ebaf7a1635dbda30148bbd0f74d0679d2fb96a`, 2 fichiers +70/−13) — note mesh-design
++  14/10 01:27Z.
++- R2 : bureau, **famille Claude** (compte tertiaire), OK 0 B / 2 N sur `c1d3271c82ba`,
++  14/10 02:05Z ; N1 (raison en ponctuation seule acceptée) et N2 (témoins manquants) →
++  lot de suite #1184. **Trace vérifiée** (relevée par mesh-design, 14/10 03:06Z) :
++  session `57f5bda5`, assistant 66, modèle `claude-opus-5-5`, 14/10 02:05:40.904Z, GO
++  3605 ; relecture lancée hors runners (canon §11, compte Claude tertiaire).
++- Feu pilote : mesh-design, 14/10 01:27Z sur `c1d3271c82ba` — CI exacte complète
++  réellement verte, toutes parts exécutées, tête et delta main contrôlés.
++- Contenu intégré : `scripts/test-hermeticity-lint.py`
++  `f3ea2d0e504f7d9641d45daff8834debde7785c6` ; `tests/test_hermeticity_lint.py`
++  `ee1bc3f1731c21cc99bf90370279594ec7f6a956` — blobs identiques à la tête (constance).
++
++### #1019 — compteurs de `docs/EXECUTEUR-MEDIEE.md` (PR 791, tête `9dfcb03e146d`)
++
++- Classe : **légère** (documentation + témoin).
++- Dépendances : #880, #925 — satisfaites.
++- Contenu intégré : `docs/EXECUTEUR-MEDIEE.md`
++  `a906548cf5d3134c0b7dcbc879f4c09524e15480` (union avec #1038) ;
++  `tests/parts/lecteurs-doc.txt` `88d677947ebb4965d851d803ebb62a08a09daf76` (ligne
++  `test_l107_executor_contract`, blob identique à la tête car #775 est exclu) ;
++  `tests/test_l107_executor_contract.py`
++  `f7bdee0f7bcd79fb78edff3d631eba0697978593` (témoin, identique à la tête).
++- **Compteurs du contrat réellement intégré** (lus dans l'arbre composé) : 63 opérations,
++  322 refusées (37 domaines), `interface_total` 385 ; le témoin
++  `test_les_compteurs_du_doc_suivent_le_contrat` est vert sur l'arbre composé et impose
++  ces chiffres au doc.
++- Relecture d'après fusion (autre famille) : due, §5.3.
++
++### #1038 — compte des opérations 1.6.x (PR 806, tête `5bc72a02e9ad`)
++
++- Classe : **légère** (documentation seule).
++- Dépendances : #880, #925 — satisfaites.
++- Contenu intégré : `docs/EXECUTEUR-MEDIEE.md`
++  `a906548cf5d3134c0b7dcbc879f4c09524e15480` — union #1019 + #1038, **blob identique** à
++  celui déjà vérifié dans l'arbre `8d530d2bc782` de la contre-épreuve (main n'a pas touché
++  ce fichier depuis `b85777c1e3e7`).
++- Vérification d'auteur : 22 opérations 1.6.x (7 housekeeping + 8 roadmap + 3 turn_costs +
++  2 operations + `hosts.usage` + `turn_resources.get`), `latest_by_path` nommé à part
++  (absent de v1.6.5 à v1.9.1).
++- Relecture d'après fusion (autre famille) : due, §5.3 ; observation §5.2 à lui verser.
++
++### #1048 — veilles systemd écrites à la main (PR 808, tête `1e7475317f83`)
++
++- Classe : **légère** (documentation seule).
++- Dépendances : #880, #925 — satisfaites.
++- Vérificateur désigné par le pilote : mty-amh-impl-05 (DeepSeek), GO du 13/10 22:2xZ sur
++  la tête ; trois points couverts (chemin absolu/PATH, identité `AGENT_MAIL_NAME`, fichier
++  d'unité *enable* vs `systemd-run` transitoire).
++- Contenu intégré : `docs/EXPLOITATION.md`
++  `086192a7987b1917b8762b472fc89d780275406f` — main a modifié le même fichier depuis
++  `b85777c1e3e7` (lignes 1243 et 2868-2876) ; le bloc ajouté par #1048 (ligne ~792) est
++  disjoint. Preuve : `git merge-file` trois voies rc=0, résultat **blob identique** au
++  blob composé.
++- Relecture d'après fusion (autre famille) : due, §5.3.
++
++## 4. Lots exclus (motif et chemin de résolution)
++
++### #748 — porte de fusion (PR 684, tête `2ec97643b8ca`)
++
++- Classe **sécurité** (la modification ajoute `fs-class` aux `needs:` du check requis
++  `tests` et accepte `skipped` — canon §2, incident #876, ruling pilote du 13/10 23:20Z) :
++  **deux avis** de familles différentes de l'auteur.
++- Présents : ameesh-cx1 (Codex) GO sur le delta `556a44a → 2ec9764` et mty-amh-impl-05
++  (DeepSeek) GO — même famille que l'auteur (docs-01) : **une seule famille hors auteur**.
++- Exclusion : **R2 Claude réelle manquante** (mandat #1204 ; porte inscrite en #1098).
++- Résolution : R2 Claude sur le résultat fusionné du workflow final (la base a bougé :
++  #1112 est dans main, donc le workflow à relire est celui de l'arbre intégré), puis
++  inclusion dans une vague ultérieure — le lot reste indépendant des cinq autres.
++
++### #963 — documentation du seuil de rotation (PR 740, tête `e0d9b6553127`)
++
++- Classe **sensible hors prod** (concurrence) ; R1 auditeur Codex GO 0 B / 0 N ;
++  feu conditionnel mesh-design 13/10 16:28Z (fusion **après #632**, CI exacte verte, tête
++  inchangée).
++- Exclusion : dépendance **#706 non satisfaite** (lot #706 en `qa`, PR 632 **OPEN**, tête
++  `31c7e6b703` — elle a bougé depuis le `5efdf8c53fc6` vu par #963). Le seuil documenté
++  (3 600 s) dépend du correctif #706.
++- Résolution : après fusion de #706/PR632, vérifier le contenu constant (patch-id), puis
++  appliquer le feu conditionnel (CI exacte verte, tête inchangée) ou intégrer #963 à la
++  vague suivante.
++
++### #775 — vérificateur de liens de docs (PR 619, tête `a02928cf6676`)
++
++- Classe corrigée par le pilote le 14/10 02:21Z : **légère** (3 fichiers ; l'étiquette
++  « SQL » du 13/10 20:53 était erronée).
++- Avis acquis : R1 mesh-design (Codex) 13/10 09:15Z GO 0 B / 1 N P3 (N1 → #1183) ;
++  auditeur (Codex) GO 0 B / 0 P2 sur la même tête ; R2 bureau (Claude) GO 0 B / 6 N.
++  Ils restent valides si les blobs sont constants après retarget.
++- Exclusion : **ordre du pilote non satisfait** — « #711 d'abord, puis retarget sur main
++  frais ». #711 (PR 548, tête `1b337d66ef92cbe12246e7e60a84054fb1038b92`) est **OPEN**,
++  CI en file au dernier relevé.
++- Résolution : après #711 → retarget de `lot/775-doc-links` sur main frais, preuve de
++  contenu constant (patch-id), **relecture de l'union #775 × #1019** sur
++  `tests/parts/lecteurs-doc.txt` (deux lignes de lecteurs) et du delta final, nouveau feu
++  pilote nommant la nouvelle tête, puis CI exacte (ou vague suivante). Voir §5.5.
++
++## 5. Réserves et points de suivi
++
++1. **#287 — famille de la R1 : TRANCHÉ, réserve levée (pilote, 14/10 03:06Z).** Le pilote
++   conserve la R1 et le feu du 13/10 12:47Z comme **historiques** sur `a2e3c60` : l'avis
++   (DeepSeek, repli 18855a) était valide au moment où il a été rendu, les blobs relus sont
++   exactement constants (§6) et **aucun nouvel avis n'est donné sous le repli actuel**, qui
++   a cessé avec la reprise des critiques Codex. Le lot reste dans la composition ; aucune
++   R1 Codex/Claude supplémentaire n'est exigée avant le gel.
++2. **#1038 — `turn_resources.begin_grace`.** Ajout 1.6.x refusé, mais rangé par le doc
++   dans le paragraphe « après la 1.6.x » (compte 46), non dérivable des tags ; laissé tel
++   quel. À verser à la relecture d'après fusion de #1038, avec le compte 46 si elle veut
++   le trancher.
++3. **Relectures légères d'après fusion (autre famille)** : #419, #1019, #1038, #1048
++   (canon §2, « dans la journée »). Sous 18855a elles étaient remplacées par un avis
++   DeepSeek indépendant ; le repli ayant cessé, une relecture Claude/Codex est possible
++   (compte tertiaire jusqu'à 08:00). À désigner au moment de la fusion.
++4. **Base mobile** : `main` peut bouger d'ici la fusion (par exemple #810/PR 663, en vol).
++   §12 : contrôler le delta ; tout chevauchement avec les 10 fichiers du paquet impose de
++   réintégrer, relire la résolution et refaire la validation du nouvel arbre.
++5. **Union #775 × #1019** : la présente vague porte la seule ligne de #1019 dans
++   `tests/parts/lecteurs-doc.txt`. Quand #775 sera retargetée, l'union devra être relue
++   sur le delta final (Pilote) et les compteurs du contrat revérifiés sur l'arbre
++   réellement intégré (§5.6).
++6. **Compteurs #1019** : vérifiés sur l'arbre composé (63 / 322 / 385) et tenus par le
++   témoin. Si main ajoute une opération d'interface avant la fusion, le témoin rougit et
++   le doc doit suivre — c'est l'objet du lot.
++
++## 6. Preuves de constance (arbre `b6606f0bc9f9…`)
++
++- **Blob à blob** : les 8 fichiers mono-lot sont **identiques** aux blobs des têtes
++  relues ; les 2 fichiers partagés sont des unions propres :
++  - `docs/EXECUTEUR-MEDIEE.md` `a906548cf5d3…` = exactement le blob déjà vérifié dans
++    l'arbre `8d530d2bc782` de la contre-épreuve (main n'a pas touché ce fichier) ;
++  - `docs/EXPLOITATION.md` `086192a7987b…` = `git merge-file` trois voies rc=0 entre la
++    version de main, celle de la base et celle de #1048 ; hunks disjoints (main 1243,
++    2868-2876 ; #1048 ~792).
++- **Tests ciblés sur l'arbre composé** (`AMEESH_REQUIRE_DB=0`, Postgres injoignable) :
++  - lecteurs de la doc + garde L161a : `test_l159a_capacity_guard` 34, `test_l162_tmpfs`
++    19 (1 sauté), `test_l233_decide_only` 2 (2 sautés), `test_l33_chatbot` 62,
++    `test_l84_serve` 19 (1 sauté), `test_site_art` 4,
++    `test_l161a_ci_sans_code` 6 → **146 tests OK, 4 sautés** ;
++  - `test_l107_executor_contract` (témoin #1019) 20/20 ; `test_hermeticity_lint` (#857)
++    18/18 ; `test_l79_chat_terminal` (#287) 16 (1 sauté) → **54 tests OK, 1 sauté**.
++  - Total : **200 tests OK, 5 sautés** (les sautés sont des tests Postgres sans base).
++- **Lint d'herméticité** de #857 sur l'arbre composé : `--diff` → 0 constat (H0 0, H1 0,
++  H2 0, H3 0), rc=0.
++- **Compteurs du contrat** : 63 opérations / 322 refusées / 385 interface, témoin vert
++  (§3, #1019).
++- Aucun test complet ni suite entière lancés : canon §3, la suite tourne une fois en CI.
++
++## 7. CI complète : une seule fois, en `workflow_dispatch`
++
++Conformément au mandat (« pilote qualifie arbre/avis final, puis run complet une fois et
++feu final »), aucune CI n'a été déclenchée pendant la préparation : la branche n'a pas de
++PR (un push sur une branche autre que `main`/`release/**` ne déclenche rien). Sur le go du
++pilote (mesh-design, 14/10 03:06Z), le run unique est un `workflow_dispatch` de
++`tests.yml` sur `integration/vague-suivante-1204` : suite complète des deux pilotes,
++**4 parts psycopg et 6 parts psql** (le plan d'un dispatch ne saute ni ne réduit les
++parts). L'ouverture d'une PR draft ne déclenche que les parts **pilotes** psql (3 parts)
++et **ne remplace pas** ce run complet : elle ne peut pas tenir lieu de CI du paquet. Le
++corps de PR est prêt en §9. Aucune CI individuelle des lots couverts n'est relancée (§12).
++
++## 8. Réversibilité
++
++- Aucune branche de lot n'a été touchée (ni commit, ni push) ; seul l'arbre de travail
++  temporaire a servi.
++- La branche de préparation se supprime sans reste : `git push origin --delete
++  integration/vague-suivante-1204`. Les objets créés sont locaux au clone de travail.
++- Rien n'est fusionné, rien n'est déployé ; aucun geste de prod.
++
++## 9. Corps de PR draft (prêt à ouvrir)
++
++Titre : `#1204 vague suivante — 6 lots (287, 419, 857, 1019, 1038, 1048), préparation`
++
++Corps : résumé du §2, renvoi à ce manifeste, mention explicite « préparation, ne pas
++fusionner avant le go du pilote et la CI complète unique (dispatch, seul run valable) »,
++liste des exclusions (#748, #963, #775) et des points de suivi (§5).
+diff --git a/scripts/test-hermeticity-lint.py b/scripts/test-hermeticity-lint.py
+index 7d3b9f916..f3ea2d0e5 100755
+--- a/scripts/test-hermeticity-lint.py
++++ b/scripts/test-hermeticity-lint.py
+@@ -24,8 +24,9 @@ Règles :
+      `datetime.now|today|utcnow`) : bombe à retardement au changement de jour.
+ 
+ Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
+-l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
+-reste visible du relecteur.
++l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison,
++non vide, reste visible du relecteur. Un marqueur dans une chaîne de code, ou
++un commentaire sans raison, n'exempte pas (R1 #707, N1).
+ 
+ Usage :
+   scripts/test-hermeticity-lint.py [FICHIERS…]        # défaut : tests/**/test_*.py
+@@ -37,13 +38,17 @@ from __future__ import annotations
+ 
+ import argparse
+ import ast
++import io
+ import json
+ import pathlib
++import re
+ import subprocess
+ import sys
++import tokenize
+ 
+ REPO = pathlib.Path(__file__).resolve().parent.parent
+-MARKER = "hermeticity: allow"
++#: exemption motivée : marqueur, séparateur, raison non vide (le motif est exigé)
++MARKER_RE = re.compile(r"hermeticity:\s*allow\s*[—–-]\s*\S")
+ 
+ #: lectures de l'horloge réelle (nom canonique importé).
+ CLOCK = {
+@@ -173,12 +178,27 @@ def _in_subtraction(call: ast.AST, root: ast.AST) -> bool:
+     return False
+ 
+ 
+-def _exempt(node: ast.AST, lines: list[str]) -> bool:
+-    """marqueur sur l'instruction englobante ou la ligne juste au-dessus."""
+-    top: ast.AST = node
++def _comments(source: str) -> dict[int, str]:
++    """Les commentaires du source, par ligne : seuls eux peuvent exempter."""
++    out: dict[int, str] = {}
++    try:
++        for token in tokenize.generate_tokens(io.StringIO(source).readline):
++            if token.type == tokenize.COMMENT:
++                out.setdefault(token.start[0], token.string)
++    except (tokenize.TokenError, IndentationError, SyntaxError):
++        return out
++    return out
++
++
++def _exempt(node: ast.AST, comments: dict[int, str]) -> bool:
++    """Exemption motivée sur l'instruction ou la ligne juste au-dessus.
++
++    Seuls les vrais commentaires comptent, et la raison doit être non vide
++    (`# hermeticity: allow — <raison>`) : un marqueur dans une chaîne, ou un
++    commentaire sans motif, n'exempte pas (R1 #707, N1 ; lot #857)."""
+     start, end = getattr(node, "lineno", 0), getattr(node, "end_lineno", 0)
+-    for line in lines[max(0, start - 2):end]:
+-        if MARKER in line:
++    for line in range(max(1, start - 1), end + 1):
++        if MARKER_RE.search(comments.get(line, "")):
+             return True
+     return False
+ 
+@@ -215,7 +235,7 @@ def lint_source(path: str, source: str) -> list[Finding]:
+         return [Finding(path, exc.lineno or 0, exc.offset or 0, "H0",
+                         "source illisible : %s" % exc.msg, "<module>")]
+     alias = _aliases(tree)
+-    lines = source.splitlines()
++    comments = _comments(source)
+     funcs = _functions(tree)
+     findings: list[Finding] = []
+     clock_lines: set[int] = set()
+@@ -225,7 +245,7 @@ def lint_source(path: str, source: str) -> list[Finding]:
+             body = node.test if isinstance(node, ast.Assert) else node
+             for sub in ast.walk(body):
+                 name = _called(sub, alias, CLOCK)
+-                if name and _in_subtraction(sub, body) and not _exempt(node, lines):
++                if name and _in_subtraction(sub, body) and not _exempt(node, comments):
+                     clock_lines.add(id(sub))
+                     findings.append(Finding(
+                         path, sub.lineno, sub.col_offset + 1, "H1",
+@@ -236,11 +256,11 @@ def lint_source(path: str, source: str) -> list[Finding]:
+         if not isinstance(node, ast.Call):
+             continue
+         name = _called(node, alias, MACHINE)
+-        if name and not _exempt(node, lines):
++        if name and not _exempt(node, comments):
+             findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
+                                     "état global de la machine : %s()" % name,
+                                     _enclosing(funcs, node)))
+-        elif _proc_literal(node) and not _exempt(node, lines):
++        elif _proc_literal(node) and not _exempt(node, comments):
+             findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
+                                     "état global de la machine : chemin /proc/…",
+                                     _enclosing(funcs, node)))
+@@ -249,7 +269,7 @@ def lint_source(path: str, source: str) -> list[Finding]:
+         if not isinstance(node, ast.Call) or id(node) in clock_lines:
+             continue
+         name = _called(node, alias, CALENDAR)
+-        if name and not _exempt(node, lines):
++        if name and not _exempt(node, comments):
+             findings.append(Finding(path, node.lineno, node.col_offset + 1, "H3",
+                                     "fixture dépendante du jour : %s()" % name,
+                                     _enclosing(funcs, node)))
+diff --git a/src/ameesh/chat.py b/src/ameesh/chat.py
+index d1c5bcfbd..69e638a9f 100644
+--- a/src/ameesh/chat.py
++++ b/src/ameesh/chat.py
+@@ -1,13 +1,25 @@
+ # SPDX-License-Identifier: AGPL-3.0-only
+-"""ameesh chat — the owner's conversation agent (work item L123).
++"""ameesh chat — the owner's conversation agent (work item L123) and the
++terminal client on an agent's shared conversation (L79).
+ 
+   ameesh chat [--harness claude|codex|…] [--name chat-<human>] [--cwd DIR]
+         opens an INTERACTIVE harness session (Claude by default) for the
+         conversation agent of the human who launches it: decision requests
+         from every project, their answers (`ameesh decide`), their other
+         requests forwarded to the orchestrators;
++  ameesh chat <agent> [--after SEQ] [--limit N] [--poll S] [--once]
++        opens the TERMINAL CLIENT on that agent's shared conversation
++        (L78/L79): the recent history, then the live stream (LISTEN on
++        `ameesh_chat`, polling when the driver cannot listen), the agent's
++        state and its open lots. A typed line is sent to the agent as mail;
++        `!urgent <text>` preempts the turn in progress and `!stop [text]`
++        interrupts it without a new message, both through
++        `AMEESH_INTERRUPT_SENDERS` (refused or delivered as a normal message,
++        never forced); `!quit` leaves. The client writes nothing when it does
++        not come from a human's terminal: it turns read-only there;
+   ameesh chat --instruction  prints the chat instructions (text versioned in the repository);
+-  ameesh chat --dry-run      says what would be launched, without launching or writing anything.
++  ameesh chat --dry-run      says what would be launched (or shown), without
++        launching, following or writing anything.
+ 
+ Unlike `ameesh attach`, the chat NEVER takes another agent's session or
+ lease: it has its own identity (`chat-<human>`), a fresh session on every
+@@ -35,11 +47,13 @@ from __future__ import annotations
+ import argparse
+ import json
+ import os
++import queue
+ import re
+ import signal
+ import string
+ import subprocess
+ import sys
++import threading
+ import time
+ 
+ from . import config as config_mod
+@@ -54,6 +68,9 @@ DEFAULT_HARNESS = "claude"
+ CONSIGNE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "consignes",
+                              "chat.md")
+ STATE_SCHEMA = "ameesh-chat/1"
++#: canal NOTIFY de la conversation (L78) et canal des changements de bail
++CHANNEL_CHAT = "ameesh_chat"
++CHANNEL_LEASE = config_mod.CHANNEL_LEASE
+ 
+ 
+ def is_chat_agent(row: dict | None) -> bool:
+@@ -151,6 +168,478 @@ def verify_session(cfg: Config, name: str, pid_text, *, chain=None) -> dict:
+     return record
+ 
+ 
++# --------------------------------------------------------------------------
++# L79 : client terminal — `ameesh chat <agent>`
++# --------------------------------------------------------------------------
++
++#: commandes tapées par l'humain (une ligne = une entrée, sinon c'est un message)
++CLIENT_QUIT = ("!quit", "!q", "!exit", "/quit", "/exit")
++CLIENT_HELP = ("!help", "?")
++CLIENT_STATE = ("!state",)
++CLIENT_URGENT = "!urgent"
++CLIENT_STOP = "!stop"
++HISTORY_DEFAULT = 20
++POLL_DEFAULT = 2.0
++#: taille d'une page lue en suivi (la borne de `conversation.history` est 500)
++STREAM_PAGE = 200
++#: ce qu'un `!stop` sans texte laisse à l'agent (le courrier exige un corps lisible)
++STOP_BODY = "(stop requested from ameesh chat)"
++#: ligne d'aide du client
++CLIENT_HELP_TEXT = (
++    "  !urgent <text>  send now, preempting the turn in progress (if authorised)\n"
++    "  !stop [text]    interrupt the turn without a new message (if authorised)\n"
++    "  !state          refresh the agent's state\n"
++    "  !quit           leave (also Ctrl-D)\n"
++    "  <anything else> sent to the agent as mail"
++)
++
++
++def _stamp(ts, *, now=None):
++    """Heure locale d'une entrée ; datée si elle n'est pas d'aujourd'hui."""
++    if not ts:
++        return "??:??:??"
++    local = time.localtime(ts)
++    today = time.localtime(time.time() if now is None else now)
++    if (local.tm_year, local.tm_yday) == (today.tm_year, today.tm_yday):
++        return time.strftime("%H:%M:%S", local)
++    return time.strftime("%m-%d %H:%M", local)
++
++
++class ClientView:
++    """Rendu texte de la conversation, sans base ni E/S implicite (`out` est injecté).
++
++    Les tranches de texte d'un même tour ne répètent pas l'en-tête, et la
++    réponse finale d'un `turn_end` n'est pas réaffichée quand le flux l'a déjà
++    montrée (même tour) : le client ne double jamais le texte de l'agent.
++    """
++
++    def __init__(self, out):
++        self.out = out
++        self._last = None
++        self._text_turn = None
++
++    def line(self, text=""):
++        self.out.write("%s\n" % text)
++        self.out.flush()
++
++    def _block(self, text, *, truncated=False):
++        lines = (text or "").splitlines() or [""]
++        if truncated:
++            lines = lines[:-1] + [lines[-1] + " […]"]
++        for line in lines:
++            self.line("  " + line)
++
++    def entry(self, entry, *, now=None):
++        kind = entry.get("kind")
++        text = entry.get("text") or ""
++        author = entry.get("author") or "?"
++        turn = entry.get("turn")
++        stamp = _stamp(entry.get("ts"), now=now)
++        truncated = bool(entry.get("truncated"))
++        if kind == "text":
++            if self._last == ("text", author, turn):
++                self._block(text, truncated=truncated)
++            else:
++                self.line("%s %s" % (stamp, author))
++                self._block(text, truncated=truncated)
++            if turn is not None:
++                self._text_turn = turn
++        elif kind == "tool":
++            meta = entry.get("meta") or {}
++            tool = meta.get("tool") or text or "tool"
++            status = " (%s)" % meta["status"] if meta.get("status") else ""
++            self.line("%s   · %s%s" % (stamp, tool, status))
++        elif kind == "turn_end":
++            meta = entry.get("meta") or {}
++            if text.strip() and (turn is None or turn != self._text_turn):
++                self._block(text, truncated=truncated)
++            bits = [meta.get("status") or "end of turn"]
++            if isinstance(meta.get("cost_usd"), (int, float)):
++                bits.append("$%.4f" % meta["cost_usd"])
++            if isinstance(meta.get("duration_s"), (int, float)):
++                bits.append("%.1fs" % meta["duration_s"])
++            usage = meta.get("usage") or {}
++            if isinstance(usage.get("context_tokens"), int):
++                bits.append("context %d" % usage["context_tokens"])
++            self.line("%s   ── %s" % (stamp, " · ".join(bits)))
++        elif kind == "human_message":
++            self.line("%s %s [human]" % (stamp, author))
++            self._block(text, truncated=truncated)
++        elif kind == "input":
++            self.line("%s   ← %s" % (stamp, author))
++            self._block(text, truncated=truncated)
++        elif kind == "state":
++            self.line("%s   · %s" % (stamp, text))
++        else:
++            self.line("%s %s: %s" % (stamp, author, text))
++        self._last = (kind, author, turn)
++
++
++def _age(ts, *, now=None):
++    if not ts:
++        return None
++    seconds = int(max(0, (time.time() if now is None else now) - ts))
++    for limit, unit in ((60, "s"), (3600, "m"), (86400, "h")):
++        if seconds < limit:
++            return "%d%s" % (seconds, unit)
++    return "%dd" % (seconds // 86400)
++
++
++def state_lines(cfg: Config, db, agent: str, *, row: dict | None = None,
++                now=None) -> list[str]:
++    """L'état de l'agent, prêt à afficher : fiche, bail, équipe, lots ouverts."""
++    from . import registry, storage
++    row = registry.get(db, agent) if row is None else row
++    if row is None:
++        return []
++    lease = storage.of(db).leases.state(agent) or {}
++    head = "%s · %s · %s" % (row.get("name") or agent, row.get("mode") or "execute",
++                             row.get("harness") or "?")
++    if row.get("host"):
++        head += " on %s" % row["host"]
++    if row.get("model"):
++        head += " · %s" % row["model"]
++    status = row.get("status") or "?"
++    if row.get("status_text"):
++        status += " — %s" % row["status_text"]
++    seen = _age(row.get("last_seen_ts"), now=now)
++    if seen:
++        status += " · seen %s ago" % seen
++    if row.get("last_error"):
++        status += " · last error: %s" % str(row["last_error"])[:120]
++    if lease.get("live"):
++        lease_line = "held by %s (epoch %s)" % (lease.get("lease_owner") or "?",
++                                                lease.get("lease_epoch"))
++    elif lease.get("lease_owner"):
++        lease_line = "expired (last owner %s)" % lease["lease_owner"]
++    else:
++        lease_line = "free"
++    lines = ["agent   : " + head, "state   : " + status, "lease   : " + lease_line]
++    team = row.get("team")
++    projects = row.get("projects") or []
++    if team or projects:
++        lines.append("team    : %s%s" % (
++            team or "-",
++            " (projects: %s)" % ", ".join(str(p) for p in projects) if projects else ""))
++    try:
++        lots = storage.of(db).work.open_for(agent)[:3]
++    except Exception:
++        lots = []
++    for index, lot in enumerate(lots):
++        lines.append("%s: #%s %s" % ("work    " if index == 0 else "          ",
++                                     lot.get("id"), lot.get("title") or ""))
++    return lines
++
++
++class TerminalClient:
++    """L79 : lit la conversation partagée d'un agent, la suit, et lui écrit.
++
++    Aucune session d'agent n'est prise : les lignes tapées partent en courrier
++    (`chat-…` ou l'humain local vérifié). Un `!stop`/`!urgent` passe par le
++    même chemin que `ameesh interrupt`, donc par `AMEESH_INTERRUPT_SENDERS` :
++    sans habilitation, il est refusé (ou remis comme un message ordinaire pour
++    `!urgent`), jamais forcé.
++    """
++
++    def __init__(self, cfg: Config, db, agent: str, *, row: dict | None = None,
++                 out=None, err=None, limit: int = HISTORY_DEFAULT, after=None,
++                 poll: float = POLL_DEFAULT, lines=None, subscribe=None,
++                 sleep=time.sleep, chain=None, environ_of=None, now=None):
++        from . import decisions, registry, work
++        if not NAME_RE.match(agent or ""):
++            raise ValueError("invalid agent name: %r" % (agent,))
++        self.cfg, self.db, self.agent = cfg, db, agent
++        self.view = ClientView(out if out is not None else sys.stdout)
++        self.err = err if err is not None else sys.stderr
++        self.limit = limit
++        self.after = after
++        self.poll = poll
++        self.now = now
++        self.row = registry.get(db, agent) if row is None else row
++        self.read_only = decisions.agent_session_reason(
++            cfg, db, chain=chain, environ_of=environ_of)
++        self.sender, self.human = self._identity(work)
++        self.subscribe = subscribe
++        self.sleep = sleep
++        self._lines = lines
++        self._queue: queue.Queue = queue.Queue(maxsize=64)
++        self._eof = threading.Event()
++        self._thread: threading.Thread | None = None
++
++    # -- identité ----------------------------------------------------------
++
++    def _identity(self, work):
++        """L'expéditeur des messages : l'humain local s'il est connu, sinon son identité de chat."""
++        from . import decisions
++        user = decisions.unix_user()
++        if work.known_human(self.db, user, self.cfg):
++            return user, True
++        return default_name(user), False
++
++    # -- lecture -----------------------------------------------------------
++
++    def show_state(self) -> None:
++        if self.row is None:
++            return
++        for line in state_lines(self.cfg, self.db, self.agent, row=self.row, now=self.now):
++            self.view.line(line)
++
++    def show_history(self, *, after=None, limit=None) -> int:
++        """Affiche la page demandée et rend le curseur (dernier seq lu)."""
++        from . import conversation
++        limit = self.limit if limit is None else limit
++        start = self.after if after is None else after
++        if start is None:
++            head = conversation.history(self.db, self.agent, after=0, limit=1)
++            start = max(0, int(head["last_seq"]) - limit)
++        page = conversation.history(self.db, self.agent, after=start, limit=limit)
++        if page["gap"]:
++            self._gap_note()
++        for entry in page["entries"]:
++            self.view.entry(entry, now=self.now)
++        if not page["entries"]:
++            self.view.line("  (no conversation entry)")
++        return int(page["next_seq"])
++
++    def _gap_note(self) -> None:
++        self.view.line("  … missing entries: the history is incomplete "
++                       "(retention, quarantine or an expired thread)")
++
++    def read_new(self, cursor: int) -> int:
++        from . import conversation, db as db_mod
++        try:
++            page = conversation.history(self.db, self.agent, after=cursor, limit=STREAM_PAGE)
++        except db_mod.DbError as exc:
++            self.view.line("  … history unavailable: %s" % db_mod.explain(exc, 160))
++            return cursor
++        if page["gap"]:
++            self._gap_note()
++        for entry in page["entries"]:
++            self.view.entry(entry, now=self.now)
++        return int(page["next_seq"])
++
++    # -- entrée ------------------------------------------------------------
++
++    def _pump(self, lines) -> None:
++        try:
++            source = sys.stdin if lines is None else lines
++            for line in source:
++                self._queue.put(line)
++        except (OSError, ValueError):
++            pass
++        finally:
++            self._eof.set()
++
++    def _start_input(self) -> None:
++        if self._thread is not None:
++            return
++        self._thread = threading.Thread(target=self._pump, args=(self._lines,), daemon=True,
++                                        name="chat-client-input")
++        self._thread.start()
++
++    def _open_listener(self):
++        from . import storage
++        if self.subscribe is not None:
++            return self.subscribe()
++        try:
++            return storage.of(self.db).wakeups.subscribe([CHANNEL_CHAT, CHANNEL_LEASE])
++        except Exception:
++            return None
++
++    def _drain(self):
++        while True:
++            try:
++                yield self._queue.get_nowait()
++            except queue.Empty:
++                return
++
++    @staticmethod
++    def _command(text, prefix):
++        return text == prefix or text.startswith(prefix + " ")
++
++    def handle(self, line) -> bool:
++        """Traite une ligne tapée ; rend False pour quitter."""
++        text = (line or "").strip()
++        if not text:
++            return True
++        if text in CLIENT_QUIT:
++            return False
++        if text in CLIENT_HELP:
++            self.view.line(CLIENT_HELP_TEXT)
++            return True
++        if text in CLIENT_STATE:
++            self.show_state()
++            return True
++        if self._command(text, CLIENT_STOP):
++            return self.interrupt(text[len(CLIENT_STOP):].strip())
++        if self._command(text, CLIENT_URGENT):
++            return self.send(text[len(CLIENT_URGENT):].strip(), urgent=True)
++        return self.send(text)
++
++    def send(self, text: str, *, urgent: bool = False) -> bool:
++        """Dépose un message pour l'agent ; rend False seulement sur `!quit`."""
++        from . import fil, mail
++        if self.read_only:
++            self.view.line("  ! read-only: %s" % self.read_only)
++            return True
++        text = (text or "").strip()
++        if not text:
++            return True
++        payload: dict = {"human": True} if self.human else {}
++        if urgent and self.sender in self.cfg.interrupt_senders:
++            payload["urgent"] = True
++        elif urgent:
++            self.view.line("  ! %s may not interrupt a turn (AMEESH_INTERRUPT_SENDERS): "
++                           "delivered as a normal message" % self.sender)
++        try:
++            message_id = mail.send(self.db, self.sender, self.agent, text, host=self.cfg.host,
++                                   kind="event" if payload.get("urgent") else "notify",
++                                   payload=payload or None)
++        except fil.UnreadableBody as exc:
++            self.view.line("  ! message not dropped: %s" % exc)
++            return True
++        self.view.line("  → sent to %s (mail #%d%s)" % (
++            self.agent, message_id, ", urgent" if payload.get("urgent") else ""))
++        return True
++
++    def interrupt(self, text: str) -> bool:
++        """`!stop` : le même chemin que `ameesh interrupt`, refusé sans habilitation."""
++        if self.read_only:
++            self.view.line("  ! read-only: %s" % self.read_only)
++            return True
++        if self.sender not in self.cfg.interrupt_senders:
++            self.view.line("  ! !stop refused: %s is not allowed to interrupt a turn "
++                           "(AMEESH_INTERRUPT_SENDERS)" % self.sender)
++            return True
++        return self.send(text or STOP_BODY, urgent=True)
++
++    # -- boucle ------------------------------------------------------------
++
++    def plan(self) -> int:
++        """`--dry-run` : l'état et ce qui serait lu, sans rien suivre ni écrire."""
++        from . import conversation, db as db_mod
++        if self.row is None:
++            print("ameesh chat: unknown agent %s" % self.agent, file=self.err)
++            return 1
++        self.show_state()
++        try:
++            head = conversation.history(self.db, self.agent, after=0, limit=1)
++        except db_mod.DbError as exc:
++            print("error: %s" % db_mod.explain(exc, 160), file=self.err)
++            return 1
++        last = int(head["last_seq"])
++        start = self.after if self.after is not None else max(0, last - self.limit)
++        self.view.line("dry run: %d entries, would show those after seq %d (up to %d) then follow; "
++                       "input %s" % (last, start, self.limit,
++                                     "read-only (%s)" % self.read_only if self.read_only
++                                     else "sent as mail by %s" % self.sender))
++        return 0
++
++    def run(self, *, follow: bool = True) -> int:
++        if self.row is None:
++            print("ameesh chat: unknown agent %s" % self.agent, file=self.err)
++            return 1
++        self.show_state()
++        cursor = self.show_history()
++        if not follow:
++            return 0
++        self.view.line("  conversation shared by every participant; "
++                       "the agent never sees owner approval here")
++        if self.read_only:
++            self.view.line("  read-only: %s" % self.read_only)
++        else:
++            self.view.line("  typing as %s; type !help for the commands"
++                           % ("human %s" % self.sender if self.human else self.sender))
++        try:
++            return self.loop(cursor)
++        except KeyboardInterrupt:
++            self.view.line("")
++            return 0
++
++    def loop(self, cursor: int) -> int:
++        from . import db as db_mod
++        self._start_input()
++        listener = self._open_listener()
++        if listener is None:
++            self.view.line("  (no LISTEN on this driver: polling every %gs)" % self.poll)
++        while True:
++            for line in self._drain():
++                if not self.handle(line):
++                    return 0
++            if self._eof.is_set() and self._queue.empty():
++                return 0
++            signal = None
++            if listener is None:
++                self.sleep(self.poll)
++            else:
++                item = listener.wait(timeout=self.poll)
++                if item is not None and item.get("event") == "down":
++                    self.view.line("  … live connection lost (%s); falling back to polling"
++                                   % (item.get("error") or "?"))
++                    listener.close()
++                    listener = None
++                elif item is not None:
++                    signal = item
++            try:
++                cursor = self.read_new(cursor)
++            except db_mod.DbError as exc:
++                self.view.line("  … history unavailable: %s" % db_mod.explain(exc, 160))
++                self.sleep(self.poll)
++            if signal is not None and signal.get("channel") == config_mod.CHANNEL_LEASE \
++                    and self.row is not None:
++                for line in state_lines(self.cfg, self.db, self.agent, now=self.now)[1:2]:
++                    self.view.line("  · " + line)
++
++
++def client_conflicts(args) -> list[str]:
++    """Options de la session de chat incompatibles avec le mode client."""
++    conflicts = []
++    if getattr(args, "harness", DEFAULT_HARNESS) != DEFAULT_HARNESS:
++        conflicts.append("--harness")
++    if getattr(args, "name", None):
++        conflicts.append("--name")
++    if getattr(args, "cwd", None):
++        conflicts.append("--cwd")
++    if getattr(args, "consigne", False):
++        conflicts.append("--instruction")
++    return conflicts
++
++
++def client_run(cfg: Config, args, *, db=None, out=None, err=None, chain=None,
++               environ_of=None, **kwargs) -> int:
++    """`ameesh chat <agent>` : le client terminal (L79)."""
++    from . import db as db_mod
++    conflicts = client_conflicts(args)
++    if conflicts:
++        print("ameesh chat %s: %s apply to the chat session, not to the terminal client"
++              % (args.agent, ", ".join(conflicts)), file=err or sys.stderr)
++        return 2
++    own, close = db, False
++    try:
++        if own is None:
++            own = db_mod.connect(cfg)
++            close = True
++        db_mod.require_schema(own)
++        client = TerminalClient(cfg, own, args.agent, out=out, err=err,
++                                limit=args.limit, after=args.after, poll=args.poll,
++                                chain=chain, environ_of=environ_of, **kwargs)
++        if args.dry_run:
++            return client.plan()
++        return client.run(follow=not args.once)
++    except db_mod.SchemaMissing as exc:
++        print("error: %s" % exc, file=err or sys.stderr)
++        return 1
++    except db_mod.Unavailable as exc:
++        print("error: database unreachable: %s" % exc, file=err or sys.stderr)
++        return 1
++    except db_mod.DbError as exc:
++        print("error: %s" % exc, file=err or sys.stderr)
++        return 1
++    finally:
++        if close and own is not None:
++            own.close()
++
++
+ # --------------------------------------------------------------------------
+ # lancement
+ # --------------------------------------------------------------------------
+@@ -179,6 +668,9 @@ def chat_env(cfg: Config, name: str, pid: int, base: dict | None = None) -> dict
+ def build_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(prog="ameesh chat", description=__doc__,
+                                      formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("agent", nargs="?", default=None,
++                        help="agent whose conversation to watch and talk to (L79, terminal "
++                             "client); without it, opens the conversation agent's session")
+     parser.add_argument("--harness", default=DEFAULT_HARNESS,
+                         help="session harness (default %s)" % DEFAULT_HARNESS)
+     parser.add_argument("--name", default=None,
+@@ -191,12 +683,26 @@ def build_parser() -> argparse.ArgumentParser:
+                         canonical="--instruction", default=argparse.SUPPRESS,
+                         help=argparse.SUPPRESS)
+     parser.add_argument("--dry-run", action="store_true",
+-                        help="say what would be launched; launch nothing, write nothing")
++                        help="say what would be launched (or shown, with an agent); "
++                             "launch nothing, write nothing")
++    # L79 : options du client terminal (`ameesh chat <agent>`)
++    parser.add_argument("--after", type=int, default=None, metavar="SEQ",
++                        help="start at this conversation sequence")
++    parser.add_argument("--limit", type=int, default=HISTORY_DEFAULT, metavar="N",
++                        help="how many entries to show on entry (1-500, default %d)"
++                             % HISTORY_DEFAULT)
++    parser.add_argument("--poll", type=float, default=POLL_DEFAULT, metavar="S",
++                        help="polling interval when LISTEN is unavailable "
++                             "(default %gs)" % POLL_DEFAULT)
++    parser.add_argument("--once", action="store_true",
++                        help="show the history and exit, without following")
+     return parser
+ 
+ 
+ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
+-    """`ameesh chat` (sans `--instruction`) : contrôles, inscription, lancement."""
++    """`ameesh chat` : le client terminal d'un agent, sinon la session de chat."""
++    if getattr(args, "agent", None):
++        return client_run(cfg, args, chain=chain, environ_of=environ_of)
+     from . import account_turn, adapters, decisions, storage
+     from . import db as db_mod
+     if os.environ.get(decisions.CHAT_ENV):
+@@ -290,11 +796,24 @@ def main(argv: list[str] | None = None) -> int:
+     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+     cfg = config_mod.load()
+     if args.consigne:
++        if getattr(args, "agent", None):
++            print("ameesh chat: --instruction does not take an agent (terminal client)",
++                  file=sys.stderr)
++            return 2
+         # relue aussi DANS la session (contexte résumé) : le nom de ce chat
+         from .decisions import CHAT_ENV, current_human, unix_user
+         name = args.name or os.environ.get(CHAT_ENV) or default_name(unix_user())
+         print(instruction(current_human(), name))
+         return 0
++    if not 1 <= args.limit <= 500:
++        print("ameesh chat: --limit must be between 1 and 500", file=sys.stderr)
++        return 2
++    if args.after is not None and args.after < 0:
++        print("ameesh chat: --after must be zero or positive", file=sys.stderr)
++        return 2
++    if args.poll <= 0:
++        print("ameesh chat: --poll must be positive", file=sys.stderr)
++        return 2
+     from . import db as db_mod
+     try:
+         return run(cfg, args)
+diff --git a/tests/parts/lecteurs-doc.txt b/tests/parts/lecteurs-doc.txt
+index 0b8dddf6d..88d677947 100644
+--- a/tests/parts/lecteurs-doc.txt
++++ b/tests/parts/lecteurs-doc.txt
+@@ -7,6 +7,7 @@
+ #
+ # Un module par ligne, dans l'ordre alphabétique, sa raison en commentaire.
+ 
++test_l107_executor_contract  # docs/EXECUTEUR-MEDIEE.md (compteurs du contrat de l'exécuteur, L107)
+ test_l159a_capacity_guard  # docs/schemas (JSON schemas of the capacity guard, L159a)
+ test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
+ test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
+diff --git a/tests/test_hermeticity_lint.py b/tests/test_hermeticity_lint.py
+index b561ed529..ee1bc3f17 100644
+--- a/tests/test_hermeticity_lint.py
++++ b/tests/test_hermeticity_lint.py
+@@ -90,6 +90,43 @@ class RulesTest(unittest.TestCase):
+             "    # hermeticity: allow — le banc mesure la garde de 5 s\n"
+             "    self.assertLess(time.time() - debut, 5)\n"), [])
+ 
++    def test_exemption_inline_comment(self):
++        self.assertEqual(self.rules(
++            "import time\n"
++            "def test_x(self):\n"
++            "    debut = time.time()\n"
++            "    self.assertLess(time.time() - debut, 5)  # hermeticity: allow — garde mesurée\n"),
++            [])
++
++    def test_exemption_without_reason_does_not_exempt(self):
++        """Un commentaire vide ne supprime pas le constat (R1 #707, N1)."""
++        self.assertEqual(self.rules(
++            "import time\n"
++            "def test_x(self):\n"
++            "    # hermeticity: allow —\n"
++            "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
++        self.assertEqual(self.rules(
++            "import time\n"
++            "def test_x(self):\n"
++            "    # hermeticity: allow\n"
++            "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
++
++    def test_marker_in_a_string_does_not_exempt(self):
++        """Le marqueur doit être un commentaire, pas une chaîne de code."""
++        self.assertEqual(self.rules(
++            "import time\n"
++            "def test_x(self):\n"
++            "    note = 'hermeticity: allow — dans une chaîne'\n"
++            "    self.assertLess(time.time() - debut, 5)\n"), ["H1"])
++
++    def test_exemption_on_a_multiline_assertion(self):
++        self.assertEqual(self.rules(
++            "import time\n"
++            "def test_x(self):\n"
++            "    # hermeticity: allow — le banc mesure la garde de 5 s\n"
++            "    self.assertTrue(\n"
++            "        time.time() - debut < 5)\n"), [])
++
+     def test_syntax_error_is_reported(self):
+         self.assertEqual(self.rules("def test_x(:\n"), ["H0"])
+ 
+diff --git a/tests/test_l107_executor_contract.py b/tests/test_l107_executor_contract.py
+index 4606c5bcd..f7bdee0f7 100644
+--- a/tests/test_l107_executor_contract.py
++++ b/tests/test_l107_executor_contract.py
+@@ -132,6 +132,19 @@ class TableTest(unittest.TestCase):
+         self.assertEqual(self.c.interface_total, len(_interface_ops()))
+         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
+ 
++    def test_les_compteurs_du_doc_suivent_le_contrat(self):
++        """#1019 : les compteurs cités par docs/EXECUTEUR-MEDIEE.md viennent de
++        contract.json ; ils doivent suivre chaque ajout à l'interface, sans
++        quoi les agents lisent des chiffres périmés."""
++        with open(os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md"), encoding="utf-8") as fh:
++            doc = re.sub(r"\s+", " ", fh.read())
++        refuses = sum(len(methodes) for methodes in self.c.refused.values())
++        for attendu in ("la table fermée des %d opérations et la liste des %d refusées"
++                        % (len(self.c.operations), refuses),
++                        "l'interface entière (%d opérations)" % self.c.interface_total):
++            with self.subTest(fragment=attendu):
++                self.assertIn(attendu, doc)
++
+     def test_jamais_d_autorite(self):
+         for d in ("approvals", "nonces", "grants", "authenticators", "canon", "packages",
+                   "placements", "visibility", "ephemerals", "session_bindings", "action_source"):
+diff --git a/tests/test_l79_chat_terminal.py b/tests/test_l79_chat_terminal.py
+new file mode 100644
+index 000000000..5fd448e98
+--- /dev/null
++++ b/tests/test_l79_chat_terminal.py
+@@ -0,0 +1,335 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""L79 (#287): `ameesh chat <agent>` — client terminal (rendu, suivi, entrée).
++
++Aucune horloge murale n'est utilisée comme vérité : `_stamp` et l'état
++reçoivent leur `now`, l'ascendance est injectée, et les tests sans base
++n'ouvrent aucune connexion. Les tests SQL tournent sous PgTestCase (CI).
++"""
++from __future__ import annotations
++
++import dataclasses
++import io
++import os
++import time
++import unittest
++from unittest import mock
++
++from ameesh import chat, config as config_mod, conversation as conversation_mod
++from ameesh import mail, registry
++
++from .support import PgTestCase
++
++#: variables d'identité retirées de l'environnement des tests (comme L124)
++_IDENTITY = ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
++             "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH", "AMEESH_CHAT", "AMEESH_CHAT_PID")
++
++
++def clean_chain():
++    """Ascendance et environnements injectés : aucun agent au-dessus."""
++    return dict(chain=[os.getpid()], environ_of=lambda pid: {})
++
++
++class _FakeSubscription:
++    def __init__(self, waits):
++        self.waits = list(waits)
++        self.closed = False
++
++    def wait(self, timeout):
++        return self.waits.pop(0) if self.waits else None
++
++    def close(self):
++        self.closed = True
++
++
++class _FakeWakeups:
++    def __init__(self, subscription=None):
++        self.subscription = subscription
++        self.channels = None
++
++    def subscribe(self, channels):
++        self.channels = list(channels)
++        return self.subscription
++
++
++class _FakeStorage:
++    def __init__(self, *, lease=None, lots=(), subscription=None):
++        self.leases = mock.Mock()
++        self.leases.state.return_value = lease or {}
++        self.work = mock.Mock()
++        self.work.open_for.return_value = list(lots)
++        self.wakeups = _FakeWakeups(subscription)
++
++
++# ==========================================================================
++# rendu
++# ==========================================================================
++
++class ViewTest(unittest.TestCase):
++    def render(self, entries, **kw):
++        out = io.StringIO()
++        view = chat.ClientView(out)
++        for entry in entries:
++            view.entry(entry, **kw)
++        return out.getvalue()
++
++    def test_text_slices_share_one_header_and_the_final_is_not_repeated(self):
++        text = self.render([
++            {"kind": "text", "text": "bonjour la suite", "author": "agent:a", "turn": "t1",
++             "ts": 1000},
++            {"kind": "text", "text": " encore", "author": "agent:a", "turn": "t1", "ts": 1001},
++            {"kind": "turn_end", "text": "bonjour la suite encore", "author": "agent:a",
++             "turn": "t1", "ts": 1002,
++             "meta": {"status": "completed", "cost_usd": 0.5, "duration_s": 2.0}},
++        ], now=1002)
++        self.assertEqual(text.count("agent:a"), 1)            # un seul en-tête pour le tour
++        self.assertEqual(text.count("bonjour la suite"), 1)   # pas de doublon à la fin
++        self.assertIn("── completed · $0.5000 · 2.0s", text)
++
++    def test_final_is_printed_when_nothing_was_streamed(self):
++        text = self.render([
++            {"kind": "turn_end", "text": "réponse finale", "author": "agent:a", "turn": "t1",
++             "ts": 1000, "meta": {"status": "completed"}},
++        ], now=1000)
++        self.assertIn("réponse finale", text)
++
++    def test_other_turns_and_kinds_are_visible(self):
++        text = self.render([
++            {"kind": "tool", "text": "read", "author": "agent:a", "turn": "t1", "ts": 1000,
++             "meta": {"tool": "read", "status": "started"}},
++            {"kind": "state", "text": "sleeping", "author": "ameesh:runner", "ts": 1001},
++            {"kind": "human_message", "text": "coucou", "author": "human:alice", "ts": 1002},
++            {"kind": "input", "text": "courrier", "author": "ameesh:runner", "ts": 1003},
++            {"kind": "text", "text": "tronqué", "author": "agent:a", "turn": "t2", "ts": 1004,
++             "truncated": True},
++        ], now=1004)
++        self.assertIn("· read (started)", text)
++        self.assertIn("· sleeping", text)
++        self.assertIn("[human]", text)
++        self.assertIn("← ameesh:runner", text)
++        self.assertIn("tronqué […]", text)
++
++    def test_turn_end_dates_only_other_days(self):
++        day = 20 * 3600
++        same = self.render([{"kind": "text", "text": "x", "author": "a", "ts": day}],
++                           now=day + 60)
++        other = self.render([{"kind": "text", "text": "x", "author": "a", "ts": day}],
++                            now=day + 3 * 86400)
++        self.assertRegex(same, r"\d\d:\d\d:\d\d a\n")
++        self.assertRegex(other, r"\d\d-\d\d \d\d:\d\d a\n")
++
++
++# ==========================================================================
++# ligne de commande
++# ==========================================================================
++
++class ParserTest(unittest.TestCase):
++    def test_agent_positional_selects_the_client(self):
++        args = chat.build_parser().parse_args(["dev1", "--once", "--after", "3", "--limit", "5"])
++        self.assertEqual((args.agent, args.once, args.after, args.limit), ("dev1", True, 3, 5))
++        self.assertIsNone(chat.build_parser().parse_args([]).agent)
++
++    def test_session_options_are_refused_with_an_agent(self):
++        args = chat.build_parser().parse_args(["dev1", "--name", "chat-x", "--harness", "codex"])
++        self.assertEqual(chat.client_conflicts(args), ["--harness", "--name"])
++        self.assertEqual(chat.client_conflicts(chat.build_parser().parse_args(["dev1"])), [])
++
++    def test_once_and_dry_run_are_distinct_flags(self):
++        args = chat.build_parser().parse_args(["dev1"])
++        self.assertFalse(args.once or args.dry_run)
++
++
++# ==========================================================================
++# client sans base : entrée, identité, suivi
++# ==========================================================================
++
++class ClientTest(unittest.TestCase):
++    """Le client reçoit une fausse base : aucune connexion, aucun courrier réel."""
++
++    row = {"name": "dev1", "mode": "execute", "harness": "claude", "host": "h1",
++           "status": "idle", "status_text": "rien", "last_seen_ts": 1000.0,
++           "team": "ameesh", "projects": ["ameesh"]}
++
++    def setUp(self):
++        env = {k: v for k, v in os.environ.items() if k not in _IDENTITY}
++        env["USER"] = "tester"
++        patcher = mock.patch.dict(os.environ, env, clear=True)
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        self.cfg = dataclasses.replace(config_mod.load(), humans="tester")
++        self.storage = _FakeStorage()
++        self.patches = [
++            mock.patch.object(registry, "get", return_value=dict(self.row)),
++            mock.patch("ameesh.storage.of", return_value=self.storage),
++            mock.patch.object(conversation_mod, "history",
++                              side_effect=lambda db, agent, after=0, limit=100: {
++                                  "entries": [], "last_seq": 0, "next_seq": max(after, 0),
++                                  "gap": False, "more": False}),
++            mock.patch.object(mail, "send", return_value=7),
++        ]
++        for patcher in self.patches:
++            patcher.start()
++            self.addCleanup(patcher.stop)
++
++    def client(self, **kw):
++        clean = clean_chain()
++        kw.setdefault("lines", [])
++        kw.setdefault("subscribe", lambda: None)
++        kw.setdefault("sleep", lambda seconds: time.sleep(0))
++        kw.setdefault("chain", clean["chain"])
++        kw.setdefault("environ_of", clean["environ_of"])
++        return chat.TerminalClient(self.cfg, object(), "dev1", out=io.StringIO(),
++                                   err=io.StringIO(), **kw)
++
++    def test_a_line_is_sent_as_the_local_human(self):
++        client = self.client()
++        self.assertTrue(client.handle("bonjour"))
++        mail.send.assert_called_once_with(
++            client.db, "tester", "dev1", "bonjour", host=self.cfg.host, kind="notify",
++            payload={"human": True})
++        self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
++
++    def test_urgent_without_authorisation_falls_back_to_a_normal_message(self):
++        client = self.client()
++        client.handle("!urgent vite")
++        kwargs = mail.send.call_args.kwargs
++        self.assertEqual(mail.send.call_args.args[3], "vite")
++        self.assertEqual(kwargs["payload"], {"human": True})     # urgent non accordé
++        self.assertEqual(kwargs["kind"], "notify")
++        self.assertIn("delivered as a normal message", client.view.out.getvalue())
++
++    def test_urgent_and_stop_use_the_interrupt_path_when_authorised(self):
++        cfg = dataclasses.replace(self.cfg, interrupt_senders=("tester",))
++        client = self.client()
++        client.cfg = cfg
++        client.handle("!urgent maintenant")
++        kwargs = mail.send.call_args.kwargs
++        self.assertEqual(kwargs["payload"], {"human": True, "urgent": True})
++        self.assertEqual(kwargs["kind"], "event")
++        mail.send.reset_mock()
++        client.handle("!stop")
++        self.assertEqual(mail.send.call_args.args[3], chat.STOP_BODY)
++        self.assertEqual(mail.send.call_args.kwargs["payload"],
++                         {"human": True, "urgent": True})
++
++    def test_stop_without_authorisation_drops_nothing(self):
++        client = self.client()
++        client.handle("!stop")
++        mail.send.assert_not_called()
++        self.assertIn("!stop refused", client.view.out.getvalue())
++
++    def test_read_only_when_launched_from_an_agent_session(self):
++        client = self.client(environ_of=lambda pid: {"AGENT_MAIL_NAME": "orch"})
++        self.assertIn("agent orch", client.read_only)
++        client.handle("bonjour")
++        mail.send.assert_not_called()
++        self.assertIn("read-only", client.view.out.getvalue())
++
++    def test_quit_help_and_state_do_not_send_anything(self):
++        client = self.client()
++        self.assertTrue(client.handle("!help"))
++        self.assertIn("!urgent", client.view.out.getvalue())
++        client.handle("!state")
++        self.assertIn("dev1 · execute · claude", client.view.out.getvalue())
++        self.assertFalse(client.handle("!quit"))
++        mail.send.assert_not_called()
++
++    def test_unverified_human_writes_under_the_chat_identity(self):
++        cfg = dataclasses.replace(self.cfg, humans="")
++        with mock.patch("ameesh.work.known_human", return_value=None):
++            client = self.client()
++        client.cfg = cfg
++        with mock.patch("ameesh.work.known_human", return_value=None):
++            client.handle("bonjour")
++        self.assertEqual(mail.send.call_args.args[1], "chat-tester")
++        self.assertEqual(mail.send.call_args.kwargs["payload"], None)
++
++    def test_loop_drains_input_then_leaves_on_end_of_input(self):
++        client = self.client(lines=["bonjour", "!quit"])
++        self.assertEqual(client.run(), 0)
++        self.assertEqual(mail.send.call_args.args[3], "bonjour")
++
++    def test_follow_reads_from_the_last_cursor(self):
++        calls = []
++
++        def history(db, agent, after=0, limit=100):
++            calls.append((after, limit))
++            if limit == 1:                     # lecture de tête : dernier seq
++                return {"entries": [], "last_seq": 4, "next_seq": 4, "gap": False, "more": False}
++            if after == 0:                     # page d'entrée : les derniers 20
++                return {"entries": [{"kind": "text", "text": "un", "author": "agent:a",
++                                     "turn": "t1", "ts": 1000}],
++                        "last_seq": 4, "next_seq": 4, "gap": False, "more": False}
++            return {"entries": [{"kind": "text", "text": "deux", "author": "agent:a",
++                                 "turn": "t2", "ts": 1001}],
++                    "last_seq": 5, "next_seq": 5, "gap": False, "more": False}
++
++        with mock.patch.object(conversation_mod, "history", side_effect=history):
++            client = self.client()
++            self.assertTrue(client.handle("!state"))
++            cursor = client.show_history()
++            self.assertEqual(calls[0], (0, 1))
++            self.assertEqual(calls[1], (0, client.limit))
++            self.assertEqual(cursor, 4)
++            self.assertEqual(client.read_new(cursor), 5)
++        text = client.view.out.getvalue()
++        self.assertIn("un", text)
++        self.assertIn("deux", text)
++
++
++# ==========================================================================
++# client sur la base réelle (CI)
++# ==========================================================================
++
++class ClientDbTest(PgTestCase):
++    def setUp(self):
++        super().setUp()
++        env = {k: v for k, v in os.environ.items() if k not in _IDENTITY}
++        env["USER"] = "tester"
++        patcher = mock.patch.dict(os.environ, env, clear=True)
++        patcher.start()
++        self.addCleanup(patcher.stop)
++        self.cfg = dataclasses.replace(self.cfg, humans="tester")
++        self.db.execute("TRUNCATE conversation_log, conversation_heads")
++        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host)
++        log = conversation_mod.Log(self.db, self.cfg, agent="dev1")
++        log.append("text", "premier", author="agent:dev1", session="s", turn="t1")
++        log.append("turn_end", "premier", author="agent:dev1", session="s", turn="t1",
++                   meta={"status": "completed"})
++
++    def client(self, argv, **kw):
++        args = chat.build_parser().parse_args(argv)
++        clean = clean_chain()
++        kw.setdefault("lines", [])
++        kw.setdefault("subscribe", lambda: None)
++        kw.setdefault("sleep", lambda seconds: time.sleep(0))
++        return chat.client_run(self.cfg, args, db=self.db, out=kw.pop("out", io.StringIO()),
++                               chain=clean["chain"], environ_of=clean["environ_of"], **kw)
++
++    def test_once_shows_the_last_entries(self):
++        out = io.StringIO()
++        self.assertEqual(self.client(["dev1", "--once"], out=out), 0)
++        text = out.getvalue()
++        self.assertIn("dev1 · execute · claude", text)
++        self.assertIn("premier", text)
++        self.assertIn("── completed", text)
++
++    def test_unknown_agent_is_refused(self):
++        err = io.StringIO()
++        args = chat.build_parser().parse_args(["fantome", "--once"])
++        clean = clean_chain()
++        code = chat.client_run(self.cfg, args, db=self.db, out=io.StringIO(), err=err,
++                               lines=[], chain=clean["chain"],
++                               environ_of=clean["environ_of"])
++        self.assertEqual(code, 1)
++        self.assertIn("unknown agent", err.getvalue())
++
++    def test_input_lands_in_the_mailbox_as_the_human(self):
++        client = chat.TerminalClient(self.cfg, self.db, "dev1", out=io.StringIO(),
++                                     lines=[], subscribe=lambda: None,
++                                     sleep=lambda seconds: time.sleep(0),
++                                     **clean_chain())
++        client.handle("bonjour")
++        rows = mail.unread(self.db, "dev1")
++        self.assertEqual(len(rows), 1)
++        self.assertEqual((rows[0]["sender"], mail.message_payload(rows[0]).get("human")),
++                         ("tester", True))

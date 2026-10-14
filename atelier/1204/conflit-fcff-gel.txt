@@ -1,0 +1,10 @@
+# git merge-tree --write-tree fcff03db4e77aeee6ccaa3bb09debde3e5ad089c 39df7c316c9e5eb88b5676e5c39edbc324d89838
+# (git 2.43.0)
+0d1ca82d81674479cfb08269339b8d8482cbe74e
+100644 f6a95515ce68c9119c407cd419a40375e4e23834 1	docs/design/etudes/index.md
+100644 fd5f09828c45f9e006cc4d14ce53fa1e51e843c0 2	docs/design/etudes/index.md
+100644 0b3e711e17fd4f2fca527c1fc5aad032a51d4998 3	docs/design/etudes/index.md
+
+Auto-merging docs/EXPLOITATION.md
+Auto-merging docs/design/etudes/index.md
+CONFLICT (content): Merge conflict in docs/design/etudes/index.md

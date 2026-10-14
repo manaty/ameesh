@@ -1,0 +1,36 @@
+=== commit candidat F ===
+tree a9d8cc4fdb23a8afbc0a47fce9385085f3e62288
+parent fcff03db4e77aeee6ccaa3bb09debde3e5ad089c
+parent 39df7c316c9e5eb88b5676e5c39edbc324d89838
+author mty-amh-docs-01 <mty-amh-docs-01@users.noreply.github.com> 1791968623 +0000
+committer mty-amh-docs-01 <mty-amh-docs-01@users.noreply.github.com> 1791968623 +0000
+
+union #1204 : vague 39df7c316c9e sur main fcff03db4e77 (prep locale, non poussee)
+
+=== union intermediaire a3ef (229ac4be) ===
+tree 661351d442feac66b925ef137e1499ff09354d23
+parent 229ac4be17233b1eb0fd63d6322ea8181f891e54
+parent 39df7c316c9e5eb88b5676e5c39edbc324d89838
+author mty-amh-docs-01 <mty-amh-docs-01@users.noreply.github.com> 1791966879 +0000
+committer mty-amh-docs-01 <mty-amh-docs-01@users.noreply.github.com> 1791966879 +0000
+
+union #1204 : vague 39df7c316c9e sur main 229ac4be1723 (prep locale, non poussee)
+
+# Conflicts:
+#	docs/design/etudes/index.md
+
+=== ls-tree des 11 fichiers du delta F vs main ===
+a906548cf5d3134c0b7dcbc879f4c09524e15480 blob 0d6aca8a28e495158e8c4a385737b0574fda0947	docs/EXECUTEUR-MEDIEE.md
+d4f0d7b88285b8ba6d2e15baec6e0401d5a6f9a0 blob 97b6d1c39e6ce755326003fb862c73c861ba27e1	docs/EXPLOITATION.md
+fb7635f979e8c060beb41ebfc707257d1ea9165c blob fd5f09828c45f9e006cc4d14ce53fa1e51e843c0	docs/design/etudes/index.md
+15b721dcec7f58e530139ad12192310e3fffd205 blob fcff03db4e77aeee6ccaa3bb09debde3e5ad089c:docs/design/etudes/l243-projects-and-names.md
+(absent)	docs/design/etudes/l243-projects-and-names.md
+904b748b98caf6468ce08b7edd6932de894bc3ab blob fcff03db4e77aeee6ccaa3bb09debde3e5ad089c:reviews/2026-10-14-1204-manifeste-vague-suivante.md
+(absent)	reviews/2026-10-14-1204-manifeste-vague-suivante.md
+f3ea2d0e504f7d9641d45daff8834debde7785c6 blob 7d3b9f91694acce2a90a7d3f9c348ba825bfadc4	scripts/test-hermeticity-lint.py
+69e638a9fb42a9f1afb2ce59eeaeb314aeb1ca91 blob d1c5bcfbdb037feb767b6744ffdbf76b3e632399	src/ameesh/chat.py
+88d677947ebb4965d851d803ebb62a08a09daf76 blob 0b8dddf6db7a46905fc5aae17fe8ee936a93a1d2	tests/parts/lecteurs-doc.txt
+ee1bc3f1731c21cc99bf90370279594ec7f6a956 blob b561ed529593bb7d5ca02b1c5717df4a7d7c605e	tests/test_hermeticity_lint.py
+f7bdee0f7bcd79fb78edff3d631eba0697978593 blob 4606c5bcd564794c079f7ef37c22ca9c51702ee3	tests/test_l107_executor_contract.py
+5fd448e98a112ebb8d0c0969e1c1d694dcbf3a9a blob fcff03db4e77aeee6ccaa3bb09debde3e5ad089c:tests/test_l79_chat_terminal.py
+(absent)	tests/test_l79_chat_terminal.py

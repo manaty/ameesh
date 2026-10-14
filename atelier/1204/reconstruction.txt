@@ -1,0 +1,13 @@
+# Reconstruction depuis les seuls refs publics, sans le commit F
+# main = fcff03db4e77aeee6ccaa3bb09debde3e5ad089c (branche main) ; gel = 39df7c316c9e5eb88b5676e5c39edbc324d89838 (integration/vague-suivante-1204)
+# 1) git merge-tree --write-tree main gel -> arbre 0d1ca82d81674479cfb08269339b8d8482cbe74e
+#    conflit unique docs/design/etudes/index.md ; etages : base f6a95515 / main fd5f0982 / gel 0b3e711e
+#    docs/EXPLOITATION.md auto-fusionne -> blob d4f0d7b88285b8ba6d2e15baec6e0401d5a6f9a0 (= blob de F)
+# 2) resolution index.md, union ordonnee (L243 de la vague puis L244 de main) :
+#    git cat-file blob <gel>:0b3e711e > gel.md ; <base>:f6a95515 > base.md ; <main>:fd5f0982 > main.md
+#    git merge-file -p --union gel.md base.md main.md   (l'ordre des deux cotes fixe L243 puis L244)
+#    -> blob fb7635f979e8c060beb41ebfc707257d1ea9165c (= blob de F:index.md), 0 marqueur, 2 etudes presentes
+# 3) arbre du conflit + ce seul blob remplace -> a9d8cc4fdb23a8afbc0a47fce9385085f3e62288
+#    arbre de F : a9d8cc4fdb23a8afbc0a47fce9385085f3e62288  => IDENTIQUES
+# Note : --union avec l'ordre inverse (main en premier) donne L244 puis L243, blob 4900aa9528ad...
+#        contenu equivalent mais ordre different ; l'ordre qualifie est L243 puis L244 (cf. F).
