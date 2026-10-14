@@ -57,6 +57,9 @@ def main() -> int:
                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
                     "AMEESH_HOST", "AMEESH_SCHEMA", "AMEESH_TURN_MAIL_MAX",
                     "AMEESH_TURN_ID", "AMEESH_HARNESS",
+                    # #834 : l'identité git de la session (auteur et committer)
+                    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
                     # L73 : dossier temporaire et caches gérés
                     "TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR", "AMEESH_CACHE_DIR",
                     "npm_config_cache", "npm_config_store_dir", "YARN_CACHE_FOLDER")},
