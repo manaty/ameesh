@@ -518,6 +518,80 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
+class PushLaneTest(unittest.TestCase):
+    """nature() on a push: the whole pushed range decides (#833)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _nature(self, base, head="HEAD", ref="refs/heads/main", event="push"):
+        return plan.nature(event, base=base, head=head, repo=self.repo.path, ref=ref)
+
+    def _doc_commit(self, name, text="# Doc\n"):
+        self.repo.write(f"docs/{name}", text)
+        return self.repo.commit()
+
+    def test_multi_commit_documentation_push_takes_the_fast_lane(self):
+        # #833: github.event.before, not HEAD^1, so every pushed commit counts
+        self._doc_commit("a.md")
+        head = self._doc_commit("b.md")
+        out = self._nature(self.repo.base, head)
+        self.assertTrue(out["docs_only"], out["why"])
+        self.assertEqual(sorted(out["files"]), ["docs/a.md", "docs/b.md"])
+
+    def test_code_hidden_behind_a_last_documentation_commit_runs_the_suite(self):
+        # the bug: HEAD^1 alone saw only the last commit, documentation, and
+        # took the fast lane over a push that carried code
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        code = self.repo.commit()
+        head = self._doc_commit("note.md")
+        last_only = self._nature(code, head)
+        self.assertTrue(last_only["docs_only"], last_only["why"])
+        out = self._nature(self.repo.base, head)
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("src/ameesh/code.py", out["files"])
+
+    def test_a_push_to_a_release_branch_always_runs_the_suite(self):
+        head = self._doc_commit("a.md")
+        out = self._nature(self.repo.base, head, ref="refs/heads/release/1.10.0")
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("full suite", out["why"])
+        self.assertIn("release/1.10.0", out["why"])
+
+    def test_created_branch_and_rewritten_history_run_the_suite(self):
+        head = self._doc_commit("a.md")
+        for base in (plan.NULL_SHA, "", "not a sha"):
+            with self.subTest(base or "empty"):
+                out = self._nature(base, head)
+                self.assertFalse(out["docs_only"], out["why"])
+                self.assertIn("pushed range unknown", out["why"])
+        # a rewritten history: the tip before the push is no ancestor anymore
+        _git(self.repo.path, "checkout", "-q", "-b", "side", self.repo.base)
+        side = self._doc_commit("side.md")
+        _git(self.repo.path, "checkout", "-q", "-")
+        out = self._nature(side, head)
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("pushed range unknown", out["why"])
+
+    def test_a_pushed_version_bump_runs_the_suite(self):
+        # L157 is a pull-request rule: a pushed version never takes the lane
+        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.3"\n')
+        base = self.repo.commit()
+        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.4"\n')
+        head = self.repo.commit()
+        out = self._nature(base, head)
+        self.assertFalse(out["version_only"], out["why"])
+        self.assertFalse(out["docs_only"], out["why"])
+
+    def test_a_pull_request_is_unchanged(self):
+        # the reference of the source branch does not matter on a PR
+        head = self._doc_commit("a.md")
+        out = self._nature(self.repo.base, head, ref="refs/heads/lot/833-x",
+                           event="pull_request")
+        self.assertTrue(out["docs_only"], out["why"])
+
+
 class PlanTest(unittest.TestCase):
     def test_fallback_without_a_map(self):
         p = plan.make_plan("push", None, NOW)
@@ -819,6 +893,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("python3 scripts/test-plan.py plan --out plan.json --map "
                       "carte/carte.json.gz", self.text)
         self.assertIn("--annotations", self.text)
+
+    def test_plan_job_passes_the_pushed_range(self):
+        # #833: a push is planned from github.event.before, not HEAD^1 alone
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
+                      "github.event.before || 'HEAD^1' }}", self.text)
+        self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
     def test_dynamic_matrices(self):
         for driver in ("psycopg", "psql"):
