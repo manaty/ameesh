@@ -352,7 +352,11 @@ class WorkerStaleExitTest(PgTestCase):
         pret = runner._stale_restart_ready()
         if worker.is_alive():
             self.assertFalse(pret, "la passe attend la mort du worker")
-            self.assertTrue(worker.wake.is_set(), "le worker au repos devait être réveillé")
+            # Pas d'assertion sur `worker.wake` ici : le worker réel peut le
+            # consommer (`clear`) entre ce constat et le nôtre, puis vivre
+            # jusqu'à son `finally` — l'assertion dépendrait de l'ordonnancement
+            # (R2 cx1). Le réveil des workers au repos est couvert par la
+            # doublure, sans course : `test_worker_au_repos_reveille_une_fois`.
         worker.join(timeout=15)
         self.assertFalse(worker.is_alive(), "le worker devait sortir entre deux tours")
         self.assertTrue(runner._stale_restart_ready(), "plus rien n'écrit : on peut se remplacer")
