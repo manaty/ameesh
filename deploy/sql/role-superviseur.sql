@@ -485,6 +485,16 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
         'duration_s', 'failed_at', 'message_id', 'recorded_at'
     ]),
+    -- #845 (0426) : garde de la CI par l'API — état des runners et de la file
+    -- (même nature que ci_runs : identifiants, noms, horodatages, comptages,
+    -- aucun contenu)
+    ('ci_runner_state', ARRAY[
+        'repo', 'runner_id', 'name', 'busy', 'job', 'busy_since', 'stuck_since',
+        'seen_at'
+    ]),
+    ('ci_queue_state', ARRAY[
+        'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
+    ]),
     -- Session history (L52, 0032 §2): which sessions, when and where;
     -- no content (transcripts stay in harness storage).
     ('persona_sessions', ARRAY[
