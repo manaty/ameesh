@@ -35,7 +35,12 @@
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57) : VM (adresse WireGuard), PERSONAS_VM (personas servies
-# par le serveur). Aucun secret n'est lu ni affiché.
+# par le serveur ; vide accepté pour un serveur sans exécutant, comme
+# manaty-mesh-1). Aucun secret n'est lu ni affiché.
+#
+# La séquence staging des quatre hôtes (deploy/mise-a-jour/staging.sh, #1155)
+# appelle ce script avec un BASCULE_ENV temporaire par hôte : la topologie y
+# prime sur ce fichier.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -57,7 +62,11 @@ if [ "$MODE" = agents ]; then
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
   [[ $HOTE_AGENTS =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "HOTE_AGENTS invalide" >&2; exit 2; }
 else
-  : "${VM:?VM manquant dans $BASCULE_ENV}" "${PERSONAS_VM:?PERSONAS_VM manquant dans $BASCULE_ENV}"
+  : "${VM:?VM manquant dans $BASCULE_ENV}"
+  # PERSONAS_VM peut etre vide : manaty-mesh-1 ne porte que la base du mesh et
+  # aucun executant (#1155). La variable doit rester declaree.
+  [ -n "${PERSONAS_VM+x}" ] \
+    || { echo "PERSONAS_VM manquant dans $BASCULE_ENV (vide accepte pour un hote sans executant)" >&2; exit 2; }
 fi
 
 ICI="$(cd "$(dirname "$0")" && pwd)"
