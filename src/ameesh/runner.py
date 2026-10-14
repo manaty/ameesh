@@ -43,7 +43,7 @@ import uuid
 
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import budget as budget_mod, db as db_mod, fil, mail, registry, sentinel, storage
+from . import budget as budget_mod, db as db_mod, fil, identity, mail, registry, sentinel, storage
 from . import persona_memory as memory_mod
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
@@ -3715,6 +3715,11 @@ class AgentWorker(threading.Thread):
             # L105 : borne du courrier remis par le hook pendant ce tour
             "AMEESH_TURN_MAIL_MAX": str(self.turn_mail_max()),
         }
+        # #834 : l'identité git de la session — auteur ET committer — vient du
+        # nom d'agent du bail, jamais de la configuration du dépôt (partagée
+        # par tous les worktrees : un `user.name` écrit par un agent valait
+        # pour les autres, incident du 13/10/2026).
+        identite.update(identity.git_identity(self.name))
         env.update(identite)
         if getattr(self.runner, "mediated", False):
             self._mediated_env(env)
@@ -6914,6 +6919,8 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
         "AMEESH_RUNNER_ID": owner, "AGENT_MESH_RUNNER_ID": owner,
         "AMEESH_LEASE_EPOCH": str(epoch), "AGENT_MESH_LEASE_EPOCH": str(epoch),
     })
+    # #834 : la session attachée porte la même identité git qu'un tour.
+    env.update(identity.git_identity(name))
     if harness:
         env["AMEESH_HARNESS"] = harness  # L224 : comme pour un tour
     return env
