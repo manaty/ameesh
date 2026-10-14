@@ -1,0 +1,202 @@
+{
+  "status": "exact local v3 review matrix admitted by pilot; coordinated freeze/publication and full CI pending",
+  "source": "bureau2026-10-14T21:25+02:00; canon home65 merged19:25:36Z, §12",
+  "base_main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "head": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+  "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "included": [
+    {
+      "lot": 490,
+      "branch": "lot/490-deepseek-tool-cgroup",
+      "source_sha": "b2f0a1b8a0c14291fddb5dfe2b57d7c45594c57f",
+      "source_base": "afa32932e72c459bf1d23314912647b23b306b73",
+      "commit": "748efffd076867f1c424a2614daaee5898af0c7a",
+      "tree": "aac1d54c7cbd674ad0b6e27de8c71e4024ad1075",
+      "paths": [
+        "docs/design/deepseek-tool-cgroup.md",
+        "pyproject.toml",
+        "src/ameesh/adapters.py",
+        "src/ameesh/deepseek_cgroup.cjs",
+        "src/ameesh/deepseek_cgroup.py",
+        "src/ameesh/platform/tool_cgroups.py",
+        "tests/l490_provider.mjs",
+        "tests/l490_worker.cjs",
+        "tests/test_adapters.py",
+        "tests/test_l490_deepseek_cgroup.py"
+      ]
+    },
+    {
+      "lot": 513,
+      "branch": "lot/513-deepseek-offpeak",
+      "source_sha": "b3e910833755ee843908f75e4a426623a5251029",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "f3e60f587de7d0431d51b5bb4339c96abf90044a",
+      "tree": "296cec0dcab3fb1887abe02b64bb70a59ee280b5",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/budget.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/exploitation.py",
+        "src/ameesh/notify.py",
+        "src/ameesh/relay.py",
+        "src/ameesh/storage/interface.py",
+        "src/ameesh/storage/postgres/costs.py",
+        "tests/test_l13_budget.py",
+        "tests/test_l513_deepseek_offpeak.py"
+      ]
+    },
+    {
+      "lot": 706,
+      "branch": "auditeur/706-rotation-latency",
+      "source_sha": "4f0bb179d28ea78cbb0fdcb9c439036130dd92c4",
+      "source_base": "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac",
+      "commit": "90f7ded8d00008833b4da2fb549bfef41c8ff099",
+      "tree": "7792305cc2f7bc2398c53926afdc8a6b6d4f6cf2",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/config.py",
+        "src/ameesh/runner.py",
+        "tests/test_706_rotation_latency.py"
+      ]
+    },
+    {
+      "lot": 859,
+      "branch": "lot/859-mail-lot-declared-guard",
+      "source_sha": "c3be406abc41ded29ae10e0f126512f37cffbbd4",
+      "source_base": "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac",
+      "commit": "7559bd3d0b95330f9c9f247709f93ad562419799",
+      "tree": "6990c8724a9fd76b32a99610f7f7e7778d3c3d34",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/assignments.py",
+        "src/ameesh/cli.py",
+        "tests/test_l118_assignments.py"
+      ]
+    },
+    {
+      "lot": 1020,
+      "branch": "lot/1020-watch-wake-identity",
+      "source_sha": "2241af9aaf2378401124f6f355b1cb7d761319f3",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "635dd51cb8439b6f2504617e2d3c4b9ee1b2ba85",
+      "tree": "33dcc73684f1b1a71d241b4e0b07b25d6bc376e0",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/watch.py",
+        "tests/test_l121_watch.py"
+      ]
+    },
+    {
+      "lot": 1028,
+      "branch": "lot/1028-n777-docstring-free-at",
+      "source_sha": "04e0656595d78a7f347ff7f1282d654b8840d322",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "b5e5675f2dac3b22ab873d4bb83a8d9bee397826",
+      "tree": "53510e4c2618f3636a1369f1d2b20fe965d02bf7",
+      "paths": [
+        "docs/COMPTES.md",
+        "src/ameesh/accounts.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/mesh_cli.py",
+        "src/ameesh/progress.py",
+        "src/ameesh/sous_utilisation.py",
+        "tests/test_1075_pace_multiplier.py",
+        "tests/test_l242b2_budget.py",
+        "tests/test_l94_underuse.py",
+        "tests/test_progress.py"
+      ]
+    },
+    {
+      "lot": 1145,
+      "branch": "lot/1145-nettoyage-configs-mktemp",
+      "source_sha": "d118afd13fe1b15fffe28e6e49ad696f33d98a3b",
+      "source_base": "acd8a0f09637824bbe3c974d28540aff7d897a9d",
+      "commit": "d3fb087f676c735eb46af01cdd7efcc65683db5c",
+      "tree": "4033db1f9f8459b655a43d7b3af6cfd3968e416e",
+      "paths": [
+        "scripts/test-parallele.sh",
+        "scripts/test.sh"
+      ]
+    },
+    {
+      "lot": 1279,
+      "branch": "lot/1279-755-yaml-compact",
+      "source_sha": "24b1e4aa3419584c4a1905503ca6915922c80395",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "429a5c54eba939899d1b34b70f4e77ca357a41e2",
+      "tree": "b702010e4c001f14506a0cb8911b3184e6653a12",
+      "paths": [
+        "tests/test_l755_workflow_timeouts.py"
+      ]
+    },
+    {
+      "lot": 1293,
+      "branch": "lot/1293-cache-venv-resave",
+      "source_sha": "f7b720253883491f9a088f20fce3b6e73782ad29",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "3a4ec4d425e3fe08e444331a8b4f5564482d7f1c",
+      "tree": "bfc44c26b959bcb38181d96745e45e94a1448225",
+      "paths": [
+        ".github/workflows/tests.yml",
+        "tests/test_l1293_l1294_venv_cache.py",
+        "tests/test_l932_ci_venv_cache.py"
+      ],
+      "covered_lots": [
+        1293,
+        1294
+      ]
+    },
+    {
+      "lot": 1196,
+      "branch": "lot/1196-sid-unique-l39",
+      "source_sha": "c3e3fd8148396d8577772c9d41522aefd61c5913",
+      "source_base": "acd8a0f09637824bbe3c974d28540aff7d897a9d",
+      "paths": [
+        "tests/test_l39_adoption_reprise.py"
+      ],
+      "commit": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+      "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59"
+    }
+  ],
+  "excluded": [
+    {
+      "lot": 532,
+      "reason": "composition conflict",
+      "detail": "b6866deae9a9fb341832adde93b79b5bed600afb\n100644 b5cdd9e3adc5e7b477c494d4ec6cabc1f6a572a8 1\tsrc/ameesh/notify.py\n100644 72374c1ab723cea4bdc9c5fbf4f78a71dd6a05a8 2\tsrc/ameesh/notify.py\n100644 c9b82675ebf672a1899f4dcc7500cb1fae165196 3\tsrc/ameesh/notify.py\n\nAuto-merging src/ameesh/exploitation.py\nAuto-merging src/ameesh/notify.py\nCONFLICT (content): Merge conflict in src/ameesh/notify.py\n"
+    },
+    {
+      "lot": 1144,
+      "reason": "composition conflict",
+      "detail": "c1c96b554bb497e7662b0d530b62c55ad17e0b5f\n100644 f3a1b02d0891bc248fc3a8e43a58d63a487ff026 1\tdocs/EXPLOITATION.md\n100644 f093f4082bc36da0ba820ae99f18c408a52f98b2 2\tdocs/EXPLOITATION.md\n100644 feab0da4ff37af2cbc231cb4b0044fcf06ae8a07 3\tdocs/EXPLOITATION.md\n\nAuto-merging docs/EXPLOITATION.md\nCONFLICT (content): Merge conflict in docs/EXPLOITATION.md\n"
+    },
+    {
+      "lot": 388,
+      "reason": "required complete contribution/review-family matrix pending; historical content and composition opinions retained"
+    }
+  ],
+  "remaining_gates": [
+    "freeze exact packet and coordinate publication with bureau (source38076/40128 and1341 remain scoped)",
+    "complete CI on final packet tree, all expected parts executed",
+    "pilot fire and target freshness",
+    "dedicated staging deployment and real host smokes"
+  ],
+  "ci_runs_started": 0,
+  "main_merges": 0,
+  "previous_candidate": "8c1f99ff00a5f7fd085fb4bfe726ab4593ed12e9",
+  "reason": "1339 merged on main2458; ten reviewed contributions recomposed automatically, all patch-ids constant; 1294 named as covered by1293 without duplicate merge",
+  "created_at": "2026-10-14T20:29:11.390058+00:00",
+  "covered_lots": [
+    490,
+    513,
+    706,
+    859,
+    1020,
+    1028,
+    1145,
+    1279,
+    1293,
+    1294,
+    1196
+  ],
+  "review_matrix_admission": "final-review-matrix-admission.json"
+}

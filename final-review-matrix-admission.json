@@ -1,0 +1,195 @@
+{
+  "head": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+  "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "base_main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "status": "pilot admits the exact review matrix; coordinated freeze/publication/CI still required",
+  "matrix": [
+    {
+      "lot": 490,
+      "class": "sensible prod (conservative)",
+      "authors": [
+        {
+          "family": "Codex",
+          "scope": "original functional contribution"
+        },
+        {
+          "family": "DeepSeek",
+          "scope": "constant integration"
+        }
+      ],
+      "required_families": 2,
+      "reviews": [
+        {
+          "family": "DeepSeek",
+          "source": "event7179 full10-file review onaca83eba, immutable blobs transported"
+        },
+        {
+          "family": "Claude",
+          "source": "milestone3584 on exactb2f0a1b8, full static review"
+        }
+      ],
+      "decision": "admitted by original functional contribution; no original-author Codex review counted"
+    },
+    {
+      "lot": 513,
+      "class": "sensible SQL/prod",
+      "required_families": 2,
+      "authors": [
+        {
+          "family": "Claude",
+          "scope": "r1 ffa2eb8b8+2cc17e2a1"
+        },
+        {
+          "family": "DeepSeek",
+          "scope": "r2/r3"
+        }
+      ],
+      "reviews_by_contribution": [
+        {
+          "contribution": "initialClaude",
+          "families": [
+            "Codex",
+            "DeepSeek"
+          ],
+          "source": "author event18960; Codex full-content lineage plus corrected findings, QA2392 then closing delta2431"
+        },
+        {
+          "contribution": "correctionsDeepSeek",
+          "families": [
+            "Codex",
+            "Claude"
+          ],
+          "source": "milestones2476/2483 and2508/3569; range-diff constant to b3e91083"
+        }
+      ],
+      "decision": "admitted by contribution; blocked1954/2376/2392 not represented as GO; final2431 is closing delta combined with unchanged original scope"
+    },
+    {
+      "lot": 706,
+      "class": "sensible concurrence",
+      "author_family": "Codex",
+      "required_families": 1,
+      "reviews": [
+        {
+          "family": "DeepSeek",
+          "source": "milestone4299 exact4f0bb179; pilot17688/17807"
+        }
+      ],
+      "decision": "admitted, constant context"
+    },
+    {
+      "lot": 859,
+      "class": "sensible droits/security",
+      "author_family": "DeepSeek",
+      "required_families": 2,
+      "reviews": [
+        {
+          "family": "Codex",
+          "source": "milestone2253 onaffc65bd"
+        },
+        {
+          "family": "Claude",
+          "source": "milestone2320 onaffc65bd"
+        }
+      ],
+      "transport_source": "pilot17156 plus independently reproduced auto-merges to c3be406a and v3",
+      "decision": "admitted; parent_lot composition and guards constant"
+    },
+    {
+      "lot": 1020,
+      "class": "sensible hors prod as explicitly qualified13/10",
+      "author_family": "DeepSeek",
+      "required_families": 1,
+      "reviews": [
+        {
+          "family": "DeepSeek",
+          "source": "independent impl07 milestones3224 bd329eac and4237 exact2241af9a"
+        }
+      ],
+      "historical_exception": {
+        "canonical_source": "signed owner18855a as persisted inProcess§2",
+        "pilot_sources": [
+          9099,
+          9205
+        ],
+        "original_budget_condition": "cx1/cx2 held, bureau withdraws, explicitly recorded event9099",
+        "scope": "historical review on unchanged code; no new present-day fallback permission"
+      },
+      "decision": "admitted by historical qualified exception and proven constant code; current Codex composition opinion not relabelled as independent whole-code review"
+    },
+    {
+      "lot": 1028,
+      "class": "sensible argent/budgets",
+      "author_family": "DeepSeek",
+      "required_families": 1,
+      "reviews": [
+        {
+          "family": "Codex",
+          "source": "milestones3481/4306 exact transport to04e06565"
+        }
+      ],
+      "decision": "admitted, cost513 composition constant"
+    },
+    {
+      "lot": 1145,
+      "class": "sensible CI hors prod",
+      "author_family": "DeepSeek",
+      "required_families": 1,
+      "reviews": [
+        {
+          "family": "Codex",
+          "source": "milestone3988 full two-script review; lineage to d118afd"
+        }
+      ],
+      "decision": "admitted, cleanup scope constant; no required-check modification"
+    },
+    {
+      "lot": 1279,
+      "class": "leger tests",
+      "author_family": "DeepSeek",
+      "required_families_before_merge": 0,
+      "reviews": [
+        {
+          "family": "Codex",
+          "source": "milestone4056; exact final test blob"
+        }
+      ],
+      "decision": "admitted with nonblocking P2 tracked1281"
+    },
+    {
+      "lot": 1293,
+      "covered_lots": [
+        1293,
+        1294
+      ],
+      "class": "sensible CI hors prod",
+      "author_family": "DeepSeek",
+      "required_families": 1,
+      "reviews": [
+        {
+          "family": "Codex",
+          "source": "milestone4240 exactf7b72025, covers both lots"
+        }
+      ],
+      "decision": "admitted; cache-only continue-on-error, required tests/check conditions unchanged"
+    },
+    {
+      "lot": 1196,
+      "class": "leger tests",
+      "author_family": "DeepSeek",
+      "required_families_before_merge": 0,
+      "reviews": [
+        {
+          "family": "Codex",
+          "source": "cx2 v2 static whole delta, transported by v3 proof"
+        }
+      ],
+      "decision": "admitted; post-merge observation still due"
+    }
+  ],
+  "composition_opinion": "cx2-v3/review.md",
+  "primary_receipts": "final-review-matrix-primary-receipts.json",
+  "new_fallback_exceptions": 0,
+  "ci_started": 0,
+  "main_merges": 0
+}

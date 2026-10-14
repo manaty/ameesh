@@ -1,0 +1,450 @@
+{
+  "head": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+  "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "base_main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "merges": [
+    {
+      "lot": 490,
+      "source_sha": "b2f0a1b8a0c14291fddb5dfe2b57d7c45594c57f",
+      "parents": [
+        "2458ec053123d3f33644fef1e092fc84cc2773d9",
+        "b2f0a1b8a0c14291fddb5dfe2b57d7c45594c57f"
+      ],
+      "tree": "aac1d54c7cbd674ad0b6e27de8c71e4024ad1075",
+      "auto_merge": true,
+      "patch_id_U0": "2fd788da277050fe915be687cafbb487eea57a56",
+      "equal_source_and_v2": true,
+      "paths": [
+        "docs/design/deepseek-tool-cgroup.md",
+        "pyproject.toml",
+        "src/ameesh/adapters.py",
+        "src/ameesh/deepseek_cgroup.cjs",
+        "src/ameesh/deepseek_cgroup.py",
+        "src/ameesh/platform/tool_cgroups.py",
+        "tests/l490_provider.mjs",
+        "tests/l490_worker.cjs",
+        "tests/test_adapters.py",
+        "tests/test_l490_deepseek_cgroup.py"
+      ]
+    },
+    {
+      "lot": 513,
+      "source_sha": "b3e910833755ee843908f75e4a426623a5251029",
+      "parents": [
+        "748efffd076867f1c424a2614daaee5898af0c7a",
+        "b3e910833755ee843908f75e4a426623a5251029"
+      ],
+      "tree": "296cec0dcab3fb1887abe02b64bb70a59ee280b5",
+      "auto_merge": true,
+      "patch_id_U0": "259bbb8c6e40c2eb71f075b407038124f64978ef",
+      "equal_source_and_v2": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/budget.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/exploitation.py",
+        "src/ameesh/notify.py",
+        "src/ameesh/relay.py",
+        "src/ameesh/storage/interface.py",
+        "src/ameesh/storage/postgres/costs.py",
+        "tests/test_l13_budget.py",
+        "tests/test_l513_deepseek_offpeak.py"
+      ]
+    },
+    {
+      "lot": 706,
+      "source_sha": "4f0bb179d28ea78cbb0fdcb9c439036130dd92c4",
+      "parents": [
+        "f3e60f587de7d0431d51b5bb4339c96abf90044a",
+        "4f0bb179d28ea78cbb0fdcb9c439036130dd92c4"
+      ],
+      "tree": "7792305cc2f7bc2398c53926afdc8a6b6d4f6cf2",
+      "auto_merge": true,
+      "patch_id_U0": "7ef4a11ba8bf869231a22e23d277f0c2501ba9ea",
+      "equal_source_and_v2": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/config.py",
+        "src/ameesh/runner.py",
+        "tests/test_706_rotation_latency.py"
+      ]
+    },
+    {
+      "lot": 859,
+      "source_sha": "c3be406abc41ded29ae10e0f126512f37cffbbd4",
+      "parents": [
+        "90f7ded8d00008833b4da2fb549bfef41c8ff099",
+        "c3be406abc41ded29ae10e0f126512f37cffbbd4"
+      ],
+      "tree": "6990c8724a9fd76b32a99610f7f7e7778d3c3d34",
+      "auto_merge": true,
+      "patch_id_U0": "f29e7dbea0180a1025920f0cb8764a41b2a97105",
+      "equal_source_and_v2": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/assignments.py",
+        "src/ameesh/cli.py",
+        "tests/test_l118_assignments.py"
+      ]
+    },
+    {
+      "lot": 1020,
+      "source_sha": "2241af9aaf2378401124f6f355b1cb7d761319f3",
+      "parents": [
+        "7559bd3d0b95330f9c9f247709f93ad562419799",
+        "2241af9aaf2378401124f6f355b1cb7d761319f3"
+      ],
+      "tree": "33dcc73684f1b1a71d241b4e0b07b25d6bc376e0",
+      "auto_merge": true,
+      "patch_id_U0": "63239363ec19427ae105034e555b100e9a10533e",
+      "equal_source_and_v2": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/watch.py",
+        "tests/test_l121_watch.py"
+      ]
+    },
+    {
+      "lot": 1028,
+      "source_sha": "04e0656595d78a7f347ff7f1282d654b8840d322",
+      "parents": [
+        "635dd51cb8439b6f2504617e2d3c4b9ee1b2ba85",
+        "04e0656595d78a7f347ff7f1282d654b8840d322"
+      ],
+      "tree": "53510e4c2618f3636a1369f1d2b20fe965d02bf7",
+      "auto_merge": true,
+      "patch_id_U0": "cf4501a656ad376f6efb9d1c14ed489ee33cbeaf",
+      "equal_source_and_v2": true,
+      "paths": [
+        "docs/COMPTES.md",
+        "src/ameesh/accounts.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/mesh_cli.py",
+        "src/ameesh/progress.py",
+        "src/ameesh/sous_utilisation.py",
+        "tests/test_1075_pace_multiplier.py",
+        "tests/test_l242b2_budget.py",
+        "tests/test_l94_underuse.py",
+        "tests/test_progress.py"
+      ]
+    },
+    {
+      "lot": 1145,
+      "source_sha": "d118afd13fe1b15fffe28e6e49ad696f33d98a3b",
+      "parents": [
+        "b5e5675f2dac3b22ab873d4bb83a8d9bee397826",
+        "d118afd13fe1b15fffe28e6e49ad696f33d98a3b"
+      ],
+      "tree": "4033db1f9f8459b655a43d7b3af6cfd3968e416e",
+      "auto_merge": true,
+      "patch_id_U0": "7e3efd1cfd1694bd38b8b331b167ae499c28dad6",
+      "equal_source_and_v2": true,
+      "paths": [
+        "scripts/test-parallele.sh",
+        "scripts/test.sh"
+      ]
+    },
+    {
+      "lot": 1279,
+      "source_sha": "24b1e4aa3419584c4a1905503ca6915922c80395",
+      "parents": [
+        "d3fb087f676c735eb46af01cdd7efcc65683db5c",
+        "24b1e4aa3419584c4a1905503ca6915922c80395"
+      ],
+      "tree": "b702010e4c001f14506a0cb8911b3184e6653a12",
+      "auto_merge": true,
+      "patch_id_U0": "c8a34334fa6b38079c1c0f81e828b3206dc1c9dd",
+      "equal_source_and_v2": true,
+      "paths": [
+        "tests/test_l755_workflow_timeouts.py"
+      ]
+    },
+    {
+      "lot": 1293,
+      "source_sha": "f7b720253883491f9a088f20fce3b6e73782ad29",
+      "parents": [
+        "429a5c54eba939899d1b34b70f4e77ca357a41e2",
+        "f7b720253883491f9a088f20fce3b6e73782ad29"
+      ],
+      "tree": "bfc44c26b959bcb38181d96745e45e94a1448225",
+      "auto_merge": true,
+      "patch_id_U0": "5c1b93434c9d72794e47a74b0d78ed0ec531bac9",
+      "equal_source_and_v2": true,
+      "paths": [
+        ".github/workflows/tests.yml",
+        "tests/test_l1293_l1294_venv_cache.py",
+        "tests/test_l932_ci_venv_cache.py"
+      ]
+    },
+    {
+      "lot": 1196,
+      "source_sha": "c3e3fd8148396d8577772c9d41522aefd61c5913",
+      "parents": [
+        "3a4ec4d425e3fe08e444331a8b4f5564482d7f1c",
+        "c3e3fd8148396d8577772c9d41522aefd61c5913"
+      ],
+      "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+      "auto_merge": true,
+      "patch_id_U0": "4f420feeeac3ac7089520c3a1e5a5f607ffb4e91",
+      "equal_source_and_v2": true,
+      "paths": [
+        "tests/test_l39_adoption_reprise.py"
+      ]
+    }
+  ],
+  "union_v2_and_main_tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "global_packet_patch_id_U0": "ff9070b11774e8800ae29c04a7043ae15317386f",
+  "base_delta_patch_id_U0": "3a1c9e3ad219e928b8d4483081ef6412af5046f4",
+  "base_delta_paths": [
+    "docs/EXPLOITATION.md",
+    "scripts/test-plan.py",
+    "tests/test_l161f_plan.py"
+  ],
+  "base_delta_equals_v2_v3_delta": true,
+  "member_blobs": {
+    ".github/workflows/tests.yml": {
+      "v2": "d38a9e6f99ed39bed9b7192bc49cfbb1758968dd",
+      "v3": "d38a9e6f99ed39bed9b7192bc49cfbb1758968dd"
+    },
+    "docs/COMPTES.md": {
+      "v2": "a751e311df317b9ea93875b80f1001ba284c892a",
+      "v3": "a751e311df317b9ea93875b80f1001ba284c892a"
+    },
+    "docs/EXPLOITATION.md": {
+      "v2": "fc721446f547bc64db4cf9bc6abcd6cdc70ca205",
+      "v3": "3b2fdc9425988eeebf4a5750b8dc9b6048fe7ba7"
+    },
+    "docs/design/deepseek-tool-cgroup.md": {
+      "v2": "77cce3072f6002ea1b011be3304d424368556f28",
+      "v3": "77cce3072f6002ea1b011be3304d424368556f28"
+    },
+    "pyproject.toml": {
+      "v2": "0ae724f6f4873aa4076436f496bd352ba29d17f8",
+      "v3": "0ae724f6f4873aa4076436f496bd352ba29d17f8"
+    },
+    "scripts/test-parallele.sh": {
+      "v2": "3c354d603fd2a43c430ff3a38e367b958c3670d5",
+      "v3": "3c354d603fd2a43c430ff3a38e367b958c3670d5"
+    },
+    "scripts/test.sh": {
+      "v2": "0c16f098b431b61df24721b354cf58c18b813dfa",
+      "v3": "0c16f098b431b61df24721b354cf58c18b813dfa"
+    },
+    "src/ameesh/accounts.py": {
+      "v2": "25bbabebf23835bd88be99ba72ed958edd0600c6",
+      "v3": "25bbabebf23835bd88be99ba72ed958edd0600c6"
+    },
+    "src/ameesh/adapters.py": {
+      "v2": "b0e876400c0c4fdab3e8f776c95c323a4484eddb",
+      "v3": "b0e876400c0c4fdab3e8f776c95c323a4484eddb"
+    },
+    "src/ameesh/assignments.py": {
+      "v2": "d8ba7b1e22d732620164609b49717973efebb388",
+      "v3": "d8ba7b1e22d732620164609b49717973efebb388"
+    },
+    "src/ameesh/budget.py": {
+      "v2": "4f8bf57d16b545e5a8ca6ac0119d6dd2623afbc1",
+      "v3": "4f8bf57d16b545e5a8ca6ac0119d6dd2623afbc1"
+    },
+    "src/ameesh/cli.py": {
+      "v2": "28d3bbbb667f97af21f3e47cc70f8d5106e6ee06",
+      "v3": "28d3bbbb667f97af21f3e47cc70f8d5106e6ee06"
+    },
+    "src/ameesh/config.py": {
+      "v2": "28ee10c70c1629566b4f8fdf9bcd1c3de1ae3842",
+      "v3": "28ee10c70c1629566b4f8fdf9bcd1c3de1ae3842"
+    },
+    "src/ameesh/cost.py": {
+      "v2": "16dba2264e5c0ecba9c01b486850007ef065e2b2",
+      "v3": "16dba2264e5c0ecba9c01b486850007ef065e2b2"
+    },
+    "src/ameesh/deepseek_cgroup.cjs": {
+      "v2": "a9be89017023664016fc27fb95e645b722944d77",
+      "v3": "a9be89017023664016fc27fb95e645b722944d77"
+    },
+    "src/ameesh/deepseek_cgroup.py": {
+      "v2": "a2ae9569beb9385a393761fac7c096b43ca4eae1",
+      "v3": "a2ae9569beb9385a393761fac7c096b43ca4eae1"
+    },
+    "src/ameesh/exploitation.py": {
+      "v2": "04b65ab274de771f6cea2ce713e42098bc7d84dd",
+      "v3": "04b65ab274de771f6cea2ce713e42098bc7d84dd"
+    },
+    "src/ameesh/mesh_cli.py": {
+      "v2": "2e96eda5668b4967b62c354bcacf71f3422f3dad",
+      "v3": "2e96eda5668b4967b62c354bcacf71f3422f3dad"
+    },
+    "src/ameesh/notify.py": {
+      "v2": "72374c1ab723cea4bdc9c5fbf4f78a71dd6a05a8",
+      "v3": "72374c1ab723cea4bdc9c5fbf4f78a71dd6a05a8"
+    },
+    "src/ameesh/platform/tool_cgroups.py": {
+      "v2": "d4c115103e3dc5236545b4b1dcc38338735dfd61",
+      "v3": "d4c115103e3dc5236545b4b1dcc38338735dfd61"
+    },
+    "src/ameesh/progress.py": {
+      "v2": "6079ac601bc1b163b6ed63d0abb575203c4e4041",
+      "v3": "6079ac601bc1b163b6ed63d0abb575203c4e4041"
+    },
+    "src/ameesh/relay.py": {
+      "v2": "36b3154c3164ca8f6950dfb1c6c6fd4ce46e6e2a",
+      "v3": "36b3154c3164ca8f6950dfb1c6c6fd4ce46e6e2a"
+    },
+    "src/ameesh/runner.py": {
+      "v2": "eb48c2709151076aa02a10a2333a13da9e149ed2",
+      "v3": "eb48c2709151076aa02a10a2333a13da9e149ed2"
+    },
+    "src/ameesh/sous_utilisation.py": {
+      "v2": "463a079b233a70ad145457d1227316b94b93aa1d",
+      "v3": "463a079b233a70ad145457d1227316b94b93aa1d"
+    },
+    "src/ameesh/storage/interface.py": {
+      "v2": "a7849c2a7a29590b719554bbc71de8a211256e53",
+      "v3": "a7849c2a7a29590b719554bbc71de8a211256e53"
+    },
+    "src/ameesh/storage/postgres/costs.py": {
+      "v2": "d1e0150f822afad60c8b52a892c4c795f89a68ed",
+      "v3": "d1e0150f822afad60c8b52a892c4c795f89a68ed"
+    },
+    "src/ameesh/watch.py": {
+      "v2": "b76e10dba1636f35d3909518639dbc2e3d1cf915",
+      "v3": "b76e10dba1636f35d3909518639dbc2e3d1cf915"
+    },
+    "tests/l490_provider.mjs": {
+      "v2": "08e9810cd4c306057555157bee3ab9b348d06758",
+      "v3": "08e9810cd4c306057555157bee3ab9b348d06758"
+    },
+    "tests/l490_worker.cjs": {
+      "v2": "12017e785529bc4d4ef5b714f25476905c62c4c6",
+      "v3": "12017e785529bc4d4ef5b714f25476905c62c4c6"
+    },
+    "tests/test_1075_pace_multiplier.py": {
+      "v2": "d1c6f05e7e528d326ffc2745543ee56ac972a61e",
+      "v3": "d1c6f05e7e528d326ffc2745543ee56ac972a61e"
+    },
+    "tests/test_706_rotation_latency.py": {
+      "v2": "152fce9d25d5a4aa6dbcaa89abf2d92982956c84",
+      "v3": "152fce9d25d5a4aa6dbcaa89abf2d92982956c84"
+    },
+    "tests/test_adapters.py": {
+      "v2": "4a18fea380e8deda0935f5a39cdccbc263eb7d18",
+      "v3": "4a18fea380e8deda0935f5a39cdccbc263eb7d18"
+    },
+    "tests/test_l118_assignments.py": {
+      "v2": "fe5423503bc134b7c5e2391149443200570346c6",
+      "v3": "fe5423503bc134b7c5e2391149443200570346c6"
+    },
+    "tests/test_l121_watch.py": {
+      "v2": "5ac60cc92359e7086f47f6d8687e35c308580dcb",
+      "v3": "5ac60cc92359e7086f47f6d8687e35c308580dcb"
+    },
+    "tests/test_l1293_l1294_venv_cache.py": {
+      "v2": "aeaa2ab11d0d9bcb5f27f9ce6d45fb250dc5a8a8",
+      "v3": "aeaa2ab11d0d9bcb5f27f9ce6d45fb250dc5a8a8"
+    },
+    "tests/test_l13_budget.py": {
+      "v2": "0b035fc03e634c45668b34ef66703a5416cdc17d",
+      "v3": "0b035fc03e634c45668b34ef66703a5416cdc17d"
+    },
+    "tests/test_l242b2_budget.py": {
+      "v2": "2e72cd25c58981e000771dd2733060ad6182f916",
+      "v3": "2e72cd25c58981e000771dd2733060ad6182f916"
+    },
+    "tests/test_l39_adoption_reprise.py": {
+      "v2": "e677ab863f36aade7957da18167957bb39e43571",
+      "v3": "e677ab863f36aade7957da18167957bb39e43571"
+    },
+    "tests/test_l490_deepseek_cgroup.py": {
+      "v2": "61b2d5973edf7fd587abbb8ddd2de96d8339e088",
+      "v3": "61b2d5973edf7fd587abbb8ddd2de96d8339e088"
+    },
+    "tests/test_l513_deepseek_offpeak.py": {
+      "v2": "6a97c0a8cfc4fd17ecea0664eeb1410de2beafae",
+      "v3": "6a97c0a8cfc4fd17ecea0664eeb1410de2beafae"
+    },
+    "tests/test_l755_workflow_timeouts.py": {
+      "v2": "51aa750e49300cf00a522f2be48dc55f3e4bcc6e",
+      "v3": "51aa750e49300cf00a522f2be48dc55f3e4bcc6e"
+    },
+    "tests/test_l932_ci_venv_cache.py": {
+      "v2": "2119ee31c8da5be64715a0fc8731d0f603efce7d",
+      "v3": "2119ee31c8da5be64715a0fc8731d0f603efce7d"
+    },
+    "tests/test_l94_underuse.py": {
+      "v2": "5f56dc9e80241dbac5b5330df374ed6739542395",
+      "v3": "5f56dc9e80241dbac5b5330df374ed6739542395"
+    },
+    "tests/test_progress.py": {
+      "v2": "40ebba7ff059bb0fb8cfa9b0086ffd5cbf3dcd8e",
+      "v3": "40ebba7ff059bb0fb8cfa9b0086ffd5cbf3dcd8e"
+    }
+  },
+  "intermediate_member_blob_changes": [
+    {
+      "lot": 490,
+      "changed_blobs": []
+    },
+    {
+      "lot": 513,
+      "changed_blobs": [
+        "docs/EXPLOITATION.md"
+      ]
+    },
+    {
+      "lot": 706,
+      "changed_blobs": [
+        "docs/EXPLOITATION.md"
+      ]
+    },
+    {
+      "lot": 859,
+      "changed_blobs": [
+        "docs/EXPLOITATION.md"
+      ]
+    },
+    {
+      "lot": 1020,
+      "changed_blobs": [
+        "docs/EXPLOITATION.md"
+      ]
+    },
+    {
+      "lot": 1028,
+      "changed_blobs": []
+    },
+    {
+      "lot": 1145,
+      "changed_blobs": []
+    },
+    {
+      "lot": 1279,
+      "changed_blobs": []
+    },
+    {
+      "lot": 1293,
+      "changed_blobs": []
+    },
+    {
+      "lot": 1196,
+      "changed_blobs": []
+    }
+  ],
+  "1339_code_exact_main": {
+    "scripts/test-plan.py": true,
+    "tests/test_l161f_plan.py": true
+  },
+  "diff_check": {
+    "v2": {
+      "rc": 2,
+      "stdout": "src/ameesh/platform/tool_cgroups.py:56: new blank line at EOF.\ntests/test_1075_pace_multiplier.py:122: trailing whitespace.\n+        soit 0,84 h. Le plancher `max(share, PACE_MARGIN)` publiait 5 % \u2014 \n",
+      "stderr": ""
+    },
+    "v3": {
+      "rc": 2,
+      "stdout": "src/ameesh/platform/tool_cgroups.py:56: new blank line at EOF.\ntests/test_1075_pace_multiplier.py:122: trailing whitespace.\n+        soit 0,84 h. Le plancher `max(share, PACE_MARGIN)` publiait 5 % \u2014 \n",
+      "stderr": ""
+    }
+  },
+  "1294_named_under_1293_no_duplicate": true,
+  "migration_delta": []
+}

@@ -1,0 +1,225 @@
+{
+  "base_main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "v2_head": "8c1f99ff00a5f7fd085fb4bfe726ab4593ed12e9",
+  "v3_head": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+  "v3_tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "direct_union_tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "same_union_tree": true,
+  "steps": [
+    {
+      "lot": 490,
+      "previous_commit": "2d5e3490c07ce82e9c8bf9d0517b5fabc4461d50",
+      "new_commit": "748efffd076867f1c424a2614daaee5898af0c7a",
+      "parent": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+      "source_sha": "b2f0a1b8a0c14291fddb5dfe2b57d7c45594c57f",
+      "tree": "aac1d54c7cbd674ad0b6e27de8c71e4024ad1075",
+      "auto_merge": true,
+      "patch_id_old": "2fd788da277050fe915be687cafbb487eea57a56",
+      "patch_id_new": "2fd788da277050fe915be687cafbb487eea57a56",
+      "patch_id_equal": true,
+      "paths": [
+        "docs/design/deepseek-tool-cgroup.md",
+        "pyproject.toml",
+        "src/ameesh/adapters.py",
+        "src/ameesh/deepseek_cgroup.cjs",
+        "src/ameesh/deepseek_cgroup.py",
+        "src/ameesh/platform/tool_cgroups.py",
+        "tests/l490_provider.mjs",
+        "tests/l490_worker.cjs",
+        "tests/test_adapters.py",
+        "tests/test_l490_deepseek_cgroup.py"
+      ]
+    },
+    {
+      "lot": 513,
+      "previous_commit": "d68f08f29d4e1e7ddb8f6ee232caa59eb72666b2",
+      "new_commit": "f3e60f587de7d0431d51b5bb4339c96abf90044a",
+      "parent": "748efffd076867f1c424a2614daaee5898af0c7a",
+      "source_sha": "b3e910833755ee843908f75e4a426623a5251029",
+      "tree": "296cec0dcab3fb1887abe02b64bb70a59ee280b5",
+      "auto_merge": true,
+      "patch_id_old": "259bbb8c6e40c2eb71f075b407038124f64978ef",
+      "patch_id_new": "259bbb8c6e40c2eb71f075b407038124f64978ef",
+      "patch_id_equal": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/budget.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/exploitation.py",
+        "src/ameesh/notify.py",
+        "src/ameesh/relay.py",
+        "src/ameesh/storage/interface.py",
+        "src/ameesh/storage/postgres/costs.py",
+        "tests/test_l13_budget.py",
+        "tests/test_l513_deepseek_offpeak.py"
+      ]
+    },
+    {
+      "lot": 706,
+      "previous_commit": "1be379738e82e537835874d5c8546c287886b8d4",
+      "new_commit": "90f7ded8d00008833b4da2fb549bfef41c8ff099",
+      "parent": "f3e60f587de7d0431d51b5bb4339c96abf90044a",
+      "source_sha": "4f0bb179d28ea78cbb0fdcb9c439036130dd92c4",
+      "tree": "7792305cc2f7bc2398c53926afdc8a6b6d4f6cf2",
+      "auto_merge": true,
+      "patch_id_old": "7ef4a11ba8bf869231a22e23d277f0c2501ba9ea",
+      "patch_id_new": "7ef4a11ba8bf869231a22e23d277f0c2501ba9ea",
+      "patch_id_equal": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/config.py",
+        "src/ameesh/runner.py",
+        "tests/test_706_rotation_latency.py"
+      ]
+    },
+    {
+      "lot": 859,
+      "previous_commit": "d40de67c708301d4eae1c5870d4681996d83a6ec",
+      "new_commit": "7559bd3d0b95330f9c9f247709f93ad562419799",
+      "parent": "90f7ded8d00008833b4da2fb549bfef41c8ff099",
+      "source_sha": "c3be406abc41ded29ae10e0f126512f37cffbbd4",
+      "tree": "6990c8724a9fd76b32a99610f7f7e7778d3c3d34",
+      "auto_merge": true,
+      "patch_id_old": "f29e7dbea0180a1025920f0cb8764a41b2a97105",
+      "patch_id_new": "f29e7dbea0180a1025920f0cb8764a41b2a97105",
+      "patch_id_equal": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/assignments.py",
+        "src/ameesh/cli.py",
+        "tests/test_l118_assignments.py"
+      ]
+    },
+    {
+      "lot": 1020,
+      "previous_commit": "70f1c02f54af6565f60da681b8ef270d06bf2f62",
+      "new_commit": "635dd51cb8439b6f2504617e2d3c4b9ee1b2ba85",
+      "parent": "7559bd3d0b95330f9c9f247709f93ad562419799",
+      "source_sha": "2241af9aaf2378401124f6f355b1cb7d761319f3",
+      "tree": "33dcc73684f1b1a71d241b4e0b07b25d6bc376e0",
+      "auto_merge": true,
+      "patch_id_old": "63239363ec19427ae105034e555b100e9a10533e",
+      "patch_id_new": "63239363ec19427ae105034e555b100e9a10533e",
+      "patch_id_equal": true,
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/watch.py",
+        "tests/test_l121_watch.py"
+      ]
+    },
+    {
+      "lot": 1028,
+      "previous_commit": "4ef084389424f53623cdda972b62e4badba50432",
+      "new_commit": "b5e5675f2dac3b22ab873d4bb83a8d9bee397826",
+      "parent": "635dd51cb8439b6f2504617e2d3c4b9ee1b2ba85",
+      "source_sha": "04e0656595d78a7f347ff7f1282d654b8840d322",
+      "tree": "53510e4c2618f3636a1369f1d2b20fe965d02bf7",
+      "auto_merge": true,
+      "patch_id_old": "cf4501a656ad376f6efb9d1c14ed489ee33cbeaf",
+      "patch_id_new": "cf4501a656ad376f6efb9d1c14ed489ee33cbeaf",
+      "patch_id_equal": true,
+      "paths": [
+        "docs/COMPTES.md",
+        "src/ameesh/accounts.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/mesh_cli.py",
+        "src/ameesh/progress.py",
+        "src/ameesh/sous_utilisation.py",
+        "tests/test_1075_pace_multiplier.py",
+        "tests/test_l242b2_budget.py",
+        "tests/test_l94_underuse.py",
+        "tests/test_progress.py"
+      ]
+    },
+    {
+      "lot": 1145,
+      "previous_commit": "4f86a8893ad22f50338820f14b96c837316615f9",
+      "new_commit": "d3fb087f676c735eb46af01cdd7efcc65683db5c",
+      "parent": "b5e5675f2dac3b22ab873d4bb83a8d9bee397826",
+      "source_sha": "d118afd13fe1b15fffe28e6e49ad696f33d98a3b",
+      "tree": "4033db1f9f8459b655a43d7b3af6cfd3968e416e",
+      "auto_merge": true,
+      "patch_id_old": "7e3efd1cfd1694bd38b8b331b167ae499c28dad6",
+      "patch_id_new": "7e3efd1cfd1694bd38b8b331b167ae499c28dad6",
+      "patch_id_equal": true,
+      "paths": [
+        "scripts/test-parallele.sh",
+        "scripts/test.sh"
+      ]
+    },
+    {
+      "lot": 1279,
+      "previous_commit": "697f149005169620b88b0b81ec5ea6695b92bc78",
+      "new_commit": "429a5c54eba939899d1b34b70f4e77ca357a41e2",
+      "parent": "d3fb087f676c735eb46af01cdd7efcc65683db5c",
+      "source_sha": "24b1e4aa3419584c4a1905503ca6915922c80395",
+      "tree": "b702010e4c001f14506a0cb8911b3184e6653a12",
+      "auto_merge": true,
+      "patch_id_old": "c8a34334fa6b38079c1c0f81e828b3206dc1c9dd",
+      "patch_id_new": "c8a34334fa6b38079c1c0f81e828b3206dc1c9dd",
+      "patch_id_equal": true,
+      "paths": [
+        "tests/test_l755_workflow_timeouts.py"
+      ]
+    },
+    {
+      "lot": 1293,
+      "previous_commit": "a3b509d46fd3b972ae266882f7f0698e5be879ac",
+      "new_commit": "3a4ec4d425e3fe08e444331a8b4f5564482d7f1c",
+      "parent": "429a5c54eba939899d1b34b70f4e77ca357a41e2",
+      "source_sha": "f7b720253883491f9a088f20fce3b6e73782ad29",
+      "tree": "bfc44c26b959bcb38181d96745e45e94a1448225",
+      "auto_merge": true,
+      "patch_id_old": "5c1b93434c9d72794e47a74b0d78ed0ec531bac9",
+      "patch_id_new": "5c1b93434c9d72794e47a74b0d78ed0ec531bac9",
+      "patch_id_equal": true,
+      "paths": [
+        ".github/workflows/tests.yml",
+        "tests/test_l1293_l1294_venv_cache.py",
+        "tests/test_l932_ci_venv_cache.py"
+      ]
+    },
+    {
+      "lot": 1196,
+      "previous_commit": "8c1f99ff00a5f7fd085fb4bfe726ab4593ed12e9",
+      "new_commit": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+      "parent": "3a4ec4d425e3fe08e444331a8b4f5564482d7f1c",
+      "source_sha": "c3e3fd8148396d8577772c9d41522aefd61c5913",
+      "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+      "auto_merge": true,
+      "patch_id_old": "4f420feeeac3ac7089520c3a1e5a5f607ffb4e91",
+      "patch_id_new": "4f420feeeac3ac7089520c3a1e5a5f607ffb4e91",
+      "patch_id_equal": true,
+      "paths": [
+        "tests/test_l39_adoption_reprise.py"
+      ]
+    }
+  ],
+  "global_patch_id": "ff9070b11774e8800ae29c04a7043ae15317386f",
+  "all_ten_patch_ids_equal": true,
+  "blob_changes_vs_v2": [
+    {
+      "path": "docs/EXPLOITATION.md",
+      "v2_blob": "fc721446f547bc64db4cf9bc6abcd6cdc70ca205",
+      "v3_blob": "3b2fdc9425988eeebf4a5750b8dc9b6048fe7ba7"
+    }
+  ],
+  "1339_code_blobs_exact_main": true,
+  "migration_delta": [],
+  "diff_check": {
+    "v2": {
+      "rc": 2,
+      "output": "src/ameesh/platform/tool_cgroups.py:56: new blank line at EOF.\ntests/test_1075_pace_multiplier.py:122: trailing whitespace.\n+        soit 0,84 h. Le plancher `max(share, PACE_MARGIN)` publiait 5 % — \n",
+      "stderr": ""
+    },
+    "v3": {
+      "rc": 2,
+      "output": "src/ameesh/platform/tool_cgroups.py:56: new blank line at EOF.\ntests/test_1075_pace_multiplier.py:122: trailing whitespace.\n+        soit 0,84 h. Le plancher `max(share, PACE_MARGIN)` publiait 5 % — \n",
+      "stderr": ""
+    }
+  },
+  "sources_file": "source-receipts-20261014.json",
+  "ci_started": 0,
+  "main_merges": 0,
+  "checkout_modified": false
+}

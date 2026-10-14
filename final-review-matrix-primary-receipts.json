@@ -1,0 +1,183 @@
+{
+  "canonical_source": "home:processus/lots.md@1d299cd952e46fd650023d9d693596d727d6e438",
+  "observed_at": "2026-10-14T20:42:11.088533+00:00",
+  "lots": {
+    "490": {
+      "milestones": [
+        {
+          "id": 3584,
+          "kind": "verdict",
+          "actor": "bureau",
+          "sha": "b2f0a1b8a0c14291fddb5dfe2b57d7c45594c57f",
+          "note": "Relecture Claude (bureau, compte Claude 3) : OK sur b2f0a1b8 (= tête gelée, PR #470). Static review only: I couldn't run the tests in my session, and the CI tests are still queued. Preload deepseek_cgroup.cjs: scope bindings limited to the pinned provider, fail-closed with exit 127, workers and loaders guarded. tool_cgroups.check is read-only and correct. 0 B. N: probe scopes not attributed by the check, nested dsh loses the guard, fail-closed on dsh upgrade or Node <22.15, PermissionError under hidepid."
+        }
+      ],
+      "events": []
+    },
+    "513": {
+      "milestones": [
+        {
+          "id": 3569,
+          "kind": "verdict",
+          "actor": "bureau",
+          "sha": "6d5763d5c21e87585525edee07648fb74a63098a",
+          "note": "Relecture Claude (bureau, compte Claude 3) : GO 0 B / 2 N sur 6d5763d5c (rebase à diff constant de a3aa8989, relu en entier). period_price, prix à l'heure du tour et du relais, paid_spent (part de l'agent bornée par le montant du mesh, repli sous le seuil) et budget_drift (clé par fournisseur) corrects ; SQL paramétré ; tests pertinents. N : coût O(relevés×lignes) de paid_spent sur 24 h sous _db_lock du relais à chaque requête ; heures de pointe non revérifiées par moi. Tests non lancés ici (pytest absent)."
+        },
+        {
+          "id": 2508,
+          "kind": "verdict",
+          "actor": "bureau",
+          "sha": "a3aa8989c",
+          "note": "Avis bureau (Claude) GO 0B/0N/1n : prix creux seulement si tout l'intervalle du tour est hors pointe (contrôle heure par heure, borné à 2 j, heure inconnue = pointe, barème local renommé = pointe) ; plafonds horaire/jour du relais et de l'agent comptés sur la dépense mesurée (paid_spent, soldes) conformément à la décision owner du 13/10 01:30 (40 $/h réels). n : entre deux relevés de solde (~10 min) le repli reste l'estimation corrigée par le rapport réel/estimé — dépassement possible borné à cet intervalle."
+        },
+        {
+          "id": 2483,
+          "kind": "verdict",
+          "actor": "ameesh-cx2",
+          "sha": "a3aa8989ccd46e460dedaebeb725d1d9116d3ad9",
+          "note": "GO Codex r3, 0 B / 0 N. B/P2 fenêtres partielles fermé : part agent du montant mesh sur la fenêtre. Preuve indépendante stockage simulé : 7 géométries + 500 jeux seed 513, mesh identique à b132d5d4 et somme(parts)<=mesh. Aucune suite rejouée, aucune validation PostgreSQL/CI. Revue exacte : https://github.com/manaty/ameesh/pull/502#pullrequestreview-5505718799 . CI exacte + second avis hétérogène requis avant fusion."
+        },
+        {
+          "id": 2476,
+          "kind": "verdict",
+          "actor": "ameesh-cx3",
+          "sha": "a3aa8989ccd46e460dedaebeb725d1d9116d3ad9",
+          "note": "#513 / PR #502 — delta R3 @ a3aa8989ccd46e460dedaebeb725d1d9116d3ad9 : **GO — 0 B / 0 N / 0 n.** B/P2 et N/P3 de ma R2 levés.\n\nLe mesh calcule share avec sa règle L242b inchangée ; l’agent reçoit share*part/window, window et part portant les mêmes bornes max(low,start)..high. Pour window>0, part<=window et la somme des parts égale le montant attribuable du mesh ; window=0 conserve le repli sans attribution. Docstring et EXPLOITATION sont alignées.\n\nContrôle indépendant du vrai _paid_spent par extraction AST et stockage en mémoire, aucun SQL/suite : intervalle complet mono-agent 0,80/0,80 ; fenêtre partielle mono-agent 0,40/0,40 ; deux agents avec estimations dans et hors fenêtre 0,20+0,20=0,40 ; sans estimation, mesh 0,40/agent 0. Témoins R3 relus, plafond et fenêtre 50/73 couverts par l’auteur. Verdict limité au delta e0e09e02..a3aa8989 ; aucune suite rejouée, aucun feu fusion/prod. CI exacte annoncée en file (38411689479)."
+        },
+        {
+          "id": 2431,
+          "kind": "verdict",
+          "actor": "mty-amh-qa-01",
+          "sha": "a3aa8989ccd46e460dedaebeb725d1d9116d3ad9",
+          "note": "r3 delta GO : 0 B / 0 N nouveau ; temoins E/F/G + invariants verts sur a3aa8989, rouges sur e0e09e02 ; 179 cibles psql OK ; CI 38411689479 en file"
+        }
+      ],
+      "events": [
+        {
+          "id": 18960,
+          "actor": "mty-amh-impl-02",
+          "created_ts": 1792008508.91526,
+          "note": "PROVENANCE D'AVIS — #1342 paquet 1, matrice PAR APPORT pour #513 (lecture seule, 14/10 20:0xZ ; rien touche, tete b3e910833755 inchangee). Reponse a mesh-design 19:57Z (msg 40552).\n\n1) AUTEUR REEL PAR APPORT\n- r1 = ffa2eb8b8 + 2cc17e2a1 (12/10) : ameesh-dev3, famille REELLE Claude au moment de l'ecriture. Source 1re main : `ameesh cost turns --agent ameesh-dev3` (41 tours le 11/10 et 51 le 12/10 en claude-opus-5-5 ; dernier tour Claude 13/10 00:17Z ; bascule deepseek seulement a partir du 13/10 21:30Z, puis 14/10). Le registre actuel (deepseek) ne vaut donc pas pour l'apport initial. Tete initiale 122cdacf (PR #502).\n- r2/r3 = d7a36eca7 + 6d5763d5c (13/10) : mty-amh-impl-02, harnais deepseek (reprise apres reassignation a 13/10 13:16Z, auteur dev3 en pause budget).\n\n2) AVIS EXISTANTS (jalons work_item_milestones)\n- cx3 Codex : 1954 bloque @122cdacf (B/P2 plafond agent) ; 2376 bloque @e0e09e02 (NO GO 1 B/P2 fenetre partielle).\n- qa-01 DeepSeek : 2392 bloque @e0e09e02 (1 B/P2 regression + 1 N/P3) ; 2431 GO @a3aa8989 (0 B / 0 N nouveau).\n- cx3 Codex 2476 GO et cx2 Codex 2483 GO @a3aa8989 (0 B / 0 N).\n- bureau Claude : 2508 GO @a3aa8989 (0 B/0 N/1 n) ; 3569 GO @6d5763d5c (« relu en entier », rebase a diff constant de a3aa8989).\n- Constance tete b3e91083 : range-diff 4/4 '=' contre a3aa8989 (GO Codex+DS) ET contre 6d5763d5c (GO Claude), patch-ids identiques ; 0 migration (note de lot 14/10 19:55Z).\n\n3) COUVERTURE PAR APPORT\n- apport initial Claude (dev3) : Codex (1954/2376, defauts trouves puis corriges) + DeepSeek (2392 defaut, 2431 GO final) => 2 familles ≠ auteur.\n- corrections DeepSeek (impl-02) : Codex (2476/2483 GO) + Claude (2508/3569 GO) => 2 familles ≠ auteur.\n- Les GO finaux Codex (2483 @a3aa8989) et Claude (3569 @6d5763d5c) portent sur la tete constante b3e91083. Le QA DeepSeek a bien couvert l'apport initial (2392 sur e0e09e02 qui le porte, puis 2431 GO sur l'ensemble corrige). Rien a completer de ce cote."
+        }
+      ]
+    },
+    "706": {
+      "milestones": [
+        {
+          "id": 4299,
+          "kind": "verdict",
+          "actor": "mty-amh-impl-01",
+          "sha": "4f0bb179d28ea78cbb0fdcb9c439036130dd92c4",
+          "note": "Verdict delta impl01 (DeepSeek) sur le gel 4f0bb179 (= 7ad34d68 + main 046a106a, arbre 1189200047815825) : GO, 0 B. Meme avis que la note 17634, aucune nouvelle lecture ni suite rejouee : conservation exacte du contenu (patch-id 58a35951 identique, 4 fichiers +85/-2 vs main), interaction config.py/runner.py conforme (plancher = max(seuil, 2x plafond effectif ; cap 0 -> seuil seul), inversion reconstruit l'arbre main 7a0abee3. Reserves : N/P3 documentaire (site/docs/reference/configuration.md l.49, site/docs/concepts/sessions.md l.52, docs/V1-MAILBOX-RUNNER.md l.320 annoncent encore 900 s) suivi par la suite 963 ; CI terminale applicable sur cette tete et feu pilote nominatif restent distincts, aucune fusion."
+        }
+      ],
+      "events": []
+    },
+    "859": {
+      "milestones": [
+        {
+          "id": 2320,
+          "kind": "verdict",
+          "actor": "bureau",
+          "sha": "affc65bd6",
+          "note": "R2 bureau (Claude) GO 0B/0N/1n"
+        },
+        {
+          "id": 2253,
+          "kind": "verdict",
+          "actor": "auditeur",
+          "sha": "affc65bd66b2fb2faf5b6181acea080369e3869d",
+          "note": "R1 Codex auditeur : GO, 0 B / 0 N sur affc65bd66b2. Les quatre fichiers du delta relus : garde history=False sur les lots deja tenus par un agent, conservation du refus de prendre le lot d un tiers et du chemin des lots libres/humains, rattachement et branche preserves, attribution gardee work.assign conservee. Temoin auteur historique -> lot propre bloque / lot libre attribue relu ; 56 OK psycopg et 56 OK psql annonces par auteur, aucune suite rejouee. CI encore pending sur run 38391022998 ; ce verdict ne vaut pas CI ni feu pilote."
+        }
+      ],
+      "events": []
+    },
+    "1020": {
+      "milestones": [
+        {
+          "id": 4237,
+          "kind": "verdict",
+          "actor": "mty-amh-impl-07",
+          "sha": "2241af9aaf2378401124f6f355b1cb7d761319f3",
+          "note": "R1 delta GO 0 B (mty-amh-impl-07) : tete rafraichie 2241af9a = merge main c4fa14a2 dans bd329eac sans reecriture (parents verifies). Delta du lot constant : patch-id dfe8654917ed1d8d0e1be4a4ce96b83a0bd05a48 identique des deux cotes (b85777c1e..bd329eac et c4fa14a23..2241af9a), range-diff 1:=1:, src/ameesh/watch.py b76e10db identique, meme liste de 3 fichiers (docs/EXPLOITATION.md, src/ameesh/watch.py, tests/test_l121_watch.py). Avis R1 initial (bd329eac554a, 13/10 22:12Z) conserve au titre de la regle a ; reste du a l'auteur : CI exacte verte (run 38576829195, aucune part annulee) + fusion --match-head-commit."
+        },
+        {
+          "id": 3224,
+          "kind": "verdict",
+          "actor": "mty-amh-impl-07",
+          "sha": "bd329eac554ae014d36aa7e804a21aecd853ac81",
+          "note": "R1 GO 0 B, 1 N (P3), 2 remarques"
+        }
+      ],
+      "events": [
+        {
+          "id": 9205,
+          "actor": "mesh-design",
+          "created_ts": 1791920442.953186,
+          "note": "13/10 22:0x mesh-design (pilote) — gel revalide sur bd329eac (base b85777c1) : il remplace 0979edf5, qui ne couvre plus le contenu. Classe inchangee : sensible hors prod. R1 = mty-amh-impl-07 sur bd329eac (18855a, DeepSeek independant de l'auteur). FEU : R1 GO 0 B + CI exacte verte + tete inchangee -> fusion --match-head-commit par l'auteur (mty-amh-impl-03). Push a 20:02Z apres la poussee de #1003."
+        },
+        {
+          "id": 9099,
+          "actor": "mesh-design",
+          "created_ts": 1791919477.966318,
+          "note": "13/10 21:3x mesh-design (pilote) : classe tranchee = sensible hors prod (infra/identite des veilles systemd ; §8, en cas de doute). Freeze 0979edf5 (base b85777c1) accorde ; si la base doit etre refusionnee apres #1003, nouvelle tete = nouveau gel a valider avant fusion. R1 = mty-amh-impl-07 (DeepSeek independant de l auteur, 18855a — cx1/cx2 en hold budget, bureau se retire). Porte : GO R1 0 B + CI exacte verte + tete inchangee -> fusion --match-head-commit par l auteur. Push apres 20:00Z et apres #1003."
+        }
+      ]
+    },
+    "1028": {
+      "milestones": [
+        {
+          "id": 4306,
+          "kind": "verdict",
+          "actor": "ameesh-cx2",
+          "sha": "04e0656595d78a7f347ff7f1282d654b8840d322",
+          "note": "Reenregistrement par identite de contenu, aucun nouvel avis : R2 Codex cx2 GO 0 B/0 N rendu le 14/10 01:06Z sur 22c6e0d0b ; tete reintegree canon §12 en 04e065659 le 14/10 13:51Z, patch-id 9a11352950a9be369bf20f479a9f718ffc5ab7c0 et 10 blobs constants. Le gel mesh-design du 01:15Z suivait le verdict : le jalon est re-declare apres le gel pour que la porte courante soit la fusion (feu fire-870 a reecrire pour cette tete), pas un verdict du."
+        },
+        {
+          "id": 3481,
+          "kind": "verdict",
+          "actor": "ameesh-cx2",
+          "sha": "22c6e0d0ba04ecfca7b1c0cb0ac88d8e05bcbaa2",
+          "note": "R2 delta Codex cx2 GO 0 B / 0 N ; P2 jauges+rythme du compte actif et P3 documentaire corrigés. 183 contrôles indépendants report->build_budget verts, contre-témoin parent confirmé. Rapport https://github.com/manaty/ameesh/pull/870#issuecomment-6158573562 ; CI exacte + feu pilote requis, aucune fusion/activation."
+        }
+      ],
+      "events": []
+    },
+    "1145": {
+      "milestones": [
+        {
+          "id": 3988,
+          "kind": "verdict",
+          "actor": "ameesh-cx1",
+          "sha": "ba95c7764114d8b6fe452750defc555993e52ea8",
+          "note": "R1 Codex indépendante : GO, 0B/0N. PR957 tête exacte ba95c7764114d8b6fe452750defc555993e52ea8, base5e826399c8223561ef0924aba49ce7c7a3b0ee68 ; delta intégral limité à scripts/test.sh et test-parallele.sh. Trap EXIT test.sh installé avant printf, chemin inchangé ensuite ; nettoyer parallèle garde ses traps, PIDS/conteneurs et journaux, enlève le chemin CONFIG_TMP créé par mktemp même si printf échoue. Nettoyage protégé || true, statut de sortie conservé. git diff --check propre. Preuves auteur l148_stage2b13OK et témoins factices rc7/1 lues ; aucune suite rejouée, aucun sondage CI. Anciennes refs de range-diff absentes localement : égalité de rebase déclarée par auteur, avis fondé sur delta final complet. Feu pilote et CI restent distincts."
+        }
+      ],
+      "events": []
+    },
+    "1279": {
+      "milestones": [
+        {
+          "id": 4056,
+          "kind": "verdict",
+          "actor": "codex2",
+          "sha": "9e735c593f1dc16b0d93de8b7a74a288af7e5637",
+          "note": "R1 indépendant Codex (codex2 runner) : GO technique 0B/1N(P2), classe légère confirmée mesh-design. Delta unique +172/-22, base fcff03db4e77aeee6ccaa3bb09debde3e5ad089c, blob51aa750e49300cf00a522f2be48dc55f3e4bcc6e. N1 initial755 couvert (.yaml et compact sans timeout). N1 nouveau lignes95/49 : virgule dans name cité invente timeout10 ou remplace120 ; sonde ciblée du code exact confirme b=10 dans les deux cas. Suite1281 créée, assignée impl04, non bloquante selon canon§2. Preuves auteur7/7 et lint0 déclarées, diff --check vérifié propre ; aucune suite rejouée, aucun run/push/fusion. Avis borné au contenu relu ; CI avant fusion auteur reste requise, publication selon1211."
+        }
+      ],
+      "events": []
+    },
+    "1293": {
+      "milestones": [
+        {
+          "id": 4240,
+          "kind": "verdict",
+          "actor": "ameesh-cx3",
+          "sha": "f7b720253883491f9a088f20fce3b6e73782ad29",
+          "note": "R1 Codex indépendante cx3, mandat mesh-design36515 du14/10 16:12. PR998, SHA forge exact f7b720253883491f9a088f20fce3b6e73782ad29, arbre b5475839cd33b15cf4a983a321a71e039c4a0efb, base c4fa14a23b07bd4fe07a9d162049774f3e90cb24. GO 0B/0N sur les trois fichiers, couvre explicitement1293 ET1294. Classe sensible CI horsprod confirmee surdelta : aucune porte/check requis modifie ; comparaison YAML semantique de tous les autres jobs, metadonnees psycopg et etapes aprescache identiques. restore/save meme chemin et cle run_id/run_attempt, prefixe meme OS/identite/Python/hash ; hosted partage et runner.name autoheberge preserve. Script deps exact sonde en bash -e -o pipefail avec outils factices : valide sans reconstruction/sauvegarde, invalide et absent reconstruits avec output1, echec pip rc9 et venv rc8 sans output ni sauvegarde. continue-on-error limite au save, aucune commande test attenuee. Lecture des deux temoins auteur sans replay ; diff-check propre. Docs officielles actions/cache restore/save consultees. Preuve locale TMPDIR/1293-r1/qualification.json. Aucun feu fusion/CI/activation deduit."
+        }
+      ],
+      "events": []
+    }
+  }
+}

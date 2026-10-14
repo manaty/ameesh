@@ -1,0 +1,199 @@
+{
+  "lot": 1342,
+  "status": "frozen for required Claude review; no CI or merge fire",
+  "frozen_at": "2026-10-14T20:53:15.822309+00:00",
+  "actor": "mesh-design",
+  "executor": "mty-amh-impl-01",
+  "validation_and_fire": "mesh-design",
+  "branch": "integration/paquet-1-20261014",
+  "head": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+  "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "base_main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "members": [
+    {
+      "lot": 490,
+      "branch": "lot/490-deepseek-tool-cgroup",
+      "source_sha": "b2f0a1b8a0c14291fddb5dfe2b57d7c45594c57f",
+      "source_base": "afa32932e72c459bf1d23314912647b23b306b73",
+      "commit": "748efffd076867f1c424a2614daaee5898af0c7a",
+      "tree": "aac1d54c7cbd674ad0b6e27de8c71e4024ad1075",
+      "paths": [
+        "docs/design/deepseek-tool-cgroup.md",
+        "pyproject.toml",
+        "src/ameesh/adapters.py",
+        "src/ameesh/deepseek_cgroup.cjs",
+        "src/ameesh/deepseek_cgroup.py",
+        "src/ameesh/platform/tool_cgroups.py",
+        "tests/l490_provider.mjs",
+        "tests/l490_worker.cjs",
+        "tests/test_adapters.py",
+        "tests/test_l490_deepseek_cgroup.py"
+      ]
+    },
+    {
+      "lot": 513,
+      "branch": "lot/513-deepseek-offpeak",
+      "source_sha": "b3e910833755ee843908f75e4a426623a5251029",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "f3e60f587de7d0431d51b5bb4339c96abf90044a",
+      "tree": "296cec0dcab3fb1887abe02b64bb70a59ee280b5",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/budget.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/exploitation.py",
+        "src/ameesh/notify.py",
+        "src/ameesh/relay.py",
+        "src/ameesh/storage/interface.py",
+        "src/ameesh/storage/postgres/costs.py",
+        "tests/test_l13_budget.py",
+        "tests/test_l513_deepseek_offpeak.py"
+      ]
+    },
+    {
+      "lot": 706,
+      "branch": "auditeur/706-rotation-latency",
+      "source_sha": "4f0bb179d28ea78cbb0fdcb9c439036130dd92c4",
+      "source_base": "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac",
+      "commit": "90f7ded8d00008833b4da2fb549bfef41c8ff099",
+      "tree": "7792305cc2f7bc2398c53926afdc8a6b6d4f6cf2",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/config.py",
+        "src/ameesh/runner.py",
+        "tests/test_706_rotation_latency.py"
+      ]
+    },
+    {
+      "lot": 859,
+      "branch": "lot/859-mail-lot-declared-guard",
+      "source_sha": "c3be406abc41ded29ae10e0f126512f37cffbbd4",
+      "source_base": "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac",
+      "commit": "7559bd3d0b95330f9c9f247709f93ad562419799",
+      "tree": "6990c8724a9fd76b32a99610f7f7e7778d3c3d34",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/assignments.py",
+        "src/ameesh/cli.py",
+        "tests/test_l118_assignments.py"
+      ]
+    },
+    {
+      "lot": 1020,
+      "branch": "lot/1020-watch-wake-identity",
+      "source_sha": "2241af9aaf2378401124f6f355b1cb7d761319f3",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "635dd51cb8439b6f2504617e2d3c4b9ee1b2ba85",
+      "tree": "33dcc73684f1b1a71d241b4e0b07b25d6bc376e0",
+      "paths": [
+        "docs/EXPLOITATION.md",
+        "src/ameesh/watch.py",
+        "tests/test_l121_watch.py"
+      ]
+    },
+    {
+      "lot": 1028,
+      "branch": "lot/1028-n777-docstring-free-at",
+      "source_sha": "04e0656595d78a7f347ff7f1282d654b8840d322",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "b5e5675f2dac3b22ab873d4bb83a8d9bee397826",
+      "tree": "53510e4c2618f3636a1369f1d2b20fe965d02bf7",
+      "paths": [
+        "docs/COMPTES.md",
+        "src/ameesh/accounts.py",
+        "src/ameesh/cost.py",
+        "src/ameesh/mesh_cli.py",
+        "src/ameesh/progress.py",
+        "src/ameesh/sous_utilisation.py",
+        "tests/test_1075_pace_multiplier.py",
+        "tests/test_l242b2_budget.py",
+        "tests/test_l94_underuse.py",
+        "tests/test_progress.py"
+      ]
+    },
+    {
+      "lot": 1145,
+      "branch": "lot/1145-nettoyage-configs-mktemp",
+      "source_sha": "d118afd13fe1b15fffe28e6e49ad696f33d98a3b",
+      "source_base": "acd8a0f09637824bbe3c974d28540aff7d897a9d",
+      "commit": "d3fb087f676c735eb46af01cdd7efcc65683db5c",
+      "tree": "4033db1f9f8459b655a43d7b3af6cfd3968e416e",
+      "paths": [
+        "scripts/test-parallele.sh",
+        "scripts/test.sh"
+      ]
+    },
+    {
+      "lot": 1279,
+      "branch": "lot/1279-755-yaml-compact",
+      "source_sha": "24b1e4aa3419584c4a1905503ca6915922c80395",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "429a5c54eba939899d1b34b70f4e77ca357a41e2",
+      "tree": "b702010e4c001f14506a0cb8911b3184e6653a12",
+      "paths": [
+        "tests/test_l755_workflow_timeouts.py"
+      ]
+    },
+    {
+      "lot": 1293,
+      "branch": "lot/1293-cache-venv-resave",
+      "source_sha": "f7b720253883491f9a088f20fce3b6e73782ad29",
+      "source_base": "c4fa14a23b07bd4fe07a9d162049774f3e90cb24",
+      "commit": "3a4ec4d425e3fe08e444331a8b4f5564482d7f1c",
+      "tree": "bfc44c26b959bcb38181d96745e45e94a1448225",
+      "paths": [
+        ".github/workflows/tests.yml",
+        "tests/test_l1293_l1294_venv_cache.py",
+        "tests/test_l932_ci_venv_cache.py"
+      ],
+      "covered_lots": [
+        1293,
+        1294
+      ]
+    },
+    {
+      "lot": 1196,
+      "branch": "lot/1196-sid-unique-l39",
+      "source_sha": "c3e3fd8148396d8577772c9d41522aefd61c5913",
+      "source_base": "acd8a0f09637824bbe3c974d28540aff7d897a9d",
+      "paths": [
+        "tests/test_l39_adoption_reprise.py"
+      ],
+      "commit": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+      "tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59"
+    }
+  ],
+  "covered_lots": [
+    490,
+    513,
+    706,
+    859,
+    1020,
+    1028,
+    1145,
+    1279,
+    1293,
+    1294,
+    1196
+  ],
+  "files_sha256": {
+    "pack1-local-candidate-v3.json": "593ff4d698e5a1a4cc0b17f5cb01487d47a7cfd4088a3c7685d89090a9a73972",
+    "pack1-v3-recomposition-proof.json": "397637f9b805dc8d869c603fa88e386db397f1de4ed9bc19e818f61f333103c9",
+    "final-review-matrix-admission.json": "160cf7bf368b65dcb47e9edb80d4d0787b42798119b29520a8fa483f84453be9",
+    "final-review-matrix-primary-receipts.json": "16892dd9ac332703eff78d675fefef470d05d7f17f41ae8ef0ac70b89db0e19c",
+    "source-receipts-20261014.json": "c097f3986979a16c09ef411192875bb956e8cfa1155ebe822f4740b77aeb844d",
+    "cx2-v3/review.md": "ecddbe065d79e2a83e4b4227781b7121f9ac00163e730a5ca76a3cde8b5014c7",
+    "cx2-v3/verification.json": "7cf733c68727b0978b48201b134b08e236d8236166814abb01e0cf4f759d45dc",
+    "cx2-v3/receipt.json": "44cd97d679e7c2b970e12d94fc2dc6974684d631d073d985db468f1a4c20573f"
+  },
+  "required_remaining": [
+    "Claude composition review by bureau on this exact head",
+    "explicit coordination for publication and full CI (bureau38076/41327)",
+    "one full packet CI with all expected parts executed and green",
+    "target freshness and pilot fire",
+    "dedicated staging deployment and real host smokes"
+  ],
+  "no_scope_additions": true,
+  "ci_runs_started": 0,
+  "main_merges": 0
+}

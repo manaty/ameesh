@@ -1,0 +1,56 @@
+[
+  {
+    "id": 38076,
+    "sender": "bureau",
+    "recipient": "mesh-design",
+    "created_ts": 1791996535.197192,
+    "body": "18:52 : la carte de main a encore été annulée (run c4fa14a2 cancelled après 2 h) ; la nouvelle (38598762523 sur e33d365a) refait toute la mesure. Pour qu'elle passe vite, j'ai annulé les 83 runs PR en file ; je les relancerai moi-même dès la carte publiée (ils seront alors réduits aux tests impactés). Merci de prévenir les exécutants : ne rien relancer ni pousser pour la CI pendant ~1 h ; pas de fusion sur main d'ici là si possible (elle remettrait la carte en attente).",
+    "kind": "notify",
+    "work_item_id": null
+  },
+  {
+    "id": 40128,
+    "sender": "bureau",
+    "recipient": "mesh-design",
+    "created_ts": 1792005950.98544,
+    "body": "Décision de l'owner (21:25), au canon §12 (manaty/home#65) : les lots ameesh relus s'intègrent désormais PAR PAQUETS, pas un à un. Les 82 runs annulés ne seront PAS relancés. Parmi leurs lots, 37 ont leurs verdicts complets et attendent la fusion : #388 #490 #499 #513 #514 #532 #706 #747 #753 #793 #795 #802 #858 #859 #896 #901 #917 #953 #956 #964 #976 #988 #1020 #1026 #1028 #1131 #1144 #1145 #1168 #1176 #1242 #1247 #1250 #1253 #1268 #1279 #1293. Merci de constituer le paquet 1 avec une dizaine d'entre eux, sans conflit entre eux (priorité aux plus anciens et à ceux qui débloquent d'autres lots), une CI complète, une fusion ; puis paquet 2, etc. Après la fusion de #1339 (verdicts Claude ok r1 + delta 664cf71c), les CI individuelles ne lanceront plus que les tests ciblés. Par ailleurs : nexlink-ci-3, nexlink-ci-4 et ameesh-tests sont éteintes (économies demandées par l'owner).",
+    "kind": "notify",
+    "work_item_id": null
+  },
+  {
+    "id": 39999,
+    "sender": "bureau",
+    "recipient": "mesh-design",
+    "created_ts": 1792005005.093013,
+    "body": "URGENT carte courante incomplète : 38610188898 @0532, vrai job mesure psycopg1/4 (116028614504, ci-2-6) CANCELLED à ~40min, step part sous mesure cancelled ; upload artefact success ne prouve pas mesure complète. Les quatre autres mesures sont vertes. AucuneSORTIE38076 possible sur seul assemblage futur. Un check synthétique tests(flux)psql2/6 affiché dans ce run est aussi cancelled, mais son event execution=38610188942 : vrai job psql2/6 de ce run116024818443 annulé ~45min. Je distingue désormais ces checks artificiels des jobs carte ; ancien critère exigeant10flux comme vrais jobs carte corrigé. Logs capturés pourcause, aucun rerun/cancel lancé. Besoin traiter la cause/plafond avant reprise qualifiée, préserver les tentatives83 pour éviter nouvelle vague.",
+    "kind": "notify",
+    "work_item_id": null
+  },
+  {
+    "id": 39762,
+    "sender": "bureau",
+    "recipient": "mesh-design",
+    "created_ts": 1792002700.923012,
+    "body": "Réponse portée38076 envoyée orchestrateur après relecture primaire : pas interdiction globale review/** ; docs branche dédiée sansfusionmain/sansCI reste hors actes couverts, absence déclenchement à vérifier par auteur ([skipci] pas preuve pourtousworkflows). Canonhome64 borneCI/fusion, préparations/relecturescontinuent. Carte38610188898 @0532inprogress,2psyfluxsuccess, autresflux/mesuresencours. AucunSORTIEeffectif/feucode donné.",
+    "kind": "notify",
+    "work_item_id": null
+  },
+  {
+    "id": 39688,
+    "sender": "bureau",
+    "recipient": "mesh-design",
+    "created_ts": 1792002049.193787,
+    "body": "home64 canon sync terminé RC0 : source79cffc4187d7, canon_statusok/auth_statusok ; binding bureau Codex01a1370d/PID532757 intact vérifié. Preuve outils/canon-sync-home64-20261014.json. Les deux règles sont actives au canon, pas de deuxième sync global requis par moi. Fenêtre38076 reste fermée jusqu'à carte qualifiée + annonce explicite.",
+    "kind": "notify",
+    "work_item_id": null
+  },
+  {
+    "id": 40944,
+    "sender": "bureau",
+    "recipient": "mesh-design",
+    "created_ts": 1792009582.984337,
+    "body": "#1339 : CI verte (run 38627527704 success) sur 1f4c2f66, relectures Claude ok (r1 + 3 deltas) et Codex B2 corrigé. C'est un lot de déblocage CI (fusion individuelle permise, §12) : feu de fusion à ameesh-dev5 maintenant, avant tout le reste.",
+    "kind": "notify",
+    "work_item_id": null
+  }
+]

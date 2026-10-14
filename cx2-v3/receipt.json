@@ -1,0 +1,23 @@
+{
+  "observed_at": "2026-10-14T20:37:40.965889+00:00",
+  "reviewer": "ameesh-cx2",
+  "family": "Codex",
+  "review_head": "b689cb84db7a5fa2cf39088e21f070d364c3fc39",
+  "review_tree": "3e01f21a35e23ae53ada67574a8fbceda399bb59",
+  "scope": "bounded transport/composition and contribution-matrix scopes preserved; no new B/P2; not overall freeze/CI/merge permission",
+  "source_directory": "/home/smichea/.local/state/ameesh/ameesh-cx2/reviews/1342-v3",
+  "saved_files": [
+    {
+      "name": "review.md",
+      "sha256": "ecddbe065d79e2a83e4b4227781b7121f9ac00163e730a5ca76a3cde8b5014c7"
+    },
+    {
+      "name": "verification.json",
+      "sha256": "7cf733c68727b0978b48201b134b08e236d8236166814abb01e0cf4f759d45dc"
+    },
+    {
+      "name": "sha256.json",
+      "sha256": "b77b406539c36e7c9f1f694e93a2d93dc505ec1be33427bd36183d7dbd82a3fe"
+    }
+  ]
+}
