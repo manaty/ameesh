@@ -145,6 +145,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
     "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
+    "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -225,8 +226,10 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
 QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 #: types qu'un passage observe depuis la configuration de l'hôte seule, sans
 #: la base du mesh : la console du pool PgBouncer local (#532). Une panne de
-#: base ne les résout jamais, et ne les cache pas non plus.
-LOCAL_TYPES = ("pgbouncer_pool_waiting",)
+#: base ne les résout jamais, et ne les cache pas non plus. #1179 : la passe
+#: ordinaire ne lit pas cette console (`local_pool=False`) et ne résout donc
+#: jamais ces types ; `run_local_pass` en est seul propriétaire.
+LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -1046,7 +1049,11 @@ class Notifier:
                  ) -> list:
         now = float(self.clock())
         if current is None:
-            current = exploitation.alerts(self.cfg, db, now=now, **(thresholds or {}))
+            # #1179 : la console du pool local n'est pas lue par la passe
+            # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
+            # seul juge de ses alertes. Une console illisible n'y échoue plus.
+            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
+                                          **(thresholds or {}))
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
@@ -1073,7 +1080,13 @@ class Notifier:
         for key in list(active):
             if key in wanted:
                 continue
-            entry = active.pop(key)
+            entry = active[key]
+            if entry["alert"].get("type") in LOCAL_TYPES:
+                # #1179 : ces alertes appartiennent à `run_local_pass`, seul à
+                # pouvoir les résoudre ; ne pas les voir ici n'est pas une
+                # preuve de résolution.
+                continue
+            del active[key]
             if entry["alert"].get("type") not in self.ncfg.types \
                     and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
