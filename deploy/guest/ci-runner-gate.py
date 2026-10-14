@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # The GitHub Actions runner of the ameesh GUEST, behind the lending host's
 # gate (lot #1256, R1 fix B2). Installed by deploy/guest/ci-runners.sh as
-# /srv/ameesh-guest/bin/ci-runner-gate, inside the guest's slice.
+# /usr/local/lib/ameesh-guest-ci/ci-runner-gate, inside the guest's slice.
 """Run the guest's GitHub runner only while the host gate is open.
 
 The GitHub runner (`run.sh`) knows nothing of the capacity gate the guard
@@ -22,7 +22,7 @@ The gate contract is read by its canonical reader
 start, never an open gate.
 
     sudo deploy/guest/ci-runners.sh --prepare      # installs this wrapper
-    ExecStart=/srv/ameesh-guest/bin/ci-runner-gate --dir /srv/ameesh-guest/ci/r%i
+    ExecStart=/usr/local/lib/ameesh-guest-ci/ci-runner-gate --dir /srv/ameesh-guest/ci/r%i
 """
 from __future__ import annotations
 
