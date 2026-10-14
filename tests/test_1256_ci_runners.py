@@ -1,21 +1,32 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """GitHub Actions runners of the ameesh guest on a lending host (lot #1256):
-the runner unit, the installer's dry runs, and the isolation it promises to
-the host's own application (never `actions.runner.*`, never `/home/runner`).
+the runner unit, the gate wrapper that keeps them behind the guard's state,
+the installer's dry runs, and the isolation it promises to the host's own
+application (never `actions.runner.*`, never `/home/runner`).
 """
 from __future__ import annotations
 
 import json
 import os
 import subprocess
+import sys
 import tempfile
+import textwrap
+import time
 import unittest
+
+import yaml
+
+from ameesh import capacity_guard
 
 from .support import REPO
 
 GUEST = os.path.join(REPO, "deploy", "guest")
 SCRIPT = os.path.join(GUEST, "ci-runners.sh")
 UNIT = os.path.join(GUEST, "ameesh-guest-ci@.service")
+PLAN = os.path.join(GUEST, "PILOT-ci-nexlink.md")
+WRAPPER = os.path.join(GUEST, "ci-runner-gate.py")
+SRC = os.path.join(REPO, "src")
 
 
 def unit(name: str) -> dict[str, list[str]]:
@@ -43,7 +54,13 @@ class GuestCiUnitTest(unittest.TestCase):
         env = dict(v.partition("=")[::2] for v in u["Environment"])
         self.assertTrue(env["PATH"].startswith("/srv/ameesh-guest/bin:"))
         self.assertEqual(env["HOME"], "/srv/ameesh-guest/home")
-        self.assertIn("/srv/ameesh-guest/ci/r%i/run.sh", u["ExecStart"][0])
+        # the gate (R1 #1256): the unit runs the wrapper, which obeys the
+        # guard's state, not run.sh directly
+        self.assertIn("/srv/ameesh-guest/bin/ci-runner-gate", u["ExecStart"][0])
+        self.assertIn("--dir /srv/ameesh-guest/ci/r%i", u["ExecStart"][0])
+        self.assertEqual(env["AMEESH_HOST_GATE_PATH"],
+                         "/run/ameesh-gate/state/state.json")
+        self.assertNotIn("run.sh", u["ExecStart"][0])
         self.assertEqual(u["PrivateTmp"], ["yes"])
         # the unit is not the runner's own `svc.sh` one: no directive ever
         # enters the application's `actions.runner.*` namespace, and the
@@ -56,6 +73,133 @@ class GuestCiUnitTest(unittest.TestCase):
         # the strict profile of the agent unit would break newuidmap/fuse
         for key in ("NoNewPrivileges", "PrivateDevices", "ProtectSystem"):
             self.assertNotIn(key, u)
+
+
+def gate_doc(state="available", mode="enforce", *, ttl=90.0, seq=1):
+    """A guard's state document (`ameesh-host-state/1`, L159f)."""
+    return {"schema": "ameesh-host-state/1", "state": state, "seq": seq,
+            "expires_ts": time.time() + ttl, "guard": {"mode": mode}}
+
+
+class GateWrapperTest(unittest.TestCase):
+    """deploy/guest/ci-runner-gate.py: the GitHub runner (a fake run.sh here)
+    runs only while the guard publishes a fresh `available` out of `enforce`,
+    and is stopped when the state closes, disappears or goes stale (R1
+    #1256)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = os.path.realpath(tmp.name)
+        self.run_dir = os.path.join(self.dir, "r1")
+        os.makedirs(self.run_dir)
+        self.events = os.path.join(self.dir, "events")
+        self.gate = os.path.join(self.dir, "state.json")
+        self.write(os.path.join(self.run_dir, "run.sh"),
+                   "#!/bin/sh\n"
+                   "trap 'echo term >> %s; exit 0' TERM\n"
+                   "echo start >> %s\n"
+                   "while :; do sleep 0.1; done\n" % (self.events, self.events),
+                   mode=0o755)
+        self.procs = []
+
+    def write(self, path, content, mode=None):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        if mode is not None:
+            os.chmod(path, mode)
+
+    def set_gate(self, **kwargs):
+        self.write(self.gate, json.dumps(gate_doc(**kwargs)))
+
+    def start(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+        proc = subprocess.Popen(
+            [sys.executable, WRAPPER, "--dir", self.run_dir, "--gate", self.gate,
+             "--interval", "0.1", "--grace", "3"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        self.procs.append(proc)
+        self.addCleanup(self.stop, proc)
+        return proc
+
+    def stop(self, proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    def events_now(self):
+        try:
+            with open(self.events, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def wait_event(self, text, timeout=6.0):
+        return self.wait_count(text, 1, timeout=timeout)
+
+    def wait_count(self, text, count, timeout=6.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.events_now().count(text) >= count:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def runner_alive(self):
+        res = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True)
+        return any(self.run_dir + "/run.sh" in line for line in res.stdout.splitlines())
+
+    def test_the_runner_runs_only_on_a_fresh_enforcing_available_state(self):
+        proc = self.start()
+        # no document: a lending host is closed by default
+        time.sleep(0.5)
+        self.assertNotIn("start", self.events_now())
+        # an observing guard stops nothing: the guests stay off (plan §6)
+        self.set_gate(mode="observe")
+        time.sleep(0.5)
+        self.assertNotIn("start", self.events_now())
+        # available out of enforce: the runner starts
+        self.set_gate()
+        self.assertTrue(self.wait_event("start"), self.events_now())
+        self.assertTrue(self.runner_alive())
+        # closed: the runner is stopped and no new one starts
+        self.set_gate(state="stopped", seq=2)
+        self.assertTrue(self.wait_event("term"), self.events_now())
+        self.assertFalse(self.runner_alive())
+        self.assertEqual(self.events_now().count("start"), 1)
+        # reopened: it starts again, same process, no systemd restart needed
+        self.set_gate(seq=3)
+        self.assertTrue(self.wait_count("start", 2), self.events_now())
+        self.assertEqual(self.events_now().count("start"), 2)
+        # SIGTERM: the wrapper forwards it and exits cleanly
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertEqual(self.events_now().count("term"), 2)
+        self.assertFalse(self.runner_alive())
+
+    def test_a_stale_state_stops_the_runner(self):
+        # the guard died or hung: its state expires, so the guest stops itself
+        self.set_gate()
+        self.start()
+        self.assertTrue(self.wait_event("start"), self.events_now())
+        self.write(self.gate, json.dumps(gate_doc(ttl=-1.0)))
+        self.assertTrue(self.wait_event("term"), self.events_now())
+        self.assertFalse(self.runner_alive())
+
+    def test_a_missing_runner_is_a_configuration_refusal(self):
+        os.remove(os.path.join(self.run_dir, "run.sh"))
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        self.assertIn("missing or not executable", proc.stdout.read())
 
 
 class CiRunnersTest(unittest.TestCase):
@@ -216,6 +360,96 @@ class CiRunnersTest(unittest.TestCase):
             if line.startswith("DRY ") or line.startswith("next,"):
                 self.assertNotIn("/home/runner", line)
                 self.assertNotIn("actions.runner", line)
+
+
+    def test_prepare_requires_the_guard(self):
+        # #1256 R1 : sans garde (ou sans couverture), rien n'arrête les
+        # invités quand l'application a besoin de l'hôte : la préparation
+        # refuse au lieu d'avertir
+        os.remove(os.path.join(self.host, "etc/ameesh/guard.json"))
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("guard.json", res.stderr)
+        self.assertIn("install-pilot.sh first", res.stderr)
+
+    def test_enable_refuses_while_the_guard_observes(self):
+        # #1256 R1 : activation fermée par défaut, enforce avant le premier
+        # job ; en observation les invités restent éteints
+        for n in (1, 2):
+            self.write("srv/ameesh-guest/ci/r%d/.runner" % n, "{}\n")
+        res = self.run_script("--enable")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("observation", res.stderr)
+        self.assertNotIn("systemctl enable --now", res.stdout)
+        # enforce : l'activation passe
+        self.write("etc/ameesh/guard.env", "AMEESH_GUARD_ARGS=\n")
+        res = self.run_script("--enable")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("systemctl enable --now ameesh-guest-ci@1.service", res.stdout)
+
+    def test_the_cached_tarball_is_verified_before_extraction(self):
+        # #1256 R1 : le cache est sous $ROOT/ci, que l'invité peut écrire ;
+        # son digest est vérifié à chaque fois avant l'extraction root
+        self.write("srv/ameesh-guest/ci/cache/actions-runner-linux-x64-2.338.0.tar.gz",
+                   "not the tarball\n")
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("cached tarball reused", res.stdout)
+        self.assertIn("af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32",
+                      res.stdout)
+        self.assertIn("sha256sum -c -", res.stdout)
+        self.assertNotIn("curl -fL", res.stdout)
+
+    def test_prepare_installs_the_gate_wrapper(self):
+        # #1256 R1 : l'unité ne lance pas run.sh directement ; --prepare pose
+        # le garde-barrière qui obéit à la porte
+        res = self.run_script("--prepare", "--host", "ci-3")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("DRY write /srv/ameesh-guest/bin/ci-runner-gate (0755 root:root)",
+                      res.stdout)
+        self.assertIn("capacity_guard", res.stdout)   # le contrat, pas un doublon
+        self.assertIn("gate available: starting", res.stdout)
+
+    def test_remove_returns_the_gate_wrapper(self):
+        self.write("etc/ameesh/ci-runners.state",
+                   "host ci-3\ncount 1\n"
+                   "created /srv/ameesh-guest/bin/ci-runner-gate\n")
+        res = self.run_script("--remove", "--count", "1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("rm -f", res.stdout)
+        self.assertIn("srv/ameesh-guest/bin/ci-runner-gate", res.stdout)
+
+    def test_check_reports_the_gate_and_the_wrapper(self):
+        for n in (1, 2):
+            self.write("srv/ameesh-guest/ci/r%d/.runner" % n,
+                       json.dumps({"agentName": "ameesh-nxl-ci-3-%d" % n,
+                                   "serverUrl": "https://github.com/manaty/ameesh"}))
+            self.write("srv/ameesh-guest/ci/r%d/.credentials" % n, "{}\n", mode=0o600)
+        res = self.run_script("--check")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("state: stopped (no document yet", res.stdout)
+        self.assertIn("wrapper: /srv/ameesh-guest/bin/ci-runner-gate is missing",
+                      res.stdout)
+        self.assertIn("check: every line ok", res.stdout)
+
+    def test_the_documented_offer_counts_jobs(self):
+        # le brouillon de fiche d'hôte du plan est lu par le contrat : le
+        # signal de jobs y est `busy_tasks`, pas le nombre d'écouteurs
+        with open(PLAN, encoding="utf-8") as fh:
+            block = fh.read().split("```yaml", 1)[1].split("```", 1)[0]
+        body = "\n".join(line for line in textwrap.dedent(block).splitlines()
+                         if line.strip() != "---")
+        lend = yaml.safe_load(body)["policy"]["lend"]
+        offer, problems, unknown = capacity_guard.parse_lend(lend)
+        self.assertEqual(problems, [])
+        # `restart_after_seconds` est la clé propre au garde (L159e4), lue par
+        # `guard.parse_offer` : le lecteur du contrat la signale, pas plus
+        self.assertEqual(unknown, ["restart_after_seconds"])
+        reclaim = offer["reclaim"]
+        self.assertEqual(reclaim["busy_tasks"], ["Runner.Worker"])
+        self.assertEqual(reclaim["busy_units"], ["actions.runner.*"])
+        # l'application garde au moins un runner : l'invité s'arrête avant
+        self.assertLess(reclaim["busy_max"], 4)
 
 
 if __name__ == "__main__":

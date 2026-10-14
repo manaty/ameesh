@@ -162,16 +162,28 @@ valid_name "$HOST" || die "invalid --host $HOST"
 for a in "${AGENTS[@]}" "${TARGETS[@]}"; do valid_name "$a" || die "invalid agent name $a"; done
 case "$MAX_AGENTS" in ''|*[!0-9]*) die "invalid --max-agents $MAX_AGENTS" ;; esac
 # the guard's unit glob: a guest pattern only, never the application's own
-# `actions.runner.*` (those are what the guard counts as the application)
+# `actions.runner.*` (those are what the guard counts as the application).
+# #1256 R1 : le motif doit être **dans le namespace de l'invité** — `*.service`
+# ou `*runner*.service` correspondent aussi aux unités `actions.runner.*` de
+# l'application, que le garde arrête au SIGKILL ; un motif qui les atteint est
+# refusé ici, et un motif qui ne vise aucune unité de l'invité aussi (un garde
+# qui ne couvre rien est un garde qui ne protège rien).
 if [ -n "$AGENT_UNITS" ]; then
   case "$AGENT_UNITS" in
-    *.service) ;;
-    *) die "--agent-units: a *.service pattern expected" ;;
+    ameesh-guest-*.service) ;;
+    *) die "--agent-units: the guest namespace expected (ameesh-guest-*.service), not $AGENT_UNITS" ;;
   esac
   case "$AGENT_UNITS" in
     *[!A-Za-z0-9_.@*:-]*) die "--agent-units: unexpected character in $AGENT_UNITS" ;;
-    *actions.runner*) die "--agent-units must never match the application's own units" ;;
   esac
+  python3 -I - "$AGENT_UNITS" <<'PY' || die "--agent-units $AGENT_UNITS matches no guest unit, or matches the application's: refused"
+import fnmatch, sys
+pattern = sys.argv[1]
+if fnmatch.fnmatch("actions.runner.manaty-nexlink.nexlink-ci-3-1.service", pattern):
+    sys.exit(1)
+sys.exit(0 if any(fnmatch.fnmatch(u, pattern) for u in
+                  ("ameesh-guest-runner@1.service", "ameesh-guest-ci@1.service")) else 1)
+PY
 fi
 case "$GUARD_MODE" in ''|observe|enforce) ;; *) die "--guard-mode observe|enforce" ;; esac
 [ "$MODE" != guard-mode ] || [ -n "$GUARD_MODE" ] || die "--set-guard-mode observe|enforce"
