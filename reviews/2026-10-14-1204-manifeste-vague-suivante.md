@@ -260,3 +260,32 @@ Titre : `#1204 vague suivante — 6 lots (287, 419, 857, 1019, 1038, 1048), pré
 Corps : résumé du §2, renvoi à ce manifeste, mention explicite « préparation, ne pas
 fusionner avant le go du pilote et la CI complète unique (dispatch, seul run valable) »,
 liste des exclusions (#748, #963, #775) et des points de suivi (§5).
+
+## 11. Addendum du 14/10 13:3xZ — rafraîchissement sur main `c4fa14a2`, activation #1211 acquise
+
+- **Activation #1211** : PR #923 fusionnée le 14/10 13:15:41Z, merge
+  `acd8a0f09637824bbe3c974d28540aff7d897a9d` (parents `537f4b964a9f` + `3668d4b6b75f`,
+  arbre `57a3b14ab82f`). La porte du mandat (« landing après 1211 actif ») est levée.
+- **Avancée de main** : `acd8a0f09` → `c4fa14a24` (PR #866, `docs/1126-roadmap-drift`,
+  `site/docs/roadmap.md` seule, +198/-1). Intersection avec les 11 fichiers de la vague
+  **VIDE** : aucun nouveau contrôle de conflit n'est requis au-delà du rejeu.
+- **Union rejouée sur cette main** : commit `faa01ed59855f69caf43856c9d1a58b7d42a0660`,
+  arbre `e008b4a881603f31ac936be68940d835bdcd35bc`, parents `c4fa14a2` + `dc29109ab`
+  (union précédente, parents `acd8a0f09` + `39df7c316`). `git merge-tree --write-tree`
+  rc=0 : main n'ayant pas touché `docs/design/etudes/index.md` ni `docs/EXPLOITATION.md`,
+  la résolution qualifiée reste en place (index union L243 puis L244 = blob `fb7635f9`,
+  0 marqueur ; EXPLOITATION auto-fusionné = blob `c81035c8`, +18/-0 vs main,
+  patch-id `5dde7542` = patch #1048 du gel).
+- **Constance** : delta union vs main = exactement les 11 fichiers de la vague ; 9/11
+  blobs identiques au gel `39df7c316` (EXECUTEUR `a906548c`, l243 `15b721dc`, manifeste
+  `904b748b`, hermeticity-lint `f3ea2d0e`, chat `69e638a9`, lecteurs-doc `88d67794`,
+  test_hermeticity `ee1bc3f1`, l107 `f7bdee0f`, l79 `5fd448e9`) ; les 2 autres sont les
+  unions attendues (index `fb7635f9`, EXPLOITATION `c81035c8`). Le présent addendum ne
+  change que ce manifeste (documentation seule) : les 10 autres blobs sont revérifiés
+  constants après ce commit.
+- **Gel** : le commit qui porte cet addendum est le SHA gelé candidat, en remplacement de
+  `d88215933` (établi sur `acd8a0f09`, périmé par #866). Après qualification du pilote, la
+  poussée de `integration/vague-suivante-1204` sur ce SHA (ff depuis `39df7c316`) déclenche
+  la suite complète unique (#1211 : suite complète sur `integration/**`, 4 parts psycopg +
+  6 parts psql, sans dispatch manuel). Le vert `39df7c316` (run `38504851830`) reste la
+  preuve historique du contenu des lots : aucun transfert au nouvel arbre (§5, canon §12).
