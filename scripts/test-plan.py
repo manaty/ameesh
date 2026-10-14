@@ -79,18 +79,18 @@ computed name, a config read by the code).
 **A block without a measure does not force the full suite** (#1339). A new
 block (a file the map does not know, a function or a class it has never
 seen) and a changed block no test executes are covered as soon as one test
-loads their file: the modules the map measured on it, or — for a file the
-map does not know — the tests the import graph reaches (`src/ameesh/**`
-and `tests/**` at HEAD; a test that imports a changed module which imports
-the new file counts, through that module's measured importers). Those tests
-join the impacted ones for a new file and for a changed block without a
-test: neither has a measured caller. A new block of a file the map knows
-keeps the measured selection (its caller for a plain function, every
-importer when the module itself counts). The selection falls back to the
-full suite only when no test loads such a file: its blocks are then neither
-measured nor imported (`phase2_why` names it). A dynamic import
-(`importlib.import_module`) leaves no static edge, so a file that no test
-imports keeps the full suite.
+loads their file: the modules the map measured on it, or — when none has
+executed it — the tests the import graph reaches (`src/ameesh/**` and
+`tests/**` at HEAD; a test that imports a changed module which imports the
+new file counts, through that module's measured importers). Those tests all
+join the impacted ones: a new block has no measured caller, and a test can
+reach it by a computed name (`dir()` then `getattr`) as soon as it has
+loaded the file. The selection falls back to the full suite only when no
+test loads such a file: its blocks are then neither measured nor imported
+(`phase2_why` names it). A dynamic import (`importlib.import_module`) leaves
+no static edge, and an import under `if TYPE_CHECKING:` never runs at
+runtime: neither certifies that a test loads a new file, so the full suite
+stays.
 
 Any error while reading the map gives the fallback plan, never a failure.
 
@@ -302,10 +302,63 @@ def _module_files(name: str, known: set[str]) -> set[str]:
     return found
 
 
+def _type_checking_names(tree: ast.AST) -> set[str]:
+    """Names bound to `typing.TYPE_CHECKING`: the plain one and any alias
+    (`from typing import TYPE_CHECKING as TC`)."""
+    names = {"TYPE_CHECKING"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "typing":
+            for alias in node.names:
+                if alias.name == "TYPE_CHECKING":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _never_runs(test: ast.expr, names: set[str]) -> bool:
+    """Whether an `if` guard is false when the code runs: `TYPE_CHECKING`
+    (always false at runtime, whatever `typing` calls it) or a false constant.
+    `not TYPE_CHECKING` is true, so it is not caught here."""
+    if isinstance(test, ast.Constant):
+        return not test.value
+    if isinstance(test, ast.Name):
+        return test.id in names
+    if isinstance(test, ast.Attribute):
+        return test.attr == "TYPE_CHECKING"
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_never_runs(value, names) for value in test.values)
+    return False
+
+
+class _RuntimeImports(ast.NodeVisitor):
+    """The import statements that may run. The body of `if TYPE_CHECKING:` — and
+    of any other guard that never runs, `if False:` — loads nothing and is left
+    out; everything else stays, lazy imports included: they may run."""
+
+    def __init__(self, names: set[str]) -> None:
+        self.names = names
+        self.imports: list[ast.stmt] = []
+
+    def visit_If(self, node: ast.If) -> None:
+        if _never_runs(node.test, self.names):
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.append(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.imports.append(node)
+
+
 def _imported_files(source: str, path: str, known: set[str]) -> set[str]:
-    """The repository files `source` imports (any depth: a lazy import or one
-    under `TYPE_CHECKING` still counts — a superset is safe). Only `ameesh.*`
-    and `tests.*` names are resolved; a syntax error leaves no edge."""
+    """The repository files `source` may load at runtime: any depth, a lazy
+    import included (it may run). An import under `if TYPE_CHECKING:` runs
+    never — the flag is false at runtime — so it leaves no edge and never
+    certifies that a test loads a new file (relecture Codex, B2). Only
+    `ameesh.*` and `tests.*` names are resolved; a syntax error leaves no
+    edge."""
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
@@ -316,7 +369,9 @@ def _imported_files(source: str, path: str, known: set[str]) -> set[str]:
     else:
         package = dotted.rsplit(".", 1)[0] if "." in dotted else ""
     names: set[str] = set()
-    for node in ast.walk(tree):
+    collector = _RuntimeImports(_type_checking_names(tree))
+    collector.visit(tree)
+    for node in collector.imports:
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -496,21 +551,19 @@ def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
     """#1339 : un bloc nouveau ou modifié sans couverture mesurée ne force plus
     la suite complète dès qu'un test charge son fichier.
 
-    Le doute se lève si les tests qui importent le fichier — les modules
-    mesurés dessus, ou pour un fichier inconnu de la carte ceux du graphe
-    d'import — ne sont pas vides. Ils rejoignent les impactés pour un fichier
-    nouveau (aucune mesure ne peut le nommer) et pour un bloc modifié sans
-    test (`untested`, aucun appelant mesuré) ; pour un nouveau bloc d'un
-    fichier connu, le mécanisme mesuré les a déjà nommés (l'appelant d'une
-    fonction simple, tous les importateurs quand le module compte). Sans
-    aucun test importateur, le doute reste et `uncovered` porte le fichier.
+    Le doute se lève si les tests qui chargent le fichier — les modules que la
+    carte a mesurés dessus, ou, si aucun ne l'a exécuté, ceux du graphe
+    d'import — ne sont pas vides. Ils rejoignent tous les impactés : un bloc
+    nouveau n'a par définition aucun appelant mesuré, et un test peut
+    l'atteindre par un nom calculé (`dir()` puis `getattr`), donc chaque test
+    qui a chargé le fichier peut l'exécuter (relecture Codex, B1). Sans aucun
+    test importateur, le doute reste et `uncovered` porte le fichier.
     """
     unknown_files = {b.split("::", 1)[0] for b in impact.unknown_blocks}
     untested_files = {u["file"] for u in impact.untested}
     targets = sorted(unknown_files | untested_files)
     if not targets:
         return
-    added = {f for f in unknown_files if f not in card.get("blocs", {})} | untested_files
     reverse: dict[str, set[str]] | None = None
     for path in targets:
         found = _measured_importers(card, path, modules)
@@ -520,10 +573,10 @@ def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
             found = _reaching_tests(card, path, modules, reverse)
         if not found:
             impact.uncovered.append(path)
-        elif path in added:
-            for m in sorted(found):
-                impact.p1.setdefault(m, f"{path} (imported)")
-            impact.importers[path] = sorted(found)
+            continue
+        for m in sorted(found):
+            impact.p1.setdefault(m, f"{path} (imported)")
+        impact.importers[path] = sorted(found)
 
 
 def _db_modules(card: dict) -> set[str]:

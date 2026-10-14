@@ -160,8 +160,31 @@ class JudgeTest(unittest.TestCase):
         self.repo.write("src/ameesh/code.py", code)
         self.repo.commit()
         impact = self.repo.judge()
-        self.assertEqual(impact.p1, {"test_a": "src/ameesh/code.py::used"})
+        # l'appelant modifié nomme test_a ; les autres tests qui chargent le
+        # fichier restent impactés (relecture Codex B1 : un nom calculé peut
+        # atteindre la fonction nouvelle)
+        self.assertEqual(impact.p1, {"test_a": "src/ameesh/code.py::used",
+                                     "test_b": "src/ameesh/code.py (imported)",
+                                     "test_c": "src/ameesh/code.py (imported)"})
         self.assertEqual(impact.unknown_blocks, ["src/ameesh/code.py::helper"])
+        self.assertEqual(impact.importers,
+                         {"src/ameesh/code.py": ["test_a", "test_b", "test_c"]})
+
+    def test_new_function_keeps_the_importers_of_its_known_file(self):
+        # #1339, relecture Codex (B1) : une fonction publique nouvelle n'a aucun
+        # appelant mesuré ; un test existant qui parcourt le fichier (`dir()`
+        # puis `getattr`) peut l'exécuter, donc tous les tests qui ont chargé le
+        # fichier restent impactés — sinon le plan se déclare sûr et les omet.
+        self.repo.write("src/ameesh/code.py",
+                        CODE_V1 + "\n\ndef added(x):\n    return x - 1\n")
+        self.repo.commit()
+        impact = self.repo.judge()
+        self.assertEqual(impact.unknown_blocks, ["src/ameesh/code.py::added"])
+        self.assertEqual(impact.uncovered, [])
+        self.assertEqual(impact.p1, {m: "src/ameesh/code.py (imported)"
+                                     for m in ("test_a", "test_b", "test_c")})
+        self.assertEqual(impact.importers,
+                         {"src/ameesh/code.py": ["test_a", "test_b", "test_c"]})
 
     def test_new_function_that_counts_for_its_module(self):
         cases = {
@@ -189,21 +212,28 @@ class JudgeTest(unittest.TestCase):
         self.assertIn("test_c", self.repo.judge().p1)
 
     def test_nothing_taken_out_of_a_dynamic_module(self):
-        def judged(line: str) -> dict:
+        def judged(line: str) -> "plan.Impact":
             self.repo.code = CODE_V1 + line + "\n"  # the map knows the line
             self.repo.write("src/ameesh/code.py", self.repo.code)
             self.repo.base = self.repo.commit()
             self.repo.write("src/ameesh/code.py", self.repo.code + "\n\ndef _extra():\n    pass\n")
             self.repo.commit()
-            return self.repo.judge().p1
+            return self.repo.judge()
 
         for why, line in {"getattr with a computed name": "f = getattr(Box, '_' + 'x', None)",
                           "globals()": "g = globals()",
                           "import *": "from os.path import *"}.items():
             with self.subTest(why):
-                self.assertIn("test_c", judged(line), why)
-        # a literal getattr name stays static: the new function is taken out
-        self.assertEqual(judged("f = getattr(Box, 'size')"), {})
+                impact = judged(line)
+                self.assertIn("test_c", impact.p1, why)
+                # le module compte comme modifié : le bloc <module> a changé
+                self.assertEqual(impact.p1["test_c"], "src/ameesh/code.py::<module>", why)
+        # a literal getattr name stays static: the new function is taken out,
+        # so no block of the file changes; its importers stay impacted all the
+        # same (#1339, relecture Codex B1), as "imported" coverage
+        impact = judged("f = getattr(Box, 'size')")
+        self.assertEqual(impact.p1, {m: "src/ameesh/code.py (imported)"
+                                     for m in ("test_a", "test_b", "test_c")})
 
     def test_removed_file_impacts_all_its_tests(self):
         self.repo.remove("src/ameesh/code.py")
@@ -303,9 +333,10 @@ class MapTest(unittest.TestCase):
         self.assertTrue(self._classify()["phase2_safe"])
 
     def test_phase2_safe_with_a_new_plain_function(self):
-        # #1339 : une fonction simple nouvelle reste trouvée par son appelant
-        # modifié ; le fichier est importé, donc plus de suite complète, et
-        # aucun importateur n'est ajouté (le mécanisme mesuré suffit).
+        # #1339 : une fonction simple nouvelle est couverte par son appelant
+        # modifié (test_a) ; tous les tests qui chargent le fichier restent
+        # impactés eux aussi (relecture Codex B1 : un nom calculé peut
+        # l'atteindre), donc la suite complète n'est pas forcée.
         code = CODE_V1.replace("    return x + 1\n", "    return helper(x)\n") \
             + "\n\ndef helper(x):\n    return x + 1\n"
         self.repo.write("src/ameesh/code.py", code)
@@ -313,8 +344,28 @@ class MapTest(unittest.TestCase):
         out = self._classify()
         self.assertIn("src/ameesh/code.py::helper", out["unknown_blocks"])
         self.assertTrue(out["phase2_safe"], out["phase2_why"])
-        self.assertEqual(out["importers"], {})
+        self.assertEqual(out["importers"]["src/ameesh/code.py"],
+                         ["test_a", "test_b", "test_c"])
         self.assertEqual(out["classes"]["test_a"], ["P1", "src/ameesh/code.py::used"])
+        self.assertTrue(all(out["classes"][m][0] == "P1"
+                            for m in ("test_a", "test_b", "test_c")))
+
+    def test_phase2_safe_with_a_new_function_and_no_caller(self):
+        # #1339, relecture Codex (B1) : la fonction nouvelle n'a aucun appelant
+        # mesuré ; le test réflexif qui parcourt le fichier est pourtant
+        # impacté, donc il doit rester dans la sélection (impactés+contrat)
+        # au lieu d'être omis pendant que le plan se déclare sûr.
+        self.repo.write("src/ameesh/code.py",
+                        CODE_V1 + "\n\ndef added(x):\n    return x - 1\n")
+        self.repo.commit()
+        out = self._classify()
+        self.assertEqual(out["unknown_blocks"], ["src/ameesh/code.py::added"])
+        self.assertEqual(out["uncovered"], [])
+        self.assertTrue(out["phase2_safe"], out["phase2_why"])
+        self.assertEqual(out["importers"]["src/ameesh/code.py"],
+                         ["test_a", "test_b", "test_c"])
+        self.assertTrue(all(out["classes"][m][0] == "P1"
+                            for m in ("test_a", "test_b", "test_c")))
 
     def test_phase2_unsafe_when_no_test_imports_the_changed_file(self):
         # #1339 : sans aucun test importateur (la carte n'a mesuré personne sur
@@ -354,6 +405,34 @@ class MapTest(unittest.TestCase):
         self.assertIn("src/ameesh/orphan.py::thing", impact.unknown_blocks)
         self.assertEqual(impact.uncovered, ["src/ameesh/orphan.py"])
         self.assertEqual(impact.importers, {})
+
+    def test_new_file_certified_by_type_checking_only_keeps_the_doubt(self):
+        # #1339, relecture Codex (B2) : le corps d'un `if TYPE_CHECKING:` ne
+        # charge rien à l'exécution ; le seul test qui charge réellement le
+        # fichier nouveau passe par importlib (aucune arête statique). Le plan
+        # ne peut donc pas certifier la couverture : suite complète, fichier
+        # nommé — au lieu de sélectionner le test TYPE_CHECKING et d'omettre
+        # le test rouge.
+        self.repo.write("tests/test_static.py",
+                        "from typing import TYPE_CHECKING\n"
+                        "if TYPE_CHECKING:\n    from ameesh.new import VALUE\n")
+        self.repo.write("tests/test_dynamic.py",
+                        "import importlib\n\nmod = importlib.import_module('ameesh.new')\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        for m in ("test_static", "test_dynamic"):
+            card["modules"][m] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new.py", "VALUE = 1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static", "test_dynamic"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertIn("src/ameesh/new.py::<module>", impact.unknown_blocks)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new.py"])
+        self.assertEqual(impact.importers, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test imports: src/ameesh/new.py", out["phase2_why"])
 
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
@@ -642,6 +721,36 @@ class ImportGraphTest(unittest.TestCase):
         for source in ("import os\nimport json\n", "def broken(:\n"):
             with self.subTest(source=source):
                 self.assertEqual(plan._imported_files(source, "tests/test_d.py", known), set())
+
+    def test_type_checking_import_is_not_a_runtime_edge(self):
+        # #1339, relecture Codex (B2) : le corps d'un `if TYPE_CHECKING:` ne
+        # charge rien à l'exécution ; il ne peut pas certifier qu'un test
+        # charge un fichier nouveau. Les formes usuelles sont couvertes,
+        # l'import réel du même fichier reste lu.
+        known = {"src/ameesh/db.py"}
+        dead = {
+            "nom importé": "from typing import TYPE_CHECKING\n"
+                           "if TYPE_CHECKING:\n    from ameesh import db\n",
+            "typing pointé": "import typing\n"
+                             "if typing.TYPE_CHECKING:\n    from ameesh import db\n",
+            "alias": "from typing import TYPE_CHECKING as TC\n"
+                     "if TC:\n    from ameesh import db\n",
+            "constante fausse": "if False:\n    from ameesh import db\n",
+        }
+        for why, source in dead.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 set())
+        live = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    import ameesh.missing\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(live, "tests/test_a.py", known),
+                         {"src/ameesh/db.py"})
+        # `not TYPE_CHECKING` est vrai à l'exécution : l'import reste une arête
+        negated = ("from typing import TYPE_CHECKING\n"
+                   "if not TYPE_CHECKING:\n    import ameesh.db\n")
+        self.assertEqual(plan._imported_files(negated, "tests/test_a.py", known),
+                         {"src/ameesh/db.py"})
 
     def test_import_graph_reaches_the_test_through_the_changed_module(self):
         self.repo.write("src/ameesh/new.py", "def thing():\n    return 1\n")
