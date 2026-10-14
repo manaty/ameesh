@@ -27,6 +27,16 @@ P1-3 le mode et la composition d'une exécution comptent (même tête mais autre
 base, ou `lot` pour un `--full`, ne verdissent pas), P2-4 `--force` ne rejoue
 ni un vert applicable ni un run en vol, P2-5 une pose déjà réservée recule et
 le verrou de la ligne du lot sérialise deux `ci run`.
+
+L'avis delta R1 sur `3ce572f7b` est tenu aussi : le gel et les derniers
+verdicts sont relus sous le verrou (`ci._revalidate`) — un `blocked` ou un
+nouveau gel commité pendant l'attente fait reculer la pose, les exceptions
+explicites (`--exception`, `--full`) gardant leur cours ; la phase critique
+refait la décision check/mode/`--force` du plan (le `--force` d'un check requis
+rouge part) ; la marque d'un run rouge visible ne tient plus la clé (`after`) ;
+une réservation `full` couvre une demande `lot`, jamais l'inverse ; le chemin
+médié, sans transaction, reste une réservation de meilleur effort — la
+sérialisation par verrou de ligne est bornée aux connexions directes.
 """
 from __future__ import annotations
 
@@ -128,6 +138,14 @@ def marque(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
     if texte:
         note += ": " + texte
     return {"id": ident, "note": note, "created_ts": time.time() if ts is None else ts}
+
+
+def porte(state: str, *, sha: str = GEL, base: str = BASE, mode: str = "lot",
+          token: str = "0" * 16, ident: int = 1, ts: float | None = None) -> dict:
+    """Une marque déjà parsée, comme `ci.request_events` la rend."""
+    return {"id": ident, "state": state, "pr": PR,
+            "label": "ci-%s-%s" % (mode, sha), "sha": sha, "base": base,
+            "mode": mode, "token": token, "ts": time.time() if ts is None else ts}
 
 
 class FakeTx:
@@ -680,6 +698,33 @@ class GelPlanTest(GelTestCase):
         self.assertEqual(self.gel(Github(), avis=0)["action"], "request")
 
 
+class ReservationTest(unittest.TestCase):
+    """`ci.reservation_holder` : la clé d'une demande pas encore visible (P2 R1).
+
+    R1 delta : la réservation suit la couverture des modes (un `full` couvre
+    le `lot`) et une marque antérieure à l'exécution visible est matérialisée
+    par elle — le `--force` d'un run rouge court peut repartir.
+    """
+
+    def test_la_reservation_full_couvre_la_demande_lot(self):
+        now = time.time()
+        full = [porte("applied", mode="full", token="6" * 16)]
+        self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "lot", "", now=now))
+        self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "full", "", now=now))
+        lot = [porte("applied", mode="lot", token="6" * 16)]
+        self.assertIsNone(ci.reservation_holder(lot, GEL, BASE, "full", "", now=now))
+        self.assertIsNotNone(ci.reservation_holder(lot, GEL, BASE, "lot", "", now=now))
+
+    def test_une_marque_anterieure_au_run_visible_ne_tient_pas(self):
+        now = time.time()
+        avant = [porte("applied", token="7" * 16, ts=now - 300)]
+        self.assertIsNone(ci.reservation_holder(avant, GEL, BASE, "lot", "",
+                                                now=now, after=now - 60))
+        apres = [porte("applied", token="7" * 16, ts=now)]
+        self.assertIsNotNone(ci.reservation_holder(apres, GEL, BASE, "lot", "",
+                                                   now=now, after=now - 60))
+
+
 class CancelPlanTest(GelTestCase):
     """`ci.cancel_plan` : les exécutions non conclues, la composition gardée."""
 
@@ -916,6 +961,135 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertIn(LABEL, gh.poses())
         self.assertTrue(any("exception unblock: main rouge" in n for n in notes))
+
+    #: R1 delta Codex (3ce572f7b) : la relecture et la décision se refont sous
+    #: le verrou commun, juste avant la pose.
+
+    def test_un_verdict_bloque_sous_le_verrou_recule(self):
+        # P1 delta : le plan a lu les verdicts avant le verrou ; le `blocked`
+        # commité par le relecteur pendant l'attente doit être relu sous le
+        # verrou — sinon la commande pose l'étiquette et démarre la CI.
+        self.gele()
+        self.on_note = lambda text: self.jalons.append(
+            jalon("verdict", sha=GEL, actor="relecteur", verdict="blocked"))
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertEqual(self.marques("applied"), [])
+        self.assertIn("blocked", notes[-1])
+        self.assertEqual(len(self.marques("reserve")), 1)
+
+    def test_un_gel_deplace_sous_le_verrou_recule(self):
+        # P1 delta : un nouveau gel enregistré entre le plan et le verrou
+        # change la tête autorisée ; la demande préparée sur l'ancienne recule.
+        self.gele()
+        self.on_note = lambda text: self.jalons.append(jalon("frozen", sha=TETE))
+        gh = Gh()
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertIn("freeze", notes[-1])
+        self.assertIn(TETE[:12], notes[-1])
+
+    def test_une_exception_ne_relit_pas_les_avis(self):
+        # P1 delta, exceptions conservées : `--exception … --reason` reste un
+        # geste explicite et tracé ; un `blocked` arrivé pendant l'attente du
+        # verrou ne l'annule pas.
+        self.jalons.append(jalon("frozen", sha=GEL))
+        self.on_note = lambda text: self.jalons.append(
+            jalon("verdict", sha=GEL, actor="relecteur", verdict="blocked"))
+        gh = Gh()
+        code, _notes = self.run_cmd(Github(), gh, args=argparse.Namespace(
+            **{**vars(self.args), "exception": "unblock", "reason": "main rouge"}))
+        self.assertEqual(code, 0)
+        self.assertIn(LABEL, gh.poses())
+
+    def test_force_repare_le_check_rouge_sous_le_verrou(self):
+        # P2 delta : le plan voit un vert applicable ET le dernier check
+        # `tests` rouge, et décide `request` avec --force ; la phase critique
+        # doit réappliquer la même décision au lieu de rendre `green` sans rien
+        # poser — la reprise du check requis ne partait pas.
+        self.gele()
+        api = Github(runs=[label_run(5, conclusion="success")],
+                     checks={"check_runs": [check_run(901, conclusion="failure")]})
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL])
+        self.assertEqual(len(self.marques("applied")), 1, notes)
+
+    def test_un_run_rouge_visible_ne_tient_plus_la_reservation(self):
+        # P2 delta : après un run rouge court, la marque `applied` de ce run
+        # tient encore la clé quinze minutes ; `--force` doit repartir — la
+        # marque antérieure au run visible est matérialisée par lui.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", token="4" * 16, ts=t - 300))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t - 60)])
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL])
+        self.assertEqual(len(self.marques("applied")), 1, notes)
+
+    def test_une_marque_posterieure_au_run_visible_tient_la_cle(self):
+        # P2 delta, garde : une marque d'un autre hôte postérieure au run
+        # visible n'est pas matérialisée par lui ; elle tient toujours la clé.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", token="5" * 16, ts=t))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t - 60)])
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=argparse.Namespace(
+            **{**vars(self.args), "force": True}))
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [])
+        self.assertTrue(any("already holds" in n for n in notes), notes)
+
+    def test_une_reservation_full_couvre_la_demande_lot(self):
+        # P2 delta : avant que le run `full` soit visible dans l'API, sa marque
+        # couvre une demande `lot` de la même composition : une seule pose.
+        self.gele()
+        gh = Gh()
+        full = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet"})
+        code, notes = self.run_cmd(Github(), gh, args=full)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL_FULL])
+        avant = len(notes)
+        code, notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL_FULL], "le full couvre le lot")
+        self.assertEqual(len(notes), avant, "la demande lot recule avant toute note")
+
+    def test_une_reservation_lot_ne_couvre_pas_la_demande_full(self):
+        # P2 delta, garde : un `lot` réservé ne dispense pas du `full` ; la
+        # demande pleine part (le run `lot` ne prouve pas la suite complète).
+        self.gele()
+        gh = Gh()
+        code, _notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL])
+        full = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet"})
+        code, _notes = self.run_cmd(Github(), gh, args=full)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [LABEL, LABEL_FULL])
+
+    def test_le_chemin_medie_reste_sans_verrou_de_ligne(self):
+        # Observation R1 : sans transaction (connexion d'exécuteur médiée,
+        # L109), la marque reste une réservation de meilleur effort ; la
+        # sérialisation par verrou de ligne est bornée aux connexions directes.
+        self.gele()
+        gh = Gh()
+        with mock.patch.object(ci.storage, "is_remote", lambda db: True):
+            code, _notes = self.run_cmd(Github(), gh)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.db.transactions, 0)
+        self.assertEqual(gh.poses(), [LABEL])
 
 
 class ParsingTest(unittest.TestCase):

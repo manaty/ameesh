@@ -923,12 +923,14 @@ def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token
     Une étiquette posée mais pas encore visible comme exécution dans l'API
     GitHub tient la clé le temps du `ttl` ; `released` (demande refusée), les
     marques périmées et celles qui précèdent l'exécution visible (`after`) ne
-    tiennent pas — une exécution visible matérialise la demande. Appelé sous le
-    verrou de la ligne du lot, il lit les marques commitées des autres
+    tiennent pas — une exécution visible matérialise la demande. La couverture
+    des modes suit celle des exécutions (§ `_covers`) : un `full` réservé
+    couvre une demande `lot` de la même composition, l'inverse non. Appelé sous
+    le verrou de la ligne du lot, il lit les marques commitées des autres
     processus ; le porteur courant est exclu (`token`).
     """
     key = [e for e in events
-           if e["sha"] == sha and e["base"] == base and e["mode"] == mode
+           if e["sha"] == sha and e["base"] == base and _covers(e["mode"], mode)
            and e["state"] == "applied" and e["token"] != token]
     if not key:
         return None
@@ -1242,16 +1244,67 @@ def _pose_request(gh, repo: str, pr: dict, label: str, mode: str, sha: str) -> d
     return {"ok": True, "dropped": dropped, "failed": failed, "error": ""}
 
 
+def _revalidate(db, item_id: int, decision: dict) -> None:
+    """Relit le gel et les verdicts sous le verrou, avant la pose (avis delta R1).
+
+    `gel_plan` décide hors transaction : un relecteur peut retirer son `ok`
+    (dernier verdict `blocked`) ou un nouveau gel être enregistré avant que la
+    réservation n'obtienne le verrou de la ligne du lot. Cette relecture refait
+    les gardes de `gel_plan` dans la transaction qui tient cette ligne, donc
+    après toute écriture concurrente ; les exceptions explicites
+    (`--exception`, `--full`), gestes marqués et motivés, ne dépendent pas des
+    verdicts et gardent leur cours.
+    """
+    from . import work
+    item = work.get(db, int(item_id))
+    if item is None:
+        raise GelError("lot #%s unknown" % item_id)
+    if decision.get("exception") or decision.get("mode") == "full":
+        return
+    sha = decision["sha"]
+    freeze = frozen_of(db, item_id)
+    frozen = ((freeze or {}).get("sha") or "").strip().lower()
+    if frozen != sha:
+        if not frozen:
+            raise GelError("lot #%s is no longer frozen (the freeze milestone moved while "
+                           "the request was prepared): nothing posed" % item_id)
+        raise GelError("the freeze of lot #%s moved to %s while the request was prepared "
+                       "(%s requested): refreeze and re-review, nothing posed"
+                       % (item_id, frozen[:12], sha[:12]))
+    assignee = (item.get("assignee") or "")
+    verdicts = latest_verdicts(db, item_id, sha, assignee)
+    blocked = [m for m in verdicts if (m.get("verdict") or "") == "blocked"]
+    if blocked:
+        raise GelError("lot #%s: %s blocked %s (last verdict of that reviewer, read under "
+                       "the lock): fix the head, refreeze and re-review; nothing posed"
+                       % (item_id, blocked[0].get("actor") or "a reviewer", sha[:12]))
+    reviews = [m for m in verdicts if (m.get("verdict") or "") == "ok"]
+    avis = int(decision.get("avis") or 0)
+    if len(reviews) < avis:
+        raise GelError("lot #%s: %d independent verdict(s) `ok` on %s, %d required (a "
+                       "verdict changed while the request was prepared): nothing posed"
+                       % (item_id, len(reviews), sha[:12], avis))
+
+
 def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> dict:
     """La demande, sous le verrou de la ligne du lot (#1343, P2 R1).
 
     `work.note` (marque `reserve`) prend le verrou `FOR NO KEY UPDATE` de
-    `work_items` dans la transaction : deux `ci run` concurrents, même d'hôtes
-    différents, se sérialisent ; le second relit les exécutions, la composition
-    de la PR et les marques, et recule si un run est visible, si la PR a bougé
-    ou si un autre a déjà posé l'étiquette. Le verrou ne survit pas au
-    processus tué (ROLLBACK) : le suivant reprend, sans attente ni marque
-    périmée.
+    `work_items` dans la transaction : sur une connexion directe, deux `ci run`
+    concurrents, même d'hôtes différents, se sérialisent ; le second relit les
+    exécutions, la composition
+    de la PR, les marques, puis le gel et les derniers verdicts (`_revalidate`,
+    avis delta R1), et recule si un run est visible, si la PR a bougé, si un
+    autre a déjà posé l'étiquette ou si l'autorisation a changé. Le verrou ne
+    survit pas au processus tué (ROLLBACK) : le suivant reprend, sans attente
+    ni marque périmée.
+
+    La sérialisation par verrou de ligne vaut pour une connexion directe. Sur
+    une connexion d'exécuteur médiée (`storage.is_remote`, L109), la phase
+    critique s'exécute sans transaction : la marque `applied` ne détecte
+    qu'une demande déjà commitée avant sa lecture, et deux poses simultanées
+    peuvent se croiser — aucune garantie inter-hôtes n'est annoncée sur ce
+    chemin.
 
     Rend `{requested, action, why?, run?}` ; `action` vaut `request` quand
     l'étiquette a été posée, sinon `green`, `running` ou `refuse`.
@@ -1276,21 +1329,49 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                     "why": "a %s request is already in flight: nothing posed"
                            % live[0]["mode"], "run": _short_run(live[0]["row"])}
         if green:
-            return {"requested": False, "action": "green",
-                    "why": "a green %s request of this composition is visible: nothing "
-                           "posed" % green[-1]["mode"], "run": _short_run(green[-1]["row"])}
+            #: avis delta R1 : la phase critique refait la même décision que `gel_plan`
+            #: — un vert applicable ne suffit pas si le dernier check requis
+            #: est rouge ; `--force` répare, sans lui rien ne part.
+            check = _latest_check(api, decision["repo"], sha)
+            if check is None or (check["status"] == "completed"
+                                 and check["conclusion"] in CHECK_GREEN):
+                return {"requested": False, "action": "green",
+                        "why": "a green %s request of this composition is visible: nothing "
+                               "posed" % green[-1]["mode"],
+                        "run": _short_run(green[-1]["row"])}
+            if check["status"] != "completed":
+                return {"requested": False, "action": "running",
+                        "why": "the required `tests` check of %s is %s (run %s): nothing "
+                               "posed" % (sha[:12], check["status"] or "?",
+                                          check.get("id") or "?"),
+                        "check": check}
+            if not force:
+                return {"requested": False, "action": "refuse",
+                        "why": "the required `tests` check of this composition is %s "
+                               "(run %s), not green although a %s request succeeded: "
+                               "--force to request the CI again"
+                               % (check["conclusion"] or "?", check.get("id") or "?",
+                                  green[-1]["mode"])}
         if runs and not force:
             return {"requested": False, "action": "refuse",
                     "why": "a %s request of this composition already ran, none green: "
                            "--force to request the CI again" % runs[-1]["mode"]}
+        #: avis delta R1 : une marque antérieure au run visible est matérialisée par lui
+        #: (run rouge court) ; seule une demande encore invisible tient la clé.
+        visible = max((_run_ts(r["row"]) for r in runs), default=0.0)
         held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
-                                  now=time.time())
+                                  now=time.time(), after=visible)
         if held:
             note("released", "another request (token %s) already holds this composition"
                  % held["token"])
             return {"requested": False, "action": "running",
                     "why": "a request of this composition was already reserved (token %s): "
                            "nothing posed" % held["token"]}
+        try:
+            _revalidate(tx, int(item_id), decision)
+        except GelError as exc:
+            note("released", str(exc))
+            return {"requested": False, "action": "refuse", "why": str(exc)}
         try:
             _check_label_actor(gh)
         except GelError as exc:
@@ -1326,7 +1407,8 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
 
     if storage.is_remote(db):
         # connexion d'exécuteur médiée : ni transaction ni verrou de ligne ; la
-        # marque reste et le second recule devant elle, sans atomicité d'hôte.
+        # marque reste et le second recule devant elle, sans atomicité d'hôte —
+        # la garantie de sérialisation est bornée aux connexions directes.
         return critical(db)
     with db.transaction() as tx:
         return critical(tx)
