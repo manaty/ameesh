@@ -210,6 +210,9 @@ last resort. Each account takes these optional settings in the host's
 | `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
 | `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
 | `pace_multiplier` [1.0] | multiplies the **elapsed share** of the pace cap: `min(90 %, elapsed × m + 10 points)`. Set per account, no implicit value (#1075: `2.0` on the Codex primary to spend its plan reserve without a reset). The reserve, the fixed caps, the overage rules, the gauges and the reset dates are unchanged |
+| `pace_ceiling` [0.90] | the account's own pace ceiling, replacing the 90 % of the guard (0019): the pace cap is `min(pace_ceiling, elapsed × pace_multiplier + 10 points)` (#1176) |
+| `pace_ceiling_end` [none] | raised ceiling for the **end of the window**: within `pace_ceiling_end_hours` of `resets_at`, the ceiling rises to this value — only when the account's overage is *proven impossible* (see below). `none` (default): no raise, the base ceiling always holds |
+| `pace_ceiling_end_hours` [6] | hours before `resets_at` where `pace_ceiling_end` applies; declared alone (without `pace_ceiling_end`), it is a configuration error |
 
 A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
 on the short window), `cap`, and `overage_cap` when the account may be billed.
@@ -229,6 +232,37 @@ With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
 pauses, but these rules still hold: an account in overage or past `cap` /
 `overage_cap` is never chosen, and with no other account the agent is
 paused (`budget : …`) rather than launched on it.
+
+### End of window: the ceiling rises only when overage is impossible (#1176)
+
+A plan window that ends with unused capacity loses it. `pace_ceiling_end`
+lets the account spend that end of window, but only where no paid overage can
+result. The raise applies to a window when `resets_at` is at most
+`pace_ceiling_end_hours` away and the account's overage is **proven
+impossible by a fresh reading**, from either source:
+
+* the gauge reading itself: an explicit "not capable" flag (Claude
+  `overageStatus` not allowed, Codex `credits.has_credits` false), with at
+  least one window still running — a reading whose windows have all reset is
+  stale (L71);
+* Claude only: the account's `.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`,
+  or `~/.claude.json` without the variable) carries a non-empty
+  `cachedExtraUsageDisabledReason`, and that cache was written **during the
+  window being raised** — never a closed window's cache.
+
+Anything else — flag absent, unknown, possible overage, stale proof, undated
+window — keeps the base ceiling (`pace_ceiling`), and an account that may be
+billed keeps `overage_cap` (80 %). `overage_impossible` is the single place
+that decides this. The overage refusal (`isUsingOverage`) and the turn cut
+are unchanged: the raise never lets a turn run in overage. A configuration
+declaration (`overage: none`) is *not* a proof: only the harness's own fresh
+reading counts.
+
+`ameesh accounts list` shows the effective ceiling and its reason per gauge
+(`seven_day 91% (pace 88%, ceiling 98%, end of window, overage impossible)`),
+and the pause reason names it too. A pause held by the base ceiling but
+lifted earlier by the raise announces the raise's hour (`until`), not the
+reset.
 
 A session opened before L30 (no account recorded) ran on the harness's
 default folder: its health, gauges and caps are read under the declared
@@ -258,7 +292,8 @@ Bureau's local sprint patch of 2026-10-11 (`~/.config/ameesh/sprint.json`,
 `"short_window_cap": 0.75` on those accounts.
 
 `ameesh accounts list --json` shows `priority`, `overage` (setting, capable,
-in use) and, per gauge, the `cap` the window is held to.
+in use) and, per gauge, the `cap` the window is held to, the effective
+`pace_ceiling` and its `ceiling_reason` (empty for the base ceiling, #1176).
 
 ## 5. Authentication failure: `auth_blocked` (L226b)
 
