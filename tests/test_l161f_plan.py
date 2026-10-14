@@ -374,6 +374,9 @@ class MapTest(unittest.TestCase):
         self.assertEqual(plan.always_hits(changes, ["test_cluster"]),
                          {"test_cluster": "always list (src/ameesh/migrations/0099_x.sql)"})
         self.assertEqual(plan.always_hits([("M", "src/ameesh/work.py")], ["test_cluster"]), {})
+        # #749 : le runner declenche la liste, comme une migration ou le SQL
+        self.assertEqual(plan.always_hits([("M", "src/ameesh/runner.py")], ["test_l31_orphans"]),
+                         {"test_l31_orphans": "always list (src/ameesh/runner.py)"})
         card = {"modules": {
             "test_recent": {"echecs": [{"ts": "2026-10-09T00:00:00+00:00"}]},
             "test_old": {"echecs": [{"ts": "2026-09-30T00:00:00+00:00"}]}}}
@@ -381,7 +384,18 @@ class MapTest(unittest.TestCase):
 
     def test_always_list_sorted_and_known(self):
         always = plan.read_list(plan.ALWAYS_FILE, parts.modules())
-        self.assertEqual(always, ["test_cluster", "test_events_attach", "test_l72_panne_de_base"])
+        self.assertEqual(always, ["test_339_orphan_settle", "test_cluster",
+                                  "test_events_attach", "test_l31_orphans",
+                                  "test_l50_group_orphan_work_items",
+                                  "test_l72_panne_de_base"])
+
+    def test_psql_pr_modules_adds_the_triggered_always_list(self):
+        # #749 : la liste « always » declenchee rejoint le pilote psql d'une PR ;
+        # sans declenchement, la selection reste exactement tests/parts/pilote-psql.txt
+        self.assertEqual(plan.psql_pr_modules(["test_a", "test_cluster"],
+                                              ["test_l31_orphans"]),
+                         ["test_a", "test_cluster", "test_l31_orphans"])
+        self.assertEqual(plan.psql_pr_modules(["test_a"], []), ["test_a"])
 
     def test_new_functions_taken_out_losslessly(self):
         # taking nothing out must give the very fingerprints of the map
@@ -504,6 +518,80 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
+class PushLaneTest(unittest.TestCase):
+    """nature() on a push: the whole pushed range decides (#833)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _nature(self, base, head="HEAD", ref="refs/heads/main", event="push"):
+        return plan.nature(event, base=base, head=head, repo=self.repo.path, ref=ref)
+
+    def _doc_commit(self, name, text="# Doc\n"):
+        self.repo.write(f"docs/{name}", text)
+        return self.repo.commit()
+
+    def test_multi_commit_documentation_push_takes_the_fast_lane(self):
+        # #833: github.event.before, not HEAD^1, so every pushed commit counts
+        self._doc_commit("a.md")
+        head = self._doc_commit("b.md")
+        out = self._nature(self.repo.base, head)
+        self.assertTrue(out["docs_only"], out["why"])
+        self.assertEqual(sorted(out["files"]), ["docs/a.md", "docs/b.md"])
+
+    def test_code_hidden_behind_a_last_documentation_commit_runs_the_suite(self):
+        # the bug: HEAD^1 alone saw only the last commit, documentation, and
+        # took the fast lane over a push that carried code
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        code = self.repo.commit()
+        head = self._doc_commit("note.md")
+        last_only = self._nature(code, head)
+        self.assertTrue(last_only["docs_only"], last_only["why"])
+        out = self._nature(self.repo.base, head)
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("src/ameesh/code.py", out["files"])
+
+    def test_a_push_to_a_release_branch_always_runs_the_suite(self):
+        head = self._doc_commit("a.md")
+        out = self._nature(self.repo.base, head, ref="refs/heads/release/1.10.0")
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("full suite", out["why"])
+        self.assertIn("release/1.10.0", out["why"])
+
+    def test_created_branch_and_rewritten_history_run_the_suite(self):
+        head = self._doc_commit("a.md")
+        for base in (plan.NULL_SHA, "", "not a sha"):
+            with self.subTest(base or "empty"):
+                out = self._nature(base, head)
+                self.assertFalse(out["docs_only"], out["why"])
+                self.assertIn("pushed range unknown", out["why"])
+        # a rewritten history: the tip before the push is no ancestor anymore
+        _git(self.repo.path, "checkout", "-q", "-b", "side", self.repo.base)
+        side = self._doc_commit("side.md")
+        _git(self.repo.path, "checkout", "-q", "-")
+        out = self._nature(side, head)
+        self.assertFalse(out["docs_only"], out["why"])
+        self.assertIn("pushed range unknown", out["why"])
+
+    def test_a_pushed_version_bump_runs_the_suite(self):
+        # L157 is a pull-request rule: a pushed version never takes the lane
+        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.3"\n')
+        base = self.repo.commit()
+        self.repo.write("pyproject.toml", '[project]\nversion = "1.2.4"\n')
+        head = self.repo.commit()
+        out = self._nature(base, head)
+        self.assertFalse(out["version_only"], out["why"])
+        self.assertFalse(out["docs_only"], out["why"])
+
+    def test_a_pull_request_is_unchanged(self):
+        # the reference of the source branch does not matter on a PR
+        head = self._doc_commit("a.md")
+        out = self._nature(self.repo.base, head, ref="refs/heads/lot/833-x",
+                           event="pull_request")
+        self.assertTrue(out["docs_only"], out["why"])
+
+
 class PlanTest(unittest.TestCase):
     def test_fallback_without_a_map(self):
         p = plan.make_plan("push", None, NOW)
@@ -540,6 +628,33 @@ class PlanTest(unittest.TestCase):
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
         self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+
+    def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
+        # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
+        # declenche la liste « always » (contrat de base, baux et orphelins) ;
+        # ces modules passent alors AUSSI sous psql des la PR, au lieu d'attendre
+        # la suite complete de main ou la CI de release.
+        mods = parts.modules()
+        always = ["test_339_orphan_settle", "test_cluster", "test_l31_orphans"]
+        card = {"schema": map_mod.SCHEMA, "commit": "0" * 40, "genere": NOW.isoformat(),
+                "modules": {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                            for m in mods},
+                "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
+        classes = {m: (["P1", "always list (src/ameesh/runner.py)"]
+                       if m in always else ["P3", ""]) for m in mods}
+        with mock.patch.object(plan, "classify", return_value={
+                "map": None, "sure": False, "phase2_safe": False, "unsure": [],
+                "untested": [], "unknown_blocks": [], "foundation": [], "changed": 1,
+                "always": always,
+                "classes": {m: list(c) for m, c in classes.items()}}):
+            p = plan.make_plan("pull_request", card, NOW)
+        if p["version_only"] or p["docs_only"]:
+            self.skipTest("the checked out commit is a version or documentation change")
+        pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
+        seen = sorted(m for ps in p["parts"]["psql"] for m in ps["modules"])
+        self.assertEqual(seen, sorted(set(pilot) | set(always)))
+        # sans declenchement, la selection reste exactement le pilote
+        self.assertEqual(plan.psql_pr_modules(pilot, []), pilot)
 
     def test_parts_impacted_first(self):
         classes = {"test_canon": ("P3", ""), "test_cluster": ("P1", "x"),
@@ -582,6 +697,9 @@ class PlanTest(unittest.TestCase):
                 "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
+        # #749 : une fusion a main passe la suite complete sous les deux pilotes
+        # (psql en 6 parts), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -775,6 +893,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("python3 scripts/test-plan.py plan --out plan.json --map "
                       "carte/carte.json.gz", self.text)
         self.assertIn("--annotations", self.text)
+
+    def test_plan_job_passes_the_pushed_range(self):
+        # #833: a push is planned from github.event.before, not HEAD^1 alone
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
+                      "github.event.before || 'HEAD^1' }}", self.text)
+        self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
     def test_dynamic_matrices(self):
         for driver in ("psycopg", "psql"):
