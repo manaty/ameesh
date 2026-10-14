@@ -92,11 +92,15 @@ class ReserveForfaitTest(_Comptes):
 
 
 class DebutDeFenetreTest(unittest.TestCase):
-    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début
-    (décision du propriétaire du 2026-10-13, option b : « pas de réserve sur
-    une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »), et
-    la pause annonce l'heure où le rythme rattrape l'usage, pas la remise à
-    zéro (remarque de l'auditeur)."""
+    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début.
+    Décision du propriétaire du 2026-10-13, option b : « pas de réserve sur une
+    fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) » — cet
+    énoncé décrit le début de fenêtre, qui s'entend `multiplier × écoulé` face
+    à la marge (`multiplier = 1`, `reserve = 10` ici : à 8 % d'écoulé avec
+    `multiplier = 2` le seuil vaut 16 %, pas 10 % — #1028 P3) ; en fin de
+    fenêtre le seuil vaut `PACE_CEILING − réserve` (80 %), il ne suit plus
+    `max(écoulé, marge)` (#1028 N1). La pause annonce l'heure où le rythme
+    rattrape l'usage, pas la remise à zéro (remarque de l'auditeur)."""
 
     SEPT_JOURS = 7 * 86400.0
 

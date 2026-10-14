@@ -286,10 +286,21 @@ class Gauge:
         """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
         jamais sous `PACE_MARGIN` quand une réserve s'applique.
 
-        La réserve protège la fin de fenêtre ; elle ne doit pas bloquer son
-        début (#777, décision du propriétaire du 2026-10-13 : « pas de réserve
-        sur une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »).
-        Une fenêtre à 1 % d'écoulé garde donc 10 points, pas 1.
+        Exactement `min(PACE_CEILING, multiplier × écoulé + PACE_MARGIN) −
+        reserve`, plancher `PACE_MARGIN` :
+        * **début de fenêtre** : tant que `multiplier × écoulé ≤ reserve`
+          (soit `≤ PACE_MARGIN` quand la réserve vaut la marge), la réserve ne
+          s'applique pas et le seuil vaut la marge (10 points), pas
+          `multiplier × écoulé + marge − réserve` — une fenêtre à 1 % d'écoulé
+          garde donc 10 points, pas 1 ; à 8 % d'écoulé avec `multiplier = 2`
+          le seuil vaut 16 %, pas 10 % (#1028 P3). C'est l'énoncé de la
+          décision du propriétaire du 2026-10-13 (#777) : « pas de réserve sur
+          une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »,
+          exact pour `multiplier = 1` et `reserve = PACE_MARGIN` tant qu'on
+          reste sous le plafond de fin de fenêtre ;
+        * **fin de fenêtre** : le seuil plafonne à `PACE_CEILING − reserve`
+          (80 % avec la réserve de 10 points) et ne suit plus l'écoulé —
+          l'énoncé `max(écoulé, marge)` n'y vaut plus (#1028 N1).
         """
         cap = max(0.0, self.pace_cap(now, multiplier) - reserve)
         return max(cap, PACE_MARGIN) if reserve else cap
@@ -310,16 +321,21 @@ class Gauge:
         celle où l'écoulé dépasse l'usage »). Un usage au-delà du plafond
         (`PACE_CEILING` moins la réserve) n'est jamais rattrapé : seule la
         remise à zéro libère la fenêtre, et c'est elle qu'on annonce.
+
+        La part cherchée est l'inverse exact de `held_cap` :
+        `(used + reserve − PACE_MARGIN) / multiplier`. Aucun plancher
+        `PACE_MARGIN` ne s'y applique (#1028 N2) : une jauge bloquée a
+        `used ≥ held_cap ≥ PACE_MARGIN`, donc la part est déjà positive ; le
+        plancher ne changeait rien pour `reserve ≥ PACE_MARGIN` et annonçait
+        une libération trop tardive en dessous (le seuil, lui, garde le sien).
         """
         if not self.resets_at:
             return None
         used = self.used_at(now)
         if used >= PACE_CEILING - reserve:
             return float(self.resets_at)
-        share = used + reserve - PACE_MARGIN
-        if reserve:
-            share = max(share, PACE_MARGIN)
-        share = min(max(share / multiplier, 0.0), 1.0)
+        share = (used + reserve - PACE_MARGIN) / multiplier
+        share = min(max(share, 0.0), 1.0)
         return float(self.resets_at) - self.window_s * (1.0 - share)
 
     def reset_passed(self, now: float) -> bool:
@@ -890,6 +906,11 @@ class CostBook:
         Le seuil est celui de la décision 0019 §2 :
         `utilisation >= min(90 %, part écoulée de la fenêtre + 10 points)`,
         moins `reserve` pour un agent non critique (L242b (2), `held_cap`).
+
+        Sans compte déclaré : c'est le rythme **nominal** (`multiplier = 1.0`)
+        qui s'applique. Un harnais à comptes déclarés passe par
+        `accounts.choose`/`accounts.evaluate`, qui portent le
+        `pace_multiplier` de son profil (#1075, #1028).
         """
         now = self.clock()
         held = [gauge for gauge in self.gauges(harness) if gauge.exceeded(now, reserve)]
@@ -1584,12 +1605,17 @@ class CostBook:
         return ""
 
     # -- rapport ------------------------------------------------------------
-    def report(self, accounts: dict | None = None, *, record: bool = False) -> list:
+    def report(self, accounts: dict | None = None, *, record: bool = False,
+               multipliers: dict | None = None) -> list:
         """Une ligne par agent : harnais, modèle, dépense 1 h/24 h, jauges.
 
         `accounts` (L30) : `{harnais: (compte actif, [Gauge…])}` pour les
         harnais à comptes déclarés ; leurs jauges sont alors celles du compte
-        actif, et la ligne nomme ce compte (`account`).
+        actif, et la ligne nomme ce compte (`account`). `multipliers` (#1028,
+        #1075) : `{harnais: multiplicateur du compte actif}`, le
+        `pace_multiplier` du profil (`accounts.report`) — le plafond affiché
+        suit le rythme du compte, jamais le rythme nominal ; un harnais absent
+        garde 1.0.
 
         L71 : une **lecture** — l'historique des jauges n'est écrit que si
         `record` est vrai. Avec un registre, seuls ses agents sont listés (les
@@ -1598,6 +1624,7 @@ class CostBook:
         rows = []
         now = self.clock()
         accounts = accounts or {}
+        multipliers = multipliers or {}
         try:
             paid = set(paid_harnesses_of())
         except CostError:
@@ -1634,7 +1661,7 @@ class CostBook:
                         "used": g.used_at(now),          # L71 : 0 si fenêtre échue
                         "last_used": g.used,
                         "reset_passed": g.reset_passed(now),
-                        "cap": g.pace_cap(now),
+                        "cap": g.pace_cap(now, multipliers.get(harness, 1.0)),
                         "elapsed": g.elapsed(now),
                         "resets_at": g.resets_at,
                     }
