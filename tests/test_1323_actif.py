@@ -3,11 +3,13 @@
 
 Deux bancs, aucun acces reel :
 
-* `actif.py` isole (journal fabrique, envoi substitue) : l'attestation n'est
-  ecrite et le rapporteur reveille que si l'activation est prouvee, une seule
-  fois par commit ;
+* `actif.py` isole (journal fabrique, envoi et relecture substitues) :
+  l'attestation n'est ecrite et le rapporteur reveille que si l'activation est
+  prouvee — sonde structuree et message reellement remis compris —, une seule
+  fois par commit, meme apres une erreur d'ecriture posterieure a l'envoi ;
 * `staging.sh` sur stubs : le signal est appele apres une sequence complete et
-  saine, jamais apres un echec, jamais sur un sous-ensemble ni a blanc.
+  saine, jamais apres un echec, jamais sur un sous-ensemble ni a blanc, et le
+  journal porte la preuve de sonde en JSON.
 """
 from __future__ import annotations
 
@@ -16,7 +18,9 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -26,10 +30,12 @@ ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / 'deploy/mise-a-jour'
 
 SHA = '0123456789abcdef0123456789abcdef01234567'
+AUTRE_SHA = 'fedcba9876543210fedcba9876543210fedcba98'
 DEPUIS = '2026-10-14T16:00:00Z'
 TS = '2026-10-14T16:05:00Z'
 HOTES = ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1', 'pc-smichea')
-SONDE = 'courrier %s : sonde remise a quidu en 2.0s (message 7)'
+DESTINATAIRE = 'quidu'
+MESSAGE = 7
 
 #: variables du runner qui supplanteraient le HOME, la config ou l'etat
 #: temporaires : jamais heritees par le banc (meme garde que #1155/#1195).
@@ -55,9 +61,20 @@ def charger_actif():
     return module
 
 
-def evenement(hote, etape, verdict='ok', detail=None, ts=TS):
+def detail_sonde(hote, sha=SHA, verdict='ok', message=MESSAGE,
+                 destinataire=DESTINATAIRE, delai=2.0, pourquoi=None):
+    """Rapport JSON de sante-courrier.py, tel que staging.sh le journalise."""
+    sonde = None
+    if verdict == 'ok':
+        sonde = {'message': message, 'destinataire': destinataire, 'delai_s': delai}
+    return json.dumps({'hote': hote, 'verdict': verdict, 'personas': 2, 'sha': sha,
+                       'souffrance': [], 'boites_mortes': [], 'sonde': sonde,
+                       'pourquoi': pourquoi})
+
+
+def evenement(hote, etape, verdict='ok', detail=None, ts=TS, sha=SHA):
     return {'ts': ts, 'hote': hote, 'etape': etape, 'verdict': verdict,
-            'sha': SHA, 'precedent': None, 'detail': detail}
+            'sha': sha, 'precedent': None, 'detail': detail}
 
 
 def journal_complet():
@@ -67,7 +84,7 @@ def journal_complet():
         out.append(evenement(hote, 'installer', detail='installe %s' % SHA[:9]))
         out.append(evenement(hote, 'redemarrer'))
         out.append(evenement(hote, 'controler'))
-        out.append(evenement(hote, 'sante', detail=SONDE % hote))
+        out.append(evenement(hote, 'sante', detail=detail_sonde(hote)))
     out.append(evenement(None, 'sequence'))
     return out
 
@@ -85,12 +102,23 @@ class ActifTest(unittest.TestCase):
         self.journal = self.root / 'staging.jsonl'
         self.actif = charger_actif()
         self.envois = []
+        #: double du transport : un envoi depose vraiment la cle, comme la base
+        self.deposes = {}
         patcheur = mock.patch.object(self.actif, 'envoyer', side_effect=self.faux_envoi)
+        patcheur.start(); self.addCleanup(patcheur.stop)
+        patcheur = mock.patch.object(self.actif, 'deja_emis',
+                                     side_effect=self.faux_deja_emis)
+        patcheur.start(); self.addCleanup(patcheur.stop)
+        patcheur = mock.patch.object(self.actif, 'verifier_remises')
         patcheur.start(); self.addCleanup(patcheur.stop)
 
     def faux_envoi(self, dest, corps, charge):
         self.envois.append({'dest': dest, 'corps': corps, 'charge': charge})
+        self.deposes[charge['emission']] = 4242
         return 4242
+
+    def faux_deja_emis(self, nom, cle):
+        return self.deposes.get(cle)
 
     def ecrire(self, evenements):
         self.journal.write_text(''.join(json.dumps(e) + '\n' for e in evenements),
@@ -115,6 +143,45 @@ class ActifTest(unittest.TestCase):
     def attestations(self):
         return sorted(self.etat.glob('actif-*.json'))
 
+    def echec_ecriture_apres_envoi(self):
+        """Premier passage : envoi reussi, ecriture finale en echec."""
+        reel = self.actif.ecrire_attestation
+        appels = []
+
+        def ecriture(chemin, attestation):
+            appels.append(1)
+            if len(appels) == 2:      # l'ecriture apres l'envoi
+                raise OSError('disque plein')
+            return reel(chemin, attestation)
+
+        with mock.patch.object(self.actif, 'ecrire_attestation', side_effect=ecriture):
+            return self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+
+    # --- B1 : le point d'entree doit s'ouvrir -----------------------------
+
+    def test_aide_argparse_ne_leve_pas(self):
+        """B1 : le help de --depuis ne doit pas etre lu comme un format."""
+        sortie = io.StringIO()
+        with redirect_stdout(sortie), self.assertRaises(SystemExit) as ctx:
+            self.actif.main(['--help'])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn('--depuis', sortie.getvalue())
+
+    def test_help_formatable_quelle_que_soit_la_version(self):
+        """B1 : un % nu casse add_argument des Python 3.13 ; format_help()
+        leve deja sur les versions qui retardent la validation."""
+        texte = self.actif.analyseur().format_help()
+        self.assertIn('--depuis', texte)
+        self.assertIn('AAAA-MM-JJTHH:MM:SSZ', texte)
+
+    def test_point_entree_aide(self):
+        p = subprocess.run([sys.executable, str(DEPLOY / 'actif.py'), '--help'],
+                           capture_output=True, text=True, env=env_isole())
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('--depuis', p.stdout)
+
+    # --- preuves et non-signal --------------------------------------------
+
     def test_sequence_complete_atteste_et_reveille_une_fois(self):
         self.ecrire(journal_complet())
         code, sortie, erreur = self.lancer(*self.hotes(), '--lot', '917',
@@ -131,11 +198,16 @@ class ActifTest(unittest.TestCase):
             self.assertEqual(attestation['hotes'][hote]['actif'], SHA)
             self.assertEqual(attestation['hotes'][hote]['etapes'],
                              {e: 'ok' for e in ('installer', 'redemarrer', 'controler', 'sante')})
-            self.assertIn('sonde remise', attestation['hotes'][hote]['sante'])
+            self.assertEqual(attestation['hotes'][hote]['sonde'],
+                             {'message': MESSAGE, 'destinataire': DESTINATAIRE,
+                              'delai_s': 2.0})
+        self.assertEqual(attestation['emissions'], {})
         self.assertEqual(attestation['notifies']['docs01']['message'], 4242)
         self.assertEqual(len(self.envois), 1)
         self.assertEqual(self.envois[0]['dest'], 'docs01')
-        for attendu in (SHA[:9], '#917', HOTES[0], 'Aucune cloture'):
+        self.assertIn(SHA[:12], self.envois[0]['charge']['emission'])
+        for attendu in (SHA[:9], '#917', HOTES[0], 'Aucune cloture',
+                        'sonde %s remise a %s' % (MESSAGE, DESTINATAIRE)):
             self.assertIn(attendu, self.envois[0]['corps'])
         # relance du meme commit : aucun second courrier, aucune duplication
         code, _, erreur = self.lancer(*self.hotes(), '--lot', '917',
@@ -226,6 +298,133 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(len(self.attestations()), 1)
         self.assertEqual(len(self.envois), 1)
 
+    # --- B2 : la sonde doit prouver une remise reelle ---------------------
+
+    def test_sonde_sans_remise_refusee(self):
+        """B2 : un verdict `sans-sonde` (auto sans persona menee, ou
+        SONDE_<HOTE>=jamais) n'atteste pas une activation."""
+        evenements = journal_complet()
+        for e in evenements:
+            if e['etape'] == 'sante':
+                e['detail'] = detail_sonde(e['hote'], verdict='sans-sonde',
+                                           pourquoi='aucune persona menee')
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('sonde', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_sonde_detail_textuel_ou_absent_refuse(self):
+        """B2 : un detail libre ou absent ne prouve pas une remise reelle."""
+        for detail in ('courrier ameesh-agents-1 : sonde remise a quidu en 2.0s (message 7)',
+                       None):
+            with self.subTest(detail=detail):
+                self.envois.clear(); self.deposes.clear()
+                evenements = journal_complet()
+                for e in evenements:
+                    if e['etape'] == 'sante' and e['hote'] == 'ameesh-agents-1':
+                        e['detail'] = detail
+                self.ecrire(evenements)
+                code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+                self.assertEqual(code, 3, erreur)
+                self.assertIn('sonde', erreur)
+                self.assertEqual(self.attestations(), [])
+                self.assertEqual(self.envois, [])
+
+    def test_sonde_d_un_autre_commit_refusee(self):
+        """B2 : la preuve porte le commit de l'execution."""
+        evenements = journal_complet()
+        evenements[3]['detail'] = detail_sonde('ameesh-agents-1', sha=AUTRE_SHA)
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('autre commit', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_evenements_d_un_autre_commit_refuses(self):
+        """B2 : un journal complet au SHA B ne prouve pas la cible A."""
+        evenements = journal_complet()
+        for e in evenements:
+            e['sha'] = AUTRE_SHA
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('autre execution', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_message_de_sonde_non_relu_n_emet_rien(self):
+        """B2 : la remise est relue en base, pas seulement declaree."""
+        self.ecrire(journal_complet())
+        with mock.patch.object(self.actif, 'verifier_remises',
+                               side_effect=self.actif.PreuveManquante('sonde 7 introuvable')):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('introuvable', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    # --- B3 : l'emission est idempotente, meme apres erreur d'ecriture ----
+
+    def test_erreur_ecriture_apres_envoi_ne_renvoie_pas(self):
+        self.ecrire(journal_complet())
+        code, _, erreur = self.echec_ecriture_apres_envoi()
+        self.assertEqual(code, 4, erreur)
+        self.assertIn('disque plein', erreur)
+        self.assertEqual(len(self.envois), 1)
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertIn('docs01', attestation['emissions'])
+        self.assertNotIn('docs01', attestation['notifies'])
+        # relance : le courrier deja depose (meme cle) est retrouve, pas renvoye
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        self.assertEqual(len(self.envois), 1)
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(attestation['emissions'], {})
+        self.assertEqual(attestation['notifies']['docs01']['message'], 4242)
+        self.assertTrue(attestation['notifies']['docs01']['reconcilie'])
+
+    def test_cle_non_ecrite_aucun_envoi(self):
+        """B3 : sans cle durable, pas d'envoi (une relance reste sure)."""
+        self.ecrire(journal_complet())
+        with mock.patch.object(self.actif, 'ecrire_attestation',
+                               side_effect=OSError('disque plein')):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 4, erreur)
+        self.assertEqual(self.envois, [])
+
+    def test_envoi_echoue_puis_relance_une_seule_fois(self):
+        """B3 : un envoi en echec ne depose rien ; la relance renvoie une fois."""
+        self.ecrire(journal_complet())
+        with mock.patch.object(self.actif, 'envoyer',
+                               side_effect=RuntimeError('base absente')):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 4, erreur)
+        self.assertIn('base absente', erreur)
+        self.assertEqual(self.envois, [])
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertIn('docs01', attestation['emissions'])
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        self.assertEqual([e['dest'] for e in self.envois], ['docs01'])
+        attestation = json.loads(self.attestations()[0].read_text())
+        self.assertEqual(attestation['emissions'], {})
+
+    def test_relecture_impossible_ne_renvoie_pas(self):
+        """B3 : sans relecture possible, on ne risque pas un doublon."""
+        self.ecrire(journal_complet())
+        code, _, _ = self.echec_ecriture_apres_envoi()
+        self.assertEqual(code, 4)
+        self.assertEqual(len(self.envois), 1)
+        with mock.patch.object(self.actif, 'deja_emis',
+                               side_effect=RuntimeError('base absente')):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 4, erreur)
+        self.assertIn('relecture', erreur)
+        self.assertEqual(len(self.envois), 1)
+
     def test_courrier_non_remis_attestation_conservee(self):
         self.ecrire(journal_complet())
         with mock.patch.object(self.actif, 'envoyer', side_effect=RuntimeError('base absente')):
@@ -236,6 +435,105 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(len(fichiers), 1)
         attestation = json.loads(fichiers[0].read_text())
         self.assertEqual(attestation['notifies'], {})
+
+    # --- N1 : le temporaire est prive des sa creation ---------------------
+
+    def test_temporaire_0600_et_unique(self):
+        self.ecrire(journal_complet())
+        modes, noms = [], []
+        reel = os.replace
+
+        def remplacer(src, dst):
+            modes.append(stat.S_IMODE(os.stat(src).st_mode))
+            noms.append(str(src))
+            return reel(src, dst)
+
+        with mock.patch.object(self.actif.os, 'replace', side_effect=remplacer):
+            code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        self.assertTrue(modes)
+        self.assertEqual(set(modes), {0o600}, modes)
+        self.assertEqual(len(set(noms)), len(noms), noms)
+        self.assertEqual(stat.S_IMODE(os.stat(self.attestations()[0]).st_mode), 0o600)
+
+
+class PreuveSondeTest(unittest.TestCase):
+    """Contrats unitaires de la preuve de sonde (B2)."""
+
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = charger_actif()
+
+    def test_detail_valide(self):
+        preuve = self.mod.preuve_sonde('ameesh-agents-1',
+                                       detail_sonde('ameesh-agents-1'), SHA)
+        self.assertEqual(preuve, {'message': MESSAGE, 'destinataire': DESTINATAIRE,
+                                  'delai_s': 2.0})
+
+    def test_details_refuses(self):
+        cas = {
+            'absent': (None, 'absente'),
+            'vide': ('', 'absente'),
+            'texte libre': ('courrier X : sonde remise (message 7)', 'illisible'),
+            'json non objet': ('[1, 2]', 'forme inconnue'),
+            'autre hote': (detail_sonde('ameesh-agents-2'), 'autre hote'),
+            'aucun sha': (detail_sonde('ameesh-agents-1', sha=''), 'autre commit'),
+            'sans-sonde': (detail_sonde('ameesh-agents-1', verdict='sans-sonde'),
+                           'sonde non remise'),
+            'ko': (detail_sonde('ameesh-agents-1', verdict='ko'), 'sonde non remise'),
+            'sonde absente': (json.dumps({'hote': 'ameesh-agents-1', 'verdict': 'ok',
+                                          'sha': SHA, 'sonde': None}),
+                              'aucune sonde'),
+            'message illisible': (detail_sonde('ameesh-agents-1', message=0),
+                                  'message de sonde'),
+            'message booleen': (detail_sonde('ameesh-agents-1', message=True),
+                                'message de sonde'),
+            'destinataire vide': (detail_sonde('ameesh-agents-1', destinataire=''),
+                                  'destinataire'),
+            'delai absent': (detail_sonde('ameesh-agents-1', delai=None), 'delai'),
+            'delai negatif': (detail_sonde('ameesh-agents-1', delai=-1), 'delai'),
+        }
+        for nom, (detail, attendu) in cas.items():
+            with self.subTest(cas=nom):
+                with self.assertRaises(self.mod.PreuveManquante) as ctx:
+                    self.mod.preuve_sonde('ameesh-agents-1', detail, SHA)
+                self.assertIn(attendu, str(ctx.exception))
+
+    def message(self, **kw):
+        row = {'id': MESSAGE, 'sender': self.mod.work.SYSTEM_SENDER,
+               'recipient': DESTINATAIRE, 'delivered_ts': 1.0,
+               'payload': {'staging': {'hote': 'ameesh-agents-1', 'sha': SHA}}}
+        row.update(kw)
+        return row
+
+    def sonde(self):
+        return {'message': MESSAGE, 'destinataire': DESTINATAIRE, 'delai_s': 2.0}
+
+    def test_message_remis_valide(self):
+        self.assertEqual(
+            self.mod.controle_message(self.message(), 'ameesh-agents-1', self.sonde(), SHA),
+            self.sonde())
+
+    def test_messages_refuses(self):
+        cas = {
+            'introuvable': (None, 'introuvable'),
+            'non remis': (self.message(delivered_ts=None), 'non remis'),
+            'mauvais destinataire': (self.message(recipient='autre'), 'destine'),
+            'mauvais expediteur': (self.message(sender='agent'), 'expediteur'),
+            'autre hote': (self.message(payload={'staging': {'hote': 'autre', 'sha': SHA}}),
+                           'autre hote'),
+            'autre commit': (self.message(payload={'staging': {'hote': 'ameesh-agents-1',
+                                                               'sha': AUTRE_SHA}}),
+                             'autre commit'),
+            'sans charge staging': (self.message(payload={}), 'autre hote'),
+        }
+        for nom, (row, attendu) in cas.items():
+            with self.subTest(cas=nom):
+                with self.assertRaises(self.mod.PreuveManquante) as ctx:
+                    self.mod.controle_message(row, 'ameesh-agents-1', self.sonde(), SHA)
+                self.assertIn(attendu, str(ctx.exception))
 
 
 class StagingSignalTest(unittest.TestCase):
@@ -333,6 +631,12 @@ class StagingSignalTest(unittest.TestCase):
     def notifications(self):
         return [l for l in self.calls() if l.startswith('venv-python notification')]
 
+    def journal(self):
+        dossier = self.home / '.local/state/ameesh/mise-a-jour'
+        fichiers = sorted(dossier.glob('staging-*.jsonl'))
+        self.assertTrue(fichiers, dossier)
+        return [json.loads(l) for l in fichiers[0].read_text().splitlines()]
+
     def creer_poste_installe(self):
         """Le poste publie un nom court : la relecture doit le retrouver."""
         court = self.sha[:7]
@@ -359,6 +663,31 @@ class StagingSignalTest(unittest.TestCase):
         self.assertIn('--rapporteur docs01', ligne)
         self.assertNotIn('--sans-sonde', ligne)
 
+    def test_journal_porte_la_preuve_de_sonde_en_json(self):
+        """B2 : le detail de `sante` est le rapport structure, lie au commit."""
+        self.creer_poste_installe()
+        p = self.run_staging('--rapporteurs', 'docs01')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        sante = [t for t in self.journal() if t['etape'] == 'sante']
+        self.assertEqual(len(sante), len(HOTES), sante)
+        for trace in sante:
+            rapport = json.loads(trace['detail'])
+            self.assertEqual(rapport['hote'], trace['hote'])
+            self.assertEqual(rapport['sha'], self.sha)
+            self.assertEqual(rapport['verdict'], 'ok')
+            self.assertEqual(rapport['sonde']['message'], MESSAGE)
+            self.assertEqual(rapport['sonde']['destinataire'], DESTINATAIRE)
+
+    def test_sonde_appelee_en_json_avec_le_commit(self):
+        self.creer_poste_installe()
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        appels = [l for l in self.calls() if 'sante-courrier.py' in l]
+        self.assertEqual(len(appels), len(HOTES), self.calls())
+        for ligne in appels:
+            self.assertIn('--json', ligne)
+            self.assertIn('--sha %s' % self.sha, ligne)
+
     def test_echec_et_retour_n_emettent_aucun_signal(self):
         (self.state / 'scenario').write_text('ko=manaty-mesh-1:controler\n')
         p = self.run_staging('--lots', '917', '--rapporteurs', 'docs01')
@@ -381,6 +710,11 @@ class StagingSignalTest(unittest.TestCase):
         appels = self.actifs()
         self.assertEqual(len(appels), 1, self.calls())
         self.assertIn('--sans-sonde', appels[0])
+        # la sonde de lecture seule est journalisee sans verdict de remise
+        sante = [t for t in self.journal() if t['etape'] == 'sante']
+        self.assertEqual(len(sante), len(HOTES), sante)
+        for trace in sante:
+            self.assertEqual(json.loads(trace['detail'])['verdict'], 'sans-sonde')
 
     def test_a_blanc_n_appelle_rien(self):
         p = self.run_staging('--a-blanc', '--lots', '917')
@@ -421,7 +755,8 @@ fi
 exit 0
 '''
 
-#: venv du poste : distingue la notification, le signal actif et la sonde
+#: venv du poste : distingue la notification, le signal actif et la sonde ;
+#: la sonde rend le rapport JSON que staging.sh journalise (preuve #1323)
 VENV_PYTHON = r'''#!/usr/bin/env bash
 set -euo pipefail
 state=${FAKE_STATE:?}
@@ -433,9 +768,11 @@ if [ "$(basename "${1:-}")" = actif.py ]; then
   printf 'actif %s\n' "$*" >> "$state/calls.log"
   exit 0
 fi
-hote=""; precedent=""
+hote=""; sha=""; cible=auto; precedent=""
 for arg in "$@"; do
   [ "$precedent" = --hote ] && hote=$arg
+  [ "$precedent" = --sha ] && sha=$arg
+  [ "$precedent" = --sonde ] && cible=$arg
   precedent=$arg
 done
 if grep -qx "ko=sante:$hote" "$state/scenario" 2>/dev/null; then
@@ -444,7 +781,11 @@ if grep -qx "ko=sante:$hote" "$state/scenario" 2>/dev/null; then
   echo "courrier $hote : KO (echec injecte)" >&2
   exit 1
 fi
-printf 'courrier %s : sonde remise a quidu en 2.0s (message 7)\n' "$hote"
+if [ "$cible" = jamais ]; then
+  printf '{"hote": "%s", "verdict": "sans-sonde", "sha": "%s", "sonde": null, "pourquoi": "sonde desactivee"}\n' "$hote" "$sha"
+  exit 0
+fi
+printf '{"hote": "%s", "verdict": "ok", "sha": "%s", "personas": 2, "souffrance": [], "boites_mortes": [], "sonde": {"message": %s, "destinataire": "%s", "delai_s": 2.0}, "pourquoi": null}\n' "$hote" "$sha" 7 quidu
 '''
 
 VENV_AMEESH = r'''#!/usr/bin/env bash

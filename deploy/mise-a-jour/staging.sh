@@ -57,7 +57,10 @@
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
 # precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
 # `precedent` nomme la version que « retour » reinstalle reellement. Le detail
-# de l'etape `sante` porte la preuve de la sonde (destinataire, delai, message).
+# de l'etape `sante` est le rapport JSON de sante-courrier.py (hote, commit,
+# verdict, message de sonde remis, destinataire, delai) : c'est la preuve
+# structuree que actif.py exige (#1323) ; un verdict `sans-sonde` n'en est pas
+# une et aucun signal de reussite n'est emis dans ce cas.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -299,7 +302,7 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
     serveur) ssh_lire "${CIBLE[$nom]}" "cat /opt/ameesh/precedent" 2>/dev/null ;;
   esac || true
 }
-sante_hote() {  # nom [jamais] : la preuve (derniere ligne) va dans SANTE_DETAIL
+sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   local nom=$1 sans=${2:-} cible_sonde var sortie
   SANTE_DETAIL=""
   var=$(var_sonde_de "$nom")
@@ -311,17 +314,17 @@ sante_hote() {  # nom [jamais] : la preuve (derniere ligne) va dans SANTE_DETAIL
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
     sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde "${cible_sonde:-auto}" \
-      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" 2>&1) \
+      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json) \
       || { printf '%s\n' "$sortie"; return 1; }
     printf '%s\n' "$sortie"
-    SANTE_DETAIL=$(printf '%s\n' "$sortie" | tail -n 1)
+    SANTE_DETAIL=$sortie
   else
     etape "courrier de $nom (lecture seule, sonde desactivee)"
     sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde jamais \
-      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" 2>&1) \
+      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json) \
       || { printf '%s\n' "$sortie"; return 1; }
     printf '%s\n' "$sortie"
-    SANTE_DETAIL=$(printf '%s\n' "$sortie" | tail -n 1)
+    SANTE_DETAIL=$sortie
   fi
 }
 notifier() {  # sujet corps
