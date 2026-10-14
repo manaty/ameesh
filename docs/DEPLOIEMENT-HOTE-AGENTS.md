@@ -3,8 +3,12 @@
 Un hôte d’agents utilise les unités **utilisateur**
 `ameesh-runner-agent@<agent>.service`, sous le compte `ameesh`.
 Depuis le poste, `deploy/mise-a-jour/vm.sh agents redemarrer` les redémarre
-une par une, hors tour. `agents controler` (ou `agents verifier`) contrôle
-les unités et les baux, sans redémarrer personne.
+une par une, hors tour. `agents controler` contrôle les unités et les baux,
+sans redémarrer personne ; `agents verifier` lit, sans rien modifier, le code
+installé, la version du venv et les migrations manquantes. `agents
+installer [REF]` et `agents retour` installent le code, comme sur le serveur
+du mesh, dans le layout du compte `ameesh` : `src/` (dépôt détaché),
+`venv/`, `src-<court>/` (instantané par commit) et `previous-sha`.
 
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
@@ -63,9 +67,15 @@ d’hôte pendant le contrôle fait échouer la preuve. En cas d’échec, la
 commande indique l’unité et la commande `journalctl --user` à lancer sous
 `ameesh` sur la VM.
 
-Ce mode couvre le redémarrage et le contrôle du code déjà installé.
-`installer` et `retour` restent les opérations du serveur du mesh ; elles
-sont refusées en mode agents. Les migrations de la base commune doivent
-être appliquées avant l’installation du code, selon la procédure de
-[BASCULE.md](BASCULE.md). Les commandes de cette page sont à exécuter par
-le responsable du déploiement après revue et validation CI.
+`agents installer REF` refuse tant que la base commune n’a pas toutes les
+migrations de REF (lues dans le dépôt du poste, comparées à
+`schema_migrations` sur la VM avec l’environnement du runner) : lancer
+d’abord `poste.sh migrer REF`, qui n’applique que des migrations additives
+avant l’installation. Le commit visé est déposé sur la VM en paquet git par
+SSH s’il y manque, puis extrait dans `src-<court>` et installé dans le venv
+(`--no-deps` d’abord, dépendances ensuite) ; le commit courant est écrit dans
+`previous-sha` avant toute modification. `agents retour` réinstalle le commit
+de `previous-sha`, redémarre puis contrôle ; il refuse sans précédent
+enregistré. Les migrations passées avant l’installation sont additives,
+l’ancien code les ignore. Les commandes de cette page sont à exécuter par le
+responsable du déploiement depuis le poste, après revue et validation CI.
