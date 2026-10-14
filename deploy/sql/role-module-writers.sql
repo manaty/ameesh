@@ -3,7 +3,8 @@
 -- These NOLOGIN groups belong to separate protected service logins, NEVER
 -- to executor logins. Credentials and canon/code are isolated at the OS level.
 -- Revoke PUBLIC TEMP on the database separately before applying this script.
--- The audit rejects effective TEMP, including grants inherited from PUBLIC.
+-- The audit rejects TEMP on the groups and their transitive members, including
+-- PUBLIC grants and other parent-role grants (also reachable by SET ROLE).
 \set ON_ERROR_STOP on
 BEGIN;
 SELECT current_schema() AS schema \gset
@@ -64,8 +65,12 @@ BEGIN
                 UNION
                 SELECT m.member FROM pg_auth_members m JOIN members x ON m.roleid = x.oid
             )
+            -- Check every parent conservatively, even when NOINHERIT means
+            -- its TEMP becomes usable only after SET ROLE. A login can create
+            -- a shadow table there and keep it when switching to the writer.
             SELECT 1 FROM members JOIN pg_roles mr ON mr.oid = members.oid
-             WHERE has_database_privilege(mr.oid, current_database(), 'TEMP')
+              JOIN pg_roles capability ON pg_has_role(mr.oid, capability.oid, 'MEMBER')
+             WHERE has_database_privilege(capability.oid, current_database(), 'TEMP')
         ) THEN
             RAISE EXCEPTION 'module writer group % has a member with TEMP (direct or inherited)', r.rolname;
         END IF;

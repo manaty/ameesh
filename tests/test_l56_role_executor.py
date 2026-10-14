@@ -184,9 +184,29 @@ class RoleExecutorTest(PgTestCase):
             # inherited memberships, not just the group.
             member = "t_writer_member_" + uuid.uuid4().hex[:8]
             inherited = "t_writer_parent_" + uuid.uuid4().hex[:8]
+            other = "t_writer_other_" + uuid.uuid4().hex[:8]
             self.db.execute("CREATE ROLE %s LOGIN" % q(member))
             self.db.execute("CREATE ROLE %s NOLOGIN" % q(inherited))
+            self.db.execute("CREATE ROLE %s NOLOGIN" % q(other))
             try:
+                # TEMP on an unrelated role must not make the script fail.
+                self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                (q(self.database), q(other)))
+                proc = run_writers()
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                for group in names:
+                    with self.subTest(direct_writer_group=group):
+                        self.db.execute("GRANT %s TO %s" % (q(group), q(member)))
+                        self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                        (q(self.database), q(member)))
+                        try:
+                            proc = run_writers()
+                            self.assertNotEqual(proc.returncode, 0)
+                            self.assertIn("has a member with TEMP", proc.stderr)
+                        finally:
+                            self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                            (q(self.database), q(member)))
+                            self.db.execute("REVOKE %s FROM %s" % (q(group), q(member)))
                 self.db.execute("GRANT %s TO %s" % (q("ameesh_it_qa"), q(inherited)))
                 self.db.execute("GRANT %s TO %s" % (q(inherited), q(member)))
                 for grantee in (inherited, member):
@@ -203,9 +223,22 @@ class RoleExecutorTest(PgTestCase):
                 # A member without TEMP leaves the contract intact.
                 proc = run_writers()
                 self.assertEqual(proc.returncode, 0, proc.stderr)
+                # An additional parent can confer TEMP through inheritance or
+                # only after SET ROLE; both paths allow creating a shadow table.
+                self.db.execute("GRANT %s TO %s" % (q(other), q(member)))
+                for inherit in (True, False):
+                    with self.subTest(temp_parent_inherit=inherit):
+                        self.db.execute("GRANT %s TO %s WITH INHERIT %s" %
+                                        (q(other), q(member), "TRUE" if inherit else "FALSE"))
+                        proc = run_writers()
+                        self.assertNotEqual(proc.returncode, 0)
+                        self.assertIn("has a member with TEMP", proc.stderr)
+                self.db.execute("REVOKE %s FROM %s" % (q(other), q(member)))
+                proc = run_writers()
+                self.assertEqual(proc.returncode, 0, proc.stderr)
             finally:
-                self.db.execute("DROP OWNED BY %s, %s" % (q(member), q(inherited)))
-                self.db.execute("DROP ROLE %s, %s" % (q(member), q(inherited)))
+                self.db.execute("DROP OWNED BY %s, %s, %s" % (q(member), q(inherited), q(other)))
+                self.db.execute("DROP ROLE %s, %s, %s" % (q(member), q(inherited), q(other)))
             self.assertEqual(self.run_script(self.role).returncode, 0)
             for name in names:
                 self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
