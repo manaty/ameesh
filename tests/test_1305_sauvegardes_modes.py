@@ -5,7 +5,9 @@ Le vrai `deploy/serveur/sauvegarder-base.sh` est exécuté, avec un faux
 `pg_dump` qui se comporte comme le vrai sur le point qui compte : il tronque le
 fichier existant sans changer son mode et note le mode qu'il voit à l'ouverture.
 Le répertoire des dumps est redirigé par `AMEESH_SAUVEGARDES_DIR`, positionnée
-ici seulement (le service systemd ne la connaît pas). Aucune base, aucun réseau.
+ici seulement (le service systemd ne la connaît pas) ; la machine et la date du
+dump du jour sont figées par de faux `hostname`/`date` du PATH. Aucune base,
+aucun réseau.
 """
 from __future__ import annotations
 
@@ -40,6 +42,20 @@ FAKE_CURL = '''#!/bin/sh
 exit 0
 '''
 
+# Le nom du dump du jour dépend de la machine et de l'horloge : on les fige
+# dans le PATH du script, pour que le test ne dépende ni de l'une ni de l'autre.
+FAKE_HOSTNAME = '''#!/bin/sh
+echo hote-test
+'''
+
+FAKE_DATE = '''#!/bin/sh
+echo 2026-01-02
+'''
+
+HOTE = "hote-test"
+JOUR = "2026-01-02"
+
+
 
 class SauvegardesPriveesTest(unittest.TestCase):
     def setUp(self):
@@ -50,23 +66,18 @@ class SauvegardesPriveesTest(unittest.TestCase):
         fakebin = os.path.join(self.tmp, "fakebin")
         os.makedirs(self.state)
         os.makedirs(fakebin, mode=0o755)
-        for nom, contenu in (("pg_dump", FAKE_PG_DUMP), ("curl", FAKE_CURL)):
+        for nom, contenu in (("pg_dump", FAKE_PG_DUMP), ("curl", FAKE_CURL),
+                             ("hostname", FAKE_HOSTNAME), ("date", FAKE_DATE)):
             chemin = os.path.join(fakebin, nom)
             with open(chemin, "w", encoding="utf-8") as fh:
                 fh.write(contenu)
             os.chmod(chemin, 0o755)
-        self.host = self.sortie("hostname")
-        self.jour = self.sortie("date", "+%F")
         self.env = dict(os.environ, FAKE_STATE=self.state,
                         AMEESH_SAUVEGARDES_DIR=self.dumps,
                         PATH=fakebin + os.pathsep + os.environ.get("PATH", ""))
         # umask permissif de l'appelant : le script doit imposer le sien
         ancien = os.umask(0o022)
         self.addCleanup(os.umask, ancien)
-
-    def sortie(self, *commande):
-        return subprocess.run(commande, capture_output=True, text=True,
-                              check=True).stdout.strip()
 
     def run_script(self):
         return subprocess.run(["/bin/sh", SCRIPT], capture_output=True,
@@ -76,8 +87,7 @@ class SauvegardesPriveesTest(unittest.TestCase):
         return stat.S_IMODE(os.stat(chemin).st_mode)
 
     def dump_du_jour(self):
-        return os.path.join(self.dumps,
-                            "ameesh-%s-%s.dump" % (self.host, self.jour))
+        return os.path.join(self.dumps, "ameesh-%s-%s.dump" % (HOTE, JOUR))
 
     def dump_ancien(self, nom, contenu, age_jours=0):
         chemin = os.path.join(self.dumps, nom)
