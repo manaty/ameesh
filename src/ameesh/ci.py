@@ -355,11 +355,12 @@ class Watcher:
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; une exécution
-        déjà connue que GitHub dit de nouveau en cours est une **relance**
-        (#901 : `run_id` inchangé, `run_attempt` suivant) : sa ligne est
-        rouverte et suivie, sauf si une tête plus récente de la branche l'a
-        remplacée ou si l'attempt n'a pas augmenté (liste en retard, #828).
-        Elle remplace les exécutions d'une autre tête sur la même
+        connue sans lot rattaché l'est dès que la branche du lot est posée
+        (#1321) ; une exécution déjà connue que GitHub dit de nouveau en cours
+        est une **relance** (#901 : `run_id` inchangé, `run_attempt` suivant) :
+        sa ligne est rouverte et suivie, sauf si une tête plus récente de la
+        branche l'a remplacée ou si l'attempt n'a pas augmenté (liste en
+        retard, #828). Elle remplace les exécutions d'une autre tête sur la même
         branche (hors base)."""
         st = storage.of(db)
         run_id = int(run["id"])
@@ -368,6 +369,20 @@ class Watcher:
         if known is not None:
             if known["status"] == "superseded":
                 return []  # la tête de la branche a bougé : la relance est sans objet
+            if known.get("work_item_id") is None:
+                # #1321 : la branche du lot peut être posée après la première
+                # vue du run ; sans ce rattachement, `_conclude` lit
+                # `recipient_of(None)` et le verdict part à personne.
+                # `open_run` est idempotent (coalesce côté stockage) : il ne
+                # remplit que le lien encore vide.
+                lot = lot_of_run(run, lots)
+                if lot is not None:
+                    st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
+                                   branch=run.get("head_branch") or "",
+                                   event=run.get("event") or "", base=base_of(run),
+                                   work_item_id=lot, url=run.get("html_url"))
+                    self.log("CI %s run %s: lot #%s linked (branch set later)"
+                             % (repo, run_id, lot))
             known_attempt = int(known.get("run_attempt") or 1)
             if attempt <= known_attempt:
                 # même attempt : soit la ligne est déjà suivie, soit une liste
