@@ -239,8 +239,15 @@ class VmAgentsHarness(unittest.TestCase):
         # vient de l'EnvironmentFile simulé ou du fichier de configuration.
         for nom in ('AMEESH_HOST', 'AGENT_MESH_HOST', 'AMEESH_CONFIG', 'AGENT_MESH_CONFIG'):
             self.env.pop(nom, None)
-        self.old = self.git(ROOT, 'rev-parse', 'HEAD~1')
-        self.target = self.git(ROOT, 'rev-parse', 'HEAD')
+        # Le dépôt d'origine est bâti par le test : la CI clone la tête en
+        # profondeur 1, l'historique du checkout n'est donc pas une dépendance
+        # admissible (défaut de test, canon §3). Trois commits réels :
+        # plus_ancien, old, target.
+        self.origin = self.root / 'origin'
+        self._build_origin()
+        self.plus_ancien = self.git(self.origin, 'rev-parse', 'HEAD~2')
+        self.old = self.git(self.origin, 'rev-parse', 'HEAD~1')
+        self.target = self.git(self.origin, 'rev-parse', 'HEAD')
         self._clone_at_old()
         self._install_versions(self.target)
         self._write_direct_url(self.old)
@@ -254,11 +261,27 @@ class VmAgentsHarness(unittest.TestCase):
     def head(self, where):
         return self.git(where, 'rev-parse', 'HEAD')
 
+    def _build_origin(self):
+        """Un dépôt d'origine à trois commits, indépendant de l'historique du
+        checkout : la CI ne fournit que la tête (clone en profondeur 1)."""
+        (self.origin / 'deploy/mise-a-jour').mkdir(parents=True)
+        shutil.copy2(SCRIPT, self.origin / 'deploy/mise-a-jour/vm.sh')
+        shutil.copy2(BAIL, self.origin / 'deploy/mise-a-jour/bail.sh')
+        shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
+        (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
+        (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')
+        subprocess.run(['git', 'init', '-q', str(self.origin)], check=True)
+        for nom in ('0001_init.sql', '0002_next.sql', '0003_target.sql'):
+            (self.origin / 'src/ameesh/migrations' / nom).write_text('-- test\n')
+            subprocess.run(['git', '-C', str(self.origin), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(self.origin), '-c', 'user.email=t@invalid',
+                            '-c', 'user.name=test', 'commit', '-q', '-m', nom], check=True)
+
     def _clone_at_old(self, at=None):
         if self.src.exists():
             shutil.rmtree(self.src)
         subprocess.run(['git', 'clone', '-q', '--shared', '--no-checkout',
-                        str(ROOT), str(self.src)], check=True, timeout=300)
+                        str(self.origin), str(self.src)], check=True, timeout=300)
         subprocess.run(['git', '-C', str(self.src), 'checkout', '-q', '--detach',
                         at or self.old], check=True, timeout=120)
 
@@ -266,7 +289,7 @@ class VmAgentsHarness(unittest.TestCase):
         """A clone that has the object but no usable HEAD (no previous code)."""
         shutil.rmtree(self.src)
         subprocess.run(['git', 'init', '-q', str(self.src)], check=True)
-        subprocess.run(['git', '-C', str(self.src), 'fetch', '-q', str(ROOT), sha],
+        subprocess.run(['git', '-C', str(self.src), 'fetch', '-q', str(self.origin), sha],
                        check=True, timeout=120)
 
     def _write_direct_url(self, sha):
@@ -275,14 +298,19 @@ class VmAgentsHarness(unittest.TestCase):
             {'url': (self.parts / ('src-' + sha[:7])).as_uri()}))
 
     def _install_versions(self, sha):
-        names = self.git(ROOT, 'ls-tree', '--name-only', sha, 'src/ameesh/migrations/')
+        names = self.git(self.origin, 'ls-tree', '--name-only', sha,
+                         'src/ameesh/migrations/')
         versions = sorted({re.match(r'0*(\d+)_', n.split('/')[-1]).group(1)
                            for n in names.splitlines() if n.endswith('.sql')},
                           key=int)
         (self.state / 'versions.txt').write_text('\n'.join(versions) + '\n')
 
     def run_vm(self, action, *args):
-        return subprocess.run(['bash', str(SCRIPT), 'agents', action, *args],
+        # Le script est celui du poste de travail : son dépôt (DEPOT, déduit de
+        # son chemin) est le dépôt d'origine du harnais, donc les SHA visés y
+        # sont résolubles sans dépendre du checkout.
+        return subprocess.run(['bash', str(self.origin / 'deploy/mise-a-jour/vm.sh'),
+                               'agents', action, *args],
                               env=self.env, capture_output=True, text=True, timeout=300)
 
     def pip_calls(self):
@@ -521,7 +549,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         """An unmodified src-<sha7> clone, as a previous run would leave one."""
         snapshot = self.parts / ('src-' + sha[:7])
         subprocess.run(['git', 'clone', '-q', '--shared', '--no-checkout',
-                        str(ROOT), str(snapshot)], check=True, timeout=300)
+                        str(self.origin), str(snapshot)], check=True, timeout=300)
         subprocess.run(['git', '-C', str(snapshot), 'checkout', '-q',
                         '--detach', sha], check=True, timeout=120)
         return snapshot
@@ -607,7 +635,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
             self.assertIn('src-' + self.target[:7], call)
 
     def test_failed_install_keeps_previous_sha_and_retour_returns_to_the_left_code(self):
-        plus_ancien = self.git(ROOT, 'rev-parse', 'HEAD~2')
+        plus_ancien = self.plus_ancien
         (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
         (self.state / 'pip-fail-at').write_text('2\n')
         p = self.run_vm('installer', self.target)
@@ -672,7 +700,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         # A→B, le premier pip réussit puis le second échoue : le journal vaut A,
         # mais direct_url.json pointe déjà B. Relancer installer ne doit pas
         # prendre B pour cible de récupération ni écraser le journal.
-        plus_ancien = self.git(ROOT, 'rev-parse', 'HEAD~2')
+        plus_ancien = self.plus_ancien
         (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
         (self.state / 'pip-fail-at').write_text('2\n')
         p = self.run_vm('installer', self.target)
@@ -807,32 +835,12 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
 
     def setUp(self):
         super().setUp()
-        # The workstation repository becomes a throw-away one, so the bundle is
-        # built from local history without touching the real repository.
-        self.depot = self.root / 'depot'
-        (self.depot / 'deploy/mise-a-jour').mkdir(parents=True)
-        shutil.copy2(SCRIPT, self.depot / 'deploy/mise-a-jour/vm.sh')
-        shutil.copy2(BAIL, self.depot / 'deploy/mise-a-jour/bail.sh')
-        (self.depot / 'src/ameesh/migrations').mkdir(parents=True)
-        (self.depot / 'src/ameesh/migrations/0001_init.sql').write_text('-- test\n')
-        subprocess.run(['git', 'init', '-q', str(self.depot)], check=True)
-        subprocess.run(['git', '-C', str(self.depot), 'add', '.'], check=True)
-        subprocess.run(['git', '-C', str(self.depot), '-c', 'user.email=t@invalid',
-                        '-c', 'user.name=test', 'commit', '-q', '-m', 'previous'],
-                       check=True)
-        self.old = self.git(self.depot, 'rev-parse', 'HEAD')
-        (self.depot / 'src/ameesh/migrations/0002_next.sql').write_text('-- test\n')
-        subprocess.run(['git', '-C', str(self.depot), 'add', '.'], check=True)
-        subprocess.run(['git', '-C', str(self.depot), '-c', 'user.email=t@invalid',
-                        '-c', 'user.name=test', 'commit', '-q', '-m', 'mid'],
-                       check=True)
-        self.mid = self.git(self.depot, 'rev-parse', 'HEAD')
-        (self.depot / 'src/ameesh/migrations/0003_target.sql').write_text('-- test\n')
-        subprocess.run(['git', '-C', str(self.depot), 'add', '.'], check=True)
-        subprocess.run(['git', '-C', str(self.depot), '-c', 'user.email=t@invalid',
-                        '-c', 'user.name=test', 'commit', '-q', '-m', 'target'],
-                       check=True)
-        self.target = self.git(self.depot, 'rev-parse', 'HEAD')
+        # Le poste de travail est le dépôt d'origine bâti par le harnais : les
+        # trois commits (previous, mid, target) viennent du test, jamais de
+        # l'historique du checkout.
+        self.depot = self.origin
+        self.mid = self.old
+        self.old = self.plus_ancien
         # The VM clone holds the old commit only, and has no origin at all.
         shutil.rmtree(self.src)
         subprocess.run(['git', 'init', '-q', str(self.src)], check=True)
@@ -843,11 +851,6 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
         self._write_direct_url(self.old)
         (self.parts / 'previous-sha').write_text(self.old + '\n')
         (self.state / 'versions.txt').write_text('1\n2\n3\n')
-
-    def run_vm(self, action, *args):
-        return subprocess.run(['bash', str(self.depot / 'deploy/mise-a-jour/vm.sh'),
-                               'agents', action, *args], env=self.env,
-                              capture_output=True, text=True, timeout=300)
 
     def _origin_main(self):
         """The workstation's origin/main, the base the old bundle excluded."""
