@@ -222,29 +222,48 @@ class WorkItems(interface.WorkItems):
         edge rolls the creation back, the suite lot is never exposed ready);
         already finished, no edge is written (the suite is available at once)
         and the parent stays traced in the journal; unknown, everything is
-        rolled back. No number is ever guessed from the title or the body."""
+        rolled back. No number is ever guessed from the title or the body.
+
+        Les verrous sont pris dans l'ordre commun avec `assign` (revue R1
+        delta #540) : les lignes de lots d'abord (`mark_item_id` et
+        `parent_lot`, par identifiant croissant), le verrou d'agent ensuite.
+        `assign` verrouille la ligne du lot puis l'agent (`_pending`) ;
+        l'ordre inverse ici (agent puis parent) interbloquait l'ajout d'une
+        suite avec l'attribution de son parent."""
         with self.db.transaction() as tx:
+            # #540 : lignes de lots d'abord, par identifiant croissant, puis
+            # le verrou d'agent de `_pending` — même ordre que `assign`.
+            marked = None
+            parent = None
+            parent_id = None if parent_lot is None else int(parent_lot)
+            for lock_id in sorted({int(v) for v in (mark_item_id, parent_lot)
+                                   if v is not None}):
+                if lock_id == parent_id:
+                    parent = tx.query(
+                        "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
+                        (lock_id,))
+                    if not parent:
+                        raise DbError("parent lot %s: no such lot" % parent_lot)
+                if mark_item_id is not None and lock_id == int(mark_item_id):
+                    marked = tx.query(
+                        "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                        (lock_id,))
+                    if not marked:
+                        raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+            if mark_item_id is not None and str(issue_ref or "").strip():
+                # le verrou sur la ligne marquée sérialise les créateurs :
+                # le second relit la référence après le commit du premier
+                duplicate = tx.query(
+                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref,))
+                if duplicate:
+                    raise DbError("issue_ref %s is already carried by lot #%d"
+                                  % (issue_ref, int(duplicate[0]["id"])))
             behind = (WorkItems(tx)._pending(assignee, None)
                       if queued_note is not None and assignee else None)
             if behind is not None:
                 assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                                   else (None, queued_note.format(lot=behind)))
-            marked = None
-            if mark_item_id is not None:
-                marked = tx.query(
-                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                    (int(mark_item_id),))
-                if not marked:
-                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
-                if str(issue_ref or "").strip():
-                    # le verrou sur la ligne marquée sérialise les créateurs :
-                    # le second relit la référence après le commit du premier
-                    duplicate = tx.query(
-                        "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
-                        " ORDER BY id LIMIT 1", (issue_ref,))
-                    if duplicate:
-                        raise DbError("issue_ref %s is already carried by lot #%d"
-                                      % (issue_ref, int(duplicate[0]["id"])))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -273,12 +292,8 @@ class WorkItems(interface.WorkItems):
             if parent_lot is not None:
                 # #1193: the explicit parent of a suite lot is linked in the
                 # same transaction as the creation — never a forgotten edge,
-                # and an edge failure never leaves the lot ready.
-                parent = tx.query(
-                    "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
-                    (int(parent_lot),))
-                if not parent:
-                    raise DbError("parent lot %s: no such lot" % parent_lot)
+                # and an edge failure never leaves the lot ready. The row was
+                # locked above, before the agent's lock (#540, ordre commun).
                 if parent[0]["state"] not in ("merged", "promoted", "closed"):
                     tx.execute(
                         "INSERT INTO work_item_dependencies(work_item_id, blocker_id,"

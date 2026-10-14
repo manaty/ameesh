@@ -4,9 +4,13 @@ written in the same operation as the creation), and the L165 queue never offers
 a lot whose explicit prerequisite is not finished."""
 from __future__ import annotations
 
+import threading
+import time
 import unittest
+from unittest import mock
 
-from ameesh import registry, storage, work
+from ameesh import db as db_mod, registry, storage, work
+from ameesh.storage.postgres import work as pg_work
 
 from .support import PgTestCase
 from .test_l165_prise_lots import _Lots
@@ -143,6 +147,117 @@ class ReadyIntakeTest(_Lots):
         out = self.take()
         self.assertEqual([(t["kind"], t["item"]["id"]) for t in out], [("lot", suite["id"])])
         self.assertEqual(work.get(self.db, suite["id"])["assignee"], "claude2")
+
+
+class LockOrderTest(PgTestCase):
+    """Revue R1 delta #540 (auditeur) : `add` (suite, ou marque) et `assign`
+    prennent les verrous dans le même ordre — les lignes de lots d'abord, le
+    verrou d'agent ensuite. L'ordre inverse interbloquait les deux transactions
+    (add d'une suite × assign de son parent), détecté et annulé par Postgres :
+    le témoin échoue alors sur l'erreur rendue par l'une des transactions."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE work_items CASCADE")
+        for name in ("orch", "dev1"):
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+
+    def edges(self, item_id):
+        return storage.of(self.db).work_dependencies.for_items([item_id])
+
+    def _wait_until_a_witness_waits(self, timeout=5.0) -> bool:
+        """Attend qu'une transaction du témoin soit en attente d'un verrou."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = self.db.query(
+                "SELECT count(*)::int AS n FROM pg_stat_activity"
+                " WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()")
+            if int(rows[0]["n"]) > 0:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _scenario(self, add_call, assign_call):
+        """T2 (`assign`) d'abord, retenu entre le verrou de sa ligne et le
+        verrou d'agent (la fenêtre exacte du scénario) ; T1 (`add`) ensuite ;
+        T2 est lâché dès que T1 attend un verrou. Rend les deux lots créés ou
+        attribués ; toute erreur d'une transaction (interblocage) est rendue
+        dans le bilan et fait échouer le témoin."""
+        done1, done2 = {}, {}
+        entered, release = threading.Event(), threading.Event()
+        real_pending = pg_work.WorkItems._pending
+
+        def run(call, done):
+            conn = db_mod.connect(self.cfg)
+            try:
+                done["item"] = call(conn)
+            except Exception as exc:  # noqa: BLE001 — le témoin doit voir l'interblocage
+                done["error"] = "%s: %s" % (type(exc).__name__, exc)
+            finally:
+                conn.close()
+
+        thread2 = threading.Thread(target=run, args=(assign_call, done2), daemon=True)
+        thread1 = threading.Thread(target=run, args=(add_call, done1), daemon=True)
+
+        def gated_pending(self_, assignee, item_id):
+            if threading.current_thread() is thread2:
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("T2 n'a pas été lâchée")
+            return real_pending(self_, assignee, item_id)
+
+        with mock.patch.object(pg_work.WorkItems, "_pending", gated_pending):
+            thread2.start()
+            self.assertTrue(entered.wait(10), "T2 n'a pas pris le verrou de sa ligne")
+            thread1.start()
+            self.assertTrue(self._wait_until_a_witness_waits(),
+                            "T1 n'a pas atteint son verrou")
+            release.set()
+            thread1.join(20)
+            thread2.join(20)
+        self.assertFalse(thread1.is_alive(), "T1 encore bloquée")
+        self.assertFalse(thread2.is_alive(), "T2 encore bloquée")
+        self.assertNotIn("error", done1, done1)
+        self.assertNotIn("error", done2, done2)
+        return done1["item"], done2["item"]
+
+    def test_add_suite_et_assign_du_parent_sans_interblocage(self):
+        parent = work.add(self.db, title="parent", actor="orch")
+
+        def add_suite(conn):
+            return work.add(conn, title="suite", app="ameesh", assignee="dev1",
+                            actor="orch", parent_lot=int(parent["id"]))
+
+        def assign_parent(conn):
+            return work.assign(conn, int(parent["id"]), "dev1", actor="orch")
+
+        suite, _ = self._scenario(add_suite, assign_parent)
+        # une seule attribution non démarrée : la suite part dans la file
+        self.assertEqual(work.get(self.db, int(parent["id"]))["assignee"], "dev1")
+        self.assertIsNone(work.get(self.db, int(suite["id"]))["assignee"])
+        self.assertEqual(suite["queued_behind"], int(parent["id"]))
+        # l'arête bloquante est écrite avec la création
+        self.assertEqual([(e["blocker_id"], e["blocking"]) for e in self.edges(suite["id"])],
+                         [(int(parent["id"]), True)])
+
+    def test_add_marque_et_assign_de_la_ligne_marquee_sans_interblocage(self):
+        marked = work.add(self.db, title="parent relu", actor="orch")
+
+        def add_marked(conn):
+            return work.add(conn, title="relecture", app="ameesh", assignee="dev1",
+                            actor="orch", mark_item_id=int(marked["id"]),
+                            mark_note="relecture #{lot} ouverte")
+
+        def assign_marked(conn):
+            return work.assign(conn, int(marked["id"]), "dev1", actor="orch")
+
+        review, _ = self._scenario(add_marked, assign_marked)
+        self.assertEqual(work.get(self.db, int(marked["id"]))["assignee"], "dev1")
+        self.assertIsNone(work.get(self.db, int(review["id"]))["assignee"])
+        self.assertEqual(review["queued_behind"], int(marked["id"]))
+        notes = [e["note"] for e in work.events(self.db, int(marked["id"]))]
+        self.assertTrue(any("relecture #%d ouverte" % int(review["id"]) in (n or "")
+                            for n in notes), notes)
 
 
 if __name__ == "__main__":

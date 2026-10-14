@@ -1039,7 +1039,11 @@ class WorkItems(Domain):
         `parent_lot` (#1193): the explicit parent of a suite lot, linked in the
         **same** transaction — a blocking edge if the parent is still open, a
         journal trace if it is already finished, everything rolled back if it
-        is unknown."""
+        is unknown.
+
+        L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
+        les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
+        identifiant croissant), le verrou d'agent ensuite."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
