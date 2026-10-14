@@ -227,3 +227,94 @@ class CiResults(interface.CiResults):
               FROM ci_queue_state
              ORDER BY repo
             """)
+
+    # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
+    def claim_guard_scan(self, repo, *, now, window_s) -> bool:
+        """Revendique la fenêtre du relevé de `repo`, atomiquement.
+
+        Vrai si aucun relevé n'a été revendiqué depuis `window_s` ; faux si un
+        autre le tient encore. L'horloge est écrite AVANT tout appel HTTP :
+        deux `notify --once` concurrents (ou deux hôtes) ne doublent pas le
+        coût, et un relevé tué en vol laisse la fenêtre expirer."""
+        rows = self.db.query(
+            """
+            INSERT INTO ci_guard_scan AS g (repo, started_at)
+            VALUES (%s, to_timestamp(%s))
+            ON CONFLICT (repo) DO UPDATE
+               SET started_at = excluded.started_at, finished_at = NULL,
+                   calls = 0, runs = 0, covered = 0, complete = NULL, reason = NULL
+             WHERE g.started_at <= excluded.started_at - make_interval(secs => %s)
+            RETURNING repo
+            """,
+            (repo, float(now), float(window_s)))
+        return bool(rows)
+
+    def finish_guard_scan(self, repo, *, now, calls, runs, covered, complete,
+                          reason=None) -> None:
+        """Clôt le relevé : coût réel, couverture, et raison d'un relevé
+        incomplet — un relevé incomplet n'a rien publié."""
+        self.db.execute(
+            """
+            UPDATE ci_guard_scan
+               SET finished_at = to_timestamp(%s), calls = %s, runs = %s,
+                   covered = %s, complete = %s, reason = %s
+             WHERE repo = %s
+            """,
+            (float(now), int(calls), int(runs), int(covered), bool(complete),
+             reason, repo))
+
+    def guard_runs(self, repo) -> dict:
+        """Le cache des relevés par exécution : `{(run_id, attempt): {...}}`."""
+        rows = self.db.query(
+            """
+            SELECT run_id, attempt, status, queued, oldest_id, oldest_at, runners
+              FROM ci_guard_run
+             WHERE repo = %s
+            """, (repo,))
+        out: dict = {}
+        for row in rows:
+            runners = row.get("runners")
+            if isinstance(runners, str):
+                try:
+                    runners = json.loads(runners or "{}")
+                except ValueError:
+                    runners = {}
+            out[(int(row["run_id"]), int(row["attempt"]))] = dict(
+                row, runners=dict(runners or {}))
+        return out
+
+    def observe_guard_run(self, repo, *, run_id, attempt, status, queued,
+                          oldest_id, oldest_at, runners) -> None:
+        """Écrit le relevé d'une exécution : seules les exécutions restées
+        `queued` (aucun job commencé) sont réutilisées sans nouvel appel."""
+        self.db.execute(
+            """
+            INSERT INTO ci_guard_run AS r
+                (repo, run_id, attempt, status, queued, oldest_id, oldest_at,
+                 runners, seen_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::timestamptz, %s::jsonb, now())
+            ON CONFLICT (repo, run_id, attempt) DO UPDATE SET
+                status    = excluded.status,
+                queued    = excluded.queued,
+                oldest_id = excluded.oldest_id,
+                oldest_at = excluded.oldest_at,
+                runners   = excluded.runners,
+                seen_at   = now()
+            """,
+            (repo, int(run_id), int(attempt), status or "", int(queued or 0),
+             int(oldest_id) if oldest_id is not None else None, oldest_at,
+             json.dumps(runners or {})))
+
+    def prune_guard_runs(self, repo, keep) -> None:
+        """Retire du cache les exécutions qui ne sont plus non conclues."""
+        keys = sorted({(int(r), int(a)) for r, a in keep})
+        if not keys:
+            self.db.execute("DELETE FROM ci_guard_run WHERE repo = %s", (repo,))
+            return
+        conds = " OR ".join(["(run_id = %s AND attempt = %s)"] * len(keys))
+        params: list = [repo]
+        for run_id, attempt in keys:
+            params += [run_id, attempt]
+        self.db.execute(
+            "DELETE FROM ci_guard_run WHERE repo = %%s AND NOT (%s)" % conds,
+            tuple(params))

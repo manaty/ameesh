@@ -47,3 +47,44 @@ create table if not exists ci_queue_state (
     queued     integer not null default 0,
     seen_at    timestamptz not null default now()
 );
+
+-- #845 (revue N/P2 2328) : la fenêtre du relevé et sa couverture, écrites
+-- dans la base AVANT le premier appel HTTP. `ci_guard_scan` est revendiquée
+-- par un UPSERT conditionnel : deux `ameesh notify --once` concurrents (ou
+-- deux hôtes) ne peuvent pas mener le même relevé et doubler le coût ; un
+-- relevé tué en vol laisse la fenêtre expirer (`ci.GUARD_SCAN_S`).
+-- `complete`/`reason` disent si le relevé a couvert toutes les exécutions non
+-- conclues : un relevé incomplet ne publie RIEN (les relevés précédents
+-- vieillissent, et `exploitation.CI_GUARD_FRESH_S` les clôt).
+create table if not exists ci_guard_scan (
+    repo        text not null primary key,
+    started_at  timestamptz not null,
+    finished_at timestamptz,
+    -- appels GitHub réellement consommés (budget `ci.GUARD_SCAN_MAX_CALLS`)
+    calls       integer not null default 0,
+    -- exécutions non conclues listées, et parmi elles celles couvertes
+    runs        integer not null default 0,
+    covered     integer not null default 0,
+    complete    boolean,
+    -- raison d'un relevé incomplet : budget, truncated, jobs_truncated,
+    -- too_many_runs, runner_truncated, failed ; NULL si complet
+    reason      text
+);
+
+-- #845 (revue N/P2 2328) : le relevé d'une exécution non conclue, réutilisé
+-- sans appel quand elle est restée `queued` (aucun job n'a commencé : sa
+-- liste de jobs ne bouge plus). Une exécution `in_progress` est toujours
+-- relue ; le cache ne sert jamais à publier un relevé partiel.
+create table if not exists ci_guard_run (
+    repo      text not null,
+    run_id    bigint not null,
+    attempt   integer not null default 1,
+    status    text not null default '',
+    queued    integer not null default 0,
+    oldest_id bigint,
+    oldest_at timestamptz,
+    -- runners tenant un job `in_progress` de cette exécution : {nom: job}
+    runners   jsonb not null default '{}'::jsonb,
+    seen_at   timestamptz not null default now(),
+    primary key (repo, run_id, attempt)
+);

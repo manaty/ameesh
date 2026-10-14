@@ -495,6 +495,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('ci_queue_state', ARRAY[
         'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
     ]),
+    -- #845 (0426, revue N/P2 2328) : la fenêtre du relevé de la garde, son
+    -- coût réel et sa couverture (même nature : horodatages, comptages,
+    -- codes) — l'état qui dit si la garde est aveugle, sans contenu
+    ('ci_guard_scan', ARRAY[
+        'repo', 'started_at', 'finished_at', 'calls', 'runs', 'covered',
+        'complete', 'reason'
+    ]),
+    -- #845 : le relevé par exécution non conclue (cache du relevé borné)
+    ('ci_guard_run', ARRAY[
+        'repo', 'run_id', 'attempt', 'status', 'queued', 'oldest_id',
+        'oldest_at', 'runners', 'seen_at'
+    ]),
     -- Session history (L52, 0032 §2): which sessions, when and where;
     -- no content (transcripts stay in harness storage).
     ('persona_sessions', ARRAY[

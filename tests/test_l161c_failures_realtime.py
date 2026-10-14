@@ -24,7 +24,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 
-from ameesh import ci, exploitation, mail, notify, registry, storage, work
+from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, storage, work
 
 from .support import PgTestCase
 
@@ -235,8 +235,11 @@ class FauxApi:
         #: #845 : runners du dépôt, jobs par exécution, liste d'exécutions
         #: tronquée, panne de l'API des runners
         self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
+        #: #845 : chemins appelés, pour compter les appels de la garde
+        self.paths: list[str] = []
 
     def __call__(self, path):
+        self.paths.append(path)
         if "/actions/runs/" in path and "/jobs" in path:
             run_id = int(path.split("/actions/runs/")[1].split("/")[0])
             jobs = self.jobs.get(run_id, [])
@@ -301,7 +304,8 @@ def run_view(run_id, sha, branch, *, base="main", message=""):
 class WatcherTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        for table in ("ci_test_failures", "ci_runs", "ci_runner_state", "ci_queue_state"):
+        for table in ("ci_test_failures", "ci_runs", "ci_runner_state", "ci_queue_state",
+                      "ci_guard_scan", "ci_guard_run"):
             self.db.execute("DELETE FROM %s" % table)
         registry.upsert(self.db, "dev-a", harness="claude", host=self.cfg.host)
         registry.upsert(self.db, "dev-b", harness="claude", host=self.cfg.host)
@@ -743,18 +747,174 @@ class WatcherTest(PgTestCase):
         self.api.truncated = True
         horloge.avance(ci.GUARD_SCAN_S)
         self.watcher.tick(self.db)
-        self.assertTrue(any("truncated" in line for line in logs), logs)
+        self.assertTrue(any("incomplete (truncated)" in line for line in logs), logs)
         self.assertEqual(len(storage.of(self.db).ci.stuck_runners()), 1)
+        self.assertEqual(self.scan_state(), (False, "truncated", 2))
         self.api.truncated = False
         self.api.live = [run_view(900 + i, "%040d" % i, "main")
                          for i in range(ci.GUARD_SCAN_MAX_RUNS + 1)]
         horloge.avance(ci.GUARD_SCAN_S)
         self.watcher.tick(self.db)
-        self.assertTrue(any("guard scan skipped" in line for line in logs), logs)
+        self.assertTrue(any("incomplete (too_many_runs)" in line for line in logs), logs)
+        self.assertEqual(self.scan_state()[1], "too_many_runs")
         # le relevé est périmé : l'alerte ne se lève plus sur un état ancien
         now = float(row["since_ts"]) + ci.GUARD_SCAN_S + exploitation.CI_GUARD_FRESH_S + 1
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=now)
                           if a["type"] == "ci_runner_stuck"], [])
+
+    def scan_state(self, repo=DEPOT):
+        """#845 : le dernier relevé de la garde — `(complete, reason, calls)`."""
+        (row,) = self.db.query(
+            "SELECT complete, reason, calls FROM ci_guard_scan WHERE repo = %s", (repo,))
+        return (row["complete"], row["reason"], int(row["calls"]))
+
+    @staticmethod
+    def est_appel_garde(path: str) -> bool:
+        """#845 : un appel de la garde (listes 100, jobs, runners).
+
+        La liste de suivi des échecs (`watch`, `per_page=50`) et les check
+        runs (`/commits/.../check-runs?per_page=100`) ne comptent pas dans le
+        budget de la garde."""
+        if "per_page=100" not in path:
+            return False
+        return ("/actions/runs?" in path or "/jobs" in path or "/actions/runners" in path)
+
+    def guard_calls(self) -> list[str]:
+        """#845 : les appels de la garde du faux API."""
+        return [p for p in self.api.paths if self.est_appel_garde(p)]
+
+    def test_garde_fenetre_persistee_avant_le_premier_appel(self):
+        """#845 (revue N/P2 2328) : la fenêtre est écrite dans la base AVANT le
+        premier appel HTTP de la garde, et elle est tenue entre deux relevés —
+        un second `notify --once` sur le même dépôt n'appelle pas la garde et
+        ne publie rien avant l'expiration."""
+        horloge = FauxHorloge()
+        logs = []
+        vu: list[bool] = []
+        reel = self.api
+
+        def api_qui_verifie(path):
+            if self.est_appel_garde(path) and not vu:
+                vu.append(bool(self.db.query(
+                    "SELECT 1 FROM ci_guard_scan WHERE repo = %s", (DEPOT,))))
+            return reel(path)
+
+        premier = ci.Watcher(self.cfg_ci, api=api_qui_verifie, clock=horloge,
+                             log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.jobs[901] = []
+        premier.tick(self.db)
+        self.assertEqual(vu, [True], "fenêtre absente avant le premier appel HTTP")
+        self.assertEqual(self.scan_state(), (True, None, 4))
+        second = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.paths.clear()
+        second.tick(self.db)
+        self.assertEqual(self.guard_calls(), [], "le second relevé a appelé la garde")
+        self.assertTrue(any("window held" in line for line in logs), logs)
+        # la fenêtre expirée, le relevé reprend
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.api.paths.clear()
+        second.tick(self.db)
+        self.assertEqual(len(self.guard_calls()), 4)
+        self.assertEqual(self.scan_state()[0], True)
+
+    def test_garde_budget_ne_publie_pas_un_releve_partiel(self):
+        """#845 (revue N/P2 2328) : un relevé qui ne peut pas couvrir toutes les
+        exécutions dans le budget s'arrête, ne publie RIEN (l'état précédent
+        n'est ni défait ni renouvelé) et date son incomplétude."""
+        horloge = FauxHorloge()
+        logs = []
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        self.api.live = [run_view(901, "9" * 40, "main")]
+        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 2000)})
+        self.api.jobs[901] = [job_view("psql 1/1", status="queued", job_id=9011,
+                                       created_at=iso(horloge.t - 2000))]
+        self.watcher.tick(self.db)
+        (avant,) = storage.of(self.db).ci.queued_oldest()
+        self.assertTrue([a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                         if a["type"] == "ci_queue_saturated"],
+                        "la file en attente doit alerter avant le relevé partiel")
+        # plus d'exécutions `in_progress` que le budget ne peut en couvrir,
+        # aucune ne porte de job en file : un relevé partiel publié effacerait
+        # l'alerte à tort.
+        couvrables = ci.GUARD_SCAN_MAX_CALLS - 3
+        self.api.live = [run_view(910 + i, "%040d" % i, "main") for i in range(couvrables + 2)]
+        for i in range(couvrables + 2):
+            self.api.live[i].update({"status": "in_progress", "created_at": iso(horloge.t)})
+            self.api.jobs[910 + i] = [job_view("psql 1/1", runner="ameesh-ci-1-1",
+                                               job_id=9100 + i)]
+        self.api.jobs.pop(901)
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.watcher.tick(self.db)
+        self.assertEqual(self.scan_state(), (False, "budget", ci.GUARD_SCAN_MAX_CALLS))
+        self.assertTrue(any("incomplete (budget)" in line for line in logs), logs)
+        (apres,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual(apres["seen_ts"], avant["seen_ts"], "un relevé partiel a publié")
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db, now=horloge.t)
+                     if a["type"] == "ci_queue_saturated"]
+        self.assertEqual(int(alerte["value"]), 1)
+        now = float(avant["seen_ts"]) + exploitation.CI_GUARD_FRESH_S + 1
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=now)
+                          if a["type"] == "ci_queue_saturated"], [])
+
+    def test_garde_cache_des_executions_queued(self):
+        """#845 (revue N/P2 2328) : une exécution restée `queued` n'a pas
+        commencé, sa liste de jobs ne bouge plus — le relevé suivant la réutilise
+        sans appel et reste complet."""
+        horloge = FauxHorloge()
+        self.watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge)
+        self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
+        run = run_view(902, "a1" * 20, "main")
+        run.update({"status": "queued", "created_at": iso(horloge.t - 1000)})
+        self.api.queued = [run]
+        self.api.jobs[902] = [job_view("psql 1/1", status="queued", job_id=9021,
+                                       created_at=iso(horloge.t - 1000))]
+        self.watcher.tick(self.db)
+        self.assertEqual(len(self.guard_calls()), 4)  # 2 listes + jobs + runners
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.api.paths.clear()
+        self.watcher.tick(self.db)
+        self.assertEqual(len(self.guard_calls()), 3, self.guard_calls())
+        self.assertEqual(self.scan_state()[0], True)
+        (row,) = storage.of(self.db).ci.queued_oldest()
+        self.assertEqual((int(row["queued"]), int(row["oldest_id"])), (1, 9021))
+        # l'exécution démarre : sa liste de jobs peut bouger, elle est relue
+        self.api.queued = []
+        self.api.live = [run_view(902, "a1" * 20, "main")]
+        self.api.live[0].update({"status": "in_progress", "created_at": iso(horloge.t - 1000)})
+        self.api.jobs[902] = [job_view("psql 1/1", runner="ameesh-ci-1-1", job_id=9021)]
+        horloge.avance(ci.GUARD_SCAN_S)
+        self.api.paths.clear()
+        self.watcher.tick(self.db)
+        self.assertEqual(len(self.guard_calls()), 4, self.guard_calls())
+
+    def test_garde_fenetre_atomique_entre_connexions(self):
+        """#845 (revue N/P2 2328) : la revendication de fenêtre est atomique —
+        quatre connexions qui la demandent ensemble n'en gagnent qu'une."""
+        import threading
+        now = time.time()
+        dbs = [self.db] + [db_mod.connect(self.cfg) for _ in range(3)]
+        for extra in dbs[1:]:
+            self.addCleanup(extra.close)
+        resultats: list[bool] = []
+        barriere = threading.Barrier(len(dbs))
+        verrou = threading.Lock()
+
+        def revendique(db):
+            st = storage.of(db)
+            barriere.wait(timeout=30)
+            gagne = bool(st.ci.claim_guard_scan(DEPOT, now=now, window_s=ci.GUARD_SCAN_S))
+            with verrou:
+                resultats.append(gagne)
+
+        threads = [threading.Thread(target=revendique, args=(db,)) for db in dbs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(sorted(resultats), [False, False, False, True])
 
     def test_garde_ne_casse_pas_le_releve(self):
         """#845 : une erreur de la garde (jeton sans droit runners, GitHub) est

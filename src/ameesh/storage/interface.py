@@ -2894,6 +2894,37 @@ class CiResults(Domain):
         """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
         queued, seen_ts}` (les dépôts sans job `queued` ont `oldest_ts` NULL)."""
 
+    # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
+    @abc.abstractmethod
+    def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:
+        """Revendique la fenêtre du relevé de `repo`, atomiquement, à
+        l'horloge `now` : vrai si aucun relevé ne l'a prise depuis `window_s`.
+        L'écriture précède tout appel HTTP, donc deux relevés concurrents ne
+        peuvent pas doubler le coût et un relevé tué en vol expire."""
+
+    @abc.abstractmethod
+    def finish_guard_scan(self, repo: str, *, now: float, calls: int, runs: int,
+                          covered: int, complete: bool, reason: str | None = None) -> None:
+        """Clôt le relevé : appels réellement consommés, exécutions listées et
+        couvertes, et raison d'un relevé incomplet (qui n'a rien publié)."""
+
+    @abc.abstractmethod
+    def guard_runs(self, repo: str) -> dict:
+        """Le cache des relevés par exécution, clé `(run_id, attempt)` :
+        `{run_id, attempt, status, queued, oldest_id, oldest_at, runners}`."""
+
+    @abc.abstractmethod
+    def observe_guard_run(self, repo: str, *, run_id: int, attempt: int, status: str,
+                          queued: int, oldest_id: int | None, oldest_at: str | None,
+                          runners: dict) -> None:
+        """Écrit le relevé d'une exécution : jobs `queued` (compte et plus
+        vieux) et runners tenant un job `in_progress` (`{nom: job}`)."""
+
+    @abc.abstractmethod
+    def prune_guard_runs(self, repo: str, keep) -> None:
+        """Retire du cache les exécutions absentes de `keep`
+        (`(run_id, attempt)`), qui ne sont plus non conclues."""
+
 
 class Handoffs(Domain):
     """L232a: destination reservations and durable lot-boundary handoffs."""
