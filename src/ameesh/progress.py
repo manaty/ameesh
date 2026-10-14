@@ -508,6 +508,12 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     for bucket in spend.values():
         for key in bucket:
             bucket[key] = round(bucket[key], 6)
+    # #1075/#1028 : le plan d'un harnais à comptes déclarés suit le rythme de
+    # son compte actif (`pace_multiplier` du profil), pas le rythme nominal ;
+    # l'affichage écarte ces harnais (déjà montrés compte par compte), le JSON
+    # garde la même valeur que `accounts.report`.
+    rythmes = {row["harness"]: float(row.get("pace_multiplier") or 1.0)
+               for row in (accounts or []) if row.get("active")}
     return {
         "currency": "USD",
         "paid_harnesses": list(paid),
@@ -517,9 +523,10 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "by_agent": [r for r in by_agent if r["usd"] or r["turns"] or r["failed_turns"]],
         "plans": [{
             "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-            "pace_cap": round(g.pace_cap(now), 4), "elapsed": round(g.elapsed(now), 4),
+            "pace_cap": round(g.pace_cap(now, rythmes.get(g.harness, 1.0)), 4),
+            "elapsed": round(g.elapsed(now), 4),
             "resets_ts": _round(g.resets_at), "window_s": g.window_s,
-            "exceeded": g.exceeded(now),
+            "exceeded": g.exceeded(now, multiplier=rythmes.get(g.harness, 1.0)),
         } for g in gauges],
         "accounts": [_account_view(row) for row in (accounts or [])],
     }

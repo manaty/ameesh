@@ -187,6 +187,23 @@ class BudgetTest(unittest.TestCase):
         self.assertFalse(plan["exceeded"])        # 80 % utilisé pour un plafond de 90 %
         self.assertAlmostEqual(plan["pace_cap"], 0.9)
 
+    def test_le_plan_d_un_compte_declare_suit_son_multiplicateur(self):
+        # #1028 P3 : le plan d'un harnais à comptes déclarés porte le rythme du
+        # compte ACTIF (`pace_multiplier` du profil, #1075) — 2 × 10 % + 10 =
+        # 30 % ici, contre 20 % au rythme nominal. L'affichage écarte ces plans
+        # (montrés compte par compte) mais le JSON doit rester cohérent.
+        gauge = cost.Gauge("codex", "codex-300min", 0.25, NOW + 4.5 * 3600, 5 * 3600)
+        compte = {"harness": "codex", "account": "primaire", "active": True,
+                  "pace_multiplier": 2.0, "gauges": []}
+        b = progress.build_budget([], [gauge], NOW, accounts=[compte])
+        plan = b["plans"][0]
+        self.assertAlmostEqual(plan["pace_cap"], 0.30)
+        self.assertFalse(plan["exceeded"])       # nominal : 0,25 ≥ 0,20
+        # sans compte actif déclaré : rythme nominal
+        b = progress.build_budget([], [gauge], NOW)
+        self.assertAlmostEqual(b["plans"][0]["pace_cap"], 0.20)
+        self.assertTrue(b["plans"][0]["exceeded"])
+
 
 def _snap(**over):
     snap = {
