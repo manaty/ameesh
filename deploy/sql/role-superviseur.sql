@@ -201,7 +201,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
         'projects',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
-        'workstream'
+        'workstream',
+        -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
+        -- pas de contenu) — comme `projects`, le garde QA les lit
+        'roles'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
