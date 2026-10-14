@@ -1,0 +1,13 @@
+MAIN 2458ec053123d3f33644fef1e092fc84cc2773d9
+LOT #1277 branche lot/1277-rebase-sujet-lot
+HEAD a7d7a9780e6eb74c0448195e684ae35e65c84ea0
+BASE acd8a0f09637824bbe3c974d28540aff7d897a9d
+merge-tree rc=0
+0593f63485e64203b556031946eaf811513d9247
+
+  CONTRIBUTING.md                                            head=7c9557c3dc union=7c9557c3dc main==base:oui patchid_const=YES
+  scripts/rebase-lot.sh                                      head=0822243796 union=0822243796 main==base:NON patchid_const=YES
+  tests/test_1277_rebase_sujet.py                            head=8c98e77944 union=8c98e77944 main==base:NON patchid_const=YES
+fichiers=3 migrations=0
+
+mesure 2026-10-14T21:04:12Z ; methode patch-id: git diff -U0 <base> <head> -- <f> vs git diff -U0 2458ec053123 <union> -- <f>

@@ -1,0 +1,93 @@
+{
+  "lot": 1277,
+  "head": "a7d7a9780e6eb74c0448195e684ae35e65c84ea0",
+  "pr": 991,
+  "branche": "lot/1277-rebase-sujet-lot",
+  "classe": "légère (CONTRIBUTING.md, scripts/rebase-lot.sh, tests/ : hors chemins sensibles §8)",
+  "main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "measured_at": "2026-10-14T21:04:12Z",
+  "union_tree": "0593f63485e64203b556031946eaf811513d9247",
+  "union_ref": "refs/atelier/1277/union-main-2458ec05",
+  "pieces_ref": "refs/atelier/1277/pieces-main-2458ec05",
+  "fichiers": [
+    {
+      "path": "CONTRIBUTING.md",
+      "head": "7c9557c3dcb9a0b09928705fcd324ff26eb0ecef",
+      "union": "7c9557c3dcb9a0b09928705fcd324ff26eb0ecef",
+      "main_eq_base": true,
+      "patchid": "302349b633a8fa6658833a2a833cc1e260fa0ff7",
+      "patchid_union": "302349b633a8fa6658833a2a833cc1e260fa0ff7",
+      "constant": true
+    },
+    {
+      "path": "scripts/rebase-lot.sh",
+      "head": "0822243796ed5bd227a4eb8103816e45855e5837",
+      "union": "0822243796ed5bd227a4eb8103816e45855e5837",
+      "main_eq_base": false,
+      "patchid": "0ee48e5dfa2339f4f69bfc4ec7f668e2e787ddb9",
+      "patchid_union": "0ee48e5dfa2339f4f69bfc4ec7f668e2e787ddb9",
+      "constant": true
+    },
+    {
+      "path": "tests/test_1277_rebase_sujet.py",
+      "head": "8c98e7794456306f012561fcd06aef74865be96a",
+      "union": "8c98e7794456306f012561fcd06aef74865be96a",
+      "main_eq_base": false,
+      "patchid": "ec902c5e3dd0a42618dcad77a9ab0c8666063ad0",
+      "patchid_union": "ec902c5e3dd0a42618dcad77a9ab0c8666063ad0",
+      "constant": true
+    }
+  ],
+  "sources": [
+    {
+      "kind": "lot-event",
+      "ref": "work:1277#event:16700",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T13:39:20.039883+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 mesh-design : relecture aprèsfusion confiéeàameesh-cx1/Codex, indépendant auteurdev3/DeepSeek, seloncanon2 (classeléger). ObjetPR991/a7d7a978, CONTRIBUTING+scripts/rebase-lot.sh+témoin ; confirmerfusion/diffsourceau geste. AuteurfusionneaprèsCIexacteverte+fraîcheur ; lecteuravisparentdanslajournée,sanssuiterejouée ; siBpostfusion, correctifprioritaire. AucunvertCIinventé."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41394",
+      "actor": "ameesh-dev3",
+      "famille": "DeepSeek (auteur)",
+      "at": "2026-10-14T20:53:44+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Candidature pieces §12 pour les 5 lots qa, mesures sur main 2458ec05."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41489",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T20:57:59+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Disposition : #1219/#1277 candidatures légères reçues pour la préparation APRÈS les gels #1342/#1204, aucun ajout à ces paquets ; unions et CI#1277 conservées à portée, fraîcheur/composition à requalifier au prochain manifeste ; #1247 et #1323 gardent R2 Claude / dépendance #1155 ; réserve Claude #1176 à qualifier au manifeste ; pièces atelier et sources à fournir au préparateur ultérieur, sans nouvelle CI ni changement de tête."
+    },
+    {
+      "kind": "forge",
+      "ref": "pr:1277",
+      "actor": null,
+      "famille": null,
+      "at": null,
+      "sha": "a7d7a9780e6eb74c0448195e684ae35e65c84ea0",
+      "verdict": "qa",
+      "texte": "PR #991 OPEN mergeStateStatus=CLEAN tête=a7d7a9780e6e (lecture gh unique au 2026-10-14T21:04:12Z)"
+    },
+    {
+      "kind": "ci",
+      "ref": "ci:38571446832",
+      "actor": null,
+      "famille": null,
+      "at": "2026-10-14T19:32:30Z",
+      "sha": "a7d7a9780e6e",
+      "verdict": "success",
+      "texte": "run 38571446832 pull_request completed/success tête a7d7a9780e6e (lecture gh unique)"
+    }
+  ]
+}
