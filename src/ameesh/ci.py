@@ -31,10 +31,13 @@ chaque passage un relevé (`Watcher.tick`) :
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
    reste, car l'agent a pu agir ; les exécutions non démarrées (`queued`,
-   `pending`) de la tête supplantée qui retiennent le groupe de concurrence
-   sont annulées — jamais sur `main`, sur `release/…` ni sur la tête courante
-   (#1161) ; une exécution de PR restée `pending` plus de cinq minutes est
-   signalée à l'assigné ;
+   `pending`) du **même groupe de concurrence** — même PR, même dépôt source,
+   même workflow — dont l'essai est prouvé antérieur à celui de la tête
+   courante sont annulées : jamais sur `main`, sur `release/…`, sur la tête
+   courante, ni sur un essai plus récent (un rerun garde son `id` et augmente
+   `run_attempt` ; sans date d'essai, rien n'est annulé) (#1161) ; une
+   exécution de PR restée `pending` plus de cinq minutes est signalée à
+   l'assigné ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
    chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
 4. une exécution qui n'est plus en cours est conclue : verdict.
@@ -145,11 +148,16 @@ def updated_ts(run: dict) -> float | None:
     return _iso_ts(run.get("updated_at") or run.get("created_at") or "")
 
 
-def created_ts(run: dict) -> float | None:
-    """L'horodatage de création d'une exécution (ISO 8601), ou `None` : l'âge
-    d'une exécution qui attend, pour le signalement des `pending` (#1161)."""
-    return _iso_ts(run.get("created_at") or run.get("run_started_at")
-                   or run.get("updated_at") or "")
+def attempt_ts(run: dict) -> float | None:
+    """L'horodatage du dernier essai d'une exécution (ISO 8601), ou `None` :
+    l'âge d'une exécution qui attend, et la seule preuve d'antériorité entre
+    deux exécutions (#1161). `run_started_at` date l'essai courant — un rerun
+    garde son `run_id`, augmente `run_attempt` et repart à cette date ;
+    `created_at` ne date que le premier essai, donc pour un rerun sans
+    `run_started_at` la date est incertaine et rend `None`."""
+    if int(run.get("run_attempt") or 1) > 1:
+        return _iso_ts(run.get("run_started_at") or "")
+    return _iso_ts(run.get("run_started_at") or run.get("created_at") or "")
 
 
 def protected_branch(branch: str) -> bool:
@@ -165,6 +173,51 @@ def pull_request_run(run: dict) -> bool:
     ou sur une étiquette n'est jamais une PR."""
     return bool(run.get("pull_requests")) \
         or (run.get("event") or "").startswith("pull_request")
+
+
+def pr_identity(run: dict) -> tuple[str, tuple[int, ...]] | None:
+    """(dépôt source, numéro(s) de PR) d'une exécution de PR, ou `None` sans
+    preuve. Le groupe de concurrence des workflows d'ameesh est
+    `format('pr-{0}', pull_request.number)` : deux PR de même nom de branche,
+    dans deux dépôts source distincts, ne se supplantent pas (#1161)."""
+    prs = [pr for pr in (run.get("pull_requests") or ()) if isinstance(pr, dict)]
+    numbers = tuple(sorted({int(pr["number"]) for pr in prs
+                            if pr.get("number") is not None}))
+    if not numbers:
+        return None
+    source = str((run.get("head_repository") or {}).get("full_name") or "").strip()
+    if not source:
+        for pr in prs:
+            source = str(((pr.get("head") or {}).get("repo") or {}).get("full_name")
+                         or "").strip()
+            if source:
+                break
+    if not source:
+        return None
+    return (source, numbers)
+
+
+def run_group(run: dict) -> tuple | None:
+    """La clé du groupe de concurrence d'une exécution : (dépôt source,
+    numéro(s) de PR, fichier de workflow). GitHub évalue `concurrency.group`
+    dans le fichier de workflow : deux exécutions ne partagent un groupe que si
+    la PR, son dépôt source et le workflow sont les mêmes. `None` sans cette
+    preuve — le relevé n'annule alors rien (#1161)."""
+    identity = pr_identity(run)
+    if identity is None:
+        return None
+    path = str(run.get("path") or "").strip()
+    return identity + (path or workflow_of(run.get("path")),)
+
+
+def proven_older(candidate: dict, successor: dict) -> bool:
+    """Le candidat est-il **prouvé** antérieur au successeur (#1161) ? L'ordre
+    des `id` ne le prouve pas : un rerun garde son `id` et augmente
+    `run_attempt`, si bien qu'une exécution d'`id` plus petit peut être le
+    dernier essai lancé. Seules deux dates d'essai strictement ordonnées le
+    prouvent ; une date incertaine conserve l'exécution."""
+    before, after = attempt_ts(candidate), attempt_ts(successor)
+    return before is not None and after is not None and before < after
 
 
 def events_of(check_runs, run_id: int) -> list[dict]:
@@ -488,10 +541,11 @@ class Watcher:
 
     def cancel_run(self, repo: str, run_id: int) -> bool:
         """Annule une exécution GitHub **non démarrée** (`queued`/`pending`)
-        d'une tête supplantée : elle retient le groupe de concurrence de la
-        tête courante (#1161). Idempotent : une exécution déjà conclue n'est
-        pas annulée ; une erreur de l'API est journalisée et rend False, sans
-        toucher à la base ni rendre de verdict."""
+        dont l'essai est prouvé antérieur à celui de la tête courante du même
+        groupe de concurrence : elle retient la tête courante (#1161).
+        Idempotent : une exécution déjà conclue n'est pas annulée ; une erreur
+        de l'API est journalisée et rend False, sans toucher à la base ni
+        rendre de verdict."""
         try:
             run = self.api("repos/%s/actions/runs/%s" % (repo, run_id)) or {}
             if (run.get("status") or "") not in CANCELLABLE_STATUSES:
@@ -635,51 +689,55 @@ class Watcher:
 
     def _unblock(self, db, repo: str, live: dict[int, dict], lots: list[dict]) -> list[dict]:
         """Les exécutions de PR qui attendent leur groupe de concurrence
-        (#1161). Le groupe est retenu par les exécutions non démarrées d'une
-        tête supplantée : le relevé les annule — jamais `main`, `release/…`,
-        jamais la tête courante, jamais une exécution plus récente que le
-        successeur (un rerun d'une tête ancienne n'est pas une exécution
-        supplantée). La tête courante restée `pending` au-delà de
-        PENDING_ALERT est signalée à l'assigné du lot."""
-        by_branch: dict[str, list[dict]] = {}
+        (#1161). Un groupe — même PR, même dépôt source, même workflow — est
+        retenu par les exécutions non démarrées d'un essai antérieur : le
+        relevé les annule, jamais `main`, `release/…`, jamais la tête courante,
+        jamais un essai dont l'antériorité n'est pas prouvée (un rerun reste,
+        #901). La tête courante restée `pending` au-delà de PENDING_ALERT est
+        signalée à l'assigné du lot."""
+        groups: dict[tuple, list[dict]] = {}
         for run in live.values():
             branch = run.get("head_branch") or ""
             if not branch or protected_branch(branch) or not pull_request_run(run):
                 continue
-            if (run.get("status") or "") in CANCELLABLE_STATUSES:
-                by_branch.setdefault(branch, []).append(run)
+            key = run_group(run)
+            if key is None:
+                continue  # PR, dépôt source ou workflow non prouvés : jamais annulé
+            groups.setdefault(key, []).append(run)
         now = float(self.clock())
         out: list[dict] = []
-        for branch in sorted(by_branch):
-            runs = by_branch[branch]
+        heads: dict[str, str | None] = {}
+        for key in sorted(groups):
+            runs = groups[key]
+            branch = runs[0].get("head_branch") or ""
             if len({r.get("head_sha") or "" for r in runs}) < 2 \
                     and not any((r.get("status") or "") == "pending" for r in runs):
                 continue  # une seule tête visible : rien à libérer ni à signaler
-            head = self.branch_head(repo, branch)
+            if branch not in heads:
+                heads[branch] = self.branch_head(repo, branch)
+            head = heads[branch]
             if not head:
-                continue
-            successors = sorted((r for r in live.values()
-                                 if (r.get("head_branch") or "") == branch
-                                 and (r.get("head_sha") or "") == head),
-                                key=lambda r: int(r["id"]))
+                continue  # tête courante non prouvée : ni annulation, ni signal
+            successors = [r for r in runs if (r.get("head_sha") or "") == head]
             if not successors:
-                continue  # aucune exécution de la tête courante : rien à libérer
-            successor = successors[-1]
+                continue  # aucun essai de la tête courante dans ce groupe
+            successor = max(successors,
+                            key=lambda r: (attempt_ts(r) or 0.0, int(r["id"])))
             cancelled: list[int] = []
-            for run in sorted(live.values(), key=lambda r: int(r["id"])):
-                if (run.get("head_branch") or "") != branch:
-                    continue
-                run_id = int(run["id"])
-                if (run.get("head_sha") or "") == head or run_id > int(successor["id"]):
+            for run in sorted(runs, key=lambda r: int(r["id"])):
+                if (run.get("head_sha") or "") == head:
                     continue
                 if (run.get("status") or "") not in CANCELLABLE_STATUSES:
                     continue
+                if not proven_older(run, successor):
+                    continue  # antériorité non prouvée : l'exécution est conservée
+                run_id = int(run["id"])
                 if self.cancel_run(repo, run_id):
                     cancelled.append(run_id)
                     out.append({"action": "cancelled", "repo": repo, "run_id": run_id,
                                 "head_sha": run.get("head_sha"), "branch": branch,
                                 "for": int(successor["id"]), "by": head})
-            for run in sorted(by_branch[branch], key=lambda r: int(r["id"])):
+            for run in sorted(runs, key=lambda r: int(r["id"])):
                 if (run.get("status") or "") != "pending" \
                         or (run.get("head_sha") or "") != head:
                     continue  # une tête supplantée qui attend : annulée ci-dessus
@@ -696,11 +754,11 @@ class Watcher:
         key = (repo, int(run["id"]))
         if key in self._pending_alerted:
             return []
-        created = created_ts(run)
-        if created is None or now - created < PENDING_ALERT:
+        started = attempt_ts(run)
+        if started is None or now - started < PENDING_ALERT:
             return []
         self._pending_alerted.add(key)
-        waited = now - created
+        waited = now - started
         item_id = lot_of_run(run, lots)
         lot = work.get(db, int(item_id)) if item_id else None
         to = recipient_of(lot)
