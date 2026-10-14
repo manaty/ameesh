@@ -50,6 +50,8 @@ def wait_label(wait):
         return None
     if wait["what"] == "scheduled":
         return "planned start %s" % wait["start"]
+    if wait["what"] == "hold":
+        return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
     return "waiting on lots %s" % ", ".join("#%d" % i for i in wait["lots"])
 
 
