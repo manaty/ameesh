@@ -351,7 +351,7 @@ app_isolation_paths() { # les chemins logiques de l'application à sonder
   local p
   while IFS= read -r p; do
     printf '%s\n' "$root${p#"$mapped"}"
-  done < <(find "$mapped" -xdev -maxdepth 5 \
+  done < <(find "$mapped" -maxdepth 5 \
              \( -name .runner -o -name .credentials \
                 -o -name .credentials_rsaparams -o -name _work \) \
              -print 2>/dev/null)
