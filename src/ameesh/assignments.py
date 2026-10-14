@@ -18,7 +18,7 @@ sous-utilisation se trompaient et la frise restait vide.
   courrier d'un relecteur sur le lot de l'auteur ne doit pas le lui voler),
   ni celui de l'expéditeur lui-même (#1066, incident #1046 : un courrier
   d'information a emporté le lot qu'il citait). La remise est un geste
-  explicite : `ameesh work assign`.
+  explicite : `--assign` pour son propre lot, `ameesh work assign` sinon.
 * `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
@@ -195,16 +195,18 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             else:
                 current = (item.get("assignee") or "").strip()
                 if current != recipient:
-                    if current and not current.startswith(work_mod.HUMAN_PREFIX):
+                    if current and not current.startswith(work_mod.HUMAN_PREFIX) \
+                            and not (assign and current == sender):
                         # #1066 (incident #1046) : un lot déjà tenu par un
                         # agent ne se remet pas par la seule étiquette
                         # `--lot`, même quand c'est l'expéditeur qui le tient.
-                        # La remise est un geste explicite (`ameesh work
-                        # assign`), jamais un effet de bord d'un courrier.
+                        # La remise est un geste explicite : `ameesh work
+                        # assign`, ou `--assign` (#964) quand c'est son propre
+                        # lot — le refus ne vise que l'effet de bord.
                         if current == sender:
                             out["warnings"].append(
                                 "lot #%d is yours: linked without reassignment to %s "
-                                "(to hand it over: ameesh work assign %d %s)"
+                                "(to hand it over: --assign, or ameesh work assign %d %s)"
                                 % (int(item["id"]), recipient, int(item["id"]),
                                    recipient))
                         else:
