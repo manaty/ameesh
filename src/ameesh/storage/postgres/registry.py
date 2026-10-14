@@ -315,7 +315,12 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
                      WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
-                   __CLAIM_OK__ AS canon_claim_ok
+                   __CLAIM_OK__ AS canon_claim_ok,
+                   -- #1250 : le harnais de la session VIVANTE (0384), absent de
+                   -- la vue dont les colonnes sont figées à sa création ;
+                   -- sous-requête pour ne pas qualifier toutes les colonnes.
+                   (SELECT r.session_harness FROM agent_registry r
+                     WHERE r.name = o.name) AS session_harness
             FROM agent_mesh_overview o
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
