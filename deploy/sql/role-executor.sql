@@ -40,6 +40,15 @@ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I T
 SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I',
               :'schema', :'role') \gexec
 SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', :'schema', :'role') \gexec
+-- L244 (#420): ameesh_module_agent is SECURITY DEFINER (it takes the shared
+-- lock on the registry for the isolated module roles). The executor group is
+-- granted EXECUTE by the blanket line above but must never hold it: the audit
+-- below flags any executable SECURITY DEFINER function, and rightly so.
+SELECT format('REVOKE EXECUTE ON FUNCTION %I.ameesh_module_agent(text) FROM %I',
+              :'schema', :'role')
+ WHERE EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = :'schema' AND p.proname = 'ameesh_module_agent'
+                 AND p.prosecdef) \gexec
 -- Module policy writes belong exclusively to isolated canon synchronization.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
               :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
