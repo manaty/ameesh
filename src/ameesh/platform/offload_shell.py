@@ -792,6 +792,11 @@ class Executor:
     def grant(self, path: str) -> None:
         """A path the shell just made: let the job write it and its tree."""
 
+    def granted(self, path: str) -> bool:
+        """True when a tree the shell built already carries what the job
+        needs from it: then it is never granted again."""
+        return True
+
     def grant_traverse(self, path: str) -> None:
         """A path of the shell's own state that the job must only enter (its
         job folder): group read and traverse, never group write, so nothing
@@ -943,41 +948,55 @@ class JobUserExecutor(Executor):
     def grant(self, path: str) -> None:
         """The shell owns what it has just made (checkout, job folder, cache
         entry): add the group's write bit and the setgid bit, so the job can
-        build there and its own files keep the shared group. The group is set
-        explicitly where the shell is a member of it (install.sh): setgid
-        inheritance alone breaks on a folder the shell did not create under a
-        setgid parent (B1 of the #354 R1 review)."""
-        gid = self._gid()
+        build there and its own files keep the shared group. By descriptor
+        (`_grant_tree`), so a same-UID job cannot race the walk with a planted
+        link (B3 of the #354 R2 review). The group is set explicitly where the
+        shell is a member of it (install.sh): setgid inheritance alone breaks
+        on a folder the shell did not create under a setgid parent (B1 of the
+        #354 R1 review)."""
         try:
-            _grant_one(path, gid)
+            _grant_tree(path, self._gid())
         except OSError:
             return
-        if not os.path.isdir(path):
-            return
-        for base, dirs, files in os.walk(path):
-            for name in dirs + files:
-                try:
-                    _grant_one(os.path.join(base, name), gid)
-                except OSError:
-                    pass
+
+    def granted(self, path: str) -> bool:
+        """A ready cache is usable when the shared group already owns it and
+        can write it: the shell granted it when it built it. A tree the job
+        may have written (group write) is never granted again -- a same-UID
+        job could have planted a link inside it (B3 of the #354 R2 review) --
+        so a cache that does not qualify is rebuilt instead."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode) or not stat.S_IMODE(st.st_mode) & 0o020:
+            return False
+        gid = self._gid()
+        return gid is None or st.st_gid == gid
 
     def grant_traverse(self, path: str) -> None:
         """The job's own folder: it enters it (`work`, `tmp` are granted
         below) but cannot create, rename or remove anything *in* it, so
-        `meta.json` and `cancel` stay out of its reach."""
+        `meta.json` and `cancel` stay out of its reach. Opened `O_NOFOLLOW`
+        and changed on the descriptor (B3 of the #354 R2 review)."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
-            st = os.lstat(path)
+            fd = os.open(path, flags)
         except OSError:
             return
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
-            return
-        gid = self._gid()
         try:
-            os.chmod(path, stat.S_IMODE(st.st_mode) | 0o050 | stat.S_ISGID)
-            if gid is not None:
-                os.chown(path, -1, gid)
+            st = os.fstat(fd)
+            gid = self._gid()
+            if gid is not None and st.st_gid != gid:
+                try:
+                    os.fchown(fd, -1, gid)
+                except OSError:
+                    pass
+            os.fchmod(fd, stat.S_IMODE(st.st_mode) | 0o050 | stat.S_ISGID)
         except OSError:
             return
+        finally:
+            os.close(fd)
 
     def clean(self, path: str) -> None:
         """The job may have left files the shell cannot enter (0700): the
@@ -997,23 +1016,68 @@ def _uid_of(user: str) -> int:
         raise Refused("no such job user %r (run deploy/guest/install.sh)" % user) from None
 
 
-def _grant_one(path: str, gid: int | None = None) -> None:
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode):
-        return                                    # never chmod a link's target
+def _grant_fd(fd: int, gid: int | None = None) -> None:
+    """Grant one already-open inode: `fchmod`/`fchown` on the descriptor, so
+    no path is ever re-resolved (B3 of the #354 R2 review)."""
+    st = os.fstat(fd)
+    if not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+        return
     mode = stat.S_IMODE(st.st_mode) | 0o060      # the shared group reads/writes
     if stat.S_ISDIR(st.st_mode):
         mode |= 0o2010                            # traverse, and setgid below
     elif mode & 0o100:
         mode |= 0o010                             # runnable, so group-runnable
-    os.chmod(path, mode)
     if gid is not None and st.st_gid != gid:
         try:
             # the shell is a member of the shared group (install.sh); a
-            # non-member falls back to the setgid inheritance
-            os.chown(path, -1, gid, follow_symlinks=False)
-        except (NotImplementedError, OSError):
+            # non-member falls back to the setgid inheritance. Before the
+            # chmod: a chown can drop the setgid bit of a directory.
+            os.fchown(fd, -1, gid)
+        except OSError:
             pass
+    os.fchmod(fd, mode)
+
+
+def _grant_tree(path: str, gid: int | None = None) -> None:
+    """`_grant_fd` over a tree, by descriptor: every directory is opened
+    `O_NOFOLLOW|O_DIRECTORY` before it is read, every entry `O_NOFOLLOW`
+    before it is granted, and a link is never followed nor granted. A same-UID
+    job racing the walk with a planted link therefore cannot make the shell
+    chmod its target (B3 of the #354 R2 review)."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        root_fd = os.open(path, flags | os.O_DIRECTORY)
+    except OSError:
+        return
+    stack = [root_fd]
+    while stack:
+        fd = stack.pop()
+        try:
+            _grant_fd(fd, gid)
+            try:
+                names = os.listdir(fd)
+            except OSError:
+                names = ()
+            for name in names:
+                if name in (".", ".."):
+                    continue
+                try:
+                    child = os.open(name, flags | os.O_DIRECTORY, dir_fd=fd)
+                except OSError:
+                    child = -1
+                if child >= 0:
+                    stack.append(child)
+                    continue
+                try:
+                    child = os.open(name, flags, dir_fd=fd)
+                except OSError:
+                    continue      # a link, a socket, an entry we may not open
+                try:
+                    _grant_fd(child, gid)
+                finally:
+                    os.close(child)
+        finally:
+            os.close(fd)
 
 
 def make_executor(cfg: dict, job_id: str) -> Executor:
@@ -1204,11 +1268,13 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
         ready = os.path.join(final, ".ready")
         if os.path.exists(ready):
             os.utime(final)
+            if job.executor.granted(final):
+                return final
             # a cache built before the shared group (or by an interrupted
-            # install) may still carry the shell's primary group: the job
-            # must be able to write it (B1 of the #354 R1 review)
-            job.executor.grant(final)
-            return final
+            # install) does not carry what the job needs: it is NOT re-granted
+            # by path, a same-UID job could have planted a link or a hard link
+            # inside it (B3 of the #354 R2 review). Rebuilt below, under the
+            # shared group; the next runs reuse it.
         emit("setup", {"profile": profile_name, "cache": key})
         # built in place (a venv records its own path); `.ready` marks a
         # complete cache, so a setup killed halfway is redone
@@ -1376,7 +1442,12 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         env["OFFLOAD_CACHE"] = prepare_cache(job, req["profile"], profile, work, env)
         for key, value in profile["env"].items():
             env[key] = _expand(str(value), env)
-        env.update(req["env"])
+        # B1 of the #354 R2 review: the client's `--env` goes to the command
+        # only. The hooks run in the job's scope with the user manager, and an
+        # `LD_AUDIT` from the client would load its library there before any
+        # filter (the launcher also strips the loader variables from them).
+        cmd_env = dict(env)
+        cmd_env.update(req["env"])
         cwd = os.path.join(work, req["cwd"]) if req["cwd"] else work
         if not os.path.isdir(cwd):
             raise Refused("run: --cwd %s does not exist in the snapshot" % req["cwd"])
@@ -1389,11 +1460,11 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             for line in out.splitlines():
                 if ENV_RE.match(line):
                     key, value = line.split("=", 1)
-                    env[key] = value
+                    cmd_env[key] = value
         meta.update(state="running", started_ts=int(time.time()), limit_s=job.limit)
         _write_meta(meta_path, meta)
         emit("start", {"job": job_id, "profile": req["profile"], "limit_s": job.limit})
-        rc, _ = job.run("command", req["argv"], cwd, env)
+        rc, _ = job.run("command", req["argv"], cwd, cmd_env)
         result["exit"] = rc
         if job.stop:
             raise Stopped()
@@ -1410,6 +1481,11 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         return 70
     finally:
         try:
+            # B4 of the #354 R2 review: what the command left behind shares
+            # the job's UID and is still alive; the `after` hook runs without
+            # the payload's filter and with the manager's address. Kill the
+            # scope before it, so nothing of the payload survives into it.
+            job.executor.kill()
             if profile is not None and profile["after"]:
                 # teardown (the job's containers), even after a stop
                 _hook(job, "after", profile["after"], work, env, supervised=False)

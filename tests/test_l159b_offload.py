@@ -280,6 +280,25 @@ class RunTest(OffloadBase):
         ok = self.offload("run", "--env", "FOO=bar baz", "--", "sh", "-c", 'echo "$FOO"')
         self.assertEqual(ok.stdout, "bar baz\n")
 
+    def test_the_client_env_never_reaches_the_profile_hooks(self):
+        # B1 of the #354 R2 review: the hooks are root-owned install-side code
+        # and run in the job's scope with the user manager; the client's
+        # --env there (LD_AUDIT…) would load its library before any filter.
+        # The command, the client's own code, keeps it.
+        before = os.path.join(self.tmp, "before.env")
+        after = os.path.join(self.tmp, "after.env")
+        self.write_profile("hooked", {
+            "before": 'printf "%%s" "${LD_AUDIT-unset}" > %s' % before,
+            "after": 'printf "%%s" "${LD_AUDIT-unset}" > %s' % after})
+        res = self.offload("run", "--profile", "hooked",
+                           "--env", "LD_AUDIT=./client.so", "--",
+                           "sh", "-c", 'printf "%s" "${LD_AUDIT-unset}"')
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "./client.so")
+        for path in (before, after):
+            with open(path) as fh:
+                self.assertEqual(fh.read(), "unset")
+
     def test_timeout_is_not_rerun_locally(self):
         marker = os.path.join(self.tmp, "local-run")
         res = self.offload("run", "--timeout", "1", "--", "sh", "-c",
@@ -1193,6 +1212,103 @@ class JobUserExecutorTest(unittest.TestCase):
         os.symlink(outside, os.path.join(tree, "link"))
         ex.grant(tree)
         self.assertEqual(os.stat(outside).st_mode & 0o777, 0o600)
+
+    def test_grant_never_gives_itself_a_path_to_a_swapped_link(self):
+        # B3 of the #354 R2 review: a same-UID job can replace an entry while
+        # the shell walks a tree it may write. Every entry is opened
+        # O_NOFOLLOW and changed on the descriptor, so the swap below makes it
+        # unreadable to the walk instead of chmod'ing the link's target.
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        tree = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(tree, "sub"))
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        victim = os.path.join(outside, "config")
+        with open(victim, "w") as fh:
+            fh.write("x")
+        os.chmod(victim, 0o600)
+        real_listdir = os.listdir
+        swapped = []
+
+        def swap(fd):
+            names = real_listdir(fd)
+            if not swapped:                    # after the listing, before the opens
+                swapped.append(True)
+                os.rmdir(os.path.join(tree, "sub"))
+                os.symlink(outside, os.path.join(tree, "sub"))
+            return names
+
+        with mock.patch.object(offload_shell.os, "listdir", swap):
+            ex.grant(tree)
+        self.assertEqual(os.stat(victim).st_mode & 0o777, 0o600)
+
+    def test_grant_changes_modes_on_the_descriptor_only(self):
+        # B3: the fix is fd-based by construction; any return to a path-based
+        # os.chmod/os.chown (which follow a swapped link) trips this witness
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        tree = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(tree, "sub"))
+        with open(os.path.join(tree, "run.sh"), "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(os.path.join(tree, "run.sh"), 0o755)
+        with mock.patch.object(offload_shell.os, "chmod",
+                               side_effect=AssertionError("path chmod")), \
+                mock.patch.object(offload_shell.os, "chown",
+                                  side_effect=AssertionError("path chown")):
+            ex.grant(tree)
+        self.assertTrue(os.stat(tree).st_mode & 0o020)
+        self.assertTrue(os.stat(os.path.join(tree, "sub")).st_mode & 0o2000)
+
+    def test_granted_requires_the_shared_group_and_write(self):
+        # B3: a ready cache is reused only when the shell already granted it
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        path = os.path.join(self.tmp, "cache")
+        os.makedirs(path)
+        with mock.patch.object(offload_shell.JobUserExecutor, "_gid",
+                               return_value=None):
+            os.chmod(path, 0o700)
+            self.assertFalse(ex.granted(path))
+            os.chmod(path, 0o2770)
+            self.assertTrue(ex.granted(path))
+        with mock.patch.object(offload_shell.JobUserExecutor, "_gid",
+                               return_value=os.getgid() + 1):
+            self.assertFalse(ex.granted(path))       # another group: rebuild
+
+    def test_a_legacy_ready_cache_is_rebuilt_not_regranted(self):
+        # B3: a cache that does not qualify is never re-granted by path (a
+        # same-UID job could have planted a link inside it); it is rebuilt
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work)
+        profile = {"lockfiles": [], "setup": "true"}
+        final = os.path.join(self.cfg["root"], "cache", "py",
+                             offload_shell._lock_hash(work, profile))
+        os.makedirs(final)
+        with open(os.path.join(final, ".ready"), "w") as fh:
+            fh.write("")
+        os.chmod(final, 0o700)                   # legacy: the job cannot write it
+        job = mock.MagicMock()
+        job.cfg, job.executor, job.stop = self.cfg, ex, {}
+        job.check.return_value = {}
+        runs: list[str] = []
+
+        def run(phase, argv, cwd, env, **kwargs):
+            runs.append(phase)
+            return 0, ""
+
+        job.run.side_effect = run
+        with mock.patch.object(offload_shell.JobUserExecutor, "_gid",
+                               return_value=None), \
+                mock.patch.object(offload_shell.JobUserExecutor, "clean",
+                                  lambda self, path: shutil.rmtree(path, True)):
+            self.assertEqual(offload_shell.prepare_cache(job, "py", profile,
+                                                         work, {}), final)
+            self.assertEqual(runs, ["setup"])    # rebuilt, not reused
+            runs.clear()
+            # the rebuild granted it: the next run reuses it without touching it
+            self.assertEqual(offload_shell.prepare_cache(job, "py", profile,
+                                                         work, {}), final)
+            self.assertEqual(runs, [])
 
     def test_dir_keeps_the_setgid_of_a_shared_parent(self):
         # B1 of the #354 R1 review: the explicit chmod of `_dir` must not

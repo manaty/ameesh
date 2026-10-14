@@ -75,10 +75,18 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   by rebuilding `/run/user/<uid>/bus` and start a unit outside its slice
   (R1-B3 of #354). The rule compares the domain masked to the kernel's 32-bit
   `int` (R2-B3: an equality test on the 64-bit register let
-  `socket(0x100000001)` start an AF_UNIX socket). `socketpair` stays allowed
-  (asyncio, multiprocessing). The profile's hooks are root-owned install-side
-  code and keep the manager (rootless Podman); an uninstallable filter
-  refuses the job.
+  `socket(0x100000001)` start an AF_UNIX socket). The filter also refuses
+  `io_uring_setup/enter/register`, which build an AF_UNIX socket without
+  `socket(2)` (R2-B2), and `ptrace`, `process_vm_readv`, `process_vm_writev`
+  and `pidfd_getfd`, which would inject into a same-UID process that still
+  holds the bus (R2-B4). `socketpair` stays allowed (asyncio, multiprocessing).
+  The client's `--env` never reaches `systemd-run` nor the `exec` wrapper --
+  both load ld.so before any filter (`LD_AUDIT` was the R2-B1 witness): it
+  travels as inert JSON chunks and `exec` applies it once the filter is
+  installed. The profile's hooks are root-owned install-side code and keep
+  the manager (rootless Podman); they never receive the client's `--env` and
+  the launcher strips the loader variables from theirs. An uninstallable
+  filter refuses the job.
 * `kernel.yama.ptrace_scope` at 1 at least (`/etc/sysctl.d/50-ameesh-guest.conf`,
   never lowered; Debian ships 0): the job shares its UID with its own user
   manager and the hooks, which keep the bus; without Yama the payload could
@@ -86,7 +94,9 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   #354 R3 reading). `--check` verifies it; a kernel without Yama is refused.
 * One supervision for every phase: a cancel, the loss of the SSH session,
   the gate or the job's deadline (counted from its slot) end setup, hooks
-  and command alike. The `after` hook still runs (teardown, 2 min at most).
+  and command alike. The `after` hook still runs (teardown, 2 min at most),
+  after the job's slice is killed: nothing of the payload outlives into it
+  (R2-B4).
 * A job whose shell died is cleaned at the next run: its slice is killed and
   its profile's `after` hook run (containers removed) before any new slot.
 * A slot (`flock`): with all slots busy, the client says it waits.
@@ -120,7 +130,11 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   mirrors and writes only the folders it was granted. A job's own folder is
   2750: the job enters it and writes `work`/`tmp` (2770) below, but it can
   neither write nor replace `meta.json` and `cancel`, and the shell never
-  opens those through a link (`O_NOFOLLOW`, R1-B2 of #354).
+  opens those through a link (`O_NOFOLLOW`, R1-B2 of #354). Every grant walks
+  the tree by descriptor (`O_NOFOLLOW`, `fchmod`/`fchown` on the opened fd,
+  R2-B3), so a same-UID job cannot swap an entry for a link while the shell
+  is granting it; a ready cache is never granted again, it is rebuilt when it
+  does not already carry the shared group (R2-B3).
 * SSH: the keys live in a root-owned file (`/etc/ameesh-guest/authorized_keys`,
   `restrict`, `from=`), and an sshd `Match User` block forces
   `ameesh-offload-shell`: four verbs (`put`, `run`, `status`, `cancel`),
