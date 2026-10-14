@@ -1,6 +1,6 @@
 {
   "observed_at": "2026-10-14T02:56:59.491566+00:00",
-  "candidate_review_sha": "142805d278338d96a9d00293f2c875d13dabdd83",
+  "candidate_review_sha": "1f05b5c95cda44a5f3f5f8a64ee0b81e1082a588",
   "executed": "read-only inventory only",
   "config_file": "/home/smichea/.local/state/ameesh/1155-bascule-recette.env",
   "config_mode": "0600",
@@ -36,7 +36,7 @@
   "plan_prepared_at": "2026-10-14T02:58:57.115949+00:00",
   "deployment_authorized_now": false,
   "gates": [
-    "Avis R1 Codex et R2 Claude réels sur le gel final (actuellement 142805d278338d96a9d00293f2c875d13dabdd83)",
+    "Avis R1 Codex et R2 Claude réels sur le gel final, actuellement 1f05b5c95cda44a5f3f5f8a64ee0b81e1082a588",
     "CI exacte entière verte, aucune part annulée ou non exécutée",
     "Feu final mesh-design avec cible et commit de retour",
     "Cible de déploiement SHA complet depuis main, constance/delta du gel qualifiés",
@@ -58,8 +58,15 @@
       "exit nonzero"
     ],
     "other_hosts": "installed SHA and process startup times remain unchanged",
-    "scope_limit": "tests real VM rollback on deliberately invalid health configuration; does not simulate OS, database or network outage",
-    "status": "proposal pending technical qualification; not executed"
+    "scope_limit": "tests real VM rollback on deliberately invalid health configuration; does not simulate OS, database or network outage; does not exercise installation failure or rollback failure",
+    "status": "technically qualified by author, awaiting pilot and all final gates; not executed",
+    "technical_qualification": "impl08 14/10 04:59: real installer/restart/control/health failure/rollback/stop path confirmed; pilot final gate still pending",
+    "preconditions": [
+      "Target SHA differs from installed afa32932; installer must really execute, not skip",
+      "Subset run still performs shared database backup and additive migrations from the workstation before first VM operation",
+      "Keep mail probe enabled; no --sans-sonde",
+      "Notification actually addressed to mesh-design"
+    ]
   },
   "healthy_sequence": {
     "order": [
@@ -97,5 +104,6 @@
     "1195: confirm ignored inherited AGENT_MESH_CONFIG and *_DATABASE_URL aliases in read-only preflight using invalid synthetic values, without printing private configuration",
     "All stored rollback references must still resolve before any host mutation",
     "Initial local configuration lacks HOTES_STAGING and contains stale PERSONAS_VM; private separate configuration prepared, original unchanged"
-  ]
+  ],
+  "previous_candidate_review_sha": "142805d278338d96a9d00293f2c875d13dabdd83"
 }
