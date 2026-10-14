@@ -401,9 +401,14 @@ class Cache:
 
 
 def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
-         migrations: str = "", cache: Cache | None = None) -> dict:
+         migrations: str = "", cache: Cache | None = None,
+         reservations=None) -> dict:
     """Le radar sur un dépôt. `lots` : `{id, branch, branch_target?, title?,
-    assignee?}`. Rend le rapport (sans horodatage ni durée)."""
+    assignee?}`. Rend le rapport (sans horodatage ni durée).
+
+    `reservations` : `branches -> liste`, appelé quand les entrées portent
+    encore `added` (les migrations ajoutées par un lot) ; seul son résultat
+    entre au rapport, `added` ne sort jamais dans le journal (#1335)."""
     cache = cache if cache is not None else Cache()
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
@@ -477,11 +482,14 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     cache.trim()
-    return {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
-                                       for b in branches],
-            "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
-            "against_target": against,
-            "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+    report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
+                                         for b in branches],
+              "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
+              "against_target": against,
+              "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+    if reservations is not None:
+        report["unreserved_migrations"] = reservations(branches)
+    return report
 
 
 def migration_probe(repo: str, branches: list[dict], directory: str) -> list[dict]:
@@ -590,13 +598,16 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
     for project in settings.projects.values():
         started = now()
         try:
-            report = scan(project.repo, lots, default_target=project.target or None,
-                          migrations=project.migrations, cache=cache)
             from .migration_reservations import probe
-            if project.migrations and not github_slug(project):
-                report["reservation_error"] = "migration reservations need a GitHub repository identity"
-            else:
-                report["unreserved_migrations"] = probe(db, project, report.get("branches") or [])
+            missing_repo = bool(project.migrations) and not github_slug(project)
+            report = scan(
+                project.repo, lots, default_target=project.target or None,
+                migrations=project.migrations, cache=cache,
+                reservations=None if missing_repo
+                else (lambda raw: probe(db, project, raw)))
+            if missing_repo:
+                report["reservation_error"] = (
+                    "migration reservations need a GitHub repository identity")
             error = None
         except (GitError, plan_git.MergeProbeError, OSError) as exc:
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
