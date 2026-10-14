@@ -1,0 +1,15 @@
+# #1110 — compte des blobs de l'union (main 6eeecc8e9 x gel c927fec5a)
+# union=ff4b5d4041958b34d2f7d9fac24d0bb8e74b044b arbre=4976b8f07429d85d61e0b218386f878f3d67bb94
+ETAT   MAIN           GEL            UNION          FICHIER
+COMBINE 9b4c91ee5957   32ad121f3878   d39d8c1e7380   deploy/sql/role-superviseur.sql
+COMBINE ee349bdcca93   b72b0de91032   66c2f5be4db7   docs/EXPLOITATION.md
+CONSTANT 2b9c1219fb78   98318a147cf5   98318a147cf5   src/ameesh/ci.py
+CONSTANT 52bd2f55f5c9   282f0536449b   282f0536449b   src/ameesh/exploitation.py
+CONSTANT d34eafe01478   414966f29e8b   414966f29e8b   src/ameesh/mediated_executor/contract.json
+CONSTANT 6eeecc8e914e   a11ef1b8f76e   a11ef1b8f76e   src/ameesh/migrations/0433_ci_runs_workflow.sql
+CONSTANT cec07ad7451a   17126bdef7ec   17126bdef7ec   src/ameesh/plan_github.py
+CONSTANT 656ed14b3a62   47abcc24053a   47abcc24053a   src/ameesh/storage/interface.py
+CONSTANT 9b131016718e   ac4a5a3aab58   ac4a5a3aab58   src/ameesh/storage/postgres/ci.py
+COMBINE b977d1e0bbf0   594246375390   47c19faed29e   tests/parts/pilote-psql.txt
+CONSTANT 6d5e488b9b74   9328af636d30   9328af636d30   tests/test_l126_issues.py
+CONSTANT 7ba19ec1c330   7b753e4a1ed6   7b753e4a1ed6   tests/test_l161c_failures_realtime.py

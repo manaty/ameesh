@@ -1,0 +1,66 @@
+commit ff4b5d4041958b34d2f7d9fac24d0bb8e74b044b
+Merge: c927fec5a 6eeecc8e9
+Author:     ameesh-dev5 <ameesh-dev5@ameesh.invalid>
+AuthorDate: Wed Oct 14 10:53:24 2026 +0000
+Commit:     ameesh-dev5 <ameesh-dev5@ameesh.invalid>
+CommitDate: Wed Oct 14 10:53:24 2026 +0000
+
+    #1110 : union main 6eeecc8e9 (#956) — suivis CI multi-workflow et réveil Nexlink conservés
+    
+    Union d'atelier de la tête gelée c927fec5a (branche lot/1110-ci-nexlink-wake,
+    laissée intacte) avec la main courante 6eeecc8e9. merge-tree rc0, aucun
+    conflit : l'arbre 4976b8f07429d85d61e0b218386f878f3d67bb94 est l'auto-fusion
+    exacte des deux parents.
+    
+    9 des 12 blobs du lot sont constants ; 3 sont combinés avec la main, sur des
+    hunks disjoints : deploy/sql/role-superviseur.sql, docs/EXPLOITATION.md,
+    tests/parts/pilote-psql.txt.
+    
+    Aucun push de branche lot, aucune PR, aucun run : seule cette ref d'atelier
+    porte l'union, pour relecture du delta (R1 delta auditeur, R2 Claude #1098).
+
+diff --cc docs/EXPLOITATION.md
+index b72b0de91,ee349bdcc..66c2f5be4
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@@ -5412,27 -5527,21 +5532,37 @@@ du check run. `ci-flow.py close` (étap
+  bilan de la part. Les parts ont donc `checks: write` ; sans ce droit (PR d'une
+  fourche), rien n'est publié et la part n'en est pas affectée.
+  
++ **Plafond du job (#899).** Chaque part reçoit son plafond
++ (`AMEESH_PLAFOND_MIN`, la valeur de son `timeout-minutes`) et l'epoch du début
++ du job (`AMEESH_JOB_DEBUT`, première étape). `publish` publie **une fois**, à
++ 80 % du plafond, une alerte dans le check run de la part (titre, résumé, ligne
++ JSON `type: alerte`) et une annotation de job (le log relu par l'étape
++ `fermer`) ; elle ne change jamais la conclusion de la part, et `ameesh notify`
++ ne la relève pas — il ne lit que les échecs de test. `summary` affiche en plus
++ la part du plafond consommée à la fin de la part : la mesure qui montre la
++ croissance de la suite d'une exécution à l'autre.
++ 
+  **Côté ameesh.** `ameesh notify`, sur l'hôte désigné par `github.host` (le
+  même que pour les issues des lots, L126 ; aucune clé nouvelle), relève à chaque
+ -passage les exécutions en cours ou en attente du workflow `tests.yml` de chaque dépôt de
+ -`github.projects` (une requête par dépôt, puis une par exécution suivie).
+ -Chaque exécution est rattachée à un lot : par sa branche
+ +passage les exécutions en cours ou en attente des workflows suivis de chaque
+ +dépôt de `github.projects` (une requête par dépôt, puis une par exécution
+ +suivie). Les workflows suivis d'un dépôt sont ceux que déclare
+ +`github.projects.<projet>.workflows` (forme longue `{"repo": …,
+ +"workflows": ["backend-suite.yml", …]}`) ; sans liste déclarée, le relevé
+ +découvre les workflows **actifs** du dépôt (`actions/workflows`, en cache une
+ +heure) et suit ceux du dépôt — le défaut L161 `tests.yml` seul quand le dépôt
+ +le publie, tous les workflows actifs sinon. Un dépôt dont les suites portent
+ +d'autres noms (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est donc
+ +plus ignoré en silence (#1110) ; un workflow déclaré mais absent du dépôt est
+ +signalé dans le journal. Chaque exécution garde son fichier de workflow : le
+ +verdict nomme la suite et, quand d'autres workflows de la même tête tournent
+ +encore, le dit — un vert de `backend-suite.yml` n'est pas « la CI est verte ».
+ +Une exécution courte peut naître et finir entre deux passages sans jamais être
+ +vue « en cours » : un **rattrapage borné** (exécutions terminées depuis moins
+ +d'une heure) les découvre, rend leur verdict et réveille l'agent, une seule
+ +fois ; l'exécution d'une tête déjà remplacée sur la même branche est écartée
+ +(pas de verdict périmé), et un workflow conclu dans le même passage n'est pas
+ +cité comme encore en cours. Chaque exécution est rattachée à un lot : par sa branche
+  (`work_items.branch`), sinon par la ligne `ameesh-work: <id>` de son commit de
+  tête (une fusion dans main). Les messages partent de `ameesh` vers l'assigné
+  du lot, dans le fil du lot (L125) :
