@@ -21,6 +21,20 @@ adds an audit event. Repeating an existing addition or absent removal leaves
 activity and the audit journal unchanged. A removed link is absent from the
 current graph; its addition/removal remains in the audit journal.
 
+A follow-up ("suite") lot is created with its parent in the same operation, so
+the edge cannot be forgotten:
+
+```sh
+ameesh mail send <agent> "…" --new-lot "suite of #212" --estimate 1h --parent-lot 212
+ameesh work add --title "suite of #212" --parent-lot 212
+```
+
+The parent is linked inside the creation transaction: a still-open parent
+becomes a blocking prerequisite, an already finished parent is only traced in
+the new lot's journal, and an unknown parent refuses the whole creation (no
+lot is written). `--parent-lot` without a created lot is refused. No number is
+ever inferred from a title or a body.
+
 A prerequisite blocks while its lot is open. `merged`, `promoted` and `closed`
 prerequisites remain visible with `blocking: false` but stop deferring
 stagnation. A reopened prerequisite becomes blocking again. Closing a blocker
@@ -39,9 +53,12 @@ limit; a blocker outside the displayed window still suppresses `stale_lot`
 and its reminders. Links combine with existing open commitment dependencies.
 A future planned start takes precedence in the displayed `planned_wait`.
 
-A dependency controls inactivity alerts, not permission to run, change state,
-merge or deploy. It does not change the lot's state to `blocked` or enforce a
-merge gate. Notes and mail are never parsed into dependency edges.
+A dependency controls inactivity alerts and the ready intake: a lot whose
+prerequisite is not delivered is excluded from the automatic take (L165) and
+is not woken as actionable for its assignee. It is not permission to run,
+change state, merge or deploy, and it does not change the lot's state to
+`blocked` or enforce a merge gate. Notes and mail are never parsed into
+dependency edges.
 
 For a commit prerequisite, link to a lot whose delivery includes verifying
 that commit in the required target. A hash in a note or a local branch does
