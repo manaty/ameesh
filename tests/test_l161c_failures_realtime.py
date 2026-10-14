@@ -698,6 +698,64 @@ class WatcherTest(PgTestCase):
         self.assertEqual(self.api.cancels, [(DEPOT, 613)])
         self.assertNotIn("cancelled", [o["action"] for o in out])
 
+    def test_preuve_reverifiee_sur_la_relecture_fraiche(self):
+        # #1161 (R1 delta) : la preuve d'antériorité est calculée sur la liste
+        # du relevé ; la relecture fraîche de l'exécution doit la confirmer
+        # avant le POST. Un rerun apparu entre les deux (essai 2 plus récent
+        # que le successeur), une date d'essai devenue plus récente, une autre
+        # tête ou un autre groupe conservent l'exécution : le POST ne vise
+        # jamais un essai que la liste n'avait pas qualifié.
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, cancel=self.api.cancel,
+                             clock=lambda: 1_000_000.0)
+        vieille, courante = "3a" * 20, "3b" * 20
+        self.api.pending = [run_view(612, courante, "lot/1-un", status="pending",
+                                     created_at="2026-10-14T07:00:00Z")]
+        self.api.branches["lot/1-un"] = courante
+        # liste : essai 1 à 06:00, antérieur ; relecture fraîche : essai 2 à
+        # 08:00, plus récent que le successeur -> conservée
+        self.api.queued = [run_view(611, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[611] = run_view(611, vieille, "lot/1-un", status="queued",
+                                      attempt=2,
+                                      run_started_at="2026-10-14T08:00:00Z")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # essai inchangé mais date d'essai fraîche plus récente que le
+        # successeur -> conservée
+        self.api.queued = [run_view(613, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[613] = run_view(613, vieille, "lot/1-un", status="queued",
+                                      run_started_at="2026-10-14T08:00:00Z")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # tête changée entre la liste et la relecture -> conservée
+        self.api.queued = [run_view(614, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[614] = run_view(614, "3c" * 20, "lot/1-un", status="queued",
+                                      created_at="2026-10-14T06:00:00Z")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # groupe changé (dépôt source) entre la liste et la relecture -> conservée
+        self.api.queued = [run_view(615, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done[615] = run_view(615, vieille, "lot/1-un", status="queued",
+                                      created_at="2026-10-14T06:00:00Z",
+                                      source="quelqu-un/ameesh")
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [])
+        self.assertNotIn("cancelled", [o["action"] for o in out])
+        # relecture fraîche conforme à la liste (essai 1, 06:00, même tête,
+        # même groupe) -> annulée, comme avant
+        self.api.queued = [run_view(616, vieille, "lot/1-un", status="queued",
+                                    created_at="2026-10-14T06:00:00Z")]
+        self.api.done.pop(616, None)
+        out = watcher.tick(self.db)
+        self.assertEqual(self.api.cancels, [(DEPOT, 616)])
+        self.assertIn(("cancelled", 616), [(o["action"], o["run_id"]) for o in out])
+
     def test_erreur_d_annulation_sans_faux_verdict(self):
         # #1161 : une erreur de l'API d'annulation est journalisée ; elle ne
         # conclut rien, ne retire rien et laisse la nouvelle exécution suivie

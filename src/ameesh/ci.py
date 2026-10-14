@@ -220,6 +220,32 @@ def proven_older(candidate: dict, successor: dict) -> bool:
     return before is not None and after is not None and before < after
 
 
+def proof_of(run: dict, successor: dict) -> dict:
+    """La preuve d'annulation d'une exécution, calculée sur la liste du relevé
+    (#1161, R1) : l'essai qualifié, sa tête, son groupe de concurrence et la
+    date d'essai du successeur. `cancel_run` la confronte à la relecture
+    fraîche avant tout POST."""
+    return {"run_attempt": int(run.get("run_attempt") or 1),
+            "head_sha": run.get("head_sha") or "",
+            "group": run_group(run),
+            "successor_ts": attempt_ts(successor)}
+
+
+def proof_holds(run: dict, proof: dict) -> bool:
+    """La relecture fraîche confirme-t-elle la preuve calculée sur la liste
+    (#1161, R1) ? Un essai qui a changé (`run_attempt`), une autre tête, un
+    autre groupe de concurrence ou une date d'essai qui n'est plus antérieure
+    au successeur rendent faux : l'exécution est conservée."""
+    if int(run.get("run_attempt") or 1) != int(proof.get("run_attempt") or 0):
+        return False
+    if (run.get("head_sha") or "") != (proof.get("head_sha") or ""):
+        return False
+    if run_group(run) != proof.get("group"):
+        return False
+    ts, successor_ts = attempt_ts(run), proof.get("successor_ts")
+    return ts is not None and successor_ts is not None and ts < successor_ts
+
+
 def events_of(check_runs, run_id: int) -> list[dict]:
     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
     la sortie des check runs « tests (flux) » d'une tête."""
@@ -539,16 +565,25 @@ class Watcher:
         sha = str(((data.get("commit") or {}).get("sha")) or "").strip()
         return sha or None
 
-    def cancel_run(self, repo: str, run_id: int) -> bool:
+    def cancel_run(self, repo: str, run_id: int, *, proof: dict | None = None) -> bool:
         """Annule une exécution GitHub **non démarrée** (`queued`/`pending`)
         dont l'essai est prouvé antérieur à celui de la tête courante du même
         groupe de concurrence : elle retient la tête courante (#1161).
         Idempotent : une exécution déjà conclue n'est pas annulée ; une erreur
         de l'API est journalisée et rend False, sans toucher à la base ni
-        rendre de verdict."""
+        rendre de verdict.
+
+        `proof` est la preuve calculée sur la liste du relevé (essai, tête,
+        groupe, date du successeur) : la relecture fraîche doit la confirmer
+        avant le POST. Un essai plus récent (`run_attempt`), une autre tête, un
+        autre groupe ou une date d'essai qui n'est plus antérieure au
+        successeur conservent l'exécution — le POST ne vise jamais un essai que
+        la liste n'avait pas qualifié (#1161, R1)."""
         try:
             run = self.api("repos/%s/actions/runs/%s" % (repo, run_id)) or {}
             if (run.get("status") or "") not in CANCELLABLE_STATUSES:
+                return False
+            if proof is not None and not proof_holds(run, proof):
                 return False
             if self.cancel is None:
                 from . import plan_github
@@ -732,7 +767,9 @@ class Watcher:
                 if not proven_older(run, successor):
                     continue  # antériorité non prouvée : l'exécution est conservée
                 run_id = int(run["id"])
-                if self.cancel_run(repo, run_id):
+                # la preuve est calculée sur la liste ; `cancel_run` la
+                # revérifie sur la relecture fraîche avant le POST (#1161, R1)
+                if self.cancel_run(repo, run_id, proof=proof_of(run, successor)):
                     cancelled.append(run_id)
                     out.append({"action": "cancelled", "repo": repo, "run_id": run_id,
                                 "head_sha": run.get("head_sha"), "branch": branch,
