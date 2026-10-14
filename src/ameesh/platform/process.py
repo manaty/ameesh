@@ -599,22 +599,69 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
                        "neither psutil nor /proc to list open files")
 
 
-#: Sélecteurs de session d'une ligne de commande : l'argument qui les suit
-#: (ou leur valeur liée par `=`) est une reprise en cours. Un identifiant cité
-#: ailleurs dans un argv — brief JSON, message, chemin — n'en est pas une
-#: (#1283 : un dsh réel dont le brief citait l'id d'une session fictive était
-#: vu comme détenteur et faisait échouer les tests d'adoption).
+#: Sélecteurs de session d'une ligne de commande : une reprise en cours nomme
+#: la session juste après eux (`claude --resume <id>`, `dsh --session-id <id>`,
+#: ou leur valeur liée par `=`), ou après les options de la sous-commande
+#: (`codex exec resume --json <id>`, `codex resume --no-alt-screen <id>`). Un
+#: identifiant cité ailleurs dans un argv — brief JSON, message, prompt, valeur
+#: d'option — n'est pas un détenteur (#1283).
 SESSION_SELECTORS = ("resume", "--resume", "-r", "--session-id")
+
+#: Options de reprise SANS valeur : le jeton suivant reste candidat au
+#: positional de session. Toute autre option est supposée prendre une valeur
+#: (la consommer évite de la prendre pour l'id, cas
+#: `codex resume -m gpt-5.1-codex <id>`) ; une valeur liée par `=` tient en un
+#: seul jeton.
+RESUME_FLAGS = frozenset({
+    "--json", "--no-alt-screen", "--include-non-interactive", "--search",
+    "--oss", "--verbose", "--fork-session", "--include-partial-messages",
+    "--strict-mcp-config", "--ide", "--print", "-p", "--continue",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust", "--dangerously-skip-permissions",
+    "--full-auto", "--skip-git-repo-check", "-h", "--help", "-V", "--version",
+})
+
+#: Options qui désignent « la session la plus récente » : aucun positional
+#: d'id ne suit, un jeton cité après elles est un prompt (#1283 R1 cx2).
+RESUME_LATEST = frozenset({"--last", "--all"})
+
+
+def _resume_positional(argv: list[str], index: int) -> str | None:
+    """Le positional de session d'une reprise à partir de `index` : options
+    consommées (leur valeur avec), `--` respecté ; None si `--last`/`--all`
+    désigne la plus récente, ou s'il n'y a plus de positional."""
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            return argv[index + 1] if index + 1 < len(argv) else None
+        if arg in RESUME_LATEST:
+            return None
+        if arg.startswith("-"):
+            if arg.partition("=")[1]:
+                index += 1
+            else:
+                index += 1
+                if arg not in RESUME_FLAGS and index < len(argv) \
+                        and not argv[index].startswith("-"):
+                    index += 1
+            continue
+        return arg
+    return None
 
 
 def _session_argument(argv: list[str], needle: str) -> bool:
-    """`needle` est-il l'argument d'une reprise, et non une simple citation ?"""
-    for index, arg in enumerate(argv[1:], start=1):
-        if arg == needle and argv[index - 1] in SESSION_SELECTORS:
-            return True
+    """`needle` est-il nommé par une reprise en cours, et non cité ?"""
+    index = 1
+    while index < len(argv):
+        arg = argv[index]
         flag, sep, value = arg.partition("=")
-        if sep and value == needle and flag in SESSION_SELECTORS:
-            return True
+        if sep and flag in SESSION_SELECTORS:
+            return value == needle
+        if arg == "resume":
+            return _resume_positional(argv, index + 1) == needle
+        if arg in ("--resume", "-r", "--session-id"):
+            return index + 1 < len(argv) and argv[index + 1] == needle
+        index += 1
     return False
 
 
