@@ -334,7 +334,8 @@ def _plan(db, args: argparse.Namespace) -> int:
 _BRANCH_RESULTS = {"merged": "CLOSED (delivered)", "already": "already delivered",
                    "refused": "work item closed", "would-merge": "would be closed",
                    "open": "open", "skipped": "skipped", "no-repo": "no repository",
-                   "no-target": "no target", "error": "error"}
+                   "no-target": "no target", "error": "error",
+                   "off-target": "delivered off target (kept open)"}
 
 
 def _sync_branches(db, args: argparse.Namespace) -> int:
