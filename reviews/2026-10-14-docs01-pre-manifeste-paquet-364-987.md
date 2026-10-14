@@ -14,7 +14,9 @@ distingué de la **simulation avec compagnons** (annexe B) ; blobs propres au c�
 14/10 06:3xZ (relu et recoupé par cx2, mail 06:24Z) : **§5** consolidé avec les
 identifiants primaires exacts (jalons `work_item_milestones`, feu `work_item_events`,
 binding `session_bindings`) ; ces avis **delta/historiques** ne valent pas GO complet
-nouveau et la qualification de famille reste réservée au pilote.
+nouveau et la qualification de famille reste réservée au pilote. Précision cx2 (mail
+06:32Z) : le binding **enregistre** un harnais Claude ; il ne prouve ni l'exécution réelle
+ni le modèle, à qualifier sur la ligne primaire (registre ≠ preuve réelle, canon §11).
 
 **Aucun feu de fusion, de déploiement ni de CI ; aucune mutation d'une branche gelée.** Le
 gel #1204 (`origin/integration/vague-suivante-1204 = 39df7c316c9e`, run 38504851830 intact)
@@ -134,7 +136,7 @@ Identifiants **primaires** relevés en première main le 14/10 06:2xZ : jalons d
 (`work_item_milestones`), feux (`work_item_events`), binding de session
 (`session_bindings`). Ces avis sont **delta/historiques** — chacun est borné au SHA
 indiqué ; ils ne valent pas GO complet nouveau du futur paquet et restent à qualifier au
-gel sur la main exacte (§7.3).
+gel sur la main exacte (§7, point 3).
 
 - **#364** — sensible prod + SQL (migration 0417, `deploy/sql/role-*.sql`, `deploy/**`,
   concurrence des fences). Auteur **mty-amh-impl-04** (harnais **DeepSeek**). Jalons :
@@ -161,8 +163,9 @@ gel sur la main exacte (§7.3).
   - **Session primaire du jalon #2739** : `session_bindings` **#26** — session
     `11783f10-5492-408f-988b-8c1035bec79b`, harnais **claude**, agent **bureau**, hôte
     pc-smichea, liée 13/10 16:29:29Z, révoquée 13/10 20:39:44Z ; sa fenêtre couvre #2696
-    (16:45Z) et #2739 (17:08Z). Le **modèle exact et la ligne primaire restent demandés
-    au bureau** : la famille Claude est établie par le binding, pas la ligne.
+    (16:45Z) et #2739 (17:08Z). Le binding **enregistre un harnais Claude** ;
+    **l'exécution réelle et le modèle restent à qualifier sur la ligne primaire**, demandée
+    au bureau (registre ≠ preuve réelle, canon §11).
   - **Feu historique** : `work_item_events` **#8263**, pilote mesh-design, 13/10
     17:17:39Z — FEU PILOTE conditionnel sur `90aae667…` : CI exacte verte sur cette tête,
     **toutes parts psql/psycopg COMPLETED/SUCCESS, aucune annulée** (#940), tête
@@ -224,8 +227,8 @@ réjeu individuel.
 
 - #1002 : `waiting` à réconcilier (R1 déjà GO).
 - #974 : avis/feu propres non rendus ; PR à retarget après #364.
-- Jalon #2739 : binding `#26` (bureau, claude) retrouvé ; **modèle exact et ligne primaire
-  demandés au bureau** (§5).
+- Jalon #2739 : binding `#26` = harnais `claude` (bureau) enregistré ; **exécution réelle
+  et modèle exact à qualifier sur la ligne primaire**, demandée au bureau (§5).
 - Les 3 fichiers #364 non patch-constants sont à relire dans le delta composé (§4).
 
 ## 9. Réversibilité
