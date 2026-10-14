@@ -861,6 +861,26 @@ class ContentMergeTest(_PlanDb):
         # idempotent
         self.assertEqual(self.run_sync(), {})
 
+    def test_le_releve_qui_ferme_le_bloqueur_reveille_le_dependant(self):
+        """L385 suite : la fermeture par contenu dépose le courrier du dépendant
+        — le relevé réel (`sync_merges`) est le chemin, pas seulement le CLI."""
+        from ameesh import mail, work_dependencies
+        git(self.repo, "checkout", "-q", "-b", "lot/bloqueur")
+        sha = self.commit("src/bloqueur.py", "b = 1\n", "bloqueur")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion bloqueur", "lot/bloqueur")
+        blocker = self.frozen("bloqueur", sha)
+        waiting = work.add(self.db, title="dépendant")
+        self.db.execute("UPDATE work_items SET assignee = 'dev-a' WHERE id = %s",
+                        (waiting["id"],))
+        work_dependencies.add(self.db, waiting["id"], blocker["id"], actor="test")
+        self.assertEqual(self.run_sync()[blocker["id"]]["result"], "merged")
+        [row] = mail.unread(self.db, "dev-a")
+        self.assertEqual((row["kind"], row["recipient"]), ("event", "dev-a"))
+        self.assertIn("lot #%d is merged" % blocker["id"], row["body"])
+        self.assertEqual(mail.message_payload(row)["dependency"]["dependent"],
+                         waiting["id"])
+
     def test_rebase_cherry_pick_et_squash_par_patch_id(self):
         git(self.repo, "checkout", "-q", "-b", "lot/a")
         self.commit("src/a.py", "a = 1\n", "a1")

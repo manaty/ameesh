@@ -6,8 +6,9 @@ import json
 import threading
 import time
 import unittest
+from unittest import mock
 
-from ameesh import db as D, plan, planned_waits, progress, stagnation, storage, work
+from ameesh import db as D, mail, plan, planned_waits, progress, stagnation, storage, work
 from ameesh import work_dependencies as dependencies
 from tests.support import PgTestCase
 
@@ -155,6 +156,117 @@ class StoreTest(PgTestCase):
         self.assertTrue(json.loads(cli("--remove", str(self.b), "--json").stdout)["changed"])
         self.assertFalse(json.loads(cli("--remove", str(self.b), "--json").stdout)["changed"])
         self.assertEqual(json.loads(cli("--json").stdout)["dependencies"], [])
+
+
+class ReleasedWakeTest(PgTestCase):
+    """L385 suite : la fermeture d'un bloqueur réveille l'agent du dépendant.
+
+    Le réveil est un courrier durable (`kind=event`) porté par le lot
+    dépendant : le runner existant s'en sert tel quel, aucun sondage ni
+    session neuve. Il part APRÈS le commit de la fermeture, une seule fois,
+    et seulement quand plus aucune attente ne retient le lot.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.a, self.b, self.c = [work.add(self.db, title=title)["id"]
+                                  for title in ("waiting", "blocker", "other blocker")]
+        self.assign(self.a, "dev-a")
+
+    def assign(self, item, name):
+        self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s", (name, item))
+
+    def inbox(self, name="dev-a"):
+        return mail.unread(self.db, name)
+
+    def mail_lot(self, row):
+        """Le lot porté par un message (la colonne n'est pas dans `unread`)."""
+        return self.db.query("SELECT work_item_id FROM agent_mailbox WHERE id = %s",
+                             (int(row["id"]),))[0]["work_item_id"]
+
+    def test_merging_the_blocker_wakes_the_assignee_once(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        done = work.merged(self.db, self.b, sha="a" * 40, actor="git:main")
+        self.assertEqual(done["result"], "merged")
+        [row] = self.inbox()
+        self.assertEqual((row["kind"], self.mail_lot(row)), ("event", str(self.a)))
+        self.assertIn("lot #%d is merged" % self.b, row["body"])
+        self.assertIn("lot #%d" % self.a, row["body"])
+        self.assertEqual(mail.message_payload(row)["dependency"],
+                         {"dependent": self.a, "blocker": self.b, "blocker_state": "merged"})
+        # Rejouer la déclaration de fusion ne réveille pas une seconde fois.
+        self.assertEqual(work.merged(self.db, self.b, sha="a" * 40, actor="git:main")["result"],
+                         "already")
+        self.assertEqual(len(self.inbox()), 1)
+
+    def test_the_wake_waits_for_the_last_blocker(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        dependencies.add(self.db, self.a, self.c, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        # L'autre bloqueur tient encore : rien n'est libéré, rien n'est envoyé.
+        self.assertEqual(dependencies.released_by(self.db, self.b), [])
+        self.assertEqual(dependencies.released_by(self.db, self.c), [])
+        self.assertEqual(self.inbox(), [])
+        work.close(self.db, self.c, abandoned=True, actor="test")
+        self.assertEqual(len(self.inbox()), 1)
+        self.assertEqual([r["id"] for r in dependencies.released_by(self.db, self.c)], [self.a])
+
+    def test_an_abandoned_blocker_wakes_with_the_reason(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        [row] = self.inbox()
+        self.assertIn("lot #%d was closed (abandoned), not merged" % self.b, row["body"])
+        self.assertIn("Reassess the prerequisite", row["body"])
+
+    def test_a_future_planned_start_is_not_released(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        self.db.execute("UPDATE work_items SET planned_start = '2999-01-01' WHERE id = %s",
+                        (self.a,))
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(dependencies.released_by(self.db, self.b), [])
+        self.assertEqual(self.inbox(), [])
+
+    def test_a_dependent_already_closed_is_not_woken(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.a, abandoned=True, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual(dependencies.released_by(self.db, self.b), [])
+        self.assertEqual(self.inbox(), [])
+
+    def test_an_unassigned_dependent_is_released_without_a_recipient(self):
+        self.assign(self.a, None)
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        work.close(self.db, self.b, abandoned=True, actor="test")
+        self.assertEqual([r["id"] for r in dependencies.released_by(self.db, self.b)], [self.a])
+        self.assertEqual(storage.of(self.db).mailbox.unread_total(), 0)
+
+    def test_the_wake_is_deposed_only_after_the_closure_commit(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        seen = []
+        real = mail.send
+
+        def spy(db, sender, recipient, body, **kw):
+            seen.append((work.get(self.db, self.b)["state"], recipient, kw.get("kind")))
+            return real(db, sender, recipient, body, **kw)
+
+        with mock.patch("ameesh.mail.send", side_effect=spy):
+            work.merged(self.db, self.b, sha="b" * 40, actor="git:main")
+        self.assertEqual(seen, [("merged", "dev-a", "event")])
+
+    def test_a_failed_wake_never_blocks_the_closure(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        with mock.patch("ameesh.mail.send", side_effect=RuntimeError("mailbox down")):
+            done = work.merged(self.db, self.b, sha="c" * 40, actor="git:main")
+        self.assertEqual(done["result"], "merged")
+        self.assertEqual(work.get(self.db, self.b)["state"], "merged")
+        self.assertEqual(self.inbox(), [])
+
+    def test_the_cli_declaration_wakes_too(self):
+        dependencies.add(self.db, self.a, self.b, actor="test")
+        proc = self.mesh("work", "merged", str(self.b), "--sha", "d" * 40, "--actor", "test")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        [row] = self.inbox()
+        self.assertEqual(self.mail_lot(row), str(self.a))
 
 
 class ResolverTest(unittest.TestCase):

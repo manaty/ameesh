@@ -45,6 +45,89 @@ def grouped(db, item_ids):
     return result
 
 
+# --------------------------------------------------------------------------
+# L385 suite : réveiller l'agent d'un dépendant quand sa dernière attente tombe
+# --------------------------------------------------------------------------
+
+def released_by(db, blocker_id) -> list[dict]:
+    """Lots ouverts dont cette fermeture lève l'attente (lecture d'après commit).
+
+    Un dépendant n'est rendu que s'il ne lui reste AUCUNE attente une fois le
+    blocage fermé : aucune arête bloquante, aucun engagement ouvert, aucun
+    début planifié futur — la même vérité que `planned_wait`. Les lots fermés,
+    fusionnés ou sans arête vers `blocker_id` n'en font jamais partie.
+    """
+    st = storage.of(db)
+    blocker_id = int(blocker_id)
+    open_items = st.operations.open_lots_activity(None)
+    rows = [r for r in open_items if int(r["id"]) != blocker_id]
+    ids = [int(r["id"]) for r in rows]
+    if not ids:
+        return []
+    edges = st.work_dependencies.for_items(ids)
+    linked = {int(e["work_item_id"]) for e in edges
+              if int(e["blocker_id"]) == blocker_id and not e["blocking"]}
+    if not linked:
+        return []
+    from . import planned_waits  # import tardif : plan importe les attentes
+    candidates = [r for r in rows if int(r["id"]) in linked]
+    waits = planned_waits.read(db, candidates, open_items=open_items, dependencies=edges)
+    return [r for r in candidates if int(r["id"]) not in waits]
+
+
+def _released_text(row, blocker_id, blocker_state, blocker_reason=""):
+    """Le corps court et factuel d'un réveil de dépendance."""
+    lot = int(row["id"])
+    title = (row.get("title") or "").strip()[:60]
+    title = " \"%s\"" % title if title else ""
+    if blocker_state == "merged":
+        return ("Dependency released: lot #%d is merged; lot #%d%s no longer waits on "
+                "any lot. Resume it when you are ready." % (int(blocker_id), lot, title))
+    why = " (%s)" % blocker_reason if blocker_reason else ""
+    return ("Dependency released: lot #%d was closed%s, not merged; lot #%d%s no longer "
+            "waits on any lot. Reassess the prerequisite before resuming."
+            % (int(blocker_id), why, lot, title))
+
+
+def notify_released(db, blocker_id, *, blocker_state, blocker_reason="") -> list[dict]:
+    """Dépose un courrier durable à l'agent de chaque dépendant libéré.
+
+    Appelé APRÈS le commit de la fermeture : rien n'est annoncé tant que l'état
+    n'est pas réel. Le message est un `event` ordinaire porté par le lot
+    dépendant : le runner existant réveille l'agent par LISTEN/NOTIFY, sans
+    sondage ni session neuve ; un agent arrêté à la main reçoit le courrier à
+    sa reprise, rien ne le redémarre. Ne lève jamais : la fermeture est le
+    fait, la notification un plus ; un échec est signalé et laissé visible.
+    Rend une ligne par courrier déposé (`lot`, `to`, `message_id`)."""
+    from . import fil, mail
+    out: list[dict] = []
+    try:
+        rows = released_by(db, blocker_id)
+    except Exception as exc:  # noqa: BLE001
+        fil.warn("dependents of lot #%s not read (%s: %s)"
+                 % (blocker_id, type(exc).__name__, str(exc)[:160]))
+        return out
+    for row in rows:
+        to = (row.get("assignee") or "").strip()
+        if not to or to.startswith(work.HUMAN_PREFIX):
+            continue
+        lot = int(row["id"])
+        body = _released_text(row, blocker_id, blocker_state, blocker_reason)
+        charge = {"dependent": lot, "blocker": int(blocker_id), "blocker_state": blocker_state}
+        if blocker_reason:
+            charge["blocker_reason"] = blocker_reason
+        try:
+            message_id = mail.send(
+                db, work.SYSTEM_SENDER, to, body, kind="event", work_item_id=str(lot),
+                payload={"dependency": charge})
+        except Exception as exc:  # noqa: BLE001
+            fil.warn("dependents of lot #%s: wake for #%d to %s not sent (%s: %s)"
+                     % (blocker_id, lot, to, type(exc).__name__, str(exc)[:160]))
+            continue
+        out.append({"lot": lot, "to": to, "message_id": message_id})
+    return out
+
+
 def wait_label(wait):
     if not wait:
         return None

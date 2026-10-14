@@ -882,6 +882,25 @@ def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
     return row
 
 
+def _notify_released(db: Db, item_id: int, *, blocker_state: str,
+                     blocker_reason: str = "") -> list[dict]:
+    """L385 suite : la fermeture d'un lot réveille les agents de ses dépendants.
+
+    Appelé APRÈS le retour de l'écriture de fermeture (donc après son commit) :
+    rien n'est annoncé avant que l'état soit réel en base. Ne lève jamais : la
+    fermeture est le fait, la notification un plus, et un échec est signalé
+    sans la remettre en cause."""
+    try:
+        from . import work_dependencies
+        return work_dependencies.notify_released(
+            db, int(item_id), blocker_state=blocker_state, blocker_reason=blocker_reason)
+    except Exception as exc:  # noqa: BLE001 - un réveil manqué ne défait pas la fusion
+        from . import fil
+        fil.warn("lot %s: dependents not notified (%s: %s)"
+                 % (item_id, type(exc).__name__, str(exc)[:160]))
+        return []
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "") -> dict:
@@ -899,6 +918,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
     (`declared`, `ameesh work merged`), suivie de `extra`.
+
+    Après le commit, les agents des lots dont c'était la dernière attente
+    reçoivent un courrier durable (L385 suite) ; un échec d'envoi ne remet pas
+    la fusion en cause.
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -929,6 +952,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": str(exc)}
         if row is not None:
+            _notify_released(db, item_id, blocker_state="merged")
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": "%s → merged" % state}
         if frozen_id is not None:
@@ -968,7 +992,11 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
           note: str = "", actor: str = "") -> dict:
     """Ferme un lot qui ne sera pas fusionné : abandonné, ou remplacé par un
-    autre lot. Jalon `closed` ; rien ne reste ouvert par oubli."""
+    autre lot. Jalon `closed` ; rien ne reste ouvert par oubli.
+
+    Après le commit, les agents des lots dont c'était la dernière attente
+    reçoivent un courrier durable (L385 suite) : l'abandon libère l'attente
+    sans prouver la livraison, le dépendant doit réévaluer son prérequis."""
     if bool(abandoned) == (superseded_by is not None):
         raise WorkError("pass --abandoned OR --superseded-by <id>")
     item = get(db, item_id)
@@ -991,6 +1019,7 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
         actor=actor, note=text)
     if row is None:
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
+    _notify_released(db, item_id, blocker_state="closed", blocker_reason=reason)
     return row
 
 

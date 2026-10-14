@@ -42,6 +42,18 @@ does not reset activity on the waiting lot: if that lot has already been idle
 for six hours, its stale alert can return immediately. Removing a link is an
 explicit edit and records ordinary activity.
 
+Closing a blocker also wakes the waiting agents. Once the last explicit
+prerequisite, open commitment dependency and future planned start are gone,
+`ameesh` deposits a durable `event` mail to the assignee of the waiting lot,
+linked to that lot. The existing runner delivers it (LISTEN/NOTIFY, no polling
+loop, no new session); an agent stopped by hand is not restarted — the message
+waits in its mailbox until it resumes. The mail leaves only after the closure
+is committed, and only once per release: a dependent with another open blocker
+is notified when the last one closes, and an unassigned lot gets no recipient.
+A closure that proves nothing (abandoned or superseded) says so in the mail:
+the wait is released, but the lot must be reassessed rather than treated as
+delivered.
+
 `work list/show --json` and `progress --json` expose a `dependencies` array
 with each blocker ID, current state, `blocking`, creation actor and timestamp.
 They also expose the common `planned_wait` result. Human-readable work output
