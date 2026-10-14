@@ -992,16 +992,72 @@ class ContentDeliveryTest(_Base):
                           "Merge pull request #627 from manaty/"
                           "agent/deepseek6-905-timestamp-precision")
         lot = self.lot(sha)
-        entry = self.sync()["results"][0]
+        lus = []
+        entry = self.sync(pr_body=lambda repo, num:
+                          lus.append(num) or "Livraison complète.")["results"][0]
         self.assertEqual(entry["result"], "merged")
         self.assertEqual(entry["target"], "origin/develop")
         self.assertEqual(entry["off_target"], "origin/main")
         self.assertEqual(entry["how"], "content-ancestor")
+        self.assertEqual(lus, [627])   # le corps de la PR PORTEUSE est lu (B2)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
         jalon = self.merged_milestone(lot["id"])
         self.assertEqual(jalon["sha"], sha)
         self.assertIn("origin/develop", jalon["note"])
         self.assertIn("declare `git config ameesh.target", jalon["note"])
+
+    def test_1005_corps_porteur_partiel_retient_le_lot(self):
+        """B2 : la PR porteuse du gel (PR627, branche agent/…) déclare le lot
+        partiel : le contenu est bien ancêtre, mais le lot reste ouvert."""
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+        entry = self.sync(pr_body=lambda repo, num:
+                          "Première partie.\n\nameesh-work-partial: %d"
+                          % lot["id"])["results"][0]
+        self.assertEqual(entry["how"], "partial")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("ameesh-work-partial: %d" % lot["id"], entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_corps_porteur_illisible_retient_le_lot(self):
+        """B2 : sans citation, le corps de la PR porteuse est illisible : on ne
+        ferme pas sans savoir."""
+        sha = self.livrer("agent/deepseek6-905-timestamp-precision",
+                          "Merge pull request #627 from manaty/"
+                          "agent/deepseek6-905-timestamp-precision")
+        lot = self.lot(sha)
+
+        def illisible(repo, num):
+            raise plan_git.GitError("gh: not logged in")
+
+        entry = self.sync(pr_body=illisible)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertIn("PR #627", entry["detail"])
+        self.assertIn("unreadable", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1005_regel_concurrent_ne_ferme_pas(self):
+        """B1 : un gel déclaré pendant le relevé (après la lecture, avant
+        l'écriture) n'a pas été examiné : la fermeture est refusée."""
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        lot = self.lot(sha)
+        _git(self.repo, "checkout", "-q", "-b", "agent/regel", "develop")
+        nouveau = self.commit("regel")          # jamais fusionné
+        _git(self.repo, "checkout", "-q", "develop")
+
+        def lire(repo, num):
+            work.milestone(self.db, lot["id"], "frozen", sha=nouveau, actor="ouvrier")
+            return "Livraison complète."
+
+        entry = self.sync(pr_body=lire)["results"][0]
+        self.assertEqual(entry["result"], "refrozen")
+        self.assertIn("new freeze declared in the meantime", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        # le nouveau gel n'est pas ancêtre : le relevé suivant laisse ouvert
+        self.assertEqual(self.sync()["results"][0]["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
 
     def test_1005_gel_non_livre_laisse_le_lot_ouvert(self):
         _git(self.repo, "checkout", "-q", "-b", "agent/jamais", "develop")
