@@ -415,3 +415,144 @@ liste des exclusions (#748, #963, #775) et des points de suivi (§5).
 - **Aucun geste distant** : pas de poussée, aucun run, aucune fusion ; PR #1016 laissée
   OPEN/MERGEABLE à tête constante, aucun close/reopen, aucun `workflow_dispatch`. Le pilote
   décide de l'inclusion de #786 dans le paquet 1 ; sinon l'union est abandonnée sans reste.
+
+## 15. Addendum du 14/10 20:0xZ — candidat du paquet suivant étendu à #1125, #1261 et #759 (union `79170f49`)
+
+- **Disposition du pilote** (mesh-design, 14/10 19:49:02Z, message 40483) : #1342 est le
+  candidat local du **paquet 1** (dix lots 388/490/513/706/859/1020/1028/1145/1279/1293 à
+  `b83d3fbf2eb6`), encore en BUILD/qualification cx2 — aucun gel final ni CI ne s'en déduit ;
+  #1204 reste la préparation du **manifeste suivant**, à ne pas nommer « paquet 1 ».
+  Demande : nouveau candidat/manifeste avec les 7 lots 287/419/857/1019/1038/1048/786, puis
+  1125@`0fe458c2`, 1261@`9964316b` et 759@`494e7916` (réf `review/deepseek2-759-y3`, avis
+  borné Codex3 GO 21:41), soit **10 lots si compatibles et portes exactes** ; conserver les
+  anciens gels/réfs sans les réécrire ; nouveau SHA après composition ; exclusions
+  748/963/775 maintenues (963 après #706 du paquet 1) ; manifeste par lot (classe,
+  dépendances, SHA, avis/familles, sections composées) ; pas de poussée d'intégration, pas de
+  CI, pas de suite globale ; cibles auteur seulement en cas d'adaptation. §12 : tout
+  changement exige un nouveau gel final, de nouveaux avis et une **CI exacte** ; aucun vieux
+  vert n'est transféré (la règle de périmètre non élargi vise la release, §2). L'extension
+  #786@`cabc40ce` est reçue pour ce dossier, sans nouvelle CI.
+
+- **Base et gel conservés** : `main` = `0532faed4bba6a683073b9c7f5b9deca64abb2bd` et
+  `origin/integration/vague-suivante-1204` = `276e6ec56` (ls-remote 19:5xZ, inchangés).
+  Départ : `cabc40ce57eb97bffad9eca0e73c1fd71f2e9e4e` (gel §14, arbre `2439f703`), conservé
+  tel quel ; aucun ancien ref n'est réécrit.
+
+- **Composition** (3 fusions `--no-ff`, `rc=0`, aucune résolution) :
+
+| étape | lot | candidat intégré | merge commit | arbre après l'étape |
+|---|---|---|---|---|
+| 1 | #1125 | `0fe458c221ed1d2cbf85db2375b2f3ab94f8d7c5` | `3b2c01bb7a08be83ce337dd803b5af832e5294aa` | `6bb24e604deaa056d0c158d291225019ff89df7b` |
+| 2 | #1261 | `9964316b2d858eff315a0f7704e4488500b375ad` | `d2b4466d97a8f6f4fa1531313a9cffea5531e52f` | `b68fac2435b3194ad5cc709247f2f76f88b9add6` |
+| 3 | #759 (Y3) | `494e7916007ded9be406af65c54728967e684af7` | `79170f49462a44d901c35edca7512191105b66ae` | `cc4711fba54bf77587c8555edccd740dce72dbb6` |
+
+- **Union** : `79170f49462a44d901c35edca7512191105b66ae`, arbre
+  `cc4711fba54bf77587c8555edccd740dce72dbb6`. Delta vs `main` = **23 fichiers** (les 13 du
+  gel §14, + `src/ameesh/alert_briefs.py` et `tests/test_l132_alert_briefs.py` de #1261, + les
+  8 fichiers propres à #759) ; delta vs gel `cabc40ce` = **11 fichiers**, tous apportés par
+  les trois lots ajoutés ; aucun fichier étranger. `git diff --check` propre, 0 marqueur de
+  conflit.
+
+- **Sections composées (unions)** :
+  - `docs/EXPLOITATION.md` `417e04a1c29b3f59829676ccc9a1837f6cf054c7` = `main` `f3a1b02d`
+    + bloc #1048 (18 lignes, ~792) + #1125 (7 lignes, section watch ~761) + #759 (4 lignes /
+    1 remplacement, ~3994-4025) : hunks disjoints, **29 insertions / 1 remplacement** vs
+    `main`, 0 marqueur ; les trois apports sont présents et vérifiés à la source ; le blob
+    `cbe2dc83` du gel reste la référence des 18 lignes de #1048.
+  - `docs/EXECUTEUR-MEDIEE.md` `a906548cf5d3134c0b7dcbc879f4c09524e15480` (union #1019 +
+    #1038, inchangée depuis §2).
+  - `docs/design/etudes/index.md` `fb7635f979e8c060beb41ebfc707257d1ea9165c` (union L243
+    puis L244, résolution qualifiée, inchangée).
+  - Les 19 autres fichiers du delta appartiennent chacun à un seul lot ; le vingtième est ce
+    manifeste.
+
+- **Manifeste par lot** (paquet suivant, dix lots) :
+
+| lot | classe | PR / réf | candidat (SHA) | dépendances | avis (famille) |
+|---|---|---|---|---|---|
+| #287 | sensible hors prod (vie privée, `chat.py`) | PR 672 | `a2e3c60de1815ace352968e36247af2610751d18` | #880, #925 satisfaites | R1 mty-amh-impl-02 **DeepSeek** GO 0 B/1 N P3 (13/10 12:39Z) ; feu mesh-design/**Codex** 13/10 12:47Z (§3) |
+| #419 | légère | PR 402 | `79ebee0636f6002d0b947fc85e62e09f39659abe` | #843, #854, #880, #925 satisfaites | revue d'auteur docs-01 DeepSeek N 0 B (même famille, ne compte pas ; §3) |
+| #857 | sensible hors prod (CI, `scripts/test*`) | PR 700 | `c1d3271c82bad1273b7035313cc3bb0ba53338cb` | #707, #880, #925 satisfaites | R1 auditeur **Codex** GO 0 B/0 N ; R2 bureau **Claude** OK 0 B/2 N (14/10 02:05Z) ; feu mesh-design (§3) |
+| #1019 | légère | PR 791 | `9dfcb03e146d9e206efa3dcb4c03fc6a340e0efe` | #880, #925 satisfaites | aucune avant fusion ; relecture d'après fusion due |
+| #1038 | légère | PR 806 | `5bc72a02e9addbbec861b288e38f74e94f2e7866` | #880, #925 satisfaites | aucune avant fusion ; relecture d'après fusion due |
+| #1048 | légère | PR 808 | `1e7475317f839a762bb9d894d26a1cc1853e7d06` | #880, #925 satisfaites | vérificateur mty-amh-impl-05 **DeepSeek** GO 13/10 22:2xZ (§3) |
+| #786 | légère | PR 1016 | `94c8125378d117a1dbd5157fcccecda67307cd66` | #724 satisfaite | aucune avant fusion ; relecture d'après fusion due (§14) |
+| #1125 | légère (hors §8 ; `docs/EXPLOITATION.md` seul) | PR 876 | `0fe458c221ed1d2cbf85db2375b2f3ab94f8d7c5` | #1314 satisfaite | aucune avant fusion ; relecture d'après fusion **DeepSeek** indépendante due (#832) |
+| #1261 | légère (hors §8 ; qualification pilote 14/10 06:32Z, Option A 17:15Z) | PR 992 | `9964316b2d858eff315a0f7704e4488500b375ad` | #1211, #1314 satisfaites | lecture **Codex** 0 B/0 N (qualification 06:32Z) ; relecture d'après fusion due |
+| #759 | sensible hors SQL/sécurité/prod (concurrence/cycle de vie ; qualification 14/10 10:13Z) | PR 749, branche `lot/759-multi-stage-close` (tête `b35a3af1`, non avancée) ; candidat Y3 intégré depuis `review/deepseek2-759-y3` | `494e7916007ded9be406af65c54728967e684af7` (parents `b35a3af1` + `main` `0532faed4`, arbre `dc675d0a`) | aucune dépendance déclarée ; `main` `0532faed4` intégrée | R1 **Codex3** GO sur `464da83e` (contenu constant) + avis borné **Codex3** FAVORABLE 0 B/0 N le 14/10 19:41Z (21:41 local) sur la recomposition `work.py`+`mesh_cli.py`, sans rejeu ni feu ; preuve auteur 216 tests OK/3 sautés (846,899 s, fin 18:44:40Z) sur `review/deepseek2-759-y3-evidence` @`372855155` |
+
+- **Sections composées par lot** (blobs de l'arbre d'union `cc4711fb`) :
+  - #287 → `src/ameesh/chat.py` `69e638a9fb42a9f1afb2ce59eeaeb314aeb1ca91` ;
+    `tests/test_l79_chat_terminal.py` `5fd448e98a112ebb8d0c0969e1c1d694dcbf3a9a`.
+  - #419 → `docs/design/etudes/index.md` union `fb7635f979e8c060beb41ebfc707257d1ea9165c`
+    (L243 + L244) ; `docs/design/etudes/l243-projects-and-names.md`
+    `15b721dcec7f58e530139ad12192310e3fffd205`.
+  - #857 → `scripts/test-hermeticity-lint.py`
+    `f3ea2d0e504f7d9641d45daff8834debde7785c6` ; `tests/test_hermeticity_lint.py`
+    `ee1bc3f1731c21cc99bf90370279594ec7f6a956`.
+  - #1019 → `docs/EXECUTEUR-MEDIEE.md` union `a906548cf5d3134c0b7dcbc879f4c09524e15480` ;
+    `tests/parts/lecteurs-doc.txt` `88d677947ebb4965d851d803ebb62a08a09daf76` ;
+    `tests/test_l107_executor_contract.py` `f7bdee0f7bcd79fb78edff3d631eba0697978593`
+    (compteurs du contrat intégré : 63 opérations / 322 refusées / 385 interface).
+  - #1038 → `docs/EXECUTEUR-MEDIEE.md` union `a906548c…` (22 opérations 1.6.x ; observation
+    `turn_resources.begin_grace` §5.2 versée à la relecture d'après fusion).
+  - #1048 → `docs/EXPLOITATION.md` : 18 lignes (blob du gel `cbe2dc83`) dans l'union
+    `417e04a1…`.
+  - #786 → `tests/fakebin/dsh` `4f92012f0a21a6bb3f9c130fde3d3bfc8413e693` ;
+    `tests/test_l224_session_harnais.py` `cae2b2c2bc01926025cb47e771701e3ebe1e9dd0`.
+  - #1125 → `docs/EXPLOITATION.md` : 7 lignes (blob du lot `bb29a569`, patch-id `f55e74a3`)
+    dans l'union `417e04a1…`.
+  - #1261 → `src/ameesh/alert_briefs.py` `dbb9e2d389994b2e379b7cc89902cca6419054e8` ;
+    `tests/test_l132_alert_briefs.py` `7aff92ef71fd6a6c828c428a828aed8eb575b1f2`.
+  - #759 → `docs/ORCHESTRATEUR.md` `da0c795e3a1618a2e3a7e2f6a0bdd6768253bc40` ;
+    `src/ameesh/mesh_cli.py` `62dd6e6b1bcd12769dc59f485cf0bc0e45ac9bd8` ;
+    `src/ameesh/plan_git.py` `ae7340e44144e2f2d3f1ad9d3720044f7cbf004a` ;
+    `src/ameesh/plan_github.py` `73b7e3ef86aa3020cd64ce2365724ce4f7aa8a51` ;
+    `src/ameesh/work.py` `b013f96c71401e87b4d4f5fb72a3510dab88123e` ; `tests/fake_github.py`
+    `71381548bdf2fab5830570eeeeb1adb3bc2806ca` ;
+    `tests/test_merged_work_item_tracking.py` `868b68bf09f60793d255a7a602d8076d16d62d92` ;
+    `tests/test_plan.py` `0cea6351e330b89ff894b9665227e69468e5b23b` ;
+    `docs/EXPLOITATION.md` : 4 lignes dans l'union `417e04a1…`.
+
+- **Vérifications de première main (20:0xZ)** :
+  - #1125 : delta exact `docs/EXPLOITATION.md` +7 (merge-base `046a106a5`) ;
+    `merge-tree(main 0532faed4, tête)` rc=0 arbre `102b0738041ffd1f412f5ceadc5662859121544d` ;
+    patch-id `f55e74a3cc16de8d61e4524b7660d53cb5f513fb` ; 0 migration ; PR OPEN/MERGEABLE,
+    tête = `origin`.
+  - #1261 : delta exact `src/ameesh/alert_briefs.py` + `tests/test_l132_alert_briefs.py`
+    (blobs ci-dessus) ; `merge-tree(main 0532faed4, tête)` rc=0 arbre
+    `f2f70dbf6d8d9eace34776847012c6a3ce66e664` ; preuve d'exécution Option A
+    `38576160134` retenue par le pilote (20 jobs : 19 succès + 1 saut doc attendu, agrégats
+    verts, run annulé 1 s après le dernier job) ; PR OPEN/MERGEABLE/CLEAN.
+  - #759 : Y3 = refusion contrôlée de `main` `0532faed4` dans `b35a3af1` (parents
+    `b35a3af1` + `0532faed4`) ; `merge-tree(main 0532faed4, Y3)` rc=0 arbre `dc675d0a` =
+    arbre de Y3 ; 9 fichiers ; avis borné Codex3 0 B/0 N ; preuve auteur 216 tests OK/3
+    sautés (déclarée, non rejouée) ; PR #749 non avancée, aucun push sur la branche du lot.
+
+- **Portes contrôlées au 19:5xZ** (lecture `gh`, aucune action) : les 10 PR sont OPEN —
+  672 #287 `a2e3c60de181`, 402 #419 `79ebee0636f6` (CONFLICTING au niveau de la PR, car la
+  PR est restée sur une base ancienne ; l'union qualifiée `index.md` L243/L244 est déjà dans
+  la composition et fusionne proprement, §11/§13), 700 #857 `c1d3271c82ba`, 791 #1019
+  `9dfcb03e146d`, 806 #1038 `5bc72a02e9ad`, 808 #1048 `1e7475317f83`, 1016 #786
+  `94c8125378d1`, 876 #1125 `0fe458c221ed`, 992 #1261 `9964316b2d85`, 749 #759
+  `b35a3af1ac26` (le paquet porte Y3 `494e7916`, pas la tête de PR). Exclusions maintenues :
+  #748 (PR 684 `2ec97643b8ca`, CONFLICTING ; #1098 en attente humaine), #963 (PR 740
+  `e0d9b6553127` ; #706/PR632 `4f0bb179d28e` OPEN), #775 (PR 619 `a02928cf6676` ;
+  #711/PR548 `e09b5476d7b6` OPEN).
+
+- **Aucun test ni CI lancés** : composition propre sans adaptation → aucune cible auteur
+  déclenchée (disposition) ; la suite complète reste due **une fois** sur le gel final
+  (§12), avec les deux pilotes PostgreSQL, les contrats et le contrôle des parts réellement
+  exécutées. Aucun geste distant : pas de poussée, aucun run, aucune fusion, aucun
+  close/reopen.
+
+- **Réfs atelier** (publiées après ce commit) : `refs/atelier/1204/union-0532faed-786-1125-1261-759`
+  = `79170f49462a44d901c35edca7512191105b66ae` ; `refs/atelier/1204/gel-0532faed-786-1125-1261-759`
+  = le commit qui porte cet addendum. Les anciennes réfs `union-0532faed-786` = `57a1863e` et
+  `gel-0532faed-786` = `cabc40ce` restent intactes. Branche locale de travail :
+  `union/1204-paquet-suivant-0532faed`.
+
+- **Suites** : qualification pilote du nouvel arbre/gel ; avis et feu dus au titre du paquet
+  (relectures d'après fusion #419/#1019/#1038/#1048/#786/#1125/#1261 à désigner au moment de
+  la fusion) ; CI complète unique sur le gel final, puis fusion du paquet (§12). Le paquet 1
+  (#1342) et le présent paquet restent distincts ; aucune CI individuelle n'est relancée.
