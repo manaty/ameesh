@@ -494,12 +494,42 @@ class Watcher:
         return out
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
-        """Une exécution en cours : enregistrée si nouvelle ; elle remplace
-        les exécutions d'une autre tête sur la même branche (hors base)."""
+        """Une exécution en cours : enregistrée si nouvelle ; une exécution
+        connue sans lot rattaché l'est dès que la branche du lot est posée
+        (#1321), tant que sa tête est encore celle de la branche ; elle
+        remplace les exécutions d'une autre tête sur la même branche (hors
+        base)."""
         st = storage.of(db)
         run_id = int(run["id"])
         known = st.ci.run(repo, run_id)
         if known is not None:
+            if known.get("work_item_id") is None:
+                # #1321 : la branche du lot peut être posée après la première
+                # vue du run ; sans ce rattachement, `_conclude` lit
+                # `recipient_of(None)` et le verdict part à personne.
+                # `open_run` est idempotent (coalesce côté stockage) : il ne
+                # remplit que le lien encore vide.
+                lot = lot_of_run(run, lots)
+                row = None
+                if lot is not None:
+                    row = next((l for l in lots if int(l["id"]) == lot), None)
+                head = run.get("head_sha") or ""
+                # une tête plus récente connue de la branche (`branch_head`,
+                # posé par le relevé des branches) rend ce run périmé : le
+                # rattacher enverrait un verdict d'une tête remplacée — et
+                # l'exécution de remplacement peut être `pending`, invisible
+                # au veilleur (#1161). Le silence vaut mieux qu'un faux vert.
+                known_head = (row or {}).get("branch_head") or ""
+                if lot is not None and (not known_head or head == known_head):
+                    st.ci.open_run(repo, run_id, head_sha=head,
+                                   branch=run.get("head_branch") or "",
+                                   event=run.get("event") or "", base=base_of(run),
+                                   work_item_id=lot, url=run.get("html_url"))
+                    self.log("CI %s run %s: lot #%s linked (branch set later)"
+                             % (repo, run_id, lot))
+                elif lot is not None:
+                    self.log("CI %s run %s: obsolete head %s (branch head %s), not linked"
+                             % (repo, run_id, _short(head), _short(known_head)))
             return []
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
