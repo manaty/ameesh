@@ -3373,6 +3373,15 @@ class AgentWorker(threading.Thread):
                                     status_text="runner shutting down: instruction put back "
                                                 "in the queue")
             return False
+        if getattr(self.runner, "restart_for_stale", False):
+            # L790 : le paquet a changé entre le choix du tour et son lancement
+            # — rien ne part sur le code périmé ; une consigne déjà prise
+            # repart en attente, le tour est refusé sans compter comme échec.
+            if registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch):
+                registry.set_status(self.db, self.name, "queued",
+                                    status_text="outdated runner: instruction put back "
+                                                "in the queue")
+            return False
         if self.runner.gate_holds():
             # L159f : l'hôte se retire entre le choix du tour et son lancement —
             # une consigne déjà prise repart en attente, rien n'est lancé.
@@ -4496,6 +4505,12 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if self.runner.draining.is_set():
                     break  # drainage : le tour d'avant est fini, aucun autre ne part
+                if getattr(self.runner, "restart_for_stale", False):
+                    # L790 : code périmé constaté — le tour d'avant est fini,
+                    # aucun autre ne part ; le bail est rendu par le `finally`,
+                    # la boucle principale se remplace ensuite.
+                    log("[%s] outdated runner: no new turn, lease released" % self.name)
+                    break
                 if self.runner.gate_holds():
                     # L159f : porte d'hôte fermée — le bail est rendu (finally)
                     self._leave_for_host()
@@ -4696,9 +4711,12 @@ class Runner:
         self.turns = 0
         self.did_turn = False
         #: L790 : le paquet a changé sous ce processus (voir
-        #: `canon_sync_once`) — plus aucune réclamation (`sweep`), et la
-        #: boucle principale se remplace entre deux tours (`run`).
+        #: `canon_sync_once`) — plus aucune réclamation (`sweep`), les workers
+        #: sortent entre deux tours et la boucle principale se remplace
+        #: (`run`).
         self.restart_for_stale = False
+        #: les workers au repos ont été réveillés une fois pour sortir (L790)
+        self._stale_woken = False
         #: L109 : exécuteur médié — pas de base, le serveur du mesh par
         #: `/api/exec/v1` (`storage.remote`). Synchronisation du canon, relevé
         #: des soldes, échéance des délégations et déplacement entre hôtes
@@ -5295,13 +5313,21 @@ class Runner:
         """L790 : le redémarrage attend la fin du dernier tour et du fond.
 
         Dès que `canon_sync_once` a constaté un code périmé, `sweep` ne
-        réclame plus : ici on ne rend vrai que lorsque plus rien n'écrit —
-        même critère que le drainage, sans sa borne (un tour en cours se
-        termine, il n'est pas interrompu)."""
+        réclame plus : ici on réveille les workers au repos pour qu'ils
+        sortent entre deux tours (même geste que le drainage, sans interrompre
+        un tour en cours), puis on ne rend vrai que lorsque plus rien n'écrit —
+        même critère que le drainage, sans sa borne."""
         if not getattr(self, "restart_for_stale", False):
             return False
         with self.lock:
-            vivants = [name for name, worker in self.workers.items() if worker.is_alive()]
+            workers = list(self.workers.items())
+        if not getattr(self, "_stale_woken", False):
+            # hors du chemin de `shutdown` : les workers au repos attendent
+            # leur propre événement, pas `wake_all` (celui de la boucle)
+            self._stale_woken = True
+            for _nom, worker in workers:
+                worker.wake.set()
+        vivants = [name for name, worker in workers if worker.is_alive()]
         return not vivants and not self.background.running_count()
 
     def _drained(self) -> bool:
@@ -7510,17 +7536,45 @@ def main(argv: list[str] | None = None) -> int:
     return code
 
 
+def _restart_argv() -> list[str]:
+    """L790 : l'invocation à rejouer, mode d'appel préservé.
+
+    `sys.argv[0]` ne dit pas le mode : sous `python -m ameesh.runner`, il porte
+    le chemin du module (`…/runner.py`), et rejouer `[sys.executable, argv[0]]`
+    lance le fichier seul — ses imports relatifs le refusent. `sys.orig_argv`
+    (3.10+) garde la ligne de commande réelle : `-m ameesh.runner`, `-m ameesh
+    run`, options de l'exécuteur et options de l'interpréteur comprises. On ne
+    reprend de l'interpréteur que `sys.executable` : chemin absolu, `execv` ne
+    cherche pas dans `PATH`.
+
+    Sans `orig_argv` (3.9), le mode est indéterminable sous `-m` : on ne devine
+    pas — la liste vide fait sortir en `EXIT_RESTART`, et le service
+    (`Restart=on-failure`) relance l'exécuteur."""
+    orig = getattr(sys, "orig_argv", None)
+    if orig:
+        return [sys.executable] + list(orig[1:])
+    if __package__:
+        return []
+    return [sys.executable] + list(sys.argv)
+
+
 def _restart_with_installed_code() -> bool:
     """L790 : rejoue l'invocation de l'exécuteur, entre deux tours.
 
     `os.execv` remplace l'image du processus : le code neuf reprend la main
     avec les mêmes arguments et le même environnement, sans passer par un
-    superviseur. Rend `False` si le remplacement échoue (l'appelant sort alors
-    en `EXIT_RESTART`, que le service relance)."""
+    superviseur. Rend `False` si le remplacement échoue, ou si le mode d'appel
+    n'est pas rejouable (l'appelant sort alors en `EXIT_RESTART`, que le
+    service relance)."""
+    argv = _restart_argv()
+    if not argv:
+        print("agent-runner: outdated code — invocation mode not replayable "
+              "(python < 3.10): the service must restart it", file=sys.stderr, flush=True)
+        return False
     print("agent-runner: outdated code — restarting with the installed package",
           file=sys.stderr, flush=True)
     try:
-        os.execv(sys.executable, [sys.executable] + list(sys.argv))
+        os.execv(argv[0], argv)
     except OSError as exc:
         print("agent-runner: restart failed: %s" % exc, file=sys.stderr, flush=True)
         return False
