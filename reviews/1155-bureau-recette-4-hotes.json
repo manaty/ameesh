@@ -85,9 +85,10 @@
       "record current SHA as actual future rollback",
       "installer exact target",
       "graceful restart outside turns",
-      "units and lease owner/epoch/liveness checks",
+      "doctor recorded by operator on hosts where controler does not run it; current script runs doctor --harness on workstation only",
       "doctor",
-      "mail probe delivered_ts and recipient identity"
+      "mail probe delivered_ts and recipient identity",
+      "If no driven persona exists, record sans-sonde explicitly; do not report actual mail delivery"
     ],
     "stop_rule": "first failure restores that host and stops sequence before later hosts",
     "proofs": [
@@ -101,9 +102,12 @@
   },
   "open_points": [
     "Server has zero active registered agents: sans-sonde must not be reported as actual mail delivery; author/pilot to qualify server mail-health evidence",
-    "1195: confirm ignored inherited AGENT_MESH_CONFIG and *_DATABASE_URL aliases in read-only preflight using invalid synthetic values, without printing private configuration",
     "All stored rollback references must still resolve before any host mutation",
     "Initial local configuration lacks HOTES_STAGING and contains stale PERSONAS_VM; private separate configuration prepared, original unchanged"
   ],
-  "previous_candidate_review_sha": "142805d278338d96a9d00293f2c875d13dabdd83"
+  "previous_candidate_review_sha": "142805d278338d96a9d00293f2c875d13dabdd83",
+  "target_proposal": "64b22e2ee5c5dc43477dee51db23edc182cf6eb1",
+  "target_status": "main recipe target proposed by author; must be frozen and approved by pilot, distinct from script review SHA",
+  "global_readonly_preflight": "operator verifies all four hosts separately before selected-VM fault run; selected run alone verifies only its selected hosts",
+  "1195_evidence": "auditeur GO on142805d2, constant delta on1f05b5c9, author red/green bank; no additional synthetic probe on live mesh"
 }
