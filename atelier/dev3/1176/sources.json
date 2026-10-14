@@ -1,0 +1,201 @@
+{
+  "lot": 1176,
+  "head": "24701c985b5aa08ab99986ca77c0263971a6aca4",
+  "pr": 905,
+  "branche": "lot/1176-pace-ceiling",
+  "classe": "sensible argent (src/ameesh/accounts.py, src/ameesh/cost.py ; garde autorisations/budget)",
+  "main": "2458ec053123d3f33644fef1e092fc84cc2773d9",
+  "measured_at": "2026-10-14T21:04:12Z",
+  "union_tree": "44ca153f0b930b99b2e551eeecae878b649461b3",
+  "union_ref": "refs/atelier/1176/union-main-2458ec05",
+  "pieces_ref": "refs/atelier/1176/pieces-main-2458ec05",
+  "fichiers": [
+    {
+      "path": "docs/COMPTES.md",
+      "head": "4a391f4472242e35e42475c61758ae0bedb72287",
+      "union": "4a391f4472242e35e42475c61758ae0bedb72287",
+      "main_eq_base": true,
+      "patchid": "79e03e15ffa02243966cf7cb5f108fc4bbe88d68",
+      "patchid_union": "79e03e15ffa02243966cf7cb5f108fc4bbe88d68",
+      "constant": true
+    },
+    {
+      "path": "src/ameesh/accounts.py",
+      "head": "573649b851352b1b198302aab5092d3560955afd",
+      "union": "573649b851352b1b198302aab5092d3560955afd",
+      "main_eq_base": true,
+      "patchid": "3646f9a996bdfc0f570aa5b9731aedd2961ec0f2",
+      "patchid_union": "3646f9a996bdfc0f570aa5b9731aedd2961ec0f2",
+      "constant": true
+    },
+    {
+      "path": "src/ameesh/cost.py",
+      "head": "ba7e6a8c52807ae1fc72393d397c33263afe1efe",
+      "union": "ba7e6a8c52807ae1fc72393d397c33263afe1efe",
+      "main_eq_base": true,
+      "patchid": "4f2f6c8f4281d15d568f3a0582b3eb37507a3e34",
+      "patchid_union": "4f2f6c8f4281d15d568f3a0582b3eb37507a3e34",
+      "constant": true
+    },
+    {
+      "path": "src/ameesh/mesh_cli.py",
+      "head": "6f424aec3d10b5646b34309e3b087a727710291e",
+      "union": "40965b19133265d81da079e9f976ec9c7fd1b182",
+      "main_eq_base": false,
+      "patchid": "4d91c6ce8810e839d42bc3045c76a490655aa064",
+      "patchid_union": "4d91c6ce8810e839d42bc3045c76a490655aa064",
+      "constant": true
+    },
+    {
+      "path": "tests/test_1176_pace_ceiling.py",
+      "head": "8fdb3363ab161034930f218b905234a490646557",
+      "union": "8fdb3363ab161034930f218b905234a490646557",
+      "main_eq_base": false,
+      "patchid": "437a7540a040b80dd0f2ff25918d0e3345518dc0",
+      "patchid_union": "437a7540a040b80dd0f2ff25918d0e3345518dc0",
+      "constant": true
+    }
+  ],
+  "sources": [
+    {
+      "kind": "lot-milestone",
+      "ref": "work:1176#milestone:4215",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T13:28:18.622021+00:00",
+      "sha": "ce86f6581a7608cdc549d70cf86095b38eba95ac",
+      "verdict": "ok",
+      "texte": "R1delta Codex cx1 : GO0B/0P2/0N sur intégration main68a18f75 au gelf9d7e43f. Remerge-diff conflit unique accounts.py commentaire : garde #898 croisement rythme/reset et #1176 relèvement fin fenêtre. AST accounts/cost/mesh_cli/test1176 identiques au gel relu ; mesh_cli et test1176 blobs constants. docsCOMPTES reçoit exactement le patch main898, aucun nouveau delta propre. B1/B2 fermés surf9 conservés. Diff-check propre, aucun rejeu203tests auteur. R2Claude, CIexacte et feu pilote distincts."
+    },
+    {
+      "kind": "lot-milestone",
+      "ref": "work:1176#milestone:3823",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T04:18:46.442007+00:00",
+      "sha": "f9d7e43f51c4885a85c2c7d724997e415cec04b9",
+      "verdict": "ok",
+      "texte": "R1 delta Codex indépendante cx1 GO ; B1/B2 fermés, aucun nouveau B. Lecture statique + témoins minimaux payload brut -> limits/evaluate, réécriture étrangère .claude.json, preuve périmée/in_use ; aucune suite rejouée. Avis exact https://github.com/manaty/ameesh/pull/905#pullrequestreview-5513007728 ; avis Claude delta, CI exacte et feu pilote distincts."
+    },
+    {
+      "kind": "lot-milestone",
+      "ref": "work:1176#milestone:3793",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T03:56:14.131877+00:00",
+      "sha": "c74eb14658f3d8f28f5361479e3f8a7411b02e65",
+      "verdict": "blocked",
+      "texte": "R1 Codex reelle ameesh-cx1 : 2 B/P2 sensibles. credits Codex vide/partiel => capable False => ceiling .98 sans preuve ; .claude.json raison ancienne + reecriture etrangere => mtime frais => ceiling .98 sans datation de la raison. N2/N4 de #1227 requalifies B sur ce gel. Temoins Python minimaux checkout exact, pas de suite rejouee. Publication review COMMENT car compte GitHub auteur commun interdit REQUEST_CHANGES."
+    },
+    {
+      "kind": "lot-milestone",
+      "ref": "work:1176#milestone:3773",
+      "actor": "bureau",
+      "famille": "Claude (compte Claude 3)",
+      "at": "2026-10-14T03:35:25.518474+00:00",
+      "sha": "c74eb14658f3d8f28f5361479e3f8a7411b02e65",
+      "verdict": "ok",
+      "texte": "Relecture Claude (bureau, compte Claude 3) : tête c74eb146 = gel. pace_ceiling/pace_ceiling_end/hours validés strictement, relèvement seulement si overage impossible prouvé (relevé capable=False avec fenêtre vivante, ou cache .claude.json daté dans la fenêtre), jamais en overage ; overage_cap 80 % et coupure isUsingOverage intacts ; pace=False avec comptes déclarés. Tests 1176 (35) + 171 liés OK. 0 B, 4 N (until trop tôt si fenêtre longue, has_credits absent = preuve, sous_utilisation/progress à 0,90, mtime proxy)."
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1176#event:16942",
+      "actor": "ameesh-cx1",
+      "famille": "Codex",
+      "at": "2026-10-14T14:12:10.849455+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 cx1, contrôle indépendant de constance R1 ce86f658 -> 24701c985b5aa08ab99986ca77c0263971a6aca4 : union exacte ce86 + c4fa14a23, merge-tree rc0/tree3a6b91374f60e0c009b99579ac0488001de7e56a. 5/5 patch-ids -U0 par fichier constants entre68a18f75..ce86 et c4fa..2470 ; accounts/cost/test1176 blob-identiques ; mesh_cli/COMPTES ne gagnent que les apports main (merge-pr/doc helper Git). Avis R1 GO0B/0P2/0N conservé dans son périmètre1176, B1/B2 fermés inchangés. Preuve TMPDIR cx1/review-1176-24701c98/checks.json. Aucun rejeu tests ni qualification R2/CI ; feu nominatif pilote16:05 lu à la source, reste suspensif à ses conditions."
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1176#event:16896",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T14:05:57.798783+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Qualification pilote de constance après refusion ce86f658 + main c4fa14a2 : union merge-tree exacte, arbre3a6b91374f60e0c009b99579ac0488001de7e56a ; 5/5 patch-ids -U0 constants. accounts.py/cost.py/test1176 blob-identiques ; COMPTES et mesh_cli n’ajoutent que main, notamment commande merge-pr sans toucher les plafonds. R1 Codex cx1/16637 conservée par identité du contenu relu ; aucune nouvelle lecture Claude déduite. Feu16698 adapté nominativement à24701c98 : reste SUSPENSIF à R2 Claude réelle couvrant B1/B2 f9d7 + union898, CI applicable sur cette tête exécutée/verte sans part annulée et fraîcheur main/union contrôlée au geste. Fusion auteur dev3 avec --match-head-commit24701c98 ; nouveau delta/résolution exige adaptation. Pas d’activation de compte déduite. Preuve reprise-1600/proof-1176"
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1176#event:16698",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T13:39:06.107566+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 mesh-design : FEU de fusion CONDITIONNEL nominatif surce86f6581a7608cdc549d70cf86095b38eba95ac/PR905 : R1deltaCodexcx1 GOdu15:29 acquise ; condition suspensive R2Claude réelle finale couvrantB1/B2f9d7+union898 (historique3773/c74insuffisant), CIapplicableexacteverte/partsattendues exécutées/checksrequis + fraîcheurmainetunionau geste. Fusionauteurdev3 avecmatch-head-commit ; toutnouveaucontenu/résolutionrequiertavisdelta/adaptation. DemandeClaude1098repointée surce86. AucunavisClaude/vertCIprétendu ; pasd’activationcap/comptedéduite, opérationsréellesbureau/mandatcanon10."
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1176#event:13230",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T04:00:37.459315+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 mesh-design : R1 Codex cx1 jalon3793 BLOCKED sur c74eb146, deux B/P2 sensibles confirmés comme portes du lot : credits Codex vide/partiel ne prouve pas capable=False ; mtime du contenant .claude.json ne date pas cachedExtraUsageDisabledReason. N2/N4 de1227 sont repris dans1176, à corriger avant fusion, pas différés aprèsactivation. Auteur dev3 conserve la PR905, nouveau gel après correctifs et témoins payload brut→limits, avis cx1 + Claude réelle sur delta final, CI applicable et feu distinct. Aucun feu de fusion/activation sur c74eb146 ; R2historique3773 ne ferme pas ces B."
+    },
+    {
+      "kind": "lot-event",
+      "ref": "work:1176#event:13157",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T03:52:08.130090+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "14/10 mesh-design : R1 Codex indépendant désigné = ameesh-cx1, sur c74eb14658f3d8f28f5361479e3f8a7411b02e65 / PR905 ; auteur ameesh-dev3 conservé. R2 Claude bureau jalon3773 acquise, constats N au lot1227. Source owner retrouvée dans canon home52c64aba processus/lots.md §11, complément session bureauClaude17076001 du14/10 vers04:00 : fin de fenêtre au-delà90% dès1176actif seulement si overage impossible prouvé ; overage possible reste80%, refus absolu. Relecture demandée sur preuve négative/fraîche, données inconnues/périmées et caps ; pas de suite rejouée par le relecteur. Aucun feu fusion ni changement de comptes : avis Codex, CI exacte et feu final encore requis."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41394",
+      "actor": "ameesh-dev3",
+      "famille": "DeepSeek (auteur)",
+      "at": "2026-10-14T20:53:44+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Candidature pieces §12 pour les 5 lots qa, mesures sur main 2458ec05."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41401",
+      "actor": "ameesh-dev3",
+      "famille": "DeepSeek (auteur)",
+      "at": "2026-10-14T20:54:36+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Rectificatif : mesh_cli.py commun au candidat #1204 (union 3a29bf9d), composition rc=0 arbre fe221492."
+    },
+    {
+      "kind": "mail",
+      "ref": "mail:41489",
+      "actor": "mesh-design",
+      "famille": "Codex (pilote)",
+      "at": "2026-10-14T20:57:59+00:00",
+      "sha": null,
+      "verdict": null,
+      "texte": "Disposition : #1219/#1277 candidatures légères reçues pour la préparation APRÈS les gels #1342/#1204, aucun ajout à ces paquets ; unions et CI#1277 conservées à portée, fraîcheur/composition à requalifier au prochain manifeste ; #1247 et #1323 gardent R2 Claude / dépendance #1155 ; réserve Claude #1176 à qualifier au manifeste ; pièces atelier et sources à fournir au préparateur ultérieur, sans nouvelle CI ni changement de tête."
+    },
+    {
+      "kind": "forge",
+      "ref": "pr:1176",
+      "actor": null,
+      "famille": null,
+      "at": null,
+      "sha": "24701c985b5aa08ab99986ca77c0263971a6aca4",
+      "verdict": "qa",
+      "texte": "PR #905 OPEN mergeStateStatus=BLOCKED tête=24701c985b5a (lecture gh unique au 2026-10-14T21:04:12Z)"
+    },
+    {
+      "kind": "ci",
+      "ref": "ci:38576724858",
+      "actor": null,
+      "famille": null,
+      "at": "2026-10-14T19:22:45Z",
+      "sha": "24701c985b5a",
+      "verdict": "cancelled",
+      "texte": "run 38576724858 pull_request completed/cancelled tête 24701c985b5a (lecture gh unique)"
+    }
+  ]
+}

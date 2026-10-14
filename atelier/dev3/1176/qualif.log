@@ -1,0 +1,15 @@
+MAIN 2458ec053123d3f33644fef1e092fc84cc2773d9
+LOT #1176 branche lot/1176-pace-ceiling
+HEAD 24701c985b5aa08ab99986ca77c0263971a6aca4
+BASE c4fa14a23b07bd4fe07a9d162049774f3e90cb24
+merge-tree rc=0
+44ca153f0b930b99b2e551eeecae878b649461b3
+
+  docs/COMPTES.md                                            head=4a391f4472 union=4a391f4472 main==base:oui patchid_const=YES
+  src/ameesh/accounts.py                                     head=573649b851 union=573649b851 main==base:oui patchid_const=YES
+  src/ameesh/cost.py                                         head=ba7e6a8c52 union=ba7e6a8c52 main==base:oui patchid_const=YES
+  src/ameesh/mesh_cli.py                                     head=6f424aec3d union=40965b1913 main==base:NON patchid_const=YES
+  tests/test_1176_pace_ceiling.py                            head=8fdb3363ab union=8fdb3363ab main==base:NON patchid_const=YES
+fichiers=5 migrations=0
+
+mesure 2026-10-14T21:04:12Z ; methode patch-id: git diff -U0 <base> <head> -- <f> vs git diff -U0 2458ec053123 <union> -- <f>
