@@ -43,14 +43,28 @@ QUOTA_PATTERNS = (
     re.compile(r"plafond (?:de |du )?(?:forfait|cr[eé]dit)", re.I),
 )
 
-#: motifs d'un débit passager (429, surcharge, Retry-After…)
+#: motifs d'un débit passager (429, surcharge, Retry-After…) — signatures
+#: fournisseur **positives**, comme les quotas : un numéro de ligne « 429 »,
+#: le sujet « rate limit » ou l'adjectif « overloaded » d'un texte libre ne
+#: désarment pas L48 et ne taisent pas l'alerte #1268 (P2 dev1 du 14/10 : un
+#: tour réellement en échec repartait sinon toutes les 10 min sans fin).
 TRANSIENT_PATTERNS = (
-    re.compile(r"\b429\b"),
-    re.compile(r"rate[_ -]?limit", re.I),
-    re.compile(r"too many requests", re.I),
-    re.compile(r"overloaded", re.I),
-    re.compile(r"retry[- ]after", re.I),
-    re.compile(r"temporarily unavailable", re.I),
+    # un « 429 » doit nommer une panne HTTP, pas une ligne de trace
+    re.compile(r"\b(?:http|status|code|error|response|request|api|upstream)\b"
+               r"[^\n]{0,24}?\b429\b", re.I),
+    re.compile(r"\b429\b[^\n]{0,24}?\b(?:too many requests|rate[_ -]?limit)",
+               re.I),
+    # un statut « 429 » seul (texte entier) reste une signature
+    re.compile(r"^\s*(?:http[\s/]*)?429\s*$", re.I),
+    # « rate limit » doit nommer la panne (error/exceeded/reached), pas le sujet
+    re.compile(r"rate[_ -]?limit(?:ed|s|ing)?[ _-]?"
+               r"(?:error|exceeded|reached|exception)", re.I),
+    re.compile(r"\btoo many requests\b", re.I),
+    # « overloaded » : forme fournisseur, ou invite explicite à réessayer
+    re.compile(r"overloaded[_ -]?error", re.I),
+    re.compile(r"\boverloaded\b[^\n]{0,40}\b(?:try again|retry)", re.I),
+    re.compile(r"\bretry[- ]after\b", re.I),
+    re.compile(r"\btemporarily unavailable\b", re.I),
 )
 
 #: genres rendus par `classify`

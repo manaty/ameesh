@@ -81,6 +81,37 @@ class ClassifyTest(unittest.TestCase):
             with self.subTest(texte=texte):
                 self.assertIsNone(rate_limit.classify(error=texte))
 
+    def test_debit_seulement_sur_signature_fournisseur(self):
+        # P2 dev1 (14/10) : « line 429 », le sujet « rate limit » ou
+        # l'adjectif « overloaded » d'un texte libre ne sont pas des
+        # signatures de débit — sinon un tour réellement en échec repart
+        # toutes les 10 min (L48 désarmé) et l'alerte #1268 est tue.
+        for texte in ("Traceback (most recent call last):\n"
+                      "  File \"runner.py\", line 429, in run\n"
+                      "ValueError: boom",
+                      "j'ai corrigé le handling du rate limit dans rate_limit.py",
+                      "le parseur est overloaded par les options",
+                      "voir la ligne 429 du journal"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(result=texte))
+                self.assertIsNone(rate_limit.classify(stderr_tail=texte))
+
+    def test_signatures_ancrees_du_debit(self):
+        # les formes fournisseur réelles restent des signatures : contexte
+        # d'erreur HTTP, phrase 429, ou statut seul.
+        for texte in ("Error code: 429 - rate limit reached",
+                      "HTTP 429 Too Many Requests",
+                      "429",
+                      "RateLimitError: too many requests",
+                      "The engine is currently overloaded, please try again later",
+                      "Rate limit exceeded"):
+            with self.subTest(texte=texte):
+                self.assertEqual(rate_limit.classify(error=texte),
+                                 rate_limit.RATE_LIMITED)
+                self.assertEqual(rate_limit.classify(result=texte),
+                                 rate_limit.RATE_LIMITED)
+
 
 class DelaiTest(unittest.TestCase):
     def test_cadence_1_2_5_10_min_puis_palier(self):
@@ -161,6 +192,23 @@ class RepriseTest(_Base):
             self.assertEqual(etat["streak"], 2)
             self.assertAlmostEqual(worker.failure_wait(), 120.0, delta=2.0)
             self.assertFalse(worker.fast_failure)
+        finally:
+            worker.watchdog_stop.set()
+
+    FAUX_429 = {"AMEESH_TEST_RESULT": "Traceback (most recent call last):\n"
+                                      "  File \"runner.py\", line 429, in run\n"
+                                      "ValueError: boom",
+                "AMEESH_TEST_EXIT": "1"}
+
+    def test_une_ligne_429_ne_desarme_pas_l48(self):
+        # P2 dev1 (14/10) : un texte libre qui contient « line 429 » n'est pas
+        # un 429 fournisseur — le tour compte comme un échec rapide (L48 armé)
+        # et aucun épisode de débit n'est ouvert.
+        _, worker = self._worker("rl8", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(worker, **self.FAUX_429))
+            self.assertIsNone(worker.rate_limit)
+            self.assertTrue(worker.fast_failure)
         finally:
             worker.watchdog_stop.set()
 
