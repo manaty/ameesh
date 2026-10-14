@@ -43,7 +43,7 @@ import uuid
 
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
-from . import budget as budget_mod, db as db_mod, fil, mail, registry, sentinel, storage
+from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import persona_memory as memory_mod
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
@@ -3755,6 +3755,11 @@ class AgentWorker(threading.Thread):
             # L105 : borne du courrier remis par le hook pendant ce tour
             "AMEESH_TURN_MAIL_MAX": str(self.turn_mail_max()),
         }
+        # #834 : l'identité git de la session — auteur ET committer — vient du
+        # nom d'agent du bail, jamais de la configuration du dépôt (partagée
+        # par tous les worktrees : un `user.name` écrit par un agent valait
+        # pour les autres, incident du 13/10/2026).
+        identite.update(identity.git_identity(self.name))
         env.update(identite)
         if getattr(self.runner, "mediated", False):
             self._mediated_env(env)
@@ -5455,6 +5460,9 @@ class Runner:
         `canon_sync.sync` ; un canon illisible enregistre l'état `unreadable`,
         ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
         cours. Un échec — canon, git, base — est journalisé et rend `False`.
+        L780 : un exécuteur plus vieux que le paquet installé saute la passe
+        sans rien écrire (canon_state, responsables et placements restent au
+        dernier passage valide) et demande un redémarrage entre deux tours.
         """
         if getattr(self, "mediated", False):
             return True  # L109 : le canon est synchronisé par le serveur
@@ -5463,6 +5471,24 @@ class Runner:
         self._canon_complete = not entries
         if not entries:
             return True
+        # L780 : livraison sous ce processus (paquet mis à jour, arbre source
+        # tiré) — l'ancien code, validateur de descripteurs compris, ne juge
+        # plus le canon. Rien n'est écrit ni fermé : l'état reste au dernier
+        # passage valide, la porte d'hôte reste fermée, la passe est signalée
+        # une fois, et le remède est un redémarrage entre deux tours.
+        stale = harnesses.stale_reason()
+        if stale:
+            self._canon_complete = False
+            if not getattr(self, "_stale_reported", False):
+                self._stale_reported = True
+                log_async("canon sync skipped: outdated runner (%s) — restart it "
+                          "between turns" % stale)
+                note = getattr(self, "_fil_note", None)
+                if note is not None:
+                    note("outdated runner: %s; canon_state unchanged and no new claim "
+                         "until a restart between turns" % stale,
+                         meta={"kind": "runner-outdated"})
+            return False
         db = None
         ok = True
         try:
@@ -6907,6 +6933,8 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
         "AMEESH_RUNNER_ID": owner, "AGENT_MESH_RUNNER_ID": owner,
         "AMEESH_LEASE_EPOCH": str(epoch), "AGENT_MESH_LEASE_EPOCH": str(epoch),
     })
+    # #834 : la session attachée porte la même identité git qu'un tour.
+    env.update(identity.git_identity(name))
     if harness:
         env["AMEESH_HARNESS"] = harness  # L224 : comme pour un tour
     return env
