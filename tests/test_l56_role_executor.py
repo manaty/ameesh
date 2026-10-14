@@ -155,11 +155,16 @@ class RoleExecutorTest(PgTestCase):
         existing = {r["rolname"] for r in self.db.query(
             "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
         script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+
+        def run_writers():
+            return subprocess.run(
+                ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                 "-f", script], capture_output=True, text=True, timeout=60,
+                env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+
         try:
             for _ in range(2):
-                proc = subprocess.run(["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                                       "-f", script], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                proc = run_writers()
                 self.assertEqual(proc.returncode, 0, proc.stderr)
             # This class has a private database: never mutate shared bench ACLs.
             for grantee in (*names, "PUBLIC"):
@@ -168,15 +173,39 @@ class RoleExecutorTest(PgTestCase):
                     self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
                                     (q(self.database), target))
                     try:
-                        proc = subprocess.run(
-                            ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                             "-f", script], capture_output=True, text=True, timeout=60,
-                            env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                        proc = run_writers()
                         self.assertNotEqual(proc.returncode, 0)
                         self.assertIn("must not create temporary objects", proc.stderr)
                     finally:
                         self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
                                         (q(self.database), target))
+            # #1194 (N1): the groups are NOLOGIN, so a member login holding
+            # TEMP re-opens the shadowing path; the audit walks the direct and
+            # inherited memberships, not just the group.
+            member = "t_writer_member_" + uuid.uuid4().hex[:8]
+            inherited = "t_writer_parent_" + uuid.uuid4().hex[:8]
+            self.db.execute("CREATE ROLE %s LOGIN" % q(member))
+            self.db.execute("CREATE ROLE %s NOLOGIN" % q(inherited))
+            try:
+                self.db.execute("GRANT %s TO %s" % (q("ameesh_it_qa"), q(inherited)))
+                self.db.execute("GRANT %s TO %s" % (q(inherited), q(member)))
+                for grantee in (inherited, member):
+                    with self.subTest(temp_member=grantee):
+                        self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
+                                        (q(self.database), q(grantee)))
+                        try:
+                            proc = run_writers()
+                            self.assertNotEqual(proc.returncode, 0)
+                            self.assertIn("has a member with TEMP", proc.stderr)
+                        finally:
+                            self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                            (q(self.database), q(grantee)))
+                # A member without TEMP leaves the contract intact.
+                proc = run_writers()
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            finally:
+                self.db.execute("DROP OWNED BY %s, %s" % (q(member), q(inherited)))
+                self.db.execute("DROP ROLE %s, %s" % (q(member), q(inherited)))
             self.assertEqual(self.run_script(self.role).returncode, 0)
             for name in names:
                 self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
