@@ -6,6 +6,10 @@ vers `main`/`release/**`, ou une PR, déclenche la suite). **Aucun geste de
 production n'a été fait pour l'écrire** : rien n'est déclaré sur un hôte, rien
 n'est mis en file.
 
+Version corrigée le 2026-10-14 06:50Z : socle réel des profils sur `pc-smichea`
+(`~/.config/ameesh/runner-profiles/`) et drop-in porteur trié **après**
+`zz-compte-owner-1013.conf`, après relevé du bureau sur PC (14/10 06:47Z).
+
 Objet : préparer le jour de pilote **L160f** ([#183](https://github.com/manaty/ameesh/issues/183)) —
 Nexlink confie l'ordre et l'exécution de ses fusions vers `develop` à ameesh
 (décision #11882 de l'owner, acceptation de l'orchestrateur Nexlink du 12/10
@@ -173,8 +177,13 @@ lèvent), **pas l'existence du dépôt** : un `repo` inexistant passe le parseur
 La clé `radar` désigne l'hôte qui fait tourner le radar **et** la file (une
 passe après chaque relevé de branches, ~300 s). **Rien n'est actif pour nexlink
 aujourd'hui** : relevé par `mesh-design` le 13/10 23:15, la clé `radar` est
-absente des trois profils locaux de `pc-smichea` (`config.json`,
-`runner-profiles/critiques-2.json`, `runner-profiles/relecteurs-codex1.json`) ;
+absente des trois profils locaux de `pc-smichea`
+(`/home/smichea/.config/ameesh/config.json`,
+`/home/smichea/.config/ameesh/runner-profiles/critiques-2.json`,
+`/home/smichea/.config/ameesh/runner-profiles/relecteurs-codex1.json` ; chemins
+réels relevés sur PC par le bureau le 14/10 06:47Z — le socle court
+`/home/smichea/runner-profiles/` employé dans la première version de ce
+document **n'existe pas**) ;
 `ameesh conflicts --project nexlink` rend `reports=[]` et la file `develop` est
 vide. Ne pas la déclarer sur deux hôtes : deux passes lanceraient deux
 exécuteurs pour la même file (courrier radar en double) — le même raisonnement
@@ -182,35 +191,55 @@ vaut pour deux unités du même hôte, d'où le profil dédié ci-dessous.
 
 Deux choix reviennent au bureau avant l'application :
 
-* **un profil dédié, une seule unité** — `runner-profiles/critiques-2.json`
-  n'est pas le profil d'**une** unité mais de **trois** sur `pc-smichea`
-  (`mesh-design`, auditeur, orchestrateur ; drop-ins vérifiés par
-  `mesh-design` le 13/10 23:21) : y ajouter `radar.projects.nexlink` armerait
+* **un profil dédié, une seule unité** —
+  `/home/smichea/.config/ameesh/runner-profiles/critiques-2.json` n'est pas le
+  profil d'**une** unité mais de **trois** sur `pc-smichea` (`mesh-design`,
+  auditeur, orchestrateur ; drop-ins vérifiés par `mesh-design` le 13/10 23:21) :
+  y ajouter `radar.projects.nexlink` armerait
   trois passes radar à leurs prochaines reprises, donc trois exécuteurs pour la
   même file. Créer un **profil dédié** — copie du profil de comptes approprié,
   section `accounts` **inchangée**, plus la seule carte §2 — et le faire lire
   par **une seule unité** (drop-in `Environment=AMEESH_CONFIG=<chemin absolu>`
-  ou unité dédiée). Les trois unités existantes gardent `critiques-2.json`,
-  sans clé `radar` ;
+  **trié après** `zz-compte-owner-1013.conf`, §3bis — ou unité dédiée). Les
+  trois unités existantes gardent `critiques-2.json`, sans clé `radar` ;
 * **la méthode de recharge** — l'exécuteur lit la configuration à son
   démarrage : redémarrer **la seule unité désignée** (`systemctl --user restart
   ameesh-runner-agent@<agent>.service`), ou attendre son prochain redémarrage.
   Avant recharge, vérifier qu'une seule unité référence le profil dédié et que
   les autres n'ont pas la clé `radar` (§4, étape 4).
 
-### 3bis. Proposition dev3 (14/10 06:05Z) — pièces exactes, à valider
+### 3bis. Proposition dev3 corrigée (14/10 06:50Z) — pièces exactes, à valider
 
-Préparée pour la validation du bureau demandée le 14/10 05:57Z (courrier
-bureau → dev3), avant le créneau proposé du 14/10 08:30 CEST. Aucun geste
-appliqué : rien n'existe sur `pc-smichea` de ce qui suit.
+Première version à 06:05Z, **corrigée** après le relevé du bureau sur PC
+(14/10 06:47Z) : le socle proposé `/home/smichea/runner-profiles/` n'existe
+pas, et un drop-in `10-radar-nexlink.conf` est trié **avant**
+`zz-compte-owner-1013.conf`, donc écrasé par lui. La version corrigée ci-dessous
+n'est **pas appliquée** : le bureau n'a reconfiguré aucune unité et n'a activé
+aucun créneau.
 
 | pièce | valeur |
 |---|---|
 | unité existante désignée | `ameesh-runner-agent@orchestrateur.service` |
-| profil source (comptes) | `/home/smichea/runner-profiles/critiques-2.json` |
-| profil dédié | `/home/smichea/runner-profiles/radar-nexlink.json` |
-| drop-in | `~/.config/systemd/user/ameesh-runner-agent@orchestrateur.service.d/10-radar-nexlink.conf` |
+| profil de comptes (source) | `/home/smichea/.config/ameesh/runner-profiles/critiques-2.json` (chemin effectif relevé par le bureau ; le littéral du drop-in peut être relatif, `config.load` le résout par `os.path.abspath`, `src/ameesh/config.py:_expand`) |
+| profil dédié | `/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json` |
+| drop-in porteur | `zzz-radar-nexlink.conf`, dans le **même répertoire** que `zz-compte-owner-1013.conf` (relevé par `systemctl --user show -p DropInPaths <unité>`, §4 étape 0) |
+| contenu du drop-in | `[Service]` puis `Environment=AMEESH_CONFIG=/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json` |
 | rechargement | `systemctl --user daemon-reload && systemctl --user restart ameesh-runner-agent@orchestrateur.service` |
+
+**Pourquoi post-`zz`** : systemd lit les drop-ins d'une unité par ordre
+alphabétique et, pour une même variable, la **dernière** affectation
+`Environment=` l'emporte. `zz-compte-owner-1013.conf` fixe `AMEESH_CONFIG` au
+profil partagé ; un `10-radar-nexlink.conf` serait lu avant lui et perdrait.
+`zzz-` est trié strictement après `zz-`, dans le même répertoire. Le drop-in du
+propriétaire n'est **ni modifié ni retiré** (consigne bureau du 14/10 06:47Z) :
+ses réglages de comptes restent en vigueur. Si le répertoire de
+`zz-compte-owner-1013.conf` n'est pas inscriptible (drop-in système), **ne rien
+écrire** : la stratégie revient au bureau, explicitement revue.
+
+**Pourquoi un chemin absolu dans le drop-in** : un `AMEESH_CONFIG` relatif est
+résolu depuis le répertoire courant du processus, qui n'est pas le répertoire
+des profils ; l'absolu lève l'ambiguïté entre le littéral du drop-in et le
+chemin effectif relevé par le bureau.
 
 Pourquoi l'orchestrateur : c'est le rôle qui tient la file et le jour de
 pilote (§5) ; l'auditeur est en lecture seule et `mesh-design` ne lance ni
@@ -218,27 +247,27 @@ l'application ni le jour de pilote (§7.4). Le choix reste au bureau : les trois
 unités lisent le même `critiques-2.json`, changer d'unité ne change que le nom
 d'instance du drop-in.
 
-**Diff exact** (aucune autre modification ; le profil partagé
-`critiques-2.json`, la section `accounts` et les deux autres unités ne sont pas
-touchés) :
+**Diff exact** (aucune autre modification ; profil partagé
+`critiques-2.json`, section `accounts` et deux autres unités non touchés) :
 
 1. `cp -a "$SRC" "$CFG"` puis sauvegarde `cp -a "$CFG" "$CFG.bak-<date>"` ;
 2. insertion du seul bloc `radar.projects.nexlink` de §2 dans `$CFG` ;
-3. création du drop-in, contenu exact :
+3. création de `$DROPIN` (`zzz-radar-nexlink.conf`), contenu exact :
 
    ```ini
    [Service]
-   Environment=AMEESH_CONFIG=/home/smichea/runner-profiles/radar-nexlink.json
+   Environment=AMEESH_CONFIG=/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json
    ```
 
-**Recharge** : §4 étapes 3 à 5 (validation du schéma, contrôle d'unicité
-`systemctl --user show -p Environment` + `systemctl --user cat`, contrôle à
-blanc). **Retour** : §6 (retirer le drop-in, `rm` du profil dédié, recharger
-cette seule unité). Un seul effet de bord : le redémarrage de l'unité coupe le
-runner de l'orchestrateur le temps de la reprise — c'est le geste du bureau
-(§7.4).
+**Recharge et preuves** : §4 étapes 0, 3, 4 et 5 — état de départ,
+`systemctl --user show -p Environment -p DropInPaths` (le nôtre en dernier),
+environnement **réel** du processus (`/proc/<MainPID>/environ`), comptes
+inchangés, contrôle à blanc. **Retour** : §6 — retirer **ce seul** drop-in et
+le profil dédié ; `zz-compte-owner-1013.conf` reste intact. Un seul effet de
+bord : le redémarrage de l'unité coupe le runner de l'orchestrateur le temps de
+la reprise — c'est le geste du bureau (§7.4).
 
-L'instance exacte du drop-in se contrôle sur l'hôte avant de l'écrire :
+L'instance exacte de l'unité se contrôle sur l'hôte avant d'écrire :
 `systemctl --user list-units 'ameesh-runner-agent@*'` et le bail du registre
 donnent le nom d'instance (`runner-orchestrateur@laptop` → `orchestrateur`) ;
 depuis `ameesh-agents-1` je n'ai ni DNS ni accès à `pc-smichea`, la
@@ -265,16 +294,19 @@ profil de comptes d'origine (sa section `accounts` est reprise telle quelle),
 `CFG` le nouveau fichier dédié, `UNIT` l'unité existante désignée :
 
 ```bash
-SRC=/home/smichea/runner-profiles/critiques-2.json  # profil de comptes d'origine
-CFG=/home/smichea/runner-profiles/radar-nexlink.json # nouveau profil dédié
+SRC=/home/smichea/.config/ameesh/runner-profiles/critiques-2.json  # profil de comptes d'origine
+CFG=/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json # nouveau profil dédié
 UNIT=ameesh-runner-agent@orchestrateur.service      # unité existante désignée (§3bis)
-DROPIN=~/.config/systemd/user/$UNIT.d/10-radar-nexlink.conf
+ZZ=$(systemctl --user show -p DropInPaths --value "$UNIT" | tr ' ' '\n' \
+     | grep -E '/zz-compte-owner-1013\.conf$')      # drop-in du propriétaire, à préserver
+DROPIN="${ZZ%/*}/zzz-radar-nexlink.conf"            # même répertoire, trié APRÈS zz
 REPO=~/development/manaty/nexlink
 AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
 ```
 
-0. **Vérifier l'hôte** — version, outillage et clone (le parseur ne vérifie ni
-   l'un ni l'autre) :
+0. **Vérifier l'hôte** — version, outillage, clone **et le chemin réel du
+   profil de comptes** (le parseur ne vérifie ni l'existence du clone ni celle
+   du profil ; le socle court proposé le 14/10 06:05Z n'existait pas) :
 
    ```bash
    ameesh --version                              # attendu : 1.10.0
@@ -286,6 +318,10 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    git -C "$REPO" fetch --prune origin           # prouve l'accès du compte au dépôt
    "$AMEESH_PY" -c "from ameesh import radar; print('land' in radar.PROJECT_KEYS, 'generated' in radar.PROJECT_KEYS)"
    # attendu : True True
+   test -f "$SRC"                                # le socle doit exister
+   test -n "$ZZ" || echo "zz introuvable : NE RIEN ÉCRIRE, stratégie à revoir"
+   echo "drop-in porteur : $DROPIN"              # même répertoire que zz, nom post-zz
+   systemctl --user show -p Environment -p DropInPaths "$UNIT"   # état de départ
    ```
 
 1. **Créer le profil dédié et le sauvegarder** — copie du profil de comptes
@@ -301,8 +337,10 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    ne rien écraser ; JSON sans commentaire ni virgule finale) ; le profil
    partagé reste intact.
 
-3. **Valider** le schéma du profil entier (lève ici si la carte est fausse ;
-   même interpréteur qu'à l'étape 0), **puis** vérifier le dépôt par git :
+3. **Valider le chargement** — le schéma du profil entier, celui que l'unité
+   lira (`$CFG`, pas le partagé), avec l'interpréteur de l'exécuteur
+   (`$AMEESH_PY`, celui du venv) : `radar.parse_settings` lève ici si la carte
+   est fausse. **Puis** vérifier le dépôt par git :
 
    ```bash
    "$AMEESH_PY" - "$CFG" <<'PY'
@@ -317,15 +355,59 @@ AMEESH_PY="$(dirname "$(readlink -f "$(command -v ameesh)")")/python3"
    ```
 
 4. **Faire pointer une seule unité sur le profil dédié, puis la recharger** —
-   drop-in `Environment=AMEESH_CONFIG=<chemin absolu de $CFG>` sur l'unité
-   désignée (`$DROPIN`, contenu exact en §3bis) ; les autres unités restent sur
-   `critiques-2.json`. Contrôler `systemctl --user show -p Environment $UNIT`
-   et `systemctl --user cat $UNIT` (drop-ins) : une seule unité référence
-   `$CFG`, aucune autre n'a la clé `radar`. Puis
-   `systemctl --user daemon-reload && systemctl --user restart $UNIT` ;
-   l'exécuteur ne relit pas la configuration à chaud.
+   écrire `$DROPIN` (contenu exact en §3bis) : même répertoire que
+   `zz-compte-owner-1013.conf`, nom trié **après** le sien ; ne jamais modifier
+   ni retirer ce dernier. Relire la fusion systemd **avant** de redémarrer :
 
-5. **Contrôle à blanc** (lecture seule) :
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user show -p Environment -p DropInPaths "$UNIT"
+   # attendu : DropInPaths liste .../zz-compte-owner-1013.conf PUIS
+   #           .../zzz-radar-nexlink.conf (le nôtre en dernier) ;
+   #           Environment contient
+   #           AMEESH_CONFIG=/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json
+   ```
+
+   Puis redémarrer **cette seule** unité et prouver l'environnement **réel** du
+   processus — l'exécuteur ne relit pas la configuration à chaud :
+
+   ```bash
+   systemctl --user restart "$UNIT"
+   PID=$(systemctl --user show -p MainPID --value "$UNIT")
+   tr '\0' '\n' < /proc/"$PID"/environ | grep '^AMEESH_CONFIG='
+   # attendu : AMEESH_CONFIG=/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json
+   systemctl --user cat "$UNIT"     # drop-ins effectivement lus, zz inclus
+   ```
+
+   La chaîne de preuve est alors complète : systemd (`Environment`,
+   `DropInPaths`) → `$CFG` → chargement `radar` (étape 3) → `accounts`
+   inchangés (étape 5).
+
+   Les autres unités restent sur `critiques-2.json` ; une seule unité référence
+   `$CFG`, aucune autre n'a la clé `radar`.
+
+5. **Prouver que les comptes sont inchangés — puis contrôle à blanc.** Le
+   profil dédié doit être le profil source **plus** la seule carte §2 :
+
+   ```bash
+   "$AMEESH_PY" - "$SRC" "$CFG" <<'PY'
+   import copy, json, sys
+   src = json.load(open(sys.argv[1]))
+   dst = json.load(open(sys.argv[2]))
+   reste = copy.deepcopy(dst)
+   projets = reste.get("radar", {}).get("projects", {})
+   projets.pop("nexlink", None)
+   if not projets:
+       reste.get("radar", {}).pop("projects", None)
+   if not reste.get("radar"):
+       reste.pop("radar", None)
+   print("accounts inchangés :", src.get("accounts") == dst.get("accounts"))
+   print("reste identique    :", src == reste)
+   PY
+   # attendu : deux True
+   ```
+
+   Contrôle à blanc (lecture seule) :
 
    ```bash
    AMEESH_CONFIG="$CFG" ameesh conflicts --project nexlink   # état de départ : reports=[]
@@ -362,10 +444,14 @@ plus de commit** : pour repousser, `ameesh work queue remove <lot>` d'abord.
 * **Atterrissage** : repasser `land` à `"off"` dans la configuration (ou
   retirer l'entrée `nexlink`), recharger l'exécuteur : la file continue
   d'ordonner, l'orchestrateur fusionne le rang 1 à la main.
-* **Configuration** : restaurer la sauvegarde de l'étape 1 (ou supprimer le
-  profil dédié et retirer le drop-in `AMEESH_CONFIG` de `$UNIT`, qui reprend
-  `critiques-2.json`), puis `systemctl --user daemon-reload && systemctl --user
-  restart $UNIT` — **cette seule unité**.
+* **Configuration** : restaurer la sauvegarde de l'étape 1, ou supprimer le
+  profil dédié et retirer **le seul** `$DROPIN` (`zzz-radar-nexlink.conf`),
+  puis `systemctl --user daemon-reload && systemctl --user restart $UNIT` —
+  **cette seule unité**. `zz-compte-owner-1013.conf` n'est **jamais** retiré ni
+  modifié (consigne bureau du 14/10 06:47Z) : l'unité reprend le profil partagé
+  `critiques-2.json`. Prouver le retour par
+  `systemctl --user show -p Environment -p DropInPaths $UNIT` (le nôtre a
+  disparu) puis, après redémarrage, `/proc/<MainPID>/environ`.
 
 ## 7. Décisions et points ouverts
 
@@ -390,15 +476,21 @@ Tranché le 13/10 :
    clé `radar` ; la recharge est le redémarrage de cette seule unité (§3, §4).
    `mesh-design` (13/10 23:21) confirme : ne pas ajouter `radar` au profil
    partagé, sinon les trois unités s'arment à leurs reprises. **Proposition
-   dev3 (14/10 06:05Z, §3bis)** : unité existante
+   dev3 corrigée (14/10 06:50Z, §3bis)** : unité existante
    `ameesh-runner-agent@orchestrateur.service`, profil
-   `/home/smichea/runner-profiles/radar-nexlink.json` dérivé de
-   `/home/smichea/runner-profiles/critiques-2.json`, drop-in
-   `10-radar-nexlink.conf`, recharge `daemon-reload` + `restart` de cette
-   unité ; à valider par le bureau avant le créneau.
-6. **Créneau du 14/10** — après REL-11 ; la **liste initiale des PR** est
-   fixée au démarrage par l'orchestrateur Nexlink, hors sensibles `915`, `695`
-   et `943` en vol.
+   `/home/smichea/.config/ameesh/runner-profiles/radar-nexlink.json` dérivé de
+   `/home/smichea/.config/ameesh/runner-profiles/critiques-2.json`, drop-in
+   `zzz-radar-nexlink.conf` (même répertoire que `zz-compte-owner-1013.conf`,
+   trié après lui ; le drop-in du propriétaire reste intact), recharge
+   `daemon-reload` + `restart` de cette unité ; preuves d'environnement effectif
+   et de comptes inchangés en §4 ; à valider par le bureau avant tout créneau.
+6. **Créneau du 14/10** — **le créneau 08:30 CEST n'est pas activé** : le
+   bureau l'a refusé sur la première proposition (réserve du 14/10 06:47Z,
+   socle inexistant et drop-in trié avant `zz`) et n'a reconfiguré aucune unité
+   ni armé aucun créneau. Un **nouveau créneau ne sera proposé qu'après
+   qualification** des pièces corrigées (§3bis) par le bureau ; la **liste
+   initiale des PR** est fixée au démarrage par l'orchestrateur Nexlink, hors
+   sensibles `915`, `695` et `943` en vol.
 7. **Portes** — les deux portes locales suffisent-elles pour le pilote, ou
    faut-il des portes par chemin (`scripts/__tests__/*.test.mjs`) dès le
    premier jour ?
