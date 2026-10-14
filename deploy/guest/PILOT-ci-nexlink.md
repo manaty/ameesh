@@ -18,7 +18,7 @@ missing, so nothing is activated.
 | | |
 |---|---|
 | Runners | `ameesh-nxl-<host>-1…N`: **1 to qualify**, a 2nd only if the post-job disk check of §6 passes (1 to 4); registered to `manaty/ameesh`, label `ameesh-ci` (the fleet's `runs-on`) |
-| Guest | user `ameesh-guest`, slice `ameesh-guest.slice`, root `/srv/ameesh-guest`, containers in **rootless Podman** |
+| Guest | user `ameesh-guest`, slice `ameesh-guest.slice`, root `/srv/ameesh-guest`, containers in **rootless Podman**; the privileged tools root installs (`docker` shim, gate wrapper) live **outside** that root, in `/usr/local/lib/ameesh-guest-ci` (§4, row 11) |
 | Host | one static CI VM of the Nexlink fleet (`scaleway-ci`), chosen and confirmed by its pilot; nothing else on it changes |
 | Duration | temporary: from the activation go to the removal below; the offer can be closed at any time by the guard or by the host's pilot |
 | Cost | none: the VM is already paid for; the guard stops the guests as soon as the application's jobs need it (the fleet is not idle in bursts: ci-3 went 0/4 to 4/4 within a minute on 2026-10-14 06:30–06:33Z, so a guest running then would have been reclaimed at once) |
@@ -40,7 +40,7 @@ persistent listener does not — R1 #1256; plus PSI and memory thresholds).
 | ameesh pilot | `mesh-design` | classes the lot, qualifies each gel, gives the merge and activation fires; owns the canon Host fiche PR |
 | Bureau | `bureau` | distributes, mints the short-lived registration token (admin), opens/closes the removal |
 | Auditor | `auditeur` | verifies the rules are applied and the evidence is first-hand |
-| Author / operator | `mty-amh-impl-07` | prepares this plan, the script and its witness; runs the read-only preflight |
+| Author / operator | `mty-amh-impl-07` | prepares this plan, the script and its witness; runs the read-only preflight; the R1-delta fix keeping the privileged tools out of the guest's root comes from `ameesh-cx3` (binôme canon §2, 2026-10-14) |
 
 An agent never changes a host's units on its own: the VM-side commands are
 run by the owner or by the host's pilot, with the script under review. The
@@ -72,11 +72,14 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
   restarts the CI runners.
 * **New**: `deploy/guest/ameesh-guest-ci@.service` (the runner unit),
   `deploy/guest/ci-runner-gate.py` (installed as
-  `/srv/ameesh-guest/bin/ci-runner-gate`: the unit's `ExecStart`, it starts
-  `run.sh` only while the guard publishes a fresh `available` state out of
+  `/usr/local/lib/ameesh-guest-ci/ci-runner-gate`: the unit's `ExecStart`,
+  it starts `run.sh` only while the guard publishes a fresh `available`
+  state out of
   `enforce`, and stops it when the state closes, disappears or goes stale —
   the GitHub runner knows nothing of the gate, R1 #1256),
-  `deploy/guest/ci-runners.sh` (prepare/register/enable/check/remove) and
+  `deploy/guest/ci-runners.sh` (prepare/register/enable/check/remove; root
+  writes only the tools outside the guest's root, and every mutation under it
+  runs as the guest — R1 delta B4, binôme) and
   `tests/test_1256_ci_runners.py`. `deploy/guest/install-pilot.sh` gains
   `--agent-units PATTERN` (default unchanged; the pattern must stay in the
   guest namespace, R1 #1256). The guard's job signal gains
@@ -178,6 +181,7 @@ GitHub-side deletion is run by the bureau (admin token), not on the VM.
 | 8 | The tokens are distinct | registration minted for `manaty/ameesh` only, read from a root-only file, `.credentials` 0600 `ameesh-guest`; the script never sees a Nexlink token | `.runner` `serverUrl`; `gh api repos/manaty/ameesh/actions/runners` |
 | 9 | The workspaces are separate | each runner has its own `_work`; the application's sweep is nominative (its `RUNNER_NAME`) and never looks at `ci/rN` | its `self-hosted-sweep.sh` (Nexlink repo) |
 | 10 | The disk is watched | own directory on the root filesystem (no volume on this VM), `disk_free_min`/`disk_paths` in the offer, `df` floor at prepare (`--disk-floor-mib`; 15 GiB default, 6 GiB qualified on ci-3, §3) | `df -Pk /srv/ameesh-guest`; `--check`; guard state |
+| 11 | The privileged tools are out of the guest's reach | `docker` shim and gate wrapper installed in `/usr/local/lib/ameesh-guest-ci` (root:root); the whole chain is checked (no symlink, root-owned, not group/other-writable) before every `--prepare` and `--remove`; every creation, extraction, publication and removal under `/srv/ameesh-guest` runs as `ameesh-guest` | `ls -ld /usr/local/lib/ameesh-guest-ci /usr/local/lib/ameesh-guest-ci/docker`; witness `tests/test_1256_ci_runners.py` (a symlinked tools path, ancestor or tool file is refused; no root mutation names a path under the guest tree; removal goes through `runuser`) |
 
 Residual limits, stated rather than hidden: the guest shares the kernel (a
 rootless container is not a VM); a job killed at level 4 is lost, not
@@ -191,7 +195,13 @@ unit whose cgroup cannot be read counts as busy (the application wins); the
 actions-runner tarball is copied to a root-private snapshot (0700/0600), its
 pinned digest is verified there, and the **guest** extracts that snapshot —
 the cache and the destination, both under the guest's `$ROOT`, are never
-unpacked by root (R1 delta B4, #1256); the gate
+unpacked by root (R1 delta B4, #1256); the two files root installs (the
+`docker` shim and the gate wrapper) are written outside `$ROOT`, in
+`/usr/local/lib/ameesh-guest-ci`, after the chain's ownership, mode and
+symlink-free state have been checked (`root_tools_safe`, before `--prepare`
+and `--remove`), so a guest rename after that check cannot redirect a
+privileged write or removal — the guest owns `$ROOT`, not this chain (R1
+delta B4, binôme impl-07/cx3, 2026-10-14); the gate
 wrapper follows the guard's own state TTL (90 s, rewritten every 30 s) and a
 state it cannot read is closed, so a guard that dies or hangs stops the guest
 runners instead of leaving them running.
@@ -302,10 +312,13 @@ The order matters; nothing else is touched.
    untouched).
 4. **Host side**: `ci-runners.sh --remove` (deregisters the host side,
    stops and removes the units, the shim, the gate wrapper and the runner
-   directories it recorded in `/etc/ameesh/ci-runners.state`;
-   `--keep-workspaces` keeps the logs). It never touches `actions.runner.*`,
-   `/home/runner`, the application's Docker daemon, or the other ameesh
-   guest files.
+   directories it recorded in `/etc/ameesh/ci-runners.state`; the shim and
+   the wrapper are the two files of `/usr/local/lib/ameesh-guest-ci`, whose
+   directory is removed too when empty; only what `--prepare` recorded is
+   removed, and a tools path swapped for a link makes the whole removal
+   refuse; `--keep-workspaces` keeps the logs). It never touches
+   `actions.runner.*`, `/home/runner`, the application's Docker daemon, or
+   the other ameesh guest files.
 5. **Canon**: the pilot merges the Host fiche PR that removes the loan (or
    records its end); the lot notes the final API state.
 
