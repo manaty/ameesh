@@ -1,0 +1,26 @@
+{
+  "session": "9741542b-2f7d-49f3-9f24-b3c643a10666",
+  "primary_log": "/home/smichea/.claude-tertiary/projects/-home-smichea-development-manaty-ameesh-revue-c3-2/9741542b-2f7d-49f3-9f24-b3c643a10666.jsonl",
+  "review_sha": "7f81941705095e25c0999883715e4f5d36859664",
+  "worker": "revue-c3-2-1003-delta",
+  "evidence": [
+    {
+      "kind": "assistant_verdict",
+      "line": 83,
+      "timestamp": "2026-10-14T05:50:09.335Z",
+      "model": "claude-opus-5-5",
+      "tool_id": "toolu_012mY4tKg99ZtUATL7bt2tDL",
+      "command": "ameesh work milestone 1003 verdict ok --sha 7f81941705095e25c0999883715e4f5d36859664 --actor bureau --note \"Relecture Claude (bureau, compte Claude 3) : GO 0 B sur 7f8194170509 (= gel, PR #776). Delta ca3004314..7f8194 relu + module complet : N1 ferm\u00e9 \u2014 PR d\u00e9j\u00e0 MERGED refus\u00e9e sans gel du lot == --head == headRefOid, branche == headRefName, cible, projet, lot non ferm\u00e9 ; rien n'est \u00e9crit avant ; --dry-run ne d\u00e9clare plus. 50/50 tests.test_1003_merge_pr. N : project explicite ignor\u00e9 sur la voie already, branche projet\u2260app non test\u00e9e, commentaires noqa en fran\u00e7ais.\"",
+      "line_sha256": "3ea0ad543723b007dad4fcd19f23501a8a8650010e9dca9ed6d5305f0c5cf50b"
+    },
+    {
+      "kind": "result",
+      "line": 84,
+      "timestamp": "2026-10-14T05:50:13.958Z",
+      "tool_id": "toolu_012mY4tKg99ZtUATL7bt2tDL",
+      "is_error": false,
+      "content": "milestone verdict added to lot #1003 (ok)",
+      "line_sha256": "1198ffeafb3ad7ed57fe592e6e0c074e072d8ed147f1a8e1f19fcadf68f8e4d4"
+    }
+  ]
+}
