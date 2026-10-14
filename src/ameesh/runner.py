@@ -3727,13 +3727,27 @@ class AgentWorker(threading.Thread):
             self.pgid = proc.pid
         return proc
 
+    def _resident_probe(self, rp) -> bool:
+        """T3 : la sonde de vivacité bornée, hors tour (aucun tour ne court).
+        Jamais d'exception : un pilote qui se trompe vaut « muet », pas un
+        tour cassé."""
+        from . import resident_runner
+        try:
+            return bool(rp.driver.probe(resident_runner.PROBE_TIMEOUT_S))
+        except Exception as exc:  # noqa: BLE001 — la sonde ne casse pas le tour
+            log("[%s] liveness probe failed (%s): treated as silent"
+                % (self.name, exc))
+            return False
+
     def _resident_for_turn(self, adapter, *, key: tuple, session: str | None, cwd: str,
                            env: dict, model, effort, tier, lot, stderr_path: str):
         """Le processus résident qui sert ce tour : celui qui tourne si sa clé
         de lancement et sa session sont celles du tour, sinon un neuf (repris
-        sur la session). None si le démarrage échoue : ce tour, et les
-        suivants pendant une attente croissante (`_resident_failed`), sont
-        servis un par événement."""
+        sur la session). Un résident muet (il vit, son protocole ne répond
+        plus) est arrêté et compté comme un échec : ce tour est servi un par
+        événement. None si le démarrage échoue : ce tour, et les suivants
+        pendant une attente croissante (`_resident_failed`), sont servis un
+        par événement."""
         from . import containers as containers_mod, resident, resident_runner
         with self.lock:
             rp = self.resident
@@ -3743,6 +3757,16 @@ class AgentWorker(threading.Thread):
                         "launch settings changed" if rp.key != key else
                         "session changed" if (rp.session or None) != (session or None) else
                         "a turn still running" if rp.driver.busy else "")
+            if not pourquoi and rp.probe_due():
+                # T3 : sonde bornée, hors tour (le tour n'est pas lancé) — un
+                # processus muet ne sert pas ce tour
+                if self._resident_probe(rp):
+                    rp.mark_alive()
+                else:
+                    raison = "silent: no answer to the liveness probe"
+                    self._resident_failed(raison)
+                    self._close_resident(raison)
+                    return None
             if not pourquoi:
                 return rp
             self._close_resident("restarted: %s" % pourquoi)
@@ -3873,6 +3897,7 @@ class AgentWorker(threading.Thread):
             pass
         rp.turns += 1
         rp.last_used = time.monotonic()
+        rp.mark_alive()          # T3 : le tour qui vient de finir est une preuve de vie
         urgence = self._urgent_end() or (
             "the host is withdrawing" if self.host_yield is not None else
             "stopping" if self.stopping.is_set() else "")
@@ -3887,7 +3912,9 @@ class AgentWorker(threading.Thread):
         """Entre deux tours : un résident mort est fermé (un échec, T2) ; un
         résident inactif depuis `resident_sleep`, ou sous la pression de
         l'hôte, est endormi — `dormant` (bail gardé, réveil au prochain tour
-        sur sa session) ; `resident=off` l'arrête."""
+        sur sa session) ; `resident=off` l'arrête ; un résident muet (T3) est
+        sondé, borné, hors tour : sans réponse il est arrêté et compté comme
+        un échec résident, le tour suivant repart sur un processus neuf."""
         from . import resident_runner
         with self.lock:
             rp = self.resident
@@ -3909,6 +3936,15 @@ class AgentWorker(threading.Thread):
             if sommeil and time.monotonic() - rp.last_used >= sommeil:
                 self._close_resident("asleep after %ds without a turn" % int(sommeil))
                 self._note_dormant("asleep after %ds without a turn" % int(sommeil))
+            elif rp.probe_due():
+                # T3 : il vit ; son protocole répond-il encore ? La sonde est
+                # bornée et hors tour (aucun tour ne court ici)
+                if self._resident_probe(rp):
+                    rp.mark_alive()
+                else:
+                    raison = "silent between turns: no answer to the liveness probe"
+                    self._resident_failed(raison)
+                    self._close_resident(raison)
 
     def _menage_apres_tour(self, menage_tour, turn_id: str, spec: dict) -> None:
         """L73 : quota du dossier temporaire, worktrees apparus, /tmp signalé ;

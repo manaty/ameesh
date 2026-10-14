@@ -27,12 +27,14 @@ Interface (`ResidentDriver`): `start()` opens or resumes the session;
 `send(text)` starts a turn and returns its `Turn` handle (`ResidentBusy` if
 one is running); `steer(text)` serves an input at the safe point of the
 running turn (outside a turn, it is `send`); `interrupt()` ends the running
-turn without killing the process; `probe()` checks that the harness answers;
-`close()` stops the process group. A turn steered one or more times stays
-**one** logical turn: its `TurnResult` lists every input it served, whatever
-the protocol does underneath (a second `result` for Claude, a second
-`turn/start` for Codex when the steer lost the race against the end of the
-turn, a second `session/prompt` for ACP).
+turn without killing the process; `probe(timeout)` checks, bounded, that the
+harness answers — a control round-trip (`initialize` again for Claude,
+`thread/read` for Codex, `session/list` for ACP), where any answer, a refusal
+too, proves it alive; `close()` stops the process group. A turn steered one or
+more times stays **one** logical turn: its `TurnResult` lists every input it
+served, whatever the protocol does underneath (a second `result` for Claude, a
+second `turn/start` for Codex when the steer lost the race against the end of
+the turn, a second `session/prompt` for ACP).
 
 Every event read from the harness goes to `on_event(raw, parsed)`: `raw` is
 the harness's own message, `parsed` the contract of `adapters.StreamReader`
@@ -99,6 +101,11 @@ class InputRefused(ResidentError):
 
 class ResidentBusy(ResidentError):
     """A turn is running: the input waits for its end (or is steered)."""
+
+
+class RequestRefused(ResidentError):
+    """The harness answered a control request, but refused it: it is alive
+    (`probe`), which is not the same as silence."""
 
 
 def log(message: str) -> None:
@@ -853,8 +860,8 @@ class ClaudeStreamJson(ResidentDriver):
                 self._controls.pop(request_id, None)
         response = slot["response"] or {}
         if response.get("subtype") != "success":
-            raise ResidentError("%s refused: %s" % (request.get("subtype"),
-                                                     response.get("error") or response))
+            raise RequestRefused("%s refused: %s" % (request.get("subtype"),
+                                                      response.get("error") or response))
         return response
 
     def _user(self, text: str, wire: str, input_id: str) -> None:
@@ -895,6 +902,22 @@ class ClaudeStreamJson(ResidentDriver):
         except ResidentError as exc:
             log("interrupt: %s" % exc)
             return False
+
+    def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
+        """Does the harness answer? The `initialize` handshake of `start()`,
+        sent again outside a turn and bounded by `timeout`: it carries no turn
+        and no state the driver depends on. Any answer — a refusal too — proves
+        the control channel and its reader alive; only silence, or a process
+        gone meanwhile, is a failure (L76 T3, #285)."""
+        if not self.alive:
+            return False
+        try:
+            self._control({"subtype": "initialize"}, timeout)
+        except RequestRefused:
+            return True                     # it answered
+        except ResidentError:
+            return False                    # silence, or gone meanwhile
+        return True
 
     # -- reading -----------------------------------------------------------
     def _read_loop(self) -> None:
