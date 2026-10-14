@@ -24,12 +24,14 @@ vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
 alternates), aucun worktree, aucun `fetch`. Une paire n'est recalculée que si
 l'une de ses deux pointes a bougé (cache en mémoire de l'exécuteur).
 
-Une cible qui nomme une branche (`develop`) est lue sur la ref publiée
-`origin/<branche>` quand elle existe : dans un clone partagé, la branche
-locale reste figée alors que les agents poussent (#1333). La sonde des
-migrations ne parle que d'une cible **certifiée** : `git ls-remote` (lecture
-seule, rien n'est écrit dans le dépôt) vérifie que la ref lue est bien la
-pointe publiée ; sinon la sonde se tait et le rapport dit pourquoi.
+Une cible qui nomme une branche — `develop`, `origin/develop`,
+`refs/remotes/origin/develop`, `refs/heads/develop`, `release/1.x`, ou
+`origin/HEAD` — est lue sur la ref publiée de son remote quand elle existe :
+dans un clone partagé, la branche locale reste figée alors que les agents
+poussent (#1333). Un SHA ou un tag est une cible figée, lue telle quelle. La
+sonde des migrations ne parle que d'une cible **certifiée** : `git ls-remote`
+(lecture seule, rien n'est écrit dans le dépôt) vérifie que la ref lue est
+bien la pointe publiée ; sinon la sonde se tait et le rapport dit pourquoi.
 
 Le résultat est un journal de l'hôte, pas une table : le dernier passage dans
 `<state_dir>/radar/<projet>.json` (lu par `ameesh conflicts`), et une ligne par
@@ -387,39 +389,97 @@ def _numbers_in(repo: str, commit: str, directory: str) -> dict[str, str]:
     return out
 
 
-def _plain_branch(target: str) -> str | None:
-    """`develop` → `develop` ; une ref déjà qualifiée (`origin/develop`,
-    `refs/…`, un SHA) → None : elle se lit telle quelle."""
-    if not target or "/" in target or plan_git._SHA_RE.match(target):
+_REMOTE_REFS = "refs/remotes/"
+_HEADS_REFS = "refs/heads/"
+
+
+def _remotes(repo: str) -> tuple[str, ...]:
+    """Les remotes déclarés du dépôt (`git remote`), `origin` par défaut."""
+    names = tuple((plan_git._out(repo, "remote") or "").split())
+    return names or ("origin",)
+
+
+def _branch_target(target: str, remotes: tuple[str, ...]) -> tuple[str, str] | None:
+    """(remote, branche) d'une cible qui nomme une branche, None sinon.
+
+    Toutes les écritures d'une branche sont reconnues — `develop`,
+    `origin/develop`, `refs/remotes/origin/develop`, `refs/heads/develop` — y
+    compris un nom qui porte un slash (`release/1.x`, #1333) : le premier
+    segment n'est un remote que s'il est déclaré. Un SHA est un cas distinct
+    (cible figée) : None, lu tel quel."""
+    target = (target or "").strip()
+    if not target or plan_git._SHA_RE.match(target):
         return None
-    return target
+    if target == "HEAD":
+        return "origin", "HEAD"
+    if target.startswith(_REMOTE_REFS):
+        remote, _, branch = target[len(_REMOTE_REFS):].partition("/")
+        return (remote, branch) if remote and branch else None
+    if target.startswith(_HEADS_REFS):
+        branch = target[len(_HEADS_REFS):]
+        return ("origin", branch) if branch else None
+    if "/" in target:
+        head, _, branch = target.partition("/")
+        if branch and head in remotes:
+            return head, branch
+    return "origin", target
 
 
-def target_commit(repo: str, target: str) -> tuple[str | None, str, str | None]:
-    """(commit, ref lue, branche publiée) de la cible.
-
-    Une cible qui nomme une branche est lue sur `origin/<branche>` quand
-    cette ref existe : dans un clone partagé, la branche locale reste figée
-    pendant que les agents poussent (#1333). La branche locale ne sert que de
-    repli, et la branche rendue permet à l'appelant de certifier la pointe
-    publiée (`published_tip`)."""
-    branch = _plain_branch(target)
-    if not branch:
-        return plan_git._commit(repo, target), target, None
-    remote = plan_git._commit(repo, "refs/remotes/origin/" + branch)
-    if remote:
-        return remote, "origin/" + branch, branch
-    return plan_git._commit(repo, target), target, branch
+def _symbolic_head(repo: str, remote: str) -> str | None:
+    """La branche que désigne `refs/remotes/<remote>/HEAD`, ou None."""
+    resolved = plan_git._out(repo, "symbolic-ref", "--quiet",
+                             _REMOTE_REFS + remote + "/HEAD")
+    prefix = _REMOTE_REFS + remote + "/"
+    if resolved and resolved.startswith(prefix) and len(resolved) > len(prefix):
+        return resolved[len(prefix):]
+    return None
 
 
-def published_tip(repo: str, branch: str) -> str | None:
-    """La pointe publiée de `branch` sur `origin`, lue par `git ls-remote` :
+def target_commit(repo: str, target: str,
+                  remotes: tuple[str, ...] | None = None
+                  ) -> tuple[str | None, str, str | None, str | None]:
+    """(commit, ref lue, branche publiée, remote publié) de la cible.
+
+    Une cible qui nomme une branche — quelle qu'en soit l'écriture — est lue
+    sur `refs/remotes/<remote>/<branche>` quand cette ref existe : dans un
+    clone partagé, la branche locale reste figée pendant que les agents
+    poussent (#1333). La branche locale ne sert que de repli ; la branche et
+    le remote rendus permettent à l'appelant de certifier la pointe publiée
+    (`published_tip`). `origin/HEAD` est résolu sur la branche qu'il désigne.
+    Un SHA, un tag ou une ref qui n'est pas une branche sont rendus tels quels,
+    sans branche publiée : cas distinct, sans certification."""
+    remotes = _remotes(repo) if remotes is None else remotes
+    split = _branch_target(target, remotes)
+    if split is None:
+        return plan_git._commit(repo, target), target, None, None
+    remote, branch = split
+    if branch == "HEAD":
+        resolved = _symbolic_head(repo, remote)
+        if resolved:
+            branch = resolved
+        else:
+            return (plan_git._commit(repo, _REMOTE_REFS + remote + "/HEAD"),
+                    remote + "/HEAD", "HEAD", remote)
+    tracking = _REMOTE_REFS + remote + "/" + branch
+    found = plan_git._commit(repo, tracking)
+    if found:
+        return found, remote + "/" + branch, branch, remote
+    local = plan_git._commit(repo, _HEADS_REFS + branch)
+    if local:
+        return local, target, branch, remote
+    return plan_git._commit(repo, target), target, None, None
+
+
+def published_tip(repo: str, remote: str, branch: str) -> str | None:
+    """La pointe publiée de `branch` sur `remote`, lue par `git ls-remote` :
     lecture seule, rien n'est écrit dans `.git`, aucun `fetch`. None si elle
     est illisible (réseau, droits, branche absente) : la cible n'est alors pas
-    certifiée et la sonde des migrations se tait (#1333)."""
+    certifiée et la sonde des migrations se tait (#1333). `branch == "HEAD"`
+    certifie la pointe par défaut du remote."""
+    spec = "HEAD" if branch == "HEAD" else _HEADS_REFS + branch
     try:
-        proc = _git(repo, "ls-remote", "--exit-code", "origin",
-                    "refs/heads/%s" % branch, timeout=LS_REMOTE_TIMEOUT)
+        proc = _git(repo, "ls-remote", "--exit-code", remote, spec,
+                    timeout=LS_REMOTE_TIMEOUT)
     except GitError:
         return None
     if proc.returncode != 0:
@@ -458,12 +518,12 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     """Le radar sur un dépôt. `lots` : `{id, branch, branch_target?, title?,
     assignee?}`. Rend le rapport (sans horodatage ni durée).
 
-    `verify` (facultatif) : `(dépôt, branche) -> pointe publiée | None`,
+    `verify` (facultatif) : `(dépôt, remote, branche) -> pointe publiée | None`,
     appelée pour une cible qui nomme une branche afin de certifier la ref
     lue avant la sonde des migrations (`run_pass` passe `published_tip`,
     lecture seule). Une certification qui échoue ou constate une pointe non
     récupérée laisse la cible non certifiée : la sonde se tait. Sans
-    `verify`, la ref `origin/<branche>` est crue telle quelle.
+    `verify`, la ref de la branche est crue telle quelle.
 
     Un dépôt superficiel suspend la sonde des migrations : `merge-base` peut
     y rendre une frontière fausse, et le delta d'une branche contiendrait
@@ -479,6 +539,7 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     # fausse (ou rien) : le delta d'une branche contiendrait alors les
     # migrations de la cible. Conservateur : la sonde se tait.
     shallow = plan_git._out(repo, "rev-parse", "--is-shallow-repository") == "true"
+    remotes = _remotes(repo)
     branches: list[dict] = []
     skipped: list[dict] = []
     verified: dict = {}
@@ -492,8 +553,9 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if tip is None:
             continue                      # branche d'un autre dépôt, ou pas encore poussée
         target = row.get("branch_target") or default_target
-        head, head_ref, published_branch = target_commit(repo, target) if target \
-            else (None, target or "", None)
+        head, head_ref, published_branch, published_remote = (
+            target_commit(repo, target, remotes) if target
+            else (None, target or "", None, None))
         if head is None:
             skipped.append(dict(entry, reason="target %s not found" % (target or "—")))
             continue
@@ -502,22 +564,25 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
             certified = False
             reason = "shallow repository (history is incomplete)"
         elif published_branch and verify is not None:
-            if published_branch not in verified:
+            published_ref = "%s/%s" % (published_remote, published_branch)
+            key = (published_remote, published_branch)
+            if key not in verified:
                 try:
-                    verified[published_branch] = verify(repo, published_branch)
+                    verified[key] = verify(repo, published_remote, published_branch)
                 except Exception:  # noqa: BLE001 - une sonde ne fait jamais échouer le passage
-                    verified[published_branch] = None
-            published = verified[published_branch]
+                    verified[key] = None
+            published = verified[key]
             if not published:
                 certified = False
-                reason = "origin/%s is unreadable (network, rights or no fetch)" \
-                    % published_branch
+                reason = "%s is unreadable (network, rights or no fetch)" \
+                    % published_ref
             elif published != head:
                 found = plan_git._commit(repo, published)
                 if found is None:
                     certified = False
-                    reason = ("origin/%s is at %s, origin publishes %s (not fetched)"
-                              % (published_branch, head[:12], published[:12]))
+                    reason = ("%s is at %s, %s publishes %s (not fetched)"
+                              % (published_ref, head[:12], published_remote,
+                                 published[:12]))
                 else:
                     head, head_ref = found, published
         base = plan_git._out(repo, "merge-base", tip, head)

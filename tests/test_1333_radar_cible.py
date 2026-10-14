@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1333 : le radar lit la cible **publiée** (`origin/<branche>`), pas une
-branche locale périmée, et ne signale que les migrations du delta propre du
-lot — pas celles que la cible porte déjà.
+"""#1333 : le radar lit la cible **publiée** (`origin/<branche>`) quelle que
+soit l'écriture de la cible — `develop`, `origin/develop`,
+`refs/remotes/origin/develop`, `refs/heads/develop`, `release/1.x`,
+`origin/HEAD` —, pas une ref locale périmée, et ne signale que les migrations
+du delta propre du lot — pas celles que la cible porte déjà. Un SHA figé reste
+un cas distinct, lu tel quel sans certification (R1 B1).
 
 Incident : un clone partagé gardait `develop` local en retard de 266 commits
 sur `origin/develop` ; chaque branche ayant fusionné une develop fraîche
@@ -76,6 +79,9 @@ def make_remote(root) -> tuple[str, str, str, str]:
     _git(repo, "commit", "-qm", "develop avance")
     new = _git(repo, "rev-parse", "HEAD")
     _git(repo, "push", "-q", "origin", "develop")
+    # le clone a été fait sur un dépôt vide : la pointe par défaut du remote
+    # n'existe qu'après la première poussée (état normal d'un clone d'agent)
+    _git(repo, "remote", "set-head", "origin", "develop")
     _git(repo, "reset", "--hard", old)           # la branche locale reste périmée
     return repo, origin, old, new
 
@@ -95,6 +101,20 @@ def lot_branch(repo, name, edits, *, merge=True) -> str:
     tip = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "-q", "develop")
     return tip
+
+
+def advance_remote(root, origin, name="470_remote.sql") -> str:
+    """Une poussée depuis un AUTRE clone : `origin/develop` avance sans que le
+    dépôt du radar ne récupère — sa ref de suivi reste en arrière, comme dans
+    un clone partagé que personne ne fetch."""
+    other = os.path.join(root, "other")
+    _git(root, "clone", "-q", origin, other)
+    _write(other, MIG + "/" + name, "-- %s\n" % name)
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "avance distante")
+    ahead = _git(other, "rev-parse", "HEAD")
+    _git(other, "push", "-q", "origin", "develop")
+    return ahead
 
 
 #: la branche qui porte la vraie collision 435 n'a PAS fusionné develop : sa
@@ -142,30 +162,116 @@ class CertifiedTargetTest(unittest.TestCase):
                          [MIG + "/460_first.sql", MIG + "/460_second.sql"])
         self.assertIsNone(dups["460"]["in_target"])
 
-    def test_the_stale_local_ref_reproduces_the_incident(self):
-        """Témoin de la cause : avec la ref locale périmée, les migrations de
-        develop passent pour des doublons et la collision réelle 435 n'est pas
-        rattachée à la cible qui la porte."""
+    def test_every_branch_spelling_is_normalized_and_certified(self):
+        """#1333 R1 B1 : `origin/develop`, `refs/remotes/origin/develop`,
+        `refs/heads/develop` et la cible par défaut (`origin/HEAD`) nomment la
+        même branche publiée que `develop` ; la certification doit les
+        protéger toutes, pas seulement le nom nu."""
+        for spelling in ("develop", "origin/develop", "refs/remotes/origin/develop",
+                         "refs/heads/develop", None):
+            with self.subTest(spelling=spelling):
+                report = radar.scan(self.repo, LOTS, default_target=spelling,
+                                    migrations=MIG, verify=radar.published_tip)
+                self.assertEqual({b["target_ref"] for b in report["branches"]},
+                                 {"origin/develop"})
+                self.assertEqual({b["target_head"] for b in report["branches"]}, {self.new})
+                self.assertEqual(report["uncertified_targets"], [])
+                self.assertEqual(sorted(d["number"] for d in report["migrations"]),
+                                 ["435", "438", "460"])
+
+    def test_a_lagging_published_tip_uncertifies_every_spelling(self):
+        """La pointe publiée avance sans fetch : la ref de suivi est périmée,
+        quelle que soit l'écriture de la cible — certification et silence,
+        jamais les migrations héritées de develop."""
+        ahead = advance_remote(self.tmp, self.origin)
+        for spelling in ("develop", "origin/develop", "refs/remotes/origin/develop",
+                         "refs/heads/develop", None):
+            with self.subTest(spelling=spelling):
+                report = radar.scan(self.repo, LOTS, default_target=spelling,
+                                    migrations=MIG, verify=radar.published_tip)
+                self.assertEqual(report["migrations"], [])
+                self.assertEqual([t["ref"] for t in report["uncertified_targets"]],
+                                 ["origin/develop"])
+                self.assertIn("not fetched", report["uncertified_targets"][0]["reason"])
+                self.assertNotIn(ahead, {b["target_head"] for b in report["branches"]})
+
+    def test_the_stale_local_ref_reproduces_the_incident_without_verify(self):
+        """Témoin négatif conservé (auditeur) : sans certification, une cible
+        qui ne peut être lue que sur la branche locale périmée — pas de ref de
+        suivi — fait entrer les migrations de develop dans le delta de chaque
+        branche, et la collision réelle 435 n'est pas rattachée."""
+        _git(self.repo, "update-ref", "-d", "refs/remotes/origin/develop")
         stale = radar.scan(self.repo, LOTS, default_target="refs/heads/develop",
                            migrations=MIG)
         dups = {d["number"]: d for d in stale["migrations"]}
         self.assertIn("334", dups)
         self.assertIn("355", dups)
-        self.assertGreaterEqual(len(dups["334"]["lots"]), 2)
         self.assertEqual(len(dups["334"]["lots"]), 7)   # les 7 branches qui ont fusionné
         self.assertTrue({10, 11} <= {h["work_item"] for h in dups["334"]["lots"]})
         self.assertNotIn(30, {h["work_item"] for h in dups["334"]["lots"]})
         self.assertIsNone(dups["334"]["in_target"])
-        # la cible périmée ignore les migrations de develop : les doublons
-        # hérités sortent avec `in_target` vide, et la collision réelle 435
-        # n'est pas rattachée à la cible qui la porte
         self.assertIsNone(dups["435"]["in_target"])
         inherited = [h for h in dups["435"]["lots"]
                      if h["path"] == MIG + "/435_minors_age_policy.sql"]
         self.assertGreaterEqual(len(inherited), 2)
 
+    def test_certification_recovers_a_target_read_on_a_stale_local_branch(self):
+        """Même cas, avec `verify` : la pointe publiée est déjà présente
+        localement, la cible est lue dessus et la sonde redevient juste."""
+        _git(self.repo, "update-ref", "-d", "refs/remotes/origin/develop")
+        report = radar.scan(self.repo, LOTS, default_target="refs/heads/develop",
+                            migrations=MIG, verify=radar.published_tip)
+        self.assertEqual(report["uncertified_targets"], [])
+        self.assertEqual({b["target_head"] for b in report["branches"]}, {self.new})
+        self.assertEqual(sorted(d["number"] for d in report["migrations"]),
+                         ["435", "438", "460"])
+
+    def test_origin_head_is_resolved_to_its_branch(self):
+        report = radar.scan(self.repo, LOTS, default_target="origin/HEAD",
+                            migrations=MIG, verify=radar.published_tip)
+        self.assertEqual({b["target_ref"] for b in report["branches"]}, {"origin/develop"})
+        self.assertEqual({b["target_head"] for b in report["branches"]}, {self.new})
+        self.assertEqual(report["uncertified_targets"], [])
+
+    def test_a_pinned_sha_is_trusted_without_certification(self):
+        """Cas distinct (R1) : un SHA figé n'est pas une branche publiée, il se
+        lit tel quel — aucune certification n'est tentée."""
+        with mock.patch.object(radar, "published_tip") as tip:
+            report = radar.scan(self.repo, LOTS, default_target=self.old,
+                                migrations=MIG, verify=radar.published_tip)
+        tip.assert_not_called()
+        self.assertEqual({b["target_ref"] for b in report["branches"]}, {self.old})
+        self.assertEqual(report["uncertified_targets"], [])
+
+    def test_a_branch_name_with_a_slash_is_not_a_remote(self):
+        """`release/1.x` : le premier segment n'est un remote que s'il est
+        déclaré. La cible est lue sur `origin/release/1.x` et certifiée."""
+        _git(self.repo, "checkout", "-q", "-B", "release/1.x", "origin/develop")
+        _write(self.repo, MIG + "/470_release.sql", "-- 470\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "release 1.x")
+        release = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "push", "-q", "origin", "release/1.x")
+        _git(self.repo, "checkout", "-q", "-B", "lot/40-doc-release", "release/1.x")
+        _write(self.repo, "docs/release.md", "r\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "docs release")
+        _git(self.repo, "checkout", "-q", "develop")
+        lots = [dict(id=40, branch="lot/40-doc-release", title="docs release")]
+        for spelling in ("release/1.x", "origin/release/1.x", "refs/heads/release/1.x"):
+            with self.subTest(spelling=spelling):
+                report = radar.scan(self.repo, lots, default_target=spelling,
+                                    migrations=MIG, verify=radar.published_tip)
+                self.assertEqual({b["target_ref"] for b in report["branches"]},
+                                 {"origin/release/1.x"})
+                self.assertEqual({b["target_head"] for b in report["branches"]}, {release})
+                self.assertEqual(report["uncertified_targets"], [])
+                # le lot n'ajoute qu'une doc : la migration 470 de sa cible
+                # n'est à personne
+                self.assertEqual(report["migrations"], [])
+
     def test_an_uncertified_target_silences_the_probe(self):
-        report = self.scan(verify=lambda repo, branch: None)
+        report = self.scan(verify=lambda repo, remote, branch: None)
         self.assertEqual(report["migrations"], [])
         self.assertEqual([t["target"] for t in report["uncertified_targets"]], ["develop"])
         self.assertIn("unreadable", report["uncertified_targets"][0]["reason"])
@@ -173,7 +279,7 @@ class CertifiedTargetTest(unittest.TestCase):
         self.assertIn("cible non certifiée", "\n".join(radar.render(report)))
 
     def test_a_published_tip_not_fetched_is_uncertified(self):
-        report = self.scan(verify=lambda repo, branch: "0" * 40)
+        report = self.scan(verify=lambda repo, remote, branch: "0" * 40)
         self.assertEqual(report["migrations"], [])
         self.assertIn("not fetched", report["uncertified_targets"][0]["reason"])
 
@@ -196,20 +302,20 @@ class CertifiedTargetTest(unittest.TestCase):
         _git(self.repo, "commit", "-qm", "avance distante")
         advanced = _git(self.repo, "rev-parse", "HEAD")
         _git(self.repo, "checkout", "-q", "develop")
-        report = self.scan(verify=lambda repo, branch: advanced)
+        report = self.scan(verify=lambda repo, remote, branch: advanced)
         self.assertEqual(report["uncertified_targets"], [])
         self.assertEqual({b["target_head"] for b in report["branches"]}, {advanced})
 
     def test_published_tip_reads_the_remote_and_fails_closed(self):
-        self.assertEqual(radar.published_tip(self.repo, "develop"), self.new)
-        self.assertIsNone(radar.published_tip(self.repo, "absente"))
+        self.assertEqual(radar.published_tip(self.repo, "origin", "develop"), self.new)
+        self.assertIsNone(radar.published_tip(self.repo, "origin", "absente"))
         local = os.path.join(self.tmp, "sans-origin")
         os.makedirs(local)
         _git(local, "init", "-q", "-b", "develop")
         _write(local, "a.txt", "a\n")
         _git(local, "add", "-A")
         _git(local, "commit", "-qm", "a")
-        self.assertIsNone(radar.published_tip(local, "develop"))
+        self.assertIsNone(radar.published_tip(local, "origin", "develop"))
 
 
 class RunPassTargetTest(PgTestCase):
