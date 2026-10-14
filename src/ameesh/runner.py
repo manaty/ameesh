@@ -714,6 +714,9 @@ class AgentWorker(threading.Thread):
         retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         # L76 : rien ne survit au bail, pas même un processus résident inactif
         self._close_resident("lease released")
+        publisher = getattr(self, "_peek_publisher", None)
+        if publisher is not None:
+            publisher.close()
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         # L113 : le travail part au serveur sous le bail, puis le dossier est
         # effacé (même bail perdu : rien ne doit rester sur l'appareil)
@@ -5066,15 +5069,25 @@ class AgentWorker(threading.Thread):
                             status_text=status_text, error=error)
 
     def _parse(self, adapter: adapters.HarnessAdapter, line: str) -> dict:
+        self._peek_reader = getattr(adapter, "reader", None)
         try:
             return adapter.parse(line)
         except Exception as exc:  # un flux inattendu ne tue pas l'exécuteur
             return {"error": "unreadable stream: %s" % exc}
 
     # -- boucles -----------------------------------------------------------
+    def ensure_peek(self) -> None:
+        if getattr(self, "_peek_publisher", None) is None:
+            from .agent_peek import Publisher
+            self._peek_publisher = Publisher(
+                self.cfg, agent=self.name, owner=self.runner.runner_id, epoch=self.epoch,
+                cwd=lambda: self.agent.get("cwd") or "",
+                reader=lambda: getattr(self, "_peek_reader", None), warn=log_async)
+
     def process_once(self, wait_seconds: float) -> bool:
         """Mode banc : au plus un tour, en attendant `wait_seconds` du travail."""
         self.ensure_watchdog()
+        self.ensure_peek()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
             # #1270 B1 : pas de tentative avant l'échéance de reprise durable ;
@@ -5103,6 +5116,7 @@ class AgentWorker(threading.Thread):
     def run(self) -> None:
         """Mode service : boucle jusqu'à l'arrêt, réveillée par NOTIFY."""
         self.ensure_watchdog()
+        self.ensure_peek()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if self.runner.draining.is_set():

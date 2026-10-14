@@ -277,6 +277,7 @@ class ServePgTest(ServerMixin, PgTestCase):
     def setUpClass(cls):
         super().setUpClass()
         registry.upsert(cls.db, "a1", chantier="demo", harness="codex", host="h1")
+        cls.db.execute("UPDATE agent_registry SET responsible='human:owner' WHERE name='a1'")
         cls.lot = work.add(cls.db, title="lot servi", app="demo", assignee="a1")
         work.move(cls.db, cls.lot["id"], "build")
         storage.of(cls.db).hosts.record(res.sample("h1"))
@@ -299,6 +300,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/projects/{project}/progress": "/api/v1/projects/demo/progress?since=2d",
             "/api/v1/agents": "/api/v1/agents",
             "/api/v1/agents/{agent}": "/api/v1/agents/a1",
+            "/api/v1/agents/{agent}/peek": "/api/v1/agents/a1/peek",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
             "/api/v1/decisions": "/api/v1/decisions?all=1",

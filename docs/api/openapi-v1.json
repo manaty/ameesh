@@ -57,6 +57,52 @@
         ],
         "type": "object"
       },
+      "ameesh-agent-peek-1": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "captured_ts": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "events": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "host": {
+            "type": "string"
+          },
+          "lot": {
+            "type": "object"
+          },
+          "schema": {
+            "const": "ameesh-agent-peek/1",
+            "type": "string"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "workspace": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema",
+          "agent",
+          "host",
+          "lot",
+          "captured_ts",
+          "stale",
+          "workspace",
+          "events"
+        ],
+        "type": "object"
+      },
       "ameesh-agents-1": {
         "properties": {
           "agents": {
@@ -1157,6 +1203,95 @@
           }
         },
         "summary": "Message to an agent: its mailbox and its thread (`agent-mail send`)"
+      }
+    },
+    "/api/v1/agents/{agent}/peek": {
+      "get": {
+        "operationId": "agents_agent_peek",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "latest public messages and tool summaries (default 10)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 50,
+              "minimum": 1,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-agent-peek-1"
+                }
+              }
+            },
+            "description": "Responsible human's agent summary (`ameesh agent peek`)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "responsible human required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Responsible human's agent summary (`ameesh agent peek`)"
       }
     },
     "/api/v1/agents/{agent}/stop": {
