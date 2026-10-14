@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import registry, work
 
@@ -99,35 +100,71 @@ class WorkTest(PgTestCase):
         self.assertEqual(work.list_items(self.db, assignee="personne"), [])
 
     def test_deplacement_concurrent_un_seul_gagnant(self):
+        """Deux `move` partis du MÊME état : le CAS n'en garde qu'un.
+
+        La barrière est posée APRÈS la lecture de l'état (dans `work.get`),
+        pas au départ des fils. Sans elle, le second appel peut lire l'état
+        déjà déplacé par le premier et appliquer une transition séquentielle
+        parfaitement légale — deux gagnants, course d'ordonnancement (CI du
+        13/10, run 38357726701 : bloqué puis build, `updated_ts` du premier
+        antérieur). Le test mesurerait alors l'ordonnanceur, pas le CAS (§3,
+        défaut dépendant de l'environnement : corrigé à la source)."""
         item = self._add()
         db1, db2 = self.connect(), self.connect()
-        barrier = threading.Barrier(2)
+        lus = threading.Barrier(2, timeout=10)
+        vrai_get = work.get
+        lectures: list = []
         resultats: list = [None, None]
 
+        def get_puis_attendre(db, item_id):
+            row = vrai_get(db, item_id)
+            lectures.append(item_id)
+            lus.wait(timeout=10)  # les deux appels tiennent le même état
+            return row
+
         def bouger(index: int, db, state: str) -> None:
-            barrier.wait(timeout=10)
             try:
                 resultats[index] = work.move(db, item["id"], state, actor="t%d" % index)
             except work.WorkError as exc:
                 resultats[index] = exc
 
         try:
-            threads = [
-                threading.Thread(target=bouger, args=(0, db1, "build")),
-                threading.Thread(target=bouger, args=(1, db2, "blocked")),
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=30)
-            gagnants = [r for r in resultats if isinstance(r, dict)]
-            perdants = [r for r in resultats if isinstance(r, work.WorkError)]
-            self.assertEqual(len(gagnants), 1, resultats)
-            self.assertEqual(len(perdants), 1, resultats)
-            self.assertEqual(work.get(self.db, item["id"])["state"], gagnants[0]["state"])
+            with mock.patch.object(work, "get", side_effect=get_puis_attendre):
+                threads = [
+                    threading.Thread(target=bouger, args=(0, db1, "build")),
+                    threading.Thread(target=bouger, args=(1, db2, "blocked")),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+                # le témoin garde son sens : si `move` cesse de lire par
+                # `work.get`, la barrière ne sert plus et le test redevient
+                # une course d'ordonnancement — on le dit ici, pas en flaky
+                self.assertEqual(len(lectures), 2, "les deux move doivent lire par work.get")
         finally:
             db1.close()
             db2.close()
+        gagnants = [r for r in resultats if isinstance(r, dict)]
+        perdants = [r for r in resultats if isinstance(r, work.WorkError)]
+        self.assertEqual(len(gagnants), 1, resultats)
+        self.assertEqual(len(perdants), 1, resultats)
+        self.assertIn("moved in the meantime", str(perdants[0]), resultats)
+        self.assertEqual(work.get(self.db, item["id"])["state"], gagnants[0]["state"])
+
+    def test_deux_moves_sequentiels_reussissent(self):
+        """Le CAS garde la transition lue, il n'interdit pas l'enchaînement.
+
+        Si le second `move` lit l'état DÉJÀ déplacé, sa transition est légale
+        et réussit : c'est l'autre visage de la course CI du 13/10 (bloqué
+        puis build, deux gagnants) — d'où la barrière posée après la lecture
+        dans le test de course, qui seule mesure le CAS."""
+        item = self._add()
+        premier = work.move(self.db, item["id"], "blocked", actor="t1")
+        second = work.move(self.db, item["id"], "build", actor="t2")
+        self.assertEqual((premier["state"], second["state"]), ("blocked", "build"))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "build")
 
     def test_notify_sur_changement_d_etat(self):
         listener = self.db.listen(["work_item"])
