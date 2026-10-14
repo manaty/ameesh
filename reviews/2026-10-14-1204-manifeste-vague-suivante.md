@@ -1,9 +1,11 @@
 # Vague suivante — manifeste de composition (préparation #1204)
 
-mty-amh-docs-01, 14/10/2026 ~03:1xZ. Mandat : lot #1204 (mesh-design, source canon
+mty-amh-docs-01, 14/10/2026 ~03:1xZ ; corrigé 14/10 ~03:10Z sur qualification du pilote
+(mesh-design, 14/10 03:06Z). Mandat : lot #1204 (mesh-design, source canon
 `processus/lots.md` §12, suite #1112). Départ : contre-épreuve docs-01
-`review/docs01-vague-suivante-d8de2a583 @1f250d328`. **Préparation seule : aucun feu de
-fusion ni de déploiement ; la CI complète n'est pas lancée.**
+`review/docs01-vague-suivante-d8de2a583 @1f250d328`. **Préparation et gel : aucun feu de
+fusion ni de déploiement ; la CI complète se lance une seule fois, en `workflow_dispatch`
+sur le SHA gelé de cette branche (§7).**
 
 ## 1. Base et gel
 
@@ -16,6 +18,9 @@ fusion ni de déploiement ; la CI complète n'est pas lancée.**
   base a bougé.
 - Cette composition **remplace** l'arbre `8d530d2bc782` de `@1f250d328` (périmé après
   #672/#749) : mêmes règles, base neuve, exclusions du mandat appliquées.
+- Gel final : le SHA de tête de `integration/vague-suivante-1204` après le commit de
+  correction de ce manifeste (documentation seule ; les 10 blobs des lots sont
+  revérifiés constants après ce commit, §6). Le run CI unique s'épingle à ce SHA.
 
 ## 2. Composition (ordre, SHA, arbres)
 
@@ -29,9 +34,9 @@ fusion ni de déploiement ; la CI complète n'est pas lancée.**
 | 6 | #1048 | 808 | `1e7475317f839a762bb9d894d26a1cc1853e7d06` | `b85777c1e3e757b9ba0caa8cef49b0db1558b251` | `8a7cdee154c368c7564c1de8b5e11ce31825d65e` | **`b6606f0bc9f91db77e678ac12b9dd5a5e78538ef`** |
 
 - **Arbre du paquet (lots) : `b6606f0bc9f91db77e678ac12b9dd5a5e78538ef`**, tête
-  `8a7cdee154c368c7564c1de8b5e11ce31825d65e`. Le commit qui porte ce manifeste est
-  ajouté **après** la composition (documentation seule) : il devient la tête de branche
-  sur laquelle une CI éventuelle tourne, sans changer le contenu des lots.
+  `8a7cdee154c368c7564c1de8b5e11ce31825d65e`. Le commit qui porte ce manifeste (et sa
+  correction sur go pilote) est ajouté **après** la composition (documentation seule) :
+  c'est le SHA gelé sur lequel la CI unique tourne, sans changer le contenu des lots.
 - Aucun conflit : les six fusions sont propres (`git merge --no-ff`), y compris les deux
   fichiers partagés (`docs/EXECUTEUR-MEDIEE.md` par #1019 puis #1038 ;
   `docs/EXPLOITATION.md` par main puis #1048).
@@ -56,7 +61,10 @@ n'est citée que lorsqu'elle est consignée dans le registre ou le fil.
 - Contenu intégré : `src/ameesh/chat.py` `69e638a9fb42a9f1afb2ce59eeaeb314aeb1ca91` ;
   `tests/test_l79_chat_terminal.py` `5fd448e98a112ebb8d0c0969e1c1d694dcbf3a9a` — blobs
   **identiques** à la tête relue (constance).
-- Réserve R1 : voir §5.1 (famille de l'avis à confirmer par le pilote).
+- Famille de la R1 — **tranché par le pilote (14/10 03:06Z), réserve levée** : l'avis et
+  le feu sont conservés comme **historiques** sur `a2e3c60` ; ils ont été acquis sous la
+  décision 18855a quand le repli s'appliquait, les blobs relus sont exactement constants
+  (ci-dessus) et **aucun nouvel avis n'est donné sous le repli actuel**. Voir §5.1.
 
 ### #419 — L243 projets et noms, étude (PR 402, tête `79ebee0636f6`)
 
@@ -82,8 +90,9 @@ n'est citée que lorsqu'elle est consignée dans le registre ou le fil.
   14/10 01:27Z.
 - R2 : bureau, **famille Claude** (compte tertiaire), OK 0 B / 2 N sur `c1d3271c82ba`,
   14/10 02:05Z ; N1 (raison en ponctuation seule acceptée) et N2 (témoins manquants) →
-  lot de suite #1184. Session non consignée au registre des lots (relecture lancée hors
-  runners, canon §11, compte Claude tertiaire).
+  lot de suite #1184. **Trace vérifiée** (relevée par mesh-design, 14/10 03:06Z) :
+  session `57f5bda5`, assistant 66, modèle `claude-opus-5-5`, 14/10 02:05:40.904Z, GO
+  3605 ; relecture lancée hors runners (canon §11, compte Claude tertiaire).
 - Feu pilote : mesh-design, 14/10 01:27Z sur `c1d3271c82ba` — CI exacte complète
   réellement verte, toutes parts exécutées, tête et delta main contrôlés.
 - Contenu intégré : `scripts/test-hermeticity-lint.py`
@@ -174,17 +183,14 @@ n'est citée que lorsqu'elle est consignée dans le registre ou le fil.
   `tests/parts/lecteurs-doc.txt` (deux lignes de lecteurs) et du delta final, nouveau feu
   pilote nommant la nouvelle tête, puis CI exacte (ou vague suivante). Voir §5.5.
 
-## 5. Réserves à trancher par le pilote avant le run complet
+## 5. Réserves et points de suivi
 
-1. **#287 — famille de la R1.** L'avis est DeepSeek sur un lot DeepSeek : il ne tient que
-   par le repli 18855a de la pause Claude/Codex, qui « cesse dès qu'un relecteur Claude ou
-   Codex est disponible » (canon §2). Les critiques Codex ont repris (note mesh-design du
-   14/10 02:21Z) et le compte Claude tertiaire sert des relectures jusqu'au 14/10 08:00
-   (canon §11). Le feu du 13/10 12:47Z a été donné explicitement sous 18855a. **Décision
-   demandée** : maintenir ce feu (l'avis était valide au moment où il a été rendu) ou
-   exiger une R1 Codex/Claude sur `a2e3c60` avant le gel. Le lot est prêt par ailleurs
-   (fusions propres, blobs constants, tests ciblés verts) ; s'il est écarté, la
-   composition se rejoue sans son étape 1 (un seul merge en moins).
+1. **#287 — famille de la R1 : TRANCHÉ, réserve levée (pilote, 14/10 03:06Z).** Le pilote
+   conserve la R1 et le feu du 13/10 12:47Z comme **historiques** sur `a2e3c60` : l'avis
+   (DeepSeek, repli 18855a) était valide au moment où il a été rendu, les blobs relus sont
+   exactement constants (§6) et **aucun nouvel avis n'est donné sous le repli actuel**, qui
+   a cessé avec la reprise des critiques Codex. Le lot reste dans la composition ; aucune
+   R1 Codex/Claude supplémentaire n'est exigée avant le gel.
 2. **#1038 — `turn_resources.begin_grace`.** Ajout 1.6.x refusé, mais rangé par le doc
    dans le paragraphe « après la 1.6.x » (compte 46), non dérivable des tags ; laissé tel
    quel. À verser à la relecture d'après fusion de #1038, avec le compte 46 si elle veut
@@ -227,15 +233,17 @@ n'est citée que lorsqu'elle est consignée dans le registre ou le fil.
   (§3, #1019).
 - Aucun test complet ni suite entière lancés : canon §3, la suite tourne une fois en CI.
 
-## 7. CI complète : non lancée
+## 7. CI complète : une seule fois, en `workflow_dispatch`
 
 Conformément au mandat (« pilote qualifie arbre/avis final, puis run complet une fois et
-feu final »), **aucune CI n'a été déclenchée** : la branche n'a pas de PR (un push sur une
-branche autre que `main`/`release/**` ne déclenche rien). Sur le go du pilote, le run
-unique se lance de deux façons :
-`workflow_dispatch` sur `integration/vague-suivante-1204` (suite complète, 6 parts psql)
-ou ouverture de la PR draft (parts pilotes psql + agrégat requis). Le corps de PR est prêt
-en §9. Aucune CI individuelle des lots couverts n'est relancée (§12).
+feu final »), aucune CI n'a été déclenchée pendant la préparation : la branche n'a pas de
+PR (un push sur une branche autre que `main`/`release/**` ne déclenche rien). Sur le go du
+pilote (mesh-design, 14/10 03:06Z), le run unique est un `workflow_dispatch` de
+`tests.yml` sur `integration/vague-suivante-1204` : suite complète des deux pilotes,
+**4 parts psycopg et 6 parts psql** (le plan d'un dispatch ne saute ni ne réduit les
+parts). L'ouverture d'une PR draft ne déclenche que les parts **pilotes** psql (3 parts)
+et **ne remplace pas** ce run complet : elle ne peut pas tenir lieu de CI du paquet. Le
+corps de PR est prêt en §9. Aucune CI individuelle des lots couverts n'est relancée (§12).
 
 ## 8. Réversibilité
 
@@ -250,5 +258,5 @@ en §9. Aucune CI individuelle des lots couverts n'est relancée (§12).
 Titre : `#1204 vague suivante — 6 lots (287, 419, 857, 1019, 1038, 1048), préparation`
 
 Corps : résumé du §2, renvoi à ce manifeste, mention explicite « préparation, ne pas
-fusionner avant le go du pilote et la CI complète unique », liste des exclusions
-(#748, #963, #775) et des réserves (§5).
+fusionner avant le go du pilote et la CI complète unique (dispatch, seul run valable) »,
+liste des exclusions (#748, #963, #775) et des points de suivi (§5).
