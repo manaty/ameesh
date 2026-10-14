@@ -2,13 +2,18 @@
 # "Always" list (L161f): test modules of objects global to the Postgres
 # cluster, which the per-schema measure of the map (tables touched by each
 # class) cannot see. They become impacted (P1) whenever a migration
-# (src/ameesh/migrations/), src/ameesh/db.py or deploy/sql/ changes
-# (scripts/test-plan.py).
+# (src/ameesh/migrations/), src/ameesh/db.py, deploy/sql/ or the runner
+# (src/ameesh/runner.py, #749) changes (scripts/test-plan.py). On a pull
+# request the psql driver runs them too when the list is triggered (#749):
+# what only one driver can see must not wait for the full suite of main.
 #
 # Additive list (L160a): one module per line, its reason in a comment on the
 # same line, alphabetical order, no duplicate (scripts/test-parts.py refuses
 # an unsorted list).
 
+test_339_orphan_settle  # #749: orphan turn groups settled without a reboot, outside the measured blocks
 test_cluster  # roles created on the cluster (supervisor, approve), grants checked against every column
 test_events_attach  # LISTEN/NOTIFY channels, global to the cluster
+test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (the release red module)
+test_l50_group_orphan_work_items  # #749: orphan work items of a group reattached, lease contract
 test_l72_panne_de_base  # database outage and reconnection
