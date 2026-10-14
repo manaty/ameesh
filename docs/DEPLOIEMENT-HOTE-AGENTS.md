@@ -77,5 +77,50 @@ SSH s’il y manque, puis extrait dans `src-<court>` et installé dans le venv
 `previous-sha` avant toute modification. `agents retour` réinstalle le commit
 de `previous-sha`, redémarre puis contrôle ; il refuse sans précédent
 enregistré. Les migrations passées avant l’installation sont additives,
-l’ancien code les ignore. Les commandes de cette page sont à exécuter par le
+l’ancien code les ignore.
+
+## Séquence staging des quatre hôtes
+
+`deploy/mise-a-jour/staging.sh [REF]` enchaîne la mise à jour des quatre hôtes
+dans l’ordre du canon §14 : `ameesh-agents-1`, `ameesh-agents-2`,
+`manaty-mesh-1`, puis `pc-smichea` **en dernier**. C’est un staging, pas une
+release : aucun go de l’owner n’est demandé.
+
+```sh
+deploy/mise-a-jour/staging.sh --a-blanc   # plan seul, rien n’est touché
+deploy/mise-a-jour/staging.sh             # cible HEAD du dépôt
+deploy/mise-a-jour/staging.sh <REF>       # commit, branche ou étiquette
+```
+
+Déroulé : `verifier` en lecture seule sur les quatre hôtes ; `sauvegarder`
+puis `migrer` sur le poste (migrations **additives** seulement, la base est
+commune) ; puis, hôte par hôte, `installer`, `redemarrer`, `controler` et la
+santé. La santé d’un hôte est celle du canon §14 : unités redémarrées et baux
+repris (`controler`), `ameesh doctor --harness` vert pour le poste, et une
+sonde de courrier réelle remise à une persona menée de l’hôte
+(`deploy/mise-a-jour/sante-courrier.py`) — elle prouve la chaîne
+message → runner → harnais, pas seulement l’unité active. Un courrier actif
+non remis depuis plus de `SOUFFRANCE_COURRIER` (900 s) est un KO.
+
+Un échec sur un hôte déclenche son `retour` automatique (`previous-sha`),
+contrôle ce retour, **arrête la séquence** et envoie un courrier urgent à
+`NOTIF_STAGING` (défaut `mesh-design`). Les hôtes suivants ne sont pas
+touchés ; le poste n’est atteint que si les VM sont saines. Un retour qui
+échoue lui-même est signalé de la même façon. Relancer la commande après un
+arrêt est sûr : un hôte déjà au commit visé n’est pas réinstallé et son
+`previous-sha` est conservé.
+
+Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
+`sha`, `precedent`, `detail`) dans
+`~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`.
+
+`HOTES_STAGING` (BASCULE_ENV) déclare la topologie, une entrée par hôte, dans
+l’ordre canonique ; `SONDE_<HOTE>` (majuscules, `-` et `.` remplacés par `_`)
+fixe la persona sondée, par défaut la première persona menée de l’hôte.
+Options : `--hotes "nom …"` (sous-ensemble, ordre canonique conservé, le
+poste reste en dernier), `--sans-sonde` (santé sans sonde de courrier),
+`--sans-sauvegarde`. Le script exige que `VM` soit l’adresse de
+`manaty-mesh-1` ; `PERSONAS_VM` peut rester vide.
+
+Les commandes de cette page sont à exécuter par le
 responsable du déploiement depuis le poste, après revue et validation CI.
