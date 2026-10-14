@@ -8,6 +8,12 @@ ameesh reads its configuration from, in order of precedence:
    `AMEESH_CONFIG`), whose keys are the setting names below;
 3. built-in defaults.
 
+A path named by `AMEESH_CONFIG` (or the alias `AGENT_MESH_CONFIG`) must exist:
+an explicitly named missing file stops ameesh with `config file not found`
+before any connection, instead of silently reading another configuration
+(#1127). Without either variable, `~/.config/ameesh/config.json` is read, and
+the historical `~/.config/agent-mesh/config.json` is the fallback.
+
 No secret is stored in the repository. The database password comes from
 `PGPASSWORD` or `~/.pgpass` (mode `0600`), or from a full DSN.
 
