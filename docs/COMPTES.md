@@ -454,17 +454,27 @@ update) leaves a helper that no longer exists. Every HTTPS GitHub operation
 then fails on the credential lookup while `gh auth status` stays healthy —
 the sentinel probes `gh`, not `git`, so it sees nothing (incident #1063).
 
-Repair on the host itself, keeping a trace of the previous file; the empty
-line is what clears a helper inherited from another scope:
+Repair on the host itself, after backing up the global file that carries the
+faulty entry (`~/.gitconfig` or `~/.config/git/config`, shown by the first
+command); the empty line is what clears a helper inherited from another scope:
 
 ```sh
-cp ~/.gitconfig ~/.gitconfig.bak-$(date +%Y%m%d-%H%M)
+# locate the scope and file holding the frozen helper (global, XDG, system)
+git config --show-origin --show-scope --get-regexp '^credential\.'
+cfg=$(git config --global --show-origin --get-regexp '^credential\.' |
+      awk -F'\t' 'sub(/^file:/,"",$1) {print $1; exit}')
+[ -n "$cfg" ] && cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M)"
 for url in https://github.com https://gist.github.com; do
   git config --global --replace-all "credential.$url.helper" ""
-  git config --global --add "credential.$url.helper" "!gh auth git-credential"
+  git config --global --add "credential.$url.helper" '!gh auth git-credential'
 done
-git ls-remote https://github.com/<org>/<private-repo> HEAD >/dev/null && echo ok
+GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/<org>/<private-repo> HEAD >/dev/null && echo ok
 ```
+
+The value is single-quoted on purpose: pasted into an interactive shell, a
+double-quoted `!gh` triggers history expansion — `event not found` when no `gh`
+command is in history, otherwise the previous `gh` command is substituted and
+the helper is written broken.
 
 Re-running `gh auth setup-git` on the host has the same effect, with that
 host's current absolute path. The PATH form above survives a later move of
