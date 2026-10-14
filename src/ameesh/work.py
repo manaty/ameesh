@@ -95,6 +95,10 @@ ASSIGN_NOTES = interface.ASSIGN_NOTE_PREFIXES
 #: sans assigné n'est prenable par la prise automatique que s'il a été rendu
 #: ainsi (`storage.interface.RETURNED_NOTE`)
 RETURN_NOTE = interface.RETURNED_NOTE
+#: §4 : états d'un lot que le geste `work return` rend à la file. Un lot en
+#: revue (`qa`), en attente d'un humain ou bloqué n'est pas de l'en-cours d'un
+#: agent : il ne se rend pas par ce geste.
+RETURN_STATES = ("intake", "build")
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
 UNKNOWN_ACTOR = "inconnu"
 #: un commit de fusion déclaré (`merged --sha`)
@@ -842,16 +846,18 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     le nouvel assigné. Rend `{item, check, previous}`.
 
     L118 : `branch` (et `branch_target`) posent aussi la branche du lot ; avec
-    une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
-    la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
-    du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
-    pas son propre travail.
+    une branche, un lot déjà assigné à cet agent n'est pas une erreur : seule
+    la branche est posée, sans attribution — la délégation en cours (L40) et
+    l'exception pilote (§4) restent en place. #705 : si le nouvel assigné est le
+    relecteur désigné du lot, la désignation tombe (le journal le dit) — un
+    relecteur ne relit pas son propre travail.
 
     §4 : `wip_exception` (une raison non vide) pose une exception pilote
     EXPLICITE à la limite d'en-cours — réservée à un humain ou à un pilote
-    (`is_pilot`), elle est écrite dans la note de la dernière attribution, et
-    le balayage (`ameesh work wip`) laisse alors le lot au-delà du plafond.
-    Elle s'efface à la réassignation suivante sans marqueur."""
+    (`is_pilot`), elle est écrite dans la note de la dernière attribution (même
+    assigné : c'est le geste qui la réécrit), et le balayage (`ameesh work
+    wip`) laisse alors le lot au-delà du plafond. Elle s'efface à l'attribution
+    suivante sans marqueur."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -868,8 +874,15 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
                         "orchestrator/design agent; the exception to the §4 limit is "
                         "explicit and reserved to the pilot" % (actor or "nobody"))
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
-    if previous == check["assignee"] and not branch and not reason:
-        raise WorkError("lot %s already assigned to %s" % (item_id, previous))
+    if previous == check["assignee"] and not reason:
+        if not branch:
+            raise WorkError("lot %s already assigned to %s" % (item_id, previous))
+        # L118 : le lot est déjà à cet agent — seule la branche est posée,
+        # sans attribution (ni note, ni annulation de délégation) : la
+        # délégation en cours (L40) et l'exception pilote (§4), portées par la
+        # dernière attribution, restent en place.
+        row = set_branch(db, item_id, branch, branch_target, actor=actor)
+        return {"item": row, "check": check, "previous": previous}
     note = "assigned to %s%s (before: %s)%s" % (
         check["assignee"],
         " — external session, owner %s" % check["responsible"] if check["externe"] else "",
@@ -957,17 +970,22 @@ def queue_warning(db: Db, item: dict, agent: str) -> str:
 def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
                     reason: str = "") -> dict:
     """§4 : rend un lot à la file d'équipe — l'assignation est retirée (CAS sur
-    l'assigné lu, journal dans la même transaction) ; branche, tête de branche,
-    gels et avis (jalons) restent. Le lot garde son état, donc un agent libre le
-    reprend avec sa branche (`unassigned_lots`).
+    l'assigné lu ET l'état, journal dans la même transaction) ; branche, tête de
+    branche, gels et avis (jalons) restent. Le lot garde son état, donc un agent
+    libre le reprend avec sa branche (`unassigned_lots`).
+
+    Seuls un lot `intake` ou `build` se rendent (`RETURN_STATES`) : un lot en
+    revue (`qa`), en attente d'un humain ou bloqué n'est pas de l'en-cours d'un
+    agent.
 
     Autorité : l'assigné lui-même, un humain, ou un pilote (`is_pilot`) — un
     agent ne rend pas le lot d'un autre."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in MERGED_STATES or item["state"] == "closed":
-        raise WorkError("lot %s already %s: nothing to return" % (item_id, item["state"]))
+    if item["state"] not in RETURN_STATES:
+        raise WorkError("lot %s is %s: only an intake or build lot returns to the team "
+                        "queue (§4)" % (item_id, item["state"]))
     current = (item.get("assignee") or "").strip()
     if not current:
         raise WorkError("lot %s has no assignee: already in the team queue" % item_id)
@@ -980,7 +998,8 @@ def return_to_queue(db: Db, item_id: int, *, actor: str = "", cfg=None,
     if reason.strip():
         note += ": %s" % " ".join(str(reason).split())
     row = storage.of(db).work.unassign(item_id, current=current, note=note,
-                                       actor=who or UNKNOWN_ACTOR)
+                                       actor=who or UNKNOWN_ACTOR,
+                                       states=RETURN_STATES)
     if row is None:
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     return row

@@ -619,14 +619,96 @@ class WorkItems(interface.WorkItems):
                 queued_note=queued_note, forced_note=forced_note, take=take,
                 ready_only=ready_only)
 
-    def unassign(self, item_id, *, current, note, actor) -> dict | None:
+    def unassign(self, item_id, *, current, note, actor, states=None) -> dict | None:
         """§4 : rend le lot à la file — l'assignation est retirée s'il a encore
         l'assigné `current` et n'est ni fusionné ni fermé, et le journal part
-        dans la même transaction ; None sinon. Branche, tête de branche et
+        dans la même transaction ; None sinon. `states` borne en plus les états
+        rendus, relu dans la transaction qui écrit. Branche, tête de branche et
         jalons ne sont pas touchés ; L40 : la délégation en cours est annulée
         (le délégué n'a plus le lot)."""
         with self.db.transaction() as tx:
-            return WorkItems(tx)._reassign(item_id, None, current, None, note, actor)
+            return WorkItems(tx)._unassign_locked(item_id, current, note, actor,
+                                                  states=states)
+
+    def _unassign_locked(self, item_id, current, note, actor, *, states=None) -> dict | None:
+        """`unassign` dans la transaction ouverte (`self.db` EST la
+        transaction) : la condition d'assigné et d'état, le journal et
+        l'annulation de la délégation partent dans la même transaction."""
+        cond, params = "", [int(item_id), current]
+        if states:
+            cond = " AND state IN (" + ", ".join(["%s"] * len(states)) + ")"
+            params.extend(list(states))
+        rows = self.db.query(
+            "UPDATE work_items SET assignee = NULL, updated_at = now(),"
+            "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+            " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
+            "   AND state NOT IN " + _CLOSED + cond +
+            " RETURNING " + item_columns(self.db), tuple(params))
+        if not rows:
+            return None
+        self.db.query(
+            "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
+            "       resolved_by = %s"
+            " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
+            (actor or "", int(item_id)))
+        self._event(int(item_id), rows[0]["state"], note, actor)
+        return rows[0]
+
+    def unassign_surplus(self, item_id, *, current, marker, prefixes, max_build,
+                         note, actor) -> dict | None:
+        """§4 : restitution du SURPLUS d'un agent, sous les gardes
+        transactionnelles. Le verrou consultatif de l'agent est pris AVANT
+        toute relecture (les prises `assign_capped` et les autres balayages du
+        même agent attendent), puis la ligne du lot est verrouillée
+        (`FOR NO KEY UPDATE` : toute attribution — assign, délégation, prise,
+        reprise — passe par un UPDATE de cette ligne) et relue : le lot doit
+        être encore en `build`, encore assigné à `current`, sans exception
+        pilote (`marker` dans la note de sa dernière attribution, `prefixes`).
+        Les lots en `build` de l'agent SANS exception sont recensés sous ce
+        verrou ; il en faut plus de `max_build` pour rendre celui-ci. None
+        sinon (rien n'est écrit) : deux balayages concurrents ne rendent jamais
+        plus que le surplus, et un lot passé en `qa`, repris ou doté d'une
+        exception entre la lecture et l'écriture n'est pas rendu."""
+        agent = str(current)
+        with self.db.transaction() as tx:
+            work = WorkItems(tx)
+            tx.query(_WIP_LOCK, (_WIP_LOCK_PREFIX + agent,))
+            rows = tx.query(
+                "SELECT id, state, assignee FROM work_items WHERE id = %s"
+                " FOR NO KEY UPDATE", (int(item_id),))
+            if not rows:
+                return None
+            row = rows[0]
+            if row["state"] != "build" or (row.get("assignee") or "") != agent:
+                return None
+            if work._wip_exception_locked(int(item_id), marker, prefixes):
+                return None
+            builds = tx.query(
+                "SELECT id FROM work_items WHERE assignee = %s AND state = 'build'"
+                " ORDER BY id", (agent,))
+            free = [int(r["id"]) for r in builds
+                    if not work._wip_exception_locked(int(r["id"]), marker, prefixes)]
+            if len(free) <= int(max_build):
+                return None
+            return work._unassign_locked(item_id, agent, note, actor)
+
+    def _wip_exception_locked(self, item_id, marker, prefixes) -> bool:
+        """§4 : la dernière note d'attribution du lot porte-t-elle `marker` ?
+        À lire sous le verrou de la ligne du lot : toute attribution met cette
+        ligne à jour avant d'écrire sa note, donc aucune ne peut se glisser
+        entre cette lecture et l'écriture qui suit."""
+        prefixes = list(prefixes or ())
+        if not prefixes:
+            return False
+        starts = " OR ".join(["starts_with(note, %s)"] * len(prefixes))
+        rows = self.db.query(
+            "SELECT e.note FROM work_item_events e"
+            " JOIN (SELECT max(id) AS id FROM work_item_events"
+            "        WHERE work_item_id = %s"
+            "          AND (" + starts + ")) last ON last.id = e.id"
+            " WHERE position(%s in e.note) > 0",
+            (int(item_id),) + tuple(prefixes) + (str(marker),))
+        return bool(rows)
 
     def wip_exceptions(self, item_ids, marker, prefixes) -> list[int]:
         """§4 : parmi `item_ids`, ceux dont la DERNIÈRE attribution porte

@@ -10,8 +10,10 @@ l'exception pilote explicite, et les compteurs de `ameesh list` / progress.
 from __future__ import annotations
 
 import time
+from unittest import mock
 
-from ameesh import backlog, notify, progress, registry, storage, work, wip
+from ameesh import backlog, handoff, notify, progress, registry, storage, work, wip
+from ameesh.storage import interface
 
 from .support import PgTestCase
 
@@ -66,6 +68,21 @@ class _Base(PgTestCase):
         kw.setdefault("orchestras", [])
         return backlog.auto_take(self.cfg, self.db, **kw)
 
+    def attributions(self, item_id):
+        """Les notes d'ATTRIBUTION du lot (§4 : elles portent l'exception
+        pilote), dans l'ordre du journal."""
+        return [e["note"] for e in work.events(self.db, item_id)
+                if (e.get("note") or "").startswith(work.ASSIGN_NOTES)]
+
+    def surplus(self, item_id, *, current="dev1", **kw):
+        """Une restitution de surplus directe (les gardes du balayage)."""
+        kw.setdefault("marker", work.WIP_EXCEPTION_MARK)
+        kw.setdefault("prefixes", work.ASSIGN_NOTES)
+        kw.setdefault("max_build", work.BUILD_LIMIT)
+        kw.setdefault("note", "restitution")
+        kw.setdefault("actor", "ameesh")
+        return storage.of(self.db).work.unassign_surplus(item_id, current=current, **kw)
+
 
 class PriseSousPlafondTest(_Base):
     def test_prise_atomique_sous_le_plafond(self):
@@ -104,6 +121,30 @@ class PriseSousPlafondTest(_Base):
                          [("dev2", libre["id"])])
         self.assertEqual(work.get(self.db, libre["id"])["assignee"], "dev2")
 
+    def test_plafond_atteint_a_l_ecriture_garde_le_lot_pour_un_autre(self):
+        """Le contrôle avant la prise passe, puis `assign_capped` refuse pour
+        plafond (une prise concurrente du même agent) : le lot n'a pas bougé et
+        doit rester offert à l'agent suivant, pas être retiré de la file
+        d'essai."""
+        self.agent("dev1")
+        self.agent("dev2")
+        libre = self.lot("à prendre")
+        st = storage.of(self.db)
+        real = type(st.work).assign_capped
+        calls: list = []
+
+        def capped(self_, item_id, assignee, **kw):
+            if not calls:               # le premier essai (dev1) : plafond
+                calls.append(assignee)
+                return None
+            return real(self_, item_id, assignee, **kw)
+
+        with mock.patch.object(type(st.work), "assign_capped", capped):
+            out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("dev2", libre["id"])])
+        self.assertEqual(work.get(self.db, libre["id"])["assignee"], "dev2")
+
 
 class RestitutionTest(_Base):
     def test_retour_cas_conserve_branche_et_journal(self):
@@ -138,6 +179,63 @@ class RestitutionTest(_Base):
         st = storage.of(self.db).work
         self.assertIsNone(st.unassign(lot["id"], current="dev2", note="n", actor="ameesh"))
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+
+    def test_le_retour_manuel_refuse_hors_intake_build(self):
+        self.agent("dev1")
+        lot = self.build(self.lot("en revue", assignee="dev1"))
+        work.move(self.db, lot["id"], "qa", note="en revue", actor="dev1")
+        with self.assertRaises(work.WorkError) as cm:
+            work.return_to_queue(self.db, lot["id"], actor="dev1", cfg=self.cfg)
+        self.assertIn("only an intake or build", str(cm.exception))
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+        # la course : un lot passé en qa entre la lecture et l'écriture ne se
+        # rend pas non plus (l'état est relu dans la transaction qui écrit)
+        st = storage.of(self.db).work
+        self.assertIsNone(st.unassign(lot["id"], current="dev1", note="n",
+                                      actor="ameesh", states=work.RETURN_STATES))
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+        # un lot `intake` assigné se rend, lui
+        intake = self.lot("intake assigné", assignee="dev1")
+        row = work.return_to_queue(self.db, intake["id"], actor="dev1", cfg=self.cfg)
+        self.assertIsNone(row["assignee"])
+        self.assertEqual(row["state"], "intake")
+
+    def test_chaque_restitution_recompte_le_surplus_sous_verrou(self):
+        self.agent("dev1")
+        lots = [self.build(self.lot("occupé %d" % i, assignee="dev1")) for i in range(4)]
+        first = self.surplus(lots[0]["id"])
+        self.assertIsNotNone(first)
+        self.assertIsNone(first["assignee"])
+        self.assertEqual(self.builds_of("dev1"), 3)
+        second = self.surplus(lots[1]["id"])
+        self.assertIsNotNone(second)
+        self.assertEqual(self.builds_of("dev1"), 2)
+        # le troisième essai ne trouve plus de surplus : rien n'est écrit
+        self.assertIsNone(self.surplus(lots[2]["id"]))
+        self.assertEqual(work.get(self.db, lots[2]["id"])["assignee"], "dev1")
+        self.assertEqual(self.builds_of("dev1"), 2)
+
+    def test_la_restitution_du_surplus_relit_etat_et_exception(self):
+        self.agent("dev1")
+        lots = [self.build(self.lot("occupé %d" % i, assignee="dev1")) for i in range(4)]
+        # un lot passé en qa n'est plus de l'en-cours : pas rendu
+        work.move(self.db, lots[0]["id"], "qa", note="en revue", actor="dev1")
+        self.assertIsNone(self.surplus(lots[0]["id"]))
+        self.assertEqual(work.get(self.db, lots[0]["id"])["assignee"], "dev1")
+        # une exception pilote posée après la lecture protège le lot
+        work.assign(self.db, lots[1]["id"], "dev1", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        self.assertIsNone(self.surplus(lots[1]["id"]))
+        self.assertEqual(work.get(self.db, lots[1]["id"])["assignee"], "dev1")
+        # le surplus se compte SANS les lots exceptés : 3 lots en build dont 1
+        # excepté → 2 sans exception, plus de surplus
+        self.assertIsNone(self.surplus(lots[2]["id"]))
+        self.assertEqual(work.get(self.db, lots[2]["id"])["assignee"], "dev1")
+        self.assertEqual(self.builds_of("dev1"), 3)
+        # l'exception est toujours là, et le lot de qa ne compte pas
+        st = storage.of(self.db).work
+        self.assertEqual(st.wip_exceptions([lots[1]["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [lots[1]["id"]])
 
     def test_le_lot_rendu_reste_prenable_avant_les_intake(self):
         self.agent("dev1")
@@ -195,6 +293,111 @@ class RestitutionTest(_Base):
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["assignee"], item["branch"], item["state"]),
                          ("dev2", "lot/rendu", "build"))
+
+
+class BrancheSeuleTest(_Base):
+    """L118 restauré (§4) : `work assign` sur le MÊME assigné avec une branche
+    ne pose que la branche — délégation en cours (L40) et exception pilote (§4)
+    restent, aucune attribution n'est écrite."""
+
+    def test_meme_assigne_avec_branche_garde_la_delegation(self):
+        self.agent("dev1")
+        self.agent("dev2")
+        lot = self.build(self.lot("délégué", assignee="dev1"))
+        work.delegate(self.db, lot["id"], "dev2", within="30m", actor="dev1",
+                      cfg=self.cfg)
+        before = work.get(self.db, lot["id"])
+        self.assertEqual(before["assignee"], "dev2")
+        self.assertTrue(before["delegated_by"])
+        attrs = self.attributions(lot["id"])
+        row = work.assign(self.db, lot["id"], "dev2", actor="human:proprio",
+                          cfg=self.cfg, branch="lot/1359-branche")
+        self.assertEqual(row["item"]["branch"], "lot/1359-branche")
+        after = work.get(self.db, lot["id"])
+        # la délégation n'est pas annulée : le lot n'a pas été réattribué
+        self.assertEqual(after["assignee"], "dev2")
+        self.assertEqual(after["delegated_by"], before["delegated_by"])
+        self.assertEqual(after["due_ts"], before["due_ts"])
+        self.assertEqual(self.attributions(lot["id"]), attrs)
+
+    def test_meme_assigne_avec_branche_garde_l_exception_pilote(self):
+        self.agent("dev1")
+        lot = self.build(self.lot("exception", assignee="dev1"))
+        work.assign(self.db, lot["id"], "dev1", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        attrs = self.attributions(lot["id"])
+        self.assertTrue(any(work.WIP_EXCEPTION_MARK in n for n in attrs))
+        row = work.assign(self.db, lot["id"], "dev1", actor="dev1", cfg=self.cfg,
+                          branch="lot/1359-exception")
+        self.assertEqual(row["item"]["branch"], "lot/1359-exception")
+        # aucune attribution de plus : l'exception tient et protège le lot
+        self.assertEqual(self.attributions(lot["id"]), attrs)
+        st = storage.of(self.db).work
+        self.assertEqual(st.wip_exceptions([lot["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [lot["id"]])
+        self.assertIsNone(self.surplus(lot["id"]))
+
+    def test_une_exception_avec_le_meme_assigne_reecrit_l_attribution(self):
+        """Avec une raison, `work assign` reste une attribution : l'exception
+        est réécrite et la délégation en cours annulée (L40)."""
+        self.agent("dev1")
+        self.agent("dev2")
+        lot = self.build(self.lot("délégué", assignee="dev1"))
+        work.delegate(self.db, lot["id"], "dev2", within="30m", actor="dev1",
+                      cfg=self.cfg)
+        work.assign(self.db, lot["id"], "dev2", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        after = work.get(self.db, lot["id"])
+        self.assertIsNone(after["delegated_by"])
+        self.assertTrue(any(work.WIP_EXCEPTION_MARK in n
+                            for n in self.attributions(lot["id"])))
+
+
+class NotesAttributionTest(_Base):
+    """§4 : toutes les notes qui CONFIENT un lot sont des attributions — la
+    dernière porte l'exception pilote, une postérieure sans marqueur l'efface."""
+
+    def test_les_textes_sont_partages(self):
+        self.assertEqual(handoff._ASSIGN_NOTES, interface.ASSIGN_NOTE_PREFIXES)
+        self.assertEqual(work.ASSIGN_NOTES, interface.ASSIGN_NOTE_PREFIXES)
+        self.assertEqual(backlog.AUTO_TAKE_NOTE, interface.AUTO_TAKE_NOTE)
+        self.assertEqual(backlog.LOT_TAKE_NOTE, interface.LOT_TAKE_NOTE)
+        self.assertEqual(handoff.HANDOFF_NOTE, interface.HANDOFF_NOTE)
+        for prefix in (interface.DELEGATED_NOTE, interface.LOT_TAKE_NOTE,
+                       interface.AUTO_TAKE_NOTE, interface.HANDOFF_NOTE):
+            self.assertIn(prefix, interface.ASSIGN_NOTE_PREFIXES)
+
+    def test_une_delegation_posterieure_efface_l_exception(self):
+        self.agent("dev1")
+        self.agent("dev2")
+        lot = self.build(self.lot("exception", assignee="dev1"))
+        work.assign(self.db, lot["id"], "dev1", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        st = storage.of(self.db).work
+        self.assertEqual(st.wip_exceptions([lot["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [lot["id"]])
+        work.delegate(self.db, lot["id"], "dev2", within="30m", actor="dev1",
+                      cfg=self.cfg)
+        self.assertEqual(st.wip_exceptions([lot["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [])
+
+    def test_une_prise_automatique_posterieure_efface_l_exception(self):
+        self.agent("dev1")
+        self.agent("dev2")
+        lot = self.build(self.lot("exception", assignee="dev1"))
+        work.assign(self.db, lot["id"], "dev1", actor="human:proprio", cfg=self.cfg,
+                    wip_exception="reprise urgente")
+        work.return_to_queue(self.db, lot["id"], actor="human:proprio", cfg=self.cfg)
+        st = storage.of(self.db).work
+        self.assertEqual(st.wip_exceptions([lot["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [lot["id"]])
+        done = st.assign_capped(lot["id"], "dev2", current=None,
+                                note="%s par dev2, au repos" % backlog.LOT_TAKE_NOTE,
+                                actor="ameesh", max_build=work.BUILD_LIMIT)
+        self.assertIsNotNone(done)
+        # la prise est une attribution : l'exception de la précédente est morte
+        self.assertEqual(st.wip_exceptions([lot["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [])
 
 
 class BalayageTest(_Base):
@@ -272,6 +475,85 @@ class BalayageTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("returned to the team queue", proc.stdout)
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+    def test_deux_balayages_interleaves_ne_rendent_que_le_surplus(self):
+        """Deux balayages lisent les mêmes 4 lots avant que l'un n'écrive : le
+        second ne rend rien de plus, chaque retour recomptant sous le verrou de
+        l'agent."""
+        self.agent("dev1")
+        lots = []
+        for i in range(4):
+            item = self.build(self.lot("occupé %d" % i, assignee="dev1"))
+            self.aged(item["id"], 10 - i)
+            lots.append(item)
+        other = self.connect()
+        second: list = []
+        crossed: list = []
+        real_get = work.get
+
+        def interleaved(db, item_id):
+            item = real_get(db, item_id)
+            if not crossed:
+                crossed.append(True)
+                # B a lu les mêmes 4 lots et rend son surplus avant que A
+                # n'écrive : A ne doit pas en rendre deux de plus
+                second.extend(wip.sweep(self.cfg, other, limit=10))
+            return item
+
+        try:
+            with mock.patch.object(work, "get", interleaved):
+                first = wip.sweep(self.cfg, self.db, limit=10)
+        finally:
+            other.close()
+        self.assertEqual([r["item"]["id"] for r in second],
+                         [lots[0]["id"], lots[1]["id"]])
+        self.assertEqual(first, [])
+        self.assertEqual(self.builds_of("dev1"), 2)
+        self.assertEqual(len(self.courriers("dev1")), 2)
+
+    def test_une_exception_posee_apres_la_lecture_protege_le_lot(self):
+        """Le pilote pose l'exception entre la lecture du balayage et son
+        écriture : le lot est relu sous verrou et n'est pas rendu."""
+        self.agent("dev1")
+        lots = []
+        for i in range(4):
+            item = self.build(self.lot("occupé %d" % i, assignee="dev1"))
+            self.aged(item["id"], 10 - i)
+            lots.append(item)
+        real_get = work.get
+        posed: list = []
+
+        def interleaved(db, item_id):
+            item = real_get(db, item_id)
+            if not posed:
+                posed.append(True)
+                work.assign(self.db, lots[0]["id"], "dev1", actor="human:proprio",
+                            cfg=self.cfg, wip_exception="reprise urgente")
+            return item
+
+        with mock.patch.object(work, "get", interleaved):
+            out = wip.sweep(self.cfg, self.db, limit=10)
+        self.assertEqual([r["item"]["id"] for r in out], [lots[1]["id"]])
+        self.assertEqual(work.get(self.db, lots[0]["id"])["assignee"], "dev1")
+        self.assertEqual(self.builds_of("dev1"), 3)
+        st = storage.of(self.db).work
+        self.assertEqual(st.wip_exceptions([lots[0]["id"]], work.WIP_EXCEPTION_MARK,
+                                           work.ASSIGN_NOTES), [lots[0]["id"]])
+
+    def test_la_lecture_du_balayage_est_dediee_aux_build(self):
+        """Le balayage lit les lots en `build` par une requête dédiée : le
+        plafond global des lots ouverts ne peut pas masquer un surplus."""
+        self.agent("dev1")
+        for i in range(3):
+            self.aged(self.lot("intake %d" % i)["id"], 20 - i)
+        builds = [self.build(self.lot("occupé %d" % i, assignee="dev1"))
+                  for i in range(2)]
+        st = storage.of(self.db)
+        rows = st.operations.build_lots_activity(10)
+        self.assertEqual([int(r["id"]) for r in rows], [b["id"] for b in builds])
+        # la lecture globale, bornée, ne voit que les intake plus anciens
+        glob = [int(r["id"]) for r in st.operations.open_lots_activity(2)]
+        self.assertNotIn(builds[0]["id"], glob)
 
 
 class CompteursTest(_Base):

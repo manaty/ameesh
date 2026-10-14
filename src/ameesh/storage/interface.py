@@ -166,10 +166,21 @@ from typing import Any, Callable, Protocol, Sequence
 #: cours (prérequis, travail confié par courrier) garde son état sans passer à
 #: la file (le pilote lit ce marqueur dans le journal, `requeued_sql`).
 RETURNED_NOTE = "returned to the queue"
-#: Débuts d'une note d'attribution : la dernière attribution d'un lot porte
-#: l'exception pilote (`work.WIP_EXCEPTION_MARK`), et un retour §4 doit être
+#: Débuts des notes par lesquelles un lot est CONFIÉ : attribution et création
+#: (`work.assign`, `work.add`), délégation à échéance (`work.delegate`), prises
+#: automatiques (`backlog.LOT_TAKE_NOTE`, `backlog.AUTO_TAKE_NOTE`), reprise
+#: sur pause budget (`handoff.HANDOFF_NOTE`). La DERNIÈRE de ces notes porte
+#: l'exception pilote à la limite d'en-cours (`work.WIP_EXCEPTION_MARK`) : une
+#: note postérieure sans le marqueur l'efface, et un retour §4 doit être
 #: POSTÉRIEUR à la dernière attribution pour rendre le lot prenable.
-ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ")
+#: Les textes sont définis ici, seuls : `wip_exceptions`, `requeued_sql`,
+#: `handoff.last_assigner` et les prises y lisent les mêmes constantes.
+DELEGATED_NOTE = "delegated to "
+LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+AUTO_TAKE_NOTE = "prise automatique"
+HANDOFF_NOTE = "repris pendant la pause budget"
+ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
+                        DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
 
 
 class Domain(abc.ABC):
@@ -1435,11 +1446,30 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def unassign(self, item_id: int, *, current: str | None, note: str,
-                 actor: str) -> dict | None:
+                 actor: str, states: Sequence[str] | None = None) -> dict | None:
         """§4 : rend le lot à la file — assignation retirée si le lot a encore
         l'assigné `current` et n'est ni fusionné ni fermé, journal dans la même
-        transaction ; None sinon. Branche, tête de branche et jalons ne sont
-        pas touchés ; L40 : la délégation en cours est annulée."""
+        transaction ; None sinon. `states` borne en plus les états rendus (le
+        retour manuel §4 : `intake` ou `build`), relu dans la transaction qui
+        écrit. Branche, tête de branche et jalons ne sont pas touchés ; L40 :
+        la délégation en cours est annulée."""
+
+    @abc.abstractmethod
+    def unassign_surplus(self, item_id: int, *, current: str, marker: str,
+                         prefixes: Sequence[str], max_build: int, note: str,
+                         actor: str) -> dict | None:
+        """§4 : restitution du SURPLUS d'un agent, sous les gardes
+        transactionnelles — le verrou consultatif de l'agent (`assign_capped`)
+        est pris AVANT toute relecture, la ligne du lot est verrouillée
+        (`FOR NO KEY UPDATE`) puis relue : le lot doit être encore en `build`,
+        encore assigné à `current`, sans exception pilote (`marker` dans la note
+        de sa dernière attribution, `prefixes`) ; l'agent doit encore dépasser
+        `max_build` lots en `build` SANS exception, recensés sous le verrou.
+        None sinon, rien n'est écrit : deux balayages concurrents ne peuvent
+        donc pas rendre plus que le surplus, et un lot passé en `qa`, repris ou
+        doté d'une exception entre la lecture et l'écriture n'est pas rendu.
+        Journal et annulation de la délégation en cours dans la même
+        transaction (comme `unassign`)."""
 
     @abc.abstractmethod
     def wip_exceptions(self, item_ids: Sequence[int], marker: str,
@@ -2541,6 +2571,15 @@ class Operations(Domain):
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
         son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
         lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
+
+    @abc.abstractmethod
+    def build_lots_activity(self, limit: int | None) -> list[dict]:
+        """§4 : les lots en `build` assignés à un agent, avec leur dernière
+        activité (`last_activity_ts`, même calcul que `open_lots_activity`),
+        les plus anciennement actifs d'abord. Lecture DÉDIÉE du balayage de la
+        limite d'en-cours : le plafond global de `open_lots_activity` peut
+        tronquer les lots d'un agent sur un mesh chargé, jamais ici (les lots
+        en `build` sont bornés par le plafond par agent)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
