@@ -126,7 +126,7 @@ jobs:
           path: ${{ runner.temp }}/mesure
           include-hidden-files: true  # cov/.coverage.*
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 1
 
   carte:
     name: carte

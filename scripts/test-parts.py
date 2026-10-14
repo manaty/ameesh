@@ -20,7 +20,9 @@ Un module absent de la table (nouveau) est pesé par son nombre de tests
 repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
 
 `--list` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
-pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR. La liste
+pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
+plan de repli le demande par `pilot_list` ; une PR de release garde la suite
+complète, scripts/test-plan.py). La liste
 est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
 refusée.
 
@@ -57,9 +59,13 @@ L161f — **plan**: with `--plan plan.json` (written once per CI run by
 their classes from the plan: every part reads the same split, computed once
 from the map. `--parts`, `--list`, `--since` and `--map` are then
 ignored; a plan without a module list for the part (fallback plan) gives
-the L116 split. With `--flow`, the part writes an `impacted` event once its
-P0 and P1 modules are done (`statut`: `vert` or `rouge`): the provisional
-green, when every part says `vert`.
+the L116 split. On a lot branch (L1211), the plan holds only the impacted
+modules and the contract list: the part runs them, the rest of the suite
+runs on main, `release/**` and the package integration branch; a release
+pull request (same branches, source or target) keeps the full suite. With
+`--flow`, the part writes an `impacted` event once its P0 and P1 modules are
+done (`statut`: `vert` or `rouge`): the provisional green, when every part
+says `vert`.
 """
 from __future__ import annotations
 
