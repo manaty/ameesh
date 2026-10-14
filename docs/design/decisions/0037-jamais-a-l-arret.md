@@ -61,7 +61,8 @@ or a risk to production.
    on budget pause, nor on a host under pressure, on low battery or not
    ready. At most `--take-max-per-hour` pickups (2) per sliding hour, counted
    in the database for the whole mesh. Assignment is conditional: two
-   concurrent takers do not take the same item.
+   concurrent takers do not take the same item. *Amended on 2026-10-13, see
+   below: the `--take-paid` gate and the mesh-wide budget pause are removed.*
 6. **Empty backlog, alert.** `backlog_empty` is raised when wakeable agents
    are idle and the backlog has nothing left to take (and
    no lot of the project is waiting); `ameesh notify` pushes it to the human
@@ -78,3 +79,31 @@ or a risk to production.
   value.
 - `--take-idle 0` (or `AMEESH_TAKE_IDLE=0`) turns pickup off; `--dry-run`
   shows the pickups that would be made without assigning anything.
+
+# Amendment of 2026-10-13: what the plans leave goes to the token
+
+Owner instruction of 2026-10-13 (canon, *Processus de lot* §4): "Quand les
+forfaits Claude sont au seuil, le travail passe à DeepSeek et Codex. […] un
+agent DeepSeek libre face à une file non vide est un dysfonctionnement."
+Lot #754, P1.
+
+## Amended rule (§5)
+
+**Plan agents first, then the token in the same pass.** The candidates are
+sorted plans first; each takes the best item or lot that fits it, and the
+pay-per-token agents then take what is left, immediately, never during a
+`balance_low` alert.
+
+Two consequences:
+
+- the `--take-paid` gate disappears, along with the mesh-wide budget pause:
+  a free pay-per-token agent facing a non-empty queue is a dysfunction, and
+  a plan agent at its ceiling must not stop the others. An agent on budget
+  pause takes nothing itself; it makes no one else wait;
+- a plan agent of the same team that cannot take an item (`within_budget`,
+  `may_take`, `lot_fits`) or that already took one in the pass no longer
+  blocks the token agents: the remaining items go in the same pass.
+
+`--take-idle 0`, `--take-lot-idle 0` and `--dry-run` keep their meaning; a
+per-agent cap (`CostBook.over`) and a host under pressure, on low battery or
+not ready still stop the pickup.
