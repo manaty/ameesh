@@ -1,0 +1,40 @@
+{
+  "head": "8e5f2662a169330bbc82365088363be505132351",
+  "base": "0532faed4bba6a683073b9c7f5b9deca64abb2bd",
+  "previous_head": "693672e046c923691d7fc3f206f6f3e8b604797e",
+  "contribution_differences": {
+    "README.md": {
+      "old_only": [],
+      "new_only": []
+    },
+    "docs/EXPLOITATION.md": {
+      "old_only": [],
+      "new_only": []
+    },
+    "src/ameesh/assignments.py": {
+      "old_only": [
+        "-                 estimate=None, app: str | None = None, new_project: bool = False) -> dict:",
+        "+                 estimate=None, app: str | None = None, new_project: bool = False,",
+        "+                 assign: bool = False) -> dict:"
+      ],
+      "new_only": [
+        "-                 parent_lot: int | None = None) -> dict:",
+        "+                 assign: bool = False, parent_lot: int | None = None) -> dict:"
+      ]
+    },
+    "src/ameesh/cli.py": {
+      "old_only": [
+        "-                estimate=estimate, app=app, new_project=new_project)",
+        "+                estimate=estimate, app=app, new_project=new_project, assign=assign)"
+      ],
+      "new_only": [
+        "-                estimate=estimate, app=app, new_project=new_project,",
+        "+                estimate=estimate, app=app, new_project=new_project, assign=assign,"
+      ]
+    },
+    "tests/test_l118_assignments.py": {
+      "old_only": [],
+      "new_only": []
+    }
+  }
+}
