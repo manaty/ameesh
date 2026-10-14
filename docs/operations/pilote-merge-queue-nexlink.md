@@ -412,6 +412,32 @@ là. L'autorisation et la nomination de l'activation du profil restent à
 coordonner **orchestrateur + mesh-design**, sur **une seule** unité : ni le parse
 ni la validation de schéma ne valent feu (§3ter).
 
+### 3sexies. Contrôle de fraîcheur avant activation — 14/10 15:14Z (dev3)
+
+Demandé par `mesh-design` (15:11Z) : vérifier dossier, profil et unité unique
+pendant la QA indépendante §10, pour fournir le **candidat de geste** à son
+retour. Contrôle de **lecture seule** (pas d'accès à `pc-smichea` depuis
+`ameesh-agents-1`) ; **aucune activation, aucune date** posée ici.
+
+| pièce | état constaté | fraîcheur |
+|---|---|---|
+| dossier | `review/183-pilote-radar-queue-nexlink` @ `e134bba4` (tête inchangée depuis 07:47Z) | à jour ; cette section l'actualise |
+| code déployé | gel `12408e2b8818` (`validation/bureau-deploiement-12408e2b`, construit sur `27df8891` = fusion #1037 + correctif #1283) — phases 1–5 de #1236 exécutées, canon `manaty/home#62` fusionné/synchronisé (source bureau 17:05) | contient **#1037** (vérifié par ascendance git), **pas #1127** |
+| carte §2 | `radar.parse_settings` et `protected_target` rejoués sur le build installé d'`ameesh-agents-1` (1.10.0, venv = `12408e2b`) | sortie **identique** à §2 : cible `develop`, `main`/tags/releases protégés, `develop` libre, `land pr merge`, 2 portes, 1 généré |
+| modules d'atterrissage | `radar.py`, `land.py`, `merge_queue.py` du build déployé **identiques octet à octet** à `origin/main` (`046a106a`) | §3quater (défaut `off`, trois verrous, retour `pr`) reste exact |
+| `config.py` | le build déployé n'a **pas** #1127 : un `AMEESH_CONFIG` explicite absent retombe encore en silence sur la config historique | le `test -f` explicite du runbook (§4 étapes 0 et 3) reste indispensable |
+| profil dédié | `radar-nexlink.json` **inactif**, `land: "off"` (bureau 07:45Z) ; le SHA d'après la pose du report-only n'est pas enregistré (le `b3b1c32e…` de §3ter est celui de la version `pr`) | à relire sur PC avant le geste (`sha256sum`), avec le contrôle « comptes inchangés » (§4 étape 5) |
+| unité unique | `ameesh-runner-agent@orchestrateur.service` + drop-in `zzz-radar-nexlink.conf` (même répertoire que `zz-compte-owner-1013.conf`) ; aucun drop-in écrit au dernier relevé | à reconfirmer sur PC (§4 étape 0 : instance, `DropInPaths`, absence du nôtre) |
+| portes Nexlink | `scripts/domains-export.mjs` (sha `0d40d0f1`) et `scripts/check-rollbacks.mjs` (sha `ff114d2a`) présents sur `develop` @ `1fd688a7` (14:30Z, lecture `gh`) | pas de renommage depuis la mesure du 13/10 ; comportement et durée non rejoués ici |
+
+**Ce qui reste à obtenir** : retours de la QA indépendante §10 (`qa-01` pour
+ameesh, `codex3` pour Nexlink), puis **feu distinct** et créneau coordonné.
+**Candidat de geste au retour QA** : §4 étapes 0, 3, 4 et 5 avec
+`land: "pr"` — profil dédié + drop-in `zzz-` + `daemon-reload` + redémarrage de
+la **seule** unité désignée, preuves d'environnement réel et de comptes
+inchangés ; si le feu n'est pas donné, maintien du report-only (§3quinquies) et
+fusion manuelle du rang 1 par l'orchestrateur (§6).
+
 ## 4. Runbook d'application (sur décision du bureau)
 
 **Profil dédié** (§3, §3bis) — pas le `critiques-2.json` partagé. `SRC` est le
@@ -628,6 +654,12 @@ Tranché le 13/10 :
    accès base) ; le créneau `land: "pr"` reste à coordonner avec les
    déploiements `#1037`/`#1236`, et l'activation du profil à autoriser/nommer
    par orchestrateur + mesh-design sur une seule unité.
+   **Mise à jour 14/10 15:14Z** : contrôle de fraîcheur §3sexies — les
+   déploiements `#1037`/`#1236` sont exécutés (gel `12408e2b`, phases 1–5,
+   canon `home#62` synchronisé) et la carte, les modules et les portes Nexlink
+   sont vérifiés sur ce build ; le geste d'activation (profil `pr` + drop-in +
+   redémarrage de l'unique unité) reste conditionné aux retours QA §10 et à un
+   **feu distinct**. Aucune date ni activation.
 7. **Portes** — les deux portes locales suffisent-elles pour le pilote, ou
    faut-il des portes par chemin (`scripts/__tests__/*.test.mjs`) dès le
    premier jour ?
