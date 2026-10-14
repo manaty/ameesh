@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -257,6 +258,52 @@ class CiRunnersTest(unittest.TestCase):
         return subprocess.run(["bash", SCRIPT, "--dry-run", *args],
                               capture_output=True, text=True,
                               env=self.script_env(**env_extra))
+
+    def start_script(self, *args, **env_extra):
+        """Un check qui vit pendant le témoin : lu sur stdout (octets, sans
+        tampon Python), arrêté en cleanup même si une assertion échoue avant
+        sa fin."""
+        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=self.script_env(**env_extra))
+        self.addCleanup(self.stop_script, proc)
+        return proc
+
+    def stop_script(self, proc):
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+    def sync_on_stdout(self, proc, needle, timeout=30.0):
+        """Lit stdout jusqu'à `needle` : les `say` du script sortent aussitôt
+        (`echo`), donc le témoin sait que la fonction observée est entrée
+        avant de muter marqueur ou porte — aucune durée fixe ne décide de
+        l'ordre (canon §3)."""
+        deadline = time.monotonic() + timeout
+        seen = b""
+        while needle not in seen:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([proc.stdout], [], [], left)[0]:
+                break
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            seen += chunk
+        self.assertIn(needle, seen, seen.decode(errors="replace"))
+        return seen
+
+    def finish_script(self, proc, seen=b"", timeout=30):
+        out = seen + (proc.stdout.read() or b"")
+        err = proc.stderr.read() or b""
+        proc.wait(timeout=timeout)
+        return out.decode(), err.decode()
 
     def test_prepare_prints_the_install_and_changes_nothing(self):
         before = sorted(os.path.relpath(os.path.join(d, f), self.host)
@@ -731,40 +778,40 @@ class CiRunnersTest(unittest.TestCase):
 
     def test_check_accepts_a_runner_stopped_within_the_delay(self):
         # C2 : un child vivant au premier relevé mais arrêté dans le délai du
-        # wrapper est un drainage obéi ; le chemin positif est couvert.
+        # wrapper est un drainage obéi ; le chemin positif est couvert. Le
+        # marqueur est posé après l'entrée attestée dans l'attente (stdout),
+        # pas après un `sleep` : la vitesse de la machine ne décide pas.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
         self.registered(1)
-        env = self.script_env(CI_RUNNERS_TEST_ACTIVE="1", CI_RUNNERS_TEST_CHILD="1",
-                              CI_RUNNERS_TEST_STOP_DELAY="30")
-        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", "--check", "--count", "1"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, env=env)
-        time.sleep(4)
+        proc = self.start_script("--check", "--count", "1",
+                                 CI_RUNNERS_TEST_ACTIVE="1",
+                                 CI_RUNNERS_TEST_CHILD="1",
+                                 CI_RUNNERS_TEST_STOP_DELAY="30")
+        seen = self.sync_on_stdout(proc, b"waiting up to 30s")
         self.write("run/ci-runners-test-child-gone-1", "")
-        out, err = proc.communicate(timeout=30)
+        out, err = self.finish_script(proc, seen)
         self.assertEqual(proc.returncode, 0, out + err)
-        self.assertIn("waiting up to 30s", out)
         self.assertIn("the runner process is gone", out)
         self.assertNotIn("KO", err)
 
     def test_check_reads_the_gate_again_and_accepts_a_reopening(self):
         # C2 résiduel : la porte est relue pendant l'attente ; une réouverture
         # available/enforce rend le child légitime au lieu d'un KO sur la
-        # porte initialement fermée (le child simulé reste vivant).
+        # porte initialement fermée (le child simulé reste vivant). La
+        # réouverture est écrite après l'entrée attestée dans l'attente : une
+        # porte déjà ouverte au relevé initial ne prendrait pas ce chemin.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
         self.registered(1)
-        env = self.script_env(CI_RUNNERS_TEST_ACTIVE="1", CI_RUNNERS_TEST_CHILD="1",
-                              CI_RUNNERS_TEST_STOP_DELAY="10")
-        proc = subprocess.Popen(["bash", SCRIPT, "--dry-run", "--check", "--count", "1"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, env=env)
-        time.sleep(3)
+        proc = self.start_script("--check", "--count", "1",
+                                 CI_RUNNERS_TEST_ACTIVE="1",
+                                 CI_RUNNERS_TEST_CHILD="1",
+                                 CI_RUNNERS_TEST_STOP_DELAY="10")
+        seen = self.sync_on_stdout(proc, b"waiting up to 10s")
         self.gate_document(state="available")
-        out, err = proc.communicate(timeout=30)
+        out, err = self.finish_script(proc, seen)
         self.assertEqual(proc.returncode, 0, out + err)
-        self.assertIn("waiting up to 10s", out)
         self.assertIn("the gate reopened while waiting", out)
         self.assertNotIn("still runs", err)
 
