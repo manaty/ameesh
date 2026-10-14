@@ -1,9 +1,0 @@
-merges 1089, conflicting 80, fully resolved by mergiraf 13, partly 9, merged with markers left 1
-mergiraf replay time: 219.2 s
-  *.json         {'resolved/differs': 7, 'resolved/same': 18, 'still': 3}
-  *.md           {'altered/differs': 1, 'resolved/differs': 4, 'resolved/same': 1, 'still': 39}
-  *.rs           {'still': 1}
-  *.ts           {'altered/differs': 2, 'new-conflict': 1, 'resolved/differs': 5, 'resolved/same': 4, 'still': 28}
-  *.tsx          {'altered/differs': 2, 'resolved/same': 1, 'still': 5}
-  *.yml          {'resolved/differs': 1, 'still': 2}
-  -              {'still': 11}

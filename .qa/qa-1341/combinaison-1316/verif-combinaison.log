@@ -1,0 +1,18 @@
+[OK  ] réf de combinaison publiée — refs/atelier/combinaison-1341-1316/union-main-2458ec05 = 1cffaf46d091a0426e18aa215e9ac4b32cb67ba0
+[OK  ] merge-tree(union1341, union1316) rc=0 — rc=0
+[OK  ] arbre recalculé == arbre de la réf de combinaison — 0f336b9e223482b38fbc8398bbfb59c99973868d == 0f336b9e223482b38fbc8398bbfb59c99973868d
+[OK  ] delta combinaison vs main = 6 fichiers attendus — 6 fichiers
+        .github/workflows/carte.yml
+        scripts/map.py
+        scripts/test-parts.py
+        tests/test_1314_carte_concurrency.py
+        tests/test_1316_carte_dispatch.py
+        tests/test_carte_parts_completes.py
+[OK  ] aucune migration dans la combinaison — []
+[OK  ] delta combinaison vs union1316 == delta #1341 (patch-ids constants) — std=3c87ed0c77c2 u0=1dba6c8775af
+[OK  ] delta combinaison vs union1341 == delta #1316 (patch-ids constants) — std=54168a4695b6 u0=307d2749b090
+[OK  ] blobs propres aux deux lots constants (hors carte.yml fusionné)
+[OK  ] patch #1341 appliqué sur main (index temporaire)
+[OK  ] patch #1316 appliqué ensuite (index temporaire)
+[OK  ] rejeu séquentiel == arbre de la combinaison — 0f336b9e223482b38fbc8398bbfb59c99973868d
+{"combinaison": "1cffaf46d091a0426e18aa215e9ac4b32cb67ba0", "arbre": "0f336b9e223482b38fbc8398bbfb59c99973868d", "verdict": "OK", "fails": []}

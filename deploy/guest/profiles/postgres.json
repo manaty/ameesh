@@ -1,5 +1,0 @@
-{
-  "description": "a throwaway Postgres per job (rootless Podman): PGPASSWORD, AMEESH_TEST_DSN, DATABASE_URL",
-  "before": "/usr/local/lib/ameesh-guest/job-postgres up",
-  "after": "/usr/local/lib/ameesh-guest/job-postgres down"
-}

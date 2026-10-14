@@ -1,0 +1,9 @@
+.....s..carte /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmp5v9l58x9/absente.json.gz illisible ([Errno 2] No such file or directory: '/home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmp5v9l58x9/absente.json.gz') : durées de tests/parts/durees.json
+..................................................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmpazd9ohip/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-qa-01/tmptfnaejlu/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+..................
+----------------------------------------------------------------------
+Ran 134 tests in 47.340s
+
+OK (skipped=1)
