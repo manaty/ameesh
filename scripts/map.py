@@ -248,17 +248,62 @@ def _json_lines(motif: str):
                     continue  # ligne coupée (processus tué en écrivant)
 
 
-def _coverage(dossiers: list[str]) -> tuple[dict, int, int]:
-    """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés
-    et celui des processus sans contexte (environnement remplacé par le test :
-    leurs lignes ne sont attribuées à aucun module)."""
+def _couverture_illisible(fichier: str) -> str | None:
+    """Raison pour laquelle un fichier de données coverage est inutilisable,
+    ou None s'il paraît sain.
+
+    Un processus tué pendant l'écriture de sa couverture laisse un fichier
+    tronqué : l'en-tête sqlite annonce N pages, N−1 sont écrites (incident
+    #1257 : `.coverage.ameesh-ci-1.pid3824966.X0pSducx`, 12 pages annoncées,
+    11 écrites, « database disk image is malformed » à la fusion). Le contrôle
+    de l'en-tête écarte ce cas avant coverage ; les corruptions plus profondes
+    sont rattrapées par l'appelant."""
+    try:
+        taille = os.path.getsize(fichier)
+        with open(fichier, "rb") as fh:
+            entete = fh.read(100)
+    except OSError as exc:
+        return f"illisible ({exc.strerror or exc})"
+    if len(entete) < 100 or entete[:16] != b"SQLite format 3\x00":
+        return "en-tête sqlite absent"
+    page = int.from_bytes(entete[16:18], "big") or 65536
+    pages = int.from_bytes(entete[28:32], "big")
+    if page < 512 or pages * page != taille:
+        return f"tronqué ({pages} pages annoncées, {taille // max(page, 1)} écrites)"
+    return None
+
+
+def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
+    """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés,
+    celui des processus sans contexte (environnement remplacé par le test :
+    leurs lignes ne sont attribuées à aucun module) et les couvertures
+    illisibles ignorées ({part, fichier, raison}).
+
+    Une couverture perdue est nommée, jamais silencieuse, et ne fait pas
+    échouer la carte entière : un artefact corrompu ne rougit plus un check
+    (#1257), mais la part fautive reste visible dans la carte et le résumé."""
     lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
+    ignorees: list[dict] = []
     for dossier in dossiers:
+        part = os.path.basename(os.path.normpath(dossier)) or dossier
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
-            from coverage import CoverageData
-            donnees = CoverageData(basename=fichier)
-            donnees.read()
+            raison = _couverture_illisible(fichier)
+            if raison is None:
+                import sqlite3
+
+                from coverage import CoverageData
+                from coverage.exceptions import DataError
+
+                try:
+                    donnees = CoverageData(basename=fichier)
+                    donnees.read()
+                except (DataError, sqlite3.DatabaseError, OSError) as exc:
+                    raison = f"{type(exc).__name__}: {exc}"
+            if raison is not None:
+                ignorees.append({"part": part, "fichier": os.path.basename(fichier),
+                                 "raison": raison})
+                continue
             processus += 1
             contextes = donnees.measured_contexts()
             if contextes and not any(context_module(c) for c in contextes):
@@ -271,7 +316,7 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int]:
                     modules = {m for m in map(context_module, contextes) if m}
                     if modules:
                         lignes[relatif][ligne] |= modules
-    return lignes, processus, sans_contexte
+    return lignes, processus, sans_contexte, ignorees
 
 
 def _version_coverage() -> str:
@@ -297,7 +342,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
               table_durees: dict | None = None) -> dict:
     """Les mesures des parts → la carte."""
     maintenant = maintenant or datetime.datetime.now(datetime.timezone.utc)
-    lignes, processus, sans_contexte = _coverage(dossiers)
+    lignes, processus, sans_contexte, couverture_ignoree = _coverage(dossiers)
 
     # blocs de tout src/, exécutés ou non
     carte_blocs: dict[str, dict] = {}
@@ -391,6 +436,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
     # L148 stage 6 : les deux graphies pendant une release, l'anglaise d'abord.
     measure = {"parts": len(dossiers), "processus": processus,
                "processus_sans_contexte": sans_contexte,
+               "couverture_ignoree": couverture_ignoree,
                "sous_processus_sans_mesure": _per_module(sans_mesure),
                "surcout": surcout}
     return {
@@ -440,6 +486,12 @@ def summary(carte: dict) -> str:
     if mesure["surcout"]:
         lignes.append("* surcoût de la mesure : " + ", ".join(
             f"{p} ×{r}" for p, r in sorted(mesure["surcout"].items())))
+    if mesure.get("couverture_ignoree"):
+        lignes.append(
+            f"* ⚠ {len(mesure['couverture_ignoree'])} couverture(s) illisible(s) "
+            "ignorée(s), données perdues pour ces processus : "
+            + ", ".join(f"{i['part']}/{i['fichier']} ({i['raison']})"
+                        for i in mesure["couverture_ignoree"]))
     if mesure["sous_processus_sans_mesure"]:
         lignes.append("* sous-processus Python lancés sans la mesure (environnement remplacé) : "
                       + ", ".join(sorted(mesure["sous_processus_sans_mesure"])))
@@ -514,6 +566,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.summary:
             with open(args.summary, "a", encoding="utf-8") as fh:
                 fh.write(texte)
+        ignorees = carte.get("mesure", {}).get("couverture_ignoree") or []
+        if ignorees:
+            # La carte reste verte (un artefact corrompu ne rougit pas un
+            # check), mais la perte est nommée dans le journal et le résumé.
+            print("::warning::carte : "
+                  f"{len(ignorees)} couverture(s) illisible(s) ignorée(s) — "
+                  + ", ".join(f"{i['part']}/{i['fichier']} ({i['raison']})"
+                              for i in ignorees))
         print(texte, end="")
         return 0
     if args.commande == "show":
