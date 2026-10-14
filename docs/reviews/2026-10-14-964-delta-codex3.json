@@ -1,0 +1,40 @@
+{
+  "reviewed_head": "693672e046c923691d7fc3f206f6f3e8b604797e",
+  "original_freeze": "593db617bb37823655b832c036697f116be0c728",
+  "original_base": "b85777c1e3e757b9ba0caa8cef49b0db1558b251",
+  "new_base": "046a106a5c8d2a81a5bf717401f8a68e8dd2d4ac",
+  "method": "inverse du diff original avec remplacement du libelle message not dropped par message not delivered ; comparaison des 5 blobs reconstruits a main 046a106a",
+  "checks": [
+    {
+      "file": "README.md",
+      "reconstructed_base_blob": "24a26a8389e744dac4d924e41790f3358bcc79f4",
+      "expected_base_blob": "24a26a8389e744dac4d924e41790f3358bcc79f4",
+      "equal": true
+    },
+    {
+      "file": "docs/EXPLOITATION.md",
+      "reconstructed_base_blob": "f3a1b02d0891bc248fc3a8e43a58d63a487ff026",
+      "expected_base_blob": "f3a1b02d0891bc248fc3a8e43a58d63a487ff026",
+      "equal": true
+    },
+    {
+      "file": "src/ameesh/assignments.py",
+      "reconstructed_base_blob": "9b1ec234421d4d0490cd679b47808b4c83608e54",
+      "expected_base_blob": "9b1ec234421d4d0490cd679b47808b4c83608e54",
+      "equal": true
+    },
+    {
+      "file": "src/ameesh/cli.py",
+      "reconstructed_base_blob": "eef32455df784941a47d1fd93f76151e79789b2e",
+      "expected_base_blob": "eef32455df784941a47d1fd93f76151e79789b2e",
+      "equal": true
+    },
+    {
+      "file": "tests/test_l118_assignments.py",
+      "reconstructed_base_blob": "4fbaf0bd50c87c1222665944b7479c72a52577c3",
+      "expected_base_blob": "4fbaf0bd50c87c1222665944b7479c72a52577c3",
+      "equal": true
+    }
+  ],
+  "tests_run": false
+}
