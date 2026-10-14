@@ -145,12 +145,16 @@ class PlatformTest(unittest.TestCase):
             open(chemin, "w").close()
             sid = "sid-l63-cite-xyz"
             pret = {nom: os.path.join(tmp, "pret-" + nom)
-                    for nom in ("citant", "repris", "lie")}
+                    for nom in ("citant", "repris", "lie", "options")}
             code = "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)"
             citant = self._child(code, pret["citant"], "--json",
                                  '{"brief": "reprends la session %s"}' % sid)
             repris = self._child(code, pret["repris"], "--resume", sid)
             lie = self._child(code, pret["lie"], "--resume=%s" % sid)
+            # #1283 R1 cx2 : les options intercalees avant l'id ne perdent pas
+            # la reprise (`codex exec resume --json <id>`).
+            options = self._child(code, pret["options"], "exec", "resume",
+                                  "--json", sid)
             self._wait(lambda: all(os.path.exists(p) for p in pret.values()))
             for nom, ctx in self.variants:
                 with self.subTest(nom), ctx():
@@ -159,6 +163,31 @@ class PlatformTest(unittest.TestCase):
                     self.assertNotIn(citant.pid, found)
                     self.assertIn(repris.pid, found)
                     self.assertIn(lie.pid, found)
+                    self.assertIn(options.pid, found)
+
+    def test_reconnaissance_du_positional_de_reprise(self):
+        """#1283 R1 cx2 : options intercalees positives, citations negatives."""
+        from ameesh.platform import process as platform_process
+        sid, autre = "sid-r1-xyz", "sid-autre-xyz"
+        cas = [
+            (["codex", "exec", "resume", "--json", sid], True),
+            (["codex", "resume", "--no-alt-screen", sid], True),
+            (["codex", "resume", "-m", "gpt-5.1-codex", sid], True),
+            (["codex", "resume", "--", sid], True),
+            (["claude", "--resume", sid], True),
+            (["claude", "-r", sid], True),
+            (["dsh", "--session-id", sid], True),
+            (["dsh", "--session-id=%s" % sid], True),
+            (["dsh", "tui", "--resume", sid], True),
+            (["codex", "resume", "--json", "prompt qui cite " + sid], False),
+            (["codex", "resume", "--last", "prompt qui cite " + sid], False),
+            (["codex", "resume", autre, "prompt qui cite " + sid], False),
+            (["codex", "resume", "--model", sid, autre], False),
+            (["dsh", "--json", '{"brief": "session %s"}' % sid], False),
+        ]
+        for argv, attendu in cas:
+            with self.subTest(argv=argv):
+                self.assertIs(platform_process._session_argument(argv, sid), attendu)
 
     def test_detenteurs_d_un_dossier(self):
         with tempfile.TemporaryDirectory() as tmp:
