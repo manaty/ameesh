@@ -1,0 +1,5 @@
+C3: absent/invalid/valid seams and real default 157: OK; stderr clean
+C2: fresh/enforce only; observe/stale/stopped closed: OK
+C2: wait statuses reopened=2 / expired=1 / child gone=0: OK
+test_check_accepts_a_runner_stopped_within_the_delay: reproduced false failure: missing waiting message when scheduled after state mutation
+test_check_reads_the_gate_again_and_accepts_a_reopening: reproduced false failure: missing waiting message when scheduled after state mutation
