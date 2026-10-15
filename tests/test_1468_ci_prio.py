@@ -236,8 +236,25 @@ class RunsOnTest(unittest.TestCase):
     def test_same_expression_on_every_linux_job(self):
         self.assertEqual(set(self.linux), {"plan", "psycopg", "psql", "doc-readers",
                                            "bilan", "version", "tests"})
-        self.assertEqual(len(set(self.linux.values())), 1, self.linux)
+        # #1256 : `bilan` (non requis, hors du chemin requis) enveloppe la
+        # règle du pool d'un prêt prioritaire (`vars.AMEESH_LENT_RUNS_ON || (...)`) ;
+        # les autres jobs Linux gardent l'expression commune à l'identique.
+        common = {job: expr for job, expr in self.linux.items() if job != "bilan"}
+        self.assertEqual(len(set(common.values())), 1, common)
         self.assertEqual(self.jobs["platform-macos"], "macos-latest")
+
+    def test_bilan_envelopes_the_pool_rule_with_the_borrowed_label(self):
+        """#1256 : le job routé garde la règle du pool quand aucun prêt n'est
+        armé, et la remplace quand `vars.AMEESH_LENT_RUNS_ON` est posé ; le
+        chemin requis, lui, garde l'expression commune."""
+        routed = self.linux["bilan"]
+        self.assertIn("AMEESH_LENT_RUNS_ON", routed)
+        lent = '["self-hosted", "linux", "ameesh-lent"]'
+        self.assertEqual(
+            evaluate(routed, pr("integration/paquet-2", vars_={"AMEESH_LENT_RUNS_ON": lent})),
+            ["self-hosted", "linux", "ameesh-lent"])
+        self.assertEqual(evaluate(routed, pr("integration/paquet-2", vars_=ON)), POOL)
+        self.assertEqual(evaluate(routed, pr("lot/1500-x", vars_=ON)), ORDINARY)
 
     def test_switch_off_keeps_previous_routing(self):
         for vars_ in ({}, {"AMEESH_CI_PRIO": "off"}, {"AMEESH_CI_PRIO": ""},
