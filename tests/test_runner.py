@@ -710,7 +710,10 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
-        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3")
+        # Le témoin mesure la clôture au bail perdu, pas la porte d'hôte réelle
+        # de la machine (en CI, l'hôte se retire : draining, user_active).
+        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
+                       AMEESH_HOST_GATE="none")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
