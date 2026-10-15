@@ -366,6 +366,11 @@ class AgentWorker(threading.Thread):
         self.runner = runner
         self.db = runner.db
         self.cfg = runner.cfg
+        #: #1466 : configuration relue, prise au début du tour suivant (jamais
+        #: au milieu d'un tour, où schéma, dossier d'état et comptes doivent
+        #: rester cohérents du début à la fin)
+        self._cfg_pending: Config | None = None
+        self._cfg_lock = threading.Lock()
         self.name = agent["name"]
         self.epoch = int(lease["lease_epoch"])
         self.agent = agent
@@ -581,6 +586,24 @@ class AgentWorker(threading.Thread):
         #: expiré sans être rendu) : un tour de reprise sur la même session
         self._reprise_attach = bool(str(agent.get("lease_owner") or "").startswith("attach:"))
         self._resume_load()
+
+    def apply_config(self, cfg: Config) -> None:
+        """Le fichier de configuration a été relu (#1466) : ce worker prendra la
+        nouvelle configuration au début de son prochain tour. Rien n'est changé
+        au milieu d'un tour : le schéma, la base et le dossier d'état d'un tour
+        en cours restent ceux avec lesquels il a démarré (R1 cx2)."""
+        with self._cfg_lock:
+            self._cfg_pending = cfg
+
+    def _apply_pending_config(self) -> None:
+        """Frontière de tour (#1466) : la configuration relue entre en vigueur
+        ici, avant tout ce qui la lit (comptes, plafonds, rôles critiques)."""
+        with self._cfg_lock:
+            cfg = self._cfg_pending
+            if cfg is None:
+                return
+            self._cfg_pending = None
+            self.cfg = cfg
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -5577,6 +5600,7 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            self._apply_pending_config()  # avant les gardes de rotation et de prise
             # #1270 B1 : pas de tentative avant l'échéance de reprise durable ;
             # un réveil déjà posé ne fait pas repartir le tour plus tôt.
             if self.retry_remaining() > 0:
@@ -5605,6 +5629,7 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                self._apply_pending_config()  # une pause budget doit voir les comptes relus
                 if self.runner.draining.is_set():
                     break  # drainage : le tour d'avant est fini, aucun autre ne part
                 if getattr(self.runner, "restart_for_stale", False):
@@ -5697,6 +5722,24 @@ class AgentWorker(threading.Thread):
             self.release_lease()
 
 
+#: #1466 : les seuls champs qu'une relecture à chaud reprend du fichier. Liste
+#: explicite, et non « tout sauf » : un champ nouveau reste figé tant qu'on ne
+#: l'ajoute pas ici. Sont rechargeables ce qui décide une pause budget et la
+#: lecture des comptes ; le reste (hôte, bail, dsn, schéma, dossier d'état,
+#: cadences, porte d'hôte) a décidé des baux et des connexions en cours : le
+#: changer sous un tour actif romprait ce qui tourne (R1 cx2 et dev2 sur #1466 :
+#: schéma et `state_dir` appliqués aux workers sans reconnexion).
+RELOADABLE_FIELDS = frozenset({
+    # provenance de la lecture (journal de l'exécuteur, `ameesh doctor`)
+    "config_path", "config_base", "config_shadowed",
+    # comptes, plafonds et rôles : la décision de pause budget
+    "accounts", "budget_usd_per_hour", "budget_usd_per_day", "budget_explicit",
+    "critical_agents", "noncritical_hourly_share", "critical_fallback_harnesses",
+    # binaires de harnais de l'hôte (L106), lus au lancement de chaque tour
+    "harness_bins",
+})
+
+
 class Runner:
     def __init__(
         self,
@@ -5708,6 +5751,7 @@ class Runner:
         wait: float = 0.0,
         dry_run: bool = False,
         max_turns: int | None = None,
+        cfg_overrides: dict | None = None,
     ):
         from .host_gate import gate_choice
         try:
@@ -5715,6 +5759,13 @@ class Runner:
         except ValueError as exc:
             raise SystemExit("agent-runner: %s" % exc) from exc
         self.cfg = cfg
+        #: #1466 : options de ligne de commande (hôte, bail, sondage, réveil),
+        #: décidées au démarrage. Elles ne se relisent pas — comme tous les
+        #: champs hors `RELOADABLE_FIELDS` — et sont gardées ici pour la trace
+        #: (l'hôte et le bail ont décidé les baux en cours).
+        self._cfg_overrides = dict(cfg_overrides or {})
+        #: #1466 : empreinte des fichiers lus au dernier chargement
+        self._config_stamp = self.config_stamp()
         self.db = db
         self.host = cfg.host
         self.runner_id = cfg.runner
@@ -6471,6 +6522,92 @@ class Runner:
         """Les plafonds en vigueur (L70) : base (cache court) > config > défaut."""
         return self.budget_cache.limits(self.cfg, db,
                                         hourly_default=self.budget_usd_per_hour)
+
+    # -- relecture de la configuration (#1466) ------------------------------
+    def config_stamp(self) -> tuple:
+        """Empreinte des fichiers lus (chemin, mtime, taille) : on ne relit
+        que sur changement."""
+        out = []
+        for path in (self.cfg.config_path, self.cfg.config_base):
+            if not path:
+                continue
+            try:
+                st = os.stat(path)
+                out.append((path, st.st_mtime_ns, st.st_size))
+            except OSError:
+                out.append((path, None, None))
+        return tuple(out)
+
+    def reload_config(self, *, force: bool = False) -> bool:
+        """Relit la configuration si un fichier lu a changé (#1466).
+
+        Un exécuteur gardait la configuration de son démarrage : un compte
+        retiré, un plafond relevé ou un profil corrigé restaient sans effet
+        jusqu'au redémarrage, et des agents restaient en pause sur un plafond
+        périmé. Seuls les champs de `RELOADABLE_FIELDS` — ceux qui décident une
+        pause budget — suivent le fichier. Tout le reste (identité de l'hôte,
+        bail, dsn, schéma, dossier d'état, cadences, porte d'hôte) a décidé des
+        baux et des connexions en cours : le changer sous un tour actif
+        romprait ce qui tourne, il reste figé jusqu'au redémarrage (R1 cx2 et
+        dev2 sur #1466 : schéma et `state_dir` appliqués aux workers sans
+        reconnexion, `refresh_host_limits` relisant `cfg.lease_ttl`).
+
+        Un fichier cassé ou disparu ne remplace rien : la dernière
+        configuration valide reste en vigueur, et le refus est journalisé une
+        fois par empreinte."""
+        if not self.cfg.config_path:
+            return False
+        stamp = self.config_stamp()
+        if not force and stamp == self._config_stamp:
+            return False
+        self._config_stamp = stamp
+        # un fichier disparu ne remplace rien : sans AMEESH_CONFIG, `load`
+        # rendrait sinon les valeurs par défaut (aucun compte)
+        disparus = [path for path, mtime, _size in stamp if mtime is None]
+        if disparus:
+            log_async("config reload refused: %s missing" % ", ".join(disparus))
+            return False
+        try:
+            lu = load_config()
+        except SystemExit as exc:
+            log_async("config reload refused: %s" % exc)
+            return False
+        if lu.config_path != self.cfg.config_path:
+            log_async("config reload refused: now reads %s, started on %s"
+                      % (lu.config_path or "defaults", self.cfg.config_path))
+            return False
+        # liste explicite : ce qui n'y est pas garde la valeur du démarrage, y
+        # compris un champ nouveau (le défaut sûr est de ne pas le relire) ;
+        # l'identité de l'exécuteur, son stockage (base, schéma, serveur médié,
+        # dossier d'état) et les options de ligne de commande ont décidé les
+        # baux et les tours en cours
+        fresh = dataclasses.replace(
+            self.cfg, **{nom: getattr(lu, nom) for nom in RELOADABLE_FIELDS})
+        if fresh == self.cfg:
+            return False
+        avant = self.cfg
+        self.cfg = fresh
+        # le scalaire que `budget_limits` avait recopié au démarrage
+        self.budget_usd_per_hour = max(0.0, fresh.budget_usd_per_hour)
+        adapters.configure(fresh)  # L106 : `harness_bins` de l'hôte
+        with self.lock:
+            workers = list(self.workers.values())
+        for worker in workers:
+            worker.apply_config(fresh)
+        note = "config reloaded: %s" % fresh.config_source
+        if "accounts" in (fresh.config_shadowed or ()):
+            note += (" — WARNING: this profile overrides the host accounts; a "
+                     "stale profile diverges silently from other runners")
+        log_async(note)
+        if fresh.critical_agents != avant.critical_agents:
+            log_async("critical agents: %s"
+                      % (", ".join(fresh.critical_agents) or "none"))
+        # la décision de pause est prise au début d'un tour : réveiller les
+        # agents endormis, y compris ceux que la pause tenait à l'écart
+        self.wake_all.set()
+        for worker in workers:
+            worker.wake.set()
+        return True
 
     # -- écoute ------------------------------------------------------------
     def dispatch(self, item: dict) -> None:
@@ -8122,8 +8259,9 @@ class Runner:
 
     def run(self) -> int:
         log("starting: host %s, runner %s, driver %s, schema %s, mail "
-            "batch %ds (L125)" % (self.host, self.runner_id, self.db.name,
-                                     self.cfg.schema, int(self.mail_batch)))
+            "batch %ds (L125); config %s" % (self.host, self.runner_id, self.db.name,
+                                             self.cfg.schema, int(self.mail_batch),
+                                             self.cfg.config_source))
         self.start_canon_sync()
         # L159f : suivi de la porte et acquittements — en `--once` aussi (r3) :
         # le tour de premier plan compte dans l'accusé partagé de l'hôte
@@ -8179,6 +8317,10 @@ class Runner:
                     self.report_boot_orphans()      # #220 r2 : solde différé
                 if time.monotonic() >= self.live_review_at:
                     self.settle_dead_turns()        # #339
+                try:
+                    self.reload_config()
+                except Exception as exc:  # la relecture ne fait jamais tomber l'exécuteur
+                    log_async("config reload failed (%s)" % type(exc).__name__)
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
@@ -8990,16 +9132,21 @@ def main(argv: list[str] | None = None) -> int:
                 _sortie_sure(code)
 
     parsed = build_parser().parse_args(argv)
+    #: #1466 : les options de ligne de commande survivent à une relecture du
+    #: fichier de configuration (elles ont décidé les baux en cours)
+    overrides: dict = {}
     if parsed.host:
-        cfg = dataclasses.replace(cfg, host=parsed.host)
+        overrides["host"] = parsed.host
     if parsed.runner_id:
-        cfg = dataclasses.replace(cfg, runner_id=parsed.runner_id)
+        overrides["runner_id"] = parsed.runner_id
     if parsed.lease_ttl:
-        cfg = dataclasses.replace(cfg, lease_ttl=parsed.lease_ttl)
+        overrides["lease_ttl"] = parsed.lease_ttl
     if parsed.poll:
-        cfg = dataclasses.replace(cfg, poll=parsed.poll)
+        overrides["poll"] = parsed.poll
     if parsed.idle_nudge:
-        cfg = dataclasses.replace(cfg, idle_nudge=parsed.idle_nudge)
+        overrides["idle_nudge"] = parsed.idle_nudge
+    if overrides:
+        cfg = dataclasses.replace(cfg, **overrides)
 
     from .host_gate import gate_choice
     try:
@@ -9032,6 +9179,7 @@ def main(argv: list[str] | None = None) -> int:
             runner = Runner(
                 cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
+                cfg_overrides=overrides,
             )
         except db_mod.DbError as exc:
             if not mediated:
