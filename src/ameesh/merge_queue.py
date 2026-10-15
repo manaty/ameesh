@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from types import SimpleNamespace
 
 from . import plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -948,6 +949,28 @@ def radar_project(cfg, repo: str):
     if len(matching) > 1:
         raise QueueError("multiple radar projects match this repository; landing conditions are ambiguous")
     return matching[0] if matching else None
+
+
+def writer_project(cfg, repo: str, app: str = "", project=None):
+    """The project identity a single-lot writer shares with the train (#1703).
+
+    `land.lock_key` keys a target lease on `project.name`. A packet train holds
+    the key of the **declared** radar project of its repository, so the direct
+    merge path (`merge_pr.direct_merge`) must resolve that same identity,
+    never a parallel one: the declared project comes first, whatever the
+    admitted lot's `app` says. Without a declared project no train can run on
+    this host, and the lot's `app` is then the explicit identity already
+    carried by the queue — no repository key is invented here (#1680). An
+    empty app refuses: an anonymous writer would open a key space of its own.
+    """
+    if project is None:
+        project = radar_project(cfg, repo)
+    if project is not None:
+        return project
+    name = (app or "").strip()
+    if not name:
+        raise QueueError("cannot reserve an undeclared target project")
+    return SimpleNamespace(name=name)
 
 
 def working_clone(cfg, repo: str, project) -> tuple:

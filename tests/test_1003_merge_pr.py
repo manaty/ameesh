@@ -182,6 +182,25 @@ class GuardTest(_Base):
         self.assertEqual(self.tip(), self.base)
         self.writer.release.assert_called_once()
 
+    def test_dry_run_takes_no_writer_lease_and_succeeds_while_reserved(self):
+        # #1703 N1: the dry run writes nothing (it stops before the push); it
+        # must neither take, hold nor refuse on the target lease, so it runs
+        # while a packet train holds that lease.
+        from ameesh.packet_reservation import ReservationError
+        self.writer.acquire.side_effect = ReservationError("target main is reserved")
+        out = self.merge(self.gh(), dry_run=True)
+        self.assertEqual(out["state"], "dry-run", out)
+        self.assertEqual(out["reservation"], "not taken (dry-run)")
+        self.writer.acquire.assert_not_called()
+        self.writer.release.assert_not_called()
+        self.assertEqual(self.tip(), self.base)
+
+    def test_the_held_reservation_is_visible_in_the_evidence(self):
+        # #1703 N2: the identity actually held is readable, so an operator can
+        # compare it with the key the train holds on the same target.
+        out = self.merge(self.gh())
+        self.assertEqual(out["reservation"], self.writer.key)
+
     def test_dry_run_builds_the_merge_commit_without_pushing(self):
         gh = self.gh()
         out = self.merge(gh, dry_run=True)
