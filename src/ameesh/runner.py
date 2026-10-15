@@ -3569,7 +3569,8 @@ class AgentWorker(threading.Thread):
         travail de fond n'est PAS confié au suivi (`background.start`) : le
         cgroup du tour est alors tué et enlevé, sa latence et son pic mémoire
         journalisés (L498, mesures)."""
-        if not getattr(self, "_turn_open", False):
+        recorded = getattr(self, "_turn_open", False)
+        if not recorded and not cgroup:
             return
         from .turn_processes import group_running
         self._turn_open = False
@@ -3598,13 +3599,14 @@ class AgentWorker(threading.Thread):
                    "%d bytes" % peak if peak is not None else "unknown"))
         orphelin = (survives or bool(conteneurs) or group_running(pgid)
                     or emptied is False)
-        try:
-            storage.of(self.db).turn_resources.close_turn(
-                turn_id, orphan=orphelin, containers=conteneurs or None)
-        except Exception as exc:  # ne casse jamais la fin d'un tour
-            log("[%s] could not close the resources of turn %s (%s)"
-                % (self.name, turn_id[:8], exc))
-            return
+        if recorded:
+            try:
+                storage.of(self.db).turn_resources.close_turn(
+                    turn_id, orphan=orphelin, containers=conteneurs or None)
+            except Exception as exc:  # ne casse jamais la fin d'un tour
+                log("[%s] could not close the resources of turn %s (%s)"
+                    % (self.name, turn_id[:8], exc))
+                return
         if orphelin:
             log("[%s] orphan resource of turn %s: %s"
                 % (self.name, turn_id[:8],
@@ -3965,14 +3967,16 @@ class AgentWorker(threading.Thread):
             if not audit_exempt:
                 root = self.runner.turn_cgroup_root()
                 if root is not None:
-                    cgroup_path = turn_cgroup.create(root, turn_id)
-                    if cgroup_path is None:
-                        log("[%s] turn %s refused: cannot create a turn cgroup under %s"
-                            % (self.name, turn_id[:8], root))
-                        raise _LancementImpossible(
-                            "turn cgroup refused: cannot create %s/turn-%s"
-                            % (root, turn_id))
+                    # Publish creation and ownership together: reconciliation
+                    # must never see a directory before its live turn id.
                     with self.runner._turn_cgroups_lock:
+                        cgroup_path = turn_cgroup.create(root, turn_id)
+                        if cgroup_path is None:
+                            log("[%s] turn %s refused: cannot create a turn cgroup under %s"
+                                % (self.name, turn_id[:8], root))
+                            raise _LancementImpossible(
+                                "turn cgroup refused: cannot create %s/turn-%s"
+                                % (root, turn_id))
                         self.runner._turn_cgroups_live.add(turn_id)
                     ready_r, ready_w = os.pipe()
             with open(stderr_path, "ab") as stderr:
@@ -6694,10 +6698,12 @@ class Runner:
         journalisée une fois — le code reste inerte là où la délégation n'est
         pas posée."""
         if not self._turn_cgroup_probed:
-            self._turn_cgroup_probed = True
             from . import turn_cgroup
             root, reason = turn_cgroup.root_for_runner()
             self._turn_cgroup_root = root
+            # Publish readiness only after the result, including to workers
+            # probing concurrently: a pending probe is not a PID/PGID fallback.
+            self._turn_cgroup_probed = True
             if root is None:
                 log("per-turn cgroup unavailable (%s): keeping PID/PGID ownership"
                     % reason)
@@ -6733,11 +6739,15 @@ class Runner:
         if root is None:
             return 0
         from . import turn_cgroup
+        # Enumerate before taking the live snapshot. A turn created during
+        # enumeration is then in live; one created later is absent from paths.
+        # Creation and publication share _turn_cgroups_lock with the snapshot.
+        paths = turn_cgroup.orphans(root)
         live = self._live_turn_ids()
         if live is None:
             return 0
         killed = 0
-        for path in turn_cgroup.orphans(root):
+        for path in paths:
             turn_id = turn_cgroup.turn_id_of(path.rsplit("/", 1)[-1])
             if not turn_id or turn_id in live:
                 continue

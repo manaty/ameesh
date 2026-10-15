@@ -636,6 +636,29 @@ class SonTurnCgroupRootTest(unittest.TestCase):
         self.assertTrue(runner._turn_cgroup_probed)
         self.assertEqual(runner._turn_cgroup_root, "/user.slice/x/unit")
 
+    def test_sonde_en_cours_ne_publie_pas_un_faux_repli(self):
+        runner = self._runner()
+        started, release = threading.Event(), threading.Event()
+        results = []
+        def probe():
+            if threading.current_thread() is worker:
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("probe not released")
+            return "/u", ""
+        worker = threading.Thread(target=lambda: results.append(runner.turn_cgroup_root()))
+        with mock.patch("ameesh.runner.log"), \
+                mock.patch("ameesh.turn_cgroup.root_for_runner", side_effect=probe):
+            worker.start()
+            try:
+                self.assertTrue(started.wait(5))
+                self.assertEqual(runner.turn_cgroup_root(), "/u")
+            finally:
+                release.set()
+                worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results, ["/u"])
+
     def test_sans_delegation_rend_none_sans_lever(self):
         runner = self._runner()
         with mock.patch("ameesh.runner.log"), \
@@ -684,6 +707,17 @@ class ReconciliationTest(unittest.TestCase):
             self.assertEqual(runner.reconcile_turn_cgroups(), 1)
         orphelins.assert_called_once_with("/u")
         self.assertEqual(tuer.call_args_list, [mock.call("/u/turn-b")])
+
+    def test_creation_pendant_enumeration_est_vue_vivante(self):
+        runner = self._runner(live=())
+        def enumerate_and_launch(root):
+            with runner._turn_cgroups_lock:
+                runner._turn_cgroups_live.add("new")
+            return ["/u/turn-new"]
+        with mock.patch("ameesh.turn_cgroup.orphans", side_effect=enumerate_and_launch), \
+                mock.patch("ameesh.turn_cgroup.kill") as kill:
+            self.assertEqual(runner.reconcile_turn_cgroups(), 0)
+        kill.assert_not_called()
 
     def test_le_travail_de_fond_en_grace_est_vivant(self):
         runner = self._runner(live=())
@@ -850,11 +884,22 @@ class RessourceDuTourTest(unittest.TestCase):
         # l'orphelin signalé porte le chemin du cgroup, pas un groupe recyclé
         self.assertTrue(any(m.endswith("/u/turn-t1") for m in messages))
 
-    def test_fermeture_sans_tour_ouvert_ne_fait_rien(self):
+    def test_fermeture_sans_ligne_base_nettoie_encore_le_cgroup(self):
+        worker = self._worker()
+        with mock.patch("ameesh.turn_cgroup.memory_peak", return_value=None), \
+                mock.patch("ameesh.turn_cgroup.kill", return_value=True) as tuer, \
+                mock.patch("ameesh.turn_processes.group_running", return_value=False), \
+                mock.patch("ameesh.runner.log"), \
+                mock.patch("ameesh.runner.storage.of") as store:
+            worker._close_turn_resource("t1", 4242, cgroup="/u/turn-t1")
+        tuer.assert_called_once_with("/u/turn-t1")
+        store.assert_not_called()
+
+    def test_fermeture_sans_cgroup_ni_ligne_base_ne_fait_rien(self):
         worker = self._worker()
         with mock.patch("ameesh.turn_cgroup.kill") as tuer, \
                 mock.patch("ameesh.runner.storage.of") as store:
-            worker._close_turn_resource("t1", 4242, cgroup="/u/turn-t1")
+            worker._close_turn_resource("t1", 4242)
         tuer.assert_not_called()
         store.assert_not_called()
 
