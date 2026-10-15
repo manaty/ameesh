@@ -512,6 +512,7 @@ class AgentWorker(threading.Thread):
         self._lot_wd_path: dict = {}
         self._lot_workdir_secondary = False
         self._lot_workdir_path: str | None = None
+        self._lot_workdir_error = ""
         #: panne de base (L72) : attente croissante entre deux essais, consigne
         #: consommée par un tour qui n'a pas pu partir (à remettre en attente
         #: au retour de la base), statut « base injoignable » posé, et session
@@ -2483,10 +2484,27 @@ class AgentWorker(threading.Thread):
             return False
         return self._lot_wd_until[lot] > time.monotonic()
 
+    def _lot_workdir_blocked(self, lot) -> bool:
+        """#811 (B1/B2) : ce lot ne peut pas ouvrir de tour faute de dossier.
+
+        L'état de différé (mémoire de ce worker) d'abord ; sinon la règle
+        partagée avec le hook (`lot_workdir.mail_hold`), pour ne pas livrer de
+        courrier dans la session d'un autre lot ni consommer un réveil pour un
+        lot dont le dossier manque. Une lecture en échec ne bloque rien."""
+        if self._lot_deferred(lot):
+            return True
+        try:
+            from . import lot_workdir
+            return lot_workdir.mail_hold(self.cfg, self.db, self.agent, lot)
+        except db_mod.DbError as exc:
+            log_async("[%s] lot workdir unreadable (%s)" % (self.name, exc))
+            return False
+
     def _mail_without_deferred_lots(self, messages: list[dict]) -> list[dict]:
         """#811 (B1) : le courrier d'un lot secondaire différé reste non lu ;
         les autres messages du tour passent (son dossier manque)."""
-        if not self._lot_wd_until:
+        from . import projects as projects_mod
+        if not messages or len(projects_mod.agent_projects(self.agent)) < 2:
             return messages
         try:
             ops = storage.of(self.db).operations
@@ -2494,7 +2512,7 @@ class AgentWorker(threading.Thread):
             for row in messages:
                 mid = int(row.get("id") or 0)
                 lots = ops.message_lots([mid]) if mid else []
-                if len(lots) == 1 and self._lot_deferred(lots[0]):
+                if len(lots) == 1 and self._lot_workdir_blocked(lots[0]):
                     continue
                 kept.append(row)
             return kept
@@ -3236,7 +3254,7 @@ class AgentWorker(threading.Thread):
         if spec is not None:
             # #408 : le réveil sur un lot actionnable porte déjà son lot
             spec["lot"] = spec.get("lot") or self.turn_lot(spec)
-            if self._lot_deferred(spec.get("lot")):
+            if self._lot_workdir_blocked(spec.get("lot")):
                 # #811 (B1) : ne pas relancer en boucle le tour d'un lot
                 # secondaire sans dossier ; la consigne repart en attente.
                 if spec.get("kind") == "prompt":
@@ -3321,7 +3339,7 @@ class AgentWorker(threading.Thread):
             return self._courrier_spec("urgent", autorises)
         if self.suite:
             lot = self.turn_lot({"kind": "suite", "prompt": "", "ids": []})
-            if not self._lot_deferred(lot):
+            if not self._lot_workdir_blocked(lot):
                 # L105 : le tour précédent a été clos par un plafond ; le travail
                 # reprend avant toute nouvelle consigne (le courrier suit, par le hook).
                 raison, self.suite = self.suite, None
@@ -3332,7 +3350,7 @@ class AgentWorker(threading.Thread):
         prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if prompt:
             lot = self.turn_lot({"kind": "prompt", "prompt": prompt, "ids": []})
-            if self._lot_deferred(lot):
+            if self._lot_workdir_blocked(lot):
                 # #811 (B1) : la consigne attend le dossier de SON lot ; elle
                 # reste en attente et les tours primaires continuent.
                 registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
@@ -3430,6 +3448,10 @@ class AgentWorker(threading.Thread):
             lots = st.actionable(self.name, today=_dt.date.today().isoformat())
             for row in lots:
                 if not self.lot_wake_allowed(row, now, base):
+                    continue
+                if self._lot_workdir_blocked(row["id"]):
+                    # #811 (B2) : pas de réveil consommé pour un lot dont le
+                    # dossier manque — un autre lot actionnable est élu.
                     continue
                 note = st.note_wake(self.name, int(row["id"]), row.get("activity_ts"))
                 log_async("[%s] idle with actionable lot #%s (%s): woken (wake %s)"
