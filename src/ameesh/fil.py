@@ -211,7 +211,8 @@ class Entry:
 class Transport(Protocol):
     name: str
 
-    def post(self, thread: ThreadRef, entry: Entry) -> str: ...
+    def post(self, thread: ThreadRef, entry: Entry, *,
+             with_census: bool = True) -> str: ...
 
     def read(self, thread: ThreadRef, since: str | None = None) -> list[Entry]: ...
 
@@ -660,9 +661,22 @@ class FileTransport:
     def __init__(self, root: str):
         self.root = os.path.abspath(os.path.expanduser(root))
         #: census laissé par le dernier `post` de cette instance, par fil :
-        #: (périphérique, inode, taille, entrées, dernière ligne, fin logique).
-        #: `census_after_post` ne le rend que si le fichier est resté celui-là.
+        #: (périphérique, inode, taille, mtime_ns, ctime_ns, entrées, dernière
+        #: ligne, fin logique). `census_after_post` ne le rend que si le fichier
+        #: est resté exactement celui-là.
         self._posted: dict[str, tuple] = {}
+
+    #: #1764 N5 : borne du cache — il ne sert qu'au `post` qui précède
+    #: l'indexation, un processus de longue vie ne garde pas un census par fil.
+    _POSTED_MAX = 256
+
+    def _remember(self, key: str, census: tuple) -> None:
+        """Retient le census d'un fil, en oubliant le plus ancien au-delà de
+        `_POSTED_MAX` (#1764 N5 : `_posted` ne grandit pas sans borne)."""
+        self._posted.pop(key, None)     # un fil reposté passe en dernier
+        self._posted[key] = census
+        while len(self._posted) > self._POSTED_MAX:
+            self._posted.pop(next(iter(self._posted)))
 
     def location(self, thread: ThreadRef) -> str:
         """Chemin du fil, pour l'affichage et l'index.
@@ -772,7 +786,8 @@ class FileTransport:
             return False
         return True
 
-    def post(self, thread: ThreadRef, entry: Entry) -> str:
+    def post(self, thread: ThreadRef, entry: Entry, *,
+             with_census: bool = True) -> str:
         """Écrit l'entrée à la fin du fil et retient son census (L361c).
 
         La marche faite pour réparer une écriture interrompue sert aussi à
@@ -780,6 +795,9 @@ class FileTransport:
         exécuteur médié, l'indexation n'a plus à relire tout le fil. Le census
         n'est retenu que si le fil était neuf ou bien formé (rien à réparer) ;
         tout doute (réparation, autre écrivain, expiration) le fait écarter.
+        `with_census=False` (#1764 N3) : l'indexation locale ne demande jamais
+        ce census — la marche de réparation reste faite, mais la plus récente
+        entrée n'est pas relue pour un census que personne ne demandera.
         """
         data = format_entry(entry).encode("utf-8")
         fd, _ = self._locked(thread, fcntl.LOCK_EX, write=True)
@@ -808,16 +826,21 @@ class FileTransport:
                 except OSError:
                     pass
                 raise
-            if size == 0 or not prefix:
-                census = self._census_after(thread, data, found, current,
-                                            size + len(prefix), shift, os.fstat(fd))
+            if with_census and (size == 0 or not prefix):
+                try:
+                    census = self._census_after(thread, data, found, current,
+                                                size + len(prefix), shift, os.fstat(fd))
+                except Exception:
+                    # #1764 N2 : le fil est écrit ; un census illisible ne fait
+                    # pas échouer le post, l'appelant relira le fil entier.
+                    census = None
         finally:
             os.close(fd)  # libère le verrou
         entry.id = "%s#%d" % (thread.key, size + len(prefix) + shift)
         if census is None:
             self._posted.pop(thread.key, None)
         else:
-            self._posted[thread.key] = census
+            self._remember(thread.key, census)
         return entry.id
 
     def _census_after(self, thread: ThreadRef, data: bytes, found: list,
@@ -830,12 +853,16 @@ class FileTransport:
         `data` : l'entrée écrite, à la position logique `start + shift` (relue,
         comme le ferait un census complet).
         """
-        new = parse(data, base=start + shift, key=thread.key)
-        new = new[0] if new else None
+        new_entries = parse(data, base=start + shift, key=thread.key)
+        new = new_entries[0] if new_entries else None
         before = _latest_entry(current, found, shift, thread.key)
         last = new if new is not None and (before is None or new.ts >= before.ts) else before
-        return (st.st_dev, st.st_ino, st.st_size, len(found) + 1,
-                _index_row(last), st.st_size + shift)
+        # #1764 N4 : le compte vient des entrées réellement lues, pas d'un « +1 »
+        # aveugle qui compterait une entrée que la relecture complète ignore.
+        # #1764 N1 : mtime/ctime_ns entrent dans l'identité — une réécriture de
+        # même taille (ou une réutilisation d'inode) les change, pas la taille.
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns,
+                len(found) + len(new_entries), _index_row(last), st.st_size + shift)
 
     def _offset(self, thread: ThreadRef, since: str) -> int:
         key, sep, offset = str(since).rpartition("#")
@@ -908,13 +935,14 @@ class FileTransport:
         Le census complet relit et décode tout le fil ; ici il est déjà déduit
         de la marche que `post` fait pour réparer une écriture interrompue
         (L361c). Il n'est rendu que si le fichier est resté exactement celui
-        écrit — même fichier (périphérique, inode), même taille : un autre
-        écrivain, une expiration ou un remplacement le font écarter, et
-        l'appelant relit le fil (`census`)."""
+        écrit — même fichier (périphérique, inode), même taille et mêmes
+        horodatages (une réécriture de même taille change mtime/ctime_ns,
+        #1764 N1) : un autre écrivain, une expiration ou un remplacement le
+        font écarter, et l'appelant relit le fil (`census`)."""
         state = self._posted.get(thread.key)
         if state is None:
             return None
-        dev, ino, size, kept, last, end = state
+        dev, ino, size, mtime_ns, ctime_ns, kept, last, end = state
         try:
             fd = self._open(thread, write=False)
         except (OSError, ThreadError):
@@ -923,7 +951,8 @@ class FileTransport:
             st = os.fstat(fd)
         finally:
             os.close(fd)
-        if (st.st_dev, st.st_ino, st.st_size) != (dev, ino, size):
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns) != (
+                dev, ino, size, mtime_ns, ctime_ns):
             return None
         return kept, last, end
 
@@ -1015,6 +1044,7 @@ class FileTransport:
             os.rename(tmp, thread.stem + ".md", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             tmp = None
             os.fsync(dir_fd)
+            self._posted.pop(thread.key, None)   # fichier réécrit : census caduc
             return report
         except BaseException:
             if tmp is not None:  # seulement le fichier que cet appel a créé
@@ -1174,7 +1204,11 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
         entry = Entry(author=member(cfg, sender),
                       recipient=", ".join(member(cfg, r) for r in recipients),
                       text=text, ts=float(ts) if ts else time.time(), meta=entry_meta)
-        external_id = transport.post(thread, entry)
+        # #1764 N3 : le census n'est calculé que pour un index médié, seul
+        # lecteur de `census_after_post` ; une indexation locale ne le demande
+        # jamais (le calcul relit la plus récente entrée à chaque post).
+        external_id = transport.post(
+            thread, entry, with_census=db is not None and storage.is_remote(db))
     except Exception as exc:
         _warn("thread write failed (%s) — message kept %s" % (
             " ".join(str(exc).split())[:200],
