@@ -177,8 +177,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       plus récent), `merged`, `delivered` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
     * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
-      verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
-      #705), sinon l'auteur du dernier verdict ;
+      verdict courant ; sinon le relecteur désigné du lot
+      (`work_items.reviewer`, #705) ; sinon None — un verdict périmé ne
+      désigne personne (#1318) ;
     * `verdict_current` : le verdict retenu porte-t-il sur le dernier gel ?
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
@@ -267,11 +268,11 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # #705 : avant tout verdict — ou après un regel, le verdict précédent ne
     # vaut plus — le relecteur DÉSIGNÉ (`work move … qa --reviewer`) est celui
     # qu'on attend ; quand un verdict courant existe, c'est son auteur qui a
-    # réellement relu.
+    # réellement relu. #1318 : un verdict périmé ne désigne personne — sans
+    # relecteur désigné on attend « un relecteur (non désigné) », pas l'auteur
+    # du verdict que le gel a rendu caduc.
     designated = (item.get("reviewer") or "").strip() or None
-    reviewer = last["actor"] if last else None
-    if designated and not verdict_current:
-        reviewer = designated
+    reviewer = (last["actor"] if last else None) if verdict_current else designated
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
