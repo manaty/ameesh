@@ -899,6 +899,18 @@ def expiry(gauges, now: float) -> tuple | None:
     return best
 
 
+def lost_at_reset(gauges, now: float) -> float:
+    """#1580 (propriétaire, 2026-10-15) : le budget qui sera **perdu à la
+    remise à zéro** si rien ne le consomme d'ici là — la capacité inutilisée
+    (`1 − utilisé`, 0034 §5/L74) de la fenêtre qui se remet à zéro le plus
+    tôt (`expiry`). 0.0 : rien n'expire (aucune fenêtre en cours : relevé
+    échu, non daté ou absent — une lecture périmée n'annonce aucune perte).
+
+    C'est le score du choix : consommer d'abord ce qui va être perdu."""
+    found = expiry(gauges, now)
+    return found[1] if found is not None else 0.0
+
+
 def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | None]:
     """Le retard du compte sur son rythme (L117, amendement 0034 du 2026-10-10) :
     `(rapport, jauge)` de sa fenêtre **la plus contraignante**, où le rapport
@@ -944,40 +956,65 @@ def explain(result: Evaluation, now: float) -> str:
     return "%s %.0f%% used (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
+def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
+    """La clé de classement d'un compte (0034 amendée, #1580).
+
+    * sans relevé d'abord (L117, amendement 0034 du 2026-10-10) : un compte
+      jamais utilisé compte pour 0 % et passe en premier, pour ne pas laisser
+      un forfait inutilisé ;
+    * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
+    * l'échéance de la capacité inutilisée (la plus proche d'abord, 0034 §1) ;
+    * la part de fenêtre perdue à cette remise à zéro (`lost_at_reset`, la
+      plus grosse d'abord) ;
+    * l'ordre déclaré (`priority`, L226b « primaries last »).
+
+    Les critères de budget précèdent l'ordre déclaré : demande du propriétaire
+    du 2026-10-15 (#1580) — le choix automatique ne suit plus un ordre fixe de
+    priorités, il consomme d'abord ce qui sera perdu à la remise à zéro."""
+    result = evaluations[profile.name]
+    gauges = result.gauges
+    found = expiry(gauges, now)
+    return (0 if not gauges else 1,
+            round(lag(gauges, now, result.limits)[0], 6),
+            found[0] if found is not None else float("inf"),
+            -round(lost_at_reset(gauges, now), 6),
+            priority(profile))
+
+
 def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
     """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
-    Clé : L226b, the failover order first (`priority`: the default account
-    last, owner decision 2026-10-07), then le retard sur le rythme (`lag`, le
-    plus petit rapport d'abord), puis l'échéance de la capacité inutilisée (la
-    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré.
+    Clé : `_rank_key` — les critères de budget d'abord (retard sur le rythme,
+    échéance de la capacité inutilisée, part perdue), l'ordre déclaré en
+    dernier (#1580, demande du propriétaire du 2026-10-15).
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
     (`Evaluation.hard`)."""
-    def key(pair):
-        index, profile = pair
-        result = evaluations[profile.name]
-        gauges = result.gauges
-        found = expiry(gauges, now)
-        return (priority(profile), round(lag(gauges, now, result.limits)[0], 6),
-                found[0] if found is not None else float("inf"), index)
     usable = [(i, p) for i, p in enumerate(items)
               if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
-    return [p for _i, p in sorted(usable, key=key)]
+    return [p for _i, p in sorted(
+        usable, key=lambda pair: _rank_key(pair[1], evaluations, now) + (pair[0],))]
 
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
     « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
-    primaire seven_day 35 % utilisé (rythme 55 %) »."""
+    primaire seven_day 35 % utilisé (rythme 55 %) ».
+
+    L'ordre déclaré ne s'annonce que s'il a réellement décidé, les critères de
+    budget étant à égalité (`_rank_key`, #1580)."""
     first = ranked[0]
-    if len(ranked) > 1 and priority(first) < priority(ranked[1]):
-        # L226b: the failover order decided, not the pace
-        why = "%s, first in the failover order (priority %d)" % (
-            explain(evaluations[first.name], now), priority(first))
-    else:
+    why = None
+    if len(ranked) > 1:
+        mine = _rank_key(first, evaluations, now)
+        other = _rank_key(ranked[1], evaluations, now)
+        if mine[:4] == other[:4] and mine[4] != other[4]:
+            # L226b: the failover order decided, the budget criteria tied
+            why = "%s, first in the failover order (priority %d)" % (
+                explain(evaluations[first.name], now), priority(first))
+    if why is None:
         why = "%s, furthest behind its pace" % explain(evaluations[first.name], now)
     if len(ranked) > 1:
         why += "; ahead of: %s" % ", ".join(

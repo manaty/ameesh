@@ -204,22 +204,26 @@ class CapsAndOrderTest(_CapsBase):
         # the long window keeps the pace cap
         self.assertEqual(evs["secondaire"].limits["seven_day"][1], "pace cap")
 
-    def test_failover_order_primary_last(self):
+    def test_budget_criteria_before_the_declared_order(self):
+        """#1580 (propriétaire, 2026-10-15) : le choix ne suit plus l'ordre
+        déclaré — le compte qui a le plus de budget inutilisé passe d'abord,
+        même déclaré dernier ; l'ordre de bascule (L226b) ne départage plus que
+        des critères de budget à égalité."""
         now = 1_800_000_000.0
         items = self._items(tertiaire={"priority": 10})
-        # the primary is the least used, yet comes last
+        # the primary is the least used: it comes first, whatever its priority
         gauges = {"primaire": self._gauges(0.05, 0.05, now),
                   "secondaire": self._gauges(0.30, 0.30, now),
                   "tertiaire": self._gauges(0.60, 0.60, now)}
         evs = self._ev(items, gauges, now)
         ranked = accounts.rank(items, evs, now)
+        self.assertEqual([p.name for p in ranked], ["primaire", "secondaire", "tertiaire"])
+        # égalité de budget : l'ordre déclaré départage encore (L226b)
+        equal = {name: self._gauges(0.05, 0.05, now) for name in gauges}
+        evs = self._ev(items, equal, now)
+        ranked = accounts.rank(items, evs, now)
         self.assertEqual([p.name for p in ranked], ["tertiaire", "secondaire", "primaire"])
         self.assertIn("first in the failover order", accounts.reason_of(ranked, evs, now))
-        # without priorities, the pace decides among the others; primary still last
-        items = self._items()
-        evs = self._ev(items, gauges, now)
-        self.assertEqual([p.name for p in accounts.rank(items, evs, now)],
-                         ["secondaire", "tertiaire", "primaire"])
 
 
 class OverageReadingTest(unittest.TestCase):
