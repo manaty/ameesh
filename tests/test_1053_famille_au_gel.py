@@ -11,8 +11,13 @@ produit. Témoins :
 
 * un changement de session entre le gel et la fusion ne change pas la famille
   du lot antérieur (témoin du lot) ;
-* un tour postérieur au gel ne compte pas ;
+* #1777 : le tour qui a posé le gel est celui dont la ligne `turn_costs` suit
+  le gel (elle est écrite à la fin du tour), dans la fenêtre d'un tour ; la
+  ligne d'une session suivante, plus tard, ne compte pas ;
 * l'auteur est l'acteur du gel, même si le lot a été réassigné depuis ;
+* #1777 : un gel reposé par un tiers garde l'acteur du premier gel, même si
+  le tiers a des tours tracés ; sans tour tracé, on retombe sur l'assigné,
+  producteur du lot ;
 * sans tour tracé, la famille reste inconnue : le registre courant n'est jamais
   une preuve historique.
 """
@@ -36,15 +41,15 @@ class FamilleAuGelTest(PgTestCase):
                             assignee="a1")["id"]
         self.sha = "a" * 40
 
-    def turn(self, agent, harness, *, offset):
+    def turn(self, agent, harness, *, offset, session=None):
         """Une ligne du grand livre, à `offset` minutes de maintenant."""
         self.db.execute(
-            "INSERT INTO turn_costs (agent, harness, recorded_at)"
-            " VALUES (%s, %s, now() + make_interval(mins => %s))",
-            (agent, harness, int(offset)))
+            "INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+            " VALUES (%s, %s, %s, now() + make_interval(mins => %s))",
+            (agent, harness, session, int(offset)))
 
-    def freeze(self, actor="a1"):
-        work.milestone(self.db, self.lot, "frozen", sha=self.sha, actor=actor)
+    def freeze(self, actor="a1", sha=None):
+        work.milestone(self.db, self.lot, "frozen", sha=sha or self.sha, actor=actor)
 
     def switch_session(self, harness):
         """La session VIVANTE de a1 bascule (rotation, adopt) après le gel."""
@@ -61,17 +66,61 @@ class FamilleAuGelTest(PgTestCase):
         return work.get(self.db, out["id"])["body"]
 
     def test_la_bascule_de_session_entre_gel_et_fusion_ne_change_pas_la_famille(self):
-        """Témoin du lot : la production est deepseek, la session courante
-        devient codex après le gel — le relecteur désigné reste codex (l'autre
-        famille que deepseek), pas claude (la famille de la nouvelle session)."""
-        self.turn("a1", "deepseek", offset=-5)
+        """Témoin du lot : la production est deepseek, et la seule ligne
+        postérieure au gel est celle d'une session SUIVANTE (codex, bien
+        après la fenêtre du tour du gel) — le relecteur désigné reste codex
+        (l'autre famille que deepseek), pas claude (la famille de la nouvelle
+        session)."""
+        self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
         self.freeze()
-        self.turn("a1", "codex", offset=5)      # postérieur au gel : ignoré
+        # session suivante, au-delà de la fenêtre d'un tour (30 min)
+        self.turn("a1", "codex", offset=45, session="s-codex")
         self.switch_session("codex")
         body = self.body()
         self.assertIn("- Auteur : a1 (harnais deepseek)", body)
         self.assertIn("— codex (règle du pilote du 13/10)", body)
         self.assertNotIn("codex ou claude", body)
+
+    def test_le_tour_du_gel_est_lu_apres_l_instant_du_gel(self):
+        """#1777 N1 : la ligne d'un tour est écrite à sa FIN ; le tour qui a
+        posé le gel (première session codex) est donc la première ligne APRÈS
+        le gel, et c'est sa famille qui compte — pas celle du tour précédent."""
+        self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
+        self.freeze()
+        self.turn("a1", "codex", offset=2, session="s-codex")   # le tour du gel
+        body = self.body()
+        self.assertIn("- Auteur : a1 (harnais codex)", body)
+        self.assertIn("— claude (règle du pilote du 13/10)", body)
+
+    def test_un_gel_par_un_tiers_sans_tour_retombe_sur_l_assigne(self):
+        """#1777 N2 : le pilote repose le gel ; il n'a aucun tour tracé, donc
+        sa famille n'est pas déduite — l'assigné porte la production."""
+        self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
+        self.freeze(actor="mesh-design")
+        body = self.body()
+        self.assertIn("- Auteur : a1 (harnais deepseek)", body)
+        self.assertIn("— codex (règle du pilote du 13/10)", body)
+
+    def test_un_gel_par_un_tiers_ne_lit_pas_le_tour_suivant_de_l_assigne(self):
+        """#1777 N2 : le gel d'un tiers porte sur un travail déjà produit ;
+        le tour que l'assigné ouvre APRÈS ce gel ne le lui attribue pas."""
+        self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
+        self.freeze(actor="mesh-design")
+        self.turn("a1", "codex", offset=2, session="s-codex")
+        body = self.body()
+        self.assertIn("- Auteur : a1 (harnais deepseek)", body)
+
+    def test_un_gel_repose_par_un_tiers_garde_l_acteur_du_premier_gel(self):
+        """#1777 N2 : le pilote repose le gel sur une nouvelle tête ; même avec
+        des tours tracés à lui, l'auteur reste l'acteur du premier gel."""
+        self.turn("a1", "deepseek", offset=-5, session="s-deepseek")
+        self.freeze()                                   # livraison par l'auteur
+        self.turn("mesh-design", "claude", offset=-2, session="s-pilote")
+        self.freeze(actor="mesh-design", sha="c" * 40)  # gel reposé, autre tête
+        body = self.body()
+        self.assertIn("- Auteur : a1 (harnais deepseek)", body)
+        self.assertIn("— codex (règle du pilote du 13/10)", body)
+        self.assertNotIn("mesh-design", body)
 
     def test_l_auteur_est_l_acteur_du_gel_meme_reassigne_depuis(self):
         """La relecture réassigne le lot après le gel : la famille reste celle
