@@ -6786,9 +6786,10 @@ class Runner:
         housekeeping pass: entries older than `thread_retention_days` leave
         this host's thread files. Never raises.
 
-        L361b : l'hôte médié n'a pas de transaction ; la connexion de
-        l'exécuteur (`self.db`) porte l'opération serveur `threads.recount`,
-        qui verrouille, recompte et expire en une seule fois."""
+        L361b : a mediated host has no transaction; the executor connection
+        (`self.db`) carries the server operation `threads.recount`, which
+        locks, counts again and expires in one shot. When it has to open one
+        itself, it closes it; a connection it was given is left open."""
         now = time.time() if now is None else now
         # the day counted on the monotonic clock (r8), the wall clock kept
         # for the retention thresholds
@@ -6797,35 +6798,40 @@ class Runner:
         if due is not None and tick < due:
             return None
         self._threads_expire_next = tick + 86400.0
+        created = None
         if db is None:
             db = getattr(self, "db", None)
         if db is None and not self.dry_run and fil.expiry_unavailable(self.cfg, None):
-            # L361b : un hôte médié n'a pas de ménage local ; sa connexion
-            # d'exécuteur porte `threads.recount`. Sans elle, rien n'expire.
+            # L361b: a mediated host has no local housekeeping; its executor
+            # connection carries `threads.recount`. Without it, nothing expires.
             try:
-                db = db_mod.connect(self.cfg)
+                db = created = db_mod.connect(self.cfg)
             except db_mod.DbError as exc:
                 log_async("thread expiry skipped: index unavailable (%s)"
                           % " ".join(str(exc).split())[:200])
                 return None
         try:
-            reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
-        except fil.ExpiryUnavailable as exc:  # said once per pass
-            log_async("thread expiry skipped: %s" % exc)
-            return None
-        except Exception as exc:  # never fatal for the runner
-            log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
-            return None
-        for report in reports:
-            if report.get("error") or report.get("held"):
-                log_async("thread expiry %s: %s" % (report["thread"],
-                                                     report.get("error") or report["held"]))
-            if report["dropped"]:
-                log_async("thread %s: %d entr%s before %s %s, %d kept" % (
-                    report["thread"], report["dropped"],
-                    "y" if report["dropped"] == 1 else "ies", report["before"],
-                    "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
-        return reports
+            try:
+                reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
+            except fil.ExpiryUnavailable as exc:  # said once per pass
+                log_async("thread expiry skipped: %s" % exc)
+                return None
+            except Exception as exc:  # never fatal for the runner
+                log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
+                return None
+            for report in reports:
+                if report.get("error") or report.get("held"):
+                    log_async("thread expiry %s: %s" % (report["thread"],
+                                                         report.get("error") or report["held"]))
+                if report["dropped"]:
+                    log_async("thread %s: %d entr%s before %s %s, %d kept" % (
+                        report["thread"], report["dropped"],
+                        "y" if report["dropped"] == 1 else "ies", report["before"],
+                        "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
+            return reports
+        finally:
+            if created is not None:      # only the connection opened here
+                created.close()
 
     def sweep_dead_letters_once(self, db, now: float | None = None,
                                 clock: float | None = None) -> dict | None:
