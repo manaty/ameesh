@@ -16,8 +16,9 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime
+from unittest import mock
 
-from ameesh import train, train_policy
+from ameesh import db as db_mod, train, train_ci, train_policy
 from tests.test_1467_train_runner import TrainRunnerTest
 
 MECHANICS = """schema: ameesh-mechanics/1
@@ -48,6 +49,65 @@ def stamp(hour):
 
 
 class RealMechanicsTest(TrainRunnerTest):
+    def hourly_canon(self):
+        hours = json.dumps(["%02d:00" % hour for hour in range(24)])
+        return self.revise(MECHANICS.replace('["11:00", "23:00"]', hours)
+                           .replace("named_fire: true", "named_fire: false"))
+
+    def test_real_hourly_calendar_keeps_pending_packet_across_restart(self):
+        commit = self.hourly_canon()
+        passage = self.passage(policy_commit=commit)
+        first, deadline = passage.scheduled_step(self.db, stamp("12"))
+        self.assertEqual(first["result"], "ci", first)
+        self.assertEqual(deadline, stamp("13"))
+        plan = first["plan"]
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+        resumed = self.passage(policy_commit=commit)
+        pending = dict(head=plan["head"], tree=plan["tree"],
+                       status="pending", complete=False)
+        with mock.patch.object(train_ci.GitHub, "read", return_value=pending):
+            result, deadline = resumed.scheduled_step(other_db, stamp("13"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual(train.digest(result["plan"]), train.digest(plan))
+        self.assertEqual(deadline, stamp("14"))
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertEqual(self.git(self.origin, "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/integration/").splitlines(),
+                         ["refs/heads/" + plan["branch"]])
+        result, _ = resumed.scheduled_step(other_db, stamp("13") + 1)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+
+    def test_real_withdrawal_keeps_ci_barrier_on_fresh_connection(self):
+        commit = self.hourly_canon()
+        passage = self.passage(policy_commit=commit)
+        first, _ = passage.scheduled_step(self.db, stamp("12"))
+        self.assertEqual(first["result"], "ci", first)
+        plan = first["plan"]
+        self.ops.queue_remove(plan["members"][0]["work_item_id"],
+                              note="fixture withdrawal", actor="fixture")
+        result, _ = passage.scheduled_step(self.db, stamp("12") + 1)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertEqual(self.ops.train_read(self.key)["phase"], "draining")
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+        resumed = self.passage(policy_commit=commit)
+        pending = dict(head=plan["head"], tree=plan["tree"],
+                       status="pending", complete=False)
+        with mock.patch.object(train_ci.GitHub, "read", return_value=pending):
+            result, deadline = resumed.scheduled_step(other_db, stamp("13"))
+        self.assertEqual(result["result"], "draining", result)
+        self.assertEqual(deadline, stamp("14"))
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+        result, _ = resumed.scheduled_step(other_db, stamp("13") + 1)
+        self.assertEqual(result["result"], "idle", result)
+        self.assertEqual(self.ops.train_read(self.key)["phase"], "invalidated")
+        self.assertIsNone(resumed.epoch)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+
     def test_real_canon_merge_flag_lands_without_a_named_fire(self):
         commit = self.revise(MECHANICS.replace("named_fire: true", "named_fire: false"))
         passage = self.passage(policy_commit=commit)

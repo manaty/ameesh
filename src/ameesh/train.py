@@ -33,8 +33,8 @@ class TrainError(RuntimeError):
 @dataclass(frozen=True)
 class Policy:
     enabled: bool = False
-    # Canon §11 bis (15/10/2026): one packet at 11:00 and 23:00 Paris
-    # during build/beta. The old interval policy is retained for later use.
+    # Build/beta uses the installed passage's compiled packet calendar.
+    # The uninstalled engine retains its historical fixture calendars.
     build_beta: bool = True
     interval_s: int = 3600
     threshold: int = 5
@@ -225,8 +225,20 @@ class Engine:
         self.epoch = epoch
         state = self.ports.load()
         try:
+            if state is not None and (state["source"], state["target"]) != (self.source, self.target):
+                raise TrainError("persisted train belongs to another repository or target")
             if state is not None and state["phase"] == "paused":
                 return {"result": "paused"}
+            if state is not None and state["phase"] == "draining":
+                # Withdrawal or stale evidence invalidates admission, not a
+                # running CI. Keep the shared reservation until that exact
+                # packet has a complete terminal outcome. Never promote it.
+                ci = self._ci(state)
+                if ci["status"] in ("pending", "absent"):
+                    return {"result": "draining", "plan": state["plan"]}
+                state["attempts"][-1]["ci"] = ci
+                state["phase"] = "invalidated"
+                state = self._save(state)
             if state is None or state["phase"] in TERMINAL:
                 rows = self.ports.entries()
                 if self.policy.build_beta:
@@ -245,8 +257,6 @@ class Engine:
                              stamp=datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d-%H%M"),
                              attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[])
                 state = self._save(state)
-            if (state["source"], state["target"]) != (self.source, self.target):
-                raise TrainError("persisted train belongs to another repository or target")
             if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
                 raise TrainError("diagnostic CI is disabled during build/beta")
             if state["phase"] == "composing":
@@ -334,7 +344,9 @@ class Engine:
                 # Keeping a failed promotion's intent makes uncertainty
                 # durable even if notifying the pilot fails.
                 if state.get("phase") != "promoting":
-                    state["phase"] = "invalidated"
+                    state["phase"] = ("draining" if state.get("phase") in
+                        ("publishing", "ci-intent", "ci", "ready", "draining")
+                        else "invalidated")
                     state["error"] = str(exc)
                     state = self._save(state)
                 self.ports.notify(str(exc), state)

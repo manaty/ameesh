@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Canon §11 bis: a single packet per Paris cutoff during build/beta."""
 from datetime import datetime
+import types
 import unittest
 from zoneinfo import ZoneInfo
 
@@ -21,10 +22,36 @@ class CutoffTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "without per-lot CI"):
             train.Policy(enabled=True, ci_mode="targeted")
 
-    def engine(self, rows):
+    def engine(self, rows, **policy):
         self.ports = MemoryPorts(rows)
         return train.Engine(self.ports, source="github.com/o/r", target="main",
-                            policy=train.Policy(enabled=True))
+                            policy=train.Policy(enabled=True, **policy))
+
+    def test_withdrawn_packet_drains_its_ci_before_next_hour_can_compose(self):
+        schedule = types.SimpleNamespace(cutoff=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.ports.rows = [admitted(2, "2026-10-15T11:01:00")]
+        self.assertEqual(engine.step(stamp("2026-10-15T11:05:00"))["result"], "refused")
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertTrue(self.ports.held)
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:00"))["result"], "draining")
+        self.assertEqual(len(self.ports.probes), 1)
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+        original = self.ports.ci
+        self.ports.ci = lambda plan: dict(head="f" * 40, tree=plan["tree"],
+                                         status="green", complete=True)
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:00"))["result"], "refused")
+        self.assertEqual(self.ports.document["phase"], "draining")
+        self.assertTrue(self.ports.held)
+        self.ports.ci = original
+        self.ports.ci_by_head[first["head"]] = "green"
+        result = engine.step(stamp("2026-10-15T12:00:01"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
+        self.assertNotEqual(result["plan"]["id"], first["id"])
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
 
     def test_default_ignores_count_and_elapsed_hour_until_cutoff(self):
         engine = self.engine([admitted(n) for n in range(1, 10)])

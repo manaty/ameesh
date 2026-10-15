@@ -19,14 +19,25 @@ du lot ; les correctifs prioritaires précèdent l'activation de ce train.
 ## Socle implémenté
 
 `train.Engine` avance par événements ou passages du runner, sans attente
-active de CI. En construction/bêta, sa politique par défaut suit les coupures
-de 11:00 et 23:00 Europe/Paris (canon Process §11 bis, instruction owner du
-15 octobre vers 06:05). Seules les admissions présentes à la coupure entrent
-dans le paquet ; une admission tardive attend la suivante. Un redémarrage
-ne compose pas un second paquet pour une coupure déjà commencée. L'ancienne
-cadence horaire/seuil reste disponible hors du mode construction/bêta,
-sans configuration active. Les dépendances ouvertes viennent avant les
-priorités ; un prérequis absent ou un cycle empêche l'admission.
+active de CI. La cadence de construction/bêta vient du calendrier compilé
+#1616. Le canon [home#94](https://github.com/manaty/home/pull/94), fusionné
+dans `937974cfcc705b35caaa4de923c193e5f3d839c4` (§11 bis, instruction owner
+du 15 octobre vers 19:50), demande maintenant un paquet chaque heure et
+une seule CI complète par paquet. Tant que le paquet courant est en CI,
+le créneau suivant reprend son manifeste ; il ne compose ni ne publie un
+second paquet. Les admissions tardives attendent le prochain créneau, et
+un redémarrage ne double pas celui qui a commencé. Les dépendances ouvertes
+viennent avant les priorités ; un prérequis absent ou un cycle empêche
+l'admission.
+
+À 11 h et 23 h, la release sélectionne la tête verte de la cible (ou le
+dernier commit vert), puis tague et déploie en staging. Cette sélection
+ne demande aucune composition supplémentaire au train. Le calendrier des
+paquets et celui des releases doivent être distingués par le contrat
+mécanique. `home#94` ne contient pas encore `processus/mecanique.yaml` :
+le port horaire est demandé à l'auteur de #1616, sans remplacer sa source
+par un intervalle local. L'ancien calendrier autonome de 11 h/23 h reste
+uniquement un banc de préparation ; aucun profil actif ne le sélectionne.
 
 L'intention est conservée en base, dans `integration_trains` (migration
 additive réservée 0442), avec une révision comparée à chaque écriture. La clé
@@ -56,6 +67,13 @@ Les phases persistées précèdent les effets externes : `publishing`,
 perdue ne provoque pas un deuxième dispatch. Une promotion incertaine conserve
 son intention ; le passage suivant constate la cible exacte ou sollicite le
 pilote. Une pause pour échecs répétés ne repart pas d'elle-même.
+
+Une admission retirée ou devenue invalide après publication ne termine pas
+la CI déjà lancée : la phase `draining` conserve le manifeste et le bail,
+sans promotion ni nouveau dispatch. Les créneaux et les événements relisent
+la conclusion de cette tête ; une conclusion absente, en attente ou non
+qualifiée conserve la réservation. Après une conclusion complète, le
+paquet est invalidé et le prochain paquet admissible peut se composer.
 
 `train_ci.GitHub` distingue un lancement par push d'un lancement explicite
 avec `expected_sha`. Il lit les workflows requis sur le commit, la branche,
