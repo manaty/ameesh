@@ -87,8 +87,13 @@ class EmpilementTest(_Empile):
 
         out = self.take()
         self.assertEqual([t["item"]["id"] for t in out], [empile["id"]])
-        self.assertIn("Stacked on blocker(s)", self.courrier(empile["id"]))
-        self.assertIn("lot/amont", self.courrier(empile["id"]))
+        courrier = self.courrier(empile["id"])
+        self.assertIn("Stacked on blocker(s)", courrier)
+        self.assertIn("lot/amont", courrier)
+        # #1738 (N8) : le texte dit ce que fait le produit — la file de fusion
+        # rejoue la pile sur le nouveau main (L160e), pas un rebase manuel.
+        self.assertIn("merge queue replays", courrier)
+        self.assertNotIn("rebase on the new main", courrier)
 
     def test_assignation_directe_accepte_le_meme_bloqueur(self):
         self.agent("claude1", team="nexlink")
@@ -444,6 +449,91 @@ class PropositionTest(_Empile):
         out = self.take()
         self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
                          [("correction", "codex1", bon["id"])])
+
+    # -- #1738 : N3 (interrupteur), N5 (sérialisation), N7 (relecteur) ------
+
+    def test_une_relecture_designe_son_relecteur(self):
+        """#1738 (N7) : la relecture proposée désigne son relecteur (#705) —
+        le lot sort des propositions suivantes et `stale_lot` s'adresse à
+        lui."""
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        self.agent("codex1", harness="codex", team="nexlink")
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"]) for t in out], [("review", "codex1")])
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "codex1")
+        self.assertEqual(storage.of(self.db).work.review_proposals(
+            5, proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE), [],
+            "un relecteur désigné écarte le lot des propositions")
+        self.assertEqual(self.take(), [])
+        self.assertEqual(len(self.mails("codex1")), 1, "aucune double proposition")
+
+    def test_une_correction_ne_touche_pas_au_relecteur(self):
+        """#1738 (N7) : une correction proposée ne désigne personne — le champ
+        `reviewer` reste au relecteur de la relecture."""
+        self.auteur()
+        lot = self.qa("corriger", verdict="blocked", branch="lot/a-corriger")
+        self.occupe()
+        self.agent("codex1", harness="codex", team="nexlink")
+
+        out = self.take()
+        self.assertEqual([t["kind"] for t in out], ["correction"])
+        self.assertFalse((work.get(self.db, lot["id"])["reviewer"] or "").strip())
+
+    def test_la_proposition_est_serialisee_par_lot(self):
+        """#1738 (N5) : le contrôle et la note tiennent sous un verrou par lot
+        — le second passage ne propose pas le même lot."""
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        st = storage.of(self.db).work
+        claim = dict(agent="codex1", kind="review",
+                     proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE,
+                     window_s=backlog.REVIEW_PROPOSAL_WINDOW_S, actor="ameesh")
+        self.assertTrue(st.claim_review_proposal(lot["id"], **claim))
+        self.assertFalse(st.claim_review_proposal(lot["id"], **claim),
+                         "fenêtre : pas de seconde proposition")
+        self.assertEqual(self.mails("codex1"), [], "le verrou n'envoie aucun courrier")
+
+    def test_une_proposition_hors_qa_est_refusee(self):
+        """#1738 (N5) : un lot sorti de `qa` entre la lecture et la note n'est
+        pas proposé."""
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s",
+                        (lot["id"],))
+        self.assertFalse(storage.of(self.db).work.claim_review_proposal(
+            lot["id"], agent="codex1", kind="review",
+            proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE,
+            window_s=backlog.REVIEW_PROPOSAL_WINDOW_S, actor="ameesh"))
+
+    def test_on_coupe_les_propositions_et_la_file_reprend(self):
+        """#1738 (N3) : `review_max_per_hour=0` coupe les propositions ; la
+        file d'amélioration, elle, est servie dans le même passage."""
+        self.auteur()
+        self.qa("relire", branch="lot/a-relire")
+        self.agent("codex1", harness="codex", team="nexlink")
+        item = self.element("amelioration prete", 50)
+
+        out = self.take(review_max_per_hour=0)
+        self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
+                         [("backlog", item["id"])])
+        self.assertTrue(all("review_proposal" not in m["payload"]
+                            for m in self.mails("codex1")),
+                        "seul le courrier de la file, aucune proposition")
+
+    def test_les_propositions_restent_par_defaut(self):
+        """#1738 (N3) : sans réglage, la proposition de relecture passe avant
+        la file d'amélioration (comportement #1677 conservé)."""
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        self.agent("codex1", harness="codex", team="nexlink")
+        item = self.element("amelioration prete", 50)
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
+                         [("review", lot["id"])])
+        self.assertIsNone(work.get(self.db, item["id"])["assignee"])
 
 
 class InactiviteTest(_Empile):

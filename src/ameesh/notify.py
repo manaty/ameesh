@@ -6,6 +6,7 @@
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
+                [--take-review-max-per-hour N]
                 [--handoff-max-per-hour N] [--handoff-idle S]
         follows the operations alerts (`ameesh alerts --follow`, same
         thresholds, same dedupe keys) and sends each raised alert and each
@@ -17,6 +18,11 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
+        #1677/#1738: when no lot is free, auto-take proposes a review (a
+        `qa` lot without a current verdict, another model family than the
+        author) or a correction (current blocking verdict, author busy) to
+        an idle agent; `--take-review-max-per-hour 0` turns these
+        proposals off, and the improvement backlog then keeps the pass.
         L233b: before any take, the intake and build lots of a non-critical
         Claude agent paused on budget go to a free DeepSeek agent of the
         same project (`ameesh.handoff.budget_handoff`);
@@ -1768,6 +1774,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
                         help="maximum team lots taken per rolling hour, for the whole mesh "
                              "(default 6)")
+    # #1738 (N3) : les propositions de relecture/correction (#1677) ont leur
+    # propre interrupteur — 0 les coupe, la file d'amélioration reprend alors
+    # tout le passage.
+    parser.add_argument("--take-review-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_REVIEW_MAX_PER_HOUR",
+                            backlog.REVIEW_PROPOSAL_MAX_PER_HOUR)),
+                        help="maximum review/correction proposals per rolling hour, for "
+                             "the whole mesh (default 6; 0 turns them off)")
     # L233b : reprise des lots d'un agent Claude en pause budget
     parser.add_argument("--handoff-max-per-hour", type=int,
                         default=int(exploitation._env_float(
@@ -1793,20 +1808,27 @@ def handoff_settings(args) -> dict | None:
 
 
 def take_settings(args) -> dict | None:
-    """Réglages de `backlog.auto_take` lus des options ; None si les deux
-    prises (file d'amélioration, lots de l'équipe) sont coupées."""
+    """Réglages de `backlog.auto_take` lus des options ; None si les trois
+    prises (file d'amélioration, lots de l'équipe, propositions de
+    relecture/correction #1677) sont coupées."""
+    from . import backlog
     idle = float(getattr(args, "take_idle", 0) or 0)
     most = int(getattr(args, "take_max_per_hour", 0) or 0)
     lot_idle = float(getattr(args, "take_lot_idle", 0) or 0)
     lot_most = int(getattr(args, "take_lot_max_per_hour", 0) or 0)
+    # #1738 (N3) : absent du namespace (appelant ancien), l'interrupteur reste
+    # au défaut du produit — les propositions ne sont pas coupées par surprise.
+    review_most = int(getattr(args, "take_review_max_per_hour",
+                              backlog.REVIEW_PROPOSAL_MAX_PER_HOUR) or 0)
     if idle <= 0 or most <= 0:
         idle, most = 0.0, 0
     if lot_idle <= 0 or lot_most <= 0:
         lot_idle, lot_most = 0.0, 0
-    if not most and not lot_most:
+    if not most and not lot_most and review_most <= 0:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
+            "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most,
+            "review_max_per_hour": max(0, review_most)}
 
 
 def _interval(args, ncfg: NotifyConfig) -> float:

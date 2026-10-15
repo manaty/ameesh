@@ -1467,6 +1467,39 @@ class WorkItems(interface.WorkItems):
             " LIMIT %s",
             (str(proposal_prefix), float(window_s), int(limit)))
 
+    def claim_review_proposal(self, item_id, *, agent, kind, proposal_prefix,
+                              window_s, actor) -> bool:
+        """#1738 (N5/N7) : voir l'interface."""
+        item = int(item_id)
+        with self.db.transaction() as tx:
+            # Un verrou consultatif par lot : deux passages (hôtes distincts)
+            # sérialisent ici, et le second relit la fenêtre APRÈS le premier.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                     ("review proposal:%d" % item,))
+            rows = tx.query("SELECT state, assignee FROM work_items WHERE id = %s",
+                            (item,))
+            if not rows or (rows[0].get("state") or "") != "qa":
+                return False
+            if (rows[0].get("assignee") or "").strip() == agent:
+                return False
+            if tx.query("SELECT 1 FROM work_item_events"
+                        " WHERE work_item_id = %s AND starts_with(note, %s)"
+                        "   AND created_at > now() - make_interval(secs => %s)"
+                        " LIMIT 1",
+                        (item, str(proposal_prefix), float(window_s))):
+                return False
+            me = WorkItems(tx)
+            if kind == "review" and has_reviewer(tx):
+                # N7 : une relecture désigne son relecteur (#705) — le lot sort
+                # des propositions suivantes et `stale_lot` s'adresse à lui.
+                if me._designate_reviewer(item, agent, actor) is None:
+                    return False
+            me._event(item, "qa",
+                      "%s: lot #%d to %s (%s)" % (proposal_prefix, item, agent, kind),
+                      actor)
+            tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (item,))
+            return True
+
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(
             """
