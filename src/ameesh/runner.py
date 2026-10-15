@@ -169,6 +169,19 @@ LIVE_REVIEW_IDLE_S = 600.0
 LIVE_REVIEW_START_SLACK_S = 300.0
 
 
+def _finite_ts(value) -> bool:
+    """#1691: is `value` a usable finite instant?
+
+    A date read back by the `psql` pilot may come as text (`'Infinity'` for an
+    infinite `timestamptz`): `float()` accepts or rejects it, and a value that
+    cannot be converted is an unknown date — never an exception raised into
+    the runner loop, which promises not to raise."""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
     """Écrit `data` sur `fd` **sans jamais attendre** le puits (diagnostic).
 
@@ -6589,7 +6602,7 @@ class Runner:
                     % (exc, int(LIVE_REVIEW_EVERY_S)))
                 return []
             unread = scan["unread"]
-            if any(stamp is None or not math.isfinite(stamp) for stamp in unread):
+            if any(not _finite_ts(stamp) for stamp in unread):
                 log("turn resources not settled: a process with an unreadable "
                     "environment and no start time; next review in %ds"
                     % int(LIVE_REVIEW_EVERY_S))
@@ -6598,9 +6611,9 @@ class Runner:
                 if not unread:
                     return False
                 start, end = row.get("started_ts"), row.get("ended_ts")
-                if start is None or not math.isfinite(start):
+                if not _finite_ts(start):
                     return True  # no lower bound proves a process unrelated
-                if end is not None and (not math.isfinite(end) or end < start):
+                if end is not None and (not _finite_ts(end) or end < start):
                     return True
                 # #1266: inspect EVERY start, not just the latest: a process
                 # after the end must not hide a possible survivor born inside.
