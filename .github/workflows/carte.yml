@@ -104,9 +104,9 @@ jobs:
         run: |
           python -m venv .venv-carte
           if [ "$AMEESH_DRIVER" = psycopg ]; then
-            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'pyyaml>=6'
           else
-            .venv-carte/bin/pip install -q 'coverage>=7.10'
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'pyyaml>=6'
           fi
           .venv-carte/bin/python scripts/map.py install
       - name: base jetable (sans fsync) et client psql

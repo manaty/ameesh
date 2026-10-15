@@ -275,12 +275,12 @@ jobs:
       - id: deps
         name: dépendances (pilote psycopg)
         run: |
-          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, yaml' >/dev/null 2>&1; then
             echo "venv restauré du cache : valide"
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'pyyaml>=6'
             echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
@@ -398,6 +398,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # ManifestesTest (test_cluster, liste « toujours ») lit deploy/k8s avec
+      # PyYAML : sans lui il est sauté, donc jamais vérifié en CI (#1511).
+      - name: pyyaml (manifestes k8s)
+        run: python -m pip install -q 'pyyaml>=6'
       - *base
       - *git
       - *plan
