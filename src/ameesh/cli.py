@@ -54,7 +54,7 @@
   agent-mail hook <claude|codex|deepseek>        hook: reads the JSON on stdin, delivers the unread
   agent-mail statusline                          Claude Code status bar: [workspace/name] work · directory
   agent-mail migrate [--dry-run | --additive-only]  applies the versioned migrations
-  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY; host harnesses (L106)
+  agent-mail doctor [--notify-test | --probe | --harness]  diagnostics: driver, schema, migrations, LISTEN/NOTIFY and the OS desktop channel (L66); host harnesses (L106)
                                                  (--probe: lightweight container probe)
 
 Identity of a session: $AGENT_MAIL_NAME (the runner sets it for the harness
@@ -1680,6 +1680,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             else:
                 print("notify     : KO (%r)" % (got,))
                 verdict = 1
+        # L66 : le canal `desktop` tel que CET OS l'affiche (notify-send,
+        # osascript, toast WSL2) ; un envoi reel s'il est route.
+        from . import notify as notify_mod
+        ok, line = notify_mod.desktop_probe(cfg)
+        print("desktop    : %s" % line)
+        if not ok:
+            verdict = 1
     db.close()
     print("verdict    : %s" % ("OK" if verdict == 0 else "KO"))
     return verdict
