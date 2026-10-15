@@ -76,11 +76,16 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   la sélection doit être exactement `classes du canon ∪ contrats` (tout module
   en trop est un élargissement, tout module manquant un contrat perdu) ;
 - **liaison tête / arbre / plan** : `--repo` (ou le cwd) est l'arbre unique du
-  geste. Son `HEAD` doit être le `--sha` annoncé, sans aucune modification
-  suivie (index ou travail) — sinon `head-moved` ; c'est cet arbre que
-  l'offload photographie et envoie. Le plan doit y être transporté : chemin
-  **relatif** à cet arbre, refusé s'il en sort (`selection-unsafe`) ou s'il est
-  ignoré par git (il ne partirait pas dans le snapshot) ;
+  geste. Son `HEAD` doit être le `--sha` annoncé — sinon `head-moved`. Le
+  contenu envoyé n'est **pas** une photographie de l'arbre de travail : c'est
+  l'arbre **construit** du SHA candidat plus le plan **relu**, figé par son
+  identité (`offload.snapshot_with`) et passé à l'offload (`--snapshot`). Un
+  fichier non suivi, un flag `assume-unchanged`/`skip-worktree` ou une
+  modification locale ne peuvent donc pas entrer dans la preuve (défaut trouvé
+  par cx1 : `git status` les masquait alors que la photographie les
+  embarquait). Le plan est un chemin **relatif** à cet arbre, refusé s'il en
+  sort (`selection-unsafe`) ou s'il est ignoré par git ; c'est le texte lu qui
+  est embarqué, pas une relecture du disque au moment du run ;
 - délai du run : `timeout_seconds` du canon ; exécution par
   `ameesh offload run --fallback none` uniquement. Sur la VM, ce chemin est
   celui du guest L159b (jetons de concurrence `flock`, scope cgroup plafonné par
@@ -103,10 +108,14 @@ réellement vus dans le flux `ameesh-test-event/1` (événements `test`), `plann
 celle du plan, `missing` ceux qui manquent, `planned_parts` les parts attendues
 et `parts` celles qui ont parlé. Une part sans fin verte, un module attendu muet
 ou un flux sans test donnent `run-incomplete` ; une part rouge donne `run-red`.
-Un `fin=succes` isolé, sans événement de test, n'est jamais un vert et ne
-remplit jamais `modules` avec le plan.
+Seul `fin.statut = succes` est vert : `echec` est rouge, tout autre statut
+(`interrompu`, `unknown`, vide) est incomplet, et le `detail` nomme le statut
+observé. Un `fin=succes` isolé, sans événement de test, n'est jamais un vert et
+ne remplit jamais `modules` avec le plan.
 
-`tree` recopie l'état vérifié : `head` observé, `clean` vrai, et
+`tree` recopie ce qui a été vérifié et ce qui est parti : `head` observé,
+`snapshot` (l'identité exacte du commit envoyé, vérifiable localement par
+`git ls-tree -r <snapshot>`), `plan` (le chemin du plan dans cet arbre), et
 `published_ref` quand la référence publiée a été relue.
 
 ## Rapport persisté (0450)
