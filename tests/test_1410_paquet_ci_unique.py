@@ -243,8 +243,12 @@ class DeclenchementTest(unittest.TestCase):
         suite = _bloc_job(PAQUET, "suite")
         self.assertIn("uses: ./.github/workflows/tests.yml", suite)
         self.assertIn("needs: couverture", suite)
-        self.assertIn("if: always() && needs.couverture.outputs.covered != 'true'", suite,
-                      "portier en échec : sa sortie vide fait tourner la suite")
+        self.assertIn("if: ${{ !cancelled() && needs.couverture.outputs.covered != 'true' }}",
+                      suite,
+                      "portier en échec : sa sortie vide fait tourner la suite ; "
+                      "portier annulé (poussée plus récente) : la suite ne part pas")
+        self.assertNotIn("if: always()", suite,
+                         "#1429 : une annulation ne doit pas dispatcher de suite")
 
     def test_le_portier_decide_sur_les_pr_et_jamais_sur_un_run(self):
         gate = _bloc_job(PAQUET, "couverture")
