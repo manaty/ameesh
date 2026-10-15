@@ -885,6 +885,27 @@ class InstallPilotTest(unittest.TestCase):
                       "holds a secret", out)
         self.assertNotIn(self.TOKEN, out)
 
+    def test_check_reports_the_volume_tree(self):
+        # L1586: --check reads the volume's modes and owners, so a layout that
+        # a reinstall no longer reopens is seen instead of repaired in silence
+        self.guest_user()
+        root = "/srv/ameesh-guest"
+        for d in ("", "/home", "/tmp", "/work"):
+            os.chmod(self.on_host(root + d), 0o700 if d else 0o2710)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("ok   %s (2710 " % root, out)
+        for d in ("home", "tmp", "work"):
+            self.assertIn("ok   %s/%s (700 " % (root, d), out)
+        # a tree reopened by hand is said, never silently repaired
+        os.chmod(self.host + root + "/home", 0o755)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL %s/home is 755 " % root, out)
+        self.assertIn("expected 700 and ameesh-guest's own", out)
+        # a volume the install never made: said too
+        os.rmdir(self.host + root + "/work")
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL missing %s/work" % root, out)
+
     def test_uninstall_removes_the_helper(self):
         res = self.dry("--uninstall")
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -939,6 +960,28 @@ class InstallPilotTest(unittest.TestCase):
             # the test's host has no /opt/ameesh/venv
             self.assertLess(out.index("record 'venv-tree /opt/ameesh/venv'"),
                             out.index("python3 -m venv /opt/ameesh/venv"))
+
+    def test_an_existing_volume_tree_is_never_reopened(self):
+        # L1586: a reinstall creates what is missing and leaves what is there:
+        # a 2710 root (L159b's layout), or a home given to the guest, keeps
+        # its mode and owner; the check reads them instead (below).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "guest")
+            for d in ("", "home", "tmp"):
+                os.makedirs(os.path.join(root, d), exist_ok=True)
+            os.chmod(root, 0o2710)
+            res = self.dry("--allow-rootfs", "--root", root)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout
+            self.assertNotIn("install -d -m 0755 %s\n" % root, out)
+            for d in ("home", "tmp"):
+                self.assertNotIn("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/%s\n"
+                                 % (root, d), out)
+                self.assertNotIn("guest-tree %s/%s'" % (root, d), out)
+            # only the missing one is created, and recorded before it
+            self.assertIn("record 'guest-tree %s/work'" % root, out)
+            self.assertIn("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/work\n" % root,
+                          out)
 
     def test_purge_removes_only_the_recorded_paths(self):
         # codex #383 r1 P1: the absolute paths recorded, never /home, /tmp,

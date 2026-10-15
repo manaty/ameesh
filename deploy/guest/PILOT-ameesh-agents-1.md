@@ -137,6 +137,11 @@ sudo deploy/guest/install-pilot.sh --host ameesh-agents-1 \
   --agent deepseek6 --agent deepseek1 --path /opt/node/bin
 ```
 
+Re-running the install never reopens an existing volume: the mode and owner
+of a tree that is already there are kept (L1586), and `--check` reports them.
+A layout given by hand on `/srv/ameesh-guest`, or the `2710` of L159b, thus
+survives a later reinstall instead of being reset to `0755`.
+
 Then the secrets (files created empty, `0640 root:ameesh-guest`, never
 overwritten by the script):
 

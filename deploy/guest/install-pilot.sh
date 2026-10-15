@@ -55,7 +55,10 @@
 # user and absolute paths, is recorded in /etc/ameesh/pilot-install.state
 # BEFORE it is created, and --purge removes only that):
 #   * user ameesh-guest (system, locked, no sudo, no docker), home
-#     $ROOT/home, $ROOT/{tmp,work}, all 0700;
+#     $ROOT/home, $ROOT/{tmp,work}, all 0700; a tree that is already there is
+#     kept as is — a reinstall never resets the mode or owner of an existing
+#     $ROOT or of its home/tmp/work, and --check reports them (L1586: a
+#     layout given by hand, or the 2710 of L159b, is not reopened);
 #   * /opt/ameesh/venv: ameesh[psycopg] from this checkout (root-owned);
 #   * /etc/systemd/system: ameesh-guest.slice, ameesh.slice.d/guest-weight.conf,
 #     ameesh-guest-runner@.service (its paths on --root, + a PATH drop-in),
@@ -726,6 +729,26 @@ if [ "$MODE" = check ]; then
       if printf '%s\n' $groups | grep -qx "$g"; then ko "$GUEST is in group $g"; fi
     done
   else ko "no user $GUEST"; fi
+  # L1586: the guest's volume, as step 1 left it. A reinstall never resets the
+  # mode or owner of a directory that is already there, so --check shows them
+  # (a 2710 root, or a home handed to the guest) instead of repairing in
+  # silence: home/tmp/work must be 0700 and the guest's own; the root belongs
+  # to the operator — 0755 as installed here, 2710 once L159b's layout is in
+  # place — so it is reported, never failed.
+  guid=$(guest_uid)
+  for d in "$ROOT" "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; do
+    if [ ! -d "$(at "$d")" ]; then ko "missing $d"; continue; fi
+    perm=$(stat -c '%a %U:%G' "$(at "$d")")
+    if [ "$d" = "$ROOT" ]; then
+      ok "$d ($perm, kept as is by a reinstall)"
+    elif [ "$(stat -c '%a' "$(at "$d")")" != 700 ]; then
+      ko "$d is $perm, expected 700 and $GUEST's own"
+    elif [ -n "$guid" ] && [ "$(stat -c '%u' "$(at "$d")")" != "$guid" ]; then
+      ko "$d is $perm, not owned by $GUEST (uid $guid)"
+    else
+      ok "$d ($perm)"
+    fi
+  done
   for f in ameesh-guest.slice ameesh.slice.d/guest-weight.conf ameesh-guest-runner@.service \
            ameesh-guard.service; do
     [ -f "$(at "$UNITS/$f")" ] && ok "$UNITS/$f" || ko "missing $UNITS/$f"
@@ -1181,11 +1204,19 @@ for d in "$ROOT" "$ROOT/home" "$ROOT/tmp" "$ROOT/work"; do
     die "$d exists and is not a directory: move it away first"
   fi
 done
-absent "$ROOT" && remember "guest-dir $ROOT"
-run install -d -m 0755 "$ROOT"
+# L1586: only what is created here is created; a directory that is already
+# there keeps its mode and owner as they are (a reinstall must not reopen the
+# volume: a layout given by hand, or the 2710 of L159b, stays). --check reads
+# and reports them.
+if absent "$ROOT"; then
+  remember "guest-dir $ROOT"
+  run install -d -m 0755 "$ROOT"
+fi
 for d in home tmp work; do
-  absent "$ROOT/$d" && remember "guest-tree $ROOT/$d"
-  run install -d -m 0700 -o "$GUEST" -g "$GUEST" "$ROOT/$d"
+  if absent "$ROOT/$d"; then
+    remember "guest-tree $ROOT/$d"
+    run install -d -m 0700 -o "$GUEST" -g "$GUEST" "$ROOT/$d"
+  fi
 done
 
 say "2. ameesh in $VENV (root-owned; the guest can run it, not change it)"
