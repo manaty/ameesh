@@ -103,6 +103,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    budgets         limits put events
    api_requests    reserve complete release
    watches         put delete list deliver
+   events          record after readable waiting bounds count_before prune
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
@@ -667,6 +668,60 @@ class Watches(Domain):
         a disable from another host waits for the end of the firing. The row
         read (with `sent` true or false), None if there is no watch; `send`
         raising rolls the transaction back."""
+
+
+# --------------------------------------------------------------------------
+# event log of the mesh (L85, migration 0396)
+# --------------------------------------------------------------------------
+
+class Events(Domain):
+    """The append-only `ameesh_events` log, source of `GET /api/v1/events`.
+
+    The rows are written by triggers on the tables they describe (same
+    transaction as the change); `record` is for what has no table (an alert
+    raised or resolved). A row: id, type, object, project, data, ts."""
+
+    @abc.abstractmethod
+    def record(self, type: str, object: str, project: str | None, data: dict) -> int:
+        """Appends one event; its id. Without `project`, the project of
+        `data["agent"]` if any."""
+
+    @abc.abstractmethod
+    def after(self, after_id: int, limit: int) -> list[dict]:
+        """The events of id greater than `after_id`, by increasing id, at
+        most `limit` (a listing for humans: ids are not in commit order)."""
+
+    @abc.abstractmethod
+    def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None]:
+        """The reader's order: (the events after `position` = (tx, id) whose
+        transaction is over for good (`tx` below the snapshot's xmin), by
+        (tx, id), at most `limit`, each row also carrying `tx`; why events
+        after `position` wait, None if none does: "xmin" for an older open
+        transaction, "restore" for rows of another cluster above the counter).
+        Both from ONE snapshot. Such a transaction can no longer add an event
+        before the last one read."""
+
+    @abc.abstractmethod
+    def bounds(self) -> dict:
+        """`first`, `last`: the smallest and largest ids kept (None and 0 when
+        empty); `head`: the position (tx, id) of the last readable event,
+        `top`: of the last event written, `oldest`: of the first one kept
+        ((0, 0) when none); `pruned`: the greatest position the retention
+        deleted ((0, 0) when none); `cluster`: the identity of the cluster
+        and timeline, outside which a position means nothing (None when its
+        functions are refused)."""
+
+    @abc.abstractmethod
+    def count_before(self, before_ts: float) -> int:
+        """The number of events older than `before_ts`."""
+
+    @abc.abstractmethod
+    def prune(self, before_ts: float, limit: int, timeout_s: float | None = None) -> int:
+        """Deletes at most `limit` events older than `before_ts` (the oldest
+        first) and raises the watermark `bounds()["pruned"]` in the same
+        statement; the number deleted.
+        `timeout_s`: lock and statement timeout of the deletion (DbError past
+        it). The table refuses an event younger than 30 days."""
 
 
 # --------------------------------------------------------------------------
@@ -3248,6 +3303,7 @@ class Storage(abc.ABC):
     budgets: Budgets
     api_requests: ApiRequests
     watches: Watches
+    events: Events
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys

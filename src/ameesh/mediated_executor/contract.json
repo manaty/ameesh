@@ -3929,7 +3929,7 @@
   }
  ],
  "refused": {
-  "interface_total": 406,
+  "interface_total": 412,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3945,6 +3945,7 @@
    "credentials": "provider credential health: mesh server only",
    "decisions": "owner decision requests (L124): mesh server only",
    "ephemerals": "pas de création d'agent depuis l'appareil",
+   "events": "event log (L85): mesh server only, the API streams it",
    "grants": "autorité (0012)",
    "hosts": "hors du sous-ensemble de l'exécuteur médié",
    "housekeeping": "ménage de l'hôte (L73) : serveur seulement, l'appareil efface son dossier en fin de bail",
@@ -4121,6 +4122,14 @@
     "create",
     "creator",
     "exists"
+   ],
+   "events": [
+    "after",
+    "bounds",
+    "count_before",
+    "prune",
+    "readable",
+    "record"
    ],
    "grants": [
     "candidates",
