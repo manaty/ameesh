@@ -589,7 +589,7 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
     waiting_lots = waiting_project_lots(lots)
-    waits = planned_waits.read(db, waiting_lots, open_items=lots) if waiting_lots else {}
+    waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
     startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
@@ -650,6 +650,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   "(ameesh work assign <lot> <agent>)" % ", ".join(asleep))
     else:
         action = "dispatch: ameesh work assign <lot> <agent>, or write to the orchestrator"
+    if waiting_lots and not startable_lots:
+        action = "no startable lot: clear the named prerequisite before assigning work"
     detail = "; ".join(parts) + ". Action: " + action
     responsible = None
     for name in attached + asleep + list(orchestras):
