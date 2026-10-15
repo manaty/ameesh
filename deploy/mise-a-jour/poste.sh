@@ -219,28 +219,18 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
-# Migrations du commit explicite REF (obligatoire) : résolution unique, une
-# seule fois ; garde additive sur une cible non installée, et --additif-seulement
-# la garde même quand REF est déjà installé (reprise de staging, avis R1 B2,
-# #1155) ; une cible déjà installée passe tout (procédure MIGRER_APRES).
+# Migrations du commit explicite REF : garde additive même si ce code est
+# déjà installé. Le lien src-current n'accorde aucune autorité de migration.
+# --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
-  local ref cible d garde=(--additive-only) force=0 sha
+  local ref cible d garde=(--additive-only) sha
   if [ "${1:-}" = "--additif-seulement" ]; then
-    force=1
     shift
   fi
   ref=${1:?REF requis pour migrer}
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
   cible=$(instantane "$sha")
-  # --additif-seulement : la garde tient meme quand l'instantane est deja
-  # src-current (reprise de staging, avis R1 B2) : des VM peuvent tourner un
-  # code precedent sur la base migree.
-  if [ "$force" != 1 ] && installe "$cible"; then
-    garde=()
-    etape "$(basename "$cible") déjà installé : toutes ses migrations passent"
-  else
-    etape "migrations de $(basename "$cible"), avant son installation (additives seulement)"
-  fi
+  etape "migrations du commit $sha, additives seulement"
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
