@@ -3929,7 +3929,7 @@
   }
  ],
  "refused": {
-  "interface_total": 405,
+  "interface_total": 409,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4006,7 +4006,8 @@
     "set_mode",
     "upsert_unleased",
     "wake_check",
-    "note_unleased"
+    "note_unleased",
+    "operator_pause"
    ],
    "api_requests": [
     "complete",
