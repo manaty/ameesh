@@ -688,13 +688,6 @@ class _PsqlTransaction:
             if proc.stdout is not None:
                 proc.stdout.close()
         finally:
-            # ON_ERROR_STOP can exit before _close() observes the process;
-            # its already-dead child's input pipe still needs closing.
-            if proc.stdin is not None:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
             if self._err is not None:
                 self._err.close()
                 self._err = None
@@ -753,14 +746,6 @@ class _PsqlTransaction:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._run(bind(sql, params))
         return 0
-
-    def script(self, sql: str) -> None:
-        """Run raw multi-statement SQL on this transaction's backend.
-
-        Unlike execute(), scripts contain literal %s (SQL format strings),
-        and must not pass through parameter binding or open another session.
-        """
-        self._run(sql)
 
 
 class _PsqlListener:
