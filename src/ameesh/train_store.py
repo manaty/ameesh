@@ -2,12 +2,14 @@
 """Durable state and reservation adapter for #1467; no extra remote rights."""
 from __future__ import annotations
 
-from . import land, storage
+from . import land, merge_queue, storage
 from .train import TrainError
 
 
 class Ledger:
     def __init__(self, db, project, target, owner):
+        if target != merge_queue._remote_branch(target):
+            raise TrainError("canonical target required for the shared train reservation")
         self.db = db
         self.ops = storage.of(db).work
         self.key = land.lock_key(project, target)

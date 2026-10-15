@@ -94,6 +94,15 @@ Le classement et son nombre d'avis viennent du fournisseur de politique,
 avec refus préalable des releases et des classements inconnus. Ce module ne
 constitue pas un fournisseur de données ni une autorisation de runtime.
 
+`train_review.qualify_recorded` raccorde le contrat de lecture de #1465 au
+validateur. Le fournisseur est obligatoire et explicite ; les reçus de
+commit et de verdict sont convertis sans compléter de champ. Une absence
+reste inconnue, une contradiction du fournisseur devient un refus du train,
+et un reçu d'un autre sujet est rejeté. Ce raccord ne garantit pas la
+frontière d'écriture du fournisseur : celle-ci doit encore prouver que le
+commit a été créé dans le tour enregistré et que l'acteur du jalon est celui
+du tour. Aucun appel du runner n'est ajouté.
+
 Interface de raccord proposée à impl07 le 15 octobre à 03:54 : un `Receipt`
 porte `subject` (`commit:<sha>` ou `milestone:<id>`), `commit` résolu, `actor`,
 `session`, `turn`, `harness` et `record` de provenance exacte. Un reçu de
@@ -172,7 +181,11 @@ la réservation du paquet. Lecture de `979f2e2b` : `fire._lock` prend seulement
 Ce bail par lot ne sérialise donc pas une fusion directe avec le train.
 Mesh-design demande le 15 octobre à 04:46 à l'auteur de #1374 de coordonner
 le bail cible commun, l'ordre de prise et un témoin train/direct. Ce code
-n'est pas encore intégré à cette branche. Aucun CLI, branchement du runner
+n'est pas encore intégré à cette branche. `Ledger` refuse les cibles alias
+(`origin/main`, `refs/heads/main`…) ; Runtime refuse aussi une admission
+alias de sa cible. Les autres voies de fusion doivent garantir la même clé
+canonique avant une activation concurrente : le refus côté train seul ne
+sérialise pas une autre voie utilisant une clé alias. Aucun CLI, branchement du runner
 ni profil actif n'est ajouté.
 
 Source du travail indépendant : mesh-design, message #45970 du 15 octobre

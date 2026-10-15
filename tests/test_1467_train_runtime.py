@@ -46,6 +46,14 @@ class TrainRuntimeTest(PgTestCase):
     def engine_for(self, runtime):
         return train.Engine(runtime, source=self.repository.source, target="main", policy=self.policy)
 
+    def test_queue_alias_is_refused_before_any_remote_effect(self):
+        self.admissions.entries.side_effect = lambda: [dict(row(1), target="origin/main")]
+        result = self.engine.step(3600)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertIn("queue target alias", result["error"])
+        self.repository.publish.assert_not_called()
+        self.repository.promote.assert_not_called()
+
     def ready(self):
         outcome = self.engine.step(3600)
         self.assertEqual(outcome["result"], "ci", outcome)

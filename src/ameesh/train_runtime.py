@@ -41,9 +41,12 @@ class Runtime:
         return self.repository.target(self.target_branch)
 
     def entries(self):
-        return [row for row in self.admissions.entries()
+        rows = [row for row in self.admissions.entries()
                 if row["source"] == self.repository.source
                 and merge_queue._remote_branch(row["target"]) == self.target_branch]
+        if any(row["target"] != self.target_branch for row in rows):
+            raise TrainError("queue target alias does not share the canonical train reservation")
+        return rows
 
     def dependencies(self, rows):
         return self.admissions.dependencies(rows)

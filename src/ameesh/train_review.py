@@ -53,6 +53,45 @@ def _order(mark):
     return stamp, number
 
 
+def qualify_recorded(db, head: str, commits: list[str], marks: list[dict], *,
+                     required: int, provider) -> dict:
+    """Read exact #1465 receipts through an explicitly trusted provider.
+
+    The caller still supplies the complete Git range, complete milestone
+    history and reviewed policy. No registry lookup, receipt CLI, or default
+    provider is installed here. Provider corruption is a refusal, distinct
+    from absent provenance; neither can manufacture an independent vote.
+    """
+    if provider is None:
+        raise TrainError("trusted exact provenance provider required")
+
+    def read(subject, reader, value):
+        try:
+            record = reader(db, value)
+        except provider.ProvenanceError as exc:
+            raise TrainError("contradictory historical provenance for %s: %s"
+                             % (subject, exc)) from exc
+        if record is None:
+            return None
+        try:
+            receipt = Receipt(**record)
+        except TypeError as exc:
+            raise TrainError("malformed historical provenance for %s" % subject) from exc
+        if receipt.subject != subject:
+            raise TrainError("historical provenance names another subject: %s" % subject)
+        return receipt
+
+    history = {}
+    for commit in commits:
+        subject = "commit:" + commit
+        history[subject] = read(subject, provider.receipt_for_commit, commit)
+    for mark in marks:
+        if mark.get("kind") == "verdict":
+            subject = "milestone:%s" % mark["id"]
+            history[subject] = read(subject, provider.receipt_for_milestone, mark["id"])
+    return qualify(head, commits, marks, history, required=required)
+
+
 def qualify(head: str, commits: list[str], marks: list[dict],
             history: dict[str, Receipt | None], *, required: int) -> dict:
     """Cover every content commit with independent final-head verdicts.

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Historical subject identity and per-author independence, without a registry."""
 import dataclasses
+import types
 import unittest
+from unittest import mock
 
 from ameesh.train import TrainError
-from ameesh.train_review import MARK_FIELDS, Receipt, qualify
+from ameesh.train_review import MARK_FIELDS, Receipt, qualify, qualify_recorded
 
 HEAD, FIRST = "a" * 40, "b" * 40
 
@@ -124,3 +126,67 @@ class HistoricalReviewsTest(unittest.TestCase):
         self.add(3, "reviewer-one", "claude", status="blocked")
         with self.assertRaisesRegex(TrainError, "unresolved blocking"):
             self.run_gate(required=0)
+
+
+class RecordedReviewsTest(HistoricalReviewsTest):
+    """The supplier boundary returns dictionaries, not consumer dataclasses."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = object()
+
+        class ProvenanceError(Exception):
+            pass
+
+        def receipt(subject):
+            value = self.receipts.get(subject)
+            return dataclasses.asdict(value) if value is not None else None
+
+        self.provider = types.SimpleNamespace(
+            ProvenanceError=ProvenanceError,
+            receipt_for_commit=mock.Mock(side_effect=lambda db, sha: receipt("commit:" + sha)),
+            receipt_for_milestone=mock.Mock(
+                side_effect=lambda db, number: receipt("milestone:%s" % number)))
+
+    def run_gate(self, *, required=2):
+        return qualify_recorded(self.db, HEAD, self.commits, self.marks,
+                                required=required, provider=self.provider)
+
+    def test_abbreviated_mark_keeps_original_facts_and_complete_commit(self):
+        self.marks[0]["sha"] = HEAD[:12]
+        receipt = self.receipts["milestone:1"]
+        self.receipts[receipt.subject] = dataclasses.replace(
+            receipt, milestone=dict(receipt.milestone, sha=HEAD[:12]))
+        result = self.run_gate()
+        self.assertEqual(result["reviews"][0]["commit"], HEAD)
+        self.assertEqual(result["reviews"][0]["milestone"]["sha"], HEAD[:12])
+        self.provider.receipt_for_commit.assert_any_call(self.db, FIRST)
+        self.provider.receipt_for_milestone.assert_any_call(self.db, 1)
+
+    def test_supplier_corruption_becomes_explicit_train_refusal(self):
+        for reader in ("receipt_for_commit", "receipt_for_milestone"):
+            with self.subTest(reader=reader), mock.patch.object(
+                    self.provider, reader,
+                    mock.Mock(side_effect=self.provider.ProvenanceError("different fact"))):
+                with self.assertRaisesRegex(TrainError, "contradictory.*different fact"):
+                    self.run_gate()
+
+    def test_missing_or_extra_receipt_field_is_refused(self):
+        valid = dataclasses.asdict(author())
+        for invalid in ({key: value for key, value in valid.items() if key != "turn"},
+                        dict(valid, guessed=True)):
+            with self.subTest(record=invalid), mock.patch.object(
+                    self.provider, "receipt_for_commit", lambda *args: invalid):
+                with self.assertRaisesRegex(TrainError, "malformed historical"):
+                    self.run_gate()
+
+    def test_supplier_cannot_substitute_another_subject(self):
+        with mock.patch.object(self.provider, "receipt_for_commit",
+                               lambda *args: dataclasses.asdict(author(HEAD))):
+            with self.assertRaisesRegex(TrainError, "another subject"):
+                self.run_gate()
+
+    def test_no_provider_cannot_fall_back_to_current_registry(self):
+        with self.assertRaisesRegex(TrainError, "trusted exact provenance provider"):
+            qualify_recorded(self.db, HEAD, self.commits, self.marks,
+                             required=0, provider=None)

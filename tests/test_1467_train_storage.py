@@ -1,9 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """SQL witnesses for train intent CAS and the shared landing reservation."""
 import types
+import unittest
+from unittest import mock
 
 from ameesh import storage, train_store
+from ameesh.train import TrainError
 from .support import PgTestCase
+
+
+class TargetIdentityTest(unittest.TestCase):
+    def test_alias_cannot_create_an_independent_lock_for_the_same_remote_branch(self):
+        for alias in ("origin/main", "refs/remotes/origin/main", "refs/heads/main"):
+            with self.subTest(alias=alias), mock.patch.object(storage, "of") as connect:
+                with self.assertRaisesRegex(TrainError, "canonical target"):
+                    train_store.Ledger(object(), types.SimpleNamespace(name="shared"),
+                                       alias, "runner")
+                connect.assert_not_called()
 
 
 class TrainStorageTest(PgTestCase):
