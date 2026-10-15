@@ -928,7 +928,8 @@ def _release(profile: Profile, depasses, hard, now: float,
 
     `ceilings` (#1176) : le plafond effectif de chaque fenêtre. Un relèvement
     de fin de fenêtre déjà prouvé peut libérer la fenêtre avant sa remise à
-    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro.
+    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro — et pas
+    avant que le rythme ait rattrapé l'usage sous le plafond relevé (#1506).
     """
     dated = []
     for gauge in depasses:
@@ -949,7 +950,16 @@ def _release(profile: Profile, depasses, hard, now: float,
             if (ceiling is not None and ceiling.from_ts is not None
                     and ceiling.end is not None and ceiling.from_ts > now
                     and gauge.used_at(now) < ceiling.end - cut):
-                free = min(free, ceiling.from_ts)
+                # #1506 : le relèvement ne libère qu'une fois le rythme
+                # rattrapé sous le plafond relevé. Annoncer `from_ts` seul
+                # promettait une pause que l'usage ne tenait pas encore à
+                # cette heure-là (l'écoulé n'avait pas rejoint l'usage sous
+                # le plafond relevé) ; l'heure juste est la plus tardive des
+                # deux.
+                raised = gauge.free_at(now, cut, profile.pace_multiplier,
+                                       ceiling.end)
+                if raised is not None:
+                    free = min(free, max(float(ceiling.from_ts), raised))
         dated.append((free, gauge))
     return max(dated, key=lambda pair: pair[0])
 
