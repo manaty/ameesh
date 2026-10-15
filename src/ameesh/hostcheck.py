@@ -186,15 +186,17 @@ def _hook_binary(command: str) -> str:
     return parts[0] if parts else ""
 
 
-def _binary_missing(binary: str) -> bool:
+def _binary_missing(binary: str, *, path: str | None = None) -> bool:
     """Le binaire d'une commande de hook est-il introuvable ? Un chemin
     (absolu ou avec un séparateur) est contrôlé sur place ; un nom seul passe
-    par le PATH — c'est le cas de l'incident du 2026-10-12 (`/usr/local/bin/
-    agent-mail` absent, tous les hooks en 127)."""
+    par `path` — le PATH qui exécute réellement les hooks (celui du
+    gestionnaire systemd) —, sinon par le PATH ambiant : c'est le cas de
+    l'incident du 2026-10-12 (`/usr/local/bin/agent-mail` absent, tous les
+    hooks en 127)."""
     chemin = os.path.expanduser(binary)
     if os.sep in chemin:
         return not (os.path.isfile(chemin) and os.access(chemin, os.X_OK))
-    return shutil.which(chemin) is None
+    return shutil.which(chemin, path=path or None) is None
 
 
 def hook_lines(cfg, ids, environ=None) -> dict:
@@ -205,10 +207,17 @@ def hook_lines(cfg, ids, environ=None) -> dict:
     illisible, ou une commande de hook dont le binaire est introuvable (le
     hook sort alors en 127 : ni courrier en cours de tour, ni Stop). Un
     fichier absent ou un événement non configuré est un avertissement, pas un
-    KO — l'agent travaille, mais sans livraison entre deux outils."""
+    KO — l'agent travaille, mais sans livraison entre deux outils.
+
+    #514 N2 : un nom de binaire seul est résolu sous le PATH du gestionnaire
+    systemd, celui qui lance les harnais (`adapters.systemd_manager_path`),
+    pas sous celui de la session du doctor — les deux peuvent diverger dans
+    les deux sens, et seule la résolution du gestionnaire décide si le hook
+    sort en 127. Le doctor reste en lecture seule."""
     environ = os.environ if environ is None else environ
     lines: list[str] = []
     ok = True
+    manager_path = adapters.systemd_manager_path(environ)
     for harness in ids:
         descriptor = harnesses.get(harness)
         name = hook_file_of(descriptor)
@@ -244,12 +253,23 @@ def hook_lines(cfg, ids, environ=None) -> dict:
                 binary = _hook_binary(command)
                 if binary and binary not in binaries:
                     binaries.append(binary)
-                if binary and _binary_missing(binary):
+                if not binary:
+                    continue
+                if _binary_missing(binary, path=manager_path or None):
                     ok = False
-                    lines.append("hooks      : %s KO — %s calls %s: not found (the "
+                    where = ""
+                    if manager_path and os.sep not in os.path.expanduser(binary):
+                        where = " under the systemd manager PATH"
+                    lines.append("hooks      : %s KO — %s calls %s: not found%s (the "
                                  "hook exits 127: no delivery between two tool calls, "
-                                 "no Stop)" % (harness, path, command))
-            if all(binary and not _binary_missing(binary) for binary in binaries) and binaries:
+                                 "no Stop)" % (harness, path, command, where))
+                elif _binary_missing(binary):
+                    # présent sous le gestionnaire, absent de la session du doctor :
+                    # le hook tourne, c'est la résolution du doctor qui est trompeuse.
+                    lines.append("hooks      : %s — %s found under the systemd manager "
+                                 "PATH, not in this session's PATH" % (harness, binary))
+            if all(binary and not _binary_missing(binary, path=manager_path or None)
+                   for binary in binaries) and binaries:
                 lines.append("hooks      : %s → %d event(s) (%s), %s"
                              % (harness, len(events), ", ".join(events),
                                 ", ".join(binaries)))
