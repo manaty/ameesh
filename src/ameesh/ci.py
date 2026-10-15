@@ -577,9 +577,12 @@ class Watcher:
     def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
         """Les exécutions terminées entre deux passages (#1110) : une exécution
         courte n'est jamais vue « en cours », donc jamais conclue sans ce
-        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
-        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
-        la même branche est ignorée (pas de verdict périmé)."""
+        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue au
+        même attempt est laissée au relevé normal (pas de doublon) ; une tête
+        déjà remplacée sur la même branche est ignorée (pas de verdict périmé).
+        Une ligne connue dont l'attempt a augmenté est une **relance** finie
+        entre deux passages (#1573 N1) : rouverte comme au relevé, puis suivie
+        par la queue existante (échecs + verdict)."""
         st = storage.of(db)
         data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
         runs = list(data.get("workflow_runs") or ())
@@ -593,17 +596,32 @@ class Watcher:
             if workflow_of(run.get("path")) not in followed:
                 continue
             run_id = int(run["id"])
-            if st.ci.run(repo, run_id) is not None:
-                continue
             updated = updated_ts(run)
             if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
                 continue
             head = run.get("head_sha") or ""
             branch = run.get("head_branch") or ""
-            if st.ci.head_replaced(repo, branch, head, run_id):
-                continue
-            out += self._follow(db, repo, run, lots)
-            row = st.ci.run(repo, run_id)
+            known = st.ci.run(repo, run_id)
+            if known is not None:
+                attempt = int(run.get("run_attempt") or 1)
+                if known["status"] == "superseded" \
+                        or attempt <= int(known.get("run_attempt") or 1):
+                    # même attempt : la liste en retard (#828) redit terminée
+                    # une exécution déjà conclue — la rouvrir renverrait son
+                    # verdict à chaque passe
+                    continue
+                # #1573 N1 : la relance est déjà finie ; `_follow` rouvre la
+                # ligne (et rattache le lot si la branche a été posée après),
+                # la queue ci-dessous rend ses échecs et son verdict
+                out += self._follow(db, repo, run, lots)
+                row = st.ci.run(repo, run_id)
+                if row is None or row.get("status") != "running":
+                    continue  # tête remplacée, ou ligne non rouverte
+            else:
+                if st.ci.head_replaced(repo, branch, head, run_id):
+                    continue
+                out += self._follow(db, repo, run, lots)
+                row = st.ci.run(repo, run_id)
             if row is None or (run.get("status") or "") != "completed":
                 continue
             out += self._failures(db, repo, row)
@@ -851,7 +869,12 @@ class Watcher:
 
     def _failures(self, db, repo: str, row: dict) -> list[dict]:
         """Les échecs nouveaux de l'attempt courant d'une exécution suivie, et
-        leur message."""
+        leur message.
+
+        Un événement de l'attempt courant enregistré pendant que la ligne était
+        encore à l'attempt précédent (liste en retard, #828) n'est pas
+        réinséré par `add_failure` quand la ligne est ensuite rouverte : il est
+        signalé ici tant qu'aucun message ne l'a porté (#1573 N2)."""
         from . import work
         st = storage.of(db)
         run_id, attempt = int(row["run_id"]), int(row.get("run_attempt") or 1)
@@ -871,6 +894,11 @@ class Watcher:
         # qu'on le sache, il n'est pas imputé par un urgent
         unknown_base = not reference
         before = set(reference.get("tests") or ())
+        # les lignes déjà enregistrées pour l'attempt courant, avec leur
+        # message : `add_failure` ne les réinsère pas (même attempt), mais
+        # celles qu'aucun message n'a portées restent à signaler (#1573 N2)
+        recorded = {(f["part"], f["test"]): f
+                    for f in st.ci.failures(repo, int(run_id))}
         new = []
         for ev in events:
             source = event_attempt(ev)
@@ -879,11 +907,13 @@ class Watcher:
                        "inherited": ev["test"] in before,
                        "excerpt": ev.get("extrait") or "", "replay": ev.get("rejouer") or "",
                        "duration_s": ev.get("duree_s"), "failed_at": ev.get("ts")}
-            if st.ci.add_failure(repo, run_id, run_attempt=source, **failure):
+            added = st.ci.add_failure(repo, run_id, run_attempt=source, **failure)
+            if source == attempt:
                 # une ligne de l'attempt précédent (check run pas encore
                 # republié par la relance) est enregistrée sous le sien, jamais
                 # imputée à l'attempt courant (#901)
-                if source == attempt:
+                seen = recorded.get((failure["part"], failure["test"]))
+                if added or (seen is not None and not seen.get("message_id")):
                     new.append(failure)
         own = [f for f in new if not f["inherited"]]
         if not own:
@@ -895,7 +925,7 @@ class Watcher:
                      "tests": [f["test"] for f in own], "to": None}]
         # premier message de l'exécution (un passif sans base compte aussi)
         first = not row.get("urgent_message_id") and not any(
-            f.get("message_id") for f in st.ci.failures(repo, int(row["run_id"])))
+            f.get("message_id") for f in recorded.values())
         urgent = first and not unknown_base
         text = failure_text(row, lot, own, first=first, unknown_base=unknown_base)
         short = failure_text(row, lot, own, first=first, unknown_base=unknown_base,

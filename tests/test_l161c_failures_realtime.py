@@ -1209,10 +1209,10 @@ class WatcherTest(PgTestCase):
     AT_NOW = "1970-01-12T13:46:40+00:00"
 
     def terminated(self, run_id, sha, branch, *, conclusion, workflow="tests.yml",
-                   updated_at=None):
+                   updated_at=None, attempt=1):
         """Une exécution terminée telle que la liste `status=completed` la rend."""
         return dict(run_view(run_id, sha, branch, workflow=workflow,
-                             updated_at=updated_at or self.AT_NOW),
+                             updated_at=updated_at or self.AT_NOW, attempt=attempt),
                     status="completed", conclusion=conclusion)
 
     def test_execution_courte_terminee_avant_le_premier_passage(self):
@@ -1349,6 +1349,69 @@ class WatcherTest(PgTestCase):
         bodies = [m["body"] for m in self.mails("dev-a")]
         self.assertEqual(len(bodies), 2)
         self.assertFalse([b for b in bodies if "still running" in b])
+
+    def test_relance_courte_finie_entre_deux_passages_est_rouverte(self):
+        """#1573 N1 : `gh run rerun` garde le run_id ; si l'attempt 2 naît et
+        finit entre deux passages, le rattrapage ne voit qu'une ligne connue.
+        Elle est rouverte (relance) puis conclue — sans quoi le verdict de la
+        relance ne partirait jamais."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "71" * 20
+        # passage 1 : attempt 1 suivi, puis conclu (échec)
+        self.api.live = [run_view(1030, sha, "lot/1-un", attempt=1)]
+        watcher.tick(self.db)
+        self.api.live, self.api.done[1030] = [], {"status": "completed",
+                                                  "conclusion": "failure"}
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("status")) for o in out],
+                         [("verdict", "failure")])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+        # passage 2 : la relance est née et finie entre les deux passages : elle
+        # n'apparaît que dans la liste des exécutions terminées (attempt 2)
+        self.api.terminated = [self.terminated(1030, sha, "lot/1-un",
+                                               conclusion="success", attempt=2)]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt"), o.get("status")) for o in out],
+                         [("rerun", 2, None), ("verdict", None, "success")])
+        row = storage.of(self.db).ci.run(DEPOT, 1030)
+        self.assertEqual((row["status"], row["run_attempt"]), ("success", 2))
+        # un seul verdict par tentative : le passage suivant ne double rien
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 2)
+
+    def test_echec_de_l_attempt_suivant_inscrit_avant_la_reouverture(self):
+        """#1573 N2 : une liste en retard (#828) peut publier un échec de
+        l'attempt 2 pendant que la ligne est encore à l'attempt 1. La ligne
+        l'enregistre sous son attempt ; à la réouverture, `add_failure` ne le
+        réinsère pas (même attempt) — il doit pourtant être signalé."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "72" * 20
+        # passage 1 : attempt 1 suivi
+        self.api.live = [run_view(1031, sha, "lot/1-un", attempt=1)]
+        watcher.tick(self.db)
+        # passage 2 : la liste dit encore attempt 1, mais le check run de la
+        # relance (attempt 2) est déjà publié et échoue
+        self.api.checks[sha] = [check_run([ev_test("tests.test_b.T.test_2", execution=1031,
+                                                   attempt=2)], attempt=2)]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
+        rows = self.db.query("SELECT test, run_attempt, message_id FROM ci_test_failures"
+                             " WHERE repo = %s AND run_id = %s", (DEPOT, 1031))
+        self.assertEqual([(r["test"], r["run_attempt"], r["message_id"]) for r in rows],
+                         [("tests.test_b.T.test_2", 2, None)])
+        # passage 3 : la liste rattrape l'attempt 2 ; la ligne est rouverte et
+        # l'échec déjà inscrit est signalé, une seule fois
+        self.api.live = [run_view(1031, sha, "lot/1-un", attempt=2)]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt"), o.get("tests"), o.get("urgent"))
+                          for o in out],
+                         [("rerun", 2, None, None),
+                          ("failures", None, ["tests.test_b.T.test_2"], True)])
+        mails = self.mails("dev-a")
+        self.assertEqual(len(mails), 1)
+        self.assertIn("tests.test_b.T.test_2", mails[0]["body"])
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
 
     def test_reference_stricte_par_workflow(self):
         """#1110 P2-2 : une ligne sans workflow (écrite avant 0433 par un
