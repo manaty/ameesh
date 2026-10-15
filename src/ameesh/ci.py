@@ -72,6 +72,8 @@ EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
+#: #747 : seuil de la vue des exécutions suivies en attente (sans notification)
+QUEUE_STARVED_S = 20 * 60.0
 
 
 class CiError(RuntimeError):
@@ -312,6 +314,9 @@ class Watcher:
         out: list[dict] = []
         for run_id in sorted(live):
             out += self._follow(db, repo, live[run_id], lots)
+        # #747 : fin de l'attente d'un runner, distincte de la durée des tests
+        st.ci.mark_started(repo, [i for i, r in live.items()
+                                  if r.get("status") == "in_progress"])
         for row in st.ci.running(repo):
             out += self._failures(db, repo, row)
             if int(row["run_id"]) not in live:
@@ -359,7 +364,7 @@ class Watcher:
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
                        base=base_of(run), work_item_id=lot_of_run(run, lots),
-                       url=run.get("html_url"))
+                       url=run.get("html_url"), created_at=run.get("created_at"))
         branch = run.get("head_branch") or ""
         if not branch or branch in BASE_BRANCHES:
             return []
@@ -491,6 +496,36 @@ def main_red(db) -> list[dict]:
     return out
 
 
+def queue_starved(db, now: float, threshold_s: float = QUEUE_STARVED_S) -> list[dict]:
+    """#747 : par dépôt, les exécutions suivies qui attendent un runner depuis
+    plus de `threshold_s` (créées chez GitHub, jamais vues démarrées) :
+    `{repo, count, oldest_ts, oldest_run_id, url}`."""
+    out: dict[str, dict] = {}
+    for row in storage.of(db).ci.queued():
+        since = row.get("created_ts") or row["first_seen_ts"]
+        if now - float(since) < threshold_s:
+            continue
+        entry = out.setdefault(row["repo"], {"repo": row["repo"], "count": 0,
+                                             "oldest_ts": since, "oldest_run_id": row["run_id"],
+                                             "url": row.get("url")})
+        entry["count"] += 1
+    return list(out.values())
+
+
+def wait_text(run: dict, now: float) -> str:
+    """#747 : attente d'un runner et durée de l'exécution, séparées."""
+    created = run.get("created_ts") or run.get("first_seen_ts")
+    started, end = run.get("started_ts"), run.get("concluded_ts")
+    if created is None:
+        return ""
+    if started is None:
+        if run.get("status") == "running":
+            return "queued %d min" % ((now - float(created)) // 60)
+        return ""
+    return "queued %d min, ran %d min" % ((float(started) - float(created)) // 60,
+                                         ((end or now) - float(started)) // 60)
+
+
 # --------------------------------------------------------------------------
 # ameesh ci status
 # --------------------------------------------------------------------------
@@ -516,6 +551,7 @@ _STATUS_FR = {"running": "running", "success": "green", "failure": "red",
 
 def render_status(report: dict) -> list[str]:
     from .notify import local_time
+    now = time.time()
     lines = ["lot #%d \"%s\" (branch %s)" % (report["work_item"], report.get("title") or "",
                                           report.get("branch") or "—")]
     if not report["runs"]:
@@ -527,9 +563,11 @@ def render_status(report: dict) -> list[str]:
             state += " by %s" % _short(run["superseded_by"])
         own = [f for f in run["failures"] if not f.get("inherited")]
         inherited = len(run["failures"]) - len(own)
-        lines.append("  %s  %s  %s  %s%s%s" % (
+        wait = wait_text(run, now)
+        lines.append("  %s  %s  %s  %s%s%s%s" % (
             local_time(run["first_seen_ts"]), _short(run["head_sha"]), state,
             "%d failure(s)" % len(own), ", %d inherited" % inherited if inherited else "",
+            "  (%s)" % wait if wait else "",
             "  %s" % run["url"] if run.get("url") else ""))
         for f in own[:10]:
             lines.append("      %s (%s)%s" % (f["test"], f.get("part") or "?",

@@ -2863,8 +2863,20 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
-                 base: str, work_item_id: int | None, url: str | None) -> dict:
-        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
+                 base: str, work_item_id: int | None, url: str | None,
+                 created_at: str | None = None) -> dict:
+        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend.
+        `created_at` : la création de l'exécution chez GitHub (0422)."""
+
+    @abc.abstractmethod
+    def mark_started(self, repo: str, run_ids: Sequence[int]) -> None:
+        """#747 : ces exécutions sont vues `in_progress` ; la première fois,
+        `started_at` prend l'heure du relevé (la fin de l'attente d'un runner)."""
+
+    @abc.abstractmethod
+    def queued(self) -> list[dict]:
+        """#747 : les exécutions `running` jamais vues démarrées, de la plus
+        ancienne à la plus récente, tous dépôts."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:
