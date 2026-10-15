@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#1604 — chemin rapide de `agent-mail hook` / `agent-mail statusline`.
+
+Le hook tourne après CHAQUE outil : quand la boîte locale dit qu'il n'y a rien
+à faire, il ne doit ni importer `ameesh.cli` (base, psycopg) ni ouvrir la base.
+Ce que ces tests protègent :
+
+* la décision rapide (marqueur frais) et le retour au chemin complet dès que le
+  marqueur est absent, périmé ou dit « à vérifier » ;
+* la livraison : Stop, SessionStart et UserPromptSubmit passent TOUJOURS par la
+  base, et un courrier en attente est remis même avec un marqueur frais ;
+* le marqueur lui-même : posé après un passage complet, invalidé par un envoi
+  local, et un cache de barre d'état de quelques secondes ;
+* le coût : le chemin rapide n'importe pas le paquet complet et son temps CPU
+  reste très en dessous d'un import de `ameesh.cli`.
+"""
+from __future__ import annotations
+
+import json
+import os
+import resource
+import subprocess
+import sys
+import time
+
+from ameesh import fastmail, registry
+
+from .support import PgTestCase
+
+#: le code d'un sous-processus qui exécute l'entrée `agent-mail` et dit ce qui
+#: a été importé — la preuve structurelle du chemin rapide.
+SONDE = (
+    "import sys; sys.argv = ['agent-mail', 'hook', 'claude'];"
+    "import ameesh.entry as e; rc = e.main();"
+    "print('rc', rc);"
+    "print('cli' if 'ameesh.cli' in sys.modules else 'rapide');"
+    "print('backend' if 'ameesh.backend' in sys.modules else 'sans-base');"
+    "print('psycopg' if 'psycopg' in sys.modules else 'sans-psycopg')"
+)
+
+
+class HookRapideTest(PgTestCase):
+    """#1604 : hook/statusline sans base quand il n'y a rien à faire."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        registry.upsert(self.db, "alpha", harness="claude", host=self.cfg.host)
+
+    # -- utilitaires -------------------------------------------------------
+    def entry(self, *args: str, env: dict | None = None, stdin: str | None = None,
+              timeout: float = 60.0) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "ameesh.entry", *args],
+            input=stdin, capture_output=True, text=True, timeout=timeout,
+            env=env or self.env(), cwd=self.tmp,
+        )
+
+    def _posttooluse(self, session: str = "sess-1") -> str:
+        return json.dumps({"hook_event_name": "PostToolUse", "cwd": self.tmp,
+                           "session_id": session})
+
+    def _marqueur_frais(self, session: str = "sess-1", pending: bool = False) -> dict:
+        """Le marqueur et l'inscription qu'un passage complet vient d'écrire."""
+        fastmail.register_done(self.cfg, "alpha",
+                               ["claude", self.tmp, session, None, None])
+        fastmail.note(self.cfg, "alpha", pending=pending, unread=1 if pending else 0)
+        return self.env(AGENT_MAIL_NAME="alpha", AMEESH_HOOK_FAST_TTL="600")
+
+    def _send(self, sender: str = "beta", text: str = "un message") -> None:
+        proc = self.cli("send", "alpha", text, env=self.env(AGENT_MAIL_NAME=sender))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def _livre(self) -> bool:
+        return bool(self.db.query(
+            "SELECT 1 FROM agent_mailbox WHERE recipient = %s AND delivered_at IS NOT NULL",
+            ("alpha",)))
+
+    # -- décision rapide ---------------------------------------------------
+    def test_posttooluse_sans_base_quand_rien_a_faire(self):
+        env = self._marqueur_frais()
+        proc = subprocess.run(
+            [sys.executable, "-c", SONDE], input=self._posttooluse(),
+            capture_output=True, text=True, timeout=60, env=env, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["rc 0", "rapide", "sans-base", "sans-psycopg"])
+        self.assertEqual(proc.stderr, "")
+
+    def test_marqueur_absent_ou_perime_repasse_par_la_base(self):
+        for etat in ("absent", "perime"):
+            with self.subTest(etat=etat):
+                env = self.env(AGENT_MAIL_NAME="alpha", AMEESH_HOOK_FAST_TTL="600")
+                fastmail.register_done(self.cfg, "alpha",
+                                       ["claude", self.tmp, "sess-1", None, None])
+                if etat == "absent":
+                    if os.path.exists(fastmail.marker_path(self.cfg, "alpha")):
+                        os.unlink(fastmail.marker_path(self.cfg, "alpha"))
+                else:
+                    fastmail.note(self.cfg, "alpha", pending=False, unread=0,
+                                  maintenant=time.time() - 3600)
+                proc = subprocess.run(
+                    [sys.executable, "-c", SONDE], input=self._posttooluse(),
+                    capture_output=True, text=True, timeout=60, env=env, cwd=self.tmp)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("cli", proc.stdout.split())
+
+    def test_inscription_due_repasse_par_la_base(self):
+        self._marqueur_frais()
+        fastmail.register_done(self.cfg, "alpha",
+                               ["claude", self.tmp, "sess-1", None, None])
+        # une clé d'inscription différente (session neuve) : chemin complet
+        proc = subprocess.run(
+            [sys.executable, "-c", SONDE],
+            input=json.dumps({"hook_event_name": "PostToolUse", "cwd": self.tmp,
+                              "session_id": "sess-2"}),
+            capture_output=True, text=True, timeout=60,
+            env=self.env(AGENT_MAIL_NAME="alpha", AMEESH_HOOK_FAST_TTL="600"),
+            cwd=self.tmp)
+        self.assertIn("cli", proc.stdout.split())
+
+    # -- la livraison ne change pas ---------------------------------------
+    def test_stop_livre_meme_avec_un_marqueur_frais(self):
+        self._send("beta", "un message pour alpha")
+        env = self._marqueur_frais()
+        payload = json.dumps({"hook_event_name": "Stop", "cwd": self.tmp,
+                              "session_id": "sess-1"})
+        proc = self.entry("hook", "claude", env=env, stdin=payload)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        reponse = json.loads(proc.stdout)
+        self.assertEqual(reponse["decision"], "block")
+        self.assertIn("un message pour alpha", reponse["reason"])
+        self.assertTrue(self._livre(), "le Stop doit remettre le courrier")
+
+    def test_posttooluse_livre_si_le_marqueur_dit_a_verifier(self):
+        self._send("gamma", "courrier a verifier")
+        env = self._marqueur_frais(pending=True)
+        proc = self.entry("hook", "claude", env=env, stdin=self._posttooluse())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        reponse = json.loads(proc.stdout)
+        self.assertIn("courrier a verifier",
+                      reponse["hookSpecificOutput"]["additionalContext"])
+        self.assertTrue(self._livre())
+
+    def test_le_chemin_complet_repose_le_marqueur(self):
+        """Après une remise, le marqueur autorise le chemin rapide suivant."""
+        self._send("beta", "un message")
+        env = self._marqueur_frais(pending=True)
+        proc = self.entry("hook", "claude", env=env, stdin=self._posttooluse())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        marque = fastmail.read_marker(self.cfg, "alpha")
+        self.assertIsNotNone(marque)
+        self.assertFalse(marque["pending"])
+        self.assertEqual(marque["unread"], 0)
+        # le hook suivant, servilement rapide, ne charge plus rien
+        proc2 = subprocess.run(
+            [sys.executable, "-c", SONDE], input=self._posttooluse(),
+            capture_output=True, text=True, timeout=60, env=env, cwd=self.tmp)
+        self.assertIn("rapide", proc2.stdout.split())
+        self.assertIn("sans-base", proc2.stdout.split())
+
+    def test_envoi_local_invalide_le_marqueur(self):
+        fastmail.note(self.cfg, "alpha", pending=False, unread=0)
+        self._send("beta", "du courrier neuf")
+        marque = fastmail.read_marker(self.cfg, "alpha")
+        self.assertTrue(marque["pending"])
+
+    def test_entree_et_cli_rendent_le_meme_json(self):
+        """Le chemin complet garde le JSON à l'octet près (compatibilité)."""
+        # instant fixe : les deux rendus portent la même heure (jamais d'horloge
+        # dans la comparaison)
+        ts = 1770000000.0
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, created_at) "
+            "VALUES (%s, %s, %s, to_timestamp(%s))", ("beta", "alpha", "même texte", ts))
+        fastmail.note(self.cfg, "alpha", pending=True, unread=1)
+        fastmail.register_done(self.cfg, "alpha",
+                               ["claude", self.tmp, "sess-1", None, None])
+        env = self.env(AGENT_MAIL_NAME="alpha")
+        payload = self._posttooluse()
+        direct = self.cli("hook", "claude", env=env, stdin=payload)
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, created_at) "
+            "VALUES (%s, %s, %s, to_timestamp(%s))", ("beta", "alpha", "même texte", ts))
+        fastmail.note(self.cfg, "alpha", pending=True, unread=1)
+        entree = self.entry("hook", "claude", env=env, stdin=payload)
+        self.assertEqual(direct.returncode, 0, direct.stderr)
+        self.assertEqual(entree.returncode, 0, entree.stderr)
+        self.assertEqual(json.loads(direct.stdout), json.loads(entree.stdout))
+
+    # -- barre d'état ------------------------------------------------------
+    def test_statusline_en_cache_quelques_secondes(self):
+        dossier = os.path.join(self.tmp, "sl")
+        os.makedirs(dossier, exist_ok=True)
+        self.cli("alias", "alpha", dossier, "chantier")
+        self._send("beta", "un message")
+        payload = json.dumps({"workspace": {"current_dir": dossier}})
+        env = self.env(AGENT_MAIL_NAME="alpha")
+        premier = self.entry("statusline", env=env, stdin=payload)
+        self.assertEqual(premier.returncode, 0, premier.stderr)
+        self.assertIn("✉ 1", premier.stdout)
+        self.db.execute("DELETE FROM agent_mailbox")
+        # dans la fenêtre du cache : la ligne n'est pas recalculée
+        second = self.entry("statusline", env=env, stdin=payload)
+        self.assertEqual(second.stdout, premier.stdout)
+        # TTL nul : le rendu revient à la base et le courrier a disparu
+        frais = self.entry("statusline", stdin=payload,
+                           env=self.env(AGENT_MAIL_NAME="alpha",
+                                        AMEESH_STATUSLINE_TTL="0"))
+        self.assertEqual(frais.returncode, 0, frais.stderr)
+        self.assertNotIn("✉", frais.stdout)
+
+    # -- coût --------------------------------------------------------------
+    def test_temoin_cout_cpu_du_chemin_rapide(self):
+        """Témoin de coût : le chemin rapide reste loin d'un import complet."""
+        env = self._marqueur_frais()
+        charge = ("import sys; sys.argv = ['agent-mail', 'hook', 'claude'];"
+                  "import ameesh.entry as e; e.main()")
+
+        def cpu_enfants() -> float:
+            usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+            return usage.ru_utime + usage.ru_stime
+
+        avant = cpu_enfants()
+        rapide = subprocess.run([sys.executable, "-c", charge],
+                                input=self._posttooluse(), capture_output=True,
+                                text=True, timeout=60, env=env, cwd=self.tmp)
+        cout_rapide = cpu_enfants() - avant
+        self.assertEqual(rapide.returncode, 0, rapide.stderr)
+
+        avant = cpu_enfants()
+        lourd = subprocess.run([sys.executable, "-c", "import ameesh.cli"],
+                               capture_output=True, text=True, timeout=120, env=env,
+                               cwd=self.tmp)
+        cout_lourd = cpu_enfants() - avant
+        self.assertEqual(lourd.returncode, 0, lourd.stderr)
+
+        self.assertLess(cout_rapide, cout_lourd,
+                        "le chemin rapide coûte %.3fs CPU, l'import complet %.3fs"
+                        % (cout_rapide, cout_lourd))
+        # borne large (le chemin rapide mesuré tourne autour de 0,05 s) : elle
+        # attrape une régression qui réimporterait le paquet, sans dépendre de
+        # la charge de la machine — le CPU consommé, lui, ne dépend pas d'elle.
+        self.assertLess(cout_rapide, 0.20,
+                        "chemin rapide : %.3fs CPU (borne 0,20 s)" % cout_rapide)
