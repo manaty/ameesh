@@ -105,6 +105,14 @@ DEFAULT_LOT_MAX_PER_HOUR = 6
 LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
 #: âge minimal d'un lot pris : l'orchestrateur qui vient de le créer le confie
 LOT_MIN_AGE_S = 300.0
+#: #1677 (c) : quand aucun lot n'est prenable, la prise propose une relecture
+#: (lot en qa sans verdict) ou une correction (dernier verdict bloquant, auteur
+#: occupé) à un agent au repos d'une autre famille de modèles. Le débit est
+#: borné par heure comme les prises, et un lot n'est pas reproposé avant
+#: `REVIEW_PROPOSAL_WINDOW_S`.
+REVIEW_PROPOSAL_NOTE = "review proposal"
+REVIEW_PROPOSAL_MAX_PER_HOUR = 6
+REVIEW_PROPOSAL_WINDOW_S = 6 * 3600.0
 #: capacités exigées qui réservent un lot à une attribution explicite
 RESERVED_CAPABILITIES = ("decision", "production")
 #: capacités déclarées qui marquent la classe d'un lot (canon §1/#803) : un lot
@@ -457,6 +465,34 @@ def lot_take_message(item: dict, orchestras: list) -> str:
                 if stack else ""))
 
 
+def review_proposal_message(item: dict, agent: str, *, kind: str, family: str) -> str:
+    """#1677 (c) : le courrier qui propose une relecture — ou la correction d'un
+    lot à verdict bloquant — à un agent au repos, quand aucun lot n'est
+    prenable. `family` est l'autre famille de modèles que celle de l'auteur."""
+    lot = int(item["id"])
+    title = (item.get("title") or "").strip()
+    branch = (item.get("branch") or "").strip() or "(branche inconnue)"
+    head = (item.get("frozen_sha") or "").strip() or "(tête gelée inconnue)"
+    author = (item.get("assignee") or "?").strip()
+    if kind == "correction":
+        return ("Lot #%d \"%s\" is in qa with a blocking last verdict, and its author %s is "
+                "busy on other lots: the correction waits. You can take it over — branch %s, "
+                "frozen head %s — fix at the source, push on the branch, then the verdict is "
+                "given again (a correction stays on the lot's branch, never a new lot). "
+                "Coordinate with the author through the lot journal; if you cannot take it, "
+                "say so rather than leaving it waiting."
+                % (lot, title, author, branch, head))
+    return ("Lot #%d \"%s\" is in qa without a verdict: the review is due, and the author %s "
+            "does not review their own work. Your family is the other one (%s). The frozen "
+            "head is %s of branch %s: read it, then deliver your verdict —\n"
+            "  ameesh work milestone %d verdict ok|blocked --sha %s\n"
+            "Review comes before anything else (canon §2): a blocking defect (B, P1) blocks "
+            "the merge. The reviewer fixes a small defect himself on the branch and pushes; "
+            "a correction too big goes back to the author. If the lot is not for you, say so "
+            "rather than leaving it waiting."
+            % (lot, title, author, family, head, branch, lot, head))
+
+
 def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
     return ("Automatic take (L165): %s, idle for %d min, took lot #%d of "
             "team %s, which had no assignee: %s. To give it to someone else: "
@@ -516,6 +552,77 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if teams[name] == team] or known)
 
 
+def _propose_reviews(db, st, listing, *, pool, room, dry_run=False) -> list:
+    """#1677 (c) : apparie les lots en attente de relecture — ou de correction —
+    aux agents au repos. Une relecture va à l'autre famille de modèles que
+    l'auteur (canon §2) ; une correction peut aller à n'importe quel agent au
+    repos, du moment que l'auteur du lot est occupé (corps du lot #1677). Les
+    relectures passent avant les corrections.
+
+    Rend les propositions dans la forme des prises (`item`, `agent`,
+    `message_id`, `kind` valant `review` ou `correction`, `notified`). Le lot
+    est marqué au journal (`REVIEW_PROPOSAL_NOTE`), ce qui l'écarte des
+    passages suivants le temps de `REVIEW_PROPOSAL_WINDOW_S`."""
+    from . import mail, registry, review_lot
+    if room <= 0 or not pool:
+        return []
+    rows = st.work.review_proposals(room, proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                                    window_s=REVIEW_PROPOSAL_WINDOW_S)
+    if not rows:
+        return []
+    # relectures d'abord, corrections ensuite (l'ordre du SQL est conservé)
+    rows = sorted(rows, key=lambda r: 1 if (r.get("last_verdict") or "") == "blocked" else 0)
+    by_name = {row.get("name"): row for row in listing}
+    out: list = []
+    used: set = set()
+    for row in pool:
+        if len(out) >= room:
+            break
+        name = row["name"]
+        reg = dict(row, **(registry.get(db, name) or {}))
+        mine = registry.live_harness(reg).strip().lower()
+        if not mine:
+            continue
+        for item in rows:
+            lot = int(item["id"])
+            if lot in used:
+                continue
+            author = (item.get("assignee") or "").strip()
+            author_reg = by_name.get(author) or registry.get(db, author) or {}
+            want = review_lot.reviewer_family(registry.live_harness(author_reg))
+            correction = (item.get("last_verdict") or "") == "blocked"
+            if correction:
+                author_row = by_name.get(author)
+                # auteur occupé : il a un autre lot actionnable que celui-ci
+                if author_row is not None and int(author_row.get("actionable_lots") or 0) <= 1:
+                    continue
+            else:
+                # relecture : l'autre famille que celle de l'auteur (canon §2) ;
+                # famille d'auteur inconnue, toute famille connue fait l'affaire
+                if want == review_lot.UNKNOWN_FAMILY:
+                    ok = mine in ("codex", "claude")
+                else:
+                    ok = mine == want
+                if not ok:
+                    continue
+            kind = "correction" if correction else "review"
+            payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
+            message_id = None
+            if not dry_run:
+                message_id = mail.send(
+                    db, SENDER, name,
+                    review_proposal_message(item, name, kind=kind, family=want),
+                    kind="event", work_item_id=str(lot), payload=payload)
+                st.work.note(lot, item.get("state") or "qa",
+                             "%s: lot #%d to %s (%s)" % (REVIEW_PROPOSAL_NOTE, lot, name, kind),
+                             SENDER)
+            used.add(lot)
+            out.append({"item": item, "agent": name, "message_id": message_id,
+                        "kind": kind, "notified": []})
+            break
+    return out
+
+
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
               max_per_hour: int = DEFAULT_TAKE_MAX_PER_HOUR,
               alerts: list | None = None, listing: list | None = None, paid=None,
@@ -524,10 +631,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
               lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None) -> list:
     """Un passage de prise automatique ; rend les prises faites (ou prévues
     en `dry_run`) : `[{item, agent, message_id, kind, notified}]`, `kind`
-    valant `lot` (lot non assigné de l'équipe, L165) ou `backlog` (file
-    d'amélioration, L119). Les lots de l'équipe passent d'abord ; tant qu'un
-    lot du projet attend, personne ne prend d'amélioration. Un seuil nul
-    désactive la prise correspondante.
+    valant `lot` (lot non assigné de l'équipe, L165), `review`/`correction`
+    (#1677 : relecture d'un lot en qa sans verdict, correction d'un lot à
+    verdict bloquant, proposées à un agent au repos d'une autre famille quand
+    aucun lot n'est prenable) ou `backlog` (file d'amélioration, L119). Les
+    lots de l'équipe passent d'abord ; tant qu'un lot du projet attend,
+    personne ne prend d'amélioration. Un seuil nul désactive la prise
+    correspondante.
 
     Les candidats sont triés forfaits d'abord : chaque agent au forfait prend
     ce qui lui va, puis les agents payés au token prennent ce qu'il reste
@@ -552,7 +662,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
     queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
     if not lots and not queue:
-        return []
+        # #1677 (c) : même sans lot prenable, un lot en qa sans verdict (ou à
+        # correction due) peut occuper un agent au repos — la sonde est bon
+        # marché, le reste du passage ne se paie que s'il y a de quoi proposer.
+        if not st.work.review_proposals(1, proposal_prefix=REVIEW_PROPOSAL_NOTE,
+                                        window_s=REVIEW_PROPOSAL_WINDOW_S):
+            return []
     listing = st.operations.listing() if listing is None else listing
     from . import auditor as auditor_mod
     try:
@@ -672,6 +787,16 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 taken.append({"item": done, "agent": check["assignee"],
                               "message_id": message_id, "kind": "lot", "notified": notified})
                 break
+    # #1677 (c) : aucun lot n'a été pris — proposer aux agents au repos une
+    # relecture (lot en qa sans verdict, autre famille que l'auteur), puis une
+    # correction (verdict bloquant, auteur occupé). Ces propositions passent
+    # avant la file d'améliorations : du travail réel sur des lots en cours.
+    if not taken:
+        proposal_room = max(0, REVIEW_PROPOSAL_MAX_PER_HOUR
+                            - st.work.auto_takes_since(TAKE_WINDOW_S, REVIEW_PROPOSAL_NOTE))
+        taken.extend(_propose_reviews(
+            db, st, listing, pool=candidates(idle_s, waiting_free=True),
+            room=proposal_room, dry_run=dry_run))
     if not queue:
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe

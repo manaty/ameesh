@@ -1565,6 +1565,17 @@ class WorkItems(Domain):
         the ready intake never offers a lot that cannot be started."""
 
     @abc.abstractmethod
+    def review_proposals(self, limit: int, *, proposal_prefix: str,
+                         window_s: float = 21600.0) -> list[dict]:
+        """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
+        sans verdict (une relecture est due) ou à dernier verdict bloquant (une
+        correction est due) — avec leur auteur, leur branche et leur tête gelée.
+
+        Un lot déjà muni d'un relecteur désigné, ou sans tête gelée, est
+        écarté ; un lot dont une proposition (`proposal_prefix` au journal) a
+        moins de `window_s` n'est pas reproposé."""
+
+    @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
         """L233b : la dernière ligne de journal du lot dont la note commence
         par l'un des `prefixes` (une attribution), puis sa ligne la plus

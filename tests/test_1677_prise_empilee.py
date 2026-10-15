@@ -11,6 +11,7 @@ tour, sinon un agent sans lot n'est jamais « au repos ».
 """
 from __future__ import annotations
 
+import json
 import time
 
 from ameesh import storage, sous_utilisation, work
@@ -135,6 +136,126 @@ class EmpilementTest(_Empile):
                        actor="test")
         edge = storage.of(self.db).work_dependencies.for_items([empile["id"]])[0]
         self.assertTrue(edge["blocking"])
+
+
+class PropositionTest(_Empile):
+    """(c) : quand aucun lot n'est prenable, la prise propose une relecture
+    (lot en qa sans verdict, autre famille que l'auteur) puis une correction
+    (dernier verdict bloquant, auteur occupé)."""
+
+    def auteur(self, name="auteur", harness="claude", team="nexlink"):
+        self.agent(name, harness=harness, team=team)
+
+    def qa(self, title, *, verdict=None, author="auteur", branch="lot/qa", sha=SHA):
+        item = self.lot(title, assignee=author)
+        self.db.execute("UPDATE work_items SET state = 'qa', branch = %s"
+                        " WHERE id = %s", (branch, item["id"]))
+        work.milestone(self.db, item["id"], "frozen", sha=sha, actor="test")
+        if verdict is not None:
+            work.milestone(self.db, item["id"], "verdict", verdict=verdict, sha=sha,
+                           actor="test")
+        return item
+
+    def occupe(self, name="auteur", title="en cours"):
+        """L'auteur est au travail : un lot **démarré** (sinon #540 le mettrait
+        en file et le lot suivant perdrait son assigné, faute de place)."""
+        item = self.lot(title, assignee=name, priority=2)
+        self.db.execute("UPDATE work_items SET state = 'build', started_at = now()"
+                        " WHERE id = %s", (item["id"],))
+        return item
+
+    def mails(self, name):
+        rows = self.db.query("SELECT body, payload FROM agent_mailbox"
+                             " WHERE recipient = %s ORDER BY id", (name,))
+        out = []
+        for row in rows:
+            payload = row["payload"]
+            out.append({"body": row["body"],
+                        "payload": json.loads(payload) if isinstance(payload, str)
+                        else payload})
+        return out
+
+    def test_une_relecture_va_a_l_autre_famille(self):
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        self.agent("codex1", harness="codex", team="nexlink")
+        self.agent("claude2", harness="claude", team="nexlink")
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
+                         [("review", "codex1", lot["id"])])
+        mails = self.mails("codex1")
+        self.assertEqual(len(mails), 1)
+        self.assertIn("#%d" % lot["id"], mails[0]["body"])
+        self.assertIn("lot/a-relire", mails[0]["body"])
+        self.assertIn(SHA, mails[0]["body"])
+        self.assertEqual(mails[0]["payload"]["review_proposal"]["kind"], "review")
+        self.assertEqual(self.mails("claude2"), [], "même famille que l'auteur")
+
+    def test_la_correction_va_a_un_agent_si_l_auteur_est_occupe(self):
+        self.auteur()
+        lot = self.qa("corriger", verdict="blocked", branch="lot/a-corriger")
+        self.occupe()
+        self.agent("codex1", harness="codex", team="nexlink")
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
+                         [("correction", "codex1", lot["id"])])
+        body = self.mails("codex1")[0]["body"]
+        self.assertIn("blocking last verdict", body)
+        self.assertIn("lot/a-corriger", body)
+
+    def test_la_correction_reste_a_l_auteur_qui_n_est_pas_occupe(self):
+        self.auteur()
+        self.qa("corriger seul", verdict="blocked", branch="lot/seul")
+        self.agent("codex1", harness="codex", team="nexlink")
+
+        self.assertEqual(self.take(), [])
+        self.assertEqual(self.mails("codex1"), [])
+
+    def test_la_correction_va_a_toute_famille_quand_l_auteur_est_occupe(self):
+        """La famille ne borne que la relecture : une correction due peut aller
+        à un agent au repos de la même famille que l'auteur."""
+        self.auteur()
+        lot = self.qa("corriger", verdict="blocked", branch="lot/a-corriger")
+        self.occupe()
+        self.agent("claude2", harness="claude", team="nexlink")
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
+                         [("correction", "claude2", lot["id"])])
+
+    def test_la_relecture_passe_avant_la_correction(self):
+        self.auteur()
+        self.qa("a corriger", verdict="blocked", branch="lot/correction")
+        self.occupe()
+        relire = self.qa("a relire", branch="lot/relecture")
+        self.agent("codex1", harness="codex", team="nexlink")
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
+                         [("review", relire["id"])],
+                         "la relecture due passe avant la correction")
+
+    def test_pas_deux_fois_la_meme_proposition(self):
+        self.auteur()
+        self.qa("relire", branch="lot/relire")
+        self.agent("codex1", harness="codex", team="nexlink")
+
+        self.assertEqual([t["kind"] for t in self.take()], ["review"])
+        self.assertEqual(self.take(), [], "le lot est marqué, l'agent a du courrier")
+        self.assertEqual(len(self.mails("codex1")), 1)
+
+    def test_un_lot_prenable_passe_avant_les_propositions(self):
+        self.auteur()
+        self.qa("relire", branch="lot/relire")
+        self.agent("codex1", harness="codex", team="nexlink")
+        prenable = self.lot("prenable", priority=1)
+
+        out = self.take()
+        self.assertEqual([(t["kind"], t["item"]["id"]) for t in out],
+                         [("lot", prenable["id"])])
+        self.assertEqual(self.mails("codex1"), [], "la prise n'a pas eu lieu")
 
 
 class InactiviteTest(_Empile):
