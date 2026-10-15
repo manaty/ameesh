@@ -85,6 +85,24 @@ class MailLinksLotsTest(_Base):
         self.assertIn("belongs to dev1: not reassigned", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
+    def test_lot_rattache_a_un_autre_agent_n_avertit_pas_sans_lot(self):
+        # #1407 : le rattachement a bien eu lieu (work_item_id) même quand la
+        # garde d'attribution ne confie pas le lot au destinataire : annoncer
+        # « has no open lot » ferait croire à un dépôt sans lien. L'absence de
+        # lot ouvert reste annoncée pour une simple étiquette (aucun lien).
+        lot = work.add(self.db, title="implementation", assignee="dev1")
+        proc = self.send("dev2", "Relis le lot de dev1.", "--from", "orch", "--lot",
+                         str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("belongs to dev1: not reassigned", proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
+        self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(lot["id"]))
+        proc = self.send("dev2", "Sur un sujet libre.", "--from", "orch", "--lot",
+                         "SUJET-LIBRE-1407")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("matches no open lot", proc.stderr)
+        self.assertIn("has no open lot", proc.stderr)
+
     def test_historique_ne_reassigne_pas_un_lot_deja_assigne(self):
         # #859 : un agent qui a confié des lots (historique L94, comme le
         # bureau) n'est pas orchestrateur pour autant : son `--lot` ne
