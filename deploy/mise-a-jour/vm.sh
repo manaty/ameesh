@@ -797,6 +797,12 @@ redemarrer() {
     suivantes=()
     for p in "${restantes[@]}"; do
       st=$(statut "$p")
+      # #1131 : persona arrêtée par le propriétaire — son unité active n'est
+      # pas réactivée (le mode agents filtre déjà `stopped`).
+      if [ "$st" = stopped ]; then
+        echo "$p : arrêté dans le registre — unité ameesh-runner@$p ignorée, pas de redémarrage"
+        continue
+      fi
       if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
