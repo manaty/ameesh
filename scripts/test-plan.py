@@ -170,14 +170,18 @@ RECENT_FAILURE_DAYS = 7
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
 #: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: saturé) ; la suite psql complète passe à neuf parts (#1692) : sur le run
+#: 38736559499 attempt 2, les six parts ont pesé 26-45,5 min sous saturation
+#: (2/6 annulée au plafond de 45 min alors qu'elle passait encore des tests),
+#: soit ≥ 227 min de travail au total ; neuf parts visent ~30 min au pire
+#: mesuré, huit en laisseraient ~34.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 4), "psql": (3, 9)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
-#: comme dans celui de 45 min de psql.
+#: comme dans celui de 60 min de psql (#1251).
 PR_TARGET_PART_S = 300
 #: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
 #: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
