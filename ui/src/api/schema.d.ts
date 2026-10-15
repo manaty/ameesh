@@ -156,6 +156,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/alerts/{key}/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acknowledge an alert as its human recipient; the alert remains visible */
+        post: operations["post_alerts_key_ack"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/budget": {
         parameters: {
             query?: never;
@@ -459,6 +476,9 @@ export interface components {
         };
         "ameesh-alerts-1": {
             alerts: {
+                acknowledged: boolean;
+                acknowledgement?: Record<string, never> | null;
+                key: string;
                 /** @constant */
                 schema: "ameesh-alert/1";
                 type: string;
@@ -1392,6 +1412,116 @@ export interface operations {
             };
             /** @description token missing or refused */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    post_alerts_key_ack: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description one key per action; a retry with the same key and the same request reads the first response back */
+                "Idempotency-Key": string;
+            };
+            path: {
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description Acknowledge an alert as its human recipient; the alert remains visible */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-action-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not allowed */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description refused, or the key's first request still running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body too large */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description body not JSON */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description key already used for another request */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
