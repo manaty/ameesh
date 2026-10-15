@@ -237,6 +237,9 @@ class Offer:
     memory_pressure_max: float | None = None
     io_pressure_max: float | None = None
     busy_units: tuple = ()
+    #: #1256 : les motifs de tâches qui prouvent un job dans les unités de
+    #: `busy_units` (un écouteur CI persistant reste `active` entre deux jobs)
+    busy_tasks: tuple = ()
     busy_max: int | None = None
     disk_free_min: int = DEFAULT_DISK_FREE_MIN
     disk_paths: tuple = ("/",)
@@ -306,7 +309,9 @@ def parse_offer(lend: Any) -> Offer:
         cpu_pressure_max=reclaim.get("cpu_pressure_max"),
         memory_pressure_max=reclaim.get("memory_pressure_max"),
         io_pressure_max=reclaim.get("io_pressure_max"),
-        busy_units=tuple(reclaim.get("busy_units", ())), busy_max=reclaim.get("busy_max"),
+        busy_units=tuple(reclaim.get("busy_units", ())),
+        busy_tasks=tuple(reclaim.get("busy_tasks", ())),
+        busy_max=reclaim.get("busy_max"),
         disk_free_min=DEFAULT_DISK_FREE_MIN if disk_min is None else disk_min,
         disk_paths=tuple(reclaim.get("disk_paths") or ("/",)),
         drain_seconds=float(parsed["drain_seconds"]),
@@ -400,8 +405,65 @@ def read_psi(window: str) -> dict:
             "psi_io_some": _psi_file("io", window)}
 
 
-def busy_count(patterns: tuple, run: Callable = subprocess.run) -> int | None:
-    """Active systemd units matching `patterns` (CI jobs), None if unknown."""
+def _unit_jobs(unit: str, tasks: tuple, run: Callable = subprocess.run, *,
+               cgroup_root: str = host.CGROUP_ROOT,
+               proc_root: str = host.PROC) -> bool | None:
+    """True when a task of UNIT's cgroup matches one of `tasks`.
+
+    A persistent CI listener stays `active` between two jobs: the only proof
+    that a job runs is a task inside the unit's **own cgroup** (the worker the
+    job spawns). The patterns are substrings of a task's command line; the
+    cgroup scoping is what keeps another guest's workers out. None when the
+    cgroup cannot be read: the caller then keeps the unit counted, because a
+    job it cannot rule out must not let the guest win (the application always
+    wins, L159a)."""
+    try:
+        proc = run(["systemctl", "show", unit, "--property=ControlGroup", "--value"],
+                   capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    cgroup = (proc.stdout or "").strip()
+    if not cgroup:
+        return None
+    try:
+        with open(os.path.join(cgroup_root, cgroup.strip("/"), "cgroup.procs"),
+                  encoding="utf-8") as fh:
+            pids = fh.read().split()
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as fh:
+                args = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError as exc:
+            # #1256 R1 delta B3: a task gone between the cgroup listing and
+            # this read leaves no /proc entry behind — nothing was hidden, it
+            # simply ended. A task still listed whose command line cannot be
+            # read (permissions, transient error) is one we cannot rule out:
+            # the unit stays counted, like an unreadable cgroup.
+            if isinstance(exc, FileNotFoundError) \
+                    and not os.path.exists(os.path.join(proc_root, pid)):
+                continue
+            return None
+        if any(pattern in args for pattern in tasks):
+            return True
+    return False
+
+
+def busy_count(patterns: tuple, run: Callable = subprocess.run, tasks: tuple = (), *,
+               cgroup_root: str = host.CGROUP_ROOT,
+               proc_root: str = host.PROC) -> int | None:
+    """Application jobs in progress among the units matching `patterns`.
+
+    Without `tasks`, every active matching unit counts (`busy_units` alone is
+    right for a host whose jobs are transient units). With `tasks` (a
+    `busy_tasks` list: substrings of a task's command line, looked for in the
+    matched units' cgroups), an idle CI listener — loaded, active, running its
+    listener process — does not count; only a unit holding a matching task
+    does. A unit whose cgroup is unreadable counts, conservatively. None if
+    systemd does not answer."""
     if not patterns:
         return None
     try:
@@ -411,7 +473,15 @@ def busy_count(patterns: tuple, run: Callable = subprocess.run) -> int | None:
         return None
     if proc.returncode != 0:
         return None
-    return sum(1 for line in proc.stdout.splitlines() if line.strip())
+    units = [line.split()[0] for line in proc.stdout.splitlines() if line.strip()]
+    if not tasks:
+        return len(units)
+    total = 0
+    for unit in units:
+        jobs = _unit_jobs(unit, tasks, run, cgroup_root=cgroup_root, proc_root=proc_root)
+        if jobs is None or jobs:
+            total += 1
+    return total
 
 
 def _mem_total() -> int | None:
@@ -423,7 +493,7 @@ def _mem_total() -> int | None:
 
 
 def read_signals(cfg: GuardConfig, now: float, *, sample: Callable | None = None,
-                 psi: Callable = read_psi, busy: Callable = busy_count) -> dict:
+                 psi: Callable = read_psi, busy: Callable | None = None) -> dict:
     """One flat reading of what the decision looks at."""
     sample = sample or (lambda: resources.sample(cfg.host, path=cfg.work_path, now=now))
     reading = dict(sample())
@@ -432,6 +502,11 @@ def read_signals(cfg: GuardConfig, now: float, *, sample: Callable | None = None
     react, decide = psi("avg10"), psi("avg60")
     disks = [resources.disk_free(p) for p in cfg.offer.disk_paths]
     disks = [d for d in disks if d is not None]
+    # #1256 : `busy_tasks` fait compter un job, pas une unité chargée ; quand
+    # l'appelant fournit son propre compteur (témoins), le sien fait foi
+    if busy is None:
+        tasks = tuple(cfg.offer.busy_tasks)
+        busy = lambda units: busy_count(units, tasks=tasks)  # noqa: E731
     reading.update({
         "ts": now,
         "psi_cpu_10": react.get("psi_cpu_some"), "psi_io_10": react.get("psi_io_some"),
