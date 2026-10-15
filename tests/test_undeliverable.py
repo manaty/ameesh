@@ -17,7 +17,8 @@ import threading
 import time
 import unittest
 
-from ameesh import exploitation, mail, notify, projects, registry, storage, undeliverable
+from ameesh import (exploitation, fastmail, mail, notify, projects, registry, storage,
+                    undeliverable)
 from ameesh.backend import PgBackend
 from ameesh.scoped_db import ScopedDb
 
@@ -441,10 +442,14 @@ class RenvoiTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dry run: 2 pending message(s) for claude3 (stopped)", proc.stdout)
         self.assertEqual(len(mail.unread(self.db, "claude3")), 2)
+        # #1689 (N1) : le renvoi dépose sans passer par `mail.send` ; le
+        # marqueur local du destinataire doit dire « à vérifier » sans TTL.
+        fastmail.note(self.cfg, "mesh-design", pending=False, unread=0)
         proc = self.mesh("mail", "forward", "claude3", "mesh-design",
                          env=self.env(AGENT_MAIL_NAME="orchestrateur"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("2 message(s) re-delivered from claude3 (stopped) to mesh-design", proc.stdout)
+        self.assertTrue(fastmail.read_marker(self.cfg, "mesh-design")["pending"])
         self.assertEqual(mail.unread(self.db, "claude3"), [])
         copies = mail.unread(self.db, "mesh-design")
         self.assertEqual([(c["sender"], c["body"], c["kind"]) for c in copies],

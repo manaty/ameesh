@@ -503,11 +503,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
-    # #1604 : un envoi local touche la boîte des destinataires de CET hôte ;
-    # leur marqueur local repasse à « à vérifier » sans attendre la base. Un
-    # destinataire d'un autre hôte n'a pas de marqueur ici : rien à faire.
-    for nom in set(targets) | set(cc):
-        fastmail.bump(cfg, nom)
+    # #1689 (N1) : le marqueur local des destinataires est posé par le dépôt
+    # lui-même (`mail.send`, `FileBackend.send`), pour tout émetteur local et
+    # pas seulement cette commande.
     if skipped:
         print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
@@ -1001,6 +999,22 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
     # `agent_id` : inscrite ici, elle devenait la session reprise au tour
     # suivant, que dsh refuse (« is a subagent or forked session »).
+    if binding.source == "explicit" and bk.kind == "pg":
+        # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a hérité)
+        # ne prend jamais le courrier d'un agent mené par l'exécuteur (bail
+        # vivant). La réservation le refuse aussi, sous verrou ; ce contrôle-ci
+        # le dit. #1689 (N2) : le refus précède l'inscription — sinon le
+        # tampon d'inscription de ce shell (clé sans bail) faisait dire au
+        # chemin rapide « inscription à jour », et le marqueur local taisait ce
+        # diagnostic à chaque PostToolUse.
+        try:
+            holder = sb.lease_holder(bk.db, name)
+        except Exception:
+            return 0
+        if holder:
+            print("agent-mail: %s is driven by the runner (live lease of %s) — "
+                  "mail left in place" % (name, holder), file=sys.stderr)
+            return 0
     session_id = None if binding.bound_to_lease else data.get("session_id")
     try:
         inscription = [tool, data.get("cwd"), session_id,
@@ -1016,16 +1030,6 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 if session_id:
                     registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
-        if binding.source == "explicit" and bk.kind == "pg":
-            # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
-            # hérité) ne prend jamais le courrier d'un agent mené par
-            # l'exécuteur (bail vivant). La réservation le refuse aussi, sous
-            # verrou ; ce contrôle-ci le dit.
-            holder = sb.lease_holder(bk.db, name)
-            if holder:
-                print("agent-mail: %s is driven by the runner (live lease of %s) — "
-                      "mail left in place" % (name, holder), file=sys.stderr)
-                return 0
         set_title(cfg, bk, name)
         if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
             return 0

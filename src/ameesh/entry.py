@@ -30,8 +30,11 @@ def _rapide_statusline(cfg, fastmail, rest: list) -> int | None:
     try:
         data = json.loads(raw or "{}")
     except ValueError:
-        return None
+        data = None
     if not isinstance(data, dict):
+        # #1689 (N3) : l'entrée est rendue au chemin complet quel que soit le
+        # JSON (illisible ou pas un objet) : il la relit à l'octet près.
+        sys.stdin = io.StringIO(raw)
         return None
     cle = fastmail.statusline_key(data)
     out = fastmail.read_statusline(cfg, cle)
