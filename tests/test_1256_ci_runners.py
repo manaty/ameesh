@@ -351,6 +351,18 @@ class GateWrapperTest(unittest.TestCase):
         self.assertNotIn("start", self.events_now())
         self.assertTrue(os.path.exists(path))
 
+    def test_a_fifo_configuration_cannot_block_a_valid_deposit(self):
+        fifo = os.path.join(self.spool, "jit-0000.b64")
+        os.mkfifo(fifo)
+        valid = self.deposit()
+        self.write(self.done, "done")
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertEqual(self.events_now().count("start"), 1)
+        self.assertFalse(os.path.exists(valid))
+        self.assertTrue(os.path.exists(fifo))
+
     def test_a_symlinked_configuration_is_left_alone(self):
         # the spool belongs to the guest; a link planted there is never a
         # configuration (O_NOFOLLOW), and it does not block a real one

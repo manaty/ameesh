@@ -221,7 +221,8 @@ def take_config(spool):
     for name in names:
         path = os.path.join(spool, name)
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            # A FIFO must not block before fstat can reject its file type.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError:
             continue
         try:
