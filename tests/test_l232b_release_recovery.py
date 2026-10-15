@@ -193,12 +193,17 @@ class RecoverySetTest(unittest.TestCase):
             self.assertFalse(self.perform('backup'))
         self.assertFalse((Path(self.root) / 'release-fixture.set.json').exists())
 
-    def test_pin_requires_a_verified_set_and_accept_requires_an_accepted_record(self):
-        self.assertFalse(self.perform('pin'))
-        self.assertFalse(self.perform('accept'))
-        self.assertTrue(self.backup())
-        self.assertFalse(self.perform('accept'))
-        self.assertTrue(self.perform('pin'))
+    def test_pin_recreates_a_missing_receipt_and_accept_requires_a_record(self):
+        """K3 R2 : un reçu manquant ne tient plus le pin — le jeu est recréé
+        depuis la source vive puis inscrit ; `accept` exige une inscription."""
+        self.assertFalse(self.perform('accept'))              # rien d'inscrit
+        with mock.patch.object(recovery.backup, 'snapshot_dump',
+                               side_effect=self.fake_dump) as dump, \
+                mock.patch.object(recovery.backup, 'verify_restore',
+                                  side_effect=self.fake_restore):
+            self.assertTrue(self.perform('pin'))              # reçu absent : recréé
+            self.assertEqual(dump.call_count, 1)
+        self.assertTrue(self.perform('accept'))
 
     def test_pinned_set_is_never_expired_until_accepted(self):
         self.assertTrue(self.backup())
@@ -422,6 +427,52 @@ class RecoverySetTest(unittest.TestCase):
                          hashlib.sha256(b'fresh-archive').hexdigest())
         for name, digest in record['files'].items():
             self.assertEqual(digest, recovery.backup.digest(Path(self.retention) / name))
+
+    def test_a_failed_recreation_at_pin_resumes_to_acceptance(self):
+        """K3 R2 (cx1 R1 Codex) : la recréation au pin survit à sa propre panne.
+        Un dump qui échoue ne laisse aucun reçu ni inscription ; le pin suivant
+        recrée depuis la source vive jusqu'à `accepted`, empreintes fraîches."""
+        appels = []
+
+        def dump(config, output, inventory):
+            appels.append(1)
+            if len(appels) == 1:
+                return self.fake_dump(config, output, inventory)
+            if len(appels) == 2:
+                raise recovery.backup.BackupError('panne de dump')
+            return self.fresh_dump(config, output, inventory)
+
+        autorite, premier = self.controller(stop='pin')
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=dump), \
+                mock.patch.object(recovery.backup, 'verify_restore',
+                                  side_effect=self.fake_restore) as restore:
+            with self.assertRaises(recovery.protocol.ControllerError):
+                recovery.protocol.run(self.root, 'release-fixture', self.manifest,
+                                      authority=autorite, adapter=premier)
+            avant = dict(self.value._pending('release-fixture')['files'])
+            stale = self.stale_stamp()
+            for name in avant:
+                os.utime(Path(self.retention) / name, (stale, stale))
+            # Première reprise : la recréation échoue — action en échec, tenue.
+            autorite, deuxieme = self.controller()
+            with self.assertRaises(recovery.protocol.ControllerError):
+                recovery.protocol.run(self.root, 'release-fixture', self.manifest,
+                                      authority=autorite, adapter=deuxieme)
+            self.assertEqual(deuxieme.steps[-1], 'pin')
+            self.assertIsNone(self.value._pending('release-fixture'))   # aucun reçu
+            self.assertIsNone(self.value._record('release-fixture'))    # rien d'inscrit
+            # Seconde reprise : la recréation aboutit et la release est acceptée.
+            autorite, troisieme = self.controller()
+            status = recovery.protocol.run(self.root, 'release-fixture', self.manifest,
+                                           authority=autorite, adapter=troisieme)
+        self.assertEqual(status, 'accepted')
+        self.assertEqual(len(appels), 3)                # reçu initial, échec, recréation
+        self.assertEqual(restore.call_count, 2)         # dump initial + recréation
+        record = self.value._record('release-fixture')
+        self.assertEqual(record['state'], 'retained')
+        self.assertNotEqual(record['files'], avant)
+        self.assertEqual(record['files']['release-fixture.dump'],
+                         hashlib.sha256(b'fresh-archive').hexdigest())
 
     def fresh_dump(self, config, output, inventory):
         Path(output).write_bytes(b'fresh-archive')

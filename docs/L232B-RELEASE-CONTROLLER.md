@@ -534,12 +534,15 @@ previously accepted sets whose policy window has passed; a held set, or one
 whose remote members have no enrolled deletion adapter, stays protected and
 the expiry is retried at the next acceptance. An interrupted publication is
 recreated from the live source; an artifact left by an interrupted attempt is
-only reused while it is inside the bounded reuse window. Outside it, `pin`
-recreates the set from the live source before registering it — the step still
-runs before any fence or migration, under the current approval — so a new
-approval never inscribes a dump made under an earlier one and the resume cannot
-wedge on a refusal that time only makes truer. A verified receipt survives a
-lost reply without a second dump, restore or upload.
+only reused while it is inside the bounded reuse window. A receipt that is
+missing, stale, unreadable or from another manifest never holds `pin`: the set
+is recreated from the live source before registration — the step still runs
+before any fence or migration, under the current approval — so a new approval
+never inscribes a dump made under an earlier one and the resume cannot wedge on
+a refusal that time only makes truer. Nothing durable precedes the fresh
+receipt, so a crash or a failed dump during the recreation is replayed by the
+next `pin`; a verified receipt, once written, survives a lost reply without a
+second dump, restore or upload.
 
 `HealthProbe` rederives the active release's own completed receipt, checks the
 versioned pointer (`health`: the activated release; `recovery_health`: the prior

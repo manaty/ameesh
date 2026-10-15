@@ -12,11 +12,13 @@
   never claims a completed backup for an incomplete artifact;
 - `pin` registers that exact set in the private retention catalog with the
   release's rollback deadline and the enrolled retention window, before any
-  migration. An unaccepted set is never expired. A receipt outside the bounded
-  reuse window is recreated from the live source before registration, under the
-  current approval (the step still runs before any fence or migration): a new
-  approval never inscribes a dump made under an earlier one, and the controller's
-  resume cannot wedge on a refusal that time only makes truer;
+  migration. An unaccepted set is never expired. A receipt that is missing,
+  stale, unreadable or from another manifest is not a reason to hold: the set
+  is recreated from the live source before registration, under the current
+  approval (the step still runs before any fence or migration). A new approval
+  never inscribes a dump made under an earlier one, the controller's resume
+  cannot wedge on a refusal that time only makes truer, and a failure or crash
+  during the recreation leaves no receipt: the next `pin` recreates again;
 - `accept` records release acceptance for retention, drops the transient
   receipt, then expires previously accepted sets whose policy window has
   passed. Expiry is best-effort: a set whose remote members have no enrolled
@@ -481,21 +483,23 @@ class RecoverySet:
                 raise RecoveryError('recovery set already deleting')
             return self._files_match(record.get('files'))
         pending = self._pending(artifact)
-        if pending is None or pending['manifest_digest'] != request['manifest_digest']:
-            return False
-        if not self._pending_files(pending):
-            return False
         # K3: the receipt is evidence of the pre-migration state only inside the
         # bounded reuse window, and it is bound to the operation, not to the
-        # approval that asked for it. A later `pin` — typically a release held
-        # across days and resumed under a new approval — must not inscribe the
-        # earlier attempt's dump as the current rollback set. Recreate it from
-        # the live source instead: `pin` still runs before any fence or migration
-        # and the current approval was checked for THIS step, so the fresh dump
-        # has the same standing as one taken by a `backup` step. Returning False
-        # would wedge the controller's resume, which replays `pin` and can only
-        # see a receipt that time makes older (dev7/4971 R2).
-        if self._stale(pending['files']):
+        # approval that asked for it. A `pin` that finds it missing, stale,
+        # unreadable or from another manifest must not hold on that: the
+        # controller replays `pin`, and time never repairs a refusal — a release
+        # held across days and resumed under a new approval would stay wedged.
+        # Recreate the set from the live source instead: `pin` still runs before
+        # any fence or migration and the current approval was checked for THIS
+        # step, so the fresh dump has the same standing as one taken by a
+        # `backup` step. Nothing durable is written before the fresh receipt, so
+        # a crash or a failed dump during the recreation leaves no receipt and
+        # the next `pin` recreates again (cx1 R1 Codex on 1bd28d908).
+        if (pending is None or pending['manifest_digest'] != request['manifest_digest']
+                or not self._pending_files(pending) or self._stale(pending['files'])):
+            # The abandoned attempt's members and upload receipt are dropped:
+            # the fresh dump must not collide with them, nor be re-stamped with
+            # their bytes.
             self._discard(artifact)
             if not self._backup(request):
                 return False
