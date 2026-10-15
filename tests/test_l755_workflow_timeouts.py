@@ -61,8 +61,8 @@ _TIMEOUT_VALUE = re.compile(r"""^(?:(\d+)|"(\d+)"|'(\d+)')$""")
 _FLOW_PAIR = re.compile(r"""^([A-Za-z0-9_.-]+)\s*:\s*([^{}\[\]]*)$""")
 #: `uses:` du corps d'un job : l'appel d'un workflow réutilisable (#1410).
 _USES = re.compile(r"""^uses\s*:\s*(.*)$""")
-#: La cible d'un `uses:` : un seul mot, nu ou entre guillemets.
-_USES_VALUE = re.compile(r"""^["']?([^"'\s]+)["']?$""")
+#: La cible d'un `uses:` : un seul mot, nu ou entre guillemets appariés.
+_USES_VALUE = re.compile(r"""^(?:([^"'\s]+)|"([^"'\s]+)"|'([^"'\s]+)')$""")
 #: Un guillemet ouvre un scalaire cité en tête de paire ou après `{`, `,`, `:`.
 _QUOTE_OPENERS = " \t{,:"
 
@@ -141,7 +141,7 @@ def _uses_value(value: str, where: str) -> str:
     match = _USES_VALUE.match(value)
     if match is None:
         raise UnsupportedWorkflow("%s : `uses:` illisible %r" % (where, value))
-    return match.group(1)
+    return next(group for group in match.groups() if group is not None)
 
 
 def _flow_job(rest: str, where: str) -> tuple[int | None, str | None]:
@@ -401,6 +401,19 @@ class WorkflowTimeoutsTest(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(UnsupportedWorkflow):
                     job_timeouts(text)
+
+    def test_la_cible_d_un_appel_exige_des_guillemets_apparies(self):
+        appel = "jobs:\n  a:\n    uses: %s\n"
+        for cible in ('./.github/workflows/x.yml', '"./.github/workflows/x.yml"',
+                      "'./.github/workflows/x.yml'"):
+            with self.subTest(cible=cible):
+                self.assertEqual(caller_jobs(appel % cible),
+                                 {"a": "./.github/workflows/x.yml"})
+        for cible in ('"./.github/workflows/x.yml', "./.github/workflows/x.yml'",
+                      '"./.github/workflows/x.yml\'', "'x\""):
+            with self.subTest(cible=cible):
+                with self.assertRaises(UnsupportedWorkflow):
+                    caller_jobs(appel % cible)
 
     def test_les_formes_non_supportees_sont_refusees(self):
         for text in (
