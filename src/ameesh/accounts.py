@@ -1283,7 +1283,15 @@ def report(cfg, db, book, *, now: float | None = None,
         active_name = (active or {}).get("account") or items[0].name
         evaluations = {}
         for profile in items:
-            result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            try:
+                result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            except Exception as exc:  # noqa: BLE001 — #1600 : jauge illisible
+                # #1600 : une lecture en erreur ne fait pas tomber l'affichage
+                # (`ameesh accounts list`) : le compte reste listé, sans marge
+                # promise, avec sa raison — même motif que `rebalance._offer`
+                # et `live_fleet`.
+                result = Evaluation(profile)
+                result.reason = "gauge readings unreadable: %s" % exc
             evaluations[profile.name] = result
             hold = holds.get(profile.name) or {}
             rows.append({
