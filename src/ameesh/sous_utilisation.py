@@ -42,6 +42,7 @@ import os
 import time
 
 from . import cost as cost_mod
+from . import planned_waits
 from . import storage
 
 UNDERUSE_TYPES = ("plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
@@ -524,6 +525,33 @@ def _budget_held(cfg, db, rows: list) -> dict:
     return held
 
 
+def split_startable(waiting_lots: list, waits: dict) -> tuple:
+    """#1608 : sépare les lots confiables (`startable`) de ceux qu'une attente
+    planifiée retient (`{id: attente}` de L368). Un orchestrateur à qui l'on
+    propose un lot bloqué l'assigne pour rien : le brief ne propose que les
+    premiers et nomme le bloqueur des seconds."""
+    startable = [lot for lot in waiting_lots if int(lot["id"]) not in waits]
+    blocked = {int(lot["id"]): waits[int(lot["id"])]
+               for lot in waiting_lots if int(lot["id"]) in waits}
+    return startable, blocked
+
+
+def waiting_text(blocked: dict, limit: int = 6) -> str:
+    """« #12 waits on #3, #4; #15 is scheduled for 2026-10-16 » (L368)."""
+    parts = []
+    for ident, wait in sorted(blocked.items())[:limit]:
+        if wait.get("what") == "dependency":
+            parts.append("#%d waits on %s" % (
+                ident, ", ".join("#%d" % int(i) for i in wait.get("lots") or ())))
+        elif wait.get("what") == "scheduled":
+            parts.append("#%d is scheduled for %s" % (ident, wait.get("start")))
+        else:
+            parts.append("#%d is waiting" % ident)
+    if len(blocked) > limit:
+        parts.append("…")
+    return "; ".join(parts)
+
+
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None, designers=(), held=(), held_hosts=(),
@@ -557,7 +585,9 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     if lots is None:
         lots = storage.of(db).operations.open_lots_activity(500)
-    waiting_lots = waiting_project_lots(lots, db=db)
+    waiting_lots = waiting_project_lots(lots)
+    waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
+    startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None
@@ -576,6 +606,14 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         parts.append("%d open lot(s) without an assignee (%s)" % (
             len(waiting_lots), ", ".join("#%d" % int(l["id"]) for l in waiting_lots[:8])
             + (", …" if len(waiting_lots) > 8 else "")))
+        if startable_lots:
+            parts.append("%d startable now: %s" % (
+                len(startable_lots),
+                ", ".join("#%d" % int(l["id"]) for l in startable_lots[:8])
+                + (", …" if len(startable_lots) > 8 else "")))
+        if blocked_lots:
+            parts.append("%d waiting for a prerequisite: %s" % (
+                len(blocked_lots), waiting_text(blocked_lots)))
     if backlog:
         parts.append("mail waiting at %s" % ", ".join(
             sorted(row["name"] for row in backlog)))
@@ -609,6 +647,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   "(ameesh work assign <lot> <agent>)" % ", ".join(asleep))
     else:
         action = "dispatch: ameesh work assign <lot> <agent>, or write to the orchestrator"
+    if waiting_lots and not startable_lots:
+        action = "no startable lot: clear the named prerequisite before assigning work"
     detail = "; ".join(parts) + ". Action: " + action
     responsible = None
     for name in attached + asleep + list(orchestras):
@@ -620,6 +660,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         "idle_capacity", None, None, len(names), idle_s, detail,
         reason="forfait_au_repos" if aggravating else "travail_en_attente",
         agents=names, lots=[int(l["id"]) for l in waiting_lots[:50]],
+        startable_lots=[int(l["id"]) for l in startable_lots[:50]],
+        blocked_lots={str(i): w for i, w in sorted(blocked_lots.items())[:50]},
         paid_working=paid_working, orchestrators=list(orchestras),
         designers=[n for n in designers if n not in orchestras],
         responsible=responsible)]
@@ -632,12 +674,20 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
     SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
     ne dit pas son équipe : tous). Un orchestrateur sans agent à occuper ne
-    reçoit rien ; il n'est jamais cité dans sa propre liste."""
+    reçoit rien ; il n'est jamais cité dans sa propre liste.
+
+    #1608 : seuls les lots sans attente planifiée sont proposés (L368) ; les
+    autres sont nommés avec leur bloqueur, pour qu'un orchestrateur ne les
+    assigne pas pour rien. Une alerte sans `startable_lots` (producteur plus
+    ancien, test) garde le comportement d'avant."""
     if alert.get("type") != "idle_capacity":
         return {}
     by_name = {row["name"]: row for row in listing}
     titles = lot_titles or {}
     lots = [int(l) for l in alert.get("lots") or ()]
+    startable = alert.get("startable_lots")
+    startable = lots if startable is None else [int(i) for i in startable]
+    blocked = {int(k): v for k, v in (alert.get("blocked_lots") or {}).items()}
     out = {}
     for orch in list(alert.get("orchestrators") or ()) + list(alert.get("designers") or ()):
         team = ((by_name.get(orch) or {}).get("team") or "").strip()
@@ -647,15 +697,23 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             continue
         parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
                  "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
-        if lots:
+        if startable:
             parts.append("Open lots without an agent: %s." % ", ".join(
                 "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")
-                for i in lots[:12]) + (" …" if len(lots) > 12 else ""))
+                for i in startable[:12]) + (" …" if len(startable) > 12 else ""))
+        elif lots:
+            parts.append("No startable open lot without an agent: %s." % waiting_text(blocked))
         else:
             parts.append("No open lot without an agent.")
-        parts.append("Give them work tied to a lot: ameesh mail send <agent> "
-                     "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
-                     "<agent>.")
+        if startable and blocked:
+            parts.append("Waiting for a prerequisite: %s." % waiting_text(blocked))
+        if startable or not lots:
+            parts.append("Give them work tied to a lot: ameesh mail send <agent> "
+                         "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
+                         "<agent>.")
+        else:
+            parts.append("Do not assign a lot that waits (its blocker is named above): clear the "
+                         "blocker, or create a startable lot (ameesh work add, or --new-lot \"title\").")
         out[orch] = " ".join(parts)
     return out
 
