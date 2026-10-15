@@ -189,14 +189,35 @@ def _hook_binary(command: str) -> str:
 def _binary_missing(binary: str, *, path: str | None = None) -> bool:
     """Le binaire d'une commande de hook est-il introuvable ? Un chemin
     (absolu ou avec un séparateur) est contrôlé sur place ; un nom seul passe
-    par `path` — le PATH qui exécute réellement les hooks (celui du
-    gestionnaire systemd) —, sinon par le PATH ambiant : c'est le cas de
+    par `path` s'il est fourni, sinon par le PATH ambiant — c'est le cas de
     l'incident du 2026-10-12 (`/usr/local/bin/agent-mail` absent, tous les
     hooks en 127)."""
     chemin = os.path.expanduser(binary)
     if os.sep in chemin:
         return not (os.path.isfile(chemin) and os.access(chemin, os.X_OK))
     return shutil.which(chemin, path=path or None) is None
+
+
+def _binary_missing_where(binary: str, manager_path: str) -> str:
+    """Où le binaire d'un hook est introuvable : la raison lisible, sinon "".
+
+    Un nom seul est cherché dans **deux** contextes : le PATH de la session
+    du doctor (le contrôle d'origine) et, quand il est lisible, le PATH du
+    gestionnaire systemd (`adapters.systemd_manager_path`). Le PATH réel du
+    service est celui de son unité (`Environment=PATH`, qu'un EnvironmentFile
+    peut encore remplacer) : aucun des deux ne le prouve à lui seul, et la
+    présence dans l'un ne doit pas masquer l'absence dans l'autre — un
+    binaire absent d'un contexte peut y sortir en 127 (#1395, avis bloquant
+    cx2 : la résolution « gestionnaire seul » rendait ok un hook introuvable
+    sous le PATH réel). Un chemin est contrôlé sur place, sans contexte."""
+    if os.sep in os.path.expanduser(binary):
+        return "not found" if _binary_missing(binary) else ""
+    missing = []
+    if _binary_missing(binary):
+        missing.append("this session's PATH")
+    if manager_path and _binary_missing(binary, path=manager_path):
+        missing.append("the systemd manager PATH")
+    return "not found under %s" % " or ".join(missing) if missing else ""
 
 
 def hook_lines(cfg, ids, environ=None) -> dict:
@@ -209,11 +230,12 @@ def hook_lines(cfg, ids, environ=None) -> dict:
     fichier absent ou un événement non configuré est un avertissement, pas un
     KO — l'agent travaille, mais sans livraison entre deux outils.
 
-    #514 N2 : un nom de binaire seul est résolu sous le PATH du gestionnaire
-    systemd, celui qui lance les harnais (`adapters.systemd_manager_path`),
-    pas sous celui de la session du doctor — les deux peuvent diverger dans
-    les deux sens, et seule la résolution du gestionnaire décide si le hook
-    sort en 127. Le doctor reste en lecture seule."""
+    #514 N2 : un nom de binaire seul est contrôlé dans les deux contextes qui
+    # peuvent lancer le hook — la session du doctor et le PATH du gestionnaire
+    # systemd (`adapters.systemd_manager_path`) ; le PATH réel du service
+    # reste celui de son unité, donc un binaire absent de l'un des deux est
+    # signalé : le gestionnaire seul ne prouve pas que le hook tournera
+    # (#1395, avis bloquant cx2). Le doctor reste en lecture seule."""
     environ = os.environ if environ is None else environ
     lines: list[str] = []
     ok = True
@@ -255,21 +277,14 @@ def hook_lines(cfg, ids, environ=None) -> dict:
                     binaries.append(binary)
                 if not binary:
                     continue
-                if _binary_missing(binary, path=manager_path or None):
+                where = _binary_missing_where(binary, manager_path)
+                if where:
                     ok = False
-                    where = ""
-                    if manager_path and os.sep not in os.path.expanduser(binary):
-                        where = " under the systemd manager PATH"
-                    lines.append("hooks      : %s KO — %s calls %s: not found%s (the "
-                                 "hook exits 127: no delivery between two tool calls, "
+                    lines.append("hooks      : %s KO — %s calls %s: %s (the hook "
+                                 "exits 127: no delivery between two tool calls, "
                                  "no Stop)" % (harness, path, command, where))
-                elif _binary_missing(binary):
-                    # présent sous le gestionnaire, absent de la session du doctor :
-                    # le hook tourne, c'est la résolution du doctor qui est trompeuse.
-                    lines.append("hooks      : %s — %s found under the systemd manager "
-                                 "PATH, not in this session's PATH" % (harness, binary))
-            if all(binary and not _binary_missing(binary, path=manager_path or None)
-                   for binary in binaries) and binaries:
+            if binaries and all(not _binary_missing_where(binary, manager_path)
+                                for binary in binaries):
                 lines.append("hooks      : %s → %d event(s) (%s), %s"
                              % (harness, len(events), ", ".join(events),
                                 ", ".join(binaries)))
