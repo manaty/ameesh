@@ -669,7 +669,7 @@ class SanteCourrierTest(unittest.TestCase):
             self.assertEqual(self.mod.dead_letters(db, 'h'),
                              [{'destinataire': 'a', 'n': 2}])
 
-    def sonde(self, etat, repond=False, attente=0.2):
+    def sonde(self, etat, repond=False, attente=0.2, accuse_remis=False):
         """La sonde sur faux courrier/registre (#1460) : remise a 100.0."""
         envoye = {}
 
@@ -677,12 +677,17 @@ class SanteCourrierTest(unittest.TestCase):
             envoye['jeton'] = corps.split('--ack ')[1].split()[0]
             return 7
 
+        def history(db, nom, **kw):
+            return [{'sender': nom, 'body': envoye['jeton'],
+                     'delivered_ts': 102.0 if accuse_remis else None}] if repond else []
+
         def unread(db, nom):
-            return [{'sender': nom, 'body': envoye['jeton']}] if repond else []
+            return [m for m in history(db, nom) if not m['delivered_ts']]
 
         with mock.patch.object(self.mod.mail, 'send', side_effect=send), \
              mock.patch.object(self.mod.mail, 'get', return_value={'delivered_ts': 100.0}), \
              mock.patch.object(self.mod.mail, 'unread', side_effect=unread), \
+             mock.patch.object(self.mod.mail, 'history', side_effect=history), \
              mock.patch.object(self.mod.registry, 'get', return_value=etat), \
              mock.patch.object(self.mod.time, 'sleep'):
             return self.mod.probe(object(), {'name': 'p', 'host': 'h'}, 'abc', attente)
@@ -701,6 +706,12 @@ class SanteCourrierTest(unittest.TestCase):
 
     def test_probe_ok_only_with_the_persona_answer(self):
         out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True)
+        self.assertEqual(out['tour'], 'ok')
+        self.assertIsNotNone(out['delai_s'])
+
+    def test_probe_ok_when_the_ack_was_already_delivered(self):
+        out = self.sonde({'last_turn_ts': 103.0, 'status': 'idle'},
+                         repond=True, accuse_remis=True)
         self.assertEqual(out['tour'], 'ok')
         self.assertIsNotNone(out['delai_s'])
 

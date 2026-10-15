@@ -106,9 +106,9 @@ def choose(rows: list[dict], sonde: str, now: float):
 
 
 def answered(db, name: str, jeton: str) -> bool:
-    """The persona's own ack carrying the token (sent by its tool call)."""
+    """The persona's own ack, even if its next hook already delivered it."""
     return any(m.get("sender") == name and jeton in (m.get("body") or "")
-               for m in mail.unread(db, name))
+               for m in mail.history(db, name, limit=mail.UNREAD_LIMIT))
 
 
 def failed_turn(db, name: str, delivered: float) -> str:
