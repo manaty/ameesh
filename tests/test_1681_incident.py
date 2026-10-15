@@ -358,5 +358,20 @@ class TestConsommateur(unittest.TestCase):
         self.assertTrue(all("illisible" in line["why"] for line in out))
 
 
+    def test_paquet_compose_n_attribue_aucun_fichier(self):
+        from ameesh import ci
+        api = _Api({
+            "repos/manaty/nexlink/commits/" + "h" * 40: {"parents": [{"sha": "b" * 40}]},
+            "repos/manaty/nexlink/compare/%s...%s" % ("b" * 40, "h" * 40): {
+                "commits": [{"sha": "calc", "author": {"login": "train"},
+                             "commit": {"message": "paquet\n\nameesh-work: 11\n\nameesh-work: 12"}}],
+                "files": [{"filename": "mobile/src/a.ts"}, {"filename": "backend/src/b.ts"}]},
+        })
+        out = ci.landed_commits("manaty/nexlink", "h" * 40, api=api)
+        self.assertEqual([c["lot"] for c in out], [11, 12])
+        self.assertEqual([c["files"] for c in out], [[], []])
+        self.assertEqual(incident.attribute(["mobile/src/a.test.ts"], out)["status"], "none")
+
+
 if __name__ == "__main__":
     unittest.main()

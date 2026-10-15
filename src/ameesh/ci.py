@@ -380,15 +380,18 @@ def gh_api(gh=None):
     return api
 
 
-#: le marqueur canon d'un lot dans le message d'un commit de fusion
-#: (`plan_git.WORK_TRAILER_RE`, `ameesh-work: <id>`)
-def _message_lot(message: str):
+#: les marqueurs canon d'un message de fusion (`plan_git.WORK_TRAILER_RE`,
+#: `ameesh-work: <id>`). Le commit composé du train #1467 en porte **un par
+#: membre** : le message entier ne désigne donc pas un lot unique.
+def _message_lots(message: str) -> list:
     from . import plan_git
-    match = plan_git.WORK_TRAILER_RE.search(message or "")
-    try:
-        return int(match.group(1)) if match else None
-    except (TypeError, ValueError):
-        return None
+    out = []
+    for match in plan_git.WORK_TRAILER_RE.finditer(message or ""):
+        try:
+            out.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _files_of(entry: dict) -> list:
@@ -416,12 +419,20 @@ def landed_commits(repo: str, head_sha: str, api=None, *, max_lots: int = 12) ->
     veilleur), et chaque commit porteur du marqueur canon `ameesh-work: <id>`
     nomme un lot.
 
-    Un atterrissage d'un seul lot rend un candidat unique avec les fichiers de
-    la comparaison entière. Un paquet (plusieurs marqueurs, train #1467) rend
-    un candidat par lot, avec les fichiers de **son** commit de fusion (lus au
-    détail) : l'agrégat ne doit pas accuser un lot du changement d'un autre.
+    Trois cas, du plus précis au plus prudent :
+
+    * un seul lot — un candidat, avec les fichiers de la comparaison entière ;
+    * un paquet dont chaque lot porte **son** commit de fusion (un marqueur par
+      commit) — un candidat par lot, fichiers de son commit (lus au détail) ;
+    * un paquet composé (**plusieurs marqueurs dans un même message**, le
+      commit final multiparent du train #1467) — les lots sont nommés, mais
+      aucun fichier ne leur est attribué : l'agrégat ne se découpe pas sans la
+      preuve du manifeste (`plan.proof.members[]`), et l'agrégat donnerait à
+      chaque lot les changements des autres. Un candidat sans fichier ne fonde
+      aucune accusation (`incident.attribute`).
+
     Sans marqueur, un candidat sans lot est rendu : il porte les fichiers, mais
-    ne peut pas fonder une accusation (`incident.attribute`).
+    ne peut pas fonder une accusation.
     """
     if not repo or not head_sha:
         return []
@@ -433,10 +444,23 @@ def landed_commits(repo: str, head_sha: str, api=None, *, max_lots: int = 12) ->
     compare = api("repos/%s/compare/%s...%s" % (repo, parents[0], head_sha)) or {}
     commits = list(compare.get("commits") or ())
     by_lot: dict = {}
+    composed: list = []
     for entry in commits:
-        lot = _message_lot((entry.get("commit") or {}).get("message") or "")
-        if lot is not None:
-            by_lot.setdefault(lot, []).append(entry)
+        lots = _message_lots((entry.get("commit") or {}).get("message") or "")
+        if len(lots) > 1:
+            composed.append((entry, lots))
+        elif lots:
+            by_lot.setdefault(lots[0], []).append(entry)
+    if composed:
+        out = []
+        for entry, lots in composed:
+            for lot in lots[:max_lots]:
+                out.append(dict(sha=str(entry.get("sha") or head_sha), lot=lot,
+                                author=_author_of(entry), summary=_summary_of(entry), files=[]))
+                max_lots -= 1
+                if max_lots <= 0:
+                    return out
+        return out
     if not by_lot:
         if not commits:
             return []
