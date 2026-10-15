@@ -2604,6 +2604,14 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % UNATTRIBUTED))
             continue
+        named = cited_lot(row.get("branch") or "") or named_lot(
+            os.path.basename(os.path.normpath(path)), row.get("agent") or "")
+        if lot is None and named is not None:
+            # A named lot that cannot be attributed is not an orphan: the
+            # lot may be open, belong to another agent, or be unreadable.
+            plan.append(dict(base, action="garde", detail="named lot #%s not attributable"
+                             % named))
+            continue
         state = _lot_state(db, lot) if lot else None
         ended = state in LOT_ENDED
         orphan = lot is None
@@ -2657,6 +2665,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                  and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
         abandoned = (ended or orphan) and now - youngest >= ORPHAN_WORKTREE_IDLE_S
         if (grace or abandoned) and st["clean"] and st["pushed"] and not st["submodules"]:
+            idle_before = None if grace else now - ORPHAN_WORKTREE_IDLE_S
+            if idle_before is not None:
+                activity = build_artifacts.survey(path, build_artifacts.rules_of(artifacts),
+                    skip_roots=skip_roots,
+                    budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+                if not activity["complete"] or activity["latest"] > idle_before:
+                    plan.append(dict(base, action="garde", detail="%s; %s" % (
+                        detail, activity["why"] or "worktree active within 24 h")))
+                    continue
             leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts))
             if leftovers is None:
                 hold = "ignored files unreadable (git status --ignored)"
@@ -2681,7 +2698,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             outcome, freed, note, built = _remove_kept_worktree(
                 path, row.get("repo") or common_dir(path), st["gitdir"], artifacts=artifacts,
                 allow=allow,
-                lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots)
+                lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
+                idle_before=idle_before)
             entries += [dict(base, kind="artifact", detail="%s; %s" % (why, b.pop("detail")),
                              **b) for b in built]
             if outcome in ("garde", "attend"):
@@ -2722,7 +2740,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
 
 
 def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
-                          journal_path, skip_roots=()) -> tuple[str, int, str, list]:
+                          journal_path, skip_roots=(), idle_before: float | None = None
+                          ) -> tuple[str, int, str, list]:
     """L230/#1665: removal of a kept worktree (lot merged, or orphan), under the
     host lock of the deleting passes (`build_artifacts`). Its build output
     goes first like an idle worktree's (descriptors, journal, `.git`,
@@ -2783,6 +2802,8 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
                                        budget=budget)
         if not found["complete"]:
             return "garde", 0, "artifacts: %s" % found["why"], built
+        if idle_before is not None and found["latest"] > idle_before:
+            return "garde", 0, "worktree active within 24 h", built
         if ident is None or found["identity"] != ident:
             return "garde", 0, "directory changed during the pass", built
         for artifact in found["artifacts"]:
