@@ -1187,7 +1187,7 @@ print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
   || die "offer or volume refused"
 
 # PATH of the runners: the directory of the DeepSeek harness (`dsh`)
-if [ ${#EXTRA_PATH[@]} -eq 0 ] && dsh=$(command -v dsh 2>/dev/null); then
+if [ "$OFFLOAD_ONLY" = 0 ] && [ ${#EXTRA_PATH[@]} -eq 0 ] && dsh=$(command -v dsh 2>/dev/null); then
   case "$(dirname "$dsh")" in /usr/bin|/usr/local/bin|/bin) ;; *) EXTRA_PATH=("$(dirname "$dsh")") ;; esac
 fi
 

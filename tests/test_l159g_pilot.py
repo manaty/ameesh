@@ -187,6 +187,18 @@ class InstallPilotTest(unittest.TestCase):
         self.assertIn("ameesh-guest-runner@.service (", out)
         self.assertIn("/etc/ameesh/guest-deepseek6.env (0640 root:ameesh-guest)", out)
 
+    def test_offload_only_ignores_a_harness_on_path(self):
+        bindir = self.on_host("/opt/harness/bin")
+        harness = os.path.join(bindir, "dsh")
+        with open(harness, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(harness, 0o755)
+        res = self.dry("--allow-rootfs", "--offload-only",
+                       PATH=bindir + os.pathsep + os.environ["PATH"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("ameesh-guest-runner@.service.d", res.stdout)
+        self.assertNotIn("Environment=PATH=", res.stdout)
+
     def test_offload_only_refuses_agents(self):
         for args in (["--agent", "deepseek5"], ["--path", "/opt/node/bin"],
                      ["--max-agents", "2"], ["--enable", "deepseek5"], ["--disable", "deepseek5"]):
