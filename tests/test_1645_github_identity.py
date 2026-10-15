@@ -250,10 +250,18 @@ class JournalTest(Base):
                      ("pr", "create", "--inconnue", "--head=" + secret),
                      ("[commande]", secret),
                      ("pr", "inconnue", secret),
-                     ("pr", "view", "--", secret)):
+                     ("pr", "view", "--", secret),
+                     # R3 cx3 : -c/--comment, texte de pr close, booléen de pr review
+                     ("pr", "close", "1", "--comment", secret),
+                     ("issue", "close", "1", "-c", secret),
+                     ("pr", "close", "1", "--comment", "-R" + secret),
+                     # -a/-r, booléens de pr review : --body ne fuit pas après eux
+                     ("pr", "review", "1", "-a", "--body", secret),
+                     ("pr", "review", "1", "-r", "-b", secret),
+                     ("pr", "review", "1", "--comment", secret)):
             self.assertEqual(self.lancer(env, *args).returncode, 3)
         texte = (next((self.state / "github").glob("gestes-*.jsonl"))).read_text()
-        self.assertEqual(len(texte.splitlines()), 16)
+        self.assertEqual(len(texte.splitlines()), 22)
         self.assertNotIn(secret, texte)
         self.assertNotIn("ZZZ", texte)
         self.assertNotIn("Bearer", texte)
@@ -261,16 +269,28 @@ class JournalTest(Base):
     def test_les_identifiants_utiles_restent_consignes(self):
         sha = "e4e90fa07bf4f2ead10ff6822057bc2fef37d6ab"
         args = ["pr", "merge", "1256", "--auto", "--squash", "--match-head-commit",
-                sha, "-R", "manaty/ameesh", "--json", "state"]
+                sha, "-R", "manaty/ameesh"]
         self.assertEqual(gi.sanitize_argv(args), args)
+        # --json est booléen de `workflow run` : sa valeur n'est jamais consignée
+        self.assertEqual(gi.sanitize_argv(["pr", "view", "1", "--json", "state"]),
+                         ["pr", "view", "1", "--json", "[valeur]"])
+        # option d'identifiant hors commande d'identifiants : masquée
+        self.assertEqual(gi.sanitize_argv(["secret", "set", "N", "--user", "x"]),
+                         ["secret", "set", "[valeur]", "--user", "[valeur]"])
+        self.assertEqual(gi.sanitize_argv(
+            ["api", "repos/manaty/ameesh/actions/runs/1/cancel", "-X", "POST"]),
+            ["api", "repos/manaty/ameesh/actions/runs/1/cancel", "-X", "POST"])
+        self.assertEqual(gi.sanitize_argv(["api", "/repos/o/r/pulls?q=x"]),
+                         ["api", "/repos/o/r/pulls?[valeur]"])
+        # après la première option, plus aucun positionnel n'est consigné
         self.assertEqual(gi.sanitize_argv(
             ["api", "-X", "POST", "repos/manaty/ameesh/actions/runs/1/cancel"]),
-            ["api", "-X", "POST", "repos/manaty/ameesh/actions/runs/1/cancel"])
+            ["api", "-X", "POST", "[valeur]"])
         # une option inconnue : rien n'est consigné après elle
         self.assertEqual(gi.sanitize_argv(["run", "list", "--inconnue", "abc", "-R", "o/r"]),
                          ["run", "list", "[option]", "[valeur]", "[valeur]", "[valeur]"])
         self.assertEqual(gi.sanitize_argv(["secret", "set", "DEMO", "--repo", "o/r"]),
-                         ["secret", "set", "[valeur]", "--repo", "o/r"])
+                         ["secret", "set", "[valeur]", "--repo", "[valeur]"])
         self.assertEqual(gi.sanitize_argv(["search", "code", "motif"]),
                          ["search", "code", "[valeur]"])
 
