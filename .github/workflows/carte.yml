@@ -226,7 +226,9 @@ jobs:
   carte:
     name: carte
     needs: mesure
-    if: always()
+    # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
+    # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
+    if: always() && !cancelled()
     # supprimer les mesures du run (étape finale) ; le reste du workflow reste en lecture
     permissions:
       contents: read
