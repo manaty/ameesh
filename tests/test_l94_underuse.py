@@ -270,6 +270,46 @@ class IdleCapacityTest(_Base):
         self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing()),
                          ["orch"])
 
+    def test_destinataires_d_alerte_sans_role_par_historique(self):
+        # #1114 : l'historique des lots confiés (30 j) ne confère pas le rôle
+        # de destinataire d'alerte ; le modèle de rôle (`orchestrators`) le
+        # garde pour l'autorité (correction, plan, analyse).
+        self.agent("claude1")
+        self.agent("autre")
+        self.agent("orch", status="running", owner="attach:proprio@poste", since_s=3 * HEURE)
+        lot = work.add(self.db, title="lot")
+        work.assign(self.db, lot["id"], "autre", actor="agent:orch")
+        work.add(self.db, title="à prendre")       # lot ouvert sans agent : idle_capacity
+
+        class Fiche:
+            def __init__(self, data):
+                self.data = data
+
+        class Agent:
+            def __init__(self, title, roles):
+                self.title, self.fiche = title, Fiche({"roles": roles})
+
+        class Canon:
+            agents = [Agent("orch", ["implementation"])]
+
+        class CanonOrch:
+            agents = [Agent("orch", ["orchestrateur"])]
+
+        self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing(),
+                                                        canons=[Canon()]), ["orch"])
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[Canon()]), [])
+        # le rôle déclaré au canon, lui, reste admis
+        self.assertEqual(sous_utilisation.alert_orchestrators(
+            self.cfg, self.db, self.listing(), canons=[CanonOrch()]), ["orch"])
+        # claude1 est au repos sans lot : l'alerte ne prend pas l'assigneur
+        repos = _types(self.alertes(), "idle_capacity")
+        self.assertEqual(len(repos), 1)
+        self.assertEqual(repos[0]["orchestrators"], [])
+        # déclaré explicitement (hub sans équipe) : destinataire, et pas par historique
+        repos = _types(self.alertes(orchestrators_declared=("orch",)), "idle_capacity")
+        self.assertEqual(repos[0]["orchestrators"], ["orch"])
+
 
 class HostUnderusedTest(_Base):
     def releve(self, host, *, load, cpus=4, turns=0, ago_s=0, mem=8 * 1024 ** 3):

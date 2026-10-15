@@ -55,7 +55,12 @@ def _workstream(row: dict) -> str:
 
 def _of_teams(orchestras, by_name: dict, teams: set) -> list:
     """Les orchestrateurs d'une des équipes (ou sans équipe) ; sans équipe
-    connue, tous."""
+    connue, tous.
+
+    `orchestras` vient de `sous_utilisation.alert_orchestrators` (#1114) :
+    l'historique d'attribution ne confère pas le rôle, donc un agent sans
+    équipe n'est ici qu'un hub explicitement déclaré (rôle au canon ou
+    `AMEESH_ALERT_ORCHESTRATORS`), jamais un assigneur récent."""
     if not teams:
         return list(orchestras)
     return [o for o in orchestras if not _team(by_name, o) or _team(by_name, o) in teams]
@@ -196,8 +201,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
-    repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
+    l'équipe de l'assigné (sinon celle du lot, #917) ; `plan_underused`, ceux
+    des équipes des agents au repos ; `estimate_bias` (L157b), ceux de
+    l'équipe de l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. Auditeurs : pour tous les types sauf
     `stale_lot` (L713 : lu à la passe de l'auditeur, sans réveil). Un agent à
@@ -249,6 +255,12 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         if kind == "stale_lot":
             text = _stale_lot(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+            if not teams:
+                # #917 : sans assigné connu, l'équipe du lot — sinon un lot
+                # ameesh réveillerait les orchestrateurs nexlink, et
+                # inversement (une alerte reçue pousse à assigner, ce qui
+                # entretient la liste des orchestrateurs par historique).
+                teams = {(alert.get("lot_team") or "").strip()} - {""}
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}

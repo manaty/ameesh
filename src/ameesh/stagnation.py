@@ -329,9 +329,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
                   now: float | None = None, limit: int = 500) -> list[dict]:
     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
 
-    Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
-    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26) et `waiting`
-    (`{what, who, label}`, L29)."""
+    Une ligne : id, title, state, assignee, `lot_team` (équipe du lot, L917),
+    `last_activity_ts`, `idle_s`, `waiting_for` (un mot de `WAITING_FOR` ou
+    None, forme L26) et `waiting` (`{what, who, label}`, L29)."""
     from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
@@ -356,6 +356,7 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "title": row.get("title"),
             "state": row.get("state"),
             "assignee": row.get("assignee") or None,
+            "lot_team": row.get("lot_team") or None,
             "last_activity_ts": float(row["last_activity_ts"]),
             "idle_s": int(now - float(row["last_activity_ts"])),
             "waiting_for": info["waiting_for"],
