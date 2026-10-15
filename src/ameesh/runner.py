@@ -2523,16 +2523,24 @@ class AgentWorker(threading.Thread):
         except db_mod.DbError:
             return {}
 
-    def _compta_marque(self, start: int, tour: str, model: str | None) -> bool:
+    def _compta_marque(self, start: int, tour: str, model: str | None,
+                       work_item_id: str | None = None,
+                       turn_id: str | None = None) -> bool:
         """Pose le marqueur **avant** le tour, atomiquement en base (L13 B5).
 
         Si la pose échoue, le tour ne démarre pas : aucune dépense sans trace
         possible (fail-closed).
+
+        `work_item_id` (#796) : le lot du tour part avec le marqueur, donc la
+        ligne du grand livre le porte même si elle est écrite par la réparation
+        d'un autre worker après une panne. `turn_id` (#796) : l'identifiant du
+        tour, pour la même raison — il relie la ligne à `turn_resources`.
         """
         self._annonce_ram = ""  # un tour neuf n'a encore rien annoncé
         try:
             registry.pending_spend_put(self.db, self.name, int(start), tour,
-                                       model if model is not None else "")
+                                       model if model is not None else "",
+                                       work_item_id=work_item_id, turn_id=turn_id)
             return True
         except db_mod.Unavailable:
             raise  # L72 : rien lancé ; la consigne est remise au retour de la base
@@ -2584,7 +2592,17 @@ class AgentWorker(threading.Thread):
                                 # `""` = modèle inconnu : tarif le plus cher
                                 # (fail-closed), jamais un repli sur un état
                                 # local mutable.
-                                model=modele)
+                                model=modele,
+                                # #796 (0423) : le lot du tour et son instant de
+                                # début viennent du marqueur, pas de la mémoire
+                                # de ce worker : la réparation par un autre
+                                # worker écrit la même attribution.
+                                work_item_id=travail.get("work_item_id"),
+                                started_at=travail.get("created_ts"),
+                                # #796 (0423) : l'identifiant du tour, même
+                                # provenance — il relie la ligne à ses
+                                # ressources (`turn_resources`)
+                                turn_id=travail.get("turn_id"))
             # Mesure du plafond de contexte (L60), lue sur la ligne écrite.
             self.last_turn_reread = usage.reread_tokens
             self.last_turn_reread_session = usage.session
@@ -3844,7 +3862,9 @@ class AgentWorker(threading.Thread):
                 or self._state_read("turn_harness") != harness:
             self.fail_turn("accounting unavailable", "turn harness not written")
             return False
-        if not self._compta_marque(events_start, label, model):
+        if not self._compta_marque(events_start, label, model,
+                                   work_item_id=str(lot_du_tour) if lot_du_tour else None,
+                                   turn_id=turn_id):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
             return False

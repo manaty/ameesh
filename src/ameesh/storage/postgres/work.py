@@ -1348,7 +1348,7 @@ class WorkItems(interface.WorkItems):
         " total_minutes::float8 AS total_minutes, agent_minutes::float8 AS agent_minutes,"
         " ci_minutes::float8 AS ci_minutes, review_minutes::float8 AS review_minutes,"
         " human_minutes::float8 AS human_minutes, ci_runs, merge_sha, diff_files,"
-        " diff_insertions, diff_deletions, measured_size, declared_size")
+        " diff_insertions, diff_deletions, measured_size, declared_size, agent_source")
 
     def save_measure(self, item_id, measure) -> dict:
         m = measure
@@ -1356,9 +1356,9 @@ class WorkItems(interface.WorkItems):
             "INSERT INTO work_item_measures (work_item_id, started_at, merged_at,"
             "  total_minutes, agent_minutes, ci_minutes, review_minutes, human_minutes,"
             "  ci_runs, merge_sha, diff_files, diff_insertions, diff_deletions,"
-            "  measured_size, declared_size)"
+            "  measured_size, declared_size, agent_source)"
             " VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s,"
-            "         %s, %s, %s, %s, %s)"
+            "         %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT (work_item_id) DO UPDATE SET measured_at = now(),"
             "  started_at = excluded.started_at, merged_at = excluded.merged_at,"
             + ", ".join(
@@ -1369,6 +1369,13 @@ class WorkItems(interface.WorkItems):
                 " THEN work_item_measures.%s ELSE excluded.%s END" % (c, c, c)
                 for c in ("total_minutes", "agent_minutes", "ci_minutes", "review_minutes",
                           "human_minutes", "ci_runs")) + ","
+            # même garde pour la provenance des minutes d'agent : garder les
+            # phases d'une mesure connue (ci_minutes non nul) garde leur
+            # source — 'states' ne devient jamais 'turns' (ni l'inverse) sans
+            # que agent_minutes soit recalculé par la même règle
+            "  agent_source = CASE WHEN excluded.ci_minutes IS NULL"
+            " AND work_item_measures.ci_minutes IS NOT NULL"
+            " THEN work_item_measures.agent_source ELSE excluded.agent_source END,"
             "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
             "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
             "  diff_insertions = coalesce(excluded.diff_insertions,"
@@ -1383,7 +1390,8 @@ class WorkItems(interface.WorkItems):
              m["total_minutes"], m["agent_minutes"], m.get("ci_minutes"),
              m["review_minutes"], m["human_minutes"], m.get("ci_runs"), m.get("merge_sha"),
              m.get("diff_files"), m.get("diff_insertions"), m.get("diff_deletions"),
-             m.get("measured_size"), m.get("declared_size")))
+             m.get("measured_size"), m.get("declared_size"),
+             m.get("agent_source")))
         return rows[0]
 
     def measure(self, item_id) -> dict | None:
@@ -1391,6 +1399,27 @@ class WorkItems(interface.WorkItems):
             "SELECT " + self._MEASURE_COLUMNS + " FROM work_item_measures"
             " WHERE work_item_id = %s", (int(item_id),))
         return rows[0] if rows else None
+
+    def turn_spans(self, item_id) -> list[dict]:
+        """#796 : les tours attribués au lot (grand livre, 0423), dans l'ordre
+        du début. `start_ts` = `turn_resources.started_at` quand le tour y est
+        relié (le tour a pris la main), sinon `turn_costs.started_at` (le
+        marqueur, posé avant le lancement) — jamais None : un tour sans aucun
+        des deux est omis. `end_ts` = `turn_resources.ended_at` quand le tour a
+        rendu ses ressources (la fin réelle), sinon l'écriture de la ligne : une
+        ligne réparée après une panne n'allonge donc plus la durée d'un tour
+        dont la ressource dit déjà quand il s'est terminé."""
+        return self.db.query(
+            "SELECT extract(epoch from coalesce(tr.started_at, tc.started_at))::float8"
+            "         AS start_ts,"
+            "       extract(epoch from coalesce(tr.ended_at, tc.recorded_at))::float8"
+            "         AS end_ts,"
+            "       tc.turn_id AS turn_id"
+            "  FROM turn_costs tc"
+            "  LEFT JOIN turn_resources tr ON tr.turn_id = tc.turn_id"
+            " WHERE tc.work_item_id = %s"
+            "   AND coalesce(tr.started_at, tc.started_at) IS NOT NULL"
+            " ORDER BY start_ts, tc.id", (int(item_id),))
 
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(

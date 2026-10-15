@@ -1661,6 +1661,30 @@
       ]
      },
      "required": true
+    },
+    {
+     "name": "work_item_id",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "turn_id",
+     "kind": "positional",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -2022,6 +2046,42 @@
      "schema": {
       "type": [
        "integer",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "work_item_id",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "started_at",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "turn_id",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
        "null"
       ]
      },
@@ -3773,7 +3833,7 @@
   }
  ],
  "refused": {
-  "interface_total": 386,
+  "interface_total": 387,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4161,6 +4221,7 @@
     "set_issue_ref",
     "set_partial_seen",
     "timeline",
+    "turn_spans",
     "unassigned_lots",
     "waiting_episodes",
     "without_project"

@@ -161,7 +161,7 @@ class Mailbox(interface.Mailbox):
         rows = self.db.query(
             """
             UPDATE agent_mailbox
-               SET delivered_at = now(), status = 'delivered'
+               SET delivered_at = clock_timestamp(), status = 'delivered'
              WHERE delivered_at IS NULL AND id IN (%s)
             RETURNING id
             """ % ", ".join(str(i) for i in clean)
@@ -175,7 +175,7 @@ class Mailbox(interface.Mailbox):
         rows = self.db.query(
             """
             UPDATE agent_mailbox AS m
-               SET delivered_at = now(), status = 'delivered',
+               SET delivered_at = clock_timestamp(), status = 'delivered',
                    meta = m.meta || jsonb_build_object('retire', %%s::jsonb)
              WHERE m.delivered_at IS NULL AND m.id IN (%s)
                AND m.sender = 'ameesh' AND m.payload ? 'ci'
@@ -277,6 +277,11 @@ class Mailbox(interface.Mailbox):
         return sorted(rows, key=lambda row: int(row["id"]))
 
     def deliver(self, recipient, owner, epoch, token, ids) -> list[int]:
+        # #796 : `clock_timestamp()`, pas `now()` — l'horodatage de remise est
+        # celui de CHAQUE message (l'instant réel où il entre dans le contexte,
+        # ici l'injection par le hook ou le lancement du tour), pas l'instant
+        # de la transaction, identique pour tout un lot. C'est ce qui rend le
+        # délai de réaction (created_at → delivered_at) mesurable.
         clean = sorted({int(i) for i in ids})
         if not clean:
             return []
@@ -287,7 +292,7 @@ class Mailbox(interface.Mailbox):
                   FROM agent_registry WHERE name = %%s FOR UPDATE
             )
             UPDATE agent_mailbox AS m
-               SET delivered_at = now(), status = 'delivered'
+               SET delivered_at = clock_timestamp(), status = 'delivered'
               FROM v
              WHERE m.recipient = %%s AND m.delivered_at IS NULL AND m.id IN (%s)
                AND m.meta->'consigne'->>'jeton' = %%s
@@ -459,7 +464,7 @@ class Mailbox(interface.Mailbox):
             rows = tx.query(
                 """
                 UPDATE agent_mailbox AS m
-                   SET delivered_at = now(), status = 'delivered',
+                   SET delivered_at = clock_timestamp(), status = 'delivered',
                        meta = (m.meta - 'consigne')
                               || jsonb_build_object('forwarded', jsonb_build_object(
                                      'to', %%s::text, 'message_id', v.new_id,

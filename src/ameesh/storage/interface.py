@@ -438,8 +438,14 @@ class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent."""
 
     @abc.abstractmethod
-    def put(self, name: str, start_index: int, turn: str | None, model: str | None) -> bool:
-        """Pose (atomiquement) le marqueur du tour, en remplaçant le précédent."""
+    def put(self, name: str, start_index: int, turn: str | None, model: str | None,
+            work_item_id: int | None = None, turn_id: str | None = None) -> bool:
+        """Pose (atomiquement) le marqueur du tour, en remplaçant le précédent.
+        `work_item_id` (#796, migration 0423) : le lot du tour, pour que la
+        ligne écrite à la réparation — par le même exécuteur ou un autre —
+        garde l'attribution ; None = lot inconnu.
+        `turn_id` (#796) : l'identifiant du tour (`turn_resources.turn_id`),
+        pour la même raison ; None = tour inconnu."""
 
     @abc.abstractmethod
     def set_model(self, name: str, model: str | None) -> bool:
@@ -447,7 +453,8 @@ class PendingSpend(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Le marqueur (agent, start_index, turn, model, created_ts), ou None."""
+        """Le marqueur (agent, start_index, turn, model, created_ts,
+        work_item_id, turn_id), ou None."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
@@ -483,7 +490,10 @@ class TurnCosts(Domain):
                executor: str | None = None, lease_owner: str | None = None,
                lease_epoch: int | None = None, void_reason: str | None = None,
                price_fallback: str | None = None,
-               cache_write_tokens: int | None = None) -> bool:
+               cache_write_tokens: int | None = None,
+               work_item_id: int | None = None,
+               started_at: float | None = None,
+               turn_id: str | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
@@ -496,7 +506,12 @@ class TurnCosts(Domain):
         `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
         0064) : `relay` pour la mesure du relais de modèle, `device` pour la
         déclaration d'un appareil médié (hors plafond) ; None = colonnes non
-        écrites (`source` vaut alors `harness`)."""
+        écrites (`source` vaut alors `harness`).
+        `work_item_id` et `started_at` (#796, migration 0423) : le lot servi par
+        le tour et son instant de début (epoch, horloge de la base) ; None =
+        inconnu, colonne non écrite. `turn_id` (#796) : l'identifiant du tour
+        (`turn_resources.turn_id`), pour relier la ligne à ses ressources ;
+        None = inconnu."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -1114,11 +1129,23 @@ class WorkItems(Domain):
     def save_measure(self, item_id: int, measure: dict) -> dict:
         """L157c: writes (or replaces) the measure of a delivered lot; a
         measure without diff keeps the diff already stored, one without CI
-        keeps the phases already stored with a known CI. Returns it."""
+        keeps the phases already stored with a known CI. Returns it.
+        `agent_source` (#796) says where `agent_minutes` comes from: 'turns'
+        (the attributed turns) or 'states' (the state timeline)."""
 
     @abc.abstractmethod
     def measure(self, item_id: int) -> dict | None:
         """L157c: the measure of a lot (phases, diff), or None."""
+
+    @abc.abstractmethod
+    def turn_spans(self, item_id: int) -> list[dict]:
+        """#796 : les tours du grand livre attribués à ce lot, dans l'ordre du
+        début : `{start_ts, end_ts, turn_id}` (epoch ; `end_ts` = écriture de la
+        ligne). `start_ts` = `turn_resources.started_at` quand le tour y est
+        relié (le tour a pris la main), sinon `turn_costs.started_at` (le
+        marqueur, posé avant le lancement) ; None si aucun des deux n'est connu
+        (ligne d'avant 0423), et le tour est alors omis. Liste vide = aucun tour
+        attribué, donc temps d'agent inconnu par les tours."""
 
     @abc.abstractmethod
     def set_branch(self, item_id: int, branch: str | None, target: str | None, *,
@@ -2351,7 +2378,9 @@ class Operations(Domain):
         """Lignes du grand livre `turn_costs` des `since_s` dernières
         secondes (de l'agent si donné), les plus récentes d'abord : id,
         agent, harness, turn, model, session, usd, input_tokens,
-        cached_input_tokens, output_tokens, recorded_ts."""
+        cached_input_tokens, output_tokens, work_item_id, started_ts,
+        recorded_ts. `work_item_id` et `started_ts` (#796) valent None pour
+        une ligne d'avant la migration 0423 ou un tour sans lot."""
 
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:
