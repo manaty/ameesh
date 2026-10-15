@@ -17,8 +17,10 @@
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
 #               6 parts, sur push vers main ou release/**, sur une PR de
-#               release (sans liste pilote), à la main (workflow_dispatch) et
-#               sur l'appel du portier de paquet (workflow_call).
+#               release (sans liste pilote), à la main (workflow_dispatch),
+#               sur l'appel du portier de paquet (workflow_call) et sur une
+#               demande de gel #1343 (`ci-lot-<sha>`/`ci-full-<sha>`, parcours
+#               PR).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
@@ -39,6 +41,31 @@
 # suite complète, les deux pilotes, sans voie version/doc ni liste pilote psql —
 # y compris dans le plan de repli. Les règles de refusion (a : delta de main
 # disjoint, b : migrations seules) viendront ensuite.
+#
+# #1343 — canon §3 (bureau home 66, owner 14/10 21:45) : sur ameesh, la
+# relecture passe avant la CI. Une poussée sur une PR de lot ne lance plus
+# rien ; la CI d'un lot (impactés + contrat, voie `mode=lot` du plan) ne tourne
+# qu'une fois, sur la tête gelée, quand les verdicts requis sont acquis.
+# `ameesh ci run <lot>` (src/ameesh/ci.py) porte ce déclencheur : gel présent,
+# branche distante et tête de PR au SHA gelé, verdict `ok` sur ce SHA (sauf lot
+# léger), puis pose d'une étiquette `ci-lot-<40hex>` / `ci-full-<40hex>` sur la
+# PR — `pull_request` `types: [labeled]` (un `workflow_dispatch` ne satisfait
+# pas un check requis de PR). Le job `plan` compare exactement le SHA de
+# l'étiquette à `pull_request.head.sha`, vérifie que le checkout est le
+# merge-ref composé de la base du payload et de cette tête (ses deux parents),
+# puis sélectionne contre la base du payload. Une étiquette étrangère, un SHA
+# qui ne nomme pas la tête, une composition qui a bougé ou un `ci-lot` sur
+# `release/**`/`integration/**` font rougir le check requis sans exécuter de
+# tests. Aucune voie version seule ou documentation seule : sur la tête gelée,
+# un check `tests` vert veut dire que des tests ont tourné. Exceptions
+# (canon) : un lot qui débloque la CI ou corrige un incident demande sa CI en
+# parallèle de sa relecture (`--exception incident|unblock --reason …`), le
+# motif et la marque restant dans la trace du lot. La commande est seule à
+# retirer/reposer son étiquette (nouvelle demande admissible, ou reprise
+# explicite d'un terminal rouge/annulé) ; une étiquette posée à la main
+# demande de vrais tests, elle ne prouve ni gel ni avis. Un run devenu périmé
+# (autre SHA, autre composition) est annulé par `ameesh ci run` ou `ameesh ci
+# cancel <lot>`, jamais le run de la composition gelée.
 #
 # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
 # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
@@ -91,6 +118,11 @@
 # fourche), rien n'est publié et la part n'en est pas affectée.
 name: tests
 
+# #1343 : le titre du run porte la demande de gel — PR, étiquette (mode et SHA
+# complet) et base du payload — pour que la commande et la preuve de fusion
+# puissent la relire ; une poussée garde le nom de sa branche.
+run-name: "tests${{ github.event_name == 'pull_request' && format(' [PR #{0} {1} base {2}]', github.event.pull_request.number, github.event.label.name, github.event.pull_request.base.sha) || (github.event_name == 'push' && format(' [{0}]', github.ref_name) || '') }}"
+
 on:
   # §12 : une poussée sur integration/** ne déclenche plus cette suite
   # directement. Le portier .github/workflows/paquet.yml décide — une tête de
@@ -98,15 +130,31 @@ on:
   # (workflow_call) quand aucune PR ouverte ne couvre la tête poussée.
   push:
     branches: [main, "release/**"]
+  # #1343 (canon §3, bureau home 66) : une poussée sur une PR de LOT ne lance
+  # plus rien. La CI d'un lot part au gel, quand les verdicts requis sont
+  # acquis : `ameesh ci run <lot>` pose sur la PR l'étiquette
+  # `ci-lot-<40hex>` / `ci-full-<40hex>`, seul déclencheur du parcours PR. Une
+  # étiquette étrangère (ni l'une ni l'autre) réveille le workflow mais le job
+  # `plan` la refuse : le check requis rougit sans exécuter de tests. Une PR de
+  # release (source ou cible release/** ou integration/**) passe aussi par sa
+  # demande `ci-full-<sha>` ; les poussées vers integration/** restent portées
+  # par le portier de paquet (§12, #1410), pas par ce déclencheur.
   pull_request:
+    types: [labeled]
+    branches: [main, "release/**", "integration/**"]
   workflow_call:
   workflow_dispatch:
 
-# Une PR dépassée est annulée. Les pushes de main partagent un groupe :
-# GitHub garde un run en cours et un seul en attente, remplacé par le suivant.
-# Release et dispatch gardent un groupe par exécution (périmètre gelé).
+# Une PR dépassée est annulée, mais la concurrency d'une étiquette ÉTRANGÈRE
+# est distincte de celle d'une demande de gel (#1343) : ajouter une étiquette
+# quelconque ne doit pas annuler un run gelé valide. Les pushes de main
+# partagent un groupe : GitHub garde un run en cours et un seul en attente,
+# remplacé par le suivant. Release et poussées gardent un groupe par exécution
+# (périmètre gelé). `ameesh ci run` annule lui-même les runs périmés d'une
+# autre composition avant de reposer son étiquette, jamais celui de la
+# composition courante.
 concurrency:
-  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}-{1}', github.event.pull_request.number, github.event.label.name) || github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main' || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -159,8 +207,14 @@ jobs:
       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
       # La référence distingue main (filtre doc) des branches release (suite
       # complète, quel que soit le contenu).
-      AMEESH_CI_BASE: ${{ github.event_name == 'push' && github.event.before || 'HEAD^1' }}
+      # #1343 : sur une PR, la base du diff est celle du payload
+      # (`pull_request.base.sha`), la composition même du merge-ref vérifié par
+      # la porte ci-dessous — jamais HEAD^1 deviné.
+      AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || 'HEAD^1') }}
       AMEESH_CI_REF: ${{ github.ref }}
+      # la tête demandée par l'étiquette (payload), tracée et comparée
+      AMEESH_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      AMEESH_CI_LABEL: ${{ github.event.label.name }}
     outputs:
       version_only: ${{ steps.plan.outputs.version_only }}
       docs_only: ${{ steps.plan.outputs.docs_only }}
@@ -170,10 +224,90 @@ jobs:
       psycopg_parts: ${{ steps.plan.outputs.psycopg_parts }}
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
+      # #1343 : mode, tête et base de la demande de gel, relus par la commande
+      # et la preuve de fusion.
+      mode: ${{ steps.gel.outputs.mode }}
+      sha: ${{ steps.gel.outputs.sha }}
+      base: ${{ steps.gel.outputs.base }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
+      # #1343 : la demande de gel est une étiquette `ci-lot-<40hex>` ou
+      # `ci-full-<40hex>` posée sur la PR par `ameesh ci run`. La porte vérifie,
+      # avant tout plan et sans exécuter un test : l'étiquette (motif exact,
+      # SHA complet), l'égalité exacte avec `pull_request.head.sha`, le mode
+      # imposé par les refs (`release/**`/`integration/**` → full), et que le
+      # checkout est bien le merge-ref composé de la base du payload et de
+      # cette tête (ses deux parents). Toute autre étiquette est refusée : le
+      # check requis rougit, rien ne tourne.
+      - name: gel (étiquette ci-lot/ci-full sur la tête gelée — #1343)
+        id: gel
+        if: github.event_name == 'pull_request'
+        # #1237 (N1 de #1211) : un nom de branche est choisi par l'auteur de la
+        # PR ; il passe par l'environnement et reste cité, jamais interpolé
+        # dans le script.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          label="$AMEESH_CI_LABEL"
+          if ! printf '%s' "$label" | grep -Eq '^ci-(lot|full)-[0-9a-f]{40}$'; then
+            echo "::error::label '$label' is not a freeze request (ci-lot-<40 hex> or ci-full-<40 hex>): foreign label, nothing run"
+            exit 1
+          fi
+          mode="$(printf '%s' "$label" | sed -E 's/^ci-(lot|full)-.*$/\1/')"
+          sha="${label##*-}"
+          head="$AMEESH_CI_HEAD"
+          if [ "$sha" != "$head" ]; then
+            echo "::error::label '$label' names $sha, the pull request head is $head: the freeze does not cover this head, nothing run"
+            exit 1
+          fi
+          base="$AMEESH_CI_BASE"
+          case "$base" in
+            *[!0-9a-f]*) echo "::error::unusable pull request base: '$base' (full 40-hex expected)"; exit 1 ;;
+          esac
+          if [ "${#base}" != 40 ]; then
+            echo "::error::unusable pull request base: '$base' (${#base} characters, full 40-hex expected)"
+            exit 1
+          fi
+          release=0
+          case "$HEAD_REF" in release/*|integration/*) release=1 ;; esac
+          case "$BASE_REF" in release/*|integration/*) release=1 ;; esac
+          if [ "$release" = 1 ] && [ "$mode" != "full" ]; then
+            echo "::error::source or target release/** or integration/** requires ci-full-<sha> (--full): a lot request never covers a release, nothing run"
+            exit 1
+          fi
+          parents="$(git rev-list --parents -n 1 HEAD)"
+          if [ "$(printf '%s' "$parents" | wc -w)" != 3 ]; then
+            echo "::error::HEAD is not the pull request merge-ref (a merge commit): the composition cannot be checked, nothing run"
+            exit 1
+          fi
+          p1="$(git rev-parse HEAD^1)"
+          p2="$(git rev-parse HEAD^2)"
+          if [ "$p1" != "$base" ]; then
+            echo "::error::the merge-ref base is $p1, the payload base is $base: the composition moved, refreeze the request, nothing run"
+            exit 1
+          fi
+          if [ "$p2" != "$head" ]; then
+            echo "::error::the merge-ref head is $p2, the label names $head: the composition moved, refreeze the request, nothing run"
+            exit 1
+          fi
+          echo "freeze request: mode=$mode sha=$sha base=$base head=$head label=$label"
+          {
+            echo "mode=$mode"
+            echo "sha=$sha"
+            echo "base=$base"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "AMEESH_CI_MODE=$mode"
+            echo "AMEESH_CI_GEL=$sha"
+          } >> "$GITHUB_ENV"
+      # une poussée garde le plan automatique (L1211, L161a) : impactés +
+      # contrat sur une branche de lot, suite complète sur main/release.
+      - name: poussée (plan automatique)
+        if: github.event_name != 'pull_request'
+        run: echo "AMEESH_CI_MODE=auto" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -195,7 +329,7 @@ jobs:
           python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
             --event "${{ github.event_name }}" \
             --base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF" \
-            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
+            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" --mode "$AMEESH_CI_MODE" \
             --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
       - uses: actions/upload-artifact@v4
@@ -497,6 +631,9 @@ jobs:
   # L158: a PR that changes the version number carries the number its content
   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
   # compares it with the content since the last tag. Any other PR: nothing to check.
+  # #1343 : chaque PR de tests est une demande de gel (étiquette ci-lot/ci-full) ;
+  # le numéro est vérifié sur la base du payload, sans quoi un lot qui change la
+  # version obtiendrait un `tests` vert sans que le numéro soit regardé.
   version:
     name: version number
     if: github.event_name == 'pull_request'
@@ -507,13 +644,18 @@ jobs:
         with:
           fetch-depth: 0  # the tags, and the range since the last one
       - name: number against content
-        run: python3 scripts/version-level.py pr HEAD^1 HEAD
+        env:
+          # la base du payload est celle du merge-ref (vérifiée par le job plan)
+          VERSION_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/version-level.py pr "$VERSION_BASE" HEAD
 
   # nom de vérification stable : vert seulement si toutes les parts le sont
-  # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
-  # L161a : ou que de la documentation, et ses lecteurs sont verts ;
+  # (L161a : une poussée de documentation seule sur main, ses lecteurs verts ;
   # L161f : une part que le plan n'a pas prévue est sautée ;
-  # L158: on a PR, the version number check must pass)
+  # L158: on a PR, the version number check must pass ;
+  # #1343 : sur une demande de gel (toute PR), jamais de voie qui saute les
+  # tests — un check `tests` vert veut dire que des tests ont tourné)
   tests:
     name: tests
     if: always()
@@ -522,19 +664,29 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: bilan des parts
+        env:
+          CI_EVENT: ${{ github.event_name }}
         run: |
-          echo "plan    : ${{ needs.plan.result }} (version seule : ${{ needs.plan.outputs.version_only }}, doc seule : ${{ needs.plan.outputs.docs_only }})"
+          echo "plan    : ${{ needs.plan.result }} (mode ${{ needs.plan.outputs.mode }}, tête ${{ needs.plan.outputs.sha }}, base ${{ needs.plan.outputs.base }})"
           echo "doc     : ${{ needs.doc-readers.result }}"
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
           echo "macOS   : ${{ needs.platform-macos.result }}"
           echo "version : ${{ needs.version.result }}"
+          # un plan refusé (étiquette étrangère, SHA qui ne nomme pas la tête,
+          # composition qui a bougé) rougit ici : rien n'a tourné, jamais vert.
           test "${{ needs.plan.result }}" = success
-          # L158: on a PR, the version number check passes (skipped elsewhere).
-          # #940 : sous `bash -e`, l'échec de la branche gauche du `&&` interne
-          # est exempté et le groupe rend 1 sans faire sortir le script — le job
-          # concluait SUCCESS. Sortie explicite après le repli légitime.
-          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; } || exit 1
+          # L158 : la version est vérifiée sur chaque PR (demande de gel).
+          if [ "$CI_EVENT" = "pull_request" ]; then
+            test "${{ needs.version.result }}" = success
+          fi
+          # #1343 : une demande de gel ne prend jamais les voies version seule
+          # (#L157) ou documentation seule (L161a) ; si le plan en produisait
+          # une, le check requis rougit au lieu de verdir sans tests.
+          if [ "$CI_EVENT" = "pull_request" ]; then
+            test "${{ needs.plan.outputs.version_only }}" = "false" || exit 1
+            test "${{ needs.plan.outputs.docs_only }}" = "false" || exit 1
+          fi
           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
             exit 0
