@@ -216,3 +216,29 @@ class Progress(interface.Progress):
              ORDER BY agent, harness, 3
             """ % (win, win, win, win, win, win, " AND ".join(clauses)),
             tuple([float(since_ts)] * 6 + params))
+
+    def ci_suite(self, *, since_ts, limit) -> list[dict]:
+        # #1476 : la suite complète tourne sur main, release/** et
+        # integration/**, en poussée comme en PR (source ou cible) ; une
+        # exécution annulée ou remplacée n'a pas de durée de suite. La borne
+        # est PAR DÉPÔT : un dépôt très actif ne chasse pas les autres de la
+        # lecture (row_number, pas un LIMIT global).
+        return self.db.query(
+            """
+            SELECT repo, run_id, branch, base, event, duration_s, concluded_ts FROM (
+                SELECT repo, run_id, branch, base, event,
+                       extract(epoch from (concluded_at - first_seen_at))::float8
+                           AS duration_s,
+                       extract(epoch from concluded_at)::float8 AS concluded_ts,
+                       row_number() OVER (PARTITION BY repo
+                                          ORDER BY concluded_at DESC, run_id DESC) AS rn
+                  FROM ci_runs
+                 WHERE status IN ('success', 'failure') AND concluded_at IS NOT NULL
+                   AND concluded_at >= to_timestamp(%s)
+                   AND (branch = 'main' OR branch LIKE 'release/%%'
+                        OR branch LIKE 'integration/%%'
+                        OR base LIKE 'release/%%' OR base LIKE 'integration/%%')
+            ) t
+             WHERE rn <= %s
+             ORDER BY concluded_ts DESC, run_id DESC
+            """, (float(since_ts), int(limit)))

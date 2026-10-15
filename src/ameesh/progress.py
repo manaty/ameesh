@@ -85,6 +85,14 @@ MAX_ACTIONS = 500
 #: longueur d'une tâche affichée (consigne en cours, libellé)
 TASK_CHARS = 140
 
+#: #1476 : cible de la durée bout en bout d'une suite complète (demande du
+#: bureau, 15/10/2026), en secondes, et fenêtre de la médiane affichée (jours)
+#: avec sa borne de lecture par dépôt
+CI_SUITE_TARGET_S = 15 * 60
+CI_SUITE_WINDOW_D = 7
+CI_SUITE_LIMIT = 500
+CI_SUITE_SCHEMA = "ameesh-ci-suite/1"
+
 #: états du lot rendus par la vue (décision 0024)
 LOT_STATES = ("active", "review", "blocked", "approved", "merged", "closed")
 #: états d'agent rendus par la vue
@@ -720,6 +728,47 @@ def _real_spend(db, paid: Iterable[str], since_ts: float, now: float) -> list[di
 # l'instantané
 # --------------------------------------------------------------------------
 
+def _ci_priority(row: dict) -> bool:
+    """#1468 : le pool prioritaire de runners couvre `integration/**` et
+    `release/**` (source ou cible d'une PR) ; une poussée sur `main` suit la
+    fusion d'un paquet déjà validé sur sa branche d'intégration et n'est pas
+    le chemin critique de la cible."""
+    return any((row.get(ref) or "").startswith(("release/", "integration/"))
+               for ref in ("branch", "base"))
+
+
+def build_ci_suite(rows: list[dict]) -> dict:
+    """#1476 : durée médiane (et p80) des suites complètes conclues, par
+    dépôt, et la part couverte par le pool prioritaire.
+
+    La durée est celle du veilleur CI (`ci_runs`) : du premier relevé de
+    l'exécution à celui de sa conclusion. L'instant de création GitHub n'est
+    pas gardé ; l'écart est borné par l'intervalle de `ameesh notify`, et il
+    porte des deux côtés, donc la médiane reste juste à un relevé près.
+    """
+    by_repo: dict = {}
+    for row in rows:
+        by_repo.setdefault(row.get("repo") or "?", []).append(row)
+    repos = []
+    for repo, runs in sorted(by_repo.items()):
+        durees = [r["duration_s"] for r in runs if r.get("duration_s") is not None]
+        prio = [r["duration_s"] for r in runs
+                if r.get("duration_s") is not None and _ci_priority(r)]
+        last = max(runs, key=lambda r: (r.get("concluded_ts") or 0, r.get("run_id") or 0))
+        repos.append({
+            "repo": repo,
+            "runs": len(durees),
+            "median_s": estimates_mod.quantile(durees, 0.5),
+            "p80_s": estimates_mod.quantile(durees, 0.8),
+            "last_s": last.get("duration_s"),
+            "last_concluded_ts": last.get("concluded_ts"),
+            "priority_runs": len(prio),
+            "priority_median_s": estimates_mod.quantile(prio, 0.5),
+        })
+    return {"schema": CI_SUITE_SCHEMA, "window_days": CI_SUITE_WINDOW_D,
+            "target_s": CI_SUITE_TARGET_S, "repos": repos}
+
+
 def _truncation(rows: list[dict], limit: int) -> dict | None:
     """`{shown, total, limit}` si la borne de rendu a coupé, sinon None."""
     total = int(rows[0].get("total") or len(rows)) if rows else 0
@@ -889,6 +938,11 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         version_view = versions_mod.empty(
             "versions: unreadable (%s)" % " ".join(str(exc).split())[:200])
 
+    # #1476 : la durée médiane des suites complètes, par dépôt (veilleur CI) ;
+    # la cible de 15 min est portée par la vue, jamais inventée.
+    ci_suite = build_ci_suite(
+        st.ci_suite(since_ts=now - CI_SUITE_WINDOW_D * 86400.0, limit=CI_SUITE_LIMIT))
+
     return {
         "schema": SCHEMA,
         "generated_ts": _round(now),
@@ -907,6 +961,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "decisions": pending,
         # L160f (#497) : versions publiées et prochaines releases par produit
         "versions": version_view,
+        # #1476 (champ ajouté) : durée médiane des suites complètes, cible 15 min
+        "ci_suite": ci_suite,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -948,6 +1004,35 @@ def _duration(seconds) -> str:
     return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)
 
 
+def _ci_suite_lines(ci: dict, width: int) -> list[str]:
+    """#1476 : la durée médiane des suites complètes, par dépôt, face à la
+    cible ; la part couverte par le pool prioritaire de #1468 est dite."""
+    target = int(ci.get("target_s") or CI_SUITE_TARGET_S)
+    out = [textwrap.fill("CI FULL SUITE (median over %d d, target ≤ %s)" % (
+        int(ci.get("window_days") or CI_SUITE_WINDOW_D), _duration(target)), width)]
+    for r in ci.get("repos", []):
+        if not r.get("runs"):
+            out.append(textwrap.fill("%s: no concluded full suite" % r["repo"], width,
+                                     subsequent_indent="  "))
+            continue
+        if r["median_s"] <= target:
+            verdict = "target met"
+        elif r.get("priority_median_s") is not None and r["priority_median_s"] <= target:
+            verdict = "target met on the priority pool only"
+        else:
+            verdict = "target not met"
+        out.append(textwrap.fill(
+            "%s: median %s · p80 %s (%d runs, %s)" % (
+                r["repo"], _duration(r["median_s"]), _duration(r.get("p80_s")),
+                r["runs"], verdict), width, subsequent_indent="  "))
+        if r.get("priority_runs"):
+            out.append(textwrap.fill(
+                "priority pool (integration/release): median %s over %d runs" % (
+                    _duration(r.get("priority_median_s")), r["priority_runs"]),
+                width, initial_indent="  ", subsequent_indent="    "))
+    return out
+
+
 def format_text(snap: dict, width: int | None = None) -> str:
     """La sortie lisible : une colonne, coupée à la largeur du terminal."""
     if width is None:
@@ -978,6 +1063,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
         # L160f (#497) : dernières versions publiées et prochaines releases
         out.append("")
         out.extend(versions_mod.format_lines(snap["versions"], width))
+
+    if (snap.get("ci_suite") or {}).get("repos"):
+        # #1476 : durée médiane des suites complètes, cible de 15 min
+        out.append("")
+        out.extend(_ci_suite_lines(snap["ci_suite"], width))
 
     if snap.get("roadmap"):
         # L96 : la feuille de route (Gantt texte), avant le détail des lots

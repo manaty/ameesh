@@ -2327,6 +2327,17 @@ class Progress(Domain):
         base) : `usd_window`, `usd_1h`, `usd_24h`, tours et jetons de la
         fenêtre. `agents` restreint aux agents nommés (None = tous)."""
 
+    @abc.abstractmethod
+    def ci_suite(self, *, since_ts: float, limit: int) -> list[dict]:
+        """Exécutions CONCLUES de la suite complète des tests depuis
+        `since_ts` (#1476), de la plus récente à la plus ancienne, au plus
+        `limit` **par dépôt** : `main`, `release/**`, `integration/**`, ou une
+        pull request dont la source ou la cible est l'une de ces branches.
+        Chaque ligne : repo, run_id, branch, base, event, `duration_s` (premier
+        relevé du veilleur → conclusion, l'unité de la vue) et
+        `concluded_ts`. Les exécutions annulées ou remplacées ne comptent pas
+        (pas de durée de suite)."""
+
 
 # --------------------------------------------------------------------------
 # vue par projet (lot L62) : qui travaille sur quoi
