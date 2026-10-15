@@ -4242,6 +4242,7 @@
     "record_balance",
     "request_restart",
     "resume",
+    "set_dormant",
     "set_settings",
     "turns"
    ],
