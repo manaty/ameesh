@@ -844,7 +844,9 @@ def backlog_empty(db, listing: list, now: float, *,
     idle = idle_agents(listing, now, idle_s)
     if not idle:
         return []
-    if storage.of(db).work.backlog(open_only=True, limit=1):
+    # #1696 (N2 de #1242) : une file dont tous les éléments sont bloqués n'est
+    # pas prenable — même filtre `ready_only` que la prise automatique (L165).
+    if storage.of(db).work.backlog(open_only=True, limit=1, ready_only=True):
         return []
     # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
     if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db):
