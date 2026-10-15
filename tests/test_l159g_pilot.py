@@ -19,6 +19,12 @@ from .support import REPO, PgTestCase
 
 GUEST = os.path.join(REPO, "deploy", "guest")
 GIB = 1024 ** 3
+# #1601: the pilot's guard accepts a path only when every character is in
+# [A-Za-z0-9/._-] and no component goes through a symbolic link. A host
+# TMPDIR may fail both (an agent's …/<agent>~<id>, a symlinked /tmp): the
+# fixture then failed on the machine instead of testing the script (canon §3).
+# The install fixtures take this fixed, resolved parent instead of TMPDIR.
+FIXED_TMP = os.path.realpath("/var/tmp")
 
 
 def unit(name: str) -> dict[str, list[str]]:
@@ -105,6 +111,12 @@ class InstallPilotTest(unittest.TestCase):
     SCRIPT = os.path.join(GUEST, "install-pilot.sh")
 
     def setUp(self):
+        # #1601: the fixtures take a fixed, resolved parent (FIXED_TMP): the
+        # guard rightly refuses an agent TMPDIR (…/<agent>~<id>) and any
+        # symlinked path, so a fixture built from TMPDIR tested the machine.
+        # tempfile's default is restored after each test.
+        self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+        tempfile.tempdir = FIXED_TMP
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.host = os.path.realpath(tmp.name)
