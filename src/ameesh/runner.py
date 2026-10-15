@@ -3796,6 +3796,20 @@ class AgentWorker(threading.Thread):
                 % len(incertains),
                 meta={"action": "remise-incertaine", "messages": incertains})
 
+    def _github_env(self, env: dict, lot) -> None:
+        """#1645 : journal des gestes gh et identité GitHub par rôle. Jamais
+        bloquant : une erreur laisse l'identité héritée, et le dit."""
+        from . import github_identity
+        try:
+            info = github_identity.apply(env, self.name, self.cfg.config_dir,
+                                         self.cfg.state_dir, lot)
+        except Exception as exc:  # noqa: BLE001 — le tour part quand même
+            log("[%s] github identity not applied: %s" % (self.name, exc))
+            return
+        if info.get("problem"):
+            log("[%s] github identity %s: %s"
+                % (self.name, info.get("identity"), info["problem"]))
+
     def _mediated_env(self, env: dict) -> None:
         """L109 : la session du harnais d'un exécuteur médié parle au serveur
         avec un jeton de session lié au bail (jamais d'accès à la base) :
@@ -4329,6 +4343,9 @@ class AgentWorker(threading.Thread):
         # pour les autres, incident du 13/10/2026).
         identite.update(identity.git_identity(self.name))
         env.update(identite)
+        # #1645 : chaque geste gh du tour est consigné (agent, tour, lot), et
+        # le tour porte le jeton de son rôle GitHub quand il est configuré.
+        self._github_env(env, lot_du_tour)
         if getattr(self.runner, "mediated", False):
             self._mediated_env(env)
         if not account_turn.apply(self, env, compte):
@@ -8054,6 +8071,12 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
     env.update(identity.git_identity(name))
     if harness:
         env["AMEESH_HARNESS"] = harness  # L224 : comme pour un tour
+    # #1645 : journal gh et identité GitHub du rôle, comme pour un tour
+    from . import github_identity
+    try:
+        github_identity.apply(env, name, cfg.config_dir, cfg.state_dir)
+    except Exception:  # noqa: BLE001 — la session part avec l'identité héritée
+        pass
     return env
 
 
