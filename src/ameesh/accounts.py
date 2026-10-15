@@ -1281,8 +1281,10 @@ def report(cfg, db, book, *, now: float | None = None,
         active = store.active(cfg.host, harness) if store else None
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
+        evaluations = {}
         for profile in items:
             result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            evaluations[profile.name] = result
             hold = holds.get(profile.name) or {}
             rows.append({
                 "harness": harness,
@@ -1314,7 +1316,7 @@ def report(cfg, db, book, *, now: float | None = None,
                 ],
                 "_gauges": list(result.gauges),
             })
-        _forecast(rows[len(rows) - len(items):], items, now)
+        _forecast(rows[len(rows) - len(items):], items, now, evaluations)
     return rows
 
 
@@ -1330,15 +1332,15 @@ def _overage_row(profile: Profile, gauges, now: float) -> dict:
             "in_use": in_overage(gauges, now)}
 
 
-def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
+def _forecast(rows: list[dict], items: list[Profile], now: float,
+              evaluations: dict) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
     (`next`, avec sa raison `why`, la même que celle du choix — L117)."""
-    evaluations = {}
+    # Keep the evaluated caps: reconstructing bare evaluations here changes
+    # the pace ratios (fixed caps, short-window caps and pace_multiplier).
     for row, profile in zip(rows, items):
-        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"])
-        evaluations[profile.name] = result
         row["losses"] = [
             {"key": g.key, "resets_at": found[0], "in_s": found[0] - now, "lost": found[1]}
             for g in row["_gauges"] for found in [g.expiring(now)] if found is not None]
