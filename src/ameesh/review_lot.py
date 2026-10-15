@@ -31,8 +31,6 @@ PREFIX = "review-after-merge:"
 #: l'échéance du canon §2 : le jour même de la fusion, heure de Paris
 TZ = "Europe/Paris"
 HOUR = "23:59"
-#: les familles de modèle connues du mesh
-FAMILIES = ("claude", "codex", "deepseek")
 #: la famille de relecture opposée à celle de l'auteur (règle du pilote,
 #: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude.
 OPPOSITE = {"claude": "codex", "deepseek": "codex", "codex": "claude"}
@@ -63,22 +61,9 @@ def deadline(now: Optional[datetime] = None) -> str:
     return "%s %s %s" % (now.date().isoformat(), HOUR, TZ)
 
 
-def family_of(harness: Optional[str]) -> str:
-    """La famille de modèle d'un harnais (`claude`, `codex`, `deepseek`), ou "".
-
-    Le harnais peut être un nom précis (`claude-opus-5-5`, `deepseek-flash`) :
-    la famille est celle du mot qu'il porte. Un harnais inconnu ne rend pas une
-    famille par défaut : l'indépendance d'un avis ne se suppose pas (#1374)."""
-    text = (harness or "").strip().lower()
-    for family in FAMILIES:
-        if family in text:
-            return family
-    return ""
-
-
 def reviewer_family(harness: Optional[str]) -> str:
     """La famille de relecture opposée au harnais de l'auteur."""
-    return OPPOSITE.get(family_of(harness), UNKNOWN_FAMILY)
+    return OPPOSITE.get((harness or "").strip().lower(), UNKNOWN_FAMILY)
 
 
 def _author(db, name: str) -> dict:
