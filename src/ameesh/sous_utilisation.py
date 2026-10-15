@@ -493,14 +493,42 @@ def waiting_project_lots(lots: list) -> list:
             and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
 
 
+def _budget_held(cfg, db, rows: list) -> dict:
+    """#1021 : `{agent: raison}` des agents dont le prochain tour est tenu
+    (budget, rythme ou authentification), lu là où l'exécuteur le calcule
+    (`account_turn.turn_hold`). `cfg` None (appelant sans hôte) : rien n'est
+    jugé. Une tenue illisible laisse l'agent dans l'alerte : c'est
+    l'attribution qui tranche, fail-closed."""
+    if cfg is None:
+        return {}
+    from . import account_turn
+    from . import db as db_mod
+    held = {}
+    for row in rows:
+        try:
+            reason = account_turn.turn_hold(cfg, db, row["name"], row)
+        except db_mod.Unavailable:
+            raise
+        except Exception:  # noqa: BLE001 - une lecture en échec ne masque pas l'alerte
+            continue
+        if reason:
+            held[row["name"]] = reason
+    return held
+
+
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None, designers=(), held=(), held_hosts=(),
-                  pressured: dict | None = None) -> list:
+                  pressured: dict | None = None, cfg=None) -> list:
     """#254 : `held`, les agents d'un hôte en pause, ni comptés ni à
     réveiller ; `held_hosts` (hôtes en pause) et `pressured` ({hôte:
     verdict} des hôtes sous pression, relevé frais) ne sont jamais proposés :
-    leurs agents sont laissés de côté et nommés."""
+    leurs agents sont laissés de côté et nommés.
+
+    #1021 : `cfg` (l'hôte qui juge) — un agent encore `idle` dont les comptes
+    viennent de franchir le seuil n'est pas proposé non plus : la pause n'est
+    écrite qu'au sondage suivant de son exécuteur, et l'attribution le refuse
+    déjà (`work.check_assignee`)."""
     if idle_s <= 0:
         return []
     pressured = pressured or {}
@@ -513,6 +541,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     spared = sorted((row["name"], row.get("host")) for row in idle
                     if row.get("host") in pressured)
     idle = [row for row in idle if row.get("host") not in pressured]
+    # #1021 : la tenue budget/rythme, lue là où l'exécuteur la calcule
+    budget_held = _budget_held(cfg, db, idle)
+    if budget_held:
+        idle = [row for row in idle if row["name"] not in budget_held]
     if not idle:
         return []
     if lots is None:
@@ -542,6 +574,9 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if on_hold:
         parts.append("left out, their host on hold: %s" % ", ".join(
             "%s on %s" % pair for pair in on_hold))
+    if budget_held:
+        parts.append("left out, next turn held: %s" % ", ".join(
+            "%s (%s)" % (name, reason) for name, reason in sorted(budget_held.items())))
     if spared:
         parts.append("left out, their host under pressure: %s" % "; ".join(
             "%s on %s (%s)" % (name, host, ", ".join(
@@ -861,7 +896,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         pressured = {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
-                         pressured=pressured)
+                         pressured=pressured, cfg=cfg)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons)

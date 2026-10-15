@@ -195,12 +195,29 @@ class _Handoff(_Base):
     def lot(self, title, assignee="claude1", *, state="intake", app="nexlink", actor=None,
             **kw):
         kw.setdefault("force", "test: several lots for one agent (#540)")
-        item = work.add(self.db, title=title, app=app, assignee=assignee,
-                        actor=actor or self.orch, **kw)
+        # #1021 : l'API refuse désormais d'attribuer un lot à un agent en tenue
+        # budget/rythme. Ces témoins L233b portent sur un lot attribué AVANT la
+        # pause de son agent — l'état que la reprise doit justement traiter :
+        # l'assigné s'écrit donc directement, comme la création le faisait.
+        item = work.add(self.db, title=title, app=app, actor=actor or self.orch, **kw)
+        if assignee:
+            self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s",
+                            (assignee, item["id"]))
+            item = work.get(self.db, item["id"])
         if state != "intake":
             self.db.execute("UPDATE work_items SET state = %s WHERE id = %s",
                             (state, item["id"]))
         return item
+
+    def force_assign(self, item_id, assignee, *, actor=""):
+        """Réattribution hors garde #1021, pour le même motif : une attribution
+        antérieure à la pause de l'agent (l'API la refuse désormais)."""
+        item = work.get(self.db, item_id)
+        return storage.of(self.db).work.assign(
+            item_id, assignee, current=item.get("assignee"),
+            note="assigned to %s (before: %s)" % (assignee,
+                                                  item.get("assignee") or "nobody"),
+            actor=actor)
 
     def hand(self, **kw):
         kw.setdefault("now", self.now)
@@ -381,7 +398,7 @@ class HandoffTest(_Handoff):
         # réattribué ensuite par l'orchestrateur : la dernière attribution compte
         self.agent("claude2", team="nexlink")
         work.assign(self.db, par_humain["id"], "claude2", actor="human:proprio")
-        work.assign(self.db, par_humain["id"], "claude1", actor=self.orch)
+        self.force_assign(par_humain["id"], "claude1", actor=self.orch)
         self.pause("claude1")
         out = self.hand()
         self.assertEqual([m["item"]["id"] for m in out], [par_humain["id"]])

@@ -473,6 +473,13 @@ def wakeable(db: Db, cfg, name: str) -> tuple[bool, str]:
     momentanément invalide ne doit pas bloquer une attribution ; la
     réclamation, elle, reste fermée tant qu'il n'est pas `ok` (`claim`).
     `wake_status` rend en plus la remarque correspondante.
+
+    #1021 : la tenue budget/rythme n'entre pas ici — elle se juge là où la
+    garde de l'exécuteur la calcule (`account_turn.turn_hold`, sur la ligne du
+    registre et les comptes de l'hôte) et `work.check_assignee` la refuse :
+    un agent réveillable peut être en pause budget, et un lot ne doit pas lui
+    être confié pour autant. `resume`, lui, reste permis (c'est le geste de
+    reprise, la pause se lèvera d'elle-même).
     """
     ok, why, _note = wake_status(db, cfg, name)
     return ok, why

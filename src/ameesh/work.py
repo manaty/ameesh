@@ -623,6 +623,12 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     `human:<id>`, avec un avertissement — `assignee` rendu est alors le nom
     normalisé, à enregistrer. Un canon momentanément invalide ne bloque pas
     l'attribution (avertissement seulement). Les refus disent quoi faire.
+
+    #1021 : un agent réveillable mais en tenue budget/rythme (`account_turn.
+    turn_hold`, la garde de l'exécuteur) est refusé de même : son exécuteur ne
+    lui donnerait pas de tour, le lot dormirait. C'est le point de passage
+    unique des attributions (`work assign`, `work add --assignee`, courrier
+    `--lot`/`--new-lot`, `delegate`, `backlog.auto_take`, `handoff`).
     """
     from . import registry
 
@@ -665,6 +671,21 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
             hint = (" — fix its registration or admission (agent-runner register "
                     "…, canon sync), or assign to a human (human:<id>)")
         raise WorkError("assignment refused: %s%s" % (why, hint))
+    # #1021 : réveillable ne suffit pas — un agent en tenue budget/rythme ou
+    # en échec d'authentification ne sera pas réveillé par son exécuteur et le
+    # lot dormirait (#885/#886/#967, confiés à des agents Codex en pause
+    # budget). Un agent arrêté garde son avertissement : l'arrêt est un geste
+    # humain, réversible, pas une tenue.
+    if row.get("status") not in ("stopped", "dead"):
+        from . import account_turn
+
+        hold = account_turn.turn_hold(cfg, db, name, row)
+        if hold:
+            raise WorkError(
+                "assignment refused: %s is held — %s; its runner will not start a "
+                "turn before the hold lifts: wait for the release, assign another "
+                "agent, or leave the lot unassigned (the team queue takes it)"
+                % (name, hold))
     warnings = []
     if row.get("status") == "stopped":
         warnings.append("%s is stopped (%s): the lot will wait for it to resume"
