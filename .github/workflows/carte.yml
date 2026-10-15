@@ -98,7 +98,11 @@ jobs:
         run: |
           python -m venv .venv-carte
           if [ "$AMEESH_DRIVER" = psycopg ]; then
-            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            # #1476 : PyYAML est la dépendance des tests qui lisent
+            # deploy/k8s (tests/test_cluster.py, ManifestesTest) ; sans elle,
+            # ces manifestes n'étaient lus par aucun test mesuré et un diff
+            # qui les touchait renvoyait le lot à la suite complète.
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'pyyaml>=6'
           else
             .venv-carte/bin/pip install -q 'coverage>=7.10'
           fi
