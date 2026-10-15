@@ -6609,7 +6609,10 @@ class Runner:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
         sa cible, avec ou sans PR, fait passer son lot livré
-        (`plan_git.sync_branches`). Sa propre connexion ; ne lève jamais."""
+        (`plan_git.sync_branches`). Le passage du feu (#1374, `fire.run_pass`)
+        suit : il arme l'auto-fusion des lots qui portent un feu du pilote et
+        réconcilie les PR fusionnées, avant l'atterrissage de la file
+        (`radar_once`). Sa propre connexion ; ne lève jamais."""
         from . import plan_git
         db = None
         try:
@@ -6623,6 +6626,7 @@ class Runner:
                     log_async("work item #%s delivered: %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.fire_once(db)
             if not self.dry_run:
                 self.measure_once(db)
                 self.lot_sessions_purge(db)
@@ -6640,6 +6644,23 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def fire_once(self, db) -> None:
+        """#1374 : le passage du feu du pilote — arme l'auto-fusion des lots
+        couverts par le gel courant et dont les portes sont vertes, invalide un
+        feu dont la tête a bougé, réconcilie une PR fusionnée. Ne lève jamais :
+        un feu raté est retenté au passage suivant."""
+        from . import fire
+        try:
+            report = fire.run_pass(self.cfg, db, dry_run=self.dry_run)
+            for entry in report:
+                if entry.get("result") in fire.LOUD:
+                    log_async("fire: lot #%s %s%s" % (
+                        entry["lot"], entry["result"],
+                        " — %s" % (entry.get("detail") or entry.get("error"))
+                        if entry.get("detail") or entry.get("error") else ""))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("fire pass failed (%s: %s)" % (type(exc).__name__, exc))
 
     def measure_once(self, db) -> None:
         """L157c: measures the lots delivered since the last sweep (phases,
