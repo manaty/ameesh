@@ -17,6 +17,11 @@ from ameesh import canon, oidc, p256
 from .test_canon import _TmpMixin, fiche, write
 from .webauthn_soft import SoftES256Key
 
+#: RS256 passe par l'extra `crypto` (optionnel) : sans lui, ces témoins ne
+#: s'exécutent pas (la CI l'installe ; le refus explicite a son propre témoin)
+_AVEC_CRYPTO = unittest.skipUnless("cryptography" in p256.available_backends(),
+                                   "extra `crypto` absent (cryptography)")
+
 ISS = "https://idp.exemple.org"
 CLIENT = "ameesh-approve"
 #: DigestInfo DER de SHA-256 (RFC 8017 §9.2) — la signature des tests reste
@@ -129,11 +134,13 @@ class VerificationTest(unittest.TestCase):
     def verifier(self, token, **kw):
         return oidc.verify(token, self.p, cache=self.cache, **kw)
 
+    @_AVEC_CRYPTO
     def test_rs256_et_es256(self):
         self.assertEqual(self.verifier(jeton(self.rsa, "RS256"))["sub"], "123")
         self.assertEqual(self.verifier(jeton(self.ec, "ES256"))["email"], "alice@exemple.org")
         self.assertEqual(self.fournisseur.appels, 2)          # découverte et JWKS, en cache
 
+    @_AVEC_CRYPTO
     def test_refus(self):
         cas = {
             "signature invalide": jeton(self.rsa, "RS256")[:-6] + "AAAAAA",
@@ -156,22 +163,26 @@ class VerificationTest(unittest.TestCase):
             with self.assertRaises(oidc.OidcError):
                 self.verifier(head + "." + body + "." + b64u(b"x"))
 
+    @_AVEC_CRYPTO
     def test_domaine_google_hd(self):
         claims = self.verifier(jeton(self.rsa, "RS256", hd="exemple.org",
                                      email="alice@gmail.com", email_verified=False))
         self.assertEqual(claims["hd"], "exemple.org")
 
+    @_AVEC_CRYPTO
     def test_audiences_multiples_exigent_azp(self):
         with self.assertRaises(oidc.OidcError):
             self.verifier(jeton(self.rsa, "RS256", aud=[CLIENT, "x"]))
         self.verifier(jeton(self.rsa, "RS256", aud=[CLIENT, "x"], azp=CLIENT))
 
+    @_AVEC_CRYPTO
     def test_nonce(self):
         token = jeton(self.rsa, "RS256", nonce="n1")
         self.verifier(token, nonce="n1")
         with self.assertRaises(oidc.OidcError):
             self.verifier(token, nonce="n2")
 
+    @_AVEC_CRYPTO
     def test_rotation_des_cles(self):
         self.verifier(jeton(self.rsa, "RS256"))
         nouvelle = _CleEC(kid="ec2")
@@ -180,9 +191,11 @@ class VerificationTest(unittest.TestCase):
         with self.assertRaises(oidc.OidcError):
             self.verifier(jeton(_CleEC(kid="fantome"), "ES256"))
 
+    @_AVEC_CRYPTO
     def test_cle_rsa_trop_courte(self):
         self.assertFalse(oidc.rsa_verify(2 ** 1023 + 1, 65537, b"m", b"\x00" * 128))
 
+    @_AVEC_CRYPTO
     def test_fournisseur_avec_chemin_supabase(self):
         """Un issuer qui porte un chemin (`/auth/v1`, Supabase) est suivi tel quel."""
         iss = "https://ref.supabase.co/auth/v1"
@@ -278,6 +291,7 @@ class VerificationTest(unittest.TestCase):
         verifier_avec(base)                                            # métadonnées absentes
         verifier_avec(dict(base, use="sig", key_ops=["verify"], alg="ES256"))
 
+    @_AVEC_CRYPTO
     def test_extension_critique_refusee(self):
         """R1 B4 : tout `crit` (même mal formé) refuse le jeton avant validation."""
         for crit in (["must_reject"], "must_reject", [], {}, 3):
