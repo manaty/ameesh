@@ -2,6 +2,7 @@
 """Release pinning through the real dispatcher, with isolated fake migrations."""
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# poste.sh « sauvegarder » exécute sauvegarder-prive.py, qui parle psycopg : la
+# part psql de la CI n'en a pas, ces deux témoins y sont sautés et couverts par
+# la part psycopg (même règle que test_653_db_connections).
+HAVE_PSYCOPG = importlib.util.find_spec("psycopg") is not None
 FAKE_MODULE = '''import json, os, sys
 from pathlib import Path
 args = sys.argv[1:]
@@ -132,16 +137,22 @@ class MigrationPinningTest(unittest.TestCase):
             {"release": "C", "args": ["migrate", "--additive-only"]},
         ])
 
+    @unittest.skipUnless(HAVE_PSYCOPG,
+                         "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")
     def test_failed_backup_start_is_propagated(self):
         done = self.run_script("sauvegarder", BACKUP_START_STATUS="42")
         self.assertEqual(done.returncode, 42, done.stdout + done.stderr)
 
+    @unittest.skipUnless(HAVE_PSYCOPG,
+                         "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")
     def test_completed_backup_result_and_exit_status_are_required(self):
         for env in ({"BACKUP_RESULT": "exit-code"}, {"BACKUP_EXIT_STATUS": "1"}):
             with self.subTest(env=env):
                 done = self.run_script("sauvegarder", **env)
                 self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
 
+    @unittest.skipUnless(HAVE_PSYCOPG,
+                         "psycopg absent (part psql) : sauvegarder-prive.py non exécutable")
     def test_successful_oneshot_does_not_require_active_state(self):
         done = self.run_script("sauvegarder")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
