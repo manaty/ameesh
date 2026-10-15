@@ -100,6 +100,8 @@ def live_fleet(db, now: float, host: str | None = None) -> dict:
         return {}
     fleet = {}
     for row in rows:
+        if row.get("status") == "stopped" or row.get("mode") == "externe":
+            continue
         expires = row.get("lease_expires_ts")
         if not row.get("lease_owner") or expires is None:
             continue
@@ -120,9 +122,20 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
     used = 0.0
     measured = []
     for profile in items:
+        if profile.kind == "api_key_env":
+            continue  # une clé API ne constitue pas une capacité de forfait
         # seuil des non-critiques : la réserve reste aux agents critiques (L242b)
         result = accounts.evaluate(book, profile, items, now, record=False, reserve=True)
-        if result.problems or result.hard:
+        if not result.ok or result.hard:
+            continue
+        # Une fenêtre échue ne mesure pas la suivante, et une courte échue
+        # invalide la longue encore ouverte (#1561). L'affichage ne promet
+        # rien sans une marge courante, même si la garde autorise un essai.
+        if any(g.reset_passed(now) for g in result.gauges):
+            continue
+        stamps = [stamp for g in result.gauges
+                  if (stamp := getattr(g, "read_at", None)) is not None]
+        if stamps and now - min(stamps) > min(g.window_s for g in result.gauges):
             continue
         long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
         if not long:
@@ -163,11 +176,21 @@ def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = No
     if fleet is None:
         fleet = live_fleet(db, now, getattr(cfg, "host", None))
     agents = {name: harness for name, harness in fleet.items() if harness}
-    kept_names = set(critical or getattr(cfg, "critical_agents", ()) or ())
+    kept_names = set(critical) | set(getattr(cfg, "critical_agents", ()) or ())
     candidates = sorted(name for name, harness in agents.items()
                         if harness in billed and name not in kept_names)
     if not candidates:
         return Proposal(reason="no usage-billed agent to move")
+    # Même définition des critiques que l'exécuteur (L242b), y compris les
+    # rôles au canon propriétaire et les orchestrateurs déclarés.
+    from . import auditor, sous_utilisation
+    try:
+        canons = auditor.load_all(cfg)
+        declared_critical = sous_utilisation.declared_orchestrators()
+        candidates = [name for name in candidates if not auditor.is_critical(
+            cfg, db, name, canons, declared=declared_critical)]
+    except Exception:  # noqa: BLE001 - rôles illisibles : aucune proposition
+        return Proposal(reason="critical agent roles unknown")
     # ne jamais vider une famille : la relecture croisée (canon §2) suppose au
     # moins deux familles représentées après la bascule
     kept = 0
