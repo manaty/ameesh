@@ -32,7 +32,7 @@ _ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
-    name, chantier, harness, host, cwd, session_id, status, status_text, model,
+    name, aliases, chantier, harness, host, cwd, session_id, status, status_text, model,
     budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     lease_owner, lease_epoch,
     extract(epoch from lease_wait_since)::float8 as lease_wait_since_ts,
@@ -305,9 +305,14 @@ class Agents(interface.Agents):
         return rows[0]
 
     def get(self, name) -> dict | None:
-        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = %%s" % AGENT_COLUMNS,
-                             (name,))
+        rows = self.db.query("SELECT %s FROM agent_registry WHERE name = "
+                             "(SELECT ameesh_resolve_agent_name(%%s, %%s))" % AGENT_COLUMNS,
+                             (name, "agents.get"))
         return rows[0] if rows else None
+
+    def resolve_name(self, name, *, operation="lookup") -> str:
+        return self.db.query("SELECT ameesh_resolve_agent_name(%s, %s) AS name",
+                             (name, operation))[0]["name"]
 
     def harnesses(self) -> dict[str, str]:
         rows = self.db.query("SELECT name, harness FROM agent_registry")
@@ -316,7 +321,8 @@ class Agents(interface.Agents):
     def overview(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
+            SELECT name, (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
+                   chantier, harness, host, cwd, session_id, status, status_text,
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
@@ -649,9 +655,9 @@ class Leases(interface.Leases):
     def state(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT lease_owner, lease_epoch, status,
+            SELECT name, lease_owner, lease_epoch, status,
                    (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
-              FROM agent_registry WHERE name = %s
+              FROM agent_registry WHERE name = (SELECT ameesh_resolve_agent_name(%s, 'registry.lease_matches'))
             """,
             (name,),
         )
