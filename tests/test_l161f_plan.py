@@ -1310,18 +1310,112 @@ def _run_bodies(text: str) -> list[str]:
 
 
 _BRANCH_REF = re.compile(r"github\.(base|head)_ref")
-_BRANCH_REF_ENV = re.compile(r"^\s+[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}$")
+_BRANCH_REF_ENV = re.compile(
+    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+_ANY_KEY = re.compile(
+    r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
+_ITEM = re.compile(r"^(?:&[A-Za-z0-9_.-]+\s*)?(?:#.*)?$|^[A-Za-z0-9_.-]+:(?:\s|$)")
 
 
-def _branch_ref_lines_outside_env(text: str) -> list[str]:
-    """Lines naming a branch other than as `NAME: ${{ github.<x>_ref }}`.
+def _dash_column(line: str) -> int | None:
+    col = len(line) - len(line.lstrip(" "))
+    return col if line[col:].startswith("- ") or line[col:] == "-" else None
 
-    #1247 R2: the forms `_run_bodies` does not parse (flow mapping, quoted
-    key, `run :`) cannot hide a branch name either: outside the environment
-    variable that carries it, alone on its line, any mention fails.
+
+def _left_open(content: str) -> bool:
+    """Does a quoted scalar or a flow collection go on past this line?"""
+    depth, quote, i = 0, None, 0
+    while i < len(content):
+        char, before = content[i], content[:i].rstrip()
+        start = not before or before[-1] in "[{," or (
+            before[-1] in ":-?" and len(before) < i)
+        if quote == '"':
+            if char == "\\":
+                i += 1
+            elif char == '"':
+                quote = None
+        elif quote == "'":
+            if content[i:i + 2] == "''":
+                i += 1
+            elif char == "'":
+                quote = None
+        elif char == "#" and (i == 0 or content[i - 1] in " \t"):
+            break
+        elif char in "\"'" and (start or depth):
+            quote = char
+        elif char in "{[" and (start or depth):
+            depth += 1
+        elif char in "}]" and depth:
+            depth -= 1
+        i += 1
+    return quote is not None or depth > 0
+
+
+def _structural_lines(lines: list[str]) -> set[int]:
+    """Lines that are YAML structure, outside every block scalar body."""
+    keep, i = set(), 0
+    while i < len(lines):
+        keep.add(i)
+        dash, col = _dash_column(lines[i]), _key_column(lines[i])
+        content = lines[i][col:]
+        match = _ANY_KEY.match(content)
+        _, rest = _node_properties((match.group("rest") if match else content).strip())
+        if _block_header(rest):
+            _, i = _block_body(lines, i, col if match or dash is None else dash)
+        else:
+            i += 1
+    return keep
+
+
+def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a key of an `env:` mapping, itself under mapping keys only?
+
+    Every ancestor must be a bare block key (or a sequence item that opens a
+    mapping): a scalar on the way (block, quoted, flow, plain) would make the
+    line its text, not an environment variable.
     """
-    return [line for line in text.splitlines()
-            if _BRANCH_REF.search(line) and not _BRANCH_REF_ENV.match(line)]
+    col, first = _key_column(lines[k]), True
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if key < col:
+            if not _BARE_KEY.match(line[key:]) or (
+                    first and line[key:].split(":", 1)[0] != "env"):
+                return False
+        elif dash is not None and dash < col:
+            if first or not _ITEM.match(line[key:]):
+                return False
+        else:
+            continue
+        first, col = False, key if dash is None else dash
+    return not first
+
+
+def _branch_ref_escapes(text: str) -> list[str]:
+    """Lines where a branch name could reach something other than `env:`.
+
+    #1247 R2: `_run_bodies` does not parse every form (quoted key, `run :`,
+    flow mapping), so the witness also closes on the structure: a branch name
+    is only allowed as `NAME: ${{ github.<x>_ref }}` in a real `env:`
+    mapping, and no quoted scalar or flow collection may go on past its line
+    (a YAML loader ignores indentation inside them).
+    """
+    lines = text.splitlines()
+    structural = _structural_lines(lines)
+    escapes = []
+    for k, line in enumerate(lines):
+        col = _key_column(line)
+        if k in structural and _left_open(line[col:]):
+            escapes.append(line)
+        elif _BRANCH_REF.search(line) and not (
+                k in structural and _dash_column(line) is None
+                and _BRANCH_REF_ENV.match(line[col:])
+                and _under_env(lines, k, structural)):
+            escapes.append(line)
+    return escapes
 
 
 class RunBodiesTest(unittest.TestCase):
@@ -1374,22 +1468,51 @@ class RunBodiesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _run_bodies(text)
 
-    def test_unparsed_forms_fail_the_branch_ref_lines(self):
-        for line in ('      - {name: x, run: "echo ${{ github.base_ref }}"}',
-                     '      - "run": echo ${{ github.head_ref }}',
-                     '      - run : echo ${{ github.base_ref }}',
-                     '      - &cmd |',
-                     '        echo "${{ github.base_ref }}"',
-                     '          BASE_REF: ${{ github.base_ref }} # x',
-                     '          run: ${{ github.head_ref }}'):
-            text = f"jobs:\n  a:\n    steps:\n{line}\n"
-            with self.subTest(line=line):
-                self.assertEqual(
-                    [line] if _BRANCH_REF.search(line) else [],
-                    _branch_ref_lines_outside_env(text))
-        self.assertEqual([], _branch_ref_lines_outside_env(
-            "    env:\n      BASE_REF: ${{ github.base_ref }}\n"
-            "      HEAD_REF: ${{ github.head_ref }}\n"))
+    def test_branch_ref_only_in_a_real_env_mapping(self):
+        # #1247 R2 (B1 mesh-design, qa01): the form of the line is not enough,
+        # it must be a key of a real `env:` mapping; and no quoted scalar or
+        # flow collection may go on past its line (a YAML loader reads it
+        # whatever the indentation of the next lines).
+        steps = "jobs:\n  a:\n    steps:\n"
+        escapes = {
+            "quoted run key": '      - "run": |\n'
+                              '          BASE_REF: ${{ github.base_ref }}\n',
+            "space before colon": '      - run : |\n'
+                                  '          HEAD_REF: ${{ github.head_ref }}\n',
+            "flow mapping": '      - {run: "echo start\n'
+                            '          BASE_REF: ${{ github.base_ref }}"}\n',
+            "quoted scalar over env": '      - name: s\n        run: "echo\n'
+                                      '        env:\n'
+                                      '          BASE_REF: ${{ github.base_ref }}"\n',
+            "flow mapping over env": '      - {name: s, run: "echo\n    env:\n'
+                                     '      BASE_REF: ${{ github.base_ref }}"}\n',
+            "env inside a block": '      - "run": |\n          env:\n'
+                                  '            BASE_REF: ${{ github.base_ref }}\n',
+            "block sequence item": '      - |\n        env:\n'
+                                   '          BASE_REF: ${{ github.base_ref }}\n',
+            "explicit key": '      - ? run\n        : |\n'
+                            '          BASE_REF: ${{ github.base_ref }}\n',
+            "inline mention": '      - {name: x, run: "echo ${{ github.base_ref }}"}\n',
+            "run value": '      - run: ${{ github.head_ref }}\n',
+        }
+        for name, step in escapes.items():
+            with self.subTest(name=name):
+                self.assertNotEqual([], _branch_ref_escapes(steps + step))
+        allowed = {
+            "step env, comments": '      - name: s\n        env:  # x\n'
+                                  '          BASE_REF: ${{ github.base_ref }}  # y\n'
+                                  '        run: echo "$BASE_REF"\n',
+            "anchored step": '      - &s\n        name: s\n        env:\n'
+                             '          HEAD_REF: ${{ github.head_ref }}\n',
+            "env first in the item": '      - env:\n'
+                                     '          BASE_REF: ${{ github.base_ref }}\n',
+        }
+        for name, step in allowed.items():
+            with self.subTest(name=name):
+                self.assertEqual([], _branch_ref_escapes(steps + step))
+        self.assertEqual([], _branch_ref_escapes(
+            "env:\n  BASE_REF: ${{ github.base_ref }}\n"
+            "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
 
     def test_block_headers_indicators_and_comment(self):
         text = textwrap.dedent("""\
@@ -1559,7 +1682,7 @@ class WorkflowTest(unittest.TestCase):
         for body in _run_bodies(self.text):
             self.assertNotIn("github.base_ref", body)
             self.assertNotIn("github.head_ref", body)
-        self.assertEqual([], _branch_ref_lines_outside_env(self.text))
+        self.assertEqual([], _branch_ref_escapes(self.text))
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
