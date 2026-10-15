@@ -1498,10 +1498,11 @@ class AgentWorker(threading.Thread):
             rp = self.resident
         if rp is None:
             return ""
+        rotate = self.session_policy() != "jamais"
         return rp.maintenance_due(
-            cap=self.context_max_tokens(),
+            cap=self.context_max_tokens() if rotate else 0,
             reread_max=resident_runner.reread_max(
-                self._state_read(resident_runner.REREAD_MAX_SETTING)))
+                self._state_read(resident_runner.REREAD_MAX_SETTING)) if rotate else 0)
 
     def _humain_recent(self, quiet: float | None = None) -> bool:
         """L81 (étude §6.3) : un message humain en attente depuis moins de

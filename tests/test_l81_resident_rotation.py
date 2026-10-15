@@ -278,6 +278,20 @@ class ResidentRotationTest(PgTestCase):
         self.assertTrue(worker.maybe_rotate())
         self.assertIsNone(worker.resident)
 
+    def test_never_policy_disables_rotation_but_keeps_native_compaction(self):
+        _runner, worker = self._worker(resident_reread_max="100")
+        self.assertTrue(self._turn(worker, "premier"))
+        rp = worker.resident
+        with mock.patch.object(worker, "session_policy", return_value="jamais"):
+            for cap in (0, 100):
+                with self.subTest(cap=cap), mock.patch.object(
+                        worker, "context_max_tokens", return_value=cap):
+                    self.assertEqual(worker._resident_maintenance(), "")
+                    self.assertFalse(worker.maybe_rotate())
+                    self.assertIs(worker.resident, rp)
+            rp.last_context, rp.context_window = 600, 1000
+            self.assertEqual(worker._resident_maintenance(), resident_runner.COMPACT)
+
     def test_half_the_window_compacts_between_two_turns(self):
         with mock.patch.dict(os.environ, {"FAKE_CLAUDE_CONTEXT": "600",
                                           "FAKE_CLAUDE_WINDOW": "1000"}):
