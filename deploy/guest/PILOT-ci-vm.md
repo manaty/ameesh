@@ -63,8 +63,7 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
 
 * **Windows.** The VM lends nothing from 30 min before each cut-off to
   2 h after it: 10:30–13:00 and 22:30–01:00, Paris time, every day (the
-  zone follows summer time). A package CI that runs longer than 2 h still
-  takes the VM back through `busy_units`.
+  zone follows summer time).
 * **No `busy_units`.** The runners' services `actions.runner.*` stay
   active between jobs: counting them counts installed runners, not running
   jobs, and with more runners than `busy_max` the gate would never open. A
