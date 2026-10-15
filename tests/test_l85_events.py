@@ -166,6 +166,7 @@ class EventLogPgTest(PgTestCase):
         holds under it: a delivered prefix, in order, and the announced wait.
         """
         deadline = time.monotonic() + timeout
+        unheld = 0
         while True:
             rows, waiting = store.readable(position, limit)
             got = [r["object"] for r in rows]
@@ -175,7 +176,20 @@ class EventLogPgTest(PgTestCase):
             self.assertEqual(waiting, "xmin")
             self.assertEqual(got, expected[:len(got)])   # a prefix, in order
             if time.monotonic() >= deadline:
-                return rows
+                # The prefix is accepted only while a transaction REALLY
+                # holds the next event (cluster xmin at or below its tx): a
+                # reader that keeps announcing "xmin" over nothing is stuck,
+                # and that is the regression these tests exist for (R2 dev1).
+                last = (int(rows[-1]["tx"]), int(rows[-1]["id"])) if rows else position
+                held = self.db.query(
+                    "select coalesce(pg_snapshot_xmin(pg_current_snapshot()) <= min(tx),"
+                    " false)::int as held from ameesh_events"
+                    " where (tx, id) > (%s::text::xid8, %s)",
+                    (str(int(last[0])), int(last[1])))[0]["held"]
+                if int(held):
+                    return rows
+                unheld += 1                              # the holder may just have ended
+                self.assertLess(unheld, 3, "readable() announces xmin, nothing holds it")
             time.sleep(0.1)
 
     def test_lot_events_carry_the_project(self):
