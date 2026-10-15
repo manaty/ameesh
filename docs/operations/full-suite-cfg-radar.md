@@ -162,9 +162,19 @@ dans ce profil — dans les deux si plusieurs acteurs peuvent lancer la porte.
 Le §5 (sauvegarde, fusion, validation) se fait sur ce même fichier, et le §5.3
 se lance avec le même `AMEESH_CONFIG`.
 
-La clé `radar` existe probablement déjà (c'est l'hôte désigné du radar de
-conflits) : **ajouter** `github` et `full_suite` aux projets existants, sans
-écraser `migrations`, `target`, `land`, `gates` ni `merge_method`.
+**Relevé pilote du 15/10 21:5xZ** : les fichiers `AMEESH_CONFIG` observés sur
+pc sont `runner-profiles/critiques-2.json` et
+`runner-profiles/relecteurs-codex1.json`, et la clé `radar` y est **absente**
+(`~/.config/ameesh/config.json` également d'après le relevé). L'opérateur
+`ameesh-dev1` relève donc sur l'hôte le profil du **vrai exécutant** qui lance
+la porte, plutôt que de considérer tous les profils, et confirme la présence ou
+l'absence de `radar` **avant d'écrire**.
+
+Si la clé `radar` est absente du fichier retenu, **ajouter le bloc `radar`
+complet** (§3.1 ci-dessous, `projects` avec les deux projets) ; si elle existe,
+**ajouter** `github` et `full_suite` aux projets existants, sans écraser
+`migrations`, `target`, `land`, `gates` ni `merge_method`. Dans les deux cas le
+reste du fichier est conservé tel quel.
 
 ```json
 "radar": {
@@ -361,9 +371,13 @@ dépôt, aucun geste GitHub.
   vérification `mty-amh-qa-01`, §3.2 (VM) hors périmètre ; déploiement
   **fait sur `ameesh-agents-1`** (relevé 21:41Z, `'full_suite' in
   radar.PROJECT_KEYS` → `True` avec l'interpréteur de l'exécuteur) ; **encore
-  à faire sur `pc-smichea`** (relevé 21:5xZ, `ameesh 1.11.1`). Chemins de
-  pc-smichea : pas de clone partagé unique, `repo` = clone de l'acteur qui
-  lance la porte, à relever (§3).
+  à faire sur `pc-smichea`** (relevé 21:5xZ, `ameesh 1.11.1`). Fichiers
+  `AMEESH_CONFIG` observés sur pc : `runner-profiles/critiques-2.json` et
+  `runner-profiles/relecteurs-codex1.json`, clé `radar` absente
+  (`~/.config/ameesh/config.json` également d'après le relevé) — l'opérateur
+  relève le profil du vrai exécutant avant d'écrire. Chemins de pc-smichea :
+  pas de clone partagé unique, `repo` = clone de l'acteur qui lance la porte,
+  à relever (§3).
 * **Mise à jour du 2026-10-15 22:0xZ** (qa-01) : runbook aligné sur ce
   périmètre (pc seul, §3.2 hors périmètre, chemins/acteurs, prérequis pc
   ouvert) ; branche rebasée sur `main` `b63e0bae` ; **aucune CI** (docs seuls),
