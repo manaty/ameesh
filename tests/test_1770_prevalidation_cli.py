@@ -48,14 +48,18 @@ def params(**over) -> SimpleNamespace:
 
 
 def flux(statut: str = "succes", module: str = "test_a") -> str:
-    return "\n".join([
-        pv.PART_MARK + "psycopg:1",
-        json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
-                    "part": "psycopg:1", "module": module, "test": "test_x",
-                    "statut": "succes"}),
-        json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
-                    "part": "psycopg:1", "statut": statut, "duree_s": 1.2}),
-    ]) + "\n" + pv.SECONDS_MARK + "42\n"
+    """Le flux complet de `plan_canon()` : sa part unique et ses deux modules."""
+    modules = [module] if module else []
+    if module == "test_a":
+        modules = ["test_a", "test_cluster"]
+    lignes = [pv.PART_MARK + "psycopg:1"]
+    for nom in modules:
+        lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                                  "part": "psycopg:1", "module": nom, "test": "test_x",
+                                  "statut": "succes"}))
+    lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                              "part": "psycopg:1", "statut": statut, "duree_s": 1.2}))
+    return "\n".join(lignes) + "\n" + pv.SECONDS_MARK + "42\n"
 
 
 class _Proc:
@@ -68,6 +72,22 @@ class _Proc:
 def runner_for(returncode: int = 0, stdout: str = ""):
     def run(argv, **kwargs):
         return _Proc(returncode, stdout)
+    return run
+
+
+def git_runner_for(head: str = A, porcelain: str = "", ls_remote: str = "",
+                   ignored: bool = False):
+    """Un `git` simulé : rev-parse, status, check-ignore et ls-remote."""
+    def run(argv, **kwargs):
+        if "rev-parse" in argv:
+            return _Proc(0, (head + "\n") if head else "")
+        if "status" in argv:
+            return _Proc(0, porcelain)
+        if "check-ignore" in argv:
+            return _Proc(0 if ignored else 1, "")
+        if "ls-remote" in argv:
+            return _Proc(0, ls_remote)
+        return _Proc(0, "")
     return run
 
 
@@ -103,6 +123,49 @@ class MeetsCanonTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class ContractContentTest(unittest.TestCase):
+    """Les contrats déclarés se relisent : leur contenu lie la sélection.
+
+    Repro cx1 : un fichier de contrat nommant un module absent du plan ne peut
+    pas rendre la sélection « sûre » — le canon déclare une garantie que le
+    plan n'exécute pas."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _file(self, name: str, text: str) -> str:
+        with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return name
+
+    def test_contrat_declare_non_selectionne_refuse(self):
+        name = self._file("contrats.txt", "test_mandatory  # garanti par le bloc\n")
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)), self.tmp.name)
+        self.assertFalse(ok)
+        self.assertIn("test_mandatory", why)
+        self.assertIn("absents de la sélection", why)
+
+    def test_contrat_invente_par_le_plan_refuse(self):
+        """Le plan compte `test_cluster` en contrat : le fichier ne le dit pas."""
+        name = self._file("contrats.txt", "test_a  # pas un contrat, juste un module\n")
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)), self.tmp.name)
+        self.assertFalse(ok)
+        self.assertIn("hors des fichiers déclarés", why)
+
+    def test_contrat_declare_selectionne_accepte(self):
+        name = self._file("contrats.txt",
+                          "test_cluster  # rôles du cluster\n# ligne de commentaire\n")
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=(name,)), self.tmp.name)
+        self.assertTrue(ok, why)
+
+    def test_contrat_illisible_refuse(self):
+        ok, why = pv.meets_canon(plan_canon(), params(contracts=("absent.txt",)),
+                                 self.tmp.name)
+        self.assertFalse(ok)
+        self.assertIn("illisible", why)
+
+
 class PublishedHeadTest(unittest.TestCase):
     def test_tete_lue_au_distant(self):
         got = pv.published_head("lot/x", runner=runner_for(
@@ -131,12 +194,15 @@ class ValidateTest(unittest.TestCase):
     def test_vert_avec_hote_et_delai_du_canon(self):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
-                             runner=runner_for(0, flux()))
+                             runner=runner_for(0, flux()),
+                             git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["causes"], [])
         self.assertEqual(report["host"], "vm1")
         self.assertEqual(report["seconds"], 42.0)
         self.assertIn("test_a", report["modules"])
+        # l'arbre vérifié est recopié dans le rapport
+        self.assertEqual(report["tree"], {"head": A, "clean": True})
 
     def test_lanceur_de_part_du_bloc_dans_la_commande(self):
         """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""
@@ -148,7 +214,8 @@ class ValidateTest(unittest.TestCase):
 
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(parts_script="tools/parts.py"),
-                             repo=self.tmp.name, runner=capture)
+                             repo=self.tmp.name, runner=capture,
+                             git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         command = " ".join(seen[0])
         self.assertIn("tools/parts.py run --plan", command)
@@ -163,37 +230,131 @@ class ValidateTest(unittest.TestCase):
             return _Proc(0, flux())
 
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
-                             params=params(), repo=self.tmp.name, runner=capture)
+                             params=params(), repo=self.tmp.name, runner=capture,
+                             git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         self.assertIn(pv.DEFAULT_PARTS_SCRIPT, " ".join(seen[0]))
+
+    def test_offload_recu_l_arbre_du_repo_et_le_plan_relatif(self):
+        """Le snapshot, c'est `--repo`, et le plan y est embarqué en relatif."""
+        seen: list = []
+
+        def capture(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return _Proc(0, flux())
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name, runner=capture,
+                             git_runner=git_runner_for())
+        self.assertTrue(report["ok"], report)
+        argv, kwargs = seen[0]
+        self.assertEqual(kwargs.get("cwd"), os.path.abspath(self.tmp.name))
+        command = " ".join(argv)
+        self.assertIn("--plan plan.json", command)
+        self.assertNotIn(self.tmp.name, command)
 
     def test_hote_hors_canon_refuse(self):
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="pc-smichea",
                         params=params(), repo=self.tmp.name,
-                        runner=runner_for(0, flux()))
+                        runner=runner_for(0, flux()), git_runner=git_runner_for())
         self.assertEqual(caught.exception.cause, "no-vm")
 
     def test_contrat_declare_introuvable_refuse(self):
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                         params=params(contracts=("tests/parts/toujours.txt",)),
-                        repo=self.tmp.name, runner=runner_for(0, flux()))
+                        repo=self.tmp.name, runner=runner_for(0, flux()),
+                        git_runner=git_runner_for())
         self.assertEqual(caught.exception.cause, "selection-unsafe")
+
+    def test_arbre_a_une_autre_tete_refuse(self):
+        """Le snapshot ne porte pas le SHA annoncé : rien ne se prouve."""
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                        params=params(), repo=self.tmp.name,
+                        runner=runner_for(0, flux()),
+                        git_runner=git_runner_for(head=B))
+        self.assertEqual(caught.exception.cause, "head-moved")
+        self.assertIn("arbre à", caught.exception.why)
+
+    def test_arbre_modifie_refuse(self):
+        """Une modification suivie partirait sur la VM : refus."""
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                        params=params(), repo=self.tmp.name,
+                        runner=runner_for(0, flux()),
+                        git_runner=git_runner_for(porcelain=" M src/ameesh/x.py\n"))
+        self.assertEqual(caught.exception.cause, "head-moved")
+        self.assertIn("modifié", caught.exception.why)
+
+    def test_plan_ignore_par_git_refuse(self):
+        """Un plan ignoré n'est pas transporté : refus avant le run."""
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                        params=params(), repo=self.tmp.name,
+                        runner=runner_for(0, flux()),
+                        git_runner=git_runner_for(ignored=True))
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.assertIn("ignoré", caught.exception.why)
+
+    def test_plan_hors_de_l_arbre_refuse(self):
+        """Un plan hors du snapshot n'existe pas dans le checkout distant."""
+        with tempfile.TemporaryDirectory() as autre:
+            ailleurs = os.path.join(autre, "plan.json")
+            with open(ailleurs, "w", encoding="utf-8") as fh:
+                json.dump(plan_canon(), fh)
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                pv.validate(lot=1770, plan_path=ailleurs, head=A, host="vm1",
+                            params=params(), repo=self.tmp.name,
+                            runner=runner_for(0, flux()),
+                            git_runner=git_runner_for())
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.assertIn("hors de l'arbre", caught.exception.why)
+
+    def test_tete_locale_bougee_pendant_le_run_invalide(self):
+        """L'arbre a bougé pendant l'exécution : le rapport ne vaut rien."""
+        appels = {"rev": 0}
+
+        def git(argv, **kwargs):
+            if "rev-parse" in argv:
+                appels["rev"] += 1
+                return _Proc(0, (A if appels["rev"] == 1 else B) + "\n")
+            return git_runner_for()(argv, **kwargs)
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name,
+                             runner=runner_for(0, flux()), git_runner=git)
+        self.assertFalse(report["ok"])
+        self.assertIn("head-moved", report["causes"])
 
     def test_rouge_ne_produit_pas_de_vert(self):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
-                             runner=runner_for(1, flux("echec")))
+                             runner=runner_for(1, flux("echec")),
+                             git_runner=git_runner_for())
         self.assertFalse(report["ok"])
         self.assertIn("run-red", report["causes"])
+
+    def test_part_sans_fin_ne_produit_pas_de_vert(self):
+        """Une part muette (pas de fin) : incomplet, jamais vert."""
+        sans_fin = "\n".join(
+            ligne for ligne in flux().splitlines()
+            if '"type": "fin"' not in ligne)
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name,
+                             runner=runner_for(0, sans_fin + "\n" + pv.SECONDS_MARK + "9\n"),
+                             git_runner=git_runner_for())
+        self.assertFalse(report["ok"])
+        self.assertIn("run-incomplete", report["causes"])
 
     def test_tete_publiee_changee_invalide(self):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
                              published_ref="lot/x",
                              runner=runner_for(0, flux()),
-                             git_runner=runner_for(0, "%s\trefs/heads/lot/x\n" % C))
+                             git_runner=git_runner_for(
+                                 ls_remote="%s\trefs/heads/lot/x\n" % C))
         self.assertFalse(report["ok"])
         self.assertIn("head-moved", report["causes"])
 
@@ -202,7 +363,8 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              published_ref="lot/x",
                              runner=runner_for(0, flux()),
-                             git_runner=runner_for(0, "%s\trefs/heads/lot/x\n" % A))
+                             git_runner=git_runner_for(
+                                 ls_remote="%s\trefs/heads/lot/x\n" % A))
         self.assertTrue(report["ok"], report)
 
 
