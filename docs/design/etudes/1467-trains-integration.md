@@ -144,6 +144,43 @@ par sous-domaine. Mesh-design confirme ce port obligatoire le 15 octobre à
 commit `ea043e087fb0c80708ed35b18863da1da473fccb` ; aucune déduction depuis les
 notes ou le registre courant ne le remplace.
 
+`train_policy.Versioned(path, commit, project)` prépare maintenant ce
+fournisseur. Il lit uniquement l'objet Git `federation.yaml` au commit complet
+audité choisi explicitement, jamais le checkout. Il exige la politique
+`risk_classes.projects.<projet>` avec son `default` explicite, et la nouvelle
+déclaration suivante (exemple de forme, pas une couverture de dépôt) :
+
+```yaml
+review_policies:
+  train_reviews:
+    schema: ameesh-train-reviews-policy/1
+    projects:
+      exemple:
+        rules:
+          - paths: ["queue/**"]
+            reviews: 1
+          - paths: ["db/**", "security/**", "deploy/**"]
+            reviews: 2
+```
+
+Chaque règle porte exactement `paths` et `reviews`, entier 1 ou 2. Il n'y a
+pas de `default` pour les comptes : chaque chemin non léger du diff doit
+être couvert explicitement, sinon le fournisseur refuse. Le maximum des
+règles applicables l'emporte ; une règle positive élève aussi un chemin
+léger en sensible. Un chemin léger sans règle demande zéro avis avant fusion.
+Les renommages gardent leurs deux chemins et les suppressions leur ancienne
+portée. Une identité de fichier que la normalisation changerait est refusée.
+La preuve lie lot, base, tête et commit du canon, sans repli entre projets.
+
+Mesh-design confirme le 15 octobre à 11:42 qu'il prépare cette déclaration
+dans le canon, sans fournisseur concurrent identifié. SQL/sécurité/prod
+demandent deux avis ; les chemins CI restent à deux tant que leur granularité
+ne distingue pas la porte de fusion. Nexlink doit être qualifié par son
+pilote avant activation. Le lecteur seul ne complète pas le canon existant
+et n'active aucun train. Quatorze témoins Git passent ; le raccord complet
+politique/lecteur historique/file SQL passe avec psql et psycopg, avec refus
+du regel sur le même SHA. Aucun run distant n'a été lancé.
+
 Interface de raccord proposée à impl07 le 15 octobre à 03:54 : un `Receipt`
 porte `subject` (`commit:<sha>` ou `milestone:<id>`), `commit` résolu, `actor`,
 `session`, `turn`, `harness` et `record` de provenance exacte. Un reçu de

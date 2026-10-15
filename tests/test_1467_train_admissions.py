@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Queue changes and exclusion races through real admission storage."""
 import dataclasses
+import json
 import os
 import subprocess
 import types
 from unittest import mock
 
-from ameesh import storage, train, train_admissions, train_history, work
+from ameesh import storage, train, train_admissions, train_history, train_policy, work
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
 
@@ -112,7 +113,14 @@ class TrainAdmissionsTest(PgTestCase):
             git("add", "content")
             git("commit", "-qm", content)
             return git("rev-parse", "HEAD")
+        with open(os.path.join(self.tmp, "federation.yaml"), "w") as fh:
+            json.dump(dict(review_policies=dict(
+                risk_classes=dict(projects={self.project.name: dict(default="sensitive", rules=[])}),
+                train_reviews=dict(schema="ameesh-train-reviews-policy/1", projects={
+                    self.project.name: dict(rules=[dict(paths=["content"], reviews=2)])}))), fh)
+        git("add", "federation.yaml")
         base, first, head = commit("base"), commit("author"), commit("correction")
+        self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
         item = self.entry["work_item_id"]
         freeze = self.ops.add_milestone(item, "frozen", sha=head, actor="fixture", verdict=None, note="")
         entry = self.ops.queue_add(item, target="main", frozen_sha=head, note="", actor="fixture",
@@ -129,6 +137,7 @@ class TrainAdmissionsTest(PgTestCase):
             receipt_for_milestone=lambda db, mid: receipts.get("milestone:%d" % mid))
         self.admissions.history = train_history.Recorded(self.db, self.tmp, provider=provider)
         proof = self.admissions.qualify([entry], base, "packet")
+        self.assertEqual(proof["members"][0]["policy"]["policy_commit"], base)
         coverage = proof["members"][0]["history"]["reviews"]["coverage"]
         self.assertEqual(set(coverage), {first, head})
         self.assertTrue(all(len(readers) == 2 for readers in coverage.values()))
