@@ -12,7 +12,9 @@ tour, sinon un agent sans lot n'est jamais « au repos ».
 from __future__ import annotations
 
 import json
+import threading
 import time
+from unittest.mock import patch
 
 from ameesh import backlog, storage, sous_utilisation, work
 
@@ -532,6 +534,47 @@ class PropositionTest(_Empile):
         bloque = self.qa("juge bloque", verdict="blocked", branch="lot/bloque")
         self.assertFalse(self.claim(bloque, kind="review"), "kind périmé")
         self.assertTrue(self.claim(bloque, kind="correction"))
+
+    def test_un_verdict_concurrent_empeche_la_relecture(self):
+        """Un verdict validé pendant l'attente du lot précède sa revalidation."""
+        self.auteur()
+        lot = self.qa("verdict concurrent", branch="lot/concurrent")
+        other = self.connect()
+        self.addCleanup(other.close)
+        with other.transaction() as tx:
+            driver = type(tx)
+        query = driver.query
+        ready, results, errors = threading.Event(), [], []
+
+        def observe(db, sql, params=()):
+            if threading.current_thread() is worker and (
+                    "FOR NO KEY UPDATE" in sql or sql.startswith("UPDATE work_items SET")):
+                ready.set()
+            return query(db, sql, params)
+
+        def claim():
+            try:
+                results.append(storage.of(other).work.claim_review_proposal(
+                    lot["id"], agent="codex1", kind="review", actor="ameesh",
+                    proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE,
+                    window_s=backlog.REVIEW_PROPOSAL_WINDOW_S))
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=claim)
+        with patch.object(driver, "query", observe):
+            try:
+                with self.db.transaction() as held:
+                    work.milestone(held, lot["id"], "verdict", verdict="ok",
+                                   sha=SHA, actor="test")
+                    worker.start()
+                    self.assertTrue(ready.wait(10), (results, errors))
+            finally:
+                worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [False], "le verdict acquis interdit la proposition")
+        self.assertFalse(work.get(self.db, lot["id"])["reviewer"])
 
     def test_on_coupe_les_propositions_et_la_file_reprend(self):
         """#1738 (N3) : `review_max_per_hour=0` coupe les propositions ; la

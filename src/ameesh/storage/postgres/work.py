@@ -1486,6 +1486,13 @@ class WorkItems(interface.WorkItems):
             # sérialisent ici, et le second relit la fenêtre APRÈS le premier.
             tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                      ("review proposal:%d" % item,))
+            # Les jalons et la désignation du pilote prennent ce verrou de
+            # ligne, pas le verrou consultatif. Le prédicat est relu APRÈS
+            # l'attente : il voit les verdicts/gels validés entre-temps, et
+            # aucun ne peut s'insérer entre cette lecture et la proposition.
+            if not tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                            (item,)):
+                return False
             # #1738 R1 (B1) : sous le verrou, le lot est relu avec le prédicat
             # de `review_proposals` (qa, gel, relecteur vide, verdict courant,
             # fenêtre) et le `kind` doit être celui qu'il donne aujourd'hui.
