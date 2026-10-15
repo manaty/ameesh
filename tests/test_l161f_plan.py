@@ -965,6 +965,57 @@ class ImportGraphTest(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
                                                       guaranteed=True), known)
+    def test_guaranteed_edges_stop_at_a_module_level_termination(self):
+        # #1627 : une terminaison atteignable à l'import (`raise` gardé, garde
+        # d'exception, exit, assert faux) laisse les imports suivants possibles,
+        # jamais garantis — sinon le plan certifie un chargement qui peut ne pas
+        # avoir eu lieu. Sens conservateur : une preuve en moins, jamais une
+        # fausse preuve.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "raise gardé": "import os\n"
+                           "if not os.environ.get('PG'):\n"
+                           "    raise RuntimeError\n"
+                           "import ameesh.db\n",
+            "raise dans un except": "try:\n"
+                                    "    import psycopg\n"
+                                    "except ImportError:\n"
+                                    "    raise SystemExit\n"
+                                    "import ameesh.db\n",
+            "exit": "exit()\nimport ameesh.db\n",
+            "quit": "quit()\nimport ameesh.db\n",
+            "os._exit": "import os\nos._exit(1)\nimport ameesh.db\n",
+            "os._exit aliasé": "from os import _exit as bye\nbye(1)\nimport ameesh.db\n",
+            "sys.exit": "import sys\nsys.exit(1)\nimport ameesh.db\n",
+            "sys.exit aliasé": "import sys as s\ns.exit(1)\nimport ameesh.db\n",
+            "exit importé": "from sys import exit as bye\nbye(1)\nimport ameesh.db\n",
+            "assert faux": "assert False\nimport ameesh.db\n",
+            "raise avant, import dans le même corps de classe":
+                "class C:\n    raise RuntimeError\n    import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # un garde mort ne termine rien : `if TYPE_CHECKING:` ne s'exécute pas
+        dead = ("from typing import TYPE_CHECKING\n"
+                "if TYPE_CHECKING:\n    raise RuntimeError\n"
+                "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(dead, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        # le corps d'une fonction ne tourne pas à l'import : son raise ne coupe
+        # pas la preuve du corps du module
+        deferred = ("def broken():\n    raise RuntimeError\n"
+                    "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(deferred, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
+        nested = ("def factory():\n"
+                  "    class C:\n        raise RuntimeError\n"
+                  "import ameesh.db\n")
+        self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
+                                              guaranteed=True), {"src/ameesh/db.py"})
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
