@@ -87,9 +87,12 @@ class WorkflowTest(unittest.TestCase):
 
     def test_main_en_cours_preservee_et_file_bornee(self):
         # #824, décision owner #17605 : pushes main regroupés, un seul pending.
-        # Releases/dispatch gardent une identité par run, PR remplacées annulées.
+        # Releases/poussées gardent une identité par run, PR remplacées annulées.
+        # #1343 : une demande de gel a un groupe par étiquette, pour qu'une
+        # étiquette étrangère n'annule pas le run gelé valide.
         self.assertIn("github.event_name == 'push' && github.ref == 'refs/heads/main' && 'main'", self.text)
-        self.assertIn("format('pr-{0}', github.event.pull_request.number)", self.text)
+        self.assertIn("format('pr-{0}-{1}', github.event.pull_request.number, "
+                      "github.event.label.name)", self.text)
         self.assertIn("|| github.run_id }}", self.text)
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.text)
         self.assertNotIn("cancel-in-progress: true", self.text)
