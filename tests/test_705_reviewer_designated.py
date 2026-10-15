@@ -477,6 +477,18 @@ class ReviewerDesignationTest(PgTestCase):
                         " reviewer text NOT NULL DEFAULT ''")
         self.db.__dict__.pop("_has_reviewer", None)
 
+    def test_colonne_vue_sans_redemarrage_apres_0421(self):
+        """#1494 N2 : une connexion ouverte avant 0421 (serve, runner) voit la
+        colonne dès qu'elle est ajoutée — l'absence n'est pas mise en cache."""
+        from ameesh.storage.postgres.work import has_reviewer
+        self.db.execute("ALTER TABLE work_items DROP COLUMN reviewer")
+        self.addCleanup(self._restore_reviewer_column)
+        self.db.__dict__.pop("_has_reviewer", None)
+        self.assertFalse(has_reviewer(self.db))
+        self.db.execute("ALTER TABLE work_items ADD COLUMN reviewer text NOT NULL DEFAULT ''")
+        self.assertTrue(has_reviewer(self.db))
+        self.assertTrue(self.db._has_reviewer)
+
     def test_lectures_avant_la_migration_0421(self):
         """#705 (revue r1, P2-3) : la prod peut être en 0373 ; sans la colonne,
         lectures, vue et alertes fonctionnent (le relecteur est alors inconnu)."""

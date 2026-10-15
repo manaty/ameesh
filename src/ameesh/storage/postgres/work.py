@@ -44,16 +44,19 @@ _COLUMNS_TEMPLATE = """
 
 
 def has_reviewer(db) -> bool:
-    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ? La
-    réponse est mise en cache sur la connexion : une lecture par base."""
-    flag = getattr(db, "_has_reviewer", None)
-    if flag is None:
-        flag = bool(db.query(
-            "SELECT 1 AS ok FROM information_schema.columns"
-            " WHERE table_schema = current_schema() AND table_name = 'work_items'"
-            "   AND column_name = 'reviewer'"))
+    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ? Seul un
+    oui est mis en cache sur la connexion : une migration ajoute la colonne
+    sans la retirer, et un processus long (serve, runner) connecté avant 0421
+    la voit dès qu'elle est appliquée, sans redémarrage (#1494 N2)."""
+    if getattr(db, "_has_reviewer", False):
+        return True
+    flag = bool(db.query(
+        "SELECT 1 AS ok FROM information_schema.columns"
+        " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+        "   AND column_name = 'reviewer'"))
+    if flag:
         try:
-            db._has_reviewer = flag
+            db._has_reviewer = True
         except Exception:  # objet sans attributs (proxy) : on relira
             pass
     return flag
@@ -505,7 +508,7 @@ class WorkItems(interface.WorkItems):
         params: list = [assignee]
         if has_reviewer(self.db):
             seen = self.db.query(
-                "SELECT reviewer FROM work_items WHERE id = %s FOR UPDATE",
+                "SELECT reviewer FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                 (int(item_id),))
             previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
             reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
