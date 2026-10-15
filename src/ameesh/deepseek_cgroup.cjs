@@ -26,6 +26,16 @@ function fail(error) {
   process.exit(127);
 }
 
+// #1460: a dsh/provider this adapter has not reviewed (e.g. dsh 0.2 on the VMs)
+// means the protection is unavailable, not that the turn must fail: dsh then
+// runs as installed, without the adapter, after a warning. Misuse of the guard
+// itself (preload order, provider preloads, workers, loaders) still fails.
+class Unavailable extends Error {}
+
+function degrade(error) {
+  console.error(`[ameesh] WARNING: DeepSeek cgroup protection unavailable, running dsh without it: ${error.message}`);
+}
+
 function packageOf(filename) {
   let directory = path.dirname(filename);
   for (;;) {
@@ -158,7 +168,7 @@ function protectWorkers() {
 function verifySource(info, source) {
   const hash = crypto.createHash('sha256').update(source).digest('hex');
   if (info.pkg.name !== PROVIDER || info.pkg.version !== VERSION || !HASHES.has(hash)) {
-    throw new Error(`unreviewed ${PROVIDER} ${info.pkg.version} (${hash}) at ${info.file}; review the cgroup adapter before running tools`);
+    throw new Unavailable(`unreviewed ${PROVIDER} ${info.pkg.version} (${hash}) at ${info.file}; review the cgroup adapter before running tools`);
   }
   return hash;
 }
@@ -193,7 +203,7 @@ function installLoader(rejectProvider = false) {
   assertNoProviderPreloads();
   assertGuardFirst();
   if (typeof registerHooks !== 'function') {
-    throw new Error('Node synchronous module hooks are unavailable (requires Node >=22.15)');
+    throw new Unavailable('Node synchronous module hooks are unavailable (requires Node >=22.15)');
   }
   // Asynchronous loaders run in a separate internal thread that is outside
   // the public Worker wrapper and cannot inherit our synchronous hooks.
@@ -224,15 +234,20 @@ function installLoader(rejectProvider = false) {
         if (!info) return loaded;
         if (!providerFile(fileURLToPath(url))) return loaded;
         if (rejectProvider) throw new Error('dsh provider is not allowed in a worker thread');
-        if (loaded.format !== 'module') throw new Error('unexpected provider module format');
-        if (loaded.source === null || loaded.source === undefined) throw new Error('provider source is unavailable for verification');
+        // Not the reviewed ESM form (e.g. a CommonJS override): unreviewed too.
+        if (loaded.format !== 'module') throw new Unavailable(`unexpected provider module format at ${info.file}`);
+        if (loaded.source === null || loaded.source === undefined) throw new Unavailable('provider source is unavailable for verification');
         const source = typeof loaded.source === 'string' ? loaded.source : Buffer.from(loaded.source).toString('utf8');
         const hash = verifySource(info, source);
-        if (entryURLs.has(url) && hash !== INDEX_HASH) throw new Error('provider export does not select the reviewed runtime entry');
+        if (entryURLs.has(url) && hash !== INDEX_HASH) throw new Unavailable('provider export does not select the reviewed runtime entry');
         if (hash !== INDEX_HASH) return loaded;
-        if (!source.includes(CP_IMPORT)) throw new Error('reviewed provider bindings are missing');
+        if (!source.includes(CP_IMPORT)) throw new Unavailable('reviewed provider bindings are missing');
         return { ...loaded, source: source.replace(CP_IMPORT, scopedBindings()) };
-      } catch (error) { fail(error); }
+      } catch (error) {
+        if (!(error instanceof Unavailable) || rejectProvider) fail(error);
+        degrade(error);
+        return loaded;
+      }
     }
   });
 }
@@ -252,16 +267,18 @@ function activate() {
       break;
     }
     const parent = path.dirname(directory);
-    if (parent === directory) throw new Error('cannot locate the dsh package/provider to verify cgroup compatibility');
+    if (parent === directory) throw new Unavailable('cannot locate the dsh package/provider to verify cgroup compatibility');
     directory = parent;
   }
-  const entry = createRequire(dshPackage).resolve(PROVIDER);
+  let entry;
+  try { entry = createRequire(dshPackage).resolve(PROVIDER); }
+  catch (error) { throw new Unavailable(`cannot resolve ${PROVIDER}: ${error.message}`); }
   const info = packageOf(entry);
-  if (!info) throw new Error('cannot locate resolved provider metadata');
+  if (!info) throw new Unavailable('cannot locate resolved provider metadata');
   // CJS resolution is an early availability check. The load hook checks the
   // actual ESM/import condition's source before evaluating it as well.
   if (verifySource(info, fs.readFileSync(entry)) !== INDEX_HASH) {
-    throw new Error('CLI provider export does not select the reviewed runtime entry');
+    throw new Unavailable('CLI provider export does not select the reviewed runtime entry');
   }
   installLoader();
   protectWorkers();
@@ -286,5 +303,11 @@ if (process.platform === 'linux') {
         process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '').replace(option, '').trim();
       }
     }
-  } catch (error) { fail(error); }
+  } catch (error) {
+    if (!(error instanceof Unavailable) || !threads.isMainThread) fail(error);
+    degrade(error);
+    // Unguarded dsh must not pass this preload on to its own Node children.
+    const option = '--require=' + JSON.stringify(__filename);
+    process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '').replace(option, '').trim();
+  }
 }

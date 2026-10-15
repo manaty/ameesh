@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from . import support  # isolate the host's agent environment
-from ameesh import adapters, deepseek_cgroup
+from ameesh import adapters, deepseek_cgroup, harnesses
 from ameesh.runner import AgentWorker
 
 
@@ -100,7 +100,8 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
             code = code.replace("CUSTOM", json.dumps(str(binary)))
             self.run_node(code, dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"]))
 
-    def test_unreviewed_provider_and_missing_module_are_loud_before_command(self):
+    def test_unreviewed_provider_and_missing_module_warn_and_run_dsh(self):
+        # #1460: an unreviewed provider must not turn every turn into a 127.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "package.json").write_text('{"name":"@deepseek-ai/dsh"}')
@@ -117,11 +118,46 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                     (provider / "index.js").write_text("// changed or unreviewed probe\n")
                 result = subprocess.run([NODE, str(entry)], env=env,
                                         capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 127, result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "COMMAND RAN\n")
+                self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
 
-    def test_profile_source_and_esm_exports_are_verified_without_vendor_dependency(self):
+    def test_vm_dsh_0_2_provider_runs_without_protection(self):
+        # #1460 as seen on agents-1: global dsh under /opt/node with provider
+        # 0.2.0-rc.2; the turn runs (no 127) and the preload is not inherited.
+        with tempfile.TemporaryDirectory() as tmp:
+            modules = Path(tmp) / "opt/node/lib/node_modules/@deepseek-ai"
+            dsh = modules / "dsh"
+            (dsh / "lib").mkdir(parents=True)
+            (dsh / "package.json").write_text('{"name":"@deepseek-ai/dsh","version":"0.2.0-rc.2"}')
+            provider = modules / "dsh-subprocess-local"
+            provider.mkdir()
+            (provider / "package.json").write_text(json.dumps({
+                "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.2.0-rc.2",
+                "type": "module", "exports": {".": "./index.js"}}))
+            (provider / "index.js").write_text('export const ran = "PROVIDER 0.2 RAN";\n')
+            (dsh / "lib/bin.mjs").write_text(
+                '#!/usr/bin/env node\n'
+                'const { ran } = await import("@deepseek-ai/dsh-subprocess-local");\n'
+                'console.log(ran, JSON.stringify(process.env.NODE_OPTIONS || ""));\n')
+            (dsh / "lib/bin.mjs").chmod(0o755)
+            # Launched like the runner: the absolute npm link /opt/node/bin/dsh,
+            # here through AMEESH_DSH_BIN; the guard follows it to the package.
+            link = Path(tmp) / "opt/node/bin/dsh"
+            link.parent.mkdir(parents=True)
+            link.symlink_to("../lib/node_modules/@deepseek-ai/dsh/lib/bin.mjs")
+            resolution = adapters.resolve_harness(harnesses.get("deepseek"), bins={}, env={
+                "AMEESH_DSH_BIN": str(link), "PATH": os.environ["PATH"], "AMEESH_HARNESS_SEARCH": ""})
+            self.assertEqual(resolution.path, str(link))
+            env = dict(os.environ, NODE_OPTIONS=deepseek_cgroup.node_options("--max-old-space-size=256"))
+            result = subprocess.run([resolution.path], env=env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, 'PROVIDER 0.2 RAN "--max-old-space-size=256"\n')
+            self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
+            self.assertIn("unreviewed @deepseek-ai/dsh-subprocess-local 0.2.0-rc.2", result.stderr)
+
+    def test_profile_source_and_esm_exports_are_verified_and_unreviewed_runs_unguarded(self):
         for absolute, conditional in ((False, False), (True, False), (False, True)):
             with self.subTest(absolute=absolute, conditional=conditional), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -143,11 +179,28 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                 code = ("const policy=require(" + json.dumps(str(deepseek_cgroup.PRELOAD)) + ");"
                         "policy.installLoader(); import(" + json.dumps(importer.as_uri()) + ");")
                 result = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 127, result.stderr)
-                self.assertEqual(result.stdout, "")
-                self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "UNREVIEWED PROFILE COMMAND RAN\n")
+                self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
                 self.assertIn(str(provider / "package.json"), result.stderr)
                 self.assertIn(hashlib.sha256(source.encode()).hexdigest(), result.stderr)
+
+    def test_commonjs_profile_provider_under_hooks_warns_and_runs(self):
+        # #1460: hooks installed, a CommonJS (unreviewed) override is no 127 either.
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "node_modules/@deepseek-ai/dsh-subprocess-local"
+            provider.mkdir(parents=True)
+            (provider / "package.json").write_text(json.dumps({
+                "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.3.0", "main": "index.js"}))
+            (provider / "index.js").write_text('console.log("COMMONJS PROVIDER RAN");\n')
+            entry = Path(tmp) / "entry.cjs"
+            entry.write_text('require("@deepseek-ai/dsh-subprocess-local");\n')
+            code = ("require(" + json.dumps(str(deepseek_cgroup.PRELOAD)) + ").installLoader();"
+                    "require(" + json.dumps(str(entry)) + ");")
+            result = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "COMMONJS PROVIDER RAN\n")
+            self.assertIn("running dsh without it: unexpected provider module format", result.stderr)
 
     def test_preload_path_with_spaces_and_quotes_still_activates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -161,9 +214,9 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                 env = dict(os.environ, NODE_OPTIONS=deepseek_cgroup.node_options())
             result = subprocess.run([NODE, str(entry)], env=env,
                                     capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 127, result.stderr)
-            self.assertEqual(result.stdout, "")
-            self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "COMMAND RAN\n")
+            self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
 
     def test_preloaded_cache_and_declared_preloads_are_refused(self):
         with tempfile.TemporaryDirectory(prefix='l490-preloads-') as tmp:
@@ -344,6 +397,10 @@ class RealProviderTest(unittest.TestCase):
                                        else env["NODE_OPTIONS"] + " " + flag)
             result = subprocess.run([NODE, str(entry), PROVIDER, mode], env=env,
                                     capture_output=True, text=True, timeout=20)
+            if success == "degraded":
+                self.assertNotEqual(result.returncode, 127, result.stderr)
+                self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
+                return result
             if not success:
                 self.assertEqual(result.returncode, 127, result.stderr)
                 self.assertNotIn("UNREVIEWED RAN", result.stdout)
@@ -396,12 +453,12 @@ class RealProviderTest(unittest.TestCase):
     def test_actual_dsh_loader_checks_profile_override_and_keeps_cgroup(self):
         fixed, _ = self.invoke("boot-ordinary", True, "reviewed")
         self.assertEqual(fixed["groups"], [fixed["parent"]] * 4)
-        self.invoke("boot-ordinary", True, "import-condition", success=False)
+        self.invoke("boot-ordinary", True, "import-condition", success="degraded")
 
     def test_profile_provider_and_changed_exports_are_checked_before_execution(self):
         for kind in ("version", "source", "exports", "import-condition"):
             with self.subTest(kind=kind):
-                self.invoke("ordinary", True, kind, success=False)
+                self.invoke("ordinary", True, kind, success="degraded")
 
     def test_reviewed_profile_provider_keeps_cgroup(self):
         fixed, _ = self.invoke("ordinary", True, "reviewed")
