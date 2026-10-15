@@ -8,17 +8,22 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 4 parts, sur push vers main, integration/** ou release/**,
-#               et sur une PR de release (source ou cible release/** ou
-#               integration/**) ;
+#               en 8 parts (#1476), sur push vers main, integration/** ou
+#               release/**, et sur une PR de release (source ou cible
+#               release/** ou integration/**) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main, integration/** ou release/**, sur
-#               une PR de release (sans liste pilote) et à la main
-#               (workflow_dispatch).
+#               12 parts (#1476), sur push vers main, integration/** ou
+#               release/**, sur une PR de release (sans liste pilote) et à la
+#               main (workflow_dispatch).
+# #1476 : la suite complète est découpée deux fois plus fin qu'avant (8 et 12
+# parts au lieu de 4 et 6), pour finir sous 15 min bout en bout avec le pool
+# prioritaire de #1468 (`ameesh-ci-pool`, paquets, releases et lots de
+# déblocage) ; le nombre de parts reste porté par le plan
+# (scripts/test-plan.py, PARTS), jamais par ce fichier.
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
@@ -335,8 +340,8 @@ jobs:
         # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
         # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
         # lot_part_count), trois au plus (#947 : sous saturation, une part
-        # unique atteignait le plafond de 30 min) ; suite complète en 6 parts
-        # sur push et sur une PR de release (sans liste pilote).
+        # unique atteignait le plafond de 30 min) ; suite complète en 12 parts
+        # (#1476) sur push et sur une PR de release (sans liste pilote).
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:

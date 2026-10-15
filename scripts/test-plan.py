@@ -149,12 +149,20 @@ RECENT_FAILURE_DAYS = 7
 #: partagent un hôte, la part unique pesait 21,7-26,6 min au repos (médiane
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
-#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts sur une PR de
+#: lot (max 17,7 min saturé), la part psql d'une PR reste à trois.
+#:
+#: #1476 : la suite complète double ses parts (huit psycopg, douze psql),
+#: équilibrées par les durées mesurées de la carte. Mesure de référence, push
+#: main du 15/10 (run 38671899155, 52,6 min bout en bout) : parts psql de
+#: 15,1 à 33,9 min et psycopg de 9,8 à 16,9 min, précédées de 6 à 26 min
+#: d'attente de runner ; à moitié charge par part et sans cette attente — le
+#: pool prioritaire de #1468 (`ameesh-ci-pool`) pour les paquets et les
+#: releases —, la dernière part vise moins de 15 min.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 8), "psql": (3, 12)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
 #: comme dans celui de 45 min de psql.
