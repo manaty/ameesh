@@ -127,6 +127,30 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(self.mailbox(), [])
         self.assertEqual(self.marks(), [])
 
+    def test_a_late_writer_returns_the_recorded_designation_without_mailing(self):
+        self.freeze()
+        freeze = pg.PgPort(self.db).latest_freeze(self.lot)
+        first = pg.PgPort(self.db).commit(
+            self.lot, freeze=freeze, required=1, state=rd.DESIGNATED,
+            reviewers=[{"name": "r1", "family": "claude"}], missing=0, why="",
+            messages=[{"to": "r1", "body": "à relire"}])
+        self.assertEqual(first["state"], rd.DESIGNATED)
+        self.assertEqual(len(self.mailbox()), 1)
+        other = self.connect()
+        try:
+            # un second écrivain, qui a lu « rien » avant d'attendre le verrou :
+            # sous verrou il retrouve la marque du premier et ne remaille pas
+            late = pg.PgPort(other).commit(
+                self.lot, freeze=freeze, required=1, state=rd.DESIGNATED,
+                reviewers=[{"name": "r1", "family": "claude"}], missing=0, why="",
+                messages=[{"to": "r1", "body": "à relire"}])
+        finally:
+            other.close()
+        self.assertEqual(late["state"], rd.DESIGNATED)
+        self.assertEqual(late["freeze"], freeze)
+        self.assertEqual(len(self.mailbox()), 1)  # la marque est celle de la base
+        self.assertEqual(len(self.marks()), 1)
+
     def test_the_engine_restarts_on_the_new_head(self):
         first = self.freeze(SHA_A)
         port = pg.PgPort(self.db)
