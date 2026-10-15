@@ -181,3 +181,34 @@ class Progress(interface.Progress):
              ORDER BY agent, harness, 3
             """ % (win, win, win, win, win, win, " AND ".join(clauses)),
             tuple([float(since_ts)] * 6 + params))
+
+    def ci_suite(self, *, since_ts, limit) -> list[dict]:
+        # #1476 : seuls les contextes qui GARANTISSENT la suite complète
+        # comptent — poussée ou PR `release/**`|`integration/**` (source ou
+        # cible) et exécution manuelle (`workflow_dispatch`, toujours
+        # complète). Une poussée sur `main` est écartée : une plage poussée
+        # entièrement documentaire y prend la voie rapide L161a (make_plan
+        # laisse les deux matrices vides) et `ci_runs` ne garde ni le mode du
+        # plan ni les jobs, donc la compter tirerait la médiane vers le bas.
+        # Une exécution annulée ou remplacée n'a pas de durée de suite. La
+        # borne est PAR DÉPÔT : un dépôt très actif ne chasse pas les autres
+        # de la lecture (row_number, pas un LIMIT global).
+        return self.db.query(
+            """
+            SELECT repo, run_id, branch, base, event, duration_s, concluded_ts FROM (
+                SELECT repo, run_id, branch, base, event,
+                       extract(epoch from (concluded_at - first_seen_at))::float8
+                           AS duration_s,
+                       extract(epoch from concluded_at)::float8 AS concluded_ts,
+                       row_number() OVER (PARTITION BY repo
+                                          ORDER BY concluded_at DESC, run_id DESC) AS rn
+                  FROM ci_runs
+                 WHERE status IN ('success', 'failure') AND concluded_at IS NOT NULL
+                   AND concluded_at >= to_timestamp(%s)
+                   AND (branch LIKE 'release/%%' OR branch LIKE 'integration/%%'
+                        OR base LIKE 'release/%%' OR base LIKE 'integration/%%'
+                        OR event = 'workflow_dispatch')
+            ) t
+             WHERE rn <= %s
+             ORDER BY concluded_ts DESC, run_id DESC
+            """, (float(since_ts), int(limit)))

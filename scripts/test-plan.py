@@ -169,12 +169,20 @@ RECENT_FAILURE_DAYS = 7
 #: partagent un hôte, la part unique pesait 21,7-26,6 min au repos (médiane
 #: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
 #: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
-#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
-#: saturé) ; la suite psql complète reste en six parts.
+#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts sur une PR de
+#: lot (max 17,7 min saturé), la part psql d'une PR reste à trois.
+#:
+#: #1476 : la suite complète double ses parts (huit psycopg, douze psql),
+#: équilibrées par les durées mesurées de la carte. Mesure de référence, push
+#: main du 15/10 (run 38671899155, 52,6 min bout en bout) : parts psql de
+#: 15,1 à 33,9 min et psycopg de 9,8 à 16,9 min, précédées de 6 à 26 min
+#: d'attente de runner ; à moitié charge par part et sans cette attente — le
+#: pool prioritaire de #1468 (`ameesh-ci-pool`) pour les paquets et les
+#: releases —, la dernière part vise moins de 15 min.
 #: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
 #: impactés et le contrat : une part par pilote suffit, et une part de plus par
 #: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
-PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+PARTS = {"psycopg": (4, 8), "psql": (3, 12)}
 #: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
 #: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
 #: comme dans celui de 45 min de psql.
@@ -815,7 +823,8 @@ def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
         impact.hit(card.get("tables", {}).get(table, ()), f"{path} (table {table})")
 
 
-def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path) -> None:
+def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path,
+          *, own: bool = True) -> None:
     readers = set(card.get("donnees", {}).get(path, ()))
     impact.hit(readers, path)
     listers: set[str] = set()
@@ -824,7 +833,15 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
     # a removal outside documentation is already a doubt, raised by `judge`:
     # only a removed document stays quiet here (the docs lane)
-    if not readers and not listers and not is_doc(path) and status != "D":
+    #
+    # #1314/#1476 : une donnée non Python que la branche ne change pas
+    # (`own=False`) vient de la cible, qui l'a déjà passée en suite complète :
+    # elle ne force plus le repli de la branche. C'est le cas mesuré d'un
+    # fichier sans lecteur mesuré (par exemple un `.cjs` ou un `.json` que la
+    # carte ne connaît pas encore) changé sur main entre la carte et la tête
+    # testée : le 15/10, deux lots sans rapport ont ainsi basculé en suite
+    # complète. Une donnée que la branche change elle-même reste un doute.
+    if not readers and not listers and not is_doc(path) and status != "D" and own:
         impact.doubt(f"{path}: read by no measured test", path)
 
 
@@ -836,12 +853,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
     `own` is the set of paths the branch itself changes — `own_base` (the base
     it merges, `HEAD^1` of a pull request's merge commit) to `head` — and
     `None` when that range cannot be read or is not trustworthy. A file of the
-    CI foundation (`is_foundation`) that the target already changed since the
-    map commit, and that this branch does not change, raises no doubt: the
-    target's own full suite validated it, and a late map must not send every
-    lot branch back to the full suite (#1314). The version-only exemption of
-    `pyproject.toml` (L157) is judged on that same own range, so a target
-    change to the file no longer breaks it.
+    CI foundation (`is_foundation`), or a data file read by no measured test
+    (`_data`), that the target already changed since the map commit, and that
+    this branch does not change, raises no doubt: the target's own full suite
+    validated it, and a late map must not send every lot branch back to the
+    full suite (#1314, #1476). The version-only exemption of `pyproject.toml`
+    (L157) is judged on that same own range, so a target change to the file no
+    longer breaks it.
     """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
@@ -892,7 +910,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         elif path.startswith(MIGRATIONS_DIR) and path.endswith(".sql"):
             _migration(card, impact, status, path, head, repo)
         else:
-            _data(card, impact, status, path, repo)
+            # #1476 : `own` inconnu (range illisible) reste conservateur : la
+            # donnée est jugée comme changée par la branche, donc le doute tient.
+            _data(card, impact, status, path, repo,
+                  own=own is None or path in own)
     #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
     #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
     #: exécuté au niveau module (relecture Codex, B2 résiduel).
