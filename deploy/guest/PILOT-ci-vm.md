@@ -80,6 +80,9 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
 
 ## Before
 
+* The L159g pilot report qualified by the project pilot, before any host
+  operation (volume included). Decision #47757 chooses b1; it does not waive
+  this prerequisite (L159 study §5.1, lot #193, mesh-design 2026-10-15).
 * On `main`: the guard (L159e), the gate (L159f), `install.sh` (L159b),
   and `install-pilot.sh --offload-only` (this lot).
 * The dedicated UID of the jobs (#354, L159b2) merged and part of the
@@ -117,7 +120,9 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
    ```
 
 3. **The offload**, obeying the guard's gate. It comes after step 2: it
-   sets `/srv/ameesh-guest` back to `0700`, the guest's own:
+   sets `/srv/ameesh-guest` to the dedicated-UID layout of #354 (`2710`,
+   shell-owned, with traversal for the jobs' group), after the pilot
+   installer's `0755`:
 
    ```sh
    sudo deploy/guest/install.sh --dry-run --gate file --key "$(cat poste.pub)" \
