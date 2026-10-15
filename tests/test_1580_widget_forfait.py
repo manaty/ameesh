@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1580 (tranche 3) — les jauges du widget omarchy et la portée par modèle.
+"""#1580 (slice 3) — the omarchy widget gauges and model scope.
 
-Constat du propriétaire (2026-10-15 09:54) : le seau « Fable Weekly » de
-claude2 est resté à 0 % quand son hebdomadaire général était à 93 %, et le
-choix automatique — qui ne lit que `rate_limit_event.unifiedWindows` — ne
-voyait pas ce seau : toute la semaine Fable était perdue à la remise à zéro.
+Owner report (2026-10-15 09:54): claude2's "Fable Weekly" bucket stayed at 0%
+while its general weekly was at 93%, and the automatic choice — which only
+reads `rate_limit_event.unifiedWindows` — did not see that bucket: the whole
+Fable week was lost at reset.
 
-Témoins : le lecteur du fichier du widget (inerte là où il n'existe pas,
-périmé au-delà de sa plus courte fenêtre), la portée d'un seau de modèle (il
-ne compte que pour une session de ce modèle) et le score (`rank`) qui
-consomme d'abord le budget perdu — y compris un seau de modèle.
+Witnesses: the widget file reader (inert where it does not exist, stale
+beyond its shortest window), the scope of a model bucket (it counts only for
+a session of that model) and the score (`rank`) which first consumes the lost
+budget — including a model bucket.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ def _profil(dossier: str, nom: str = "primaire") -> accounts.Profile:
 
 
 class WidgetUsageTest(unittest.TestCase):
-    """Le lecteur du fichier du widget : forme, inertie, fraîcheur."""
+    """The widget file reader: shape, inertia, freshness."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ameesh-widget-")
@@ -82,7 +82,7 @@ class WidgetUsageTest(unittest.TestCase):
         payload.update(extra)
         return payload
 
-    def test_seaux_lus_et_portee_de_modele(self):
+    def test_buckets_read_and_model_scope(self):
         self._ecrit("claude-secondary.json", self._instantane())
         gauges = widget_usage.read(_profil(self.compte, "secondaire"),
                                    now=self.now, directory=self.dossier)
@@ -94,15 +94,15 @@ class WidgetUsageTest(unittest.TestCase):
         self.assertAlmostEqual(gauges[0].used, 0.27)
         self.assertAlmostEqual(gauges[1].used, 0.13)
         self.assertEqual([g.scope for g in gauges], ["", "", "fable"])
-        # resetsAt ISO → epoch, à la seconde près
+        # resetsAt ISO → epoch, to the second
         self.assertAlmostEqual(gauges[0].resets_at, self.now + 4 * HEURE, places=2)
-        # #1789/N2 : le relevé expose sa date, comme les jauges de journal
+        # #1789/N2: the reading exposes its date, like the log gauges
         for gauge in gauges:
             self.assertAlmostEqual(gauge.read_at, self.now - 60, places=2)
 
-    def test_repli_mtime_porte_aussi_la_date(self):
-        """#1789/N2 : sans `updatedAt`, la date du relevé vient du mtime et
-        reste exposée (`read_at`)."""
+    def test_mtime_fallback_also_carries_the_date(self):
+        """#1789/N2: without `updatedAt`, the reading's date comes from the
+        mtime and stays exposed (`read_at`)."""
         stamp = self.now - 120
         instantane = self._instantane()
         del instantane["updatedAt"]
@@ -112,9 +112,9 @@ class WidgetUsageTest(unittest.TestCase):
         self.assertIsNotNone(gauges)
         self.assertAlmostEqual(gauges[0].read_at, stamp, places=2)
 
-    def test_titre_de_seau_avec_parenthese(self):
-        """#1789/N4 : « Fable Weekly (7-day) » donne la portée « fable », pas
-        « fable ( ) » — le seau n'est plus écarté du filtrage par modèle."""
+    def test_bucket_title_with_parenthesis(self):
+        """#1789/N4: "Fable Weekly (7-day)" gives the scope "fable", not
+        "fable ( )" — the bucket is no longer set aside by model filtering."""
         instantane = self._instantane()
         instantane["limits"] = [
             {"label": "Weekly (7-day)", "percent": 0.93,
@@ -132,13 +132,13 @@ class WidgetUsageTest(unittest.TestCase):
         fable = accounts.model_scoped(gauges, "claude-fable-5")
         self.assertIn("seven_day@fable", [g.key for g in fable])
 
-    def test_iso_avec_et_sans_microsecondes(self):
+    def test_iso_with_and_without_microseconds(self):
         avant = widget_usage._iso_epoch("2026-10-21T12:00:00+00:00")
         apres = widget_usage._iso_epoch("2026-10-21T12:00:00.245717+00:00")
         self.assertAlmostEqual(apres - avant, 0.245717, places=5)
         self.assertAlmostEqual(
             widget_usage._iso_epoch("2026-10-21T12:00:00Z"), avant, places=6)
-        # les deux formes se lisent sur un instantané frais
+        # both forms are read from a fresh snapshot
         self._ecrit("claude-secondary.json", self._instantane(limits=[
             {"label": "Weekly (7-day)", "percent": 1.0,
              "resetsAt": "2026-10-21T12:00:00+00:00"},
@@ -153,7 +153,7 @@ class WidgetUsageTest(unittest.TestCase):
         self.assertAlmostEqual(gauges[1].resets_at, court, places=5)
         self.assertAlmostEqual(gauges[1].used, 0.5)
 
-    def test_percent_borne_et_echelle(self):
+    def test_percent_clamped_and_scale(self):
         self._ecrit("claude-secondary.json", self._instantane(limits=[
             {"label": "Session (5-hour)", "percent": 42,
              "resetsAt": _iso(self.now + HEURE)},
@@ -162,47 +162,47 @@ class WidgetUsageTest(unittest.TestCase):
         ]))
         gauges = widget_usage.read(_profil(self.compte, "secondaire"),
                                    now=self.now, directory=self.dossier)
-        # au-delà de 1 : à sec, jamais lu comme un pourcentage (1.05 ≠ 1 %)
+        # above 1: dry, never read as a percentage (1.05 ≠ 1%)
         self.assertAlmostEqual(gauges[0].used, 1.0)
         self.assertAlmostEqual(gauges[1].used, 1.0)
 
-    def test_inertie_source_absente_ou_illisible(self):
+    def test_inertia_missing_or_unreadable_source(self):
         profil = _profil(self.compte, "secondaire")
-        # dossier absent
+        # missing directory
         self.assertIsNone(widget_usage.read(profil, now=self.now,
                                             directory=os.path.join(self.tmp, "rien")))
-        # JSON illisible
+        # unreadable JSON
         self._ecrit("claude-secondary.json", "{pas du json")
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
-        # schéma inconnu
+        # unknown schema
         self._ecrit("claude-secondary.json", self._instantane(schemaVersion=2))
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
-        # pas prêt
+        # not ready
         self._ecrit("claude-secondary.json", self._instantane(ready=False))
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
-        # aucun seau lisible
+        # no readable bucket
         self._ecrit("claude-secondary.json", self._instantane(limits=[
             {"label": "Something else", "percent": 0.5}]))
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
-        # le compte par défaut lit `claude.json`
+        # the default account reads `claude.json`
         self._ecrit("claude.json", self._instantane())
         defaut = os.path.join(self.tmp, "claude")
         os.makedirs(defaut, exist_ok=True)
         self.assertIsNotNone(widget_usage.read(_profil(defaut, "primaire"),
                                                now=self.now, directory=self.dossier))
 
-    def test_fraicheur_plus_courte_fenetre(self):
+    def test_freshness_shortest_window(self):
         profil = _profil(self.compte, "secondaire")
-        # 6 h de retard, avec une fenêtre de 5 h : périmé (#1561)
+        # 6 h behind, with a 5 h window: stale (#1561)
         self._ecrit("claude-secondary.json", self._instantane(
             updatedAt=_iso(self.now - 6 * HEURE)))
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
-        # 4 h de retard : encore dans la fenêtre courte
+        # 4 h behind: still within the short window
         self._ecrit("claude-secondary.json", self._instantane(
             updatedAt=_iso(self.now - 4 * HEURE)))
         self.assertIsNotNone(widget_usage.read(profil, now=self.now,
                                                directory=self.dossier))
-        # un fichier sans fenêtre courte vit à l'échelle de sa fenêtre longue
+        # a file without a short window lives on its long window's scale
         self._ecrit("claude-secondary.json", self._instantane(
             updatedAt=_iso(self.now - 6 * HEURE),
             limits=[{"label": "Weekly (7-day)", "percent": 0.5,
@@ -210,7 +210,7 @@ class WidgetUsageTest(unittest.TestCase):
         self.assertIsNotNone(widget_usage.read(profil, now=self.now,
                                                directory=self.dossier))
 
-    def test_updated_at_absent_repli_sur_mtime(self):
+    def test_updated_at_absent_fallback_on_mtime(self):
         profil = _profil(self.compte, "secondaire")
         payload = self._instantane()
         payload.pop("updatedAt")
@@ -220,7 +220,7 @@ class WidgetUsageTest(unittest.TestCase):
         self._ecrit("claude-secondary.json", payload, mtime=self.now - 6 * HEURE)
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
 
-    def test_dossier_par_variable_d_environnement(self):
+    def test_directory_from_environment_variable(self):
         with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
             self.assertEqual(widget_usage.usage_dir(), self.dossier)
             self._ecrit("claude-secondary.json", self._instantane())
@@ -231,7 +231,7 @@ class WidgetUsageTest(unittest.TestCase):
 
 
 class PorteeParModeleTest(unittest.TestCase):
-    """Le filtrage des seaux de modèle et le score qui en découle."""
+    """Model bucket filtering and the score that follows from it."""
 
     def setUp(self) -> None:
         self.now = time.time()
@@ -244,7 +244,7 @@ class PorteeParModeleTest(unittest.TestCase):
                   scope="fable"),
         ], Overage(True, False))
 
-    def test_filtrage_par_modele(self):
+    def test_filtering_by_model(self):
         jauges = self._jauges()
         fable = accounts.model_scoped(jauges, "claude-fable-5")
         self.assertEqual([g.key for g in fable],
@@ -253,55 +253,55 @@ class PorteeParModeleTest(unittest.TestCase):
         self.assertEqual([g.key for g in autre], ["five_hour", "seven_day"])
         inconnu = accounts.model_scoped(jauges, "")
         self.assertEqual([g.key for g in inconnu], ["five_hour", "seven_day"])
-        # pas de session (affichage) : tous les seaux, y compris de modèle
+        # no session (display): all buckets, including model ones
         self.assertIs(accounts.model_scoped(jauges, None), jauges)
-        # la copie garde le type et les drapeaux d'overage du relevé
+        # the copy keeps the reading's type and overage flags
         self.assertIsInstance(autre, Gauges)
         self.assertTrue(autre.overage.capable)
-        # aucune jauge de modèle : la liste est rendue telle quelle
+        # no model gauge: the list is returned as is
         sans = Gauges([Gauge("claude", "five_hour", 0.1, self.now + HEURE, 5 * HEURE)])
         self.assertIs(accounts.model_scoped(sans, "fable"), sans)
 
-    def test_budget_perdu_du_seau_de_modele(self):
+    def test_lost_budget_of_the_model_bucket(self):
         jauges = self._jauges()
-        # pour un agent Fable : le seau Fable se remet à zéro le plus tôt, sa
-        # capacité inutilisée est le budget perdu
+        # for a Fable agent: the Fable bucket resets earliest, its
+        # unused capacity is the lost budget
         self.assertAlmostEqual(
             accounts.lost_at_reset(accounts.model_scoped(jauges, "fable"), self.now),
             1.0)
-        # pour un autre modèle : le seau Fable ne compte pas, la fenêtre 5 h
-        # est la plus proche (10 h) et sa part inutilisée vaut 0.9
+        # for another model: the Fable bucket does not count, the 5 h
+        # window is the closest (10 h) and its unused share is 0.9
         self.assertAlmostEqual(
             accounts.lost_at_reset(accounts.model_scoped(jauges, "opus"), self.now),
             0.9)
 
-    def test_rank_prefere_le_seau_de_modele_pour_son_modele(self):
-        # priorités déclarées : le secondaire passe avant le primaire à
-        # égalité de budget (L226b « primaries last »)
+    def test_rank_prefers_the_model_bucket_for_its_model(self):
+        # declared priorities: the secondaire goes before the primaire at
+        # equal budget (L226b "primaries last")
         primaire = accounts.Profile("claude", "primaire", priority=100)
         secondaire = accounts.Profile("claude", "secondaire", priority=20)
-        # A : retard identique à B ; son seau Fable à 0 % se remet à zéro dans
-        # 2 h, sa fenêtre 5 h dans 5 h
+        # A: same lag as B; its Fable bucket at 0% resets in
+        # 2 h, its 5 h window in 5 h
         ga = Gauges([
             Gauge("claude", "five_hour", 0.05, self.now + 5 * HEURE, 5 * HEURE),
             Gauge("claude", "seven_day", 0.05, self.now + 7 * JOUR, 7 * JOUR),
             Gauge("claude", "seven_day@fable", 0.0, self.now + 2 * HEURE, 7 * JOUR,
                   scope="fable"),
         ])
-        # B : même retard, même échéance, aucun seau de modèle
+        # B: same lag, same deadline, no model bucket
         gb = Gauges([
             Gauge("claude", "five_hour", 0.05, self.now + 5 * HEURE, 5 * HEURE),
             Gauge("claude", "seven_day", 0.05, self.now + 7 * JOUR, 7 * JOUR),
         ])
         ev = lambda p, g: accounts.Evaluation(p, gauges=g)  # noqa: E731
-        # agent Fable : A d'abord (seau Fable perdu dans 2 h, aucune perte chez B)
+        # Fable agent: A first (Fable bucket lost in 2 h, no loss at B)
         fable = {"primaire": ev(primaire, accounts.model_scoped(ga, "fable")),
                  "secondaire": ev(secondaire, gb)}
         self.assertEqual([p.name for p in accounts.rank([primaire, secondaire], fable,
                                                          self.now)],
                          ["primaire", "secondaire"])
-        # autre modèle : le seau Fable est écarté, A et B à égalité de budget,
-        # l'ordre déclaré départage (secondaire 20 avant primaire 100)
+        # other model: the Fable bucket is set aside, A and B at equal budget,
+        # the declared order breaks the tie (secondaire 20 before primaire 100)
         autre = {"primaire": ev(primaire, accounts.model_scoped(ga, "opus")),
                  "secondaire": ev(secondaire, gb)}
         self.assertEqual([p.name for p in accounts.rank([primaire, secondaire], autre,
@@ -310,7 +310,7 @@ class PorteeParModeleTest(unittest.TestCase):
 
 
 class GaugesOfTest(unittest.TestCase):
-    """`gauges_of` : widget frais d'abord, journaux sinon, overage conservé."""
+    """`gauges_of`: fresh widget first, logs otherwise, overage kept."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ameesh-widget-")
@@ -332,7 +332,7 @@ class GaugesOfTest(unittest.TestCase):
                   encoding="utf-8") as fh:
             json.dump(payload, fh)
 
-    def test_widget_frais_prioritaire_et_overage_du_journal(self):
+    def test_fresh_widget_priority_and_overage_from_the_log(self):
         self._ecrit({"schemaVersion": 1, "ready": True,
                      "updatedAt": _iso(self.now - 60),
                      "limits": [
@@ -348,9 +348,9 @@ class GaugesOfTest(unittest.TestCase):
                                      model="claude-fable-5", now=self.now)
         self.assertEqual([g.key for g in vus],
                          ["five_hour", "seven_day", "seven_day@fable"])
-        self.assertTrue(vus.overage.capable)     # repris du journal
+        self.assertTrue(vus.overage.capable)     # taken from the log
 
-    def test_repli_sur_le_journal_si_source_absente_ou_perimee(self):
+    def test_fallback_on_the_log_if_source_missing_or_stale(self):
         profil = _profil(self.compte, "primaire")
         with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
             vus = accounts.gauges_of(self.book, profil, [profil], now=self.now)
@@ -362,12 +362,12 @@ class GaugesOfTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
             vus = accounts.gauges_of(self.book, profil, [profil], now=self.now)
             self.assertEqual([g.key for g in vus], ["five_hour"])
-            self.assertAlmostEqual(vus[0].used, 0.8)    # le journal, pas le widget
+            self.assertAlmostEqual(vus[0].used, 0.8)    # the log, not the widget
 
-    def test_cle_api_ne_lit_pas_le_widget_du_primaire(self):
-        """#1789/N3 : une clé API n'a pas de dossier de configuration — sans
-        garde, `home()` retombe sur le dossier par défaut et sa ligne
-        afficherait les jauges du primaire."""
+    def test_api_key_does_not_read_the_primaire_widget(self):
+        """#1789/N3: an API key has no configuration directory — without a
+        guard, `home()` falls back on the default directory and its line
+        would display the primaire's gauges."""
         cle = accounts.Profile("claude", "cle", kind="api_key_env",
                                env="ANTHROPIC_API_KEY")
         self._ecrit({"schemaVersion": 1, "ready": True,
@@ -379,13 +379,12 @@ class GaugesOfTest(unittest.TestCase):
             vus = accounts.gauges_of(self.book, cle, [cle], now=self.now)
         lecture.assert_not_called()
         self.assertEqual([g.key for g in vus], ["five_hour"])
-        self.assertAlmostEqual(vus[0].used, 0.8)        # le journal du compte
+        self.assertAlmostEqual(vus[0].used, 0.8)        # the account's log
 
-    def test_deux_dossiers_de_meme_nom_ne_partagent_pas_le_fichier(self):
-        """#1789/N3 : `a/claude` et `b/claude` tombaient sur le même
-        `claude.json` ; la clé passe au chemin complet — le widget n'écrit pas
-        ce fichier, le journal reprend la main au lieu d'afficher les jauges
-        d'un autre dossier."""
+    def test_two_directories_with_the_same_name_do_not_share_the_file(self):
+        """#1789/N3: `a/claude` and `b/claude` fell on the same `claude.json`;
+        the key moves to the full path — the widget does not write that file,
+        the log takes over instead of displaying another directory's gauges."""
         a = _profil(os.path.join(self.tmp, "a", "claude"), "a")
         b = _profil(os.path.join(self.tmp, "b", "claude"), "b")
         for profil in (a, b):
@@ -398,16 +397,16 @@ class GaugesOfTest(unittest.TestCase):
             for profil in (a, b):
                 vus = accounts.gauges_of(self.book, profil, [a, b], now=self.now)
                 self.assertEqual([g.key for g in vus], ["five_hour"])
-                self.assertAlmostEqual(vus[0].used, 0.8)   # le journal, pas le widget
+                self.assertAlmostEqual(vus[0].used, 0.8)   # the log, not the widget
 
 
 class ChooseAvecWidgetTest(_Base):
-    """De bout en bout : le choix porte le modèle de l'agent (tranche 3).
+    """End to end: the choice carries the agent's model (slice 3).
 
-    Le seau Fable du primaire est à sec et se remet à zéro bientôt : un agent
-    Fable doit l'éviter (le seau le retient), un agent d'un autre modèle doit
-    pouvoir l'ignorer. Les deux comptes sont par ailleurs identiques, le
-    primaire passant devant par son ordre déclaré.
+    The primaire's Fable bucket is dry and resets soon: a Fable agent must
+    avoid it (the bucket holds it back), an agent of another model must be
+    able to ignore it. The two accounts are otherwise identical, the primaire
+    coming first by its declared order.
     """
 
     def _comptes(self):
@@ -443,8 +442,8 @@ class ChooseAvecWidgetTest(_Base):
         self._widget("claude-autre", None)
         runner, worker = self._worker("wf", "claude", {"claude": comptes})
         if registre:
-            # `ameesh set <agent> model=…` : le modèle est au registre, sans
-            # fichier d'état — c'est lui que le runner passe au tour
+            # `ameesh set <agent> model=…`: the model is in the registry,
+            # without a state file — it is the one the runner passes to the turn
             worker.agent = dict(worker.agent or {}, model=modele)
         else:
             os.makedirs(os.path.join(self.cfg.state_dir, worker.name), exist_ok=True)
@@ -458,13 +457,13 @@ class ChooseAvecWidgetTest(_Base):
         self.assertEqual(raison, "")
         return worker._account.name
 
-    def test_agent_fable_evite_le_seau_a_sec(self):
+    def test_fable_agent_avoids_the_dry_bucket(self):
         self.assertEqual(self._choix("claude-fable-5"), "secondaire")
 
-    def test_autre_modele_ignore_le_seau_de_modele(self):
+    def test_other_model_ignores_the_model_bucket(self):
         self.assertEqual(self._choix("claude-opus-5-5"), "primaire")
 
-    def test_modele_du_registre(self):
+    def test_model_from_the_registry(self):
         self.assertEqual(self._choix("claude-fable-5", registre=True), "secondaire")
         self.assertEqual(self._choix("claude-opus-5-5", registre=True), "primaire")
 
