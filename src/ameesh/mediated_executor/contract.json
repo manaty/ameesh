@@ -3929,7 +3929,7 @@
   }
  ],
  "refused": {
-  "interface_total": 411,
+  "interface_total": 412,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4093,6 +4093,7 @@
     "prune_guard_runs",
     "queued",
     "queued_oldest",
+    "reopen_run",
     "run",
     "running",
     "running_on",
