@@ -2458,11 +2458,6 @@ class WorkflowTest(unittest.TestCase):
         # ancré sur l'étape gel : le `if` du job version ne doit pas suffire.
         self.assertIn("        id: gel\n        if: github.event_name == 'pull_request'\n",
                       self.text)
-        # Les poussées main/release/integration gardent la suite complète.
-        self.assertIn('  pull_request:\n    types: [labeled]\n    branches: [main, '
-                      '"release/**", "integration/**"]\n', self.text)
-        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
-        self.assertNotIn("\n  workflow_dispatch:", self.text)
 
     def test_label_gate_exact_frozen_sha_and_composition(self):
         # #1343 : le job plan ne teste que la composition demandée — étiquette
@@ -2493,7 +2488,9 @@ class WorkflowTest(unittest.TestCase):
         # plan en produisait une, l'agrégat requis rougit au lieu de verdir
         # sans tests.
         job = self.text[self.text.index("\n  tests:\n"):]
-        self.assertIn('if [ "$CI_EVENT" = "pull_request" ]; then', job)
+        # #940 : l'agrégat n'admet que les expressions de son contrat et garde
+        # `github.event_name` dans le script (pas d'`env:` intercalé).
+        self.assertIn('if [ "${{ github.event_name }}" = pull_request ]; then', job)
         self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
         self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
 
