@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""`ameesh serve`: the mesh's read API, local mode (L84).
+"""`ameesh serve`: the mesh's API, local mode (L84 read, L87 human actions).
 
   ameesh serve [--port 8780] [--token-file PATH] [--human human:ID] [--organisation NAME]
   ameesh serve --openapi        prints the OpenAPI 3.1 document (docs/api/openapi-v1.json)
 
 Embeddable interface study (docs/design/etudes/ui-integrable.md, §2.1, §2.4,
 §3, §7). A standard-library HTTP server, separate from ameesh-approve (another
-process, another origin), **bound to 127.0.0.1 only** (no host option),
-**read-only**: GET and HEAD, anything else is 405, and the Postgres session is
-`default_transaction_read_only`.
+process, another origin), **bound to 127.0.0.1 only** (no host option). Reads
+are GET and HEAD, on a Postgres session in `default_transaction_read_only`.
+The human actions (L87, `serve_actions`) are POST, on a writable session of
+their own, each with an `Idempotency-Key` (required) reserved in the database
+before the action runs (`api_idempotency`, migration 0440): a retry reads the
+first response back and never acts twice. Any other method is 405.
 
 Local mode (v1): the human is the machine's owner (`--human`, otherwise
 `notify.default_human`, otherwise the only declared human, otherwise
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import http
 import http.server
 import json
@@ -51,7 +55,7 @@ import sys
 import urllib.parse
 from typing import Callable
 
-from . import __version__, httpkit
+from . import __version__, httpkit, serve_actions, storage
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -75,6 +79,9 @@ _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
 CSP = "default-src 'none'; frame-ancestors 'none'"
+#: `Idempotency-Key` of an action (L87), and how long its response is kept
+_IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+IDEMPOTENCY_RETENTION_S = 86400
 #: the standalone page (L88): its own files and the API, nothing inline
 UI = "/ui"
 # the package's directory, then ui/static opened one name at a time from it,
@@ -110,6 +117,8 @@ class Context:
     cfg: object
     human: str
     organisation: str | None = None
+    #: the principal a deputy acts for (0033 §7, team mode L86); local mode: None
+    on_behalf_of: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -300,17 +309,32 @@ ROUTES = (
     Route(OPENAPI_PATH, "openapi", "This document", _openapi, db=False, auth=False),
 )
 _PARAM_RE = {"id": _LOT_RE}
+#: the human actions (L87), under the API prefix
+ACTIONS = tuple(dataclasses.replace(action, path=API + action.path)
+                for action in serve_actions.ACTIONS)
+
+
+def _params(m: re.Match) -> dict:
+    params = {k: urllib.parse.unquote(v) for k, v in m.groupdict().items()}
+    for name, value in params.items():
+        if not _PARAM_RE.get(name, _NAME_RE).match(value):
+            raise ApiError(400, "bad_path", "%s refused" % name)
+    return params
 
 
 def match(path: str) -> tuple[Route, dict] | None:
     for route in ROUTES:
         m = route.regex.match(path)
         if m:
-            params = {k: urllib.parse.unquote(v) for k, v in m.groupdict().items()}
-            for name, value in params.items():
-                if not _PARAM_RE.get(name, _NAME_RE).match(value):
-                    raise ApiError(400, "bad_path", "%s refused" % name)
-            return route, params
+            return route, _params(m)
+    return None
+
+
+def match_action(path: str) -> tuple[serve_actions.Action, dict] | None:
+    for action in ACTIONS:
+        m = action.regex.match(path)
+        if m:
+            return action, _params(m)
     return None
 
 
@@ -387,6 +411,8 @@ SCHEMAS = {
                                mode=_STR, oidc_issuer=_STR_NULL, approve_url=_STR_NULL,
                                languages={"type": "array", "items": _STR}, openapi=_STR),
     "ameesh-error/1": _obj("ameesh-error/1", ["error", "message"], error=_STR, message=_STR),
+    "ameesh-action/1": _obj("ameesh-action/1", ["action", "by", "for", "result"],
+                            action=_STR, by=_STR, result=_OBJ, **{"for": _STR}),
 }
 
 
@@ -429,12 +455,46 @@ def openapi() -> dict:
         if params:
             operation["parameters"] = params
         paths[route.path] = {"get": operation}
+    for action in ACTIONS:
+        params = [{"name": name, "in": "path", "required": True,
+                   "schema": {"type": "integer"} if name == "id" else {"type": "string"}}
+                  for name in re.findall(r"\{(\w+)\}", action.path)]
+        params.append({"name": "Idempotency-Key", "in": "header", "required": True,
+                       "schema": {"type": "string", "pattern": _IDEMPOTENCY_RE.pattern},
+                       "description": "one key per action; a retry with the same key and "
+                                      "the same request reads the first response back"})
+        body = {"type": "object", "additionalProperties": False,
+                "required": [name for name, (_schema, required) in action.body.items()
+                             if required],
+                "properties": {name: schema for name, (schema, _required)
+                               in action.body.items()}}
+        responses = {"200": _response(action.summary, "ameesh-action/1"),
+                     "400": _response("bad request", "ameesh-error/1"),
+                     "401": _response("token missing or refused", "ameesh-error/1"),
+                     "403": _response("not allowed", "ameesh-error/1"),
+                     "404": _response("not found", "ameesh-error/1"),
+                     "409": _response("refused, or the key's first request still running",
+                                      "ameesh-error/1"),
+                     "413": _response("body too large", "ameesh-error/1"),
+                     "415": _response("body not JSON", "ameesh-error/1"),
+                     "422": _response("key already used for another request",
+                                      "ameesh-error/1"),
+                     "503": _response("database unavailable", "ameesh-error/1")}
+        operation = {"operationId": "post_" + re.sub(r"[^A-Za-z0-9]+", "_",
+                                                     action.path[len(API) + 1:]).strip("_"),
+                     "summary": action.summary, "parameters": params,
+                     "requestBody": {"required": True, "content": {
+                         "application/json": {"schema": body}}},
+                     "responses": responses}
+        paths.setdefault(action.path, {})["post"] = operation
     return {
         "openapi": "3.1.0",
         "info": {"title": "ameesh API", "version": "1",
-                 "description": "Read API of an ameesh mesh, local mode (L84). Each response "
-                                "is the serialisation of the matching `--json` output of the "
-                                "CLI; `schema` names it.",
+                 "description": "API of an ameesh mesh, local mode: reads (L84), each the "
+                                "serialisation of the matching `--json` output of the CLI "
+                                "(`schema` names it), and the human actions (L87), POST "
+                                "with a required `Idempotency-Key`. No route approves, "
+                                "produces or attaches a receipt.",
                  "license": {"name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only"}},
         "servers": [{"url": "http://127.0.0.1:%d" % DEFAULT_PORT}],
         "security": [{"bearer": []}],
@@ -447,8 +507,90 @@ def openapi() -> dict:
 
 
 # --------------------------------------------------------------------------
+# actions (L87)
+# --------------------------------------------------------------------------
+
+def _err(code: str, message: str) -> dict:
+    return {"schema": "ameesh-error/1", "error": code, "message": message}
+
+
+def fingerprint(path: str, body: dict) -> str:
+    """What an `Idempotency-Key` is bound to: the method, the path and the
+    canonical body."""
+    canonical = json.dumps({"method": "POST", "path": path, "body": body}, sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def act(ctx: Context, db, action, params: dict, body: dict, key: str,
+        digest: str) -> tuple[int, dict, bool]:
+    """Run `action` once per (human, `key`): (status, response, replayed).
+
+    The key is reserved in the database BEFORE the action runs. Already
+    answered with the same request: its response, replayed, nothing done. Used
+    for another request: 422. Its first request still running, or its outcome
+    unknown (the server stopped in between): 409, nothing done — retrying with
+    a new key could act twice, so check first. A refusal is stored like a
+    success (the same request is refused the same way); a transient failure
+    (5xx) releases the key, so the same request can be retried with it."""
+    requests = storage.of(db).api_requests
+    row = requests.reserve(ctx.human, key, digest, retention_s=IDEMPOTENCY_RETENTION_S)
+    if row is not None:
+        if row["fingerprint"] != digest:
+            return 422, _err("idempotency_mismatch",
+                             "this Idempotency-Key was used for another request"), False
+        if row["status"] is None:
+            return 409, _err("idempotency_in_progress",
+                             "the first request with this Idempotency-Key has not answered, "
+                             "or its outcome is unknown: check before acting again"), False
+        return row["status"], row["response"], True
+    try:
+        result = action.build(ctx, db, params, body)
+    except serve_actions.ActionError as exc:
+        status, data = exc.status, _err(exc.code, str(exc))
+    else:
+        status, data = 200, {"schema": "ameesh-action/1", "action": action.name,
+                             "by": ctx.human, "for": serve_actions.principal(ctx),
+                             "result": result}
+    # any other exception leaves the key reserved: the action may have been
+    # done, a retry must not do it twice (409 above)
+    if status >= 500:
+        requests.release(ctx.human, key)
+        return status, data, False
+    requests.complete(ctx.human, key, status, data)
+    return status, data, False
+
+
+def _no_constant(name: str):
+    raise ValueError("%s is not JSON" % name)
+
+
+def _no_duplicates(pairs: list) -> dict:
+    out: dict = {}
+    for name, value in pairs:
+        if name in out:
+            raise ValueError("duplicate key %r" % name)
+        out[name] = value
+    return out
+
+
+# --------------------------------------------------------------------------
 # server
 # --------------------------------------------------------------------------
+
+def db_writer(cfg) -> Callable:
+    """`write(fn)`: `fn(db)` on a writable connection of its own (L87)."""
+    rw = dataclasses.replace(cfg, read_only=False)
+
+    def write(fn):
+        db = db_mod.connect(rw)
+        try:
+            db_mod.require_schema(db, defer=True)
+            return fn(db)
+        finally:
+            db.close()
+    return write
+
 
 def db_reader(cfg) -> Callable:
     """`read(fn)`: `fn(db)` on a read-only connection of its own."""
@@ -465,7 +607,7 @@ def db_reader(cfg) -> Callable:
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
-    """Read-only: GET and HEAD; anything else is 405."""
+    """GET and HEAD read, POST acts (L87); anything else is 405."""
 
     server_version = "ameesh-serve"
     sys_version = ""
@@ -474,6 +616,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     ctx: Context
     token: str
     read: Callable
+    #: the writable connection of the actions; None: actions unavailable
+    write: Callable | None = None
 
     def version_string(self) -> str:
         return self.server_version
@@ -508,18 +652,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                    extra)
 
     def _refuse(self) -> None:
-        self._error(405, "method_not_allowed", "read-only: GET and HEAD only",
-                    (("Allow", "GET, HEAD"),))
+        self.close_connection = True
+        self._error(405, "method_not_allowed", "GET and HEAD read, POST acts",
+                    (("Allow", "GET, HEAD, POST"),))
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = \
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = \
         lambda self: self._refuse()
 
     def do_HEAD(self) -> None:
         self.do_GET()
 
     def do_GET(self) -> None:
+        self._serve(self._get)
+
+    def do_POST(self) -> None:
+        # one action per connection: an error before the body is read never
+        # leaves it to be parsed as the next request
+        self.close_connection = True
+        self._serve(self._post)
+
+    def _serve(self, handle: Callable) -> None:
         try:
-            self._get()
+            handle()
         except ApiError as exc:
             self._error(exc.status, exc.code, str(exc))
         except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
@@ -531,12 +685,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             log.warning("internal error: %s", type(exc).__name__)
             self._error(500, "internal", "internal error")
 
-    def _get(self) -> None:
+    def _guard(self) -> None:
         if not self._host_ok():
             raise ApiError(403, "host_refused", "host refused: http://127.0.0.1:%d/"
                            % self.server.server_address[1])
         if not self.server.limiter.allow(self.client_address[0]):
             raise ApiError(429, "rate_limited", "too many requests")
+
+    def _get(self) -> None:
+        self._guard()
         url = urllib.parse.urlsplit(self.path)
         if url.path == WELL_KNOWN:
             self._json(200, discovery(self.ctx))
@@ -546,6 +703,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         found = match(url.path)
         if found is None:
+            if match_action(url.path) is not None:
+                self._error(405, "method_not_allowed", "this route acts: POST",
+                            (("Allow", "POST"),))
+                return
             raise ApiError(404, "not_found", "no such route (see %s)" % OPENAPI_PATH)
         route, params = found
         if route.auth and not httpkit.bearer_ok(self.headers.get("Authorization"), self.token):
@@ -569,6 +730,68 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             data = route.build(self.ctx, None, params, query)
         self._json(200, data)
+
+    def _post(self) -> None:
+        self._guard()
+        url = urllib.parse.urlsplit(self.path)
+        found = match_action(url.path)
+        if found is None:
+            if (match(url.path) is not None or url.path == WELL_KNOWN or url.path == UI
+                    or url.path.startswith(UI + "/")):
+                self._error(405, "method_not_allowed", "this route reads: GET or HEAD",
+                            (("Allow", "GET, HEAD"),))
+                return
+            raise ApiError(404, "not_found", "no such route (see %s)" % OPENAPI_PATH)
+        action, params = found
+        if not httpkit.bearer_ok(self.headers.get("Authorization"), self.token):
+            self._error(401, "unauthorized", "token missing or refused",
+                        (("WWW-Authenticate", "Bearer"),))
+            return
+        if url.query:
+            raise ApiError(400, "bad_query", "an action takes no query string")
+        if self.write is None:
+            raise ApiError(503, "unavailable", "actions unavailable on this server")
+        keys = self.headers.get_all("Idempotency-Key") or []
+        if len(keys) != 1 or not _IDEMPOTENCY_RE.match(keys[0]):
+            raise ApiError(400, "idempotency_key", "one Idempotency-Key header is required "
+                           "(8 to 128 characters: letters, digits, _ and -)")
+        body = self._body(action)
+        status, data, replayed = self.write(lambda db: act(
+            self.ctx, db, action, params, body, keys[0], fingerprint(url.path, body)))
+        self._json(status, data, (("Idempotent-Replayed", "true"),) if replayed else ())
+
+    def _body(self, action) -> dict:
+        """The JSON object of the request: Content-Length bounded, no chunk,
+        no duplicate key, no NaN/Infinity, only the action's fields."""
+        if self.headers.get("Transfer-Encoding"):
+            raise ApiError(411, "length_required", "a Content-Length body is required")
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            raise ApiError(415, "unsupported_media_type", "Content-Type: application/json")
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) != 1 or not lengths[0].strip().isdigit():
+            raise ApiError(411, "length_required", "a Content-Length body is required")
+        length = int(lengths[0])
+        if length > serve_actions.MAX_BODY:
+            raise ApiError(413, "too_large", "body over %d bytes" % serve_actions.MAX_BODY)
+        raw = self.rfile.read(length) if length else b""
+        if len(raw) != length:
+            raise ApiError(400, "bad_body", "body shorter than its Content-Length")
+        try:
+            data = json.loads(raw.decode("utf-8"), parse_constant=_no_constant,
+                              object_pairs_hook=_no_duplicates)
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            raise ApiError(400, "bad_body", "unreadable JSON body") from None
+        if not isinstance(data, dict):
+            raise ApiError(400, "bad_body", "a JSON object is required")
+        unknown = sorted(set(data) - set(action.body))
+        if unknown:
+            raise ApiError(400, "bad_body", "unknown field(s): %s" % ", ".join(unknown)[:200])
+        missing = [name for name, (_schema, required) in action.body.items()
+                   if required and name not in data]
+        if missing:
+            raise ApiError(400, "bad_body", "missing field(s): %s" % ", ".join(missing))
+        return data
 
     def _ui(self, path: str) -> None:
         """The standalone page and its files: a fixed list, nothing else."""
@@ -640,12 +863,16 @@ class ServeHTTPServer(httpkit.BoundedHTTPServer):
 
 def make_server(ctx: Context, *, token: str, read: Callable, port: int = DEFAULT_PORT,
                 max_connections: int = MAX_CONNECTIONS,
-                rate_per_minute: int = RATE_PER_MINUTE) -> ServeHTTPServer:
-    """The server, bound to 127.0.0.1 (port 0: a free port)."""
+                rate_per_minute: int = RATE_PER_MINUTE,
+                write: Callable | None = None) -> ServeHTTPServer:
+    """The server, bound to 127.0.0.1 (port 0: a free port). Without `write`,
+    the actions answer 503."""
     if not token:
         raise ValueError("a token is required")
-    handler = type("ServeHandler", (Handler,), {"ctx": ctx, "token": token,
-                                                "read": staticmethod(read)})
+    attrs = {"ctx": ctx, "token": token, "read": staticmethod(read)}
+    if write is not None:
+        attrs["write"] = staticmethod(write)
+    handler = type("ServeHandler", (Handler,), attrs)
     server = ServeHTTPServer((BIND, int(port)), handler, max_connections=max_connections)
     server.limiter = httpkit.RateLimiter(rate_per_minute)
     return server
@@ -728,7 +955,8 @@ def main(argv: list[str] | None = None) -> int:
         print("ameesh serve: database unavailable: %s" % exc, file=sys.stderr)
         return 1
     try:
-        server = make_server(ctx, token=token, read=read, port=args.port)
+        server = make_server(ctx, token=token, read=read, port=args.port,
+                             write=db_writer(cfg))
     except OSError as exc:
         print("ameesh serve: port %s unavailable on %s: %s"
               % (args.port, BIND, exc.strerror or exc), file=sys.stderr)
@@ -744,5 +972,5 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["API", "BIND", "Context", "DEFAULT_PORT", "ROUTES", "SCHEMAS", "discovery",
-           "main", "make_server", "openapi", "owner"]
+__all__ = ["ACTIONS", "API", "BIND", "Context", "DEFAULT_PORT", "ROUTES", "SCHEMAS", "act",
+           "discovery", "main", "make_server", "openapi", "owner"]

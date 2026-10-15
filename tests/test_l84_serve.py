@@ -122,9 +122,12 @@ class DefencesTest(ServerMixin, unittest.TestCase):
         self.assertEqual(self.get("/api/v1/me", host="localhost:%d" % self.port)[0], 200)
 
     def test_read_only_methods(self):
-        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        # L87: POST acts, on its own routes only; a read route refuses it
+        status, headers, _b = self.get("/api/v1/me", method="POST")
+        self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD"))
+        for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
             status, headers, _b = self.get("/api/v1/me", method=method)
-            self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD"), method)
+            self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD, POST"), method)
         status, headers, body = self.get("/api/v1/me", method="HEAD")
         self.assertEqual((status, body), (200, b""))
         self.assertGreater(int(headers["Content-Length"]), 0)
@@ -248,9 +251,11 @@ class OpenApiTest(unittest.TestCase):
                 self.assertEqual(operation["security"], [])
         self.assertEqual(doc["paths"]["/.well-known/ameesh"]["get"]["security"], [])
 
-    def test_no_write_route(self):
-        for item in serve.openapi()["paths"].values():
-            self.assertEqual(set(item), {"get"})
+    def test_writes_are_the_actions_only(self):
+        # L87: a POST exists exactly on the human actions, nothing else writes
+        actions = {action.path for action in serve.ACTIONS}
+        for path, item in serve.openapi()["paths"].items():
+            self.assertEqual(set(item) - {"get"}, {"post"} if path in actions else set(), path)
 
 
 class SystemdUnitTest(unittest.TestCase):
