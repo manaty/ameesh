@@ -87,6 +87,11 @@ class ScopedReservationsTest(PgTestCase):
         work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
         work.reserve_migration(self.db, self.b['id'], 401, repo=self.repo)
         work.close(self.db, self.b['id'], abandoned=True, actor='dev')
+        # Depuis #956, la clôture libère la réservation legacy : on rétablit
+        # l'état d'avant #956 (un lot terminal garde son numéro, le
+        # déclencheur lui rend son dépôt) — c'est cet héritage que la
+        # migration projette en « released ».
+        self.db.execute('UPDATE work_items SET migration = 401 WHERE id = %d' % self.b['id'])
         self.db.execute('TRUNCATE work_migration_reservations RESTART IDENTITY')
         migration = next(m for m in migrations.discover() if m.name == 'migration_reservation_slots')
         self.assertEqual(migrations.non_additive(migration), [])
