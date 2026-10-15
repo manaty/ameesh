@@ -64,7 +64,7 @@ Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
 sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (421 opérations) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (422 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 `turn_resources.running_started_before` est une lecture de portée H :
