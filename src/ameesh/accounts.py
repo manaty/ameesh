@@ -110,6 +110,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass, field
@@ -118,6 +119,9 @@ from typing import Callable, NamedTuple
 from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
 from .cost import PACE_CEILING
+
+#: #1469: a billing account id (`openai-manaty`), the same on every host
+BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
@@ -226,6 +230,13 @@ class Profile:
     pace_ceiling: float = PACE_CEILING
     pace_ceiling_end: float | None = None
     pace_ceiling_end_hours: float = PACE_CEILING_END_HOURS
+    #: #1469: the provider billing account this profile spends from, shared by
+    #: every key, profile name, agent and host that bills it (`account_budget`);
+    #: empty = no daily account envelope applies
+    billing_account: str = ""
+    #: #1469: dollars reserved before each turn on that billing account (the
+    #: bound of one turn), settled at the real cost when the turn ends
+    reserve_usd: float = 2.0
 
     @property
     def default(self) -> bool:
@@ -408,6 +419,17 @@ def parse(raw) -> dict[str, list[Profile]]:
             pace_multiplier = _pace_multiplier(harness, name, item.get("pace_multiplier"))
             pace_ceiling, pace_ceiling_end, pace_ceiling_end_hours = _pace_ceiling(
                 harness, name, item)
+            billing = str(item.get("billing_account") or "")
+            if billing and not BILLING_RE.match(billing):
+                raise AccountError("account %s/%s: invalid billing_account %r"
+                                   % (harness, name, billing))
+            try:
+                reserve = float(item.get("reserve_usd", 2.0))
+            except (TypeError, ValueError):
+                raise AccountError("account %s/%s: unreadable reserve_usd" % (harness, name))
+            if not reserve > 0 or reserve == float("inf"):
+                raise AccountError("account %s/%s: reserve_usd must be positive"
+                                   % (harness, name))
             overage = str(item.get("overage") or "auto")
             if overage not in OVERAGE_MODES:
                 raise AccountError("account %s/%s: overage must be one of %s"
@@ -444,6 +466,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 pace_multiplier=pace_multiplier, pace_ceiling=pace_ceiling,
                 pace_ceiling_end=pace_ceiling_end,
                 pace_ceiling_end_hours=pace_ceiling_end_hours,
+                billing_account=billing, reserve_usd=reserve,
             ))
         out[harness] = profiles
     return out

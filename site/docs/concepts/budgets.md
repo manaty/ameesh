@@ -71,6 +71,71 @@ last and capped, never overage (L226b).
 The decision is fresh at every turn. A paused agent shows the reason in
 `ameesh list`, and the thread keeps a trace.
 
+## Daily envelope per billing account
+
+A provider **billing account** (`openai-manaty`, `deepseek-manaty`) can carry
+one USD envelope per **calendar day**, shared by every agent, key and host
+that spends from it. Each host profile names the account it bills:
+
+```json
+"accounts": {"codex": [{"name": "openai-api", "type": "api_key_env",
+                        "key_env": "OPENAI_KEY", "billing_account": "openai-manaty",
+                        "reserve_usd": 2}],
+             "deepseek": [{"name": "ds", "type": "api_key_env", "key_env": "DS_KEY",
+                           "billing_account": "deepseek-manaty"}]}
+```
+
+Several keys and profile names can name the same account. Rotating a key,
+recreating an agent or moving a host keeps the account's history and
+envelope. A human sets the envelope once for the whole mesh:
+
+```
+ameesh budget set --account openai-manaty --per-day 100      # Europe/Paris by default
+ameesh budget set --account deepseek-manaty --per-day 100 --tz Europe/Paris
+```
+
+- **Period**: the day runs from 00:00 to 24:00 in the account's zone. A DST
+  day lasts 23 h or 25 h with the same cap. `ameesh budget` shows the next
+  reset. This is distinct from the sliding 24 h cap of the mesh.
+- **Admission**: before each turn, the runner reserves the profile's
+  `reserve_usd` (2 $ by default, the bound of one turn). The reservation is
+  taken in one database transaction under a lock on the account: the day's
+  settled spend, plus the open reservations, plus the reservations kept for
+  the day, plus the new one, must fit the cap, whatever the number of runners
+  and hosts. The account decides whether a turn is paid, not the harness: an
+  API-key Codex profile with a billing account is reserved and counted.
+- **Settlement**: when the turn ends, its ledger row is tagged with the
+  account and the reservation is closed, in one transaction. An uncertain
+  outcome keeps the reservation counted in full for its day (`kept`), in
+  addition to the measured cost. Uncertain outcomes are an error, a lost
+  lease, preemption, a turn closed by a cap, or a crash followed by repair. A
+  human checks the turn, then releases it with `ameesh budget release <id>`.
+  A turn can cost more than its reservation; the excess is counted in full
+  and blocks the next turns. The cap can therefore be exceeded by at most the
+  excess of the turns running at that moment.
+- **Exhaustion**: the agent is paused with
+  `budget : account openai-manaty 99.00/100.00 $ (calendar day Europe/Paris) until 00:00`.
+  No critical-agent exception applies. The critical fallback only takes a
+  profile whose own account still has room. Other accounts keep their own
+  capacity. Conversations and documents are untouched.
+- **Audit**: setting an envelope, removing it and releasing a reservation are
+  for authorized humans only. Each change is journaled in `budget_events`
+  (`scope = account:<id>`) and in the thread.
+
+!!! warning "Coverage boundary"
+    The envelope covers the turns of runners connected to the mesh database.
+    It does **not** cover:
+
+    - mediated executors, which go through the model relay, still under the
+      mesh caps only;
+    - a profile without `billing_account`;
+    - any use of the same keys outside ameesh, such as an application calling
+      the provider directly or a developer's shell.
+
+    For DeepSeek, the balance poll shows the real drop (`ameesh cost balance`).
+    For OpenAI, there is no reading yet: outside spend is not seen. An
+    application that wants its calls counted must go through ameesh.
+
 ## Commands
 
 ```bash
@@ -81,6 +146,7 @@ ameesh cost turns [--agent A] [--since 24h] [--json]     # the per-turn ledger
 ameesh cost gauges [--harness H] [--since 7d] [--json]   # history of plan gauges
 ameesh cost balance [--provider deepseek] [--record] [--json]   # provider balance, real spend per hour and day
 ameesh budget show | set --per-hour X [--per-day Y] [--agent A] | unset …   # caps in the database
+ameesh budget set --account ID --per-day X [--tz Z] | unset --account ID | release N   # account envelopes
 ameesh accounts list | use ACCOUNT | auto | healthy | check # accounts and failover
 ameesh set <agent> model=… effort=… tier=…   # routing: applied at the next turn
 ameesh progress                         # includes spend and gauges
