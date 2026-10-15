@@ -634,6 +634,54 @@ class GithubTest(_PlanDb):
         self.assertEqual(work.get(self.db, n)["state"], "merged")
         self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#92" % REPO)
 
+    def test_1693_stage_reason_annule_toute_fusion_anterieure_a_la_correction(self):
+        # #1693 (N1, vue cx2) : le critère est l'instant de la fusion, pas le
+        # seul `pr_ref` — après deux corrections, une PR plus ancienne que la
+        # dernière correction ne referme pas le lot, même si `pr_ref` porte
+        # désormais une autre PR.
+        item = {"id": 7, "pr_ref": "%s#92" % REPO, "branch": "lot/7-etape"}
+        pr = {"number": 91, "headRefName": "lot/7-etape", "body": ""}
+        detail = plan_github._stage_reason(item, pr, None, "%s#91" % REPO,
+                                           annulled_ts=200.0, merged_ts=100.0)
+        self.assertIn("antérieure à la dernière correction", detail)
+        # une fusion POSTÉRIEURE à la correction ferme (None)
+        self.assertIsNone(plan_github._stage_reason(item, pr, None, "%s#91" % REPO,
+                                                    annulled_ts=100.0, merged_ts=200.0))
+
+    def test_1693_deux_corrections_aucune_ancienne_fusion_ne_referme(self):
+        # #1693 (N1, vue cx2) : intégration — après deux fusions annulées, le
+        # relevé revoit les deux PR ; la première (`pr_ref` porte la seconde)
+        # doit être retenue par le critère d'instant. Les instants des
+        # corrections sont posés pour que chaque fusion tombe entre deux.
+        a = work.add(self.db, title="deux corrections")
+        n = a["id"]
+        work.set_branch(self.db, n, "lot/%d-etape" % n, actor="orch", source="test")
+        self.merged_pr(91, "lot/%d-etape" % n, body="Étape.\n\nameesh-work: %d" % n,
+                       merged_at="2030-01-01T00:00:00Z")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        work.move(self.db, n, "build", actor="orch", correct="trop tôt (1)")
+        self.db.execute("UPDATE work_item_events SET created_at = to_timestamp(2000000000)"
+                        " WHERE work_item_id = %s AND state = 'build'", (n,))
+        self.merged_pr(92, "lot/%d-etape" % n, body="Fin.\n\nameesh-work: %d" % n,
+                       merged_at="2035-01-01T00:00:00Z")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#92" % REPO)
+        work.move(self.db, n, "build", actor="orch", correct="trop tôt (2)")
+        self.db.execute("UPDATE work_item_events SET created_at = to_timestamp(2100000000)"
+                        " WHERE work_item_id = %s AND state = 'build'", (n,))
+        report = plan_github.sync_github(self.db, self.gh, REPO)
+        by_pr = {r["pr"]: r for r in report["results"]}
+        self.assertIn("antérieure à la dernière correction", by_pr["%s#91" % REPO]["detail"])
+        self.assertEqual(work.get(self.db, n)["state"], "build")
+        # seul un transport fusionné APRÈS la dernière correction ferme le lot
+        self.merged_pr(93, "lot/%d-etape" % n, body="Vraie fin.\n\nameesh-work: %d" % n,
+                       merged_at="2040-01-01T00:00:00Z")
+        plan_github.sync_github(self.db, self.gh, REPO)
+        self.assertEqual(work.get(self.db, n)["state"], "merged")
+        self.assertEqual(work.get(self.db, n)["pr_ref"], "%s#93" % REPO)
+
     def test_1693_le_constat_stage_merged_ne_se_repete_pas_apres_une_note(self):
         # #1693 (N3) : la dédup du constat lit le journal récent, pas seulement
         # sa dernière ligne — une note intercalée ne le fait pas réécrire.

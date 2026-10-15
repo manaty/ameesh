@@ -8,18 +8,19 @@
 -- correction, et la vraie fusion écrit son propre jalon.
 --
 -- Les lots corrigés AVANT ce correctif gardent ce jalon. Cette reprise le
--- retire, avec un critère étroit : le lot est encore ouvert (ni `merged`, ni
--- `promoted`, ni `closed`) ET son journal porte une correction
--- `merged → build` (la seule transition de `merged` vers `build`, cf.
--- `CORRECTIONS` de work.py). Un lot sorti de `merged` par `blocked` ou
--- `waiting_human` — transitions normales — garde son jalon : sa fusion n'a
--- pas été annulée.
+-- retire avec un critère étroit : le jalon est encore celui d'une fusion
+-- ANNULÉE, c'est-à-dire que la dernière correction `merged → build` du lot est
+-- plus récente que sa dernière entrée en `merged` (vue cx2). Un lot refusionné
+-- depuis — même ensuite passé à `blocked` ou `waiting_human` — garde donc son
+-- jalon, celui de la vraie fusion ; un lot sorti de `merged` par `blocked` ou
+-- `waiting_human` sans correction le garde aussi. Seule la fusion que rien
+-- n'est venu confirmer disparaît.
 delete from work_item_milestones m
  where m.kind = 'merged'
-   and exists (select 1 from work_items w
-                where w.id = m.work_item_id
-                  and w.state not in ('merged', 'promoted', 'closed'))
-   and exists (select 1 from work_item_events e
-                where e.work_item_id = m.work_item_id
-                  and e.state = 'build'
-                  and e.note like 'correction: merged → build%');
+   and (select max(e.created_at) from work_item_events e
+         where e.work_item_id = m.work_item_id
+           and e.state = 'build'
+           and e.note like 'correction: merged → build%')
+     > (select max(e.created_at) from work_item_events e
+         where e.work_item_id = m.work_item_id
+           and e.state = 'merged');
