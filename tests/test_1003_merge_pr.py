@@ -420,6 +420,15 @@ class MergeTest(_Base):
         with self.assertRaisesRegex(merge_pr.MergePrError, "targets release/1"):
             self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
 
+    def test_a_target_written_refs_remotes_origin_names_the_same_branch(self):
+        # #1253 (cx3): `refs/remotes/origin/main` must name `main`, like
+        # `origin/main` does (merge_queue's normalization); the guard used to
+        # refuse it and declare nothing.
+        self.lot_target = "refs/remotes/origin/main"
+        _git(self.origin, "update-ref", "refs/heads/main", self.head)
+        out = self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+        self.assertEqual(out["state"], "already", out)
+
     def test_an_already_merged_view_that_does_not_name_the_head_is_refused(self):
         with self.assertRaisesRegex(merge_pr.MergePrError, "head is"):
             self.merge(self.gh(state="MERGED", headRefOid="a" * 40,
@@ -581,6 +590,22 @@ class RunTest(unittest.TestCase):
         code, text = self.run_with(out, args=self.args(lot=1003, json=False))
         self.assertEqual(code, 0)
         self.assertIn("WARNING lot not declared", text)
+
+    def test_an_unknown_actor_declares_nothing(self):
+        # N2 (#1253): the merged milestone is never attributed to
+        # UNKNOWN_ACTOR — the merge is a fact that is kept, the declaration is
+        # skipped and the warning names the fix.
+        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
+               "tip": "d" * 40}
+        for actor in ("", work.UNKNOWN_ACTOR):
+            with self.subTest(actor=actor):
+                with mock.patch.object(merge_pr.work, "merged") as recorded:
+                    code, text = self.run_with(out, args=self.args(actor=actor, json=False))
+                self.assertEqual(code, 0)
+                recorded.assert_not_called()
+                self.assertIn("WARNING lot not declared", text)
+                self.assertIn("unknown actor", text)
 
     def test_an_already_merged_pr_is_declared_on_its_lot(self):
         out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
