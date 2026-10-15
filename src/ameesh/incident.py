@@ -442,6 +442,16 @@ def _open(ops, ref: str) -> Optional[dict]:
     return None
 
 
+def _lot_author(db, lot) -> str:
+    """L'agent assigné au lot candidat, ou "" (lot introuvable, sans assigné,
+    magasin illisible) : sans nom sûr, l'incident reste dans la file."""
+    try:
+        row = work.get(db, int(lot)) or {}
+    except Exception:  # noqa: BLE001 - sans nom sûr, personne n'est désigné
+        return ""
+    return str(row.get("assignee") or "")
+
+
 def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = "",
                   workflow: str = "", url: str = "", modules: Iterable[str] = (),
                   tests: Iterable[str] = (), commits: Iterable[dict] = (), app: str = "",
@@ -459,6 +469,9 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
     refuserait un auteur non réveillable et perdrait l'incident), puis l'auteur
     du lot **candidat** (`unique`) est assigné si le registre l'accepte ;
     sinon l'incident reste dans la file de l'équipe et le corps porte le nom.
+    L'auteur est l'agent assigné au lot candidat, jamais l'auteur Git du
+    commit : un commit de fusion peut porter le compte de l'owner ou du
+    composeur, pas celui de l'agent qui a fait le lot.
     """
     ref = ref_of(repo, run_id)
     out = {"id": None, "created": False, "status": "", "lot": None, "author": "",
@@ -475,7 +488,8 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
         return out
     author = ""
     if attribution["status"] == "unique":
-        author = attribution.get("author") or ""
+        author = _lot_author(db, attribution.get("lot"))
+        out["author"] = author
     try:
         created = work.add(
             db, title=title_of(branch=branch, run_id=run_id, workflow=workflow,
@@ -568,6 +582,14 @@ def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
                     continue
             except Exception:  # noqa: BLE001 - garde indisponible : le relevé courant fait foi
                 pass
+            existing = _open(st.work, ref_of(repo, run_id))
+            if existing is not None:
+                # déjà porté : ni relevé GitHub ni rapport à chaque passage
+                line.update({"id": int(existing["id"]),
+                             "why": "incident #%d déjà ouvert (état %s)"
+                                    % (int(existing["id"]), existing.get("state") or "?")})
+                out.append(line)
+                continue
             try:
                 failures = st.ci.failures(repo, run_id)
             except Exception:  # noqa: BLE001 - sans échecs relevés, l'incident reste dû
@@ -597,8 +619,11 @@ def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
                 modules=[f.get("module") for f in failures],
                 tests=[f.get("test") for f in failures],
                 commits=commits, app=app, links=links, diagnosis=diagnosis, actor=actor)
+            earlier = line["why"]
             line.update(result)
-            if not line["why"]:
+            if earlier:
+                line["why"] = "%s ; %s" % (line["why"] or "ouvert", earlier)
+            elif not line["why"]:
                 line["why"] = "ouvert"
             out.append(line)
     return out

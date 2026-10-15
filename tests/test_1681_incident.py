@@ -380,6 +380,7 @@ class TestOuverture(unittest.TestCase):
         created = {"id": 9001}
         with self._db(_Ops(store)), \
                 mock.patch.object(incident.work, "add", return_value=created) as add, \
+                mock.patch.object(incident.work, "get", return_value={"assignee": "deepseek4"}), \
                 mock.patch.object(incident.work, "assign") as assign:
             out = incident.open_incident(
                 object(), repo="manaty/nexlink", branch="develop", run_id=77, app="nexlink",
@@ -451,6 +452,7 @@ class TestOuverture(unittest.TestCase):
         store = _Store()
         with self._db(_Ops(store)), \
                 mock.patch.object(incident.work, "add", return_value={"id": 9003}), \
+                mock.patch.object(incident.work, "get", return_value={"assignee": "agent-arrêté"}), \
                 mock.patch.object(incident.work, "assign", side_effect=RuntimeError("non réveillable")):
             out = incident.open_incident(
                 object(), repo="manaty/nexlink", branch="develop", run_id=80,
@@ -460,6 +462,44 @@ class TestOuverture(unittest.TestCase):
         self.assertTrue(out["created"])
         self.assertFalse(out["assigned"])
         self.assertIn("non assigné", out["why"])
+
+    def test_auteur_est_l_agent_du_lot_pas_l_auteur_git(self):
+        # un commit de fusion porte souvent le compte de l'owner ou du
+        # composeur : l'incident va à l'agent assigné au lot candidat
+        store = _Store()
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9005}), \
+                mock.patch.object(incident.work, "get", return_value={"assignee": "deepseek4"}) as get, \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.open_incident(
+                object(), repo="manaty/ameesh", branch="main", run_id=82,
+                modules=[self.MODULE], commits=[commit("a" * 40, 1242, [self.FILE],
+                                                       author="smichea")],
+                links={self.MODULE: [self.FILE]})
+        get.assert_called_once()
+        self.assertEqual(get.call_args.args[1], 1242)
+        self.assertEqual(assign.call_args.args[2], "deepseek4")
+        self.assertEqual(out["author"], "deepseek4")
+        self.assertTrue(out["assigned"])
+
+    def test_lot_sans_assigne_personne_n_est_designe(self):
+        store = _Store()
+        for found in ({"assignee": None}, None, RuntimeError("magasin")):
+            kwargs = ({"side_effect": found} if isinstance(found, Exception)
+                      else {"return_value": found})
+            with self._db(_Ops(store)), \
+                    mock.patch.object(incident.work, "add", return_value={"id": 9006}), \
+                    mock.patch.object(incident.work, "get", **kwargs), \
+                    mock.patch.object(incident.work, "assign") as assign:
+                out = incident.open_incident(
+                    object(), repo="manaty/ameesh", branch="main", run_id=83,
+                    modules=[self.MODULE], commits=[commit("a" * 40, 1242, [self.FILE],
+                                                           author="smichea")],
+                    links={self.MODULE: [self.FILE]})
+            assign.assert_not_called()
+            self.assertTrue(out["created"])
+            self.assertEqual(out["status"], "unique")
+            self.assertEqual(out["author"], "")
 
 
 class _CiStore:
@@ -521,6 +561,33 @@ class TestConsommateur(unittest.TestCase):
         self.assertTrue(out[0]["created"])
         self.assertEqual(out[0]["id"], 9100)
         self.assertEqual(out[0]["app"], "nexlink")
+
+    def test_incident_deja_ouvert_sans_relevé_github(self):
+        store = _Store([{"id": 9200, "issue_ref": "ci-incident:manaty/nexlink:501",
+                         "state": "intake"}])
+        lands = mock.Mock(return_value=[])
+        diagnoses = mock.Mock(return_value=None)
+        with self._db(_CiStore([self._run()]), store), \
+                mock.patch.object(incident.work, "add") as add:
+            out = incident.consume(object(), lands=lands, links=self.LINKS,
+                                   diagnoses=diagnoses)
+        lands.assert_not_called()
+        diagnoses.assert_not_called()
+        add.assert_not_called()
+        self.assertEqual(out[0]["id"], 9200)
+        self.assertIn("déjà ouvert", out[0]["why"])
+
+    def test_atterrissage_illisible_reste_dans_le_motif(self):
+        store = _Store()
+
+        def lands(*_a):
+            raise RuntimeError("404")
+
+        with self._db(_CiStore([self._run()]), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9201}):
+            out = incident.consume(object(), lands=lands, links=self.LINKS)
+        self.assertTrue(out[0]["created"])
+        self.assertIn("atterrissage illisible", out[0]["why"])
 
     def test_sans_carte_inconnu(self):
         store = _Store()
