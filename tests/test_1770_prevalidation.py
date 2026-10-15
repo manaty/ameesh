@@ -46,6 +46,24 @@ def flux(statut: str = "succes", part: str = "psycopg:1", module: str = "test_a"
     ])
 
 
+def flux_complet(statut_2: str = "succes") -> str:
+    """Le flux d'une exécution **complète** de `plan_sain()` : deux parts,
+    trois modules (le contrat `test_cluster` compris)."""
+    lignes = []
+    for part, modules, statut in (("psycopg:1", ["test_a"], "succes"),
+                                  ("psycopg:2", ["test_cluster", "test_b"], statut_2)):
+        lignes.append(pv.PART_MARK + part)
+        lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "debut",
+                                  "part": part, "modules": modules}))
+        for module in modules:
+            lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                                      "part": part, "module": module,
+                                      "test": "test_x", "statut": "succes"}))
+        lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                                  "part": part, "statut": statut, "duree_s": 1.2}))
+    return "\n".join(lignes)
+
+
 class SelectionTest(unittest.TestCase):
     def test_plan_sain_accepte(self):
         sel = pv.selection(plan_sain(), head=A)
@@ -120,27 +138,75 @@ class SelectionTest(unittest.TestCase):
 class ProofTest(unittest.TestCase):
     def setUp(self):
         self.sel = pv.selection(plan_sain(), head=A)
-        self.flow = pv.parse_flow(flux())
+        self.flow = pv.parse_flow(flux_complet())
 
-    def test_vert_avec_fin_succes(self):
+    def test_vert_seulement_si_toutes_les_parts_et_modules(self):
         rapport = self.sel.proof(lot=7, host="vm-agents-1",
                                  run={"outcome": "green", "exit": 0, "seconds": 12.0},
                                  flow=self.flow)
-        self.assertTrue(rapport["ok"])
+        self.assertTrue(rapport["ok"], rapport)
         self.assertEqual(rapport["outcome"], "green")
-        self.assertEqual(rapport["modules"], ["test_a"])
+        # les modules du rapport sont ceux réellement exécutés (ordre trié),
+        # le plan reste dans `planned`
+        self.assertEqual(rapport["modules"], ["test_a", "test_b", "test_cluster"])
+        self.assertEqual(rapport["planned"], ["test_a", "test_cluster", "test_b"])
+        self.assertEqual(rapport["missing"], [])
+        self.assertEqual(rapport["planned_parts"], ["psycopg:1", "psycopg:2"])
         self.assertEqual(rapport["sha"], A)
         self.assertEqual(rapport["host"], "vm-agents-1")
 
-    def test_sans_fin_le_run_est_incomplet(self):
+    def test_une_seule_part_ne_vaut_pas_vert(self):
+        """Repro cx1 : une part verte sur deux, un module sur trois -> refus."""
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
-                                 flow={"fins": (), "modules": ("test_a",)})
+                                 flow=pv.parse_flow(flux()))
         self.assertFalse(rapport["ok"])
         self.assertIn("run-incomplete", rapport["causes"])
+        # jamais les modules du plan : la preuve dit ce qui a tourné
+        self.assertEqual(rapport["modules"], ["test_a"])
+        self.assertEqual(rapport["missing"], ["test_b", "test_cluster"])
+
+    def test_fin_verte_sans_test_ninvente_aucun_module(self):
+        """Un unique fin=succes, zéro test : incomplet, modules vides."""
+        seul_fin = "\n".join([
+            pv.PART_MARK + "psycopg:1",
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                        "part": "psycopg:1", "statut": "succes", "duree_s": 0.1}),
+        ])
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow(seul_fin))
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-incomplete", rapport["causes"])
+        self.assertEqual(rapport["modules"], [])
+        self.assertEqual(rapport["tests"], 0)
+        self.assertEqual(rapport["planned"], ["test_a", "test_cluster", "test_b"])
+
+    def test_module_planifie_non_execute_refuse(self):
+        """Deux parts vertes mais un module attendu muet : refus."""
+        partiel = "\n".join(
+            ligne for ligne in flux_complet().splitlines()
+            if '"module": "test_b"' not in ligne)
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow(partiel))
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-incomplete", rapport["causes"])
+        self.assertEqual(rapport["missing"], ["test_b"])
+
+    def test_sans_aucun_flux_le_run_est_incomplet(self):
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow={"fins": (), "modules": ()})
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-incomplete", rapport["causes"])
+        self.assertEqual(rapport["modules"], [])
 
     def test_fin_echec_refuse(self):
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
-                                 flow=pv.parse_flow(flux(statut="echec")))
+                                 flow=pv.parse_flow(flux_complet(statut_2="echec")))
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-red", rapport["causes"])
+
+    def test_run_rouge_de_loffload_refuse(self):
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "run-red", "exit": 1},
+                                 flow=self.flow)
         self.assertFalse(rapport["ok"])
         self.assertIn("run-red", rapport["causes"])
 
@@ -150,6 +216,11 @@ class ProofTest(unittest.TestCase):
                                  flow=self.flow, head_after=B)
         self.assertFalse(rapport["ok"])
         self.assertIn("head-moved", rapport["causes"])
+
+    def test_arbre_verifie_recopie_dans_le_rapport(self):
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=self.flow, tree={"head": A, "clean": True})
+        self.assertEqual(rapport["tree"], {"head": A, "clean": True})
 
     def test_selection_refusee_ne_produit_pas_de_vert(self):
         sel = pv.selection(plan_sain(), head=B)

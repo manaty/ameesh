@@ -69,22 +69,45 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
 
 - sans canon relu (`--canon-commit` absent ou bloc absent) : refus
   `block-missing`, aucune exécution ;
-- contrôles avant tout run : hôte déclaré au canon (sinon `no-vm`), contrats
-  déclarés présents dans le dépôt, sélection exactement `classes du canon ∪
-  contrats` (tout module en trop est un élargissement, tout module manquant un
-  contrat perdu) ;
+- contrôles avant tout run : hôte déclaré au canon (sinon `no-vm`) ; chaque
+  fichier de contrat déclaré est **relu** (un fichier illisible refuse) et son
+  contenu lie la sélection : tout module qu'il nomme doit être exécuté, et le
+  plan ne peut pas compter comme contrat un module absent de ces fichiers ;
+  la sélection doit être exactement `classes du canon ∪ contrats` (tout module
+  en trop est un élargissement, tout module manquant un contrat perdu) ;
+- **liaison tête / arbre / plan** : `--repo` (ou le cwd) est l'arbre unique du
+  geste. Son `HEAD` doit être le `--sha` annoncé, sans aucune modification
+  suivie (index ou travail) — sinon `head-moved` ; c'est cet arbre que
+  l'offload photographie et envoie. Le plan doit y être transporté : chemin
+  **relatif** à cet arbre, refusé s'il en sort (`selection-unsafe`) ou s'il est
+  ignoré par git (il ne partirait pas dans le snapshot) ;
 - délai du run : `timeout_seconds` du canon ; exécution par
   `ameesh offload run --fallback none` uniquement. Sur la VM, ce chemin est
   celui du guest L159b (jetons de concurrence `flock`, scope cgroup plafonné par
   l'offre `policy.lend` de l'hôte) : aucune suite lourde n'est lancée hors de
   lui, et il ne contourne pas `ameesh heavy`, qui reste l'outil des agents
   natifs de l'hôte ;
-- après le run, si `--published-ref` est donnée, la référence est relue **au
-  distant** (`git ls-remote`) : une tête qui a bougé invalide le rapport
-  (`head-moved`) ;
+- après le run, la tête locale est relue (l'arbre a-t-il bougé pendant
+  l'exécution ?) ; si `--published-ref` est donnée, la référence est relue en
+  plus **au distant** (`git ls-remote`). Un mouvement, ou une relecture
+  impossible, invalide le rapport (`head-moved`) ;
 - le rapport `ameesh-prevalidation/1` est imprimé (`--json`) ; code de sortie 0
   si vert, 1 sinon. **Aucun jalon, aucun verdict** : l'accroche automatique du
-  gel n'existe pas encore.
+  gel n'existe pas encore. Une preuve de gel nomme `--published-ref` : sans
+  elle, la tête n'est relue qu'en local, et le rapport le dit (`tree`).
+
+## La preuve est exhaustive
+
+Le rapport ne recopie pas le plan : `modules` est la liste des modules
+réellement vus dans le flux `ameesh-test-event/1` (événements `test`), `planned`
+celle du plan, `missing` ceux qui manquent, `planned_parts` les parts attendues
+et `parts` celles qui ont parlé. Une part sans fin verte, un module attendu muet
+ou un flux sans test donnent `run-incomplete` ; une part rouge donne `run-red`.
+Un `fin=succes` isolé, sans événement de test, n'est jamais un vert et ne
+remplit jamais `modules` avec le plan.
+
+`tree` recopie l'état vérifié : `head` observé, `clean` vrai, et
+`published_ref` quand la référence publiée a été relue.
 
 ## Rapport persisté (0450)
 
