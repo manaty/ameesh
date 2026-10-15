@@ -111,6 +111,12 @@ ARGS = {  # op: (args, kwargs, résultat)
  "threads.index": ([], {"project": "site", "lot": "812", "transport": "github", "host": HOST,
                          "location": "owner/repo#812", "entry_id": "c-1001", "mailbox_ids": [812],
                          "author": "agent:" + AG, "excerpt": "PR relue.", "ts": TS, "trace": {"comment_id": 1001}}, None),
+ # L361b : le census d'un fil d'hôte médié, verrou + recomptage + expiration en une opération
+ "threads.recount": ([], {"project": "site", "lot": "812", "transport": "github", "host": HOST,
+                          "location": "owner/repo#812", "kept": 7,
+                          "last": {"entry_id": "site/812#3800", "mailbox_id": 812,
+                                   "author": "agent:" + AG, "excerpt": "PR relue.", "ts": TS},
+                          "end": 4096}, 4096),
  "work.mark_delegate_turn": ([AG, [812], "délégation : tour de inge-front sur le lot"], {}, [812]),
  # session
  "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True}),
