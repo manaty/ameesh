@@ -188,9 +188,17 @@ def _common_responsible(rows) -> str | None:
 # --------------------------------------------------------------------------
 
 def _gauge(row: dict) -> cost_mod.Gauge:
-    return cost_mod.Gauge(row["harness"], row["key"], float(row.get("used") or 0.0),
+    """La jauge d'une ligne d'historique, portée par modèle restituée.
+
+    #1789/N6 : la clé d'un seau propre à un modèle porte sa portée
+    (`seven_day@fable`, #1580) — l'historique ne stocke pas le `scope` ; le
+    relire ici évite qu'un seau de modèle soit pris pour la fenêtre générale
+    du compte (alertes de sous-utilisation, `plan_underused`)."""
+    key = row["key"]
+    _, _, scope = key.partition("@")
+    return cost_mod.Gauge(row["harness"], key, float(row.get("used") or 0.0),
                           row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
-                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]))
+                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]), scope=scope)
 
 
 def expiring(gauge, now: float) -> tuple | None:
@@ -279,9 +287,13 @@ def plan_underused(db, listing: list, now: float, *,
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
+        # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
+        # la capacité générale du compte inutilisable — seules les fenêtres
+        # générales se taisent entre elles ; un seau de modèle reste alerte.
+        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
         for gauge, seen in live:
             if any(other.exceeded(now, 0.0, multiplier, ceiling)
-                   for other, _ in live if other is not gauge):
+                   for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now

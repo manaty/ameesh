@@ -165,6 +165,11 @@ os.environ["AMEESH_SYSTEMCTL"] = ""
 os.environ["AMEESH_SESSION_STORE_CHECK"] = "0"
 EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
 os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
+#: #1580 (tranche 3) : jamais les jauges du widget omarchy du poste (pc-smichea
+#: en a de fraîches, dans ~/.local/state/omarchy/agents/usage) ; un test qui en
+#: veut pointe la variable sur son propre dossier
+EMPTY_USAGE_WIDGET = tempfile.mkdtemp(prefix="ameesh-test-usage-")
+os.environ["AMEESH_USAGE_WIDGET_DIR"] = EMPTY_USAGE_WIDGET
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
     os.environ.pop(_bin_var, None)
