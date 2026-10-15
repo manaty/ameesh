@@ -50,7 +50,7 @@ HOME = re.compile(r'/[A-Za-z0-9._/-]{0,127}\Z')
 OUTPUT = 65536
 
 REGISTRY = ("SELECT name, host, status, lease_owner, lease_expires_at, lease_epoch, turns,"
-            " last_turn_at FROM agent_registry WHERE name = %s")
+            " last_error, last_turn_at FROM agent_registry WHERE name = %s")
 TURNS = ("SELECT turn_id, status, started_at, ended_at FROM turn_resources"
          " WHERE agent = %s AND host = %s AND started_at >= %s ORDER BY id")
 RUNNING = ("SELECT count(*) AS running FROM turn_resources"

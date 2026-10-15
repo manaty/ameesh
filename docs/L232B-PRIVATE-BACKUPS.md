@@ -91,7 +91,12 @@ The server installer installs this helper and removes the former age-only
 no catalog record keeps its declared local window (`expire-unregistered
 --max-age`, 14 days for the daily dump) and is removed by age; a set
 registered in the catalog (for example by the release controller) is never
-touched by that age path, whatever its age or state. So expiry stays explicit
+touched by that age path, whatever its age or state. A refused candidate — a
+daily dump that is publicly readable, shared or owned by another identity — is
+never deleted and makes the `expire-unregistered` command exit non-zero; the
+daily server script keeps that status, still runs `prune`, then fails, so a
+file that will never expire cannot leave the timer silently green. So expiry
+stays explicit
 and catalogued, while the daily dump cannot fill the database disk without
 bound. Unregistered artifacts that predate this rule are treated the same way
 and expire on the first completed run after the window. Disk admission must
@@ -109,7 +114,11 @@ For these sets, the controller uses the Python `prune(..., remote_adapter=...)`
 interface. The adapter must inspect pinned object digests and perform an
 **atomic conditional** `delete_if_digest`, returning an exact object/digest
 absence receipt. An inspect followed by unconditional deletion cannot satisfy
-this contract. The entire eligible batch is checked before deletion; remote
+this contract. The entire eligible batch is checked before deletion; a pinned
+remote digest that changed or disappeared in that preflight refuses the whole
+batch, and the error names the artifact and object to reconcile — a set that
+can no longer be proven complete is settled before any other candidate is
+expired, and nothing is deleted meanwhile. Remote
 copies are removed and their receipts persisted before local files are
 removed. A storage failure or wrong receipt retains the local recovery copy.
 A crash after remote deletion but before saving its receipt can replay an

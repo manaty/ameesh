@@ -23,6 +23,9 @@ class Host(account_fixture.Accounts):
         for logical,mode in installer.DIRECTORIES.items():
             target=self.root/logical.lstrip('/')
             target.mkdir(parents=True,mode=mode,exist_ok=True)
+            # mkdir(2) applies the caller's umask: the fixture must publish the
+            # reviewed mode exactly (0711 store), never the session's umask.
+            target.chmod(mode)
         return True
     def validate_configuration(self,bundle): return True
     def validate_restored_configuration(self,bundle): return True
@@ -109,6 +112,19 @@ class InstallerTest(unittest.TestCase):
             root = self.root/logical.lstrip('/')
             self.assertEqual(stat.S_IMODE(root.stat().st_mode), mode, logical)
             self.assertEqual(root.stat().st_uid, os.geteuid(), logical)
+
+    def test_reviewed_layout_modes_do_not_follow_the_caller_umask(self):
+        # §3 : le témoin 0711 ne dépend pas de l'umask de la session qui lance
+        # la suite. Un umask restrictif donnerait 0700 au dépôt de versions.
+        previous=os.umask(0o077)
+        try:
+            self.system.layout(self.bundle)
+        finally:
+            os.umask(previous)
+        for logical,mode in (('/var/lib/ameesh-release-bootstrap',0o700),
+                             ('/opt/ameesh-release/store',0o711)):
+            root=self.root/logical.lstrip('/')
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode),mode,logical)
 
     def test_lost_activation_reply_rechecks_configuration_and_never_recreates_account(self):
         original=self.system.activate_ssh_configuration; lost=[False]
