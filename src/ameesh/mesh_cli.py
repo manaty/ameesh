@@ -244,7 +244,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             status = row.get("status") or "?"
             if row.get("status_text"):
                 status = "%s/%s" % (status, row["status_text"][:22])
-            if row.get("operator_paused"):
+            if row.get("operator_paused") and row.get("status") not in ("stopped", "dead", "blocked"):
                 status = ("pause-next" if row.get("status") == "running" else "op-paused")
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
