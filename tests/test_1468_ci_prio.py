@@ -246,7 +246,11 @@ class RunsOnTest(unittest.TestCase):
             """'["self-hosted", "linux", "ameesh-ci"]'""",
             """vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]'"""),
             self.linux["bilan"])
-        self.assertEqual(self.jobs["platform-macos"], "macos-latest")
+        # #987 x #1468 : le job requis tourne sur l'image x64 standard
+        # (`macos-26-intel`) ; `macos-latest` (macOS 26 arm64) n'obtenait pas
+        # de capacité hébergée et était annulé sans qu'une étape ne tourne.
+        # Le littéral reste épinglé : toute dérive de l'image est vue.
+        self.assertEqual(self.jobs["platform-macos"], "macos-26-intel")
 
     def test_switch_off_keeps_previous_routing(self):
         for vars_ in ({}, {"AMEESH_CI_PRIO": "off"}, {"AMEESH_CI_PRIO": ""},
