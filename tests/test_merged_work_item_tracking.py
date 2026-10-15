@@ -1093,6 +1093,43 @@ class ContentDeliveryTest(_Base):
         self.assertFalse(found["merged"])
         self.assertIn("revert", found["detail"])
 
+    def test_1638_citation_revertee_ne_ferme_pas(self):
+        sha = self.livrer("agent/498", "composition")
+        lot = self.lot(sha)
+        _git(self.repo, "commit", "--amend", "-q", "-m",
+             "composition\n\nameesh-work: %d" % lot["id"])
+        self.publish_develop()
+        self.assertEqual(self.sync(dry_run=True)["results"][0]["result"], "would-merge")
+        self.retirer()
+        found = self.sync()["results"][0]
+        self.assertEqual(found["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        _git(self.repo, "config", "ameesh.target", "origin/develop")
+        self.assertIn("revert", self.sync()["results"][0]["detail"])
+
+    def test_1638_mention_revertee_branche_supprimee(self):
+        sha = self.livrer("agent/498", "Merge branch agent/498")
+        self.retirer()
+        _git(self.repo, "branch", "-D", "agent/498")
+        for seen in (None, sha):
+            with self.subTest(seen=seen):
+                found = plan_git.branch_probe(self.repo, "agent/498", "origin/develop",
+                                              seen_head=seen)
+                self.assertFalse(found["merged"])
+                self.assertIn("revert", found["detail"])
+
+    def test_1638_modification_binaire_revertee(self):
+        _git(self.repo, "checkout", "-q", "-b", "agent/498", "develop")
+        with open(os.path.join(self.repo, "socle"), "wb") as fh:
+            fh.write(b"nouveau\x00contenu")
+        _git(self.repo, "commit", "-q", "-am", "modification binaire")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "composition", "agent/498")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        self.retirer()
+        self.assertFalse(plan_git.probe(self.repo, sha, "origin/develop")["merged"])
+
     def test_1638_ancetre_evolue_reste_fusionne(self):
         # un lot suivant touche le même fichier : le contenu du gel est
         # toujours là, l'arbre a évolué ; l'ascendance reste admise (doute
@@ -1106,6 +1143,13 @@ class ContentDeliveryTest(_Base):
         entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
         self.assertEqual((entry["result"], entry["how"]), ("merged", "ancestor"))
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_1638_chemin_unicode_evolue_reste_fusionne(self):
+        sha = self.livrer("agent/évolution", "composition")
+        with open(os.path.join(self.repo, "agent-évolution"), "a") as fh:
+            fh.write("suite\n")
+        _git(self.repo, "commit", "-q", "-am", "suite sur le meme fichier")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
 
 
 class CurrentLotTest(_Base):

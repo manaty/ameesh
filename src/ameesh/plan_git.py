@@ -150,7 +150,7 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
     parent = _out(repo, "rev-parse", "--verify", "--quiet", sha + "^1")
     if parent is None:
         return None
-    diff = _git(repo, "diff", "--no-color", parent, sha)
+    diff = _git(repo, "diff", "--no-color", "--binary", parent, sha)
     if diff.returncode != 0 or not diff.stdout.strip():
         return None
     forward = _applies(repo, head, diff.stdout)
@@ -161,12 +161,14 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
         return None
     # les deux échouent (arbres évolués) : seuls les chemins ajoutés disparus
     # ou supprimés revenus prouvent le retrait
-    status = _out(repo, "diff", "--name-status", parent, sha)
-    for line in (status or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) < 2:
+    status = _out(repo, "diff", "--name-status", "-z", parent, sha)
+    fields = iter((status or "").split("\0"))
+    for kind in fields:
+        path = next(fields, "")
+        if kind.startswith(("R", "C")):
+            next(fields, None)       # les renommages/copies portent deux chemins
+        if kind not in ("A", "D") or not path:
             continue
-        kind, path = parts[0][:1], parts[-1]
         present = _out(repo, "rev-parse", "--verify", "--quiet",
                        "%s:%s" % (head, path)) is not None
         if kind == "A" and not present:
@@ -640,6 +642,10 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     def mention(why: str) -> dict:
         sha = merge_mentioning(repo, branch, head, since_ts)
         if sha:
+            gone = _content_gone(repo, sha, head)
+            if gone:
+                return dict(out, detail="merge commit %s that cites %s was reverted: %s"
+                                        % (sha[:12], branch, gone))
             return dict(out, merged=True, how="message", ref=sha,
                         detail="merge commit %s of %s that cites %s" % (sha[:12], target,
                                                                           branch))
@@ -1017,7 +1023,13 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
             partial = (merge, "merge commit %s declares itself partial "
                        "(\"ameesh-work-partial: %d\"): lot kept open"
                        % (merge["sha"][:12], lot))
+    reverted = None
     for merge in citing:
+        gone = _content_gone(repo, merge["sha"], _commit(repo, target))
+        if gone:
+            reverted = "merge commit %s of %s was reverted: %s" % (
+                merge["sha"][:12], target, gone)
+            continue
         number = merge_pr_number(merge["message"])
         if not number:
             cited = merge
@@ -1068,6 +1080,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
                          how=cited["how"], ref=cited["sha"],
                          detail=_citation(cited, lot, target),
                          note=_citation(cited, lot, target, sha=False))
+        elif reverted:
+            found = dict(found or {"tip": None, "ahead": False}, merged=False,
+                         how=None, ref=None, detail=reverted)
         elif found is None:
             found = {"merged": False, "how": None, "ref": None, "tip": None,
                      "ahead": False,
