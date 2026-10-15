@@ -289,7 +289,12 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         raise AssignmentError(str(exc)) from exc
     if item is not None:
         out.update(lot=item, work_item_id=str(item["id"]))
-    if not has_open and not out["assigned"] and not _is_chat(db, recipient):
+    # #1407 : l'avertissement ne vaut que pour un dépôt SANS lien. Un `--lot`
+    # résolu est un rattachement effectif (le fil et l'activité du lot le
+    # lisent) même quand la garde d'attribution ne confie pas le lot au
+    # destinataire ; seule une étiquette sans lot ouvert reste sans lien.
+    if not has_open and not out["assigned"] and item is None \
+            and not _is_chat(db, recipient):
         out["warnings"].append(
             "%s has no open lot: this work will show up neither in ameesh projects "
             "nor in alerts — link it (--lot <id|ref>) or create it "
