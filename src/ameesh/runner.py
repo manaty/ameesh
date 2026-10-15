@@ -336,6 +336,7 @@ class AgentWorker(threading.Thread):
         #: au milieu d'un tour, où schéma, dossier d'état et comptes doivent
         #: rester cohérents du début à la fin)
         self._cfg_pending: Config | None = None
+        self._cfg_lock = threading.Lock()
         self.name = agent["name"]
         self.epoch = int(lease["lease_epoch"])
         self.agent = agent
@@ -501,16 +502,18 @@ class AgentWorker(threading.Thread):
         nouvelle configuration au début de son prochain tour. Rien n'est changé
         au milieu d'un tour : le schéma, la base et le dossier d'état d'un tour
         en cours restent ceux avec lesquels il a démarré (R1 cx2)."""
-        self._cfg_pending = cfg
+        with self._cfg_lock:
+            self._cfg_pending = cfg
 
     def _apply_pending_config(self) -> None:
         """Frontière de tour (#1466) : la configuration relue entre en vigueur
         ici, avant tout ce qui la lit (comptes, plafonds, rôles critiques)."""
-        cfg = self._cfg_pending
-        if cfg is None:
-            return
-        self._cfg_pending = None
-        self.cfg = cfg
+        with self._cfg_lock:
+            cfg = self._cfg_pending
+            if cfg is None:
+                return
+            self._cfg_pending = None
+            self.cfg = cfg
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -3392,7 +3395,6 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
-        self._apply_pending_config()  # #1466 : frontière de tour
         self.fast_failure = False
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
@@ -4518,6 +4520,7 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            self._apply_pending_config()  # avant les gardes de rotation et de prise
             self.apply_restart_if_requested()
             self.maybe_rotate()
             spec = self.rotate_for_lot(self.pick())
@@ -4538,6 +4541,7 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                self._apply_pending_config()  # une pause budget doit voir les comptes relus
                 if self.runner.draining.is_set():
                     break  # drainage : le tour d'avant est fini, aucun autre ne part
                 if getattr(self.runner, "restart_for_stale", False):

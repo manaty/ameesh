@@ -183,13 +183,34 @@ class RelectureConfigTest(unittest.TestCase):
         le worker la prend à sa frontière de tour."""
         cfg = self._cfg()
         worker = SimpleNamespace(name="agent-2", cfg="celle-du-tour",
-                                 _cfg_pending=None)
+                                 _cfg_pending=None, _cfg_lock=threading.Lock())
         AgentWorker.apply_config(worker, cfg)
         self.assertEqual(worker.cfg, "celle-du-tour")     # rien au milieu du tour
         AgentWorker._apply_pending_config(worker)
         self.assertIs(worker.cfg, cfg)
         AgentWorker._apply_pending_config(worker)          # idempotent
         self.assertIs(worker.cfg, cfg)
+
+    def test_un_compte_corrige_debloque_la_selection_du_prochain_tour(self):
+        ancien = Config(accounts={"deepseek": [{"name": "plafonne"}]})
+        frais = replace(ancien, accounts={"deepseek": [{"name": "disponible"}]})
+        worker = SimpleNamespace(cfg=ancien, _cfg_pending=None,
+                                 _cfg_lock=threading.Lock(), stopping=threading.Event())
+        worker.ensure_watchdog = lambda: None
+        worker.apply_restart_if_requested = lambda: None
+        worker._apply_pending_config = lambda: AgentWorker._apply_pending_config(worker)
+        worker.rotate_for_lot = lambda spec: spec
+        worker._moved_before_turn = lambda spec: False
+        observations = []
+        # Les gardes de rotation et de sélection lisent les comptes AVANT
+        # run_turn : un compte plafonné ne doit pas empêcher sa relecture.
+        worker.maybe_rotate = lambda: observations.append(worker.cfg.accounts)
+        worker.pick = lambda: ({"kind": "prompt"} if worker.cfg is frais else None)
+        worker.run_turn = lambda spec: observations.append(worker.cfg.accounts)
+        AgentWorker.apply_config(worker, frais)
+        self.assertIs(worker.cfg, ancien)  # le tour actif garde sa configuration
+        self.assertTrue(AgentWorker.process_once(worker, 0))
+        self.assertEqual(observations, [frais.accounts, frais.accounts])
 
 
 if __name__ == "__main__":
