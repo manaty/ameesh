@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """GitHub Actions runners of the ameesh guest on a lending host (lot #1256):
-the runner unit, the gate wrapper that keeps them behind the guard's state,
-the installer's dry runs, and the isolation it promises to the host's own
-application (never `actions.runner.*`, never `/home/runner`).
+the runner unit, the single-use gate wrapper that keeps them behind the
+guard's state, the installer's dry runs, the label separation of option A
+(the borrowed runners never carry the fleet's label, and only a job outside
+the required path may target them), and the isolation it promises to the
+host's own application (never `actions.runner.*`, never `/home/runner`).
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import select
@@ -34,6 +38,26 @@ SRC = os.path.join(REPO, "src")
 # (R1 delta B4, #1256, binôme).
 TOOLS = "/usr/local/lib/ameesh-guest-ci"
 TOOLS_REL = TOOLS.lstrip("/")
+# the guest's own label, and the fleet's: a guest runner must never carry the
+# second (option A of the R2 B1 arbitration)
+LENT = "ameesh-lent"
+FLEET = "ameesh-ci"
+
+
+def jit_config(name="ameesh-nxl-ci-3-1", repo="https://github.com/manaty/ameesh",
+               files=None):
+    """A JIT configuration, as `POST …/generate-jitconfig` returns it: base64
+    of a JSON object mapping runner file names to base64 contents
+    (actions/runner v2.338.0, Runner.cs: every entry is written into the
+    runner's root before the single job)."""
+    if files is None:
+        runnersettings = json.dumps(
+            {"agentName": name, "gitHubUrl": repo,
+             "serverUrl": "https://pipelines.actions.githubusercontent.com/t/"})
+        files = {".runner": runnersettings, ".credentials": "{}"}
+    doc = {key: base64.b64encode(value.encode()).decode()
+           for key, value in files.items()}
+    return base64.b64encode(json.dumps(doc).encode()).decode()
 
 
 def unit(name: str) -> dict[str, list[str]]:
@@ -50,7 +74,7 @@ def unit(name: str) -> dict[str, list[str]]:
 
 
 class GuestCiUnitTest(unittest.TestCase):
-    def test_unit_stays_in_the_guest(self):
+    def test_unit_is_single_use_and_stays_in_the_guest(self):
         u = unit("ameesh-guest-ci@.service")
         self.assertEqual(u["User"], ["ameesh-guest"])
         self.assertEqual(u["Slice"], ["ameesh-guest.slice"])
@@ -68,6 +92,10 @@ class GuestCiUnitTest(unittest.TestCase):
         # guard's state, not run.sh directly
         self.assertIn(TOOLS + "/ci-runner-gate", u["ExecStart"][0])
         self.assertIn("--dir /srv/ameesh-guest/ci/r%i", u["ExecStart"][0])
+        # option A (#1256): one start consumes one deposited single-use
+        # configuration, and nothing re-arms the unit behind the operator
+        self.assertIn("--spool /srv/ameesh-guest/ci/jit/r%i", u["ExecStart"][0])
+        self.assertEqual(u["Restart"], ["no"])
         self.assertEqual(env["AMEESH_HOST_GATE_PATH"],
                          "/run/ameesh-gate/state/state.json")
         self.assertNotIn("run.sh", u["ExecStart"][0])
@@ -92,24 +120,33 @@ def gate_doc(state="available", mode="enforce", *, ttl=90.0, seq=1):
 
 
 class GateWrapperTest(unittest.TestCase):
-    """deploy/guest/ci-runner-gate.py: the GitHub runner (a fake run.sh here)
-    runs only while the guard publishes a fresh `available` out of `enforce`,
-    and is stopped when the state closes, disappears or goes stale (R1
-    #1256)."""
+    """deploy/guest/ci-runner-gate.py: the guest's runner (a fake run.sh here)
+    starts **one** single-use configuration, only while the guard publishes a
+    fresh `available` out of `enforce`, and is stopped when the state closes,
+    disappears or goes stale (R1 #1256, option A)."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dir = os.path.realpath(tmp.name)
         self.run_dir = os.path.join(self.dir, "r1")
+        self.spool = os.path.join(self.dir, "jit/r1")
         os.makedirs(self.run_dir)
+        os.makedirs(self.spool)
         self.events = os.path.join(self.dir, "events")
         self.gate = os.path.join(self.dir, "state.json")
+        self.done = os.path.join(self.dir, "done")
         self.write(os.path.join(self.run_dir, "run.sh"),
                    "#!/bin/sh\n"
+                   "# the real runner writes these from the JIT blob, for the\n"
+                   "# length of one job (Runner.cs: RunJitConfig)\n"
+                   "echo '{\"agentName\":\"ameesh-nxl-ci-3-1\"}' > .runner\n"
+                   "echo '{}' > .credentials\n"
+                   "echo \"start $*\" >> %s\n"
                    "trap 'echo term >> %s; exit 0' TERM\n"
-                   "echo start >> %s\n"
-                   "while :; do sleep 0.1; done\n" % (self.events, self.events),
+                   "while [ ! -e %s ]; do sleep 0.1; done\n"
+                   "echo done >> %s\n"
+                   "exit 0\n" % (self.events, self.events, self.done, self.events),
                    mode=0o755)
         self.procs = []
 
@@ -119,6 +156,12 @@ class GateWrapperTest(unittest.TestCase):
             fh.write(content)
         if mode is not None:
             os.chmod(path, mode)
+        return path
+
+    def deposit(self, blob=None, name="jit-0001.b64"):
+        path = os.path.join(self.spool, name)
+        self.write(path, (blob if blob is not None else jit_config()) + "\n", mode=0o600)
+        return path
 
     def set_gate(self, **kwargs):
         self.write(self.gate, json.dumps(gate_doc(**kwargs)))
@@ -128,8 +171,8 @@ class GateWrapperTest(unittest.TestCase):
         env["PYTHONPATH"] = os.pathsep.join(
             [SRC] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
         proc = subprocess.Popen(
-            [sys.executable, WRAPPER, "--dir", self.run_dir, "--gate", self.gate,
-             "--interval", "0.1", "--grace", "3"],
+            [sys.executable, WRAPPER, "--dir", self.run_dir, "--spool", self.spool,
+             "--gate", self.gate, "--interval", "0.1", "--grace", "3"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         self.procs.append(proc)
         self.addCleanup(self.stop, proc)
@@ -168,36 +211,67 @@ class GateWrapperTest(unittest.TestCase):
         res = subprocess.run(["ps", "-eo", "args="], capture_output=True, text=True)
         return any(self.run_dir + "/run.sh" in line for line in res.stdout.splitlines())
 
-    def test_the_runner_runs_only_on_a_fresh_enforcing_available_state(self):
+    def test_a_closed_gate_consumes_nothing(self):
+        # no document, then an observing guard: a lending host is closed by
+        # default, and a closed gate must not burn a single-use configuration
+        path = self.deposit()
+        # a stale local configuration from a killed run: it is removed before
+        # the next job starts (a credential that outlived its job is dead)
+        self.write(os.path.join(self.run_dir, ".runner"), "stale\n")
         proc = self.start()
-        # no document: a lending host is closed by default
         time.sleep(0.5)
-        self.assertNotIn("start", self.events_now())
-        # an observing guard stops nothing: the guests stay off (plan §6)
         self.set_gate(mode="observe")
         time.sleep(0.5)
         self.assertNotIn("start", self.events_now())
-        # available out of enforce: the runner starts
+        self.assertTrue(os.path.exists(path), "a closed gate consumed the configuration")
+        self.assertTrue(os.path.exists(os.path.join(self.run_dir, ".runner")))
+        self.assertFalse(self.runner_alive())
+        # available out of enforce: it starts, and consumes exactly that one
         self.set_gate()
         self.assertTrue(self.wait_event("start"), self.events_now())
+        self.assertFalse(os.path.exists(path))
+        self.assertIn("--jitconfig", self.events_now())
         self.assertTrue(self.runner_alive())
-        # closed: the runner is stopped and no new one starts
-        self.set_gate(state="stopped", seq=2)
-        self.assertTrue(self.wait_event("term"), self.events_now())
-        self.assertFalse(self.runner_alive())
-        self.assertEqual(self.events_now().count("start"), 1)
-        # reopened: it starts again, same process, no systemd restart needed
-        self.set_gate(seq=3)
-        self.assertTrue(self.wait_count("start", 2), self.events_now())
-        self.assertEqual(self.events_now().count("start"), 2)
-        # SIGTERM: the wrapper forwards it and exits cleanly
         proc.terminate()
-        self.assertEqual(proc.wait(timeout=10), 0)
-        self.assertEqual(self.events_now().count("term"), 2)
-        self.assertFalse(self.runner_alive())
+        proc.wait(timeout=10)
 
-    def test_a_stale_state_stops_the_runner(self):
+    def test_one_start_consumes_one_configuration_and_cleans_up(self):
+        # the runner writes `.runner`/`.credentials` from the JIT blob; they
+        # must not outlive the job (option A: no durable credential here)
+        self.deposit()
+        self.set_gate()
+        proc = self.start()
+        self.assertTrue(self.wait_event("start"), self.events_now())
+        self.assertTrue(os.path.exists(os.path.join(self.run_dir, ".runner")),
+                        "the runner's own JIT files must exist during the job")
+        # a second start with an empty spool consumes nothing and says so
+        second = self.start()
+        self.assertEqual(second.wait(timeout=10), 0)
+        self.assertIn("no configuration deposited", second.stdout.read())
+        self.assertEqual(self.events_now().count("start"), 1)
+        # the job ends normally: the configuration is spent, the local files
+        # the runner wrote are removed, and the wrapper returns the exit code
+        self.write(self.done, "")
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertTrue(self.wait_event("done"), self.events_now())
+        for leftover in (".runner", ".credentials", ".credentials_rsaparams"):
+            self.assertFalse(os.path.exists(os.path.join(self.run_dir, leftover)),
+                             "%s outlived the job" % leftover)
+        self.assertEqual(len(os.listdir(self.spool)), 0)
+
+    def test_the_configuration_is_handed_to_run_sh_exactly_once(self):
+        blob = jit_config()
+        self.deposit(blob)
+        self.set_gate()
+        self.start()
+        self.assertTrue(self.wait_event("start"), self.events_now())
+        events = self.events_now()
+        self.assertEqual(events.count("start"), 1)
+        self.assertIn("--jitconfig %s" % blob, events)
+
+    def test_a_closed_state_stops_the_single_use_runner(self):
         # the guard died or hung: its state expires, so the guest stops itself
+        self.deposit()
         self.set_gate()
         self.start()
         self.assertTrue(self.wait_event("start"), self.events_now())
@@ -205,11 +279,40 @@ class GateWrapperTest(unittest.TestCase):
         self.assertTrue(self.wait_event("term"), self.events_now())
         self.assertFalse(self.runner_alive())
 
+    def test_an_invalid_configuration_is_refused_not_run(self):
+        self.deposit(blob="not base64 at all", name="jit-bad.b64")
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        out = proc.stdout.read()
+        self.assertIn("refusing to run it", out)
+        self.assertNotIn("start", self.events_now())
+        self.assertTrue(os.path.exists(os.path.join(self.spool, "jit-bad.b64")))
+
+    def test_a_symlinked_configuration_is_left_alone(self):
+        # the spool belongs to the guest; a link planted there is never a
+        # configuration (O_NOFOLLOW), and it does not block a real one
+        real = self.write(os.path.join(self.dir, "elsewhere.b64"),
+                          jit_config() + "\n", mode=0o600)
+        os.symlink(real, os.path.join(self.spool, "jit-link.b64"))
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertIn("no configuration deposited", proc.stdout.read())
+        self.assertNotIn("start", self.events_now())
+        self.assertTrue(os.path.exists(real))
+
     def test_a_missing_runner_is_a_configuration_refusal(self):
         os.remove(os.path.join(self.run_dir, "run.sh"))
         proc = self.start()
         self.assertEqual(proc.wait(timeout=10), 78)
         self.assertIn("missing or not executable", proc.stdout.read())
+
+    def test_a_missing_spool_is_a_configuration_refusal(self):
+        shutil.rmtree(self.spool)
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        self.assertIn("is not a directory", proc.stdout.read())
 
 
 class CiRunnersTest(unittest.TestCase):
@@ -305,6 +408,32 @@ class CiRunnersTest(unittest.TestCase):
         proc.wait(timeout=timeout)
         return out.decode(), err.decode()
 
+    def prepared(self, n, name=None):
+        """The runner slot is installed (config.sh) — option A has no
+        `.runner` until a JIT configuration runs one job."""
+        self.write("srv/ameesh-guest/ci/r%d/config.sh" % n, "#!/bin/sh\nexit 0\n",
+                   mode=0o755)
+
+    def deposit_file(self, n=1, name=None, blob=None, repo="https://github.com/manaty/ameesh"):
+        name = name or ("ameesh-nxl-ci-3-%d" % n)
+        return self.write("root/jit-r%d.b64" % n,
+                          (blob if blob is not None else jit_config(name=name, repo=repo))
+                          + "\n", mode=0o600)
+
+    def arm(self, n=1, blob=None):
+        """A configuration physically deposited in the slot's spool: what
+        `--deposit` writes outside a dry run (the dry runs cannot)."""
+        blob = blob if blob is not None else jit_config(name="ameesh-nxl-ci-3-%d" % n)
+        canonical = "".join(blob.split())
+        digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+        self.prepared(n)
+        return self.write("srv/ameesh-guest/ci/jit/r%d/jit-%s.b64" % (n, digest),
+                          canonical, mode=0o600)
+
+    def pending(self, n=1):
+        root = os.path.join(self.host, "srv/ameesh-guest/ci/jit/r%d" % n)
+        return [f for f in os.listdir(root) if f.endswith(".b64")]
+
     def test_prepare_prints_the_install_and_changes_nothing(self):
         before = sorted(os.path.relpath(os.path.join(d, f), self.host)
                         for d, _, files in os.walk(self.host) for f in files)
@@ -315,6 +444,7 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32", out)
         self.assertIn("ci/r1", out)
         self.assertIn("ci/r2", out)
+        self.assertIn("ci/jit/r1", out)          # the single-use deposit directory
         self.assertIn("DRY write /etc/systemd/system/ameesh-guest-ci@.service", out)
         self.assertIn("systemctl daemon-reload", out)
         # nothing it would run ever names the application's namespace or trees
@@ -387,18 +517,113 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("1048576 MiB", res.stderr)
 
-    def test_register_never_prints_the_token(self):
-        secret = "ghs_" + "x" * 32
-        self.write("root/reg.token", secret + "\n", mode=0o600)
-        for n in (1, 2):
-            self.write("srv/ameesh-guest/ci/r%d/config.sh" % n, "#!/bin/sh\nexit 0\n", mode=0o755)
-        res = self.run_script("--register", "--host", "ci-3", "--count", "2",
-                              "--token-file", "/root/reg.token")
+    def test_there_is_no_persistent_registration_any_more(self):
+        # option A (arbitrage R2 B1) : plus de jeton d'enregistrement sur
+        # l'hôte, plus de `config.sh --unattended`, plus de label de la
+        # flotte. Les deux anciennes options refusent en nommant le dépôt.
+        self.write("root/reg.token", "ghs_" + "x" * 32 + "\n", mode=0o600)
+        res = self.run_script("--register", "--token-file", "/root/reg.token")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("--deposit", res.stderr)
+        self.assertIn("single-use", res.stderr)
+        res = self.run_script("--prepare", "--token-file", "/root/reg.token")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("--deposit", res.stderr)
+        with open(SCRIPT, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertNotIn("--labels " + FLEET, src)   # jamais le label de la flotte
+        self.assertNotIn("--unattended", src)
+        self.assertIn("LABEL=" + LENT, src)
+
+    def test_deposit_prints_one_configuration_and_never_its_bytes(self):
+        blob = jit_config()
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        self.deposit_file(1, blob=blob)
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertNotIn(secret, res.stdout + res.stderr)
-        self.assertIn("--token <token>", res.stdout)
-        self.assertIn("--name ameesh-nxl-ci-3-1", res.stdout)
-        self.assertIn("--labels ameesh-ci", res.stdout)
+        out = res.stdout
+        # root ne lit que la source, l'invité écrit sous son arbre (B4)
+        self.assertIn("DRY runuser -u ameesh-guest -- sh -c", out)
+        self.assertIn("srv/ameesh-guest/ci/jit/r1/jit-", out)
+        self.assertIn("one job, then the runner is removed by GitHub", out)
+        self.assertNotIn(blob, out + res.stderr)
+        self.assertNotIn(blob[:40], out + res.stderr)
+
+    def test_deposit_refuses_a_configuration_of_another_repository(self):
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        self.deposit_file(1, repo="https://github.com/other/repo")
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("nothing deposited", res.stderr)
+
+    def test_deposit_refuses_an_unsafe_runner_file_name(self):
+        # une configuration porte des noms de fichiers écrits dans la racine
+        # du runner : un chemin n'y entre jamais
+        blob = jit_config(files={"../../etc/passwd": "eA=="})
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        self.deposit_file(1, blob=blob)
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("unsafe runner file name", res.stderr)
+        self.assertEqual(self.pending(1), [])
+
+    def test_deposit_refuses_a_second_deposit_of_the_same_configuration(self):
+        # une configuration = un job : la déposer deux fois est une erreur, pas
+        # un second job en silence
+        blob = jit_config()
+        self.arm(1, blob)
+        self.deposit_file(1, blob=blob)
+        self.assertEqual(len(self.pending(1)), 1)
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("already deposited", res.stderr)
+        self.assertEqual(len(self.pending(1)), 1)
+
+    def test_deposit_binds_the_configuration_to_its_runner_slot(self):
+        for n in (1, 2):
+            self.prepared(n)
+            self.write("srv/ameesh-guest/ci/jit/r%d/.keep" % n, "")
+        # la configuration nomme le runner : c'est elle qui décide du slot
+        self.deposit_file(1, name="ameesh-nxl-ci-3-2")
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--runner", "1", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("names slot 2", res.stderr)
+        self.assertEqual(self.pending(1), [])
+        # une configuration étrangère au préfixe est refusée
+        self.deposit_file(1, name="someone-elses-runner")
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("names runner", res.stderr)
+        # sans nom dans la configuration, --runner est exigé
+        self.deposit_file(1, blob=jit_config(files={".credentials": "{}"}))
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("--runner", res.stderr)
+
+    def test_enable_refuses_without_a_deposited_configuration(self):
+        # un démarrage = un job : sans dépôt, l'unité n'aurait rien à
+        # consommer, donc --enable refuse au lieu d'armer un écouteur vide
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        self.write("etc/ameesh/guard.env", "AMEESH_GUARD_ARGS=\n")
+        res = self.run_script("--enable", "1")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no deposited JIT configuration", res.stderr)
+        self.assertIn("--deposit", res.stderr)
+        self.assertNotIn("systemctl start", res.stdout)
+
+    def test_enable_arms_one_job_per_configuration(self):
+        self.arm(1)
+        self.write("etc/ameesh/guard.env", "AMEESH_GUARD_ARGS=\n")
+        res = self.run_script("--enable", "1")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # `start`, pas `enable --now` : rien ne ré-arme l'unité au démarrage
+        self.assertIn("systemctl start ameesh-guest-ci@1.service", res.stdout)
+        self.assertNotIn("systemctl enable --now ameesh-guest-ci@1.service", res.stdout)
+        self.assertIn("runs at most one job", res.stdout)
 
     def test_disable_refuses_a_running_job(self):
         res = self.run_script("--disable", busy=True)
@@ -434,6 +659,8 @@ class CiRunnersTest(unittest.TestCase):
         res = self.run_script("--remove", "--count", "2", busy=True)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("terminal", res.stderr)
+        self.write("etc/ameesh/ci-runners.state",
+                   "host ci-3\ncount 2\ncreated /srv/ameesh-guest/ci/jit\n")
         res = self.run_script("--remove", "--count", "2")
         self.assertEqual(res.returncode, 0, res.stderr)
         out = res.stdout
@@ -441,12 +668,14 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("systemctl disable --now ameesh-guest-ci@2.service", out)
         self.assertIn("rm -f ", out)
         self.assertIn("etc/systemd/system/ameesh-guest-ci@.service", out)
+        # les configurations à usage unique partent avec le prêt
+        self.assertIn("runuser -u ameesh-guest -- rm -rf", out)
+        self.assertIn("srv/ameesh-guest/ci/jit", out)
         self.assertIn("gh api -X DELETE", out)
         for line in out.splitlines():
             if line.startswith("DRY ") or line.startswith("next,"):
                 self.assertNotIn("/home/runner", line)
                 self.assertNotIn("actions.runner", line)
-
 
     def test_prepare_requires_the_guard(self):
         # #1256 R1 : sans garde (ou sans couverture), rien n'arrête les
@@ -461,17 +690,17 @@ class CiRunnersTest(unittest.TestCase):
     def test_enable_refuses_while_the_guard_observes(self):
         # #1256 R1 : activation fermée par défaut, enforce avant le premier
         # job ; en observation les invités restent éteints
-        for n in (1, 2):
-            self.write("srv/ameesh-guest/ci/r%d/.runner" % n, "{}\n")
+        self.arm(1)
+        self.arm(2)
         res = self.run_script("--enable")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("observation", res.stderr)
-        self.assertNotIn("systemctl enable --now", res.stdout)
+        self.assertNotIn("systemctl start", res.stdout)
         # enforce : l'activation passe
         self.write("etc/ameesh/guard.env", "AMEESH_GUARD_ARGS=\n")
         res = self.run_script("--enable")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("systemctl enable --now ameesh-guest-ci@1.service", res.stdout)
+        self.assertIn("systemctl start ameesh-guest-ci@1.service", res.stdout)
 
     def test_the_archive_is_never_extracted_by_root(self):
         # #1256 R1 delta B4 : le cache et la destination d'extraction sont
@@ -648,27 +877,23 @@ class CiRunnersTest(unittest.TestCase):
 
     def test_the_recorded_disk_floor_is_adopted_by_the_later_commands(self):
         # #1256 R1 delta B5 : le plancher qualifié au --prepare est enregistré ;
-        # --register ne retombe pas sur le défaut 15360 qui refuserait la ci-3
+        # le dépôt ne retombe pas sur le défaut 15360 qui refuserait la ci-3
         # mesurée (8.95 GiB libres).
-        self.write("root/reg.token", "ghs_secret\n", mode=0o600)
-        for n in (1, 2):
-            self.write("srv/ameesh-guest/ci/r%d/config.sh" % n,
-                       "#!/bin/sh\nexit 0\n", mode=0o755)
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        self.deposit_file(1)
         self.write("etc/ameesh/ci-runners.state", "host ci-3\ncount 2\nfloor 1\n")
-        res = self.run_script("--register", "--host", "ci-3",
-                              "--token-file", "/root/reg.token")
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("--name ameesh-nxl-ci-3-1", res.stdout)
+        self.assertIn("deposited: r1", res.stdout)
         # une valeur enregistrée trop haute est reprise telle quelle : refus,
         # jamais un repli silencieux sur le défaut
         self.write("etc/ameesh/ci-runners.state", "host ci-3\ncount 2\nfloor 999999\n")
-        res = self.run_script("--register", "--host", "ci-3",
-                              "--token-file", "/root/reg.token")
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("999999 MiB floor", res.stderr)
         # l'option explicite l'emporte sur la valeur enregistrée
-        res = self.run_script("--register", "--host", "ci-3",
-                              "--token-file", "/root/reg.token", "--disk-floor-mib", "1")
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--disk-floor-mib", "1", "--host", "ci-3")
         self.assertEqual(res.returncode, 0, res.stderr)
 
     def test_prepare_installs_the_gate_wrapper(self):
@@ -690,43 +915,34 @@ class CiRunnersTest(unittest.TestCase):
         self.assertIn("rm -f", res.stdout)
         self.assertIn(TOOLS + "/ci-runner-gate", res.stdout)
 
-    def test_check_reports_the_gate_and_the_wrapper(self):
-        # C1 (#1256 R1 amont) : l'URL passée à `config.sh --url` se relit dans
-        # `gitHubUrl` ; `serverUrl` porte le tenant Actions, jamais le dépôt.
-        for n, repo in ((1, "https://github.com/manaty/ameesh"),
-                        (2, "https://github.com/manaty/ameesh.git/")):
-            self.write("srv/ameesh-guest/ci/r%d/.runner" % n,
-                       json.dumps({"agentName": "ameesh-nxl-ci-3-%d" % n,
-                                   "gitHubUrl": repo,
-                                   "serverUrl": "https://pipelines.actions."
-                                                "githubusercontent.com/t/"}))
-            self.write("srv/ameesh-guest/ci/r%d/.credentials" % n, "{}\n", mode=0o600)
-        res = self.run_script("--check")
+    def test_check_accepts_a_prepared_slot_without_credentials(self):
+        # option A : aucun `.runner`/`.credentials` en dehors d'un job ; un
+        # emplacement préparé, sans dépôt, est sain (il attend un dépôt)
+        self.prepared(1)
+        res = self.run_script("--check", "--count", "1")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("state: stopped (no document yet", res.stdout)
-        self.assertIn("wrapper: %s/ci-runner-gate is missing" % TOOLS,
-                      res.stdout)
+        self.assertIn("wrapper: %s/ci-runner-gate is missing" % TOOLS, res.stdout)
+        self.assertIn("deposited configurations: 0 (one job each)", res.stdout)
         self.assertIn("check: every line ok", res.stdout)
 
-    def test_check_refuses_a_runner_of_another_repository(self):
-        # C1 : un `serverUrl` qui nomme le dépôt ne prouve rien ; c'est le
-        # `gitHubUrl` (l'URL de `config.sh --url`) qui fait foi.
-        self.write("srv/ameesh-guest/ci/r1/.runner",
-                   json.dumps({"agentName": "ameesh-nxl-ci-3-1",
-                               "gitHubUrl": "https://github.com/other/repo",
-                               "serverUrl": "https://github.com/manaty/ameesh"}))
+    def test_check_refuses_a_dead_credential_left_on_disk(self):
+        # un `.runner`/`.credentials` laissé par une exécution tuée est le
+        # credential durable que l'option A supprime : KO, chemin nommé
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/r1/.runner", "{}\n")
         self.write("srv/ameesh-guest/ci/r1/.credentials", "{}\n", mode=0o600)
         res = self.run_script("--check", "--count", "1")
         self.assertNotEqual(res.returncode, 0)
-        self.assertIn("r1: .runner unreadable or registered on another repository",
-                      res.stderr)
+        self.assertIn("r1: .runner is left on disk while no unit runs", res.stderr)
+        self.assertIn("r1: .credentials is left on disk while no unit runs", res.stderr)
 
     def test_check_proves_the_application_is_out_of_the_guest_s_read(self):
         # R2 #1256 B2 : un job de l'application est root-equivalent sur cette
         # VM (Docker) ; `--check` sonde donc en tant qu'invité la racine des
         # runners, leurs secrets et leurs arbres de travail, et exige l'échec
         # de `test -r` sur chacun.
-        self.registered(1)
+        self.prepared(1)
         self.write("home/runner/r1/.runner", "{}\n", mode=0o600)
         self.write("home/runner/r1/.credentials", "secret\n", mode=0o600)
         self.write("home/runner/r1/_work/nexlink/README", "x\n", mode=0o644)
@@ -738,7 +954,7 @@ class CiRunnersTest(unittest.TestCase):
 
     def test_check_refuses_an_application_secret_the_guest_can_read(self):
         # le KO nomme le chemin fautif, pas seulement un compte
-        self.registered(1)
+        self.prepared(1)
         self.write("home/runner/r1/.credentials", "secret\n", mode=0o600)
         res = self.run_script(
             "--check", "--count", "1",
@@ -752,22 +968,14 @@ class CiRunnersTest(unittest.TestCase):
             {"schema": "ameesh-host-state/1", "state": state, "seq": 3,
              "expires_ts": time.time() + 90, "guard": {"mode": "enforce"}}))
 
-    def registered(self, n):
-        self.write("srv/ameesh-guest/ci/r%d/.runner" % n,
-                   json.dumps({"agentName": "ameesh-nxl-ci-3-%d" % n,
-                               "gitHubUrl": "https://github.com/manaty/ameesh",
-                               "serverUrl": "https://pipelines.actions."
-                                            "githubusercontent.com/t/"}))
-        self.write("srv/ameesh-guest/ci/r%d/.credentials" % n, "{}\n", mode=0o600)
-
     def test_check_accepts_the_wrapper_waiting_for_a_closed_gate(self):
-        # C2 : le wrapper arrête son child puis reste actif à attendre la
-        # réouverture ; une unité active sans processus runner n'est pas une
+        # C2 : le wrapper attend la réouverture sans consommer de
+        # configuration ; une unité active sans processus runner n'est pas une
         # désobéissance.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
         for n in (1, 2):
-            self.registered(n)
+            self.prepared(n)
         res = self.run_script("--check", CI_RUNNERS_TEST_ACTIVE="1,2")
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         self.assertIn("state: stopped", res.stdout)
@@ -778,7 +986,7 @@ class CiRunnersTest(unittest.TestCase):
         # sous une unité active n'est plus un drainage, c'est une désobéissance.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
-        self.registered(1)
+        self.prepared(1)
         res = self.run_script("--check", "--count", "1",
                               CI_RUNNERS_TEST_ACTIVE="1",
                               CI_RUNNERS_TEST_CHILD="1",
@@ -793,7 +1001,7 @@ class CiRunnersTest(unittest.TestCase):
         # et le refus garde sa raison ; le défaut des dry runs est zéro.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
-        self.registered(1)
+        self.prepared(1)
         res = self.run_script("--check", "--count", "1",
                               CI_RUNNERS_TEST_ACTIVE="1",
                               CI_RUNNERS_TEST_CHILD="1")
@@ -809,7 +1017,7 @@ class CiRunnersTest(unittest.TestCase):
         # pas après un `sleep` : la vitesse de la machine ne décide pas.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
-        self.registered(1)
+        self.prepared(1)
         proc = self.start_script("--check", "--count", "1",
                                  CI_RUNNERS_TEST_ACTIVE="1",
                                  CI_RUNNERS_TEST_CHILD="1",
@@ -829,7 +1037,7 @@ class CiRunnersTest(unittest.TestCase):
         # porte déjà ouverte au relevé initial ne prendrait pas ce chemin.
         self.write(TOOLS_REL + "/ci-runner-gate", "#!/bin/sh\nexit 0\n", mode=0o755)
         self.gate_document()
-        self.registered(1)
+        self.prepared(1)
         proc = self.start_script("--check", "--count", "1",
                                  CI_RUNNERS_TEST_ACTIVE="1",
                                  CI_RUNNERS_TEST_CHILD="1",
@@ -845,7 +1053,11 @@ class CiRunnersTest(unittest.TestCase):
         # le brouillon de fiche d'hôte du plan est lu par le contrat : le
         # signal de jobs y est `busy_tasks`, pas le nombre d'écouteurs
         with open(PLAN, encoding="utf-8") as fh:
-            block = fh.read().split("```yaml", 1)[1].split("```", 1)[0]
+            plan = fh.read()
+        # the plan carries more than one yaml block (the routing expression,
+        # the Host fiche): the offer is the one with `policy:`
+        blocks = [block.split("```", 1)[0] for block in plan.split("```yaml")[1:]]
+        block = next(block for block in blocks if "policy:" in block)
         body = "\n".join(line for line in textwrap.dedent(block).splitlines()
                          if line.strip() != "---")
         lend = yaml.safe_load(body)["policy"]["lend"]
@@ -864,13 +1076,109 @@ class CiRunnersTest(unittest.TestCase):
         self.assertEqual(offer["disk_max"], 4 * 2 ** 30)
         self.assertEqual(reclaim["disk_free_min"], 5 * 2 ** 30)
         # le plancher de préparation du plan suit la réserve du garde
+        self.assertIn("--prepare --count 1 --disk-floor-mib 6144", plan)
+        # #1256 R1 delta B5 : le dépôt du plan répète le plancher qualifié, il
+        # ne retombe pas sur le défaut 15 GiB
+        self.assertIn("--disk-floor-mib 6144 --deposit", plan)
+        self.assertNotIn("disk_max: 30GiB", plan)
+
+
+class WorkflowRoutingTest(unittest.TestCase):
+    """Option A (#1256): the borrowed label is never the fleet's, and only a
+    job outside the required path (`tests`, the only required status check)
+    may target it. These witnesses read the workflows and the plan, so a
+    later `runs-on` edit cannot quietly move a required job onto a lending
+    host."""
+
+    REQUIRED = "tests"
+
+    def workflows(self):
+        root = os.path.join(REPO, ".github", "workflows")
+        out = {}
+        for name in sorted(os.listdir(root)):
+            if name.endswith((".yml", ".yaml")):
+                with open(os.path.join(root, name), encoding="utf-8") as fh:
+                    out[name] = yaml.safe_load(fh) or {}
+        return out
+
+    def needs_closure(self, jobs, job):
+        seen = set()
+        stack = [job]
+        while stack:
+            current = stack.pop()
+            needs = jobs.get(current, {}).get("needs") or []
+            if isinstance(needs, str):
+                needs = [needs]
+            for parent in needs:
+                if parent not in seen:
+                    seen.add(parent)
+                    stack.append(parent)
+        return seen
+
+    def routed(self):
+        """(workflow, job, spec) of every job whose runs-on reads the
+        borrowed-label variable."""
+        for name, doc in self.workflows().items():
+            for job, spec in (doc.get("jobs") or {}).items():
+                if "AMEESH_LENT_RUNS_ON" in str(spec.get("runs-on", "")):
+                    yield name, job, spec
+
+    def test_the_borrowed_label_is_never_a_literal_of_a_job(self):
+        # on ne route que par la variable d'opérateur : aucun `runs-on` ne
+        # nomme le label en dur, donc aucune faute de frappe ne peut envoyer
+        # un job sur un hôte prêté, et le retrait se fait en une variable
+        for name, doc in self.workflows().items():
+            for job, spec in (doc.get("jobs") or {}).items():
+                self.assertNotIn(LENT, str(spec.get("runs-on", "")),
+                                 "%s/%s names the borrowed label directly" % (name, job))
+
+    def test_only_non_gating_jobs_outside_the_required_path_are_routed(self):
+        routed = list(self.routed())
+        self.assertEqual(sorted("%s/%s" % (name, job) for name, job, _ in routed),
+                         ["tests.yml/bilan", "ui.yml/ui"])
+        tests = self.workflows()["tests.yml"]["jobs"]
+        closure = self.needs_closure(tests, self.REQUIRED) | {self.REQUIRED}
+        for name, job, spec in routed:
+            self.assertNotIn(job, closure,
+                             "%s/%s is needed by the required check" % (name, job))
+            doc = self.workflows()[name]
+            perms = doc.get("permissions", {})
+            if isinstance(perms, str):
+                self.assertIn(perms, ("read-all", "none"))
+            else:
+                for scope, value in perms.items():
+                    self.assertNotEqual(value, "write", "%s grants write" % scope)
+            job_perms = spec.get("permissions", {})
+            if isinstance(job_perms, str):
+                self.assertIn(job_perms, ("read-all", "none"))
+            else:
+                for scope, value in job_perms.items():
+                    self.assertNotEqual(value, "write", "%s/%s grants write" % (name, scope))
+            # nothing else depends on it in its own workflow
+            for other, other_spec in (doc.get("jobs") or {}).items():
+                self.assertNotIn(job, other_spec.get("needs", []) or [],
+                                 "%s/%s feeds %s" % (name, job, other))
+
+    def test_the_required_check_stays_on_the_fleet(self):
+        jobs = self.workflows()["tests.yml"]["jobs"]
+        self.assertEqual(jobs[self.REQUIRED].get("name"), self.REQUIRED)
+        closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
+        self.assertEqual(closure, {"plan", "version", "psycopg", "psql",
+                                   "platform-macos", "doc-readers", "tests"})
+        for job in sorted(closure):
+            self.assertNotIn("AMEESH_LENT_RUNS_ON", str(jobs[job].get("runs-on", "")),
+                             "%s is part of the required path" % job)
+
+    def test_the_plan_documents_the_routing_rule(self):
         with open(PLAN, encoding="utf-8") as fh:
             plan = fh.read()
-        self.assertIn("--prepare --count 1 --disk-floor-mib 6144", plan)
-        # #1256 R1 delta B5 : le register du plan répète le plancher qualifié,
-        # il ne retombe pas sur le défaut 15 GiB
-        self.assertIn("--register --disk-floor-mib 6144", plan)
-        self.assertNotIn("disk_max: 30GiB", plan)
+        self.assertIn("AMEESH_LENT_RUNS_ON", plan)
+        self.assertIn(LENT, plan)
+        self.assertIn("single-use", plan)
+        # la règle, et ce qui ne peut pas être routé
+        self.assertIn("the fleet's `ameesh-ci`", plan)
+        for forbidden in ("plan", "carte"):
+            self.assertIn("`%s`" % forbidden, plan)
 
 
 if __name__ == "__main__":

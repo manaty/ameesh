@@ -143,9 +143,23 @@ env:
 # asks for `ameesh-ci`, as before. The routing only picks the runner: no
 # `if:`, no part, no required check depends on it, and no hosted runner is
 # ever added (a fork PR keeps ubuntu-latest, as before). The job-level
-# expression is the same everywhere (tests/test_1468_ci_prio.py);
+# expression is the same everywhere (tests/test_1468_ci_prio.py), sauf
+# `bilan` qui porte en plus le repli prêté de #1256 ci-dessous ;
 # docs/EXPLOITATION.md, « Runners prioritaires », gives the activation and
 # rollback steps; scripts/ci-queue-wait.py measures the queue wait per class.
+#
+# Borrowed capacity (lot #1256, option A of the R2 B1 arbitration): a lending
+# host runs SINGLE-USE runners under the DISTINCT label `ameesh-lent`, never
+# `ameesh-ci`, so no job of the fleet — in particular the required check
+# `tests` and everything it needs — can land there. Only a job that is not
+# the required check, is not needed by it, holds no write permission and
+# feeds nothing the required path reads may target that label; the admissible
+# list and the residual risk are in deploy/guest/PILOT-ci-nexlink.md §3.
+# `vars.AMEESH_LENT_RUNS_ON` is set to `["self-hosted","linux","ameesh-lent"]`
+# only while a loan is armed (a single-use configuration deposited and the
+# slot armed); unset, the job stays on the fleet. The one job routed below
+# (`bilan`, after the priority pool of #1468) is `continue-on-error` and is
+# NOT in the `needs` of `tests`.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # lot PR only; merge commit against its target), the branch context
@@ -464,12 +478,21 @@ jobs:
         run: python -m unittest -v ${{ needs.plan.outputs.doc_readers }}
 
   # L161f : leaks (failures of modules the map did not select) and the
-  # provisional green, for the two-week review (L161i); never required
+  # provisional green, for the two-week review (L161i); never required.
+  # Its result gates nothing and nothing required reads what it produces, so
+  # it is the job this lot routes to the borrowed label when a loan is armed
+  # (option A, #1256; plan §3): a forged green here costs the two-week tally,
+  # never a required check.
   bilan:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
+    # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
+    # clôture du check requis (tests/test_1256_ci_runners.py), seul job routé
+    # du workflow avec `ui.yml/ui` ; c'est le seul job Linux dont l'expression
+    # diffère de celle des autres (tests/test_1468_ci_prio.py).
+runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     steps:
