@@ -18,8 +18,11 @@ import time
 from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
-from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
-from .work_dependencies import last_verdict as _last_verdict, not_blocking as _not_blocking
+from .work_dependencies import _LOCK as _DEPENDENCIES_LOCK
+from .work_dependencies import current_verdict as _current_verdict
+from .work_dependencies import last_freeze_sha as _last_freeze_sha
+from .work_dependencies import not_blocking as _not_blocking
+from .work_dependencies import reviewed_head as _reviewed_head
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -448,14 +451,8 @@ class WorkItems(interface.WorkItems):
                 # peut apparaître entre le contrôle et l'attribution. Verrouiller
                 # aussi les amonts empêche leur réouverture pendant la prise.
                 tx.execute(_DEPENDENCIES_LOCK)
-                # #1677 : un bloqueur en `qa` dont le dernier verdict est
-                # favorable (ok) n'empêche plus la prise — il attend sa fusion,
-                # le lot pris s'empile sur sa tête gelée. Le verdict est lu sous
-                # le même verrou que l'état, donc une correction (`blocked`)
-                # arrivée avant la prise la refuse.
                 rows = tx.query(
-                    "SELECT w.id, w.state, w.assignee, " + _last_verdict("w") +
-                    " AS last_verdict FROM work_items w"
+                    "SELECT w.id, w.state, w.assignee FROM work_items w"
                     " WHERE w.id = %s OR w.id IN (SELECT blocker_id FROM work_item_dependencies"
                     "                              WHERE work_item_id = %s)"
                     " ORDER BY w.id FOR UPDATE", (int(item_id), int(item_id)))
@@ -463,9 +460,18 @@ class WorkItems(interface.WorkItems):
                 if current is not None or item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
-                if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
-                       and not (r["state"] == "qa" and r.get("last_verdict") == "ok")
-                       for r in rows):
+                # #1677 : un bloqueur en `qa` à verdict COURANT favorable (et à
+                # tête relue) n'empêche plus la prise — il attend sa fusion, le
+                # lot pris s'empile sur cette tête. Le verdict est relu par une
+                # requête POSTÉRIEURE au verrou (N4) : en READ COMMITTED, la
+                # sous-requête d'un `SELECT … FOR UPDATE` lit l'instantané pris
+                # avant l'attente du verrou, donc un verdict `blocked` validé
+                # pendant cette attente y serait invisible. Le prédicat est le
+                # même que celui de `unassigned_lots` (une seule règle).
+                if tx.query("SELECT 1 FROM work_item_dependencies d"
+                            " JOIN work_items b ON b.id = d.blocker_id"
+                            " WHERE d.work_item_id = %s AND NOT " + _not_blocking("b") +
+                            " LIMIT 1", (int(item_id),)):
                     return None
             behind = None
             if (queued_note is not None or take) and assignee:
@@ -1375,20 +1381,20 @@ class WorkItems(interface.WorkItems):
 
     def unassigned_lots(self, limit) -> list[dict]:
         # #1677 : les lots dont tous les bloqueurs sont terminés **ou** en `qa`
-        # à dernier verdict favorable sont prenables ; `stack_on` décrit ces
-        # bloqueurs (lot, branche, tête gelée) pour le courrier de prise.
+        # à verdict courant favorable sont prenables ; `stack_on` décrit ces
+        # bloqueurs (lot, branche, tête relue) pour le courrier de prise. La
+        # tête est celle que le verdict nomme, sinon celle du dernier gel (B2) :
+        # un bloqueur sans tête relue reste bloquant.
         stack_on = (
             "(SELECT string_agg('#' || b.id::text || ' ('"
             "                    || coalesce(nullif(btrim(b.branch), ''), '—')"
-            "                    || ', gel ' || coalesce(f.sha, '—') || ')',"
+            "                    || ', gel ' || coalesce(" + _reviewed_head("b") + ", '—') || ')',"
             "                  ', ' ORDER BY b.id)"
             "   FROM work_item_dependencies d"
             "   JOIN work_items b ON b.id = d.blocker_id"
-            "   LEFT JOIN LATERAL (SELECT m.sha FROM work_item_milestones m"
-            "                       WHERE m.work_item_id = b.id AND m.kind = 'frozen'"
-            "                       ORDER BY m.at DESC, m.id DESC LIMIT 1) f ON true"
             "  WHERE d.work_item_id = work_items.id AND b.state = 'qa'"
-            "    AND " + _last_verdict("b") + " = 'ok')")
+            "    AND " + _current_verdict("b") + " = 'ok'"
+            "    AND " + _reviewed_head("b") + " IS NOT NULL)")
         return self.db.query(
             ("SELECT w.*,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
@@ -1421,35 +1427,38 @@ class WorkItems(interface.WorkItems):
 
     def review_proposals(self, limit, *, proposal_prefix, window_s=21600.0) -> list[dict]:
         """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
-        sans verdict (une relecture est due) ou à dernier verdict bloquant (une
-        correction est due) — avec leur auteur, leur branche et leur tête gelée.
+        sans verdict COURANT (une relecture est due) ou à verdict courant
+        bloquant (une correction est due) — avec leur auteur, leur branche,
+        leur tête gelée, leur équipe résolue (`lot_team`, même règle que
+        `unassigned_lots`) et les colonnes du lot dont la prise a besoin
+        (`required_capabilities`, `type`, …).
 
         La prise y apparie un agent au repos d'une autre famille que l'auteur
         (canon §2). Un lot déjà muni d'un relecteur désigné (0421) a un
         destinataire : il n'est pas proposé. Un lot sans tête gelée n'a rien à
         relire. Un lot dont la proposition date de moins de `window_s` (note
         `proposal_prefix…` au journal) est écarté : deux passages ne proposent
-        pas le même lot deux fois."""
+        pas le même lot deux fois. B1 : le verdict lu est le verdict courant —
+        un `ok` portant sur une tête regelée depuis ne dispense plus de la
+        relecture."""
         reviewer_guard = "   AND coalesce(w.reviewer, '') = ''" if has_reviewer(self.db) else ""
-        last_verdict = (
-            "(SELECT m.verdict FROM work_item_milestones m"
-            "  WHERE m.work_item_id = w.id AND m.kind = 'verdict'"
-            "  ORDER BY m.at DESC, m.id DESC LIMIT 1)")
-        frozen_sha = (
-            "(SELECT m.sha FROM work_item_milestones m"
-            "  WHERE m.work_item_id = w.id AND m.kind = 'frozen'"
-            "  ORDER BY m.at DESC, m.id DESC LIMIT 1)")
+        frozen_sha = _last_freeze_sha("w")
+        current = _current_verdict("w")
         return self.db.query(
-            "SELECT w.id, w.title, w.state, w.assignee, w.app, w.team, w.priority,"
-            "       w.branch, " + frozen_sha + " AS frozen_sha,"
-            "       " + last_verdict + " AS last_verdict"
+            "SELECT w.*,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       " + frozen_sha + " AS frozen_sha,"
+            "       " + current + " AS last_verdict"
             "  FROM work_items w"
+            "  LEFT JOIN work_packages k ON k.id = w.package_id"
+            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
             " WHERE w.state = 'qa'"
             "   AND w.assignee IS NOT NULL AND btrim(w.assignee) <> ''"
             "   AND left(w.assignee, 6) <> 'human:'"
             "   AND " + frozen_sha + " IS NOT NULL"
             + reviewer_guard +
-            "   AND coalesce(" + last_verdict + ", '') <> 'ok'"
+            "   AND coalesce(" + current + ", '') <> 'ok'"
             "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
             "                    WHERE e.work_item_id = w.id"
             "                      AND starts_with(e.note, %s)"

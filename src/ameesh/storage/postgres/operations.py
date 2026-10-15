@@ -19,7 +19,7 @@ from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 from .work import has_reviewer
-from .work_dependencies import last_verdict as _last_verdict
+from .work_dependencies import current_verdict as _current_verdict
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -151,12 +151,14 @@ class Operations(interface.Operations):
               LEFT JOIN LATERAL (
                   -- #1677 : ce que l'agent doit encore faire — ses lots qui
                   -- l'occupent, plus la correction d'un lot en qa dont le
-                  -- dernier verdict est bloquant. Aucun lot actionnable = au
-                  -- repos, quel que soit le temps depuis le dernier tour.
+                  -- verdict COURANT est bloquant (B1 : un `blocked` d'une tête
+                  -- regelée depuis n'attend plus de correction). Aucun lot
+                  -- actionnable = au repos, quel que soit le temps depuis le
+                  -- dernier tour.
                   SELECT count(*) AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
-                          OR (w.state = 'qa' AND """ + _last_verdict("w") + """ = 'blocked'))
+                          OR (w.state = 'qa' AND """ + _current_verdict("w") + """ = 'blocked'))
                      AND (w.planned_start IS NULL OR w.planned_start <= j.today)) ac ON true
               LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
