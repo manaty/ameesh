@@ -194,6 +194,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_profile',
         -- L232a (0371) : clôture de passage entre hôtes
         'handoff_fenced',
+        -- #1521 (0446) : début du motif de statut, sans contenu
+        'status_reason_since',
         -- L26 (0027) : réglages et état de session, sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
         'status_since', 'restart_requested_at', 'session_reset_at',
