@@ -74,14 +74,35 @@ class ClassifyTest(unittest.TestCase):
                 self.assertIsNone(rate_limit.classify(error=texte))
                 self.assertIsNone(rate_limit.classify(result=texte))
 
-    def test_quota_prime_entre_les_textes(self):
-        # R1 cx3 B2 : le quota prime sur le débit, tous textes confondus.
+    def test_quota_prime_entre_les_canaux_fournisseur(self):
+        # R1 cx3 B2 : le quota prime sur le débit, parmi les textes du
+        # fournisseur ; le résultat libre ne départage rien (#1397).
         self.assertEqual(rate_limit.classify(
             error="HTTP 429 Too Many Requests", stderr_tail="insufficient_quota"),
             rate_limit.QUOTA)
         self.assertEqual(rate_limit.classify(
             error="429", result="you have hit your weekly limit"),
-            rate_limit.QUOTA)
+            rate_limit.RATE_LIMITED)
+
+    def test_quota_seulement_sur_les_canaux_fournisseur(self):
+        # #1397 (P3 dev1) : le résultat libre du tour peut *parler* d'un quota
+        # sans en subir — « not near the usage limit » ne classe pas un quota
+        # (sinon une phrase du modèle suffit à déclencher la pause de quota).
+        # Les deux cas : résultat libre ignoré, canaux fournisseur classés.
+        for texte in ("You've hit your usage limit",
+                      "not near the usage limit",
+                      "insufficient_quota",
+                      "credit balance is too low"):
+            with self.subTest(texte=texte, canal="result"):
+                self.assertIsNone(rate_limit.classify(result=texte))
+        for texte in ("insufficient_quota: you exceeded your current quota",
+                      "You've hit your usage limit",
+                      "credit balance is too low"):
+            with self.subTest(texte=texte, canal="error"):
+                self.assertEqual(rate_limit.classify(error=texte), rate_limit.QUOTA)
+            with self.subTest(texte=texte, canal="stderr"):
+                self.assertEqual(rate_limit.classify(stderr_tail=texte),
+                                 rate_limit.QUOTA)
 
     def test_aucune_conclusion_sur_un_texte_illisible(self):
         # ni vide, ni erreur sans rapport ne concluent quoi que ce soit sur le
