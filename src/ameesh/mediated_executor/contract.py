@@ -395,7 +395,17 @@ class Contract:
     #: {domaine: [méthodes]} : opérations de l'interface refusées à dessein
     refused: Mapping[str, tuple]
     refused_reasons: Mapping[str, str]
-    interface_total: int
+
+    @property
+    def interface_total(self) -> int:
+        """Le nombre d'opérations de l'interface classées, admises ou refusées.
+
+        #1517 : dérivé, jamais stocké. Le compteur que chaque lot ajoutant une
+        méthode d'interface incrémentait dans `contract.json` était une même
+        ligne disputée par tous ces lots, donc un conflit garanti à chaque
+        composition de paquet ; la garantie (toute l'interface est classée)
+        reste tenue par le test du contrat (`test_l107_executor_contract`)."""
+        return len(self.operations) + sum(len(m) for m in self.refused.values())
 
     def get(self, name: str) -> Operation:
         """L'opération admise, sinon `NotSupportedRemotely`."""
@@ -501,8 +511,7 @@ def parse(data: Mapping) -> Contract:
     ref = data["refused"]
     return Contract(version=data["version"], prefix=data["prefix"], operations=ops,
                     refused={k: tuple(v) for k, v in ref["operations"].items()},
-                    refused_reasons=dict(ref["reasons"]),
-                    interface_total=ref["interface_total"])
+                    refused_reasons=dict(ref["reasons"]))
 
 
 @lru_cache(maxsize=1)

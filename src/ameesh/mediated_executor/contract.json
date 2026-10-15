@@ -3773,7 +3773,6 @@
   }
  ],
  "refused": {
-  "interface_total": 386,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
