@@ -73,6 +73,16 @@ class ContractTest(unittest.TestCase):
         finally:
             shutil.rmtree(repo, ignore_errors=True)
 
+    def test_creation_outside_a_turn_writes_nothing(self):
+        """Le hook `post-commit` hors tour managé ne constate rien (jamais bloquant)."""
+        repo = tempfile.mkdtemp(prefix="ameesh-1465-created-")
+        try:
+            subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+            self.assertIsNone(prov.prepare_commit_creation(repo, environ={}))
+            self.assertIsNone(prov.read_commit_creation(repo))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
 
 class PgProvenanceTest(PgTestCase):
     """La lecture réelle : la preuve jointe au fait, ou `unknown`."""
@@ -227,11 +237,20 @@ class PgProvenanceTest(PgTestCase):
             "AGENT_MAIL_NAME": actor, "AMEESH_TURN_ID": turn,
             "AMEESH_HARNESS": harness})
 
+    def _created(self, repo, *, actor="mty-amh-impl-07", turn="t" * 32,
+                 harness="deepseek"):
+        """Le hook `post-commit` : le fait de création de l'objet né."""
+        return prov.prepare_commit_creation(repo, environ={
+            "AGENT_MAIL_NAME": actor, "AMEESH_TURN_ID": turn,
+            "AMEESH_HARNESS": harness})
+
     def _commit_attested(self, repo, env, message, **kw):
-        """Le tour réel : index prêt, attestation, puis le commit."""
+        """Le tour réel : index prêt, attestation, commit, fait de création."""
         self._stage(repo, message)
         self._attest(repo, **kw)
-        return self._commit_only(repo, env, message)
+        head = self._commit_only(repo, env, message)
+        self._created(repo, **kw)
+        return head
 
     def test_an_inherited_head_is_unknown_not_attributed_to_the_new_turn(self):
         """Témoin cx3 15/10 04:37 : un HEAD hérité n'est pas une création.
@@ -282,9 +301,77 @@ class PgProvenanceTest(PgTestCase):
         amended = self._head(repo)
         self.assertNotEqual(amended, amended_from)
         self.assertNotEqual(amended, first)
+        self.assertIsNotNone(self._created(repo))
         row = prov.record_commit(self.db, amended, identity=ident, cwd=repo)
         self.assertTrue(row["recorded"])
         self.assertEqual(prov.receipt_for_commit(self.db, amended)["session"], "s-1")
+
+    def test_a_replayed_old_object_is_refused_despite_the_attested_shape(self):
+        """B1 cx2/Codex 15/10 12:12 : un objet ancien restauré n'est pas une création.
+
+        Le scénario rejoué : C est créé sous un tour antérieur (même
+        committer), HEAD revient sur son parent A, l'index est préparé à
+        l'identique de l'arbre(C), l'attestation du nouveau tour est écrite,
+        puis HEAD est remis sur C. La forme attestée est satisfaite, mais un
+        `reset` n'écrit aucun fait de création : `record_commit` refuse et
+        l'origine reste inconnue."""
+        ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                 "harness": "deepseek"}
+        repo, env = self._repo()
+        first = self._head(repo)
+        old = self._commit(repo, env, "ancien")  # C, créé sous un tour antérieur
+        subprocess.run(["git", "reset", "-q", "--hard", first], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        self._stage(repo, "ancien")  # index identique à l'arbre(C)
+        self._attest(repo)
+        subprocess.run(["git", "reset", "-q", "--hard", old], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        self.assertIsNone(prov.read_commit_creation(repo))
+        self.assertTrue(prov._attests_creation(repo, old, prov.read_commit_intent(repo)),
+                        "la forme attestée seule serait acceptée : c'est le défaut B1")
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, old, identity=ident, cwd=repo)
+        self.assertIsNone(prov.receipt_for_commit(self.db, old))
+
+    def test_a_creation_record_covers_only_the_object_it_names(self):
+        """Le fait de création d'un commit ne couvre pas un autre objet."""
+        ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                 "harness": "deepseek"}
+        repo, env = self._repo()
+        old = self._head(repo)
+        self._commit_attested(repo, env, "deux")  # vrai commit du tour
+        subprocess.run(["git", "reset", "-q", "--hard", old], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        # le fait de création du commit "deux" existe encore, mais il nomme
+        # un autre objet : il ne couvre pas C
+        self.assertIsNotNone(prov.read_commit_creation(repo))
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, old, identity=ident, cwd=repo)
+        self.assertIsNone(prov.receipt_for_commit(self.db, old))
+
+    def test_a_reset_is_not_a_creation(self):
+        """Le reflog d'un `reset` n'est pas un `git commit` : rien n'est constaté."""
+        repo, env = self._repo()
+        first = self._head(repo)
+        self._commit(repo, env, "deux")
+        self._attest(repo)
+        subprocess.run(["git", "reset", "-q", "--hard", first], cwd=repo,
+                       check=True, capture_output=True, env=env)
+        self.assertIsNone(self._created(repo))
+
+    def test_an_abandoned_attestation_writes_no_creation(self):
+        """Une attestation sans commit ne produit aucun fait de création ; le
+        commit qui suit, dans le même tour, produit bien les deux."""
+        ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                 "harness": "deepseek"}
+        repo, env = self._repo()
+        self._stage(repo, "deux")
+        self.assertIsNotNone(self._attest(repo))
+        self.assertIsNone(self._created(repo))
+        head = self._commit_only(repo, env, "deux")
+        self.assertIsNotNone(self._created(repo))
+        row = prov.record_commit(self.db, head, identity=ident, cwd=repo)
+        self.assertTrue(row["recorded"])
 
     def test_record_commit_accepts_the_creation_attested_by_this_turn(self):
         ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
@@ -336,6 +423,11 @@ class HookInstallTest(unittest.TestCase):
             with open(path, encoding="utf-8") as fh:
                 self.assertIn("ameesh #1465", fh.read())
             self.assertTrue(os.access(path, os.X_OK))
+        # le `post-commit` constate l'objet né AVANT d'écrire la preuve
+        with open(out["path"], encoding="utf-8") as fh:
+            post = fh.read()
+        self.assertIn("provenance created", post)
+        self.assertIn("provenance record", post)
         self.assertTrue(prov.install_hook(self.tmp)["installed"])
         foreign = "#!/bin/sh\necho autre\n"
         with open(out["path"], "w", encoding="utf-8") as fh:

@@ -25,10 +25,10 @@
         decision answers, chat) not attached to any work item (L130);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
-  ameesh provenance record --commit SHA | intent | install | show
+  ameesh provenance record --commit SHA | intent | created | install | show
         #1465 : preuve exacte d'origine (acteur, session, tour, harnais) d'un
-        commit ou d'un jalon — le hook `pre-commit` atteste la création dans le
-        tour, le hook `post-commit` écrit la preuve ;
+        commit ou d'un jalon — le hook `pre-commit` atteste le commit qui vient,
+        le hook `post-commit` constate l'objet né puis écrit la preuve ;
   ameesh accounts list | use <harness> <account> | auto [harness]
         multiple accounts per provider: active, gauges, override (L30);
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]

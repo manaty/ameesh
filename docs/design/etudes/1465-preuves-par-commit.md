@@ -69,25 +69,28 @@ témoins isolés de cx3, 15/10 04:27–04:29 puis 04:37) :
 - **jalon** : la même transaction que `work_item_milestones` (le fait et sa
   preuve naissent ensemble) ;
 - **commit** : la paire de hooks du dépôt de l'agent. Le `pre-commit` écrit une
-  **attestation de création** — identité du tour, HEAD et arbre de départ, aléa
-  — dans le répertoire git du worktree (`--absolute-git-dir` : les hooks sont
-  partagés, l'attestation ne l'est pas). Le `post-commit` appelle
-  `ameesh provenance record --commit HEAD`, qui exige l'attestation, vérifie
-  que le commit en est bien la création (il part du HEAD attesté, fusion en
-  cours résolue comprise, ou en est la réécriture — amend : mêmes parents que
-  le HEAD attesté —, avec l'arbre attesté), la **consomme** et écrit la preuve.
-  Trois bornes : HEAD du dépôt sous la main, committer de l'acteur du tour
-  (`<acteur>@ameesh.invalid`, posé par le runner), attestation de création de
-  **ce** tour. Un HEAD hérité d'un tour antérieur, même committé par le même
-  agent, n'a pas d'attestation : son origine reste inconnue (écart cx3,
-  15/10 06:37), jamais réattribuée au nouveau tour par le seul couple
-  HEAD + committer ;
+  **attestation** — identité du tour, HEAD et arbre de départ, aléa — dans le
+  répertoire git du worktree (`--absolute-git-dir` : les hooks sont partagés,
+  l'attestation ne l'est pas). Le `post-commit` écrit le **fait de création**
+  de l'objet né (`sha`, arbre, parents), repris de la dernière entrée de reflog
+  de HEAD — qui n'est un `git commit` que si l'objet vient de naître — puis
+  appelle `ameesh provenance record --commit HEAD`, qui exige l'attestation ET
+  le fait de création, liés par le même aléa, vérifie que le commit en est bien
+  la création (il part du HEAD attesté, fusion en cours résolue comprise, ou en
+  est la réécriture — amend : mêmes parents que le HEAD attesté —, avec l'arbre
+  attesté), les **consomme** et écrit la preuve. Trois bornes : HEAD du dépôt
+  sous la main, committer de l'acteur du tour (`<acteur>@ameesh.invalid`, posé
+  par le runner), fait de création de **ce** tour. Un objet hérité ou seulement
+  restauré par `reset`/`checkout`, même committé par le même agent, n'a pas de
+  fait de création : son origine reste inconnue (écart cx3, 15/10 06:37 ; B1
+  cx2/Codex, 15/10 12:12), jamais réattribuée au nouveau tour par le seul
+  couple HEAD + committer ni par la forme attestée ;
 - **chemins couverts** : `git commit` (y compris `-a`, `--amend`, et la
-  résolution d'une fusion par `git commit`) naît avec son attestation. Les
-  commits créés sans `pre-commit` (`git merge --no-ff` sans conflit, `git
-  rebase`, `git cherry-pick`) restent `unknown` : le fournisseur ne devine
-  jamais, et un écrivain `post-merge`/`post-rewrite` sera ajouté si le train
-  #1467 a besoin de ces chemins ;
+  résolution d'une fusion par `git commit`) naît avec son attestation et son
+  fait de création. Les commits créés sans `pre-commit` (`git merge --no-ff`
+  sans conflit, `git rebase`, `git cherry-pick`) restent `unknown` : le
+  fournisseur ne devine jamais, et un écrivain `post-merge`/`post-rewrite`
+  sera ajouté si le train #1467 a besoin de ces chemins ;
 - le tour (`AMEESH_TURN_ID`) et le harnais (`AMEESH_HARNESS`) viennent de
   l'environnement du runner ; la session, du registre vivant de l'acteur
   (`registry.live_harness`, #1037), recontrôlée contre l'étiquette du tour ;
@@ -100,10 +103,11 @@ témoins isolés de cx3, 15/10 04:27–04:29 puis 04:37) :
 Livré dans les points réversibles de `lot/1465-preuves-par-commit` : migration
 0445, contrat de stockage, fournisseur (`receipt_for_commit`,
 `receipt_for_milestone`), écriture (`ameesh provenance record --commit`,
-`ameesh provenance intent`, `ameesh provenance install` — paire de hooks —,
-jalon gel/verdict et sa preuve dans la même transaction que
-`work_item_milestones`), pose des hooks à l'ouverture de session par le runner
-(jamais en mode relayé) et témoins (`tests/test_1465_provenance.py`).
+`ameesh provenance intent`, `ameesh provenance created`,
+`ameesh provenance install` — paire de hooks —, jalon gel/verdict et sa preuve
+dans la même transaction que `work_item_milestones`), pose des hooks à
+l'ouverture de session par le runner (jamais en mode relayé) et témoins
+(`tests/test_1465_provenance.py`).
 
 Reste avant gel : faire relire
 les deux familles requises (SQL sensible, canon §2). L'historique **antérieur**

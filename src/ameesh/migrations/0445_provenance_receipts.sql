@@ -9,11 +9,12 @@
 --
 -- Cette table est la source unique du fournisseur `ameesh.review_provenance` :
 -- une ligne écrite AU MOMENT du fait, par l'outil qui le produit —
--- `ameesh provenance record --commit <sha>` (hook post-commit, donc pour chaque
--- commit) pour un commit, la déclaration du jalon pour un verdict (même
--- transaction que `work_item_milestones`). `sha` est le commit COMPLET (40 ou
--- 64 hex) : une abréviation citée par un jalon est résolue à la déclaration,
--- quand le dépôt est sous la main.
+-- `ameesh provenance record --commit <sha>` (paire de hooks `pre-commit` /
+-- `post-commit` : l'attestation, puis le fait de création de l'objet né, donc
+-- pour chaque commit) pour un commit, la déclaration du jalon pour un verdict
+-- (même transaction que `work_item_milestones`). `sha` est le commit COMPLET
+-- (40 ou 64 hex) : une abréviation citée par un jalon est résolue à la
+-- déclaration, quand le dépôt est sous la main.
 --
 -- Absence de ligne = origine inconnue. Le fournisseur rend alors `unknown`,
 -- jamais un voisin temporel ; le qualificateur refuse (pas de GO implicite).

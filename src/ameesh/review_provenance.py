@@ -27,10 +27,14 @@ managé (`AMEESH_TURN_ID`), la `session` celle du registre vivant de l'acteur,
 et le `harness` celui du tour (`AMEESH_HARNESS`), recontrôlé contre le registre.
 
 Un commit n'est enregistrable que s'il a été **créé dans ce tour** : le hook
-`pre-commit` écrit avant le commit une attestation de création (identité du
-tour, HEAD et arbre de départ), que `record_commit` exige et consomme. Un HEAD
-hérité d'un tour antérieur — même committé par le même agent — n'a pas
-d'attestation : son origine reste inconnue (écart cx3, 15/10 04:37).
+`pre-commit` écrit avant le commit une attestation (identité du tour, HEAD et
+arbre de départ, aléa), puis le hook `post-commit` écrit le **fait de création**
+de l'objet né (`sha`, arbre, parents), repris de la dernière entrée de reflog de
+HEAD — qui n'est un `git commit` que si l'objet vient de naître. `record_commit`
+exige les deux, liés par le même aléa, et les consomme. Un objet seulement
+restauré par `reset` ou `checkout`, même committé par le même agent, ne produit
+pas de fait de création : son origine reste inconnue (écarts cx3, 15/10 04:37,
+puis B1 cx2/Codex, 15/10 12:12).
 """
 from __future__ import annotations
 
@@ -226,6 +230,19 @@ def _git(cwd: str | None, *args: str) -> str | None:
 #: l'attestation ne l'est pas.
 INTENT_NAME = "ameesh-provenance-intent.json"
 
+#: Le fait de création du hook `post-commit`, à côté de l'attestation : il nomme
+#: l'objet né (`sha`, arbre, parents) et reprend l'aléa de l'attestation. Un
+#: `reset` ou un `checkout` vers un objet ancien n'en produit pas — la dernière
+#: entrée de reflog de HEAD n'est alors pas un `git commit`.
+CREATED_NAME = "ameesh-provenance-created.json"
+
+#: Les messages de reflog que SEUL `git commit` écrit pour l'objet qu'il vient
+#: de créer : initial, ordinaire, amend, résolution de fusion. `reset`,
+#: `checkout`, `merge --no-ff` automatique, `rebase` et `cherry-pick` écrivent
+#: d'autres messages (origine inconnue, jamais devinée).
+CREATION_RELOG = ("commit:", "commit (initial):", "commit (amend):",
+                  "commit (merge):")
+
 
 def intent_path(cwd: str | None = None) -> str | None:
     """Le chemin de l'attestation de ce worktree, ou None hors dépôt."""
@@ -271,6 +288,10 @@ def prepare_commit_intent(cwd: str | None = None, *, environ=None,
         "harness": ident["harness"],
         "head": _git(cwd, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") or "",
         "tree": tree,
+        # L'état de reflog AVANT le commit : le fait de création devra constater
+        # une entrée NOUVELLE (un commit qui n'apporte rien au reflog n'a pas
+        # créé d'objet dans ce tour).
+        "reflog": list(_head_reflog(cwd) or []),
         "nonce": secrets.token_hex(16),
     }
     tmp = path + ".tmp"
@@ -346,6 +367,113 @@ def _same_identity(row, identity: dict) -> bool:
             and row["turn"] == identity["turn"] and row["harness"] == identity["harness"])
 
 
+def created_path(cwd: str | None = None) -> str | None:
+    """Le chemin du fait de création de ce worktree, ou None hors dépôt."""
+    root = _git(cwd, "rev-parse", "--absolute-git-dir")
+    return os.path.join(root, CREATED_NAME) if root else None
+
+
+def clear_commit_creation(cwd: str | None = None) -> None:
+    """Retire le fait de création du worktree (au mieux : absent n'est pas une erreur)."""
+    path = created_path(cwd)
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def read_commit_creation(cwd: str | None = None) -> dict | None:
+    """Le fait de création en cours de ce worktree, ou None si absent ou illisible."""
+    path = created_path(cwd)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("actor", "turn", "harness", "sha", "tree", "nonce"):
+        if not isinstance(data.get(key), str):
+            return None
+    parents = data.get("parents")
+    if not isinstance(parents, list) or any(not isinstance(p, str) for p in parents):
+        return None
+    return data
+
+
+def _head_reflog(cwd: str | None = None) -> tuple[str, str] | None:
+    """(sha, message) de la dernière entrée de reflog de HEAD, ou None."""
+    out = _git(cwd, "reflog", "-1", "--format=%H%x00%gs", "HEAD")
+    if not out or "\x00" not in out:
+        return None
+    sha, _, message = out.partition("\x00")
+    return sha.strip().lower(), message.strip()
+
+
+def prepare_commit_creation(cwd: str | None = None, *, environ=None,
+                            actor: str = "") -> dict | None:
+    """Écrit le fait de création de l'objet qui vient de naître (hook `post-commit`).
+
+    Il lie le tour courant à l'objet créé : `sha`, arbre et parents de HEAD,
+    repris de la dernière entrée de reflog — qui doit être un `git commit` de
+    CE HEAD. Un `reset`/`checkout` vers un objet ancien, un `merge --no-ff`
+    automatique, un `rebase` ou un `cherry-pick` écrivent un autre message :
+    aucun fait de création n'est écrit, et `record_commit` refusera l'objet.
+
+    Il exige l'attestation `pre-commit` du MÊME tour (même aléa repris) et une
+    entrée de reflog **nouvelle** par rapport à celle que l'attestation
+    portait : un HEAD inchangé, qui portait déjà son `commit:` d'un tour
+    antérieur, n'est pas une création. Sans ces deux conditions, rien n'est
+    écrit. Ne bloque jamais un commit ; aucune base n'est requise (c'est
+    `record_commit` qui écrit la preuve)."""
+    env = os.environ if environ is None else environ
+    path = created_path(cwd)
+    if path is None:
+        return None
+    try:
+        ident = capture(env, actor=actor)
+    except ProvenanceError:
+        return None
+    intent = read_commit_intent(cwd)
+    if intent is None or (intent["actor"], intent["turn"], intent["harness"]) != (
+            ident["actor"], ident["turn"], ident["harness"]):
+        return None
+    head = _git(cwd, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    reflog = _head_reflog(cwd)
+    before = intent.get("reflog")
+    before = tuple(before) if isinstance(before, list) and len(before) == 2 else None
+    if not head or reflog is None or reflog[0] != head \
+            or not reflog[1].startswith(CREATION_RELOG) or reflog == before:
+        return None
+    parents = _parents(cwd, head)
+    tree = _git(cwd, "rev-parse", "%s^{tree}" % head)
+    if parents is None or not tree:
+        return None
+    creation = {
+        "version": 1,
+        "actor": ident["actor"],
+        "turn": ident["turn"],
+        "harness": ident["harness"],
+        "sha": head,
+        "tree": tree,
+        "parents": parents,
+        "nonce": intent["nonce"],
+    }
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(creation, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        return None
+    return creation
+
+
 def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
                            cwd: str | None = None) -> dict | None:
     """L'identité exacte du tour courant, ou None si le fait n'y est pas déclaré.
@@ -378,10 +506,12 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
     courant (jamais de l'appelant). Trois bornes : le commit est **HEAD du
     dépôt sous la main**, son committer est l'acteur du tour
     (`<acteur>@ameesh.invalid`, posé par le runner), et il est **attesté comme
-    création de ce tour** par le hook `pre-commit` (identité du tour, HEAD et
-    arbre de départ) — attestation consommée par l'écriture. Un HEAD hérité
-    d'un tour antérieur, même committé par le même agent, n'a pas d'attestation
-    de création : son origine reste inconnue (écart cx3, 15/10 04:37), jamais
+    création de ce tour** par la paire de hooks — l'attestation `pre-commit`
+    (identité du tour, HEAD et arbre de départ, aléa) et le fait de création
+    `post-commit` (l'objet né), liés par le même aléa ; les deux sont consommés
+    par l'écriture. Un objet seulement restauré par `reset`/`checkout`, même
+    committé par le même agent, n'a pas de fait de création : son origine reste
+    inconnue (écart cx3, 15/10 04:37 ; B1 cx2/Codex, 15/10 12:12), jamais
     réattribuée au nouveau tour.
 
     Une preuve déjà écrite pour ce commit n'est pas réécrite : une identité
@@ -428,6 +558,30 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
             "creation attestation of %s/%s/%s is not from this turn (%s/%s/%s)"
             % (intent["actor"], intent["turn"][:8], intent["harness"],
                identity["actor"], identity["turn"][:8], identity["harness"]))
+    creation = read_commit_creation(cwd)
+    if creation is None:
+        raise ProvenanceError(
+            "no creation record for %s: a restored object is not a creation"
+            " of this turn" % full[:12])
+    if (creation["actor"] != identity["actor"] or creation["turn"] != identity["turn"]
+            or creation["harness"] != identity["harness"]):
+        raise ProvenanceError(
+            "creation record of %s/%s/%s is not from this turn (%s/%s/%s)"
+            % (creation["actor"], creation["turn"][:8], creation["harness"],
+               identity["actor"], identity["turn"][:8], identity["harness"]))
+    if creation["sha"] != full:
+        raise ProvenanceError(
+            "creation record names %s, not %s: a restored object is not a creation"
+            % (creation["sha"][:12], full[:12]))
+    if creation["nonce"] != intent["nonce"]:
+        raise ProvenanceError(
+            "creation record and attestation of %s do not come from the same gesture"
+            % full[:12])
+    parents = _parents(cwd, full)
+    tree = _git(cwd, "rev-parse", "%s^{tree}" % full)
+    if parents is None or tree != creation["tree"] or parents != creation["parents"]:
+        raise ProvenanceError(
+            "creation record does not describe commit %s" % full[:12])
     if not _attests_creation(cwd, full, intent):
         raise ProvenanceError(
             "commit %s is not the creation attested for this turn" % full[:12])
@@ -438,13 +592,15 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
             "%s: already recorded for %s/%s, not %s/%s"
             % (subject, row["actor"], row["turn"], identity["actor"], identity["turn"]))
     clear_commit_intent(cwd)
+    clear_commit_creation(cwd)
     return row
 
 
 #: les hooks posés par `ameesh provenance install` — ils ne bloquent JAMAIS un
 #: commit : hors tour managé, sans base ou sans ameesh, ils sortent 0.
-#: `pre-commit` atteste la création (identité du tour, HEAD et arbre de départ),
-#: `post-commit` écrit la preuve en consommant l'attestation.
+#: `pre-commit` atteste le commit qui vient (identité du tour, HEAD et arbre de
+#: départ) ; `post-commit` constate le fait de création de l'objet né, puis
+#: écrit la preuve en consommant les deux.
 PRE_COMMIT_HOOK = """#!/bin/sh
 # ameesh #1465 — attestation de creation du commit, avant qu'il naisse.
 # Ne bloque jamais un commit : hors tour manage ou sans ameesh, sort 0.
@@ -455,10 +611,11 @@ exit 0
 """
 
 HOOK = """#!/bin/sh
-# ameesh #1465 — preuve d'origine du commit, dans le tour qui l'a cree.
+# ameesh #1465 — fait de creation de l'objet ne, puis preuve d'origine.
 # Ne bloque jamais un commit : hors tour manage ou sans base, sort 0.
 [ "${AMEESH_TURN_ID:-}" ] || exit 0
 command -v ameesh >/dev/null 2>&1 || exit 0
+ameesh provenance created >/dev/null 2>&1
 ameesh provenance record --commit HEAD --quiet >/dev/null 2>&1 || exit 0
 exit 0
 """
@@ -533,6 +690,10 @@ def build_parser():
     att = sub.add_parser("intent",
                          help="write the creation attestation (pre-commit hook)")
     att.add_argument("--json", action="store_true")
+    cre = sub.add_parser("created",
+                         help="write the creation record of the new object"
+                              " (post-commit hook)")
+    cre.add_argument("--json", action="store_true")
     show = sub.add_parser("show", help="read the receipt, or nothing if unknown")
     show.add_argument("--commit", default="")
     show.add_argument("--milestone", type=int, default=None)
@@ -558,6 +719,12 @@ def main(argv: list[str] | None = None) -> int:
         attestation = prepare_commit_intent()
         if args.json:
             print(json.dumps(attestation, sort_keys=True))
+        return 0
+    if args.command == "created":
+        # aucune base requise : le hook `post-commit` constate l'objet né
+        creation = prepare_commit_creation()
+        if args.json:
+            print(json.dumps(creation, sort_keys=True))
         return 0
     db = _connect()
     try:
