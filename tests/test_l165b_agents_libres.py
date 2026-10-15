@@ -139,7 +139,8 @@ class IdleCapacityTest(_Libres):
         self.assertEqual(alert["agents"], ["dev7"])
         self.assertEqual(alert["lots"], [lot["id"]])
         self.assertEqual(alert["designers"], ["mesh-design"])
-        self.assertIn("without a lot in progress", alert["detail"])
+        # #1677 (N9) : le motif est « aucun lot actionnable », plus une durée
+        self.assertIn("without an actionable lot", alert["detail"])
         briefs = alert_briefs.briefs(alert, self.listing(), {lot["id"]: "sans agent"},
                                      auditor_names=["auditeur"])
         self.assertEqual(sorted(briefs), ["auditeur", "mesh-design", "orchestrateur"])
