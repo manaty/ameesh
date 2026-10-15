@@ -9,6 +9,7 @@ import json
 import secrets
 import time
 import unittest
+import urllib.request
 from unittest import mock
 
 from ameesh import canon, oidc, p256
@@ -88,13 +89,15 @@ class _CleEC:
         return r.to_bytes(32, "big") + s.to_bytes(32, "big")
 
 
-def jeton(cle, alg, **claims) -> str:
+def jeton(cle, alg, _header=None, **claims) -> str:
     now = int(time.time())
     base = {"iss": ISS, "aud": CLIENT, "sub": "123", "iat": now, "exp": now + 600,
             "email": "alice@exemple.org", "email_verified": True}
     base.update(claims)
     base = {k: v for k, v in base.items() if v is not None}
-    head = b64u(json.dumps({"alg": alg, "kid": cle.kid, "typ": "JWT"}).encode())
+    entete = {"alg": alg, "kid": cle.kid, "typ": "JWT"}
+    entete.update(_header or {})
+    head = b64u(json.dumps(entete).encode())
     body = b64u(json.dumps(base).encode())
     sig = cle.sign((head + "." + body).encode())
     return head + "." + body + "." + b64u(sig)
@@ -211,6 +214,115 @@ class VerificationTest(unittest.TestCase):
             with self.assertRaises(oidc.OidcError) as ctx:
                 oidc.rsa_verify(self.rsa.n, self.rsa.e, b"m", self.rsa.sign(b"m"))
         self.assertIn("crypto", str(ctx.exception))
+        with mock.patch.object(builtins, "__import__", new=sans_crypto):
+            with self.assertRaises(oidc.OidcError) as ctx:
+                self.verifier(jeton(self.rsa, "RS256"))     # le message ne se perd pas
+        self.assertIn("crypto", str(ctx.exception))
+
+    def test_redirections_controlees(self):
+        """R1 B2 : chaque saut est contrôlé avant émission ; pas de descente http."""
+        handler = oidc._SafeRedirect()
+        req = urllib.request.Request(ISS + "/jwks")
+        with self.assertRaises(oidc.OidcError):                       # https -> http distant
+            handler.redirect_request(req, None, 302, "Found", {},
+                                     "http://203.0.113.7/jwks")
+        self.assertIsNotNone(handler.redirect_request(req, None, 302, "Found", {},
+                                                      ISS + "/jwks2"))     # https -> https
+        local = urllib.request.Request("http://127.0.0.1:8080/realms/x/jwks")
+        self.assertIsNotNone(handler.redirect_request(local, None, 302, "Found", {},
+                                                      "http://127.0.0.1:8080/realms/x/2"))
+        with self.assertRaises(oidc.OidcError):                       # boucle locale -> distant
+            handler.redirect_request(local, None, 302, "Found", {},
+                                     "http://203.0.113.7/jwks")
+
+    def test_reponse_finale_hors_schema_refusee(self):
+        """R1 B2 : même sans redirection suivie, l'URL finale est recontrôlée."""
+        class Reponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def geturl(self):
+                return "http://203.0.113.7/jwks"
+
+            def read(self, n):
+                return b"{}"
+
+        class Ouvreur:
+            def open(self, req, timeout=None):
+                return Reponse()
+
+        with mock.patch.object(oidc, "_OPENER", Ouvreur()):
+            with self.assertRaises(oidc.OidcError):
+                oidc._fetch_json(ISS + "/jwks")
+
+    def test_metadonnees_de_cle_respectees(self):
+        """R1 B3 : `use`, `key_ops`, `alg` déclarés sont respectés ; absents, acceptés."""
+        base = self.ec.jwk()
+
+        def verifier_avec(jwk):
+            def fetch(url):
+                if url.endswith("/.well-known/openid-configuration"):
+                    return {"issuer": ISS, "jwks_uri": ISS + "/jwks"}
+                return {"keys": [jwk]}
+            return oidc.verify(jeton(self.ec, "ES256"), self.p,
+                               cache=oidc.KeyCache(fetch=fetch))
+
+        for champ, valeur in (("use", "enc"), ("key_ops", ["sign"]),
+                              ("key_ops", "verify"), ("alg", "ES384")):
+            with self.assertRaises(oidc.OidcError, msg="%s=%r" % (champ, valeur)):
+                verifier_avec(dict(base, **{champ: valeur}))
+        verifier_avec(base)                                            # métadonnées absentes
+        verifier_avec(dict(base, use="sig", key_ops=["verify"], alg="ES256"))
+
+    def test_extension_critique_refusee(self):
+        """R1 B4 : tout `crit` (même mal formé) refuse le jeton avant validation."""
+        for crit in (["must_reject"], "must_reject", [], {}, 3):
+            with self.assertRaises(oidc.OidcError, msg=repr(crit)):
+                self.verifier(jeton(self.rsa, "RS256",
+                                    _header={"crit": crit, "must_reject": True}))
+        self.verifier(jeton(self.rsa, "RS256", _header={"typ": "JWT"}))   # sans `crit`
+
+    def test_contrat_du_jeton_d_identite(self):
+        """R1 B5 : sub/iat/exp obligatoires, nombres finis hors booléens."""
+        cas = {
+            "sub absent": jeton(self.rsa, "RS256", sub=None),
+            "sub non chaîne": jeton(self.rsa, "RS256", sub=123),
+            "sub vide": jeton(self.rsa, "RS256", sub=""),
+            "iat absent": jeton(self.rsa, "RS256", iat=None),
+            "iat non fini": jeton(self.rsa, "RS256", iat=float("inf")),
+            "exp infini": jeton(self.rsa, "RS256", exp=float("inf")),
+            "exp booléen": jeton(self.rsa, "RS256", exp=True),
+            "aud non chaîne": jeton(self.rsa, "RS256", aud=123),
+            "aud liste non chaîne": jeton(self.rsa, "RS256", aud=[CLIENT, 42]),
+            "nbf non fini": jeton(self.rsa, "RS256", nbf=float("nan")),
+        }
+        for attendu, token in cas.items():
+            with self.assertRaises(oidc.OidcError, msg=attendu):
+                self.verifier(token)
+
+    def test_decouverte_emetteur_exact(self):
+        """R1 B1 : l'émetteur annoncé par la découverte est comparé sans normalisation."""
+        def fetch(url):
+            return {"issuer": ISS + "/", "jwks_uri": ISS + "/jwks"}
+
+        with self.assertRaises(oidc.OidcError):
+            oidc.KeyCache(fetch=fetch).keys(ISS)
+
+    def test_fournisseur_types_exacts(self):
+        """R1 B1 : types exigés, valeurs conservées telles quelles."""
+        for raw in ({"issuer": 123, "client_id": CLIENT},
+                    {"issuer": ISS, "client_id": 42},
+                    {"issuer": "", "client_id": CLIENT},
+                    {"issuer": "ftp://idp.example", "client_id": CLIENT}):
+            with self.assertRaises(oidc.OidcError):
+                oidc.Provider.from_dict(raw)
+        # un `/` final n'est pas rabattu : la valeur reste telle quelle, le jeton
+        # ne correspondra simplement pas (fail closed)
+        self.assertEqual(oidc.Provider.from_dict(
+            {"issuer": ISS + "/", "client_id": CLIENT}).issuer, ISS + "/")
 
     def test_fournisseur_mal_configure(self):
         for raw in ({"issuer": "http://idp", "client_id": "c"}, {"issuer": ISS}):
@@ -261,6 +373,22 @@ class RattachementTest(_TmpMixin, unittest.TestCase):
         self.assertIsNone(oidc.human_for([c], claims, issuer="https://autre.example"))
         self.assertIsNone(oidc.human_for([c], {"sub": "sub-bruno"}, issuer=ISS))
         self.assertIsNone(oidc.human_for([c], claims, issuer=ISS, mode="email"))
+
+    def test_sujet_et_emetteur_exacts(self):
+        """R1 B1 : ni espace, ni type, ni `/` final ne sont rabattus."""
+        root = self.example_copy()
+        write(root, "membres/alice.md", "\n".join([
+            "---", "type: Member", "title: alice",
+            "oidc_subjects:",
+            '  - {issuer: "https://idp.exemple.org", subject: "123"}',
+            "---", "", "# alice", ""]))
+        c = canon.load(root, untrusted=True)
+        self.assertEqual(oidc.human_for([c], {"sub": "123"}, issuer=ISS), "human:alice")
+        self.assertIsNone(oidc.human_for([c], {"sub": " 123 "}, issuer=ISS))
+        self.assertIsNone(oidc.human_for([c], {"sub": 123}, issuer=ISS))
+        self.assertIsNone(oidc.human_for([c], {"sub": "123"}, issuer=ISS + "/"))
+        self.assertIsNone(oidc.human_for([c], {"sub": "123"},
+                                         issuer=" https://idp.exemple.org"))
 
     def test_les_modes_ne_se_melangent_pas(self):
         root = self.example_copy()
