@@ -69,6 +69,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L78: human/agent messages and the pending readable-thread copy.
     ('conversation_log', ARRAY['text', 'meta', 'thread_text']),
+    ('agent_peek', ARRAY['payload']),
     ('thread_index', ARRAY[
         'last_excerpt'
     ]),
