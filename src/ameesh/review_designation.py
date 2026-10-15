@@ -241,9 +241,9 @@ def families_of(authors: Iterable) -> tuple[set, set]:
     """`(noms, familles)` interdits, tirés des auteurs du contenu gelé.
 
     Un auteur est `{"name", "family"}` : l'assigné du lot et chaque correcteur
-    qui a poussé sur la tête (preuves exactes #1465). Une famille inconnue
-    n'interdit que le nom — elle ne se devine pas — et ne rend pas le candidat
-    éligible pour autant.
+    qui a poussé sur la tête (preuves exactes #1465). Une famille inconnue ne
+    se devine pas : `select` attend alors au lieu de désigner (voir
+    `unknown_families`).
     """
     names, families = set(), set()
     for author in authors or ():
@@ -255,6 +255,16 @@ def families_of(authors: Iterable) -> tuple[set, set]:
         if family and family not in PLACEHOLDER_FAMILIES:
             families.add(family)
     return names, families
+
+
+def unknown_families(authors: Iterable) -> list[str]:
+    """Les auteurs dont la famille réelle est inconnue (vide ou étiquette).
+
+    Sans leur famille, l'indépendance d'un relecteur ne se prouve pas : un
+    relecteur de la même famille réelle serait désigné sans le savoir."""
+    return sorted({str((a or {}).get("name") or "").strip() for a in authors or ()
+                   if str((a or {}).get("family") or "").strip().lower()
+                   in PLACEHOLDER_FAMILIES})
 
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
@@ -279,6 +289,13 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "why": "no review required", "forbidden": sorted(forbidden)}
     if required == 0:
+        return out
+    unknown = unknown_families(authors)
+    if unknown:
+        # Un auteur sans famille réelle connue : l'indépendance ne se prouve
+        # pas, on attend au lieu d'écarter le seul nom (canon §2).
+        out.update({"state": WAITING, "missing": required,
+                    "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
     eligible = [c for c in candidates or ()
                 if c.eligible(forbidden_names=names, forbidden_families=forbidden,

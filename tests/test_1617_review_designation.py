@@ -152,13 +152,18 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(two["missing"], 1)
         self.assertEqual(two["reviewers"], [])
 
-    def test_author_with_unknown_family_is_excluded_by_name(self):
-        picked = rd.select(
-            required=1,
-            authors=[{"name": "codex-one", "family": ""}],
-            candidates=candidates(row("codex-one", harness="codex", session="codex"),
-                                  row("codex-two", harness="codex", session="codex")))
-        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-two"])
+    def test_author_with_unknown_family_waits_instead_of_guessing(self):
+        # codex-two est peut-être de la famille réelle de l'auteur : on attend.
+        for family in ("", "unknown"):
+            picked = rd.select(
+                required=1,
+                authors=[{"name": "codex-one", "family": family}],
+                candidates=candidates(row("codex-one", harness="codex", session="codex"),
+                                      row("codex-two", harness="codex", session="codex")))
+            self.assertEqual(picked["state"], rd.WAITING)
+            self.assertEqual(picked["reviewers"], [])
+            self.assertEqual(picked["missing"], 1)
+            self.assertIn("codex-one", picked["why"])
 
     def test_unavailable_candidates_are_skipped_even_the_least_loaded(self):
         # Les indisponibles seraient les moins chargés : la disponibilité passe avant.
