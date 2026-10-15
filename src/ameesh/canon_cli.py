@@ -469,9 +469,10 @@ def _print_mechanics(done) -> None:
     if done is None:
         return
     if done.status == "ok":
-        print("mechanics (#1616) : cutoffs %s %s; max_in_build %d; CI %s "
+        packets = "%d/jour" % len(done.packets) if done.packets else "aucun"
+        print("mechanics (#1616) : cutoffs %s %s; paquets %s; max_in_build %d; CI %s "
               "(incident %s); families %s"
-              % (", ".join(done.cutoffs), done.timezone, done.max_in_build,
+              % (", ".join(done.cutoffs), done.timezone, packets, done.max_in_build,
                  done.ci.get("packet", "?"), done.ci.get("incident_label", "?"),
                  ", ".join(done.reviews.get("families") or [])))
     elif done.status == "absent":

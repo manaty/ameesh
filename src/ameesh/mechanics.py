@@ -4,7 +4,12 @@
 Le canon (`processus/mecanique.yaml`, manaty/home) déclare, un bloc par règle
 mécanique, ce que l'outillage exécute sans agent :
 
-- `cutoffs` et `timezone` : les coupures du train, en heure locale IANA ;
+- `cutoffs` et `timezone` : les coupures de release du train, en heure locale
+  IANA ;
+- `packets.cutoffs` : la cadence des paquets horaires (#1467, §11 bis horaire),
+  distincte des coupures de release ; bloc absent = aucune cadence, tuple vide
+  explicite et `last_packet`/`next_packet` refusés, jamais un repli sur
+  `cutoffs` ni sur une durée locale (#1757) ;
 - `build.max_in_build` : le plafond de lots en développement par agent ;
 - `ci.packet`, `ci.incident_label`, `ci.environment_red`, `ci.faulty_lot` :
   une suite par paquet, l'étiquette qui autorise exceptionnellement la CI d'un
@@ -56,8 +61,10 @@ _TIME = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
-_DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "build", "ci", "reviews", "merge", "projects")
-_OVERRIDE_KEYS = ("timezone", "cutoffs", "build", "ci")
+_DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
+                  "merge", "projects")
+_OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci")
+_PACKETS_KEYS = ("cutoffs",)
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
@@ -79,6 +86,7 @@ class ProjectOverride:
     name: str
     timezone: str | None = None
     cutoffs: tuple[str, ...] | None = None
+    packet_cutoffs: tuple[str, ...] | None = None
     max_in_build: int | None = None
     ci_packet: str | None = None
     ci_incident_label: str | None = None
@@ -105,6 +113,8 @@ class Document:
     merge_repeat_freeze: bool
     merge_on_green_packet: bool
     merge_post_merge_red: str
+    #: cadence des paquets horaires (`packets.cutoffs`) ; `()` = aucune cadence
+    packet_cutoffs: tuple[str, ...] = ()
     overrides: tuple[ProjectOverride, ...] = ()
 
     def override(self, project: str) -> ProjectOverride | None:
@@ -118,6 +128,7 @@ class Document:
             "schema": self.schema,
             "timezone": self.timezone,
             "cutoffs": list(self.cutoffs),
+            "packets": {"cutoffs": list(self.packet_cutoffs)},
             "build": {"max_in_build": self.max_in_build},
             "ci": {"packet": self.ci_packet,
                    "incident_label": self.ci_incident_label,
@@ -160,6 +171,7 @@ class Mechanics:
     project: str
     timezone: str
     cutoffs: tuple[str, ...]
+    packet_cutoffs: tuple[str, ...]
     max_in_build: int
     ci_packet: str
     ci_incident_label: str
@@ -211,6 +223,56 @@ class Mechanics:
                 return min(after)
         raise MechanicsError("no cutoff declared after %.3f" % now)
 
+    # -- paquets horaires ---------------------------------------------------
+
+    def packets_on(self, day: date) -> tuple[tuple[float, str], ...]:
+        """Les paquets d'un jour local, `(epoch UTC, libellé HH:MM)`.
+
+        La cadence est celle déclarée (`packets.cutoffs`), jamais une durée
+        locale ni un repli sur les coupures de release : sans bloc, la liste
+        est vide (#1757). Une heure absente (passage à l'heure d'été) est
+        sautée ; une heure répétée (passage à l'heure d'hiver) donne ses deux
+        occurrences, distinguées par leur epoch, sans doublon d'epoch.
+        """
+        zone = self.zone()
+        out: list[tuple[float, str]] = []
+        for label in self.packet_cutoffs:
+            naive = datetime(day.year, day.month, day.day,
+                             int(label[:2]), int(label[3:]))
+            stamps: list[float] = []
+            for fold in (0, 1):
+                stamp = naive.replace(tzinfo=zone, fold=fold).timestamp()
+                back = datetime.fromtimestamp(stamp, zone).replace(tzinfo=None)
+                if back == naive and stamp not in stamps:
+                    stamps.append(stamp)
+            out.extend((stamp, label) for stamp in stamps)
+        out.sort(key=lambda item: item[0])
+        return tuple(out)
+
+    def last_packet(self, now: float) -> float:
+        """Dernier paquet local à `now` ou avant ; refuse sans cadence déclarée."""
+        if not self.packet_cutoffs:
+            raise MechanicsError("no packet cadence declared")
+        local = datetime.fromtimestamp(now, self.zone())
+        for offset in (0, -1):
+            before = [stamp for stamp, _ in self.packets_on(local.date() + timedelta(days=offset))
+                      if stamp <= now]
+            if before:
+                return max(before)
+        raise MechanicsError("no packet declared before %.3f" % now)
+
+    def next_packet(self, now: float) -> float:
+        """Premier paquet local strictement après `now` ; refuse sans cadence."""
+        if not self.packet_cutoffs:
+            raise MechanicsError("no packet cadence declared")
+        local = datetime.fromtimestamp(now, self.zone())
+        for offset in (0, 1):
+            after = [stamp for stamp, _ in self.packets_on(local.date() + timedelta(days=offset))
+                     if stamp > now]
+            if after:
+                return min(after)
+        raise MechanicsError("no packet declared after %.3f" % now)
+
     # -- revue --------------------------------------------------------------
 
     def reviews_for(self, paths) -> ReviewNeed:
@@ -259,6 +321,7 @@ class Mechanics:
             "project": self.project,
             "timezone": self.timezone,
             "cutoffs": list(self.cutoffs),
+            "packets": {"cutoffs": list(self.packet_cutoffs)},
             "build": {"max_in_build": self.max_in_build},
             "ci": {"packet": self.ci_packet,
                    "incident_label": self.ci_incident_label,
@@ -305,6 +368,17 @@ def _cutoffs(value, where: str) -> tuple[str, ...]:
         seen.add(item)
         out.append(item)
     return tuple(out)
+
+
+def _packets(value, where: str) -> tuple[str, ...]:
+    """Le bloc `packets` (#1757) : cadence explicite, jamais une durée locale.
+
+    Bloc présent mais vide, clé inconnue, heure mal formée ou doublon : refus.
+    L'absence du bloc n'est pas un repli — `compile_document` la traduit en
+    tuple vide, et `last_packet`/`next_packet` refusent alors explicitement.
+    """
+    data = _mapping(value, where, _PACKETS_KEYS)
+    return _cutoffs(data.get("cutoffs"), where + ".cutoffs")
 
 
 def _positive_int(value, where: str) -> int:
@@ -385,12 +459,16 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         scope = "%s.%s" % (where, name)
         data = _mapping(block, scope, _OVERRIDE_KEYS)
         timezone = cutoffs = None
+        packet_cutoffs = None
         max_in_build = None
         packet = label = environment = faulty = None
         if "timezone" in data:
             timezone = _timezone(data["timezone"], scope + ".timezone")
         if "cutoffs" in data:
             cutoffs = _cutoffs(data["cutoffs"], scope + ".cutoffs")
+        if "packets" in data:
+            # bloc entier remplacé, comme `cutoffs` : jamais une fusion partielle
+            packet_cutoffs = _packets(data["packets"], scope + ".packets")
         if "build" in data:
             build = _mapping(data["build"], scope + ".build", _BUILD_KEYS)
             max_in_build = _positive_int(build.get("max_in_build"),
@@ -398,6 +476,7 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         if "ci" in data:
             packet, label, environment, faulty = _ci(data["ci"], scope + ".ci")
         out.append(ProjectOverride(name=name, timezone=timezone, cutoffs=cutoffs,
+                                   packet_cutoffs=packet_cutoffs,
                                    max_in_build=max_in_build, ci_packet=packet,
                                    ci_incident_label=label,
                                    ci_environment_red=environment,
@@ -425,6 +504,9 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
     packet, label, environment, faulty = _ci(parsed.get("ci"), source + ".ci")
     named_fire, repeat_freeze, on_green, post_merge = _merge(parsed.get("merge"),
                                                              source + ".merge")
+    # `packets` optionnel : absent = aucune cadence (tuple vide explicite), un
+    # bloc présent — même vide — est validé strictement et refusé s'il est mal formé.
+    packets = _packets(parsed["packets"], source + ".packets") if "packets" in parsed else ()
     return Document(
         schema=SCHEMA,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
@@ -444,6 +526,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         merge_repeat_freeze=repeat_freeze,
         merge_on_green_packet=on_green,
         merge_post_merge_red=post_merge,
+        packet_cutoffs=packets,
         overrides=_overrides(parsed.get("projects"), source + ".projects"),
     )
 
@@ -586,6 +669,11 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
                   else document.timezone),
         cutoffs=(override.cutoffs if override and override.cutoffs
                  else document.cutoffs),
+        # `packets` se remplace en bloc, présent ou absent : un override sans
+        # `packets` hérite du bloc global, il ne le vide jamais.
+        packet_cutoffs=(override.packet_cutoffs
+                        if override and override.packet_cutoffs is not None
+                        else document.packet_cutoffs),
         max_in_build=(override.max_in_build if override and override.max_in_build
                       else document.max_in_build),
         ci_packet=(override.ci_packet if override and override.ci_packet
