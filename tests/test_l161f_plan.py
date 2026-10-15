@@ -1325,17 +1325,14 @@ def _dash_column(line: str) -> int | None:
 
 def _left_open(content: str) -> bool:
     """Does a quoted scalar or a flow collection go on past this line?"""
-    # Node properties can separate the key from the opening quote/flow node.
-    # Inspect the value itself, including for keys that _run_bodies cannot read.
-    _, content = _node_properties(content.strip())
-    match = _ANY_KEY.match(content)
-    if match:
-        _, content = _node_properties(match.group("rest").strip())
+    # Fail closed on an opening delimiter after whitespace or a YAML flow
+    # separator, whatever key, explicit value marker or property precedes it.
+    # A plain scalar with an unmatched delimiter may be refused; permitting it
+    # could hide a quoted/flow continuation whose indentation YAML ignores.
     depth, quote, i = 0, None, 0
     while i < len(content):
-        char, before = content[i], content[:i].rstrip()
-        start = not before or before[-1] in "[{," or (
-            before[-1] in ":-?" and len(before) < i)
+        char = content[i]
+        start = i == 0 or content[i - 1].isspace() or content[i - 1] in "[{,:"
         if quote == '"':
             if char == "\\":
                 i += 1
@@ -1527,6 +1524,18 @@ class RunBodiesTest(unittest.TestCase):
             for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
                                "&cmd !!str"):
                 text = (f"jobs:\n  a:\n    steps:\n      - {key}: {properties} \"echo\n"
+                        "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
+                with self.subTest(key=key, properties=properties):
+                    self.assertNotEqual([], _branch_ref_escapes(text))
+
+    def test_explicit_mapping_value_properties_cannot_hide_a_scalar(self):
+        # The YAML value starts after `:`, independently of the explicit key.
+        # Quoted scalar continuation ignores the apparent root env's indent.
+        for key in ("run", '"run"'):
+            for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
+                               "&cmd !!str"):
+                text = (f"jobs:\n  a:\n    steps:\n      - ? {key}\n"
+                        f"        : {properties} \"echo\n"
                         "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
                 with self.subTest(key=key, properties=properties):
                     self.assertNotEqual([], _branch_ref_escapes(text))
