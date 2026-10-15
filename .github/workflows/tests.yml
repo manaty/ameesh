@@ -86,6 +86,18 @@ env:
 # organisation. A pull request from a fork never reaches that host (the
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
+#
+# Borrowed capacity (lot #1256, option A of the R2 B1 arbitration): a lending
+# host runs SINGLE-USE runners under the DISTINCT label `ameesh-lent`, never
+# `ameesh-ci`, so no job of the fleet — in particular the required check
+# `tests` and everything it needs — can land there. Only a job that is not
+# the required check, is not needed by it, holds no write permission and
+# feeds nothing the required path reads may target that label; the admissible
+# list and the residual risk are in deploy/guest/PILOT-ci-nexlink.md §3.
+# `vars.AMEESH_LENT_RUNS_ON` is set to `["self-hosted","linux","ameesh-lent"]`
+# only while a loan is armed (a single-use configuration deposited and the
+# slot armed); unset, the job stays on the fleet. The one job routed below
+# (`bilan`) is `continue-on-error` and is NOT in the `needs` of `tests`.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # merge commit against its target) and the plan of the run, from the map
@@ -334,12 +346,16 @@ jobs:
         run: python -m unittest -v ${{ needs.plan.outputs.doc_readers }}
 
   # L161f : leaks (failures of modules the map did not select) and the
-  # provisional green, for the two-week review (L161i); never required
+  # provisional green, for the two-week review (L161i); never required.
+  # Its result gates nothing and nothing required reads what it produces, so
+  # it is the job this lot routes to the borrowed label when a loan is armed
+  # (option A, #1256; plan §3): a forged green here costs the two-week tally,
+  # never a required check.
   bilan:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     steps:

@@ -15,19 +15,26 @@
 #
 #   sudo deploy/guest/ci-runners.sh --dry-run --check
 #   sudo deploy/guest/ci-runners.sh --prepare --count 2
-#   sudo deploy/guest/ci-runners.sh --register --token-file /root/reg.token
-#   sudo deploy/guest/ci-runners.sh --enable
+#   sudo deploy/guest/ci-runners.sh --deposit /root/jit-ci-3-1.b64
+#   sudo deploy/guest/ci-runners.sh --enable 1       # one job, then nothing
 #   sudo deploy/guest/ci-runners.sh --check          # the isolation evidence
 #   sudo deploy/guest/ci-runners.sh --disable        # no new job there
 #   sudo deploy/guest/ci-runners.sh --remove         # terminal jobs only
 #
 # Modes (exactly one):
-#   --prepare         install the runner software, the units and the `docker`
-#                     shim; nothing starts, nothing registers
-#   --register        register each runner to the ameesh repository; needs
-#                     --token-file F (a short-lived registration token, read
-#                     by root only, never written, never printed)
-#   --enable [R…]     enable and start the runners (default: every prepared one)
+#   --prepare         install the runner software, the units, the `docker`
+#                     shim and the deposit directories; nothing starts,
+#                     nothing registers
+#   --deposit FILE    deposit ONE just-in-time configuration (base64, from
+#                     `POST /repos/manaty/ameesh/actions/runners/
+#                     generate-jitconfig`, minted **off this host** by the
+#                     ameesh side): one file = one job, and GitHub removes
+#                     the runner after it. No registration token ever reaches
+#                     the host, and nothing durable stays on it (option A of
+#                     the R2 B1 arbitration; plan §1/§3)
+#   --enable [R…]     arm the runners (default: every prepared one): each
+#                     needs a deposited configuration, and runs **one** job
+#                     then stops. Refuses while the guard observes (R1 #1256)
 #   --disable [R…]    stop and disable them; refuses while a job is running
 #                     there (or --wait-terminal S)
 #   --check           what is in place, and the isolation evidence
@@ -42,14 +49,18 @@
 #   --host NAME           the host's short name (default: hostname -s)
 #   --count N             runners, 1 to 4 (default 2, or the count a
 #                         previous --prepare recorded in the state file)
-#   --disk-floor-mib N    refuse --prepare/--register when the guest
+#   --runner N            with --deposit: the slot the configuration names,
+#                         when its `.runner` does not say it (the name inside
+#                         the configuration always wins: it decides the work
+#                         directory and the registration GitHub removes)
+#   --disk-floor-mib N    refuse --prepare when the guest
 #                         directory holds less than N MiB free (default
 #                         15360 = 15 GiB). The Host fiche's reclaim.disk_free_min
 #                         plus the install margin: a guest installed under the
 #                         threshold that stops it would never run (plan §3, §6).
 #                         --prepare records the qualified value in its state
-#                         file; --register and the next --prepare adopt it
-#                         when the option is not repeated (R1 delta B5)
+#                         file; the next --prepare adopts it when the option is
+#                         not repeated (R1 delta B5)
 #   --tarball FILE        use this actions-runner tarball instead of the
 #                         download (offline hosts)
 #   --version V           runner version to download (default 2.338.0, the
@@ -72,13 +83,17 @@
 #     never stops, starts, enables, disables or removes `actions.runner.*`;
 #   * the unit runs `/usr/local/lib/ameesh-guest-ci/ci-runner-gate` (installed here), not `run.sh`: the
 #     GitHub runner starts only while the guard's gate is a fresh `available`
-#     out of `enforce`, and is stopped when the gate closes, disappears or
-#     goes stale (R1 #1256);
+#     out of `enforce`, is stopped when the gate closes, disappears or
+#     goes stale (R1 #1256), and consumes **one** deposited single-use
+#     configuration per start (option A, plan §3);
 #   * containers run rootless, under the runner's cgroup, inside
 #     `ameesh-guest.slice`: no `/run/docker.sock`, no `docker` group, so a job
 #     cannot use the application's Docker daemon nor read its images;
-#   * the registration token is read from a root-only file and only ever
-#     passed to `config.sh`; the dry run prints `<token>` instead.
+#   * the registration token never reaches this host: `--deposit` takes one
+#     single-use JIT configuration, minted off the host by the ameesh side,
+#     validates it and hands it to the guest's deposit directory; the dry run
+#     never prints its content. A persistent `.runner`/`.credentials` left by
+#     an older installation is a KO in --check (option A, plan §3);
 #   * the runner archive is verified by its pinned digest on a root-private
 #     snapshot, and extracted by the guest: root never extracts a path the
 #     guest can rewrite (R1 delta B4, #1256).
@@ -94,6 +109,10 @@ SRC_UNIT=$HERE/$UNIT
 STATE=$ETC/ci-runners.state
 TOOLS=/usr/local/lib/ameesh-guest-ci
 SHIM=$TOOLS/docker
+# the single-use JIT configurations the ameesh side deposits (one file = one
+# job), per runner slot: under $ROOT, so the guest reads them and consumes
+# them; nothing else is written there by root (option A, plan §3)
+JIT_DIR=$ROOT/ci/jit
 # root-owned tools live outside the guest-writable root (R1 binome B4)
 # the gate wrapper (R1 #1256): the unit's ExecStart, installed by --prepare
 GATE_WRAPPER=$TOOLS/ci-runner-gate
@@ -101,6 +120,11 @@ GATE_WRAPPER=$TOOLS/ci-runner-gate
 GATE_STATE=/run/ameesh-gate/state/state.json
 REPO_URL=https://github.com/manaty/ameesh
 REPO_SLUG=manaty/ameesh
+# The guest's own label, and the whole point of option A (R2 B1 arbitration):
+# it is never the fleet's `ameesh-ci`, so a job addressed to the fleet can
+# never land on a lending host, and no required check may ever name it. The
+# routing rule (which jobs may target it) is in the plan, §3.
+LABEL=ameesh-lent
 VERSION=2.338.0
 # the digest published for actions/runner v2.338.0 linux-x64 (the fleet's)
 SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
@@ -108,10 +132,10 @@ URL_BASE=https://github.com/actions/runner/releases/download
 HOST=$(hostname -s)
 COUNT=2
 COUNT_SET=0
-# the prepare/register floor (MiB): the Host fiche's `reclaim.disk_free_min`
+# the prepare floor (MiB): the Host fiche's `reclaim.disk_free_min`
 # plus the runner install margin. The preflight revises it on measurement
 # (#1256: 6144 on the measured ci-3, 8.95 GiB free), never below the guard's
-# own stop threshold. --prepare records it in the state file; the later
+# own stop threshold. --prepare records it in the state file; the next
 # commands adopt it (R1 delta B5) unless the operator repeats the option.
 DISK_FLOOR_MIB=15360
 FLOOR_SET=0
@@ -121,7 +145,8 @@ KEEP=0
 PURGE=0
 DRY=0
 MODE=""
-TOKEN_FILE=""
+DEPOSIT=""
+RUNNER=""
 TARGETS=()
 # the root-private snapshot of the runner archive (R1 delta B4): a directory
 # of its own, 0700, removed on exit
@@ -135,7 +160,7 @@ BAD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host|--count|--tarball|--version|--sha256|--token-file|--wait-terminal|--disk-floor-mib)
+    --host|--count|--tarball|--version|--sha256|--wait-terminal|--disk-floor-mib|--deposit|--runner)
       [ $# -ge 2 ] || die "$1 needs a value" ;;
   esac
   case "$1" in
@@ -145,12 +170,14 @@ while [ $# -gt 0 ]; do
     --tarball) TARBALL=$2; shift 2 ;;
     --version) VERSION=$2; shift 2 ;;
     --sha256) SHA256=$2; shift 2 ;;
-    --token-file) TOKEN_FILE=$2; shift 2 ;;
+    --deposit) MODE=deposit; DEPOSIT=$2; shift 2 ;;
+    --runner) RUNNER=$2; shift 2 ;;
     --wait-terminal) WAIT=$2; shift 2 ;;
     --keep-workspaces) KEEP=1; shift ;;
     --dry-run) DRY=1; shift ;;
     --prepare) MODE=prepare; shift ;;
-    --register) MODE=register; shift ;;
+    --register) die "--register is gone (option A, R2 B1 arbitration): a lending host gets single-use JIT configurations only; mint one off this host and use --deposit FILE (plan §3/§6)" ;;
+    --token-file) die "--token-file is gone (option A): no registration token reaches a lending host; deposit a single-use JIT configuration with --deposit FILE (plan §3/§6)" ;;
     --enable) MODE=enable; shift
       while [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; do TARGETS+=("$1"); shift; done ;;
     --disable) MODE=disable; shift
@@ -161,7 +188,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown option $1 (see --help)" ;;
   esac
 done
-[ -n "$MODE" ] || die "one mode: --prepare, --register, --enable, --disable, --check, --remove"
+[ -n "$MODE" ] || die "one mode: --prepare, --deposit, --enable, --disable, --check, --remove"
 case "$COUNT" in ''|*[!0-9]*) die "invalid --count $COUNT" ;; esac
 [ "$COUNT" -ge 1 ] && [ "$COUNT" -le 4 ] || die "--count 1..4, not $COUNT"
 case "$DISK_FLOOR_MIB" in ''|*[!0-9]*) die "invalid --disk-floor-mib $DISK_FLOOR_MIB" ;; esac
@@ -173,7 +200,17 @@ case "$HOST" in ''|*[!a-z0-9-]*|-*) die "invalid --host $HOST" ;; esac
 case "$VERSION" in ''|*[!A-Za-z0-9._-]*) die "invalid --version $VERSION" ;; esac
 case "$SHA256" in ''|*[!0-9a-f]*) die "invalid --sha256 $SHA256" ;; esac
 [ ${#SHA256} = 64 ] || die "--sha256: 64 hex digits expected"
-[ "$MODE" = register ] || [ -z "$TOKEN_FILE" ] || die "--token-file goes with --register"
+if [ "$MODE" = deposit ]; then
+  [ -n "$DEPOSIT" ] || die "--deposit needs the configuration file to read"
+else
+  [ -z "$DEPOSIT" ] || die "--deposit goes with a file, as its own mode"
+fi
+case "$RUNNER" in
+  "") ;;
+  ''|*[!0-9]*) die "invalid --runner $RUNNER" ;;
+  *) [ "$RUNNER" -ge 1 ] && [ "$RUNNER" -le 4 ] || die "--runner 1..4, not $RUNNER" ;;
+esac
+[ -z "$RUNNER" ] || [ "$MODE" = deposit ] || die "--runner goes with --deposit"
 [ "$MODE" = disable ] || [ "$MODE" = remove ] || [ "$WAIT" = 0 ] \
   || die "--wait-terminal goes with --disable or --remove"
 [ "$KEEP" = 0 ] || [ "$MODE" = remove ] || die "--keep-workspaces goes with --remove"
@@ -187,7 +224,7 @@ if [ "$DRY" = 1 ] && [ -n "${CI_RUNNERS_TEST_HOST:-}" ]; then
   STATE=${CI_RUNNERS_TEST_STATE:-$HOSTDIR/etc/ameesh/ci-runners.state}
 fi
 at() { if [ -n "$HOSTDIR" ]; then echo "$HOSTDIR$1"; else echo "$1"; fi; }
-# The number of runners is the one --prepare recorded: --register, --enable,
+# The number of runners is the one --prepare recorded: --deposit, --enable,
 # --disable, --check and --remove adopt it when the operator does not repeat
 # --count (a --remove that fell back to 2 would leave r3/r4 behind). An
 # explicit --count still wins.
@@ -196,10 +233,10 @@ if [ "$COUNT_SET" = 0 ] && [ -f "$STATE" ]; then
   case "$recorded_count" in ''|*[!0-9]*) ;; *) COUNT=$recorded_count ;; esac
 fi
 # The disk floor qualified at --prepare is recorded too (R1 delta B5): on the
-# measured ci-3 the plan prepares with 6144, and --register without the option
-# used to fall back to the 15360 default and refuse the same host. An explicit
-# --disk-floor-mib still wins; a recorded value only counts if it is one this
-# script would have accepted.
+# measured ci-3 the plan prepares with 6144, and a later mode that repeated no
+# option would fall back to the 15360 default and refuse the same host. An
+# explicit --disk-floor-mib still wins; a recorded value only counts if it is
+# one this script would have accepted.
 if [ "$FLOOR_SET" = 0 ] && [ -f "$STATE" ]; then
   recorded_floor=$(awk '/^floor /{f=$2} END{print f}' "$STATE" 2>/dev/null || true)
   case "$recorded_floor" in
@@ -303,6 +340,8 @@ next, from a machine with an admin token on $REPO_SLUG (the operator, not the ho
   gh api "repos/$REPO_SLUG/actions/runners?per_page=100" --paginate \\
     -q '.runners[] | select(.name|startswith("$RUNNER_PREFIX-")) | "\(.id) \(.name)"'
   gh api -X DELETE "repos/$REPO_SLUG/actions/runners/<id>"     # once per line
+list offline entries too: a JIT configuration deposited but never run leaves a
+registration that never came online, and it is removed the same way.
 then verify: the repository's runner list is back to its pre-loan set, and
 the application's own runners are all still online (never unregistered here).
 EOF
@@ -573,6 +612,7 @@ prepare() {
   # this tree, under a root-owned chain (R1 delta B4, #1256).
   no_symlink_path ci
   no_symlink_path ci/cache
+  no_symlink_path ci/jit
   if absent "$ROOT/ci"; then
     run runuser -u "$GUEST" -- install -d -m 0700 "$(at "$ROOT/ci")"
     remember "$ROOT/ci" created
@@ -580,6 +620,10 @@ prepare() {
   if absent "$ROOT/ci/cache"; then
     run runuser -u "$GUEST" -- install -d -m 0700 "$(at "$ROOT/ci/cache")"
     remember "$ROOT/ci/cache" created
+  fi
+  if absent "$JIT_DIR"; then
+    run runuser -u "$GUEST" -- install -d -m 0700 "$(at "$JIT_DIR")"
+    remember "$JIT_DIR" created
   fi
   if absent "$TOOLS"; then
     run install -d -o root -g root -m 0755 "$(at "$TOOLS")"
@@ -639,10 +683,7 @@ SHIM
   for n in $(seq 1 "$COUNT"); do
     dir=$ROOT/ci/r$n
     no_symlink_path "ci/r$n"
-    if [ -f "$(at "$dir/.runner")" ]; then
-      say "r$n is already registered: software kept (re-run --remove first to reinstall)"
-      continue
-    fi
+    no_symlink_path "ci/jit/r$n"
     if [ -e "$(at "$dir")" ] && ! recorded "$dir"; then
       die "$dir already exists and is not this script's: move it aside first"
     fi
@@ -650,14 +691,29 @@ SHIM
       run runuser -u "$GUEST" -- install -d -m 0755 "$(at "$dir")"
       remember "$dir" created
     fi
-    # extraction sous l'invité, depuis l'instantané privé de root : un
-    # remplacement de chemin après le digest ne fait plus écrire root
-    if [ "$DRY" = 1 ]; then
-      printf 'DRY runuser -u %s -- tar -xzf - -C %s < %s (root-private snapshot)\n' \
-        "$GUEST" "$(at "$dir")" "$stage"
-    else
-      runuser -u "$GUEST" -- tar -xzf - -C "$(at "$dir")" <"$stage"
+    if absent "$JIT_DIR/r$n"; then
+      run runuser -u "$GUEST" -- install -d -m 0700 "$(at "$JIT_DIR/r$n")"
+      remember "$JIT_DIR/r$n" created
     fi
+    # The software is re-extracted only once. A `.runner`/`.credentials` left
+    # by an older, non-JIT installation is not a registration to keep: option
+    # A has no durable credential, so they are removed as the guest before
+    # anything runs (--check reports them when they survive a dead run).
+    if [ -f "$(at "$dir/config.sh")" ]; then
+      say "r$n software already present: kept (no re-extraction)"
+    else
+      # extraction sous l'invité, depuis l'instantané privé de root : un
+      # remplacement de chemin après le digest ne fait plus écrire root
+      if [ "$DRY" = 1 ]; then
+        printf 'DRY runuser -u %s -- tar -xzf - -C %s < %s (root-private snapshot)\n' \
+          "$GUEST" "$(at "$dir")" "$stage"
+      else
+        runuser -u "$GUEST" -- tar -xzf - -C "$(at "$dir")" <"$stage"
+      fi
+    fi
+    run runuser -u "$GUEST" -- rm -f \
+      "$(at "$dir")/.runner" "$(at "$dir")/.credentials" \
+      "$(at "$dir")/.credentials_rsaparams"
   done
   # publication du cache par l'invité (le cache est sous $ROOT/ci, donc à
   # lui) : les octets viennent de l'instantané vérifié, et la prochaine
@@ -680,36 +736,113 @@ SHIM
       printf 'version %s\n' "$VERSION"
       printf 'sha256 %s\n' "$SHA256"
       printf 'prefix %s\n' "$RUNNER_PREFIX"
+      printf 'label %s\n' "$LABEL"
+      printf 'model jit\n'
       printf 'application_units %s\n' "$(app_count)"
     } >>"$STATE"
   fi
-  say "prepared; next: --register --token-file FILE, then --enable, then --check"
+  say "prepared; next: --deposit FILE (one single-use JIT configuration per job), then --enable, then --check"
 }
 
-# --- register ---------------------------------------------------------------
-register() {
+# --- deposit ----------------------------------------------------------------
+# One single-use JIT configuration, minted off this host by the ameesh side
+# (bureau, admin token) and handed over here. Root reads the source file,
+# validates it and pipes the bytes to the guest's deposit directory: root
+# writes nothing under $ROOT (R1 delta B4), and no registration token is ever
+# seen by this host (option A, R2 B1 arbitration).
+deposit() {
   need_root
-  [ -n "$TOKEN_FILE" ] || die "--register needs --token-file FILE"
-  local token; token=$(cat "$(at "$TOKEN_FILE")" 2>/dev/null || true)
-  [ -n "$token" ] || die "$TOKEN_FILE is empty or unreadable"
-  local n dir
-  for n in $(seq 1 "$COUNT"); do
-    dir=$ROOT/ci/r$n
-    [ -f "$(at "$dir/config.sh")" ] || die "r$n is not prepared (--prepare --count $COUNT)"
-    if [ -f "$(at "$dir/.runner")" ]; then
-      say "r$n is already registered: skipped"
-      continue
-    fi
-    if [ "$DRY" = 1 ]; then
-      printf 'DRY runuser -u %s -- %s/config.sh --unattended --replace --url %s --token <token> --name %s-%s --labels ameesh-ci --work _work\n' \
-        "$GUEST" "$dir" "$REPO_URL" "$RUNNER_PREFIX" "$n"
-    else
-      runuser -u "$GUEST" -- "$(at "$dir")/config.sh" --unattended --replace \
-        --url "$REPO_URL" --token "$token" --name "$RUNNER_PREFIX-$n" \
-        --labels ameesh-ci --work _work
-    fi
-  done
-  say "registered; next: --enable, then a first job (qualification) and --check"
+  [ -r "$(at "$DEPOSIT")" ] || die "$DEPOSIT is unreadable"
+  local parsed n target digest
+  # validation (python3 -I: no site, no environment): strict base64 of a JSON
+  # object, safe file names, base64 values, and the repository of `.runner`
+  # when it is carried; the digest names the deposit (one file = one job)
+  parsed=$(python3 -I - "$(at "$DEPOSIT")" "$REPO_URL" <<'PYJIT'
+import base64, binascii, hashlib, json, re, sys
+
+MAX = 65536
+try:
+    with open(sys.argv[1], "rb") as fh:
+        raw = fh.read(MAX + 1)
+except OSError as exc:
+    sys.exit("unreadable: %s" % exc)
+if len(raw) > MAX:
+    sys.exit("larger than %d bytes: not a JIT configuration" % MAX)
+try:
+    # the runner's own reader (Convert.FromBase64String) ignores ASCII
+    # whitespace, and `gh api` ends the file with a newline: strip it before
+    # decoding, and digest the canonical text (same configuration, same name)
+    text = "".join(raw.decode("ascii").split())
+    doc = json.loads(base64.b64decode(text, validate=True).decode("utf-8"))
+except (UnicodeDecodeError, ValueError, binascii.Error) as exc:
+    sys.exit("not base64 of a JSON document: %s" % exc)
+if not isinstance(doc, dict) or not doc:
+    sys.exit("not a non-empty JSON object of runner files")
+files = {}
+for name, value in doc.items():
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+        sys.exit("unsafe runner file name %r" % (name,))
+    if not isinstance(value, str):
+        sys.exit("runner file %s is not base64 text" % name)
+    try:
+        files[name] = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        sys.exit("runner file %s is not base64: %s" % (name, exc))
+
+
+def normalize(url):
+    url = (url or "").strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        return url
+    host, _, path = rest.partition("/")
+    return "%s://%s/%s" % (scheme.lower(), host.lower(), path)
+
+
+name = ""
+if ".runner" in files:
+    try:
+        settings = json.loads(files[".runner"].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        sys.exit("its .runner is not JSON: %s" % exc)
+    if normalize(settings.get("gitHubUrl")) != normalize(sys.argv[2]):
+        sys.exit("its .runner names %r, not %s" % (settings.get("gitHubUrl"), sys.argv[2]))
+    name = settings.get("agentName") or ""
+print("%s %s" % (hashlib.sha256(text.encode("ascii")).hexdigest()[:16], name))
+PYJIT
+) || die "$DEPOSIT is not a usable single-use JIT configuration (nothing deposited)"
+  digest=${parsed%% *}
+  name=${parsed#* }
+  # the configuration names the runner; the slot it belongs to follows, so the
+  # job's directory and `_work` match the registration GitHub removes
+  if [ -n "$name" ]; then
+    case "$name" in
+      "$RUNNER_PREFIX"-[1-4]) n=${name##*-} ;;
+      *) die "$DEPOSIT names runner '$name', not $RUNNER_PREFIX-<slot>" ;;
+    esac
+    [ -z "$RUNNER" ] || [ "$RUNNER" = "$n" ] \
+      || die "$DEPOSIT names slot $n, not --runner $RUNNER"
+  else
+    [ -n "$RUNNER" ] || die "$DEPOSIT does not name its runner: pass --runner N"
+    n=$RUNNER
+  fi
+  [ "$n" -le "$COUNT" ] \
+    || die "$DEPOSIT is for runner $n, beyond the $COUNT prepared (--prepare --count $n first)"
+  target=$JIT_DIR/r$n/jit-$digest.b64
+  [ -d "$(at "$JIT_DIR/r$n")" ] || die "$(at "$JIT_DIR/r$n") is missing: run --prepare first"
+  if [ -e "$(at "$target")" ]; then
+    die "$target is already deposited: one configuration is one job, deposit a fresh one"
+  fi
+  if [ "$DRY" = 1 ]; then
+    printf 'DRY runuser -u %s -- sh -c %s < %s (single-use JIT configuration %s for r%s)\n' \
+      "$GUEST" "'cat >$target'" "$(at "$DEPOSIT")" "$digest" "$n"
+  else
+    runuser -u "$GUEST" -- sh -c 'umask 077; cat >"$1"' sh "$(at "$target")" <"$(at "$DEPOSIT")"
+  fi
+  say "deposited: r$n, one job, then the runner is removed by GitHub (digest $digest)"
+  say "next: --enable $n when the guard enforces, then --check"
 }
 
 # --- enable / disable -------------------------------------------------------
@@ -728,9 +861,18 @@ enable() {
   local n
   for n in $(targets); do
     case "$n" in ''|*[!0-9]*) die "invalid runner $n" ;; esac
-    [ -f "$(at "$ROOT/ci/r$n/.runner")" ] || die "r$n is not registered"
-    run systemctl enable --now "ameesh-guest-ci@$n.service"
+    # option A : un démarrage = un job, et un job = une configuration à usage
+    # unique déposée. Sans dépôt, l'unité n'aurait rien à consommer : refus,
+    # pas un écouteur persistant qui attendrait un jeton.
+    if ! compgen -G "$(at "$JIT_DIR/r$n")/*.b64" >/dev/null; then
+      die "r$n has no deposited JIT configuration: --deposit FILE first (one job per configuration)"
+    fi
+    # `start`, pas `enable --now` : un job à usage unique ne se ré-arme pas au
+    # démarrage de l'hôte ; le prochain job demande un nouveau dépôt et un
+    # nouveau --enable (plan §6)
+    run systemctl start "ameesh-guest-ci@$n.service"
   done
+  say "armed: each unit runs at most one job, then stops (deposit a fresh configuration to re-arm it)"
 }
 disable() {
   need_root
@@ -783,7 +925,7 @@ check() {
   fi
   say "shim: $SHIM"
   [ -x "$(at "$SHIM")" ] || ko "$SHIM is missing or not executable"
-  say "runners"
+  say "runners (single-use JIT, label $LABEL, never the fleet's ameesh-ci)"
   local n active_runners=0
   for n in $(seq 1 "$COUNT"); do
     local dir=$ROOT/ci/r$n
@@ -791,38 +933,25 @@ check() {
     state=$(unit_state "$n" ActiveState); enabled=$(unit_state "$n" UnitFileState)
     printf 'r%s: unit=%s/%s dir=%s\n' "$n" "${state:-?}" "${enabled:-?}" "$dir"
     [ "$state" = active ] && active_runners=$((active_runners + 1)) || true
-    if [ -f "$(at "$dir/.runner")" ]; then
-      # C1 (R1 amont #1256) : `config.sh --url` est relu dans `gitHubUrl`
-      # (ConfigurationManager.cs : GitHubUrl=inputUrl, ServerUrl=TenantUrl) ;
-      # `serverUrl` ne nomme que le transport Actions et reste affiché.
-      python3 -I - "$(at "$dir/.runner")" "$REPO_URL" <<'PY' \
-        || ko "r$n: .runner unreadable or registered on another repository"
-import json, sys
-
-
-def normalize(url):
-    url = (url or "").strip().rstrip("/")
-    if url.endswith(".git"):
-        url = url[:-4]
-    scheme, sep, rest = url.partition("://")
-    if not sep:
-        return url
-    host, _, path = rest.partition("/")
-    return "%s://%s/%s" % (scheme.lower(), host.lower(), path)
-
-
-d = json.load(open(sys.argv[1]))
-print("  name=%s repo=%s server=%s"
-      % (d.get("agentName"), d.get("gitHubUrl"), d.get("serverUrl")))
-sys.exit(0 if normalize(d.get("gitHubUrl")) == normalize(sys.argv[2]) else 1)
-PY
-      [ -f "$(at "$dir/.credentials")" ] && printf '  credentials: %s\n' \
-        "$(stat -c '%a %U:%G' "$(at "$dir/.credentials")" 2>/dev/null || echo '?')" \
-        || ko "r$n: .credentials is missing"
-    else
-      ko "r$n: not registered"
+    local pending
+    pending=$(compgen -G "$(at "$JIT_DIR/r$n")/*.b64" 2>/dev/null | wc -l || true)
+    printf '  deposited configurations: %s (one job each)\n' "${pending:-0}"
+    # option A (R2 B1 arbitration): the runner writes `.runner`/`.credentials`
+    # from its JIT configuration for the length of one job, and the wrapper
+    # removes them before and after it. Left behind while no unit runs, they
+    # are the durable credential of the old persistent registration, which a
+    # root-equivalent application job on this host could read and reuse.
+    if [ "$state" != active ]; then
+      for leftover in .runner .credentials .credentials_rsaparams; do
+        if [ -e "$(at "$dir/$leftover")" ]; then
+          ko "r$n: $leftover is left on disk while no unit runs (JIT credentials live for one job only)"
+        fi
+      done
     fi
-    [ "$state" = active ] || echo "note: r$n is not active (enabled=$enabled)"
+    if [ ! -f "$(at "$dir/config.sh")" ]; then
+      ko "r$n: not prepared (no config.sh under $dir)"
+    fi
+    [ "$state" = active ] || echo "note: r$n is not active ($enabled): a job for $LABEL waits for a deposit and --enable"
   done
   say "application untouched"
   local now; now=$(app_count)
@@ -945,6 +1074,10 @@ remove() {
   [ "$KEEP" = 1 ] && [ ${#kept[@]} -gt 0 ] && say "kept (--keep-workspaces): ${kept[*]}"
   if [ "$KEEP" = 0 ]; then
     recorded "$ROOT/ci/cache" && run runuser -u "$GUEST" -- rm -rf "$(at "$ROOT/ci/cache")"
+    # the deposited single-use configurations go with the loan: they are
+    # credentials for `manaty/ameesh`, and the operator's forge-side step
+    # below removes the registrations they created (offline ones included)
+    recorded "$JIT_DIR" && run runuser -u "$GUEST" -- rm -rf "$(at "$JIT_DIR")"
     recorded "$ROOT/ci" && run runuser -u "$GUEST" -- rmdir --ignore-fail-on-non-empty "$(at "$ROOT/ci")" || true
   fi
   recorded "$SHIM" && run rm -f "$(at "$SHIM")"
@@ -961,7 +1094,7 @@ remove() {
 
 case "$MODE" in
   prepare) preconditions; prepare ;;
-  register) preconditions; register ;;
+  deposit) preconditions; deposit ;;
   enable) enable ;;
   disable) disable ;;
   check) check ;;

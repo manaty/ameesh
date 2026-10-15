@@ -31,9 +31,20 @@ permissions:
 # organisation. A pull request from a fork never reaches that host (the
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
+#
+# Borrowed capacity (lot #1256, option A of the R2 B1 arbitration): a lending
+# host runs SINGLE-USE runners under the DISTINCT label `ameesh-lent`, never
+# `ameesh-ci`, so no job of the fleet — in particular the required check
+# `tests` of tests.yml and everything it needs — can land there. This job is
+# not a required check (branch protection requires `tests` only), is not
+# needed by it, holds no write permission and feeds nothing the required path
+# reads, so it may target the borrowed label when a loan is armed; the
+# admissible list and the residual risk are in deploy/guest/PILOT-ci-nexlink.md
+# §3. `vars.AMEESH_LENT_RUNS_ON` is unset outside a loan, and the job stays on
+# the fleet.
 jobs:
   ui:
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     defaults:
       run:
