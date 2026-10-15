@@ -655,7 +655,7 @@ class MapTest(unittest.TestCase):
                     self.assertEqual(p["selection"]["mode"], "full")
                     self.assertIn("release/**", p["selection"]["why"])
                     self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
                         sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
@@ -683,7 +683,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("release/**", release["selection"]["why"])
         self.assertNotEqual(release["parts"]["psycopg"], [])
         self.assertEqual(plan.outputs(release)["code"], "true")
-        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [9] * 9)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -1311,10 +1311,10 @@ class PlanTest(unittest.TestCase):
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         out = plan.outputs(p)
         self.assertEqual(json.loads(out["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(out["psql_parts"], "6")
+        self.assertEqual(out["psql_parts"], "9")
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
@@ -1337,7 +1337,9 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+        # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
+        # de lot reste à trois (n_pr), inchangé.
+        self.assertEqual(plan.PARTS["psql"][1], 9)
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -1413,8 +1415,8 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
         # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 6 parts), pas seulement la CI de release.
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        # (psql en 9 parts depuis #1692), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -1596,7 +1598,7 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
                 self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
                 self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                 self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
@@ -1623,7 +1625,7 @@ class LotBranchTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
