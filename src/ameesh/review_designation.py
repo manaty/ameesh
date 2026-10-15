@@ -29,8 +29,10 @@ Idempotence : la désignation est liée au **jalon `frozen`** (son identifiant e
 son SHA exact), pas au lot. Un même gel rejoué rend la désignation déjà
 enregistrée sans renvoyer de courrier ; un gel nouveau (nouveau jalon, nouveau
 SHA) est un autre objet, donc une nouvelle désignation — l'ancienne ne compte
-plus. Le `Port` refuse d'écrire pour un gel qui n'est plus le dernier : aucun
-retour à une ancienne tête.
+plus. Une désignation est **finale** pour son gel ; une attente est un marqueur
+**réessayable** (une notification par gel, la désignation la remplace si la
+capacité ou la preuve revient). Le `Port` refuse d'écrire pour un gel qui n'est
+plus le dernier : aucun retour à une ancienne tête.
 """
 from __future__ import annotations
 
@@ -367,26 +369,26 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
 
 def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
                      why: str, families: str = "") -> str:
-    """La notification de capacité : aucun relecteur indépendant disponible.
+    """La notification d'attente : aucun relecteur indépendant désignable.
 
-    Elle dit ce qui manque et ne demande aucune admission : le lot reste en
-    attente du nombre d'avis requis, et la capacité doit être rétablie
-    (relecteur d'une autre famille remis au registre, budget, hôte).
+    Elle dit ce qui manque — capacité de relecture ou preuve d'auteur — et ne
+    demande aucune admission : le lot reste en attente du nombre d'avis requis.
     """
     row = dict(lot or {})
     return "\n".join([
-        "Désignation au gel impossible (canon §2, #1617) — capacité de relecture.",
+        "Désignation au gel impossible (canon §2, #1617) — relecture en attente.",
         "",
         "Lot : #%s « %s »" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
         "- Gel : jalon frozen #%s, tête %s." % ((freeze or {}).get("id"),
                                                 str((freeze or {}).get("sha") or "")[:12]),
-        "- Avis requis : %d ; familles indépendantes manquantes : %d." % (required, missing),
+        "- Avis requis : %d ; manquants : %d." % (required, missing),
         "- Motif : %s" % why,
     ] + (["- Familles disponibles : %s." % families] if families else []) + [
         "",
         "Aucune admission implicite : le lot reste en attente de ses avis. Rétablir "
-        "la capacité (une autre famille de modèle au registre, un relecteur "
-        "disponible) puis relancer la désignation.",
+        "la capacité ou la preuve manquante (une autre famille de modèle au "
+        "registre, un relecteur disponible, la provenance exacte des commits) puis "
+        "relancer la désignation.",
     ])
 
 
@@ -406,6 +408,12 @@ class Port(Protocol):
     rien écrire (aucun retour à une ancienne tête) —, recontrôle la marque
     idempotente du gel (un appel concurrent rend la désignation du gagnant,
     sans second courrier) et dépose les courriers dans la même transaction.
+
+    Une **désignation est finale** pour son gel : rejouée, elle rend la même
+    chose sans second courrier. Une **attente** est un marqueur réessayable :
+    une notification par gel, et si la capacité revient (ou la preuve
+    d'auteur), la désignation remplace le marqueur pour le même gel — les
+    courriers aux relecteurs ne partent qu'alors, une seule fois.
     """
 
     def latest_freeze(self, lot: int) -> Optional[dict]:
@@ -424,7 +432,7 @@ class Port(Protocol):
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
-          families=KNOWN_FAMILIES) -> dict:
+          unknown_authors: Iterable = (), families=KNOWN_FAMILIES) -> dict:
     """Désigne les relecteurs du dernier gel du lot, ou dit pourquoi il attend.
 
     `policy` porte les règles déjà analysées (`Rule` ou déclaration
@@ -433,6 +441,11 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     aucun avis requis est un refus, jamais un zéro silencieux. `port` fait
     l'écriture (voir `Port`). Rend la désignation : `{state, required,
     reviewers, missing, why, freeze}` avec `replayed` quand elle existait déjà.
+
+    `unknown_authors` nomme les commits du gel dont la provenance exacte
+    (#1465) est inconnue : sans elle, l'indépendance d'un relecteur ne peut pas
+    être établie, donc la désignation attend au lieu de deviner — un état
+    explicite, jamais un repli.
 
     Le gel est relu à chaque essai : si le `Port` refuse un gel devenu périmé
     (`StaleFreeze`, rien n'a été écrit), la désignation repart sur le nouveau
@@ -449,6 +462,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     for author in authors:
         if not isinstance(author, Mapping) or not str(author.get("name") or "").strip():
             raise DesignationError("an author is {name, family}, not %r" % (author,))
+    unknown = [str(value) for value in (unknown_authors or ()) if str(value).strip()]
     last = None
     for _attempt in range(FREEZE_ATTEMPTS):
         freeze = port.latest_freeze(lot)
@@ -467,12 +481,27 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             return {"state": NONE, "required": 0, "reviewers": [], "missing": 0,
                     "why": "light lot: no review before merge", "freeze": freeze}
         existing = port.recorded(lot, freeze["id"])
-        if existing:
+        if existing and existing.get("state") == DESIGNATED:
             out = dict(existing)
             out["replayed"] = True
             return out
-        selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families)
+        if unknown:
+            # Une preuve d'auteur manquante interdit de prouver l'indépendance :
+            # attente explicite, notification, aucun relecteur désigné.
+            why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
+                   % (len(unknown), ", ".join(unknown[:5])))
+            selection = {"state": WAITING, "required": required, "reviewers": [],
+                         "missing": required, "why": why}
+        else:
+            selection = select(required=required, authors=authors, candidates=candidates,
+                               families=families)
+        if selection["state"] == WAITING and existing:
+            # L'attente de ce gel est déjà enregistrée et notifiée : on n'en
+            # renvoie pas une seconde, mais la sélection a été retentée — si la
+            # capacité est revenue, la branche ci-dessous désigne enfin.
+            out = dict(existing)
+            out["replayed"] = True
+            return out
         state = selection["state"]
         messages = []
         if state == DESIGNATED:

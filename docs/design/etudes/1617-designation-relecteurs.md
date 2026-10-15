@@ -70,39 +70,58 @@ l'ancienne ne compte plus. Aucun retour à une ancienne tête n'est possible :
 le gel est relu sous verrou, et un SHA qui n'est pas un identifiant de commit
 est refusé.
 
+Une désignation est **finale** pour son gel ; une attente est un **marqueur
+réessayable** : une notification par gel, et si la capacité revient — ou si la
+preuve d'auteur arrive — la désignation remplace le marqueur pour le même gel,
+les courriers aux relecteurs ne partant qu'alors, une seule fois. Une
+provenance d'auteur inconnue (#1465 manquant pour un commit du gel) ne se
+devine pas : la désignation passe en attente avec une notification, jamais un
+relecteur choisi au hasard.
+
 Ce qui doit venir de l'extérieur, et de qui :
 
 - **règles et familles** : de la compilation canon de #1616 (ou du lecteur
   `train_policy.Versioned` de #1467 en attendant) ; le repli local
   (`claude`, `codex`, `deepseek`, mêmes valeurs que `train_review.FAMILIES`)
   est un paramètre `families`, pas une constante de politique ;
-- **required, base, tête exacte, classe** : du `Requirement` déjà calculé par
-  #1467 (`train_policy.Versioned`) ;
+- **required, base, tête exacte, classe, commit de canon** : de l'adaptateur
+  au gel, à partir du `Requirement` déjà calculé par #1467
+  (`train_policy.Versioned`) — cx3 a confirmé le 15/10 que le runner de #1467
+  ne voit pas le gel à l'écriture et que le raccord se fait par un hook étroit
+  au gel, pas dans `train*` ;
 - **auteurs et correcteurs** : des reçus exacts de #1465
   (`review_provenance.receipt_for_commit`), jamais d'une note ou d'une
-  assignation ; l'assigné du lot reste un auteur au minimum.
+  assignation ; l'assigné du lot reste un auteur au minimum. La collecte doit
+  fonctionner **avant tout verdict** : `train_review.qualify` attend les avis
+  et n'est pas appelable ici. Une preuve manquante est passée en
+  `unknown_authors` (attente), jamais ignorée.
 
 ## Le hook (non branché)
 
-Le point d'appel naturel est l'écriture du jalon `frozen`
-(`work.milestone(..., "frozen", sha=…)`, déjà sous le verrou de la ligne du
-lot) ou l'étape de gel du runner de #1467, dans la **même transaction** que le
-jalon. Le port Postgres sera écrit avec l'accord de #1616 et #1467 ; il
-n'écrit ni `work.py` ni `review_lot.py` ni les modules `train*` sans cet
-accord. La CLI (`ameesh work reviewers <lot>` ou équivalent) viendra au même
-moment.
+Point d'accord avec cx3 (#1467, 15/10 10:21) : un hook **étroit** sur
+`work.milestone(kind=frozen)`, sans modifier les modules `train*` ni coder de
+politique en dur. L'écriture du jalon tient déjà le verrou de la ligne du lot
+(`storage.postgres.work.add_milestone`) ; le raccord doit faire tenir dans la
+**même transaction** la marque idempotente, les courriers et le journal, le
+fil lisible étant écrit après le commit (`mail.send(..., after_commit=…)`).
+La signature du `Port` ci-dessus est la surface à qualifier avec #1616
+(adaptateur canon) et #1467 (point d'appel) ; ni `work.py` ni `review_lot.py`
+ni `train*` ne sont touchés avant cet accord. La CLI
+(`ameesh work reviewers <lot>` ou équivalent) viendra au même moment.
 
 ## Vérification
 
-`tests/test_1617_review_designation.py` — 26 tests ciblés, sans base :
+`tests/test_1617_review_designation.py` — 28 tests ciblés, sans base :
 maximum des règles par chemin et zéro du léger ; deux familles SQL/sécurité/prod
 distinctes et hors auteur ; correcteur devenu auteur écarté (nom et famille) ;
 famille lue sur la session et non sur le nom ; indisponibilité et charge ;
-attente explicite notifiée une fois ; politique Nexlink (deux avis `supabase`,
-un par défaut) ; même gel rejoué = un seul courrier ; nouveau gel = nouvelle
-désignation sans retour à l'ancienne tête ; gel qui bouge pendant l'écriture =
-reprise sur la nouvelle tête, trois mouvements = échec sans boucle ; tête
-invalide ou non gelée refusée.
+attente explicite notifiée une fois ; provenance d'auteur inconnue = attente,
+puis désignation quand la preuve arrive ; capacité revenue = désignation sur le
+même gel ; politique Nexlink (deux avis `supabase`, un par défaut) ; même gel
+rejoué = un seul courrier ; nouveau gel = nouvelle désignation sans retour à
+l'ancienne tête ; gel qui bouge pendant l'écriture = reprise sur la nouvelle
+tête, trois mouvements = échec sans boucle ; tête invalide ou non gelée
+refusée.
 
 ## Reste avant activation
 
