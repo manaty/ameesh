@@ -154,6 +154,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .provenance import Provenance
 from .work_dependencies import WorkDependencies
 
 import abc
@@ -3016,6 +3017,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    provenance: Provenance
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions

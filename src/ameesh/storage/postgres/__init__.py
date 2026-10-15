@@ -33,6 +33,7 @@ from .packages import WorkPackages
 from .placement import Placements
 from .progress import Progress
 from .projects import Projects
+from .provenance import Provenance
 from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
@@ -67,6 +68,7 @@ class PostgresStorage(interface.Storage):
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
         self.work_dependencies = WorkDependencies(db)
+        self.provenance = Provenance(db)
         self.lot_sessions = LotSessions(db)
         self.packages = WorkPackages(db)
         self.actions = Actions(db)
