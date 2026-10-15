@@ -152,6 +152,25 @@ class RecordedReviewsTest(HistoricalReviewsTest):
         return qualify_recorded(self.db, HEAD, self.commits, self.marks,
                                 required=required, provider=self.provider)
 
+    def test_compiled_family_declaration_and_independence_reach_recorded_validator(self):
+        def check(**rules):
+            return qualify_recorded(self.db, HEAD, self.commits, self.marks,
+                                    required=2, provider=self.provider, **rules)
+        with self.assertRaisesRegex(TrainError, "missing independent"):
+            check(families=("codex", "claude"))
+        self.add(3, "reviewer-three", "claude")
+        proof = check(families=("codex", "claude"), distinct_families=False)
+        self.assertEqual(proof["coverage"][FIRST], ["milestone:1", "milestone:3"])
+        self.add(4, "same-author-family", "codex")
+        with self.assertRaisesRegex(TrainError, "missing independent"):
+            check(families=("codex",))
+        # A declared family change still never permits the author's actor
+        # or session to approve their own content.
+        for sha in self.commits:
+            self.receipts["commit:" + sha] = author(sha, "author", "claude")
+        proof = check(families=("codex", "claude"), exclude_author_family=False)
+        self.assertEqual(len(proof["coverage"][FIRST]), 2)
+
     def test_abbreviated_mark_keeps_original_facts_and_complete_commit(self):
         self.marks[0]["sha"] = HEAD[:12]
         receipt = self.receipts["milestone:1"]

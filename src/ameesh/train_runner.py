@@ -9,6 +9,7 @@ only its fencing epoch survives between calls, never a closed connection.
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 from . import (merge_queue, radar, resolutions, train, train_admissions,
                train_ci, train_fire, train_git, train_history, train_policy,
@@ -17,7 +18,7 @@ from . import (merge_queue, radar, resolutions, train, train_admissions,
 
 class Passage:
     def __init__(self, cfg, project, *, owner, policy, policy_path,
-                 policy_commit, workflows, provider, notify):
+                 policy_commit, workflows, provider, mechanics, notify):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
@@ -25,6 +26,7 @@ class Passage:
         self.cfg, self.project, self.owner = cfg, project, owner
         self.policy, self.policy_path, self.policy_commit = policy, policy_path, policy_commit
         self.workflows, self.provider, self.notify = workflows, provider, notify
+        self.mechanics = mechanics
         self.epoch = None
 
     def runtime(self, db):
@@ -37,10 +39,23 @@ class Passage:
             raise train.TrainError("qualified exact provenance provider required")
         if self.policy.ci_mode != "packet":
             raise train.TrainError("runner passage requires packet CI; no lot CI adapter installed")
+        if not self.policy.build_beta:
+            raise train.TrainError("runner passage requires compiled canon cutoffs")
         target = merge_queue._remote_branch(self.project.target)
         if not target:
             raise train.TrainError("explicit project target required for runner passage")
-        requirement = train_policy.Versioned(self.policy_path, self.policy_commit, self.project.name)
+        if self.mechanics is None:
+            raise train.TrainError("explicit compiled canon mechanics provider required")
+        try:
+            rules = self.mechanics.load(self.policy_path, self.policy_commit, self.project.name)
+        except self.mechanics.MechanicsError as exc:
+            raise train.TrainError("cannot load compiled canon mechanics: %s" % exc) from exc
+        if (rules.commit, rules.project) != (self.policy_commit, self.project.name):
+            raise train.TrainError("compiled mechanics belongs to another commit or project")
+        if rules.ci_packet != "full":
+            raise train.TrainError("train requires full packet CI in the compiled canon")
+        policy = replace(self.policy, schedule=rules)
+        requirement = train_policy.Compiled(rules)
         ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows)
         source = merge_queue.source_of(self.project.repo)
         # The radar, another target, and another runner may all replay merges
@@ -50,11 +65,11 @@ class Passage:
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         repository = train_git.Repository(self.project, clone)
         ledger = train_store.Ledger(db, self.project, target, self.owner)
-        history = train_history.Recorded(db, clone.path, provider=self.provider)
+        history = train_history.Recorded(db, clone.path, provider=self.provider, review_rules=rules)
         admissions = train_admissions.Admissions(db, self.project, history, policy=requirement)
         return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
             fires=train_fire.Fires(self.cfg, ledger), admissions=admissions,
-            target=target, policy=self.policy, notify=self.notify)
+            target=target, policy=policy, notify=self.notify)
 
     def step(self, db, now):
         """One bounded event/pass; never wait for CI and never retain ``db``."""
@@ -62,7 +77,7 @@ class Passage:
             return {"result": "off"}
         runtime = self.runtime(db)
         engine = train.Engine(runtime, source=runtime.repository.source,
-                              target=runtime.target_branch, policy=self.policy)
+                              target=runtime.target_branch, policy=runtime.policy)
         engine.epoch = self.epoch
         try:
             return engine.step(now)

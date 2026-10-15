@@ -94,6 +94,12 @@ class Versioned:
             review.classify(self.policy, paths)  # validates every Git path
         except (canon.GitError, review.ReviewError) as exc:
             raise TrainError("cannot classify exact lot content: %s" % exc) from exc
+        risk, reviews = self._need(paths)
+        requirement = Requirement(row["work_item_id"], base, head, risk, reviews, self.commit)
+        requirement.check(row, base)
+        return requirement
+
+    def _need(self, paths):
         risk, reviews = "light", 0
         for changed in paths:
             cls, _ = self.policy.class_of(changed)
@@ -106,6 +112,26 @@ class Versioned:
             if review.RANK[cls] > review.RANK[risk]:
                 risk = cls
             reviews = max(reviews, count)
-        requirement = Requirement(row["work_item_id"], base, head, risk, reviews, self.commit)
-        requirement.check(row, base)
-        return requirement
+        return risk, reviews
+
+
+class Compiled(Versioned):
+    """Use #1616's compiled object; never parse a second policy or fall back.
+
+    Git range, project, release and exact-subject checks remain shared with
+    the standalone reader. Classification/counts belong to mechanics alone.
+    """
+
+    def __init__(self, rules):
+        if rules.schema != "ameesh-mechanics/1" or not SHA.fullmatch(rules.commit):
+            raise TrainError("exact compiled canon mechanics required")
+        self.mechanics = rules
+        self.commit, self.project = rules.commit, rules.project
+        self.policy = rules.review_policy
+
+    def _need(self, paths):
+        try:
+            need = self.mechanics.reviews_for(paths)
+        except (canon.CanonError, review.ReviewError) as exc:
+            raise TrainError("cannot classify compiled canon policy: %s" % exc) from exc
+        return need.risk, need.reviews

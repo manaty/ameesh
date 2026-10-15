@@ -41,6 +41,9 @@ class Policy:
     # No implicit extra CI for the packet-replaces-lot-CI rule (canon §12).
     ci_mode: str = "packet"
     max_failures: int = 8
+    # The installed passage supplies the compiled canon calendar (#1616).
+    # None retains the standalone, uninstalled engine's legacy calendar.
+    schedule: object | None = None
 
     def __post_init__(self):
         if self.ci_mode not in ("packet", "targeted"):
@@ -49,6 +52,9 @@ class Policy:
             raise ValueError("build/beta requires packet CI without per-lot CI")
         if self.interval_s <= 0 or self.threshold <= 0 or self.max_failures <= 0:
             raise ValueError("positive train limits expected")
+
+    def cutoff(self, now):
+        return self.schedule.cutoff(now) if self.schedule is not None else cutoff(now)
 
 
 def digest(value) -> str:
@@ -104,7 +110,7 @@ def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0
     if not rows:
         return False
     if policy.build_beta:
-        slot = cutoff(now)
+        slot = policy.cutoff(now)
         return last_started < slot and any(float(r["queued_ts"]) <= slot for r in rows)
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
@@ -225,7 +231,7 @@ class Engine:
                 if self.policy.build_beta:
                     # A late admission belongs to the next packet, even if
                     # this cutoff was empty or the executor has restarted.
-                    slot = cutoff(now)
+                    slot = self.policy.cutoff(now)
                     rows = [r for r in rows if float(r["queued_ts"]) <= slot]
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,

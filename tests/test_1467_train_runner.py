@@ -8,15 +8,32 @@ import json
 import os
 import subprocess
 import tempfile
-import time
 import types
+from datetime import datetime
 from unittest import mock
 
 from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_runner, work)
+                    train_policy, train_runner, work)
 
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
+
+
+class FixtureMechanics(train_policy.Versioned):
+    """Explicit #1616 boundary fixture; integration probes use the real loader."""
+    schema = "ameesh-mechanics/1"
+    ci_packet = "full"
+    families = ("codex", "claude", "deepseek")
+    exclude_author_family = distinct_families = True
+    cutoff = staticmethod(train.cutoff)
+
+    @property
+    def review_policy(self):
+        return self.policy
+
+    def reviews_for(self, paths):
+        risk, count = self._need(paths)
+        return types.SimpleNamespace(risk=risk, reviews=count)
 
 
 class TrainRunnerTest(PgTestCase):
@@ -74,8 +91,12 @@ class TrainRunnerTest(PgTestCase):
         self.provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: self.receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: self.receipts.get("milestone:%d" % mid))
+        self.mechanics = types.SimpleNamespace(MechanicsError=train.TrainError,
+            load=mock.Mock(side_effect=FixtureMechanics))
         self.notices, self.api_calls = [], []
-        self.key, self.now = self.project.name + ":main", time.time()
+        self.key = self.project.name + ":main"
+        self.now = datetime.fromisoformat("2026-10-15T11:00:00+02:00").timestamp()
+        self.db.execute("UPDATE merge_queue SET queued_at=to_timestamp(%s)", [self.now - 3600])
         api = mock.patch.object(train_ci.GitHub, "_api", side_effect=self.api)
         api.start()
         self.addCleanup(api.stop)
@@ -97,9 +118,10 @@ class TrainRunnerTest(PgTestCase):
 
     def passage(self, **kw):
         return train_runner.Passage(**dict(dict(cfg=self.cfg, project=self.project, owner="runner-a",
-            policy=train.Policy(enabled=True, build_beta=False, threshold=1),
+            policy=train.Policy(enabled=True),
             policy_path=self.publisher, policy_commit=self.base, workflows=self.workflows,
-            provider=self.provider, notify=lambda reason, state: self.notices.append(reason)), **kw))
+            provider=self.provider, mechanics=self.mechanics,
+            notify=lambda reason, state: self.notices.append(reason)), **kw))
 
     def api(self, path):
         self.api_calls.append(path)
@@ -166,9 +188,56 @@ class TrainRunnerTest(PgTestCase):
 
     def test_provider_and_ci_contract_are_required_before_reserving_target(self):
         for overrides, message in ((dict(provider=None), "provenance provider"),
+                                   (dict(mechanics=None), "mechanics provider"),
+                                   (dict(policy=train.Policy(enabled=True, build_beta=False)), "canon cutoffs"),
                                    (dict(workflows=()), "complete required workflow"),
                                    (dict(policy_commit="HEAD"), "exact audited canon commit")):
             with self.subTest(overrides=overrides), self.assertRaisesRegex(
                     (train.TrainError, ValueError), message):
                 self.passage(**overrides).step(self.db, self.now)
         self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
+
+    def test_compiled_calendar_controls_admission_cutoff_and_survives_restart(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        # The calendar is a trusted compiled port. Choosing times relative
+        # to the actual queue timestamp keeps this independent of wall time.
+        queued = self.ops.queue(None)[0]["queued_ts"]
+        rules.cutoff = lambda now: queued - 1 if now < queued + 100 else queued + 100
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage(policy=train.Policy(enabled=True))
+        self.assertEqual(passage.step(self.db, queued + 50)["result"], "idle")
+        self.assertEqual(self.api_calls, [])
+        result = passage.step(self.db, queued + 100)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual(result["plan"]["proof"]["members"][0]["policy"]["policy_commit"], self.base)
+        self.assertEqual(passage.step(self.db, queued + 101)["result"], "awaiting-fire")
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+        self.mechanics.load.assert_called_with(self.publisher, self.base, self.project.name)
+
+    def test_missing_invalid_or_incompatible_compiled_policy_refuses_before_effect(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        self.mechanics.load.side_effect = train.TrainError("mechanics absent")
+        with self.assertRaisesRegex(train.TrainError, "mechanics absent"):
+            self.passage().step(self.db, self.now)
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        for fields in (dict(ci_packet="impacted"), dict(ci_packet="none"),
+                       dict(commit="a" * 40), dict(project="other")):
+            modified = types.SimpleNamespace(**dict(vars(rules), **fields))
+            self.mechanics.load.return_value = modified
+            with self.subTest(fields=fields), self.assertRaises(train.TrainError):
+                self.passage().step(self.db, self.now)
+        self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
+        self.assertEqual(self.api_calls, [])
+        self.assertFalse(os.path.exists(self.cfg.state_dir))
+
+    def test_compiled_families_are_used_by_real_historical_admission(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.families = ("codex", "claude")
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        result = self.passage().step(self.db, self.now)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertIn("missing independent", result["error"])
+        self.assertEqual(self.api_calls, [])

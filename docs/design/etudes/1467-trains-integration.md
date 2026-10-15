@@ -267,6 +267,24 @@ qualification récupère d'abord les branches exactes dans ce clone : un dépôt
 ne connaissant que la cible peut ainsi lire l'historique des lots. Aucun
 profil ni point d'appel du runner actif n'est installé par ce module.
 
+Raccord #1616 (contrat impl07 du 15 octobre à 12:43, corrigé à
+`ddf1091d3a47c89ca8dcc1c445221af37d828b35`) : le constructeur exige aussi
+le fournisseur explicite `mechanics`, et appelle
+`mechanics.load(policy_path, policy_commit, project.name)` à chaque passage.
+Il refuse le mode par intervalle et toute CI canon autre que `full`.
+Le même objet compilé fournit `Policy.schedule.cutoff`,
+`train_policy.Compiled.reviews_for` et les familles/règles d'indépendance de
+`train_history.Recorded`. Le lecteur autonome `Versioned` reste disponible
+pour les appels de préparation ; le passage ne s'y replie jamais. Une règle
+absente ou invalide refuse avant toute réservation ou publication.
+
+Le branchement du callback de gel dans `work.py` et le stockage appartient
+à impl02/#1617 (coordination cx3 du 15 octobre vers 12:47) ; #1467 ne touche
+pas ces hooks. Aucun paramètre canon, fournisseur ou profil actif n'est
+sélectionné par ce raccord. Le témoin interbranches reproductible est
+`reviews/1467-mechanics-port/probe.py` : il charge uniquement l'objet
+`mechanics.py` au commit fournisseur complet, sans fusionner sa branche.
+
 Cinq témoins de ce passage passent avec psql et psycopg ; la passe psycopg
 inclut aussi les treize gardes du runtime (18 tests verts). Git et SQL sont
 réels et jetables, CI et fournisseur de reçus sont simulés explicitement.

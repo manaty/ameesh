@@ -12,10 +12,11 @@ from .train import TrainError, identity
 
 
 class Recorded:
-    def __init__(self, db, path, *, provider):
+    def __init__(self, db, path, *, provider, review_rules=None):
         if provider is None:
             raise TrainError("trusted exact provenance provider required")
         self.db, self.path, self.provider = db, path, provider
+        self.review_rules = review_rules
 
     def _git(self, *args):
         proc = resolutions._run(self.path, *args)
@@ -46,7 +47,11 @@ class Recorded:
         if freeze["id"] != row["frozen_id"] or len(raw) < 7 or not head.startswith(raw) \
                 or self._git("rev-parse", "--verify", raw + "^{commit}") != head:
             raise TrainError("admission no longer names the latest exact freeze")
+        independence = {} if self.review_rules is None else dict(
+            families=self.review_rules.families,
+            exclude_author_family=self.review_rules.exclude_author_family,
+            distinct_families=self.review_rules.distinct_families)
         proof = train_review.qualify_recorded(self.db, head, commits, marks,
-                                             required=required, provider=self.provider)
+            required=required, provider=self.provider, **independence)
         return dict(schema="ameesh-train-history/1", base=base,
                     admission=identity(row), reviews=proof)

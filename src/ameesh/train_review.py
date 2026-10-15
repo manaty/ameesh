@@ -33,10 +33,10 @@ class Receipt:
     record: str                  # exact provenance record, never free-form note
     milestone: dict | None = None
 
-    def known(self):
+    def known(self, families=FAMILIES):
         return (all(isinstance(value, str) and value.strip() for value in (
             self.subject, self.commit, self.actor, self.session, self.turn, self.record))
-                and SHA.fullmatch(self.commit) is not None and self.harness in FAMILIES)
+                and SHA.fullmatch(self.commit) is not None and self.harness in families)
 
 
 def _actor(value):
@@ -54,7 +54,8 @@ def _order(mark):
 
 
 def qualify_recorded(db, head: str, commits: list[str], marks: list[dict], *,
-                     required: int, provider) -> dict:
+                     required: int, provider, families=FAMILIES,
+                     exclude_author_family=True, distinct_families=True) -> dict:
     """Read exact #1465 receipts through an explicitly trusted provider.
 
     The caller still supplies the complete Git range, complete milestone
@@ -89,11 +90,13 @@ def qualify_recorded(db, head: str, commits: list[str], marks: list[dict], *,
         if mark.get("kind") == "verdict":
             subject = "milestone:%s" % mark["id"]
             history[subject] = read(subject, provider.receipt_for_milestone, mark["id"])
-    return qualify(head, commits, marks, history, required=required)
+    return qualify(head, commits, marks, history, required=required, families=families,
+                   exclude_author_family=exclude_author_family, distinct_families=distinct_families)
 
 
 def qualify(head: str, commits: list[str], marks: list[dict],
-            history: dict[str, Receipt | None], *, required: int) -> dict:
+            history: dict[str, Receipt | None], *, required: int, families=FAMILIES,
+            exclude_author_family=True, distinct_families=True) -> dict:
     """Cover every content commit with independent final-head verdicts.
 
     The caller supplies the complete Git range and unbounded milestone read,
@@ -109,6 +112,10 @@ def qualify(head: str, commits: list[str], marks: list[dict],
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise TrainError("explicit review requirement expected")
+    if not isinstance(families, (tuple, list, set, frozenset)) or not families \
+            or any(not isinstance(f, str) or not f.strip() for f in families) \
+            or type(exclude_author_family) is not bool or type(distinct_families) is not bool:
+        raise TrainError("explicit family and independence rules required")
     if not SHA.fullmatch(head) or not commits or len(set(commits)) != len(commits) \
             or any(not SHA.fullmatch(commit) for commit in commits):
         raise TrainError("complete exact content-commit range expected")
@@ -116,7 +123,7 @@ def qualify(head: str, commits: list[str], marks: list[dict],
     for commit in commits:
         subject = "commit:" + commit
         receipt = history.get(subject)
-        if not isinstance(receipt, Receipt) or not receipt.known() \
+        if not isinstance(receipt, Receipt) or not receipt.known(families) \
                 or receipt.subject != subject or receipt.commit != commit:
             raise TrainError("unknown historical author for commit %s" % commit[:12])
         authors.append(receipt)
@@ -137,7 +144,7 @@ def qualify(head: str, commits: list[str], marks: list[dict],
             continue
         subject = "milestone:%s" % mark["id"]
         receipt = history.get(subject)
-        if not isinstance(receipt, Receipt) or not receipt.known():
+        if not isinstance(receipt, Receipt) or not receipt.known(families):
             continue  # an unknown reviewer supplies no independent vote
         if receipt.subject != subject or _actor(receipt.actor) != actor \
                 or receipt.milestone != {key: mark.get(key) for key in MARK_FIELDS}:
@@ -157,9 +164,10 @@ def qualify(head: str, commits: list[str], marks: list[dict],
     coverage = {}
     for author in authors:
         candidates = [r for r in accepted if _actor(r.actor) != _actor(author.actor)
-                      and r.harness != author.harness and r.session != author.session]
+                      and (not exclude_author_family or r.harness != author.harness)
+                      and r.session != author.session]
         chosen = next((group for group in combinations(candidates, required)
-                       if len({r.harness for r in group}) == required
+                       if (not distinct_families or len({r.harness for r in group}) == required)
                        and len({r.session for r in group}) == required), None)
         if chosen is None:
             raise TrainError("missing independent final-head reviews for commit %s (%s)"
@@ -167,4 +175,5 @@ def qualify(head: str, commits: list[str], marks: list[dict],
         coverage[author.commit] = [r.subject for r in chosen]
     return dict(schema="ameesh-train-reviews/1", head=head, required=required,
                 authors=[asdict(r) for r in authors], reviews=[asdict(r) for r in accepted],
-                coverage=coverage)
+                coverage=coverage, independence=dict(families=sorted(families),
+                    exclude_author_family=exclude_author_family, distinct_families=distinct_families))
