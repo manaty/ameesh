@@ -116,32 +116,41 @@ def live_fleet(db, now: float, host: str | None = None) -> dict:
     return fleet
 
 
-def _offer(items: list, agents: list, now: float, book) -> Offer:
-    """La marge d'un harnais au forfait : ses comptes, leur fenêtre longue."""
+def _offer(items: list, agents: list, now: float, book, unreadable: list | None = None) -> Offer:
+    """La marge d'un harnais au forfait : ses comptes, leur fenêtre longue.
+
+    `unreadable` : liste où noter les comptes dont la jauge n'a pas pu être lue
+    (#1600) — une lecture en erreur ne fait pas tomber l'affichage des comptes.
+    """
     free = 0.0
     used = 0.0
     measured = []
     for profile in items:
         if profile.kind == "api_key_env":
             continue  # une clé API ne constitue pas une capacité de forfait
-        # seuil des non-critiques : la réserve reste aux agents critiques (L242b)
-        result = accounts.evaluate(book, profile, items, now, record=False, reserve=True)
-        if not result.ok or result.hard:
+        try:
+            # seuil des non-critiques : la réserve reste aux agents critiques (L242b)
+            result = accounts.evaluate(book, profile, items, now, record=False, reserve=True)
+            if not result.ok or result.hard:
+                continue
+            # Une fenêtre échue ne mesure pas la suivante, et une courte échue
+            # invalide la longue encore ouverte (#1561). L'affichage ne promet
+            # rien sans une marge courante, même si la garde autorise un essai.
+            if any(g.reset_passed(now) for g in result.gauges):
+                continue
+            stamps = [stamp for g in result.gauges
+                      if (stamp := getattr(g, "read_at", None)) is not None]
+            if stamps and now - min(stamps) > min(g.window_s for g in result.gauges):
+                continue
+            long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
+            if not long:
+                continue  # aucune fenêtre longue mesurée : rien à porter
+            free += min(max(0.0, result.limits[g.key][0] - g.used_at(now)) for g in long)
+            used += sum(g.used_at(now) for g in long)
+        except Exception:  # noqa: BLE001 — jauge illisible : compte non mesuré (#1600)
+            if unreadable is not None:
+                unreadable.append(profile.name)
             continue
-        # Une fenêtre échue ne mesure pas la suivante, et une courte échue
-        # invalide la longue encore ouverte (#1561). L'affichage ne promet
-        # rien sans une marge courante, même si la garde autorise un essai.
-        if any(g.reset_passed(now) for g in result.gauges):
-            continue
-        stamps = [stamp for g in result.gauges
-                  if (stamp := getattr(g, "read_at", None)) is not None]
-        if stamps and now - min(stamps) > min(g.window_s for g in result.gauges):
-            continue
-        long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
-        if not long:
-            continue  # aucune fenêtre longue mesurée : rien à porter
-        free += min(max(0.0, result.limits[g.key][0] - g.used_at(now)) for g in long)
-        used += sum(g.used_at(now) for g in long)
         measured.append(profile.name)
     unit = DEFAULT_AGENT_SHARE
     if agents:
@@ -198,11 +207,21 @@ def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = No
         members = [name for name, harness in agents.items() if harness == family]
         if members and all(name in candidates for name in members):
             kept += 1
+    unreadable: list = []
     offers = [_offer(declared[harness], [name for name, h in agents.items()
-                                         if h == harness], now, book)
+                                         if h == harness], now, book,
+                     unreadable=unreadable)
               for harness in sorted(declared) if harness not in billed]
     ranked = sorted((o for o in offers if o.capacity > 0),
                     key=lambda o: (-o.capacity, o.harness))
+    if not ranked and unreadable:
+        # #1600 : aucune marge mesurable parce que des jauges sont illisibles —
+        # on le dit (l'affichage des comptes ne tombe pas), comme `live_fleet`
+        # rend {} sur une base illisible.
+        return Proposal(offers=tuple(offers), candidates=len(candidates),
+                        kept_for_review=kept,
+                        reason="gauge readings unreadable for %s"
+                               % ", ".join(sorted(set(unreadable))))
     movable = min(len(candidates) - kept, sum(o.capacity for o in ranked))
     moves = []
     remaining = movable
