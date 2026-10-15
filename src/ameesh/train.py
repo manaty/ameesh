@@ -173,6 +173,17 @@ class Engine:
         if proof != plan["proof"]:
             raise TrainError("admission evidence changed: recompose and fire again")
 
+    def _ci(self, state):
+        ci = self.ports.ci(state["plan"])
+        if ci.get("head") != state["plan"]["head"] \
+                or ci.get("tree") != state["plan"]["tree"]:
+            raise TrainError("CI evidence is for another commit or tree")
+        if ci.get("status") not in ("pending", "absent", "green", "red"):
+            raise TrainError("unknown CI outcome")
+        if ci["status"] in ("green", "red") and not ci.get("complete"):
+            raise TrainError("CI is not the complete required suite")
+        return ci
+
     def step(self, now: float) -> dict:
         """One executor/event pass. No loops waiting for CI or a verdict."""
         if not self.policy.enabled:
@@ -229,16 +240,9 @@ class Engine:
                 return {"result": "ci", "plan": state["plan"]}
             if state["phase"] in ("ci", "ci-intent"):
                 self._current(state)
-                ci = self.ports.ci(state["plan"])
-                if ci.get("head") != state["plan"]["head"] \
-                        or ci.get("tree") != state["plan"]["tree"]:
-                    raise TrainError("CI evidence is for another commit or tree")
+                ci = self._ci(state)
                 if ci.get("status") in ("pending", "absent"):
                     return {"result": "ci", "plan": state["plan"]}
-                if ci.get("status") not in ("green", "red"):
-                    raise TrainError("unknown CI outcome")
-                if not ci.get("complete"):
-                    raise TrainError("CI is not the complete required suite")
                 state["attempts"][-1]["ci"] = ci
                 if ci["status"] == "red":
                     return self._red(state, now)
@@ -247,8 +251,20 @@ class Engine:
                     return self._next_probe(state, now)
                 state["phase"] = "ready"
                 state = self._save(state)
-            if state["phase"] == "ready":
+            elif state["phase"] == "ready":
+                # A fire may arrive long after the initial green. A rerun or
+                # a newer workflow attempt must supersede that old evidence.
                 self._current(state)
+                ci = self._ci(state)
+                if ci["status"] in ("pending", "absent"):
+                    state["phase"] = "ci"
+                    self._save(state)
+                    return {"result": "ci", "plan": state["plan"]}
+                state["attempts"][-1]["ci"] = ci
+                if ci["status"] == "red":
+                    return self._red(state, now)
+                state = self._save(state)
+            if state["phase"] == "ready":
                 fire = self.ports.authorize(state["plan"])
                 if not fire:
                     return {"result": "awaiting-fire", "plan": state["plan"]}
@@ -344,6 +360,9 @@ class Engine:
             state = self._save(state)
             return {"result": "empty"}
         state["good"], state["excluded"], state["pending"] = [], [], []
+        # Subsequent diagnostics concern this new union only. Previously
+        # quarantined members must never reappear as prerequisite context.
+        state["members"] = members
         # Even if this set equals a green diagnostic half, compose a new plan
         # and run complete CI on its own head before the actual promotion.
         state = self._plan(state, members, now)

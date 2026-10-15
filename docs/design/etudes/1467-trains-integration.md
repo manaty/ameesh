@@ -56,13 +56,20 @@ pilote. Une pause pour échecs répétés ne repart pas d'elle-même.
 avec `expected_sha`. Il lit les workflows requis sur le commit, la branche,
 l'événement et la tentative exacts. Un job requis sauté ne prouve pas une
 suite exécutée. Une annulation ne permet pas d'accuser un lot. L'adaptateur
-ne relance et ne sonde jamais en boucle.
+ne relance et ne sonde jamais en boucle. Les blobs audités des workflows et
+de leurs planificateurs sont vérifiés sur le commit exact : conserver le nom
+d'un job tout en changeant sa matrice ou ses conditions ne transmet aucun
+vert. Un échec d'agrégat avec toutes les parts vertes ne désigne aucun lot.
+Une nouvelle tentative CI pendant l'attente du feu remplace la preuve verte
+antérieure ; le moteur la relit avant de promouvoir.
 
 Après un rouge, la bissection teste ses moitiés avec leurs prérequis. Un
 prérequis fautif reporte ses dépendants sans les désigner comme fautifs. Les
 moitiés vertes ne suffisent jamais à qualifier leur union : le reste est
 recomposé et passe sa propre CI complète. Une interaction entre deux moitiés
 vertes provoque une pause avec ses preuves. Le plafond d'échecs borne le coût.
+La nouvelle union devient le périmètre des diagnostics suivants : un membre
+déjà exclu ne peut réapparaître comme contexte de prérequis.
 
 ## Qualification et feu : raccord restant avant gel
 
@@ -77,6 +84,31 @@ d'un agent, son registre courant et les textes libres ne sont pas des preuves.
 Le contrat est coordonné directement avec impl07 (#1465 / ancien #1053).
 Unknown refuse l'admission. Les avis requis, blocages B et P2 sensible,
 retraits et deltas doivent être requalifiés juste avant chaque effet.
+
+`train_review.qualify` fournit maintenant le validateur pur de ces preuves.
+Il couvre chaque commit de contenu par les avis sur la tête finale, avec
+des familles différentes de cet auteur et entre elles, et des sessions
+distinctes. Le correcteur est l'auteur de son commit. Un blocage d'un autre
+relecteur ne disparaît pas sous un nouvel `ok` ; un regel ne l'efface pas.
+Le classement et son nombre d'avis viennent du fournisseur de politique,
+avec refus préalable des releases et des classements inconnus. Ce module ne
+constitue pas un fournisseur de données ni une autorisation de runtime.
+
+Interface de raccord proposée à impl07 le 15 octobre à 03:54 : un `Receipt`
+porte `subject` (`commit:<sha>` ou `milestone:<id>`), `commit` résolu, `actor`,
+`session`, `turn`, `harness` et `record` de provenance exacte. Un reçu de
+verdict porte aussi les cinq champs originaux du jalon (`id`, `actor`,
+`at_ts`, `sha`, `verdict`) ; un reçu ne peut être réaffecté à un autre fait.
+Le fournisseur doit établir ces liens avant de construire les reçus ; une
+chaîne `record` fournie par un appelant ne suffit jamais à les attester.
+La plage Git et l'historique des jalons sont complets, sans limite de lecture
+silencieuse. Aucun appel CLI de fourniture arbitraire de reçus n'est ajouté.
+
+Source vérifiée par mesh-design le 15 octobre à 03:53 : #1053 à `f934b3e7`
+est descriptif au gel ; `turn_costs` (0014) et `persona_sessions` (0066)
+ne portent pas seuls un lien exact commit/verdict vers son tour. Une session
+peut être rouverte en modifiant son intervalle. Le rapprochement temporel le
+plus proche demeure donc refusé ; le fournisseur exact reste chez #1465.
 
 Les deux modes de CI sont explicites : `packet` préserve le remplacement
 de la CI de lot par celle du paquet (§12), `targeted` exige en plus la CI
@@ -96,16 +128,52 @@ direct de #1374 de contourner la réservation du paquet.
 
 ## Raccord des dépôts restant avant gel
 
-Sur ameesh, `tests.yml` déclenche déjà la suite complète au push sur
-`integration/**`. Ne pas ajouter un dispatch à ce même push. Le contrat des
-jobs requis doit couvrir toutes les parts exécutables de la suite complète,
-avec leur matrice, à partir du workflow de la tête qualifiée.
+Sur ameesh, `train_contracts.ameesh()` décrit le contrat vérifié sur
+`e4e4c85c` : push `integration/**`, `plan`, quatre parts psycopg, six parts
+psql, `plateforme macOS` et `tests`. Aucun dispatch supplémentaire. Les blobs
+de `tests.yml`, `test-plan.py`, `test-parts.py`, `ci-flow.py` et `map.py` sont
+liés à ce contrat. Leur modification exige un nouveau contrat audité ; elle
+ne peut hériter des anciens noms de jobs. Le futur adaptateur doit vérifier
+ces sources dans le clone avant publication aussi, pour ne pas lancer un
+push CI dont il sait déjà le contrat périmé.
 
-Sur Nexlink, aucun push `integration/**` ne déclenche les suites. Chaque
-workflow doit être vérifié sur la cible gelée : présence de `workflow_dispatch`,
-garde `expected_sha` et jobs exécutables complets. La liste communiquée par
-orchestrateur comprend dix-sept suites et `docs-gate` ; elle reste à vérifier
-fichier par fichier avant raccord, sans extrapoler de celle d'ameesh.
+Sur Nexlink, aucun push `integration/**` ne déclenche les suites. La lecture
+fichier par fichier sur `develop@ddbe5c9f073b60d218da0414688188899da3b544`
+confirme les dix-huit `workflow_dispatch` et la garde `expected_sha` dans
+chaque job exécutable. Le tableau ci-dessous identifie leurs blobs et jobs ;
+les jobs réutilisables de statut ne remplacent aucune exécution.
+
+| Workflow `.github/workflows/*.yml` | Blob | Jobs exécutables au dispatch |
+| --- | --- | --- |
+| backend-suite | `bd96a40996502a4b240edd1aad66c29e3f6568ef` | backend ; changed-paths réservé au push develop |
+| desktop-suite | `0b02fbc6ff255bd3ee559d3ed93d44315f7af24e` | desktop ; Desktop suite Windows/macOS selon CI_HOSTED_DESKTOP |
+| host-rust | `1d6fb4f00d2eb23fa9b41d49e601a31a3f77e080` | host (ubuntu-latest) ; matrice Windows/macOS selon CI_HOSTED_DESKTOP |
+| mobile-suite | `2de99b599e30b29b36bd52a8562876727696becf` | mobile |
+| scripts-suite | `d3adae3ac635760db96f8b15a7d23b8a78f2fdb9` | scripts |
+| website-suite | `dc8a926633307654b234a230f71721e5bb08e8a3` | website |
+| sql-invariant | `83ef745d40f634db7a2cdc1b8bed46e6001d0358` | sql-rules (CONTENT_DB=1) |
+| sync-checks | `86af79354c5eb614ff9a499c49c7b500f091f121` | all |
+| message-crypto | `d35012345ade7c9c67fce1816ebcc5227e387022` | typescript, backend-copy, python |
+| node-oplog | `dbe8104b5c108dfd93842d824743330fe1996882` | typescript, python |
+| node-channel | `3d92156b06261ae014777db965ace7d7767ab144` | typescript, python |
+| nexlink-key | `c9bdb1322a70a4160d0a6ce0474c6615b5549d81` | typescript, python, drift |
+| host-key | `77f81bd501839d6d22a81206008ef5cc4d8317cb` | typescript, python |
+| page-host | `8ca62018d647efc68842a0df17697d296611736c` | typescript, sync |
+| remote-help-ts | `545896e468bbde7a4790855d0df16f4820577319` | shared, drift, website-remote-mock, backend, wp10-wake-sampler |
+| routing-library | `d210b0d096864a7b7cd063e54983a27d094d224b` | vectors |
+| rollback-checks | `dca228aa5602bfac6b245a9c326953832d7372f6` | all |
+| docs-gate | `b3ca96df80f6950e3d029c84ef8fd6b29c856268` | docs |
+
+**Écart bloquant constaté, communiqué au pilote à 03:50** : backend-suite
+(ligne 368) et website-suite (ligne 122) passent par `change-set.mjs` avec
+`workflow_dispatch` sur le train. Ce script (blob
+`7278613797a7d233f17e430b06fd3ef1df3a6e89`, ligne 104) ne force la suite
+complète que sur push/develop. Un job vert peut ainsi n'avoir exécuté que
+les impactés, voire avoir sauté l'étape de tests. Il n'existe donc pas encore
+de contrat Nexlink complet utilisable. Orchestrateur a confié le raccord
+au chantier CI #1470 / mty-nxl-impl-01 (courrier du 15 octobre à 03:55,
+confirmé par mesh-design à 03:57), deux avis indépendants avant CI. Le SHA
+du gel permettra de reprendre l'audit ; aucun dispatch n'a été lancé ici.
 
 L'échec `queue add` sur le poste orchestrateur est dû au profil
 `critiques-2.json` sans `radar.projects`, alors que `radar-nexlink.json`
@@ -121,3 +189,15 @@ preuve de CI, branches et bail Git sur un dépôt bare jetable. Les tests SQL
 portent sur les révisions, l'expiration, la reprise et le partage du bail avec
 `land`. Les suites complètes appartiennent à la CI du paquet. Le lot reste en
 `build` ; aucun gel, avis de livraison, feu, PR ou activation n'est déclaré.
+
+Seconde passe : 44 tests ciblés moteur/Git/CI/historique verts, dont
+renouvellement de CI pendant attente du feu, refus d'une part manquante sous
+agrégat vert, sources CI modifiées, exclusion conservée après recomposition,
+attribution de correction et indépendance historique de chaque auteur.
+Vérification du planificateur réel : les cinq blobs correspondent au contrat,
+et un plan push/integration répartit tous les modules dans quatre parts
+psycopg et six parts psql, sans sélection de lot ni voie doc/version.
+Les trois témoins SQL psql et psycopg du premier point de travail restent
+inchangés. Le prochain raccord dépend des sources exactes #1465 et de #1470 ;
+le fournisseur de feu structuré et sa sérialisation avec le retrait restent
+à implémenter avant gel et branchement au runner.

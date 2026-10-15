@@ -158,6 +158,45 @@ class TrainTest(unittest.TestCase):
         self.assertEqual(engine.step(3602)["result"], "refused")
         self.assertNotIn("promote", [e[0] for e in self.ports.effects])
 
+    def test_new_ci_attempt_after_waiting_for_fire_supersedes_green(self):
+        engine = self.make()
+        plan = engine.step(3600)["plan"]
+        self.ports.ci_by_head[plan["head"]] = "green"
+        self.ports.fired = False
+        self.assertEqual(engine.step(3601)["result"], "awaiting-fire")
+        self.ports.fired = True
+        self.ports.ci_by_head[plan["head"]] = "pending"
+        self.assertEqual(engine.step(3602)["result"], "ci")
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+        self.ports.ci_by_head[plan["head"]] = "green"
+        self.assertEqual(engine.step(3603)["result"], "landed")
+
+    def test_red_after_waiting_for_fire_isolates_instead_of_promoting(self):
+        engine = self.make()
+        plan = engine.step(3600)["plan"]
+        self.ports.ci_by_head[plan["head"]] = "green"
+        self.ports.fired = False
+        engine.step(3601)
+        self.ports.fired = True
+        self.ports.ci_by_head[plan["head"]] = "red"
+        self.assertEqual(engine.step(3602)["result"], "empty")
+        self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+
+    def test_ready_rechecks_exact_complete_ci_after_restart(self):
+        for change in ("head", "complete"):
+            with self.subTest(change=change):
+                engine = self.make()
+                plan = engine.step(3600)["plan"]
+                self.ports.ci_by_head[plan["head"]] = "green"
+                self.ports.fired = False
+                engine.step(3601)
+                old = self.ports.ci(plan)
+                old[change] = "f" * 40 if change == "head" else False
+                self.ports.ci = lambda p: old
+                self.ports.fired = True
+                self.assertEqual(engine.step(3602)["result"], "refused")
+                self.assertNotIn("promote", [e[0] for e in self.ports.effects])
+
     def test_requeue_same_sha_invalidates_old_admission(self):
         engine = self.make()
         engine.step(3600)
@@ -270,6 +309,27 @@ class TrainTest(unittest.TestCase):
         self.assertEqual([r["work_item_id"] for r in self.ports.rows], [2])
         self.assertEqual([e for e in self.ports.effects if e[0] == "quarantine"],
                          [("quarantine", [1])])
+
+    def test_second_diagnostic_never_reintroduces_quarantined_members(self):
+        engine = self.make([row(1), row(2), row(3)], threshold=3)
+        plan = engine.step(0)["plan"]
+        self.ports.ci_by_head[plan["head"]] = "red"
+        engine.step(1)
+        first = engine.step(2)["plan"]
+        self.ports.ci_by_head[first["head"]] = "red"  # exclude 1
+        engine.step(3)
+        rest = engine.step(4)["plan"]
+        self.ports.ci_by_head[rest["head"]] = "green"  # diagnostic 2,3
+        engine.step(5)
+        union = engine.step(6)["plan"]
+        # A later complete run can fail even when the probe was green.
+        self.ports.ci_by_head[union["head"]] = "red"
+        # If a new dependency points at the excluded lot, 2 must wait;
+        # including 1 as prerequisite context would resurrect a quarantine.
+        self.ports.edges = [dict(work_item_id=2, blocker_id=1, blocking=True)]
+        last = engine.step(7)["plan"]
+        self.assertEqual([r["work_item_id"] for r in last["members"]], [3])
+        self.assertNotIn(1, self.ports.probes[-1])
 
 
 class TrainGitTest(_Land):
