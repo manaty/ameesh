@@ -51,7 +51,40 @@ CAUSES = (
     "run-red",            # la sélection est rouge
     "run-incomplete",     # timeout, annulation, part sans fin : inexploitable (124/130/70)
     "transport-lost",     # connexion perdue, résultat non authentifié
+    "block-missing",      # le canon ne porte pas le bloc `prevalidation` (#1770)
 )
+
+
+class PrevalidationError(Exception):
+    """Un refus nommé : la prévalidation s'arrête, elle ne suppose rien.
+
+    `cause` appartient à [`CAUSES`] ; ce refus n'écrit ni jalon ni verdict.
+    """
+
+    def __init__(self, cause: str, why: str = ""):
+        super().__init__("%s: %s" % (cause, why) if why else cause)
+        self.cause = cause
+        self.why = why
+
+
+def load_parameters(repo: str, commit: str, project: str):
+    """Lit le canon relu (#1616) et rend `(document, bloc prevalidation)`.
+
+    Le consommateur explicite refuse un bloc absent, cause `block-missing` :
+    aucune sélection, aucun hôte et aucun délai ne se supposent. L'accroche
+    automatique du gel ne l'appelle pas tant que la règle n'est pas adoptée.
+    Le lecteur `mechanics` est importé ici pour rester nommément refusable.
+    """
+    try:
+        from . import mechanics
+    except ImportError as exc:  # lecteur absent : refus nommé, jamais de repli
+        raise PrevalidationError("block-missing",
+                                 "mechanics reader absent: %s" % exc) from exc
+    document = mechanics.load(repo, commit, project)
+    if document.prevalidation is None:
+        raise PrevalidationError("block-missing",
+                                 "%s has no prevalidation block" % document.source)
+    return document, document.prevalidation
 #: sort du run selon le code de sortie de `ameesh offload run --fallback none`
 RUN_OUTCOMES = {0: "green", 1: "run-red", 75: "no-vm", 124: "run-incomplete",
                 130: "run-incomplete", 70: "run-incomplete", 255: "transport-lost"}
