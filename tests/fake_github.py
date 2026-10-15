@@ -74,6 +74,11 @@ def handle(state: dict, argv: list, stdin: str | None = None) -> tuple[int, str,
             if wanted != "ALL" and pr.get("state", "OPEN") != wanted:
                 continue
             rows.append(dict(pr, number=int(number)))
+        # `--limit` est un plafond réel de `gh pr list` (#759) : le faux doit
+        # le respecter, sinon un plafond tronqué passerait inaperçu au banc.
+        limit = _option(argv, "--limit")
+        if limit:
+            rows = rows[:int(limit)]
         return 0, json.dumps(rows), ""
     if not argv or argv[0] != "api":
         return 2, "", "faux gh : commande non prise en charge : %s" % " ".join(argv)
@@ -102,6 +107,24 @@ def handle(state: dict, argv: list, stdin: str | None = None) -> tuple[int, str,
         repo = _repo(state, whole.group(1))
         return 0, json.dumps({"full_name": whole.group(1), "visibility": repo["visibility"],
                               "private": repo["visibility"] != "public"}), ""
+    # #759 : les PR ouvertes sont lues en REST paginé (`repos/R/pulls`) pour
+    # être exhaustives ; `--paginate` côté faux rend toutes les pages d'un coup.
+    pulls = re.fullmatch(r"repos/([^/]+/[^/]+)/pulls", route)
+    if pulls and method == "GET":
+        params = dict(p.split("=", 1) for p in query.split("&") if "=" in p)
+        wanted = (params.get("state") or "open").upper()
+        rows = []
+        for key, pr in sorted(state.get("prs", {}).items()):
+            name, _, number = key.partition("#")
+            if name != pulls.group(1) or pr.get("state", "OPEN") != wanted:
+                continue
+            head_repo = ({"full_name": "fork/" + name} if pr.get("isCrossRepository")
+                         else {"full_name": name})
+            rows.append({"number": int(number), "state": "open",
+                         "head": {"ref": pr.get("headRefName") or "", "repo": head_repo},
+                         "base": {"repo": {"full_name": name}},
+                         "body": pr.get("body") or "", "html_url": pr.get("url") or ""})
+        return 0, _lines(rows), ""
     match = re.fullmatch(r"repos/([^/]+/[^/]+)/(labels|issues)(?:/(\d+))?"
                          r"(?:/(sub_issues|sub_issue|comments))?", route)
     if not match:

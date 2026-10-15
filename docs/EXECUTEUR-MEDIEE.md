@@ -15,7 +15,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 296 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 323 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -63,8 +63,8 @@ Comptes : 63 opérations, dont 25 lectures et 38 écritures. 53 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (377
-opérations après intégration de main et de #330) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (386
+opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 `turn_resources.running_started_before` est une lecture de portée H :
@@ -76,12 +76,13 @@ Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
 qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
-l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
-L96), `turn_costs.correct`, `ledger`, `spent_between` (grand livre, L95),
-`operations.assigners`, `latest_gauges` (sous-utilisation, L94),
-`hosts.usage` et `turn_resources.get`. Un exécuteur médié ne fait ni ménage
-local ni passage périodique de ménage : son dossier de travail est effacé en
-fin de bail.
+l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
+`roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
+`spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
+(sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
+`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
+exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
+dossier de travail est effacé en fin de bail.
 
 Les deux opérations de L31b (`leases.hold_note`, `leases.release_hold` :
 l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de

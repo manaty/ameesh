@@ -436,7 +436,14 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, "%s has no human owner (required with a canon)" % name, ""
     if not row.get("placement_admitted"):
         if row.get("placement_ok") is True:
-            why = "profile diverged since evaluation (next canon sync)"
+            # #1219 : nommer la divergence (profils évalué et courant) — le même
+            # diagnostic que `ameesh list`/`canon check`, au lieu d'un texte
+            # court qui cache la cause et promet un canon sync qui ne corrige
+            # pas une inscription qui re-divergera.
+            from .placement import recorded as _recorded  # import tardif : pas de cycle
+            verdict = (_recorded(db, row.get("host")) or {}).get(name) or {}
+            why = verdict.get("placement_diagnostic") or (
+                "profile diverged since evaluation (next canon sync)")
         else:
             why = row.get("placement_diagnostic") or (
                 "placement not evaluated" if row.get("placement_ok") is None

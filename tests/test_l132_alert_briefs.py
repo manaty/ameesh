@@ -43,6 +43,15 @@ class BriefsTest(unittest.TestCase):
         self.assertIn("ameesh work merged 42 --sha", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
 
+    def test_stale_lot_parque_sur_un_lot_ouvert(self):
+        """#1261 : un lot parqué se débloque par une dépendance déclarée
+        (planned_wait, L368), pas par une relance de son auteur."""
+        text = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])["orch"]
+        self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        self.assertIn("the alert stops while the wait is planned", text)
+        self.assertLess(text.index("ameesh work dependencies 42"),
+                        text.index("ameesh mail send dev1"))
+
     def test_stale_lot_ne_reveille_pas_l_auditeur(self):
         """L713 : lu à la passe de l'auditeur, pas poussé ; les autres alertes si."""
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
