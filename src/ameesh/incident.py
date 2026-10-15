@@ -15,6 +15,13 @@ Ce module porte la règle seule :
   elle rend un lot candidat unique, plusieurs candidats, ou rien. Sans carte
   (`links=None`), elle rend `unknown` : rien n'est affirmé. Jamais d'accusation
   sans preuve — un candidat n'est pas une culpabilité ;
+* `diagnosis_of` lit le **rapport factuel commun** `ameesh-train-diagnosis/1`
+  (#1467) quand il vise la tête exacte : il en rend les faits (paquet, jobs
+  rouges avec leur tentative, environnement, attribution) et les manques
+  (`missing`), sans en tirer d'exemption, de retrait ni d'accusation. Un lot
+  « prouvé » sans reçu d'exécution locale (`environment.receipts`) retombe en
+  candidat : jamais « prouvé » sans reçu. Le module ne dépend pas de #1467 à
+  l'exécution, le rapport lui est fourni ;
 * `open_incident` écrit le lot, **une seule fois** par exécution (identité
   portée par `issue_ref = ci-incident:<repo>:<run_id>`, quel que soit l'état du
   lot), et **ne lève jamais** : un incident non écrit est rendu, pas propagé ;
@@ -44,6 +51,9 @@ from . import storage, work
 
 #: l'identité de l'incident d'une exécution, portée par `issue_ref`
 PREFIX = "ci-incident:"
+#: le schéma du rapport factuel commun produit par le train (#1467, #1616) —
+#: lu comme une donnée, sans dépendre de son module à l'exécution
+DIAGNOSIS_SCHEMA = "ameesh-train-diagnosis/1"
 #: les modules qui ne sont pas des fichiers de test : un agrégat, une panne
 #: d'installation — rien qui désigne un lot
 PLACEHOLDERS = (
@@ -220,6 +230,80 @@ def attribute(modules: Iterable[str], commits: Iterable[dict], links=None) -> di
     return out
 
 
+def _dicts(value) -> list:
+    """Les entrées dict d'une liste, sans rien inventer."""
+    return [entry for entry in value or () if isinstance(entry, dict)]
+
+
+def _texts(value) -> list:
+    """Les phrases non vides d'une liste, espaces normalisés."""
+    out: list[str] = []
+    for entry in value or ():
+        text = " ".join(str(entry).split())
+        if text:
+            out.append(text)
+    return out
+
+
+def _declared(entry: dict) -> str:
+    """Un candidat déclaré, décrit par sa seule identité lisible."""
+    lot = entry.get("lot", entry.get("work_item_id", entry.get("id")))
+    if lot not in (None, ""):
+        return "#%s" % lot
+    return str(entry.get("sha") or entry.get("file") or "?")[:12]
+
+
+def diagnosis_of(report, *, head_sha: str = "") -> Optional[dict]:
+    """Le rapport factuel commun `ameesh-train-diagnosis/1` (#1467), lu comme donnée.
+
+    N'accepte que le schéma connu et, quand `head_sha` est donné, la **tête
+    exacte** (`packet.head`) : un rapport d'une autre tête, d'un autre schéma
+    ou illisible rend `None`, et l'appelant garde son propre relevé.
+
+    Le rapport n'autorise rien par lui-même : ni exemption d'environnement, ni
+    retrait de lot, ni accusation. Ce lecteur en rend les faits (paquet, jobs
+    rouges avec leur tentative, environnement, attribution) et les manques
+    (`missing`). Un lot d'`attribution.proven_lots` sans **reçu** d'exécution
+    locale (`environment.receipts`) n'est pas cru prouvé : il retombe en
+    candidat et le manque est ajouté — jamais « prouvé » sans reçu (#1467).
+    """
+    if not isinstance(report, dict) or report.get("schema") != DIAGNOSIS_SCHEMA:
+        return None
+    packet = report.get("packet") if isinstance(report.get("packet"), dict) else {}
+    head = str(packet.get("head") or "")
+    if head_sha and head != str(head_sha):
+        return None
+    environment = report.get("environment") \
+        if isinstance(report.get("environment"), dict) else {}
+    receipts = [receipt for receipt in (environment.get("receipts") or ()) if receipt]
+    attribution = report.get("attribution") \
+        if isinstance(report.get("attribution"), dict) else {}
+    candidates = _dicts(attribution.get("candidates"))
+    proven = _dicts(attribution.get("proven_lots"))
+    missing = _texts(report.get("missing"))
+    if proven and not receipts:
+        candidates = candidates + proven
+        proven = []
+        missing.append("reçu d'exécution local absent : les lots cités prouvés "
+                       "retombent en candidats")
+    runs = [{"workflow": str(run.get("workflow") or ""),
+             "run": run.get("run"), "attempt": run.get("attempt"),
+             "failed_jobs": [{"id": job.get("id"), "name": str(job.get("name") or "")}
+                             for job in _dicts(run.get("failed_jobs"))]}
+            for run in _dicts(report.get("ci"))]
+    return {
+        "schema": DIAGNOSIS_SCHEMA,
+        "packet": {field: str(packet.get(field) or "")
+                   for field in ("source", "target", "base", "head", "tree")},
+        "environment": {"status": str(environment.get("status") or "unknown"),
+                        "receipts": len(receipts)},
+        "attribution": {"status": str(attribution.get("status") or "unknown"),
+                        "candidates": candidates, "proven_lots": proven},
+        "ci": runs,
+        "missing": missing,
+    }
+
+
 def title_of(*, branch: str, run_id: int, workflow: str = "", attribution: Optional[dict] = None) -> str:
     """Le titre de l'incident : l'exécution, et le lot candidat s'il est unique."""
     where = "%s%s" % (branch or "?", " (%s)" % workflow if workflow else "")
@@ -230,10 +314,48 @@ def title_of(*, branch: str, run_id: int, workflow: str = "", attribution: Optio
     return out
 
 
+def _diagnosis_lines(diagnosis: dict) -> list[str]:
+    """Les faits du rapport commun, sans rien en tirer de plus."""
+    packet = diagnosis.get("packet") or {}
+    environment = diagnosis.get("environment") or {}
+    attribution = diagnosis.get("attribution") or {}
+    lines = [
+        "",
+        "Diagnostic factuel (`%s`) : paquet `%s` → `%s`, base `%s`, tête `%s`, "
+        "arbre `%s`."
+        % (diagnosis.get("schema") or DIAGNOSIS_SCHEMA,
+           (packet.get("source") or "?")[:60], (packet.get("target") or "?")[:60],
+           (packet.get("base") or "?")[:12], (packet.get("head") or "?")[:12],
+           (packet.get("tree") or "?")[:12]),
+        "- Environnement : **%s** (%d reçu(s) d'exécution locale)."
+        % (environment.get("status") or "unknown", int(environment.get("receipts") or 0)),
+        "- Attribution : **%s** — ce rapport ne désigne aucun lot."
+        % (attribution.get("status") or "unknown"),
+    ]
+    for run in diagnosis.get("ci") or ():
+        jobs = ["%s%s" % (job.get("name") or "?",
+                          " (#%s)" % job["id"] if job.get("id") else "")
+                for job in run.get("failed_jobs") or ()]
+        lines.append("- Job(s) rouge(s) : workflow `%s`, run `%s`, tentative `%s` — %s."
+                     % (run.get("workflow") or "?", run.get("run") or "?",
+                        run.get("attempt") or "?", ", ".join(jobs) or "aucun job nommé"))
+    declared = attribution.get("candidates") or []
+    if declared:
+        lines.append("- Candidats **déclarés** par le rapport (à trancher, jamais une "
+                     "désignation) : %s." % ", ".join(_declared(c) for c in declared[:10]))
+    missing = diagnosis.get("missing") or []
+    if missing:
+        lines.append("- Manques déclarés par le rapport :")
+        lines += ["  - %s" % phrase for phrase in missing[:10]]
+    return lines
+
+
 def body_of(*, repo: str, branch: str, run_id: int, head_sha: str = "", workflow: str = "",
             url: str = "", modules: Iterable[str] = (), tests: Iterable[str] = (),
-            attribution: Optional[dict] = None, author: str = "") -> str:
-    """Le corps de l'incident : l'exécution, les tests, l'attribution, la suite."""
+            attribution: Optional[dict] = None, author: str = "",
+            diagnosis: Optional[dict] = None) -> str:
+    """Le corps de l'incident : l'exécution, les tests, l'attribution, le
+    diagnostic factuel commun s'il est fourni, la suite."""
     attribution = attribution or {}
     mods = list(modules or ())
     names = list(tests or ())
@@ -259,6 +381,8 @@ def body_of(*, repo: str, branch: str, run_id: int, head_sha: str = "", workflow
                                    "qualifié sur cet hôte, rien n'est affirmé",
                         "unattributable": "échec non rattaché à un fichier de test"}
                      .get(attribution.get("status"), "attribution incomplète"))
+    if diagnosis:
+        lines += _diagnosis_lines(diagnosis)
     if mods:
         lines += ["", "Fichiers de test en échec :"]
         lines += ["- `%s`" % m for m in mods[:20]]
@@ -305,12 +429,15 @@ def _open(ops, ref: str) -> Optional[dict]:
 def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = "",
                   workflow: str = "", url: str = "", modules: Iterable[str] = (),
                   tests: Iterable[str] = (), commits: Iterable[dict] = (), app: str = "",
-                  links=None, actor: str = work.SYSTEM_SENDER) -> dict:
+                  links=None, diagnosis: Optional[dict] = None,
+                  actor: str = work.SYSTEM_SENDER) -> dict:
     """Ouvre l'incident d'une exécution rouge d'atterrissage, s'il n'existe pas.
 
     Rend `{id, created, status, lot, author, assigned, why}` — ne lève jamais.
     `links` est le port `test→fichiers` qualifié passé à `attribute` : sans
-    lui, le statut est `unknown` et aucun lot n'est désigné.
+    lui, le statut est `unknown` et aucun lot n'est désigné. `diagnosis` est le
+    rapport commun lu par `diagnosis_of` : il est versé au corps comme fait,
+    sans désigner de lot.
 
     Le lot est créé `bug` priorité 1, **sans assigné** (une création assignée
     refuserait un auteur non réveillable et perdrait l'incident), puis l'auteur
@@ -340,7 +467,8 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
             type="bug", priority=1, source=ref, app=app,
             body=body_of(repo=repo, branch=branch, run_id=run_id, head_sha=head_sha,
                          workflow=workflow, url=url, modules=attribution["modules"],
-                         tests=tests, attribution=attribution, author=author),
+                         tests=tests, attribution=attribution, author=author,
+                         diagnosis=diagnosis),
             issue_ref=ref, actor=actor)
     except Exception as exc:  # noqa: BLE001 - l'incident ne fait jamais tomber le relevé
         existing = _open(ops, ref)
@@ -370,7 +498,7 @@ INTEGRATION = {
 }
 
 
-def consume(db, *, integration=None, lands=None, links=None,
+def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
             actor: str = work.SYSTEM_SENDER) -> list[dict]:
     """#1681 : ouvre les incidents des exécutions **terminales rouges** de la
     branche d'intégration, une seule fois par exécution.
@@ -387,6 +515,12 @@ def consume(db, *, integration=None, lands=None, links=None,
     d'autres dépôts. `links` est le port `test→fichiers` qualifié
     (`links_of(carte)`) : sans carte sur l'hôte, l'attribution est `unknown` et
     aucun lot n'est désigné.
+
+    `diagnoses(repo, head_sha)` rend le rapport factuel commun
+    (`ameesh-train-diagnosis/1`, #1467) du paquet atterri, ou None. Il n'est lu
+    que s'il vise la **tête exacte** (`diagnosis_of`) et ne sert que de fait
+    versé au corps : il n'en découle aucune exemption d'environnement, aucun
+    retrait ni aucune accusation. Sans lui, le relevé local fait foi.
 
     Rend une ligne par exécution examinée, ne lève jamais.
     """
@@ -410,7 +544,7 @@ def consume(db, *, integration=None, lands=None, links=None,
             run_id, head_sha = int(row["run_id"]), str(row.get("head_sha") or "")
             line = {"repo": repo, "branch": branch, "app": app, "run_id": run_id, "id": None,
                     "created": False, "status": "", "lot": None, "author": "",
-                    "assigned": False, "why": ""}
+                    "assigned": False, "why": "", "diagnosis": ""}
             try:
                 if st.ci.head_replaced(repo, branch, head_sha, run_id):
                     line["why"] = "tête remplacée : verdict périmé, aucun incident"
@@ -427,12 +561,26 @@ def consume(db, *, integration=None, lands=None, links=None,
                 commits = list(lands(repo, head_sha))
             except Exception as exc:  # noqa: BLE001 - sans preuve, aucune accusation
                 line["why"] = "atterrissage illisible : %s" % type(exc).__name__
+            diagnosis = None
+            if diagnoses is not None and head_sha:
+                try:
+                    report = diagnoses(repo, head_sha)
+                except Exception as exc:  # noqa: BLE001 - un lecteur muet n'empêche pas l'incident
+                    report = None
+                    line["diagnosis"] = "illisible : %s" % type(exc).__name__
+                else:
+                    diagnosis = diagnosis_of(report, head_sha=head_sha)
+                    line["diagnosis"] = ("lu (tête exacte)" if diagnosis
+                                         else ("ignoré : schéma ou tête étrangers"
+                                               if report is not None else "absent"))
+            else:
+                line["diagnosis"] = "absent"
             result = open_incident(
                 db, repo=repo, branch=branch, run_id=run_id, head_sha=head_sha,
                 workflow=str(row.get("workflow") or ""), url=str(row.get("url") or ""),
                 modules=[f.get("module") for f in failures],
                 tests=[f.get("test") for f in failures],
-                commits=commits, app=app, links=links, actor=actor)
+                commits=commits, app=app, links=links, diagnosis=diagnosis, actor=actor)
             line.update(result)
             if not line["why"]:
                 line["why"] = "ouvert"

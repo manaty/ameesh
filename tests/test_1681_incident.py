@@ -26,6 +26,26 @@ def commit(sha: str, lot, files, author: str = "deepseek4", summary: str = "trav
     return {"sha": sha, "lot": lot, "author": author, "summary": summary, "files": files}
 
 
+def diagnosis_report(head: str, **over):
+    """Le rapport `ameesh-train-diagnosis/1` tel que le train le produit (#1467).
+
+    Même forme que `train_diagnosis.unresolved` : construit ici pour que ce
+    consommateur soit témoin du contrat sans dépendre du module du train.
+    """
+    out = {
+        "schema": "ameesh-train-diagnosis/1",
+        "packet": {"source": "manaty/nexlink", "target": "develop",
+                   "base": "b" * 40, "head": head, "tree": "t" * 40},
+        "ci": [{"workflow": "tests.yml", "run": 501, "attempt": 2,
+                "failed_jobs": [{"id": 42, "name": "pytest"}]}],
+        "environment": {"status": "unknown", "receipts": []},
+        "attribution": {"status": "unknown", "candidates": [], "proven_lots": []},
+        "missing": ["liste complète des tests en échec liée à la tentative"],
+    }
+    out.update(over)
+    return out
+
+
 class TestCarteImpact(unittest.TestCase):
     """`attribute` : des liens qualifiés, jamais une preuve de culpabilité."""
 
@@ -159,6 +179,69 @@ class TestLiens(unittest.TestCase):
         liens = incident.links_of(carte)
         self.assertEqual(incident._link_files(liens, "tests/test_ci.py"),
                          {"src/ameesh/ci.py"})
+
+
+class TestDiagnosticFactuel(unittest.TestCase):
+    """`diagnosis_of` : le rapport commun lu comme donnée, jamais une autorité."""
+
+    HEAD = "h" * 40
+
+    def test_schema_ou_rapport_etranger_ignore(self):
+        self.assertIsNone(incident.diagnosis_of(None))
+        self.assertIsNone(incident.diagnosis_of({}))
+        self.assertIsNone(incident.diagnosis_of(
+            diagnosis_report(self.HEAD, schema="ameesh-train-diagnosis/2")))
+
+    def test_tete_exacte_exigee(self):
+        autre = diagnosis_report("x" * 40)
+        self.assertIsNone(incident.diagnosis_of(autre, head_sha=self.HEAD))
+        self.assertEqual(incident.diagnosis_of(autre)["packet"]["head"], "x" * 40)
+
+    def test_rapport_unknown_rend_les_faits_et_les_manques(self):
+        out = incident.diagnosis_of(diagnosis_report(self.HEAD), head_sha=self.HEAD)
+        self.assertEqual(out["schema"], incident.DIAGNOSIS_SCHEMA)
+        self.assertEqual(out["packet"]["head"], self.HEAD)
+        self.assertEqual(out["packet"]["target"], "develop")
+        self.assertEqual(out["environment"], {"status": "unknown", "receipts": 0})
+        self.assertEqual(out["attribution"]["status"], "unknown")
+        self.assertEqual(out["attribution"]["candidates"], [])
+        self.assertEqual(out["attribution"]["proven_lots"], [])
+        self.assertEqual(out["ci"][0]["attempt"], 2)
+        self.assertEqual(out["ci"][0]["failed_jobs"], [{"id": 42, "name": "pytest"}])
+        self.assertEqual(out["missing"],
+                         ["liste complète des tests en échec liée à la tentative"])
+
+    def test_prouve_sans_recu_retombe_en_candidat(self):
+        out = incident.diagnosis_of(
+            diagnosis_report(self.HEAD, attribution={
+                "status": "proven", "candidates": [],
+                "proven_lots": [{"work_item_id": 1598}]}), head_sha=self.HEAD)
+        self.assertEqual(out["attribution"]["proven_lots"], [])
+        self.assertEqual(out["attribution"]["candidates"], [{"work_item_id": 1598}])
+        self.assertTrue(any("reçu" in phrase for phrase in out["missing"]))
+
+    def test_prouve_avec_recu_conserve(self):
+        out = incident.diagnosis_of(
+            diagnosis_report(self.HEAD,
+                             environment={"status": "known",
+                                          "receipts": [{"result": "green"}]},
+                             attribution={"status": "known", "candidates": [],
+                                          "proven_lots": [{"work_item_id": 1598}]}),
+            head_sha=self.HEAD)
+        self.assertEqual([lot["work_item_id"] for lot in out["attribution"]["proven_lots"]],
+                         [1598])
+        self.assertEqual(out["environment"]["receipts"], 1)
+
+    def test_corps_porte_le_diagnostic_sans_accuser(self):
+        diagnosis = incident.diagnosis_of(diagnosis_report(self.HEAD), head_sha=self.HEAD)
+        body = incident.body_of(repo="manaty/nexlink", branch="develop", run_id=501,
+                                head_sha=self.HEAD, modules=["mobile/src/a.test.ts"],
+                                attribution={"status": "unknown"}, diagnosis=diagnosis)
+        self.assertIn("ameesh-train-diagnosis/1", body)
+        self.assertIn("tentative `2`", body)
+        self.assertIn("liste complète des tests en échec", body)
+        self.assertIn("ne désigne aucun lot", body)
+        self.assertNotIn("fautif", body)
 
 
 class _Store:
@@ -462,6 +545,79 @@ class TestConsommateur(unittest.TestCase):
                                    lands=lambda *a: [], links=self.LINKS)
         self.assertEqual(len(out), 2)
         self.assertTrue(all("illisible" in line["why"] for line in out))
+
+    def test_rapport_factuel_lu_et_verse_au_corps(self):
+        store = _Store()
+        seen = []
+
+        def diagnoses(repo, sha):
+            seen.append((repo, sha))
+            return diagnosis_report(sha)
+
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9110}) as add, \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(), lands=lambda *a: [], diagnoses=diagnoses)
+        self.assertEqual(seen, [("manaty/nexlink", "h" * 40)])
+        self.assertEqual(out[0]["diagnosis"], "lu (tête exacte)")
+        body = add.call_args.kwargs["body"]
+        self.assertIn("ameesh-train-diagnosis/1", body)
+        self.assertIn("liste complète des tests en échec", body)
+
+    def test_rapport_etranger_ignore_et_incident_ouvert(self):
+        store = _Store()
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9111}) as add, \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(), lands=lambda *a: [],
+                                   diagnoses=lambda repo, sha: diagnosis_report("x" * 40))
+        self.assertEqual(out[0]["diagnosis"], "ignoré : schéma ou tête étrangers")
+        self.assertNotIn("ameesh-train-diagnosis/1", add.call_args.kwargs["body"])
+
+    def test_rapport_illisible_n_empeche_pas_l_incident(self):
+        store = _Store()
+
+        def broken(repo, sha):
+            raise RuntimeError("magasin absent")
+
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9112}), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(), lands=lambda *a: [], diagnoses=broken)
+        self.assertEqual(out[0]["diagnosis"], "illisible : RuntimeError")
+        self.assertTrue(out[0]["created"])
+
+    def test_sans_lecteur_le_releve_local_fait_foi(self):
+        store = _Store()
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9113}), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(),
+                                   lands=lambda *a: [commit("c" * 40, 1598, [self.FILE])],
+                                   links=self.LINKS)
+        self.assertEqual(out[0]["diagnosis"], "absent")
+        self.assertEqual(out[0]["status"], "unique")
+
+    def test_sans_tete_observee_aucun_rapport_lu(self):
+        store = _Store()
+        called = []
+        with self._db(_CiStore([self._run(head_sha="")],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9114}), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(), lands=lambda *a: [],
+                                   diagnoses=lambda repo, sha: called.append((repo, sha)))
+        self.assertEqual(called, [])
+        self.assertEqual(out[0]["diagnosis"], "absent")
 
 
 if __name__ == "__main__":
