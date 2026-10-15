@@ -11,6 +11,7 @@ modules the map did not select. No database needed.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime
 import importlib.util
 import io
@@ -1801,14 +1802,14 @@ class LotBranchTest(unittest.TestCase):
 
     def _plan(self, event="pull_request", classes=None, card=None,
               base_ref="main", head_ref="lot/1211-ci-impactes-contrat",
-              nature_kw=None, **state_kw):
+              nature_kw=None, mode="auto", **state_kw):
         state = self._state(classes if classes is not None else self._classes(), **state_kw)
         nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
         nature.update(nature_kw or {})
         with mock.patch.object(plan, "classify", return_value=state), \
                 mock.patch.object(plan, "nature", return_value=dict(nature)):
             return plan.make_plan(event, card if card is not None else {}, NOW,
-                                  base_ref=base_ref, head_ref=head_ref)
+                                  base_ref=base_ref, head_ref=head_ref, mode=mode)
 
     def _ran(self, p, driver="psycopg"):
         return sorted(m for ps in p["parts"][driver] for m in ps["modules"])
@@ -1868,12 +1869,21 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
 
     def test_full_suite_on_main_release_and_integration(self):
-        for event in ("push", "workflow_dispatch"):
-            with self.subTest(event):
-                p = self._plan(event=event)
-                self.assertEqual(p["selection"]["mode"], "full")
-                self.assertIn("integration", p["selection"]["why"])
-                self.assertEqual(self._ran(p), sorted(self.mods))
+        # une poussée sur main/release/integration garde la suite complète.
+        p = self._plan(event="push")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("integration", p["selection"]["why"])
+        self.assertEqual(self._ran(p), sorted(self.mods))
+
+    def test_full_request_on_a_lot_pull_request_runs_the_whole_suite(self):
+        # #1343 : `ci-full-<sha>` (release, paquet, demande explicite) sur une
+        # PR ordinaire garde la suite complète, les deux pilotes.
+        p = self._plan(event="pull_request", mode="full")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertEqual(self._ran(p), sorted(self.mods))
+        self.assertEqual(self._ran(p, "psql"), sorted(self.mods))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
 
     def test_release_pull_request_never_takes_the_impacted_selection(self):
         # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
@@ -2788,9 +2798,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("--annotations", self.text)
 
     def test_plan_job_passes_the_pushed_range(self):
-        # #833: a push is planned from github.event.before, not HEAD^1 alone
-        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'push' && "
-                      "github.event.before || 'HEAD^1' }}", self.text)
+        # #833: a push is planned from github.event.before, not HEAD^1 alone ;
+        # #1343 : une demande de gel est planifiée depuis la base du payload
+        # (`pull_request.base.sha`), la composition même du merge-ref vérifié.
+        self.assertIn("AMEESH_CI_BASE: ${{ github.event_name == 'pull_request' && "
+                      "github.event.pull_request.base.sha || (github.event_name == 'push' && "
+                      "github.event.before || 'HEAD^1') }}", self.text)
         self.assertIn('--base "$AMEESH_CI_BASE" --ref "$AMEESH_CI_REF"', self.text)
 
     def test_dynamic_matrices(self):
@@ -2883,6 +2896,11 @@ class WorkflowTest(unittest.TestCase):
         # ancré sur l'étape gel : le `if` du job version ne doit pas suffire.
         self.assertIn("        id: gel\n        if: github.event_name == 'pull_request'\n",
                       self.text)
+        # Les poussées main/release/integration gardent la suite complète.
+        self.assertIn('  pull_request:\n    types: [labeled]\n    branches: [main, '
+                      '"release/**", "integration/**"]\n', self.text)
+        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        self.assertNotIn("\n  workflow_dispatch:", self.text)
 
     def test_label_gate_exact_frozen_sha_and_composition(self):
         # #1343 : le job plan ne teste que la composition demandée — étiquette
