@@ -635,8 +635,8 @@ class _Remise:
     l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
     """
 
-    def __init__(self, bk, name: str, binding) -> None:
-        self.bk, self.name = bk, name
+    def __init__(self, cfg, bk, name: str, binding) -> None:
+        self.cfg, self.bk, self.name = cfg, bk, name
         self.pg = getattr(bk, "kind", None) == "pg"
         self.owner = binding.runner_id if binding.bound_to_lease else None
         self.epoch = binding.epoch if self.owner else None
@@ -645,18 +645,53 @@ class _Remise:
         self.ouverte = False
 
     def prendre(self, limite: int | None = None) -> list[dict]:
-        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
+        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour).
+
+        #811 B1 : un message dont l'unique lot est un secondaire déclaré sans
+        dossier n'est pas réservé — l'exécuteur retient ce courrier, mais son
+        état de différé vit en mémoire et le hook ne le voit pas : sans cette
+        garde partagée il le remettrait dans la session d'un autre lot et le
+        marquerait livré."""
         if not self.pg:
             self.msgs = self.bk.unread(self.name)
             if limite is not None:
                 self.msgs = self.msgs[:max(0, limite)]
             return self.msgs
+        ids = self._deliverable(limite)
+        if not ids:
+            self.msgs = []
+            return self.msgs
         rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
                             limit=200 if limite is None else max(1, limite))
         self.ouverte = bool(rows)
         self.msgs = [mail.normalize(row) for row in rows]
         return self.msgs
+
+    def _deliverable(self, limite: int | None) -> list[int]:
+        """#811 B1 : les ids à réserver, les lots différés laissés en place.
+
+        Même règle que l'exécuteur (`lot_workdir.mail_hold`), dérivée du
+        registre et du Host pour être visible du hook."""
+        from . import lot_workdir, projects, registry, storage
+        rows = mail.unread(self.bk.db, self.name)
+        agent = registry.get(self.bk.db, self.name) or {}
+        if len(projects.agent_projects(agent)) < 2:
+            gardes = [int(row["id"]) for row in rows if row.get("id") is not None]
+        else:
+            ops = storage.of(self.bk.db).operations
+            gardes = []
+            for row in rows:
+                mid = int(row.get("id") or 0)
+                lots = ops.message_lots([mid]) if mid else []
+                if len(lots) == 1 and lot_workdir.mail_hold(self.cfg, self.bk.db, agent,
+                                                            lots[0]):
+                    continue
+                if mid:
+                    gardes.append(mid)
+        if limite is not None:
+            gardes = gardes[:max(1, limite)]
+        return gardes
 
     def _ids(self) -> list[int]:
         return [int(m["id"]) for m in self.msgs if m.get("id") is not None]
@@ -978,7 +1013,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                     etat["differe"] = True
             _tour_ecrit(cfg, name, etat)
             return 0
-        remise = _Remise(bk, name, binding)
+        remise = _Remise(cfg, bk, name, binding)
         try:
             msgs = remise.prendre(borne - etat["remis"] if etat is not None else None)
             avis = ""

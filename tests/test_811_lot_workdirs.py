@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L243-4: project directories and per-lot resume on real Postgres."""
+import io
+import json
 import os
+import sys
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import backlog, canon, lot_workdir, mail, registry, storage, work
+from ameesh import backlog, canon, cli, lot_workdir, mail, registry, storage, work
 from ameesh.runner import AgentWorker
 
 from . import test_l165c_sessions_par_lot as sessions
@@ -126,28 +130,22 @@ class RoutingTest(sessions._Base):
         self.assertNotEqual(row['status'], 'blocked')
 
     def test_missing_secondary_mail_waits_primary_mail_passes(self):
-        """#811 B1 : dossier secondaire absent — seul son courrier attend ; le
-        courrier primaire du même agent passe, dans le cwd primaire."""
+        """#811 B1 : dossier secondaire absent — le courrier de B n'ouvre même
+        pas de tour (règle partagée exécuteur/hook) ; il reste non lu, aucun
+        blocage global, et le courrier primaire passe."""
         os.rmdir(self.secondary)
         mail.send(self.db, 'orch', 'worker', 'B plus tard', work_item_id=str(self.b))
-        spec = self.worker.rotate_for_lot(self.worker.pick())
-        self.assertTrue(spec.get('lot_switch_failed'))
-        self.assertFalse(self.worker.run_turn(spec))
+        self.assertIsNone(self.worker.pick())                 # rien à faire pour B
         self.assertTrue(self.worker.workdir_ready())          # aucun blocage global
-        self.assertTrue(self.worker._lot_deferred(str(self.b)))
         self.assertEqual(len(mail.unread(self.db, 'worker')), 1)  # B reste non lu
         self.tour(self.worker, self.a, 'A maintenant', session='session-A')
         self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self.primary)
 
     def test_pending_prompt_for_missing_secondary_keeps_primary_mail(self):
-        """#811 B1 : une fois le lot secondaire différé, la consigne qui lui
-        serait rattachée reste en attente au lieu de consommer le tour ; le
-        courrier primaire passe."""
+        """#811 B1/B2 : la consigne qui serait rattachée au lot sans dossier est
+        tenue (règle partagée, sans tour perdu) ; le courrier primaire passe
+        dans le même pick."""
         os.rmdir(self.secondary)
-        mail.send(self.db, 'orch', 'worker', 'B plus tard', work_item_id=str(self.b))
-        spec = self.worker.rotate_for_lot(self.worker.pick())
-        self.assertTrue(spec.get('lot_switch_failed'))
-        self.assertFalse(self.worker.run_turn(spec))          # B est différé
         # B est le seul lot assigné ouvert : la consigne lui serait rattachée.
         self.db.execute('UPDATE work_items SET assignee = NULL WHERE id = %s', (self.a,))
         self.db.execute("UPDATE agent_registry SET pending_prompt = 'consigne'"
@@ -159,6 +157,47 @@ class RoutingTest(sessions._Base):
         self.assertIn('A maintenant', spec['prompt'])
         agent = registry.get(self.db, 'worker')
         self.assertIn('consigne', agent.get('pending_prompt') or '')   # non consommée
+
+    def test_hook_holds_a_blocked_secondary_message_during_a_primary_turn(self):
+        """#811 B1 : le hook ne remet pas le courrier d'un lot sans dossier —
+        l'état de différé du worker vit en mémoire et lui est invisible ; le
+        message doit rester non lu pour le lot, pas être livré dans A."""
+        os.rmdir(self.secondary)
+        mid_a = mail.send(self.db, 'orch', 'worker', 'A pendant le tour A',
+                          work_item_id=str(self.a))
+        mid_b = mail.send(self.db, 'orch', 'worker', 'B retenu', work_item_id=str(self.b))
+        env = {'AGENT_MAIL_NAME': 'worker',
+               'AMEESH_RUNNER_ID': self.worker.runner.runner_id,
+               'AMEESH_LEASE_EPOCH': str(self.worker.epoch),
+               'AMEESH_TURN_ID': ''}
+        payload = json.dumps({'hook_event_name': 'PostToolUse', 'cwd': self.primary,
+                              'session_id': 'session-A'})
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(sys, 'stdin', io.StringIO(payload)), \
+                mock.patch.object(sys, 'stdout', out):
+            self.assertEqual(cli.cmd_hook(self.cfg, 'claude'), 0)
+        texte = out.getvalue()
+        self.assertIn('A pendant le tour A', texte)
+        self.assertNotIn('B retenu', texte)
+        restants = [int(m['id']) for m in mail.unread(self.db, 'worker') if m.get('id')]
+        self.assertEqual(restants, [mid_b])                   # A remis, B intact
+        self.assertNotEqual(mid_a, mid_b)
+
+    def test_lot_wake_skips_a_blocked_lot_and_wakes_the_ready_one(self):
+        """#811 B2 : le réveil du lot sans dossier n'est pas consommé ; le lot
+        actionnable prêt, derrière lui, est réveillé à sa place."""
+        self.db.execute('UPDATE work_items SET priority = 1 WHERE id = %s', (self.b,))
+        os.rmdir(self.secondary)
+        self.worker._lot_workdir_deferred(str(self.b))        # B est différé
+        self.worker.last_activity = time.monotonic() - 10_000.0
+        self.worker._lot_wake_checked = float('-inf')
+        spec = self.worker._lot_wake_spec()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec['lot'], str(self.a))
+        rows = {int(r['id']): r for r in storage.of(self.db).lot_sessions.actionable('worker')}
+        self.assertEqual(int(rows[self.b]['wakes']), 0)       # réveil de B intact
+        self.assertEqual(int(rows[self.a]['wakes']), 1)
 
     def test_mediated_secondary_cannot_use_primary_depot(self):
         self.worker.runner.mediated = True
