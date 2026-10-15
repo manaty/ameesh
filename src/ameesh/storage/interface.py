@@ -101,6 +101,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
+   api_requests    reserve complete release
    watches         put delete list deliver
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
@@ -568,15 +569,50 @@ class Budgets(Domain):
 
     @abc.abstractmethod
     def put(self, scope: str, window_s: int, usd: float | None, *,
-            actor: str) -> tuple[bool, float | None]:
+            actor: str, lower_only: bool = False,
+            ceiling: float | None = None) -> tuple[bool, float | None]:
         """Pose (`usd` > 0) ou retire (`usd` None) un plafond, et journalise,
         en UNE transaction (verrou de la ligne). Rend (changé, ancienne
-        valeur) ; rien n'est écrit ni journalisé si la valeur est la même."""
+        valeur) ; rien n'est écrit ni journalisé si la valeur est la même.
+
+        `lower_only` (L87, `POST /api/v1/budget/caps`) : ValueError, rien
+        d'écrit, sauf si `usd` est strictement sous le plafond en vigueur,
+        lu sous le verrou — la ligne en place, sinon `ceiling` (celui de la
+        configuration ; None : aucun plafond)."""
 
     @abc.abstractmethod
     def events(self, limit: int, scope: str | None = None) -> list[dict]:
         """Les derniers changements, récents d'abord : scope, window_s,
         old_usd, new_usd, actor, at_ts."""
+
+
+# --------------------------------------------------------------------------
+# API idempotency (L87, migration 0440)
+# --------------------------------------------------------------------------
+
+class ApiRequests(Domain):
+    """The `Idempotency-Key` of the API's actions (`ameesh serve`): one row
+    per (human, key), reserved before the action runs, completed with its
+    response once it has answered."""
+
+    @abc.abstractmethod
+    def reserve(self, human: str, key: str, fingerprint: str, *,
+                retention_s: int) -> dict | None:
+        """Reserves (human, key) for the request `fingerprint`, in ONE
+        transaction, after purging the rows older than `retention_s`. None when
+        the key is new (the caller acts); otherwise the row in place:
+        fingerprint, status, response (status and response None while the
+        first request is still running)."""
+
+    @abc.abstractmethod
+    def complete(self, human: str, key: str, status: int, response: dict) -> bool:
+        """Stores the response of a reserved key; False if the reservation is
+        gone or already completed (nothing written)."""
+
+    @abc.abstractmethod
+    def release(self, human: str, key: str) -> bool:
+        """Drops a reservation that was never completed (transient failure:
+        the client may retry with the same key); False if there was none."""
 
 
 # --------------------------------------------------------------------------
@@ -3008,6 +3044,7 @@ class Storage(abc.ABC):
     accounts: Accounts
     credentials: Credentials
     budgets: Budgets
+    api_requests: ApiRequests
     watches: Watches
     mailbox: Mailbox
     wakeups: Wakeups
