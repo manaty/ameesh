@@ -1249,7 +1249,20 @@ class InstallPilotTest(unittest.TestCase):
         offer_text = re.search(r"```json\n(.*?)```", text, re.S).group(1)
         offer, problems, unknown = capacity_guard.parse_lend(json.loads(offer_text))
         self.assertEqual((problems, unknown), ([], []))
-        self.assertEqual(offer["reclaim"]["busy_units"], ["actions.runner.*"])
+        # the runners' services stay active between jobs: no busy_units (R1 cx1)
+        self.assertNotIn("busy_units", offer["reclaim"])
+        # install.sh caps the offloaded jobs, not the guard: same values
+        caps = shlex.split(re.search(r'CAPS="([^"]*)"', text).group(1))
+        caps = dict(zip(caps[::2], caps[1::2]))
+        gib = 1024 ** 3
+        self.assertEqual(int(caps["--slots"]) * offer["agent_memory_max"] // gib,
+                         offer["memory_max"] // gib)
+        self.assertEqual(int(caps["--memory-max"].rstrip("G")), offer["memory_max"] // gib)
+        self.assertEqual(int(caps["--job-memory-max"].rstrip("G")),
+                         offer["agent_memory_max"] // gib)
+        self.assertEqual(float(caps["--cpu-share"]) * 16, offer["cpu_max"])  # 16 vCPU
+        self.assertEqual(len(re.findall(r"sudo deploy/guest/install\.sh (?:--dry-run )?--gate file \$CAPS",
+                                        text)), 2)
         self.assertTrue(all(w.endswith("Europe/Paris") for w in offer["windows"]))
         offer_file = os.path.join(self.host, "offer.json")
         with open(offer_file, "w", encoding="utf-8") as fh:

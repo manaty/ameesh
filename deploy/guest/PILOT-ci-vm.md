@@ -53,8 +53,6 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
     "cpu_pressure_max": "20%",
     "memory_pressure_max": "2%",
     "io_pressure_max": "20%",
-    "busy_units": ["actions.runner.*"],
-    "busy_max": 2,
     "disk_free_min": "10GiB",
     "disk_paths": ["/", "/srv/ameesh-guest"]
   },
@@ -67,16 +65,32 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
   2 h after it: 10:30–13:00 and 22:30–01:00, Paris time, every day (the
   zone follows summer time). A package CI that runs longer than 2 h still
   takes the VM back through `busy_units`.
-* **`busy_units`/`busy_max`.** Outside the cut-offs, only a lot that
-  unblocks the CI or fixes an incident runs a CI (§11 bis). With more than
-  two runner jobs at once, the guard drains the guest; it lends again after
-  `calm_seconds`. Check the units' names first (step 1): the pattern must
-  match the runners' services on this VM.
+* **No `busy_units`.** The runners' services `actions.runner.*` stay
+  active between jobs: counting them counts installed runners, not running
+  jobs, and with more runners than `busy_max` the gate would never open. A
+  job has no unit of its own (its `Runner.Worker` lives in the service's
+  cgroup). Outside the cut-offs, only a lot that unblocks the CI or fixes an
+  incident runs a CI (§11 bis): the pressure and memory thresholds above
+  take the VM back from the guest when such a CI loads it, and
+  `cpu_weight` 10 makes the CI win every contention meanwhile. A per-job
+  unit (the runner's job hooks) is for the CI's maintainers to offer; until
+  then the offer names none.
 * **Caps.** `cpu_max` 6 and `memory_max` 18 GiB are the study's
-  off-peak margin (≈ 7 vCPU, ≈ 18 GB); `cpu_weight` 10 makes the CI win
-  every contention. Three jobs of `agent_memory_max` 6 GiB fit.
-  `disk_max` 40 GiB is the volume `volume-pilot.sh` makes (40 GB, about
-  €3.80 a month): nothing else holds it.
+  off-peak margin (≈ 7 vCPU, ≈ 18 GB). Three jobs of `agent_memory_max`
+  6 GiB fit. `disk_max` 40 GiB is the volume `volume-pilot.sh` makes (40 GB,
+  about €3.80 a month): nothing else holds it.
+* **Who enforces the caps.** In b1, the guard's caps would bound
+  `ameesh-guest.slice`, where guest runners live, and there are none here.
+  The offloaded jobs run in `user-<uid>.slice` of the jobs' user (#354), and
+  the shell that receives them in the guest's own. `install.sh` writes the
+  caps on both, from its own options, which default to 75 % of the CPUs and
+  60 % of the RAM. Step 3 therefore passes the offer's values explicitly:
+  `--cpu-share` is `cpu_max` divided by `nproc` (0.375 on 16 vCPU),
+  `--memory-max` is `memory_max`, `--job-memory-max` is `agent_memory_max`
+  and `--slots 3`. Each of the two slices gets these caps in full; the
+  shell only unpacks snapshots, so the jobs' slice is the one that counts.
+  The guard keeps the gate (windows and reclaim); the gate does not read
+  the caps.
 
 ## Before
 
@@ -106,7 +120,7 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
 
    ```sh
    nproc; free -g; df -h / /srv/ameesh-guest
-   systemctl list-units --plain --no-legend 'actions.runner.*'   # busy_units matches them
+   systemctl list-units --plain --no-legend 'actions.runner.*'   # the CI's runners, left alone
    id runner                                                       # docker: expected
    ss -ltnp | awk 'NR>1 {print $4}'                                # loopback ports to deny
    ```
@@ -125,11 +139,17 @@ To be written in the VM's `Host` card of the canon (`hotes/<vm>.md`,
    installer's `0755`:
 
    ```sh
-   sudo deploy/guest/install.sh --dry-run --gate file --key "$(cat poste.pub)" \
+   CAPS="--slots 3 --cpu-share 0.375 --memory-max 18G --memory-high 15G --job-memory-max 6G"
+   sudo deploy/guest/install.sh --dry-run --gate file $CAPS --key "$(cat poste.pub)" \
      --from <workstation IP>,<mesh VM IP> --deny-port <ports of step 1>
-   sudo deploy/guest/install.sh --gate file --key "$(cat poste.pub)" \
+   sudo deploy/guest/install.sh --gate file $CAPS --key "$(cat poste.pub)" \
      --from <workstation IP>,<mesh VM IP> --deny-port <ports of step 1>
    ```
+
+   `0.375` is 6 CPUs out of 16: with another `nproc`, use 6 divided by it.
+   The dry run's `caps on user-….slice` lines must show `MemoryMax=18G` and
+   `CPUQuota=600%`, for the guest and for the jobs' user. Any other
+   value means the offer and the caps differ: stop there.
 
 4. **Check.** Every line `ok`:
 
