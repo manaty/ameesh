@@ -34,6 +34,7 @@ from .menage import Housekeeping
 from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
+from .prevalidation import PrevalidationReports
 from .progress import Progress
 from .projects import Projects
 from .provenance import Provenance
@@ -98,4 +99,5 @@ class PostgresStorage(interface.Storage):
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
         self.ci = CiResults(db)
+        self.prevalidation = PrevalidationReports(db)
         self.conversations = Conversations(db)
