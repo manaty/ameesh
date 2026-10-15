@@ -26,8 +26,9 @@ from __future__ import annotations
 import dataclasses
 import os
 import unittest
+from unittest import mock
 
-from ameesh import persona_sessions as ps, registry, reprise, review_lot
+from ameesh import persona_sessions as ps, platform, registry, reprise, review_lot
 from ameesh.backend import PgBackend
 
 from .support import PgTestCase
@@ -63,6 +64,14 @@ class AdoptBasculeTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #1805 : le sujet est la purge des reglages, pas le garde-fou
+        # processus — table des processus injectee (deterministe). Sur un
+        # poste ou un demon du meme utilisateur est illisible (gpg-agent),
+        # platform.holders leve NotAvailable et `adopt` refuse (fail-closed
+        # L63b, voulu) ; la lecture reelle a ses tests (test_l63_platform).
+        patcher = mock.patch.object(platform, "holders", lambda *a, **k: [])
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.travail = os.path.join(self.tmp, "travail")
         os.makedirs(self.travail, exist_ok=True)
         self.compte = _dossier(os.path.join(self.tmp, "comptes", "codex-1"),
