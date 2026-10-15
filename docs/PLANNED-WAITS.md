@@ -30,8 +30,14 @@ A lot is stale when it is open and inactive beyond the configured threshold
   `since`) and only an explicit lift (`unhold:`, `hold lifted:`,
   `hold released:`, `hold cleared:`) or a state change ends it: an ordinary
   note (triage, status report) does not, and a later `hold:` note re-arms it.
-  The runner wake keeps its own, older convention (`LotSessions.HOLD_PREFIX`,
-  last non-empty note decides); the two are deliberately separate.
+  The write path authenticates the claim: `ameesh work note` and
+  `ameesh work move --note` refuse a `hold:`/lift note that claims a pilot
+  identity the writing session cannot prove (same guard as a state
+  correction, `history=False`). The runner wake keeps its own, older
+  convention (`LotSessions.HOLD_PREFIX`, last non-empty note decides): any
+  assignee may write a plain `hold:` to stop its own wake, but such a hold is
+  not a pilot's and does not defer this alert; the two conventions are
+  deliberately separate.
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free

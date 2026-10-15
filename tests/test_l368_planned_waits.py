@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import time
 import unittest
 
@@ -149,9 +150,30 @@ class UnitTest(unittest.TestCase):
 
 
 class PgTest(PgTestCase):
+    #: #1664 r2 : l'identité du lanceur ne décide pas du test.
+    IDENTITY_ENV = ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                    "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+                    "AMEESH_ALERT_ORCHESTRATORS")
+
     def setUp(self):
         self.db.execute("TRUNCATE work_items, commitments, work_packages CASCADE")
         self.now = time.time()
+
+    def unbound(self, **extra):
+        """Environnement d'identité neutre pour ce test, restauré à la fin."""
+        saved = {key: os.environ.get(key) for key in self.IDENTITY_ENV}
+        for key in self.IDENTITY_ENV:
+            os.environ.pop(key, None)
+        os.environ.update(extra)
+
+        def restore():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore)
 
     def old(self, item):
         for sql in ("UPDATE work_items SET updated_at = to_timestamp(%s), created_at = to_timestamp(%s) WHERE id = %s",
@@ -223,8 +245,9 @@ class PgTest(PgTestCase):
     def test_hold_note_suppresses_stagnation_until_lifted_or_moved(self):
         """#1664 : une note `hold:` d'un pilote éteint la relance 6 h et ses vues
         (work, progression) ; une note ordinaire ne la lève pas, seuls une levée
-        explicite ou un changement d'état le font ; le hold d'un acteur sans
-        autorité ne compte pas."""
+        explicite ou un changement d'état le font ; le hold d'un acteur ordinaire
+        (règle 1) ne compte pas."""
+        self.unbound()
         lot = self.item("parked on an operator window")
         work.note(self.db, lot["id"], "hold: fenêtre opérateur + accès",
                   actor="human:pilote")
@@ -242,7 +265,7 @@ class PgTest(PgTestCase):
         work.note(self.db, lot["id"], "triage: relevé de passage", actor="dev7")
         self.old(lot)
         self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
-        # le hold d'un acteur sans autorité ne compte pas
+        # le hold d'un acteur ordinaire (règle 1) ne compte pas pour la stagnation
         other = self.item("hold sans autorité")
         work.note(self.db, other["id"], "hold: décision d'équipe", actor="dev7")
         self.old(other)
@@ -262,3 +285,58 @@ class PgTest(PgTestCase):
         self.old(lot)
         self.assertIn(lot["id"],
                       [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+
+    def test_hold_note_authenticates_the_claimed_pilot(self):
+        """#1664 r2 (B1) : une session ordinaire ne pose ni ne lève un hold de
+        pilote en donnant `--actor human:…` ; sa propre note `hold:` (règle 1)
+        reste permise et n'éteint pas la stagnation."""
+        lot = self.item("porte pilote")
+        other = self.item("faux hold de pilote")
+        # un terminal humain sans liaison dit qui il est : le hold de pilote passe
+        self.unbound()
+        work.note(self.db, lot["id"], "hold: porte opérateur", actor="human:pilote")
+        self.old(lot)
+        self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
+                         [other["id"]])
+        # une session liée ordinaire ne se dit pas pilote…
+        self.unbound(AGENT_MAIL_NAME="dev7")
+        with self.assertRaisesRegex(work.WorkError, "belongs to dev7"):
+            work.note(self.db, other["id"], "hold: faux pilote", actor="human:pilote")
+        with self.assertRaisesRegex(work.WorkError, "belongs to dev7"):
+            work.move(self.db, other["id"], "build", note="hold: faux pilote",
+                      actor="human:pilote")
+        # …ni lever le hold du pilote, même en son propre nom
+        with self.assertRaisesRegex(work.WorkError, "neither a human"):
+            work.note(self.db, lot["id"], "unhold: à tort", actor="dev7")
+        # sa propre note `hold:` (règle 1) passe, mais la stagnation reste due
+        work.note(self.db, other["id"], "hold: je ne peux pas avancer", actor="dev7")
+        self.old(other)
+        self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
+                         [other["id"]])
+        self.old(lot)
+        self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
+                         [other["id"]])
+
+    def test_cli_refuses_a_pilot_hold_from_an_ordinary_session(self):
+        """#1664 r2 (B1) : le chemin réel — `work.resolve_actor` rend `--actor`
+        explicite avant tout contrôle, et la garde d'écriture refuse la session
+        ordinaire ; un terminal humain sans liaison dit qui il est, et le pilote
+        lié pose son hold en son nom."""
+        lot = self.item("porte pilote")
+        spoof = self.mesh("work", "note", str(lot["id"]), "hold: faux pilote",
+                          "--actor", "human:pilote", env=self.env(AGENT_MAIL_NAME="dev7"))
+        self.assertNotEqual(spoof.returncode, 0, spoof.stdout)
+        self.assertIn("refused", spoof.stderr)
+        # un humain à son terminal : aucune liaison, il dit qui il est
+        ok = self.mesh("work", "note", str(lot["id"]), "hold: fenêtre opérateur",
+                       "--actor", "human:pilote", env=self.env())
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.old(lot)
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        # le pilote lié (rôle déclaré) pose son hold en son nom
+        other = self.item("porte pilote liée")
+        self.unbound(AGENT_MAIL_NAME="mesh-design",
+                     AMEESH_ALERT_ORCHESTRATORS="mesh-design")
+        work.note(self.db, other["id"], "hold: fenêtre opérateur", actor="mesh-design")
+        self.old(other)
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])

@@ -6,8 +6,9 @@ an explicit blocking dependency — or an explicit **hold** (#1664), the note a
 pilot writes when the lot is parked on a gate no open lot carries (operator
 window, human decision). The hold stops the stale reminders and the SLO
 breaches, like any other planned wait, until the lot changes state or the hold
-is explicitly lifted. Only a pilot's hold counts here (`pilot_holds`); the
-runner wake keeps its own, older convention (`LotSessions.HOLD_PREFIX`)."""
+is explicitly lifted. Only a pilot's hold counts here (`pilot_holds`), and the
+write path authenticates that claim (`work.check_wait_note`); the runner wake
+keeps its own, older convention (`LotSessions.HOLD_PREFIX`)."""
 from __future__ import annotations
 
 import re
@@ -23,6 +24,19 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 _HOLD = re.compile("^" + re.escape(LotSessions.HOLD_PREFIX), re.I)
 #: les notes de levée explicite ; un changement d'état du lot lève aussi.
 _LIFT = re.compile(r"^(?:unhold|hold\s+(?:lifted|released|cleared))\s*:", re.I)
+
+
+def is_hold_note(text) -> bool:
+    """#1664 : la note qui pose une retenue (`hold: <raison>`). Le préfixe est
+    celui du réveil (règle 1) ; seule la retenue d'un pilote compte pour la
+    stagnation (`pilot_holds`)."""
+    return bool(_HOLD.match(str(text or "").strip()))
+
+
+def is_lift_note(text) -> bool:
+    """#1664 : la note qui lève explicitement une retenue (`unhold:`,
+    `hold lifted:`/`released:`/`cleared:`)."""
+    return bool(_LIFT.match(str(text or "").strip()))
 
 
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
@@ -55,10 +69,10 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
             if allowed is not None and not (allowed(who) if callable(allowed)
                                             else who in allowed):
                 continue
-            if _HOLD.match(text):
+            if is_hold_note(text):
                 held = {"what": "hold", "by": who or None,
                         "since": event.get("created_ts")}
-            elif _LIFT.match(text):
+            elif is_lift_note(text):
                 held = None
         if held:
             out[ident] = held
@@ -75,7 +89,7 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     du canon), sans l'historique des lots confiés. Un hold d'un autre acteur
     garde son effet sur le réveil (règle 1) mais ne supprime pas l'alerte."""
     events = list(events or ())
-    if not any(_HOLD.match(str(event.get("note") or "").strip()) for event in events):
+    if not any(is_hold_note(event.get("note")) for event in events):
         return {}
     cfg = getattr(db, "cfg", None) if cfg is None else cfg
     from . import assignments, work            # imports tardifs : pas de cycle
