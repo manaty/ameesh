@@ -58,9 +58,10 @@
         the event log (lot transitions, turns, costs, threads, decisions, alerts) and
         its retention (365 days by default, L85);
   ameesh identity verify [JETON|-] [--issuer U --client-id C] [--domain D]
-        vérifie un jeton d'identité OIDC et le rattache au canon (`emails` ou
-        `oidc_subjects` d'une fiche Member) : L86, lot #377 ; sortie 3 si
-        aucun membre ne correspond ;
+                         [--binding subject|email]
+        vérifie un jeton d'identité OIDC et le rattache au canon (le couple
+        `{issuer, subject}` d'une fiche Member par défaut, `emails` sur choix
+        explicite) : L86, lot #377 ; sortie 3 si aucun membre ne correspond ;
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);

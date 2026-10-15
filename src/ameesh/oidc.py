@@ -12,24 +12,31 @@ qu'il est* dans l'organisation. Ce module :
   échéances (`exp`, `nbf`, `iat`, avec une tolérance), `nonce` s'il est
   attendu, et la **restriction de domaine** de l'organisation (`hd` de Google,
   sinon domaine de l'e-mail, avec `email_verified`) ;
-* rattache l'identité vérifiée à un **membre du canon** (`human:<id>`) :
-  soit par l'e-mail vérifié du jeton (`emails:` de la fiche, étude §2.4),
-  soit par le couple `{issuer, subject}` (`oidc_subjects:` de la fiche).
+* rattache l'identité vérifiée à un **membre du canon** (`human:<id>`), par le
+  couple exact `{issuer, subject}` (`oidc_subjects:` de la fiche) par défaut,
+  ou par l'e-mail vérifié (`emails:`, mode `email`) si l'owner l'active.
 
-Le champ du canon n'est pas encore tranché : la proposition 0033 phase 2
-(manaty/home#97, lot #377) recommande `emails` et garde `oidc_subjects` en
-secours. Ce module lit les deux, et rien ne s'active sans décision de l'owner.
+Le rattachement est une décision de l'owner (proposition 0033 phase 2,
+manaty/home#97, lot #377) : la relecture recommande `{issuer, subject}` —
+OIDC Core §5.7, un e-mail peut être réattribué et n'est pas un identifiant
+unique. `identity.binding` vaut `subject` par défaut ; `email` ne s'active que
+par choix explicite. Rien n'est activé sans décision.
 
-Aucune dépendance : RS256 est vérifié en Python pur (PKCS#1 v1.5, clé ≥ 2048
-bits), ES256 par `ameesh.p256`. Un jeton n'est jamais journalisé.
+Le contrat (étude `ui-integrable` §2.4, fiche L86) : **RS256 par l'extra
+`crypto`** (`cryptography`, PKCS#1 v1.5, clé ≥ 2048 bits), **ES256 par
+`ameesh.p256`**. L'extra reste optionnel à l'installation ; sans lui, RS256 est
+refusé par une erreur explicite (fail closed), jamais par un repli maison. Un
+jeton n'est jamais journalisé.
 
 Configuration de l'hôte (jamais de secret ; un client OIDC public suffit pour
 vérifier) :
 
-    "identity": {"providers": [
-        {"issuer": "https://accounts.google.com", "client_id": "…",
-         "domains": ["exemple.org"]}
-    ]}
+    "identity": {
+        "binding": "subject",             # subject (défaut) | email
+        "providers": [
+            {"issuer": "https://accounts.google.com", "client_id": "…",
+             "domains": ["exemple.org"]}
+        ]}
 
 Un `issuer` en `http://` n'est accepté que sur la boucle locale (essai
 Keycloak d'un poste) ; partout ailleurs, `https://` est exigé.
@@ -37,7 +44,6 @@ Keycloak d'un poste) ; partout ailleurs, `https://` est exigé.
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac
 import json
 import time
@@ -49,8 +55,6 @@ ALLOWED_ALGS = ("RS256", "ES256")
 DEFAULT_LEEWAY_S = 60
 JWKS_TTL_S = 3600
 RSA_MIN_BITS = 2048
-#: DigestInfo DER de SHA-256 (RFC 8017 §9.2)
-_SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
 class OidcError(ValueError):
@@ -111,18 +115,36 @@ def _int(b64: str) -> int:
     return int.from_bytes(b64url_decode(b64), "big")
 
 
+def _crypto():
+    """L'extra `crypto` (`cryptography>=41`), requis pour RS256 (fiche L86).
+
+    L'extra reste optionnel à l'installation : sans lui, RS256 n'a pas de
+    vérificateur et le jeton est refusé par une erreur explicite (fail closed),
+    jamais par un repli écrit à la main."""
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    except ImportError as exc:
+        raise OidcError("RS256 exige l'extra `crypto` : `pip install 'ameesh[crypto]'`"
+                        " (cryptography>=41)") from exc
+    return rsa, padding, hashes, InvalidSignature
+
+
 def rsa_verify(n: int, e: int, message: bytes, signature: bytes) -> bool:
-    """RSASSA-PKCS1-v1_5 avec SHA-256 (RS256), en temps constant pour la comparaison."""
-    k = (n.bit_length() + 7) // 8
-    if n.bit_length() < RSA_MIN_BITS or len(signature) != k:
+    """RS256 (RSASSA-PKCS1-v1_5, SHA-256) par l'extra `crypto`."""
+    rsa, padding, hashes, invalid = _crypto()
+    try:
+        public = rsa.RSAPublicNumbers(e, n).public_key()
+    except (ValueError, TypeError):
         return False
-    s = int.from_bytes(signature, "big")
-    if s >= n:
+    if public.key_size < RSA_MIN_BITS:
         return False
-    em = pow(s, e, n).to_bytes(k, "big")
-    t = _SHA256_PREFIX + hashlib.sha256(message).digest()
-    expected = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
-    return hmac.compare_digest(em, expected)
+    try:
+        public.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+    except invalid:
+        return False
+    return True
 
 
 def es256_verify(jwk: dict, message: bytes, signature: bytes) -> bool:
@@ -136,6 +158,7 @@ def es256_verify(jwk: dict, message: bytes, signature: bytes) -> bool:
 
 
 def verify_signature(header: dict, jwk: dict, signing_input: bytes, signature: bytes) -> bool:
+    """RS256 par l'extra `crypto` (sans lui, `OidcError` : fail closed), ES256 par `p256`."""
     alg = header.get("alg")
     if alg == "RS256" and jwk.get("kty") == "RSA":
         return rsa_verify(_int(jwk["n"]), _int(jwk["e"]), signing_input, signature)
@@ -271,28 +294,62 @@ def _member_subjects(member, issuer: str) -> set:
     return out
 
 
-def human_for(canons, claims: dict, *, issuer: str = "") -> str | None:
+#: rattachement au canon : `subject` (défaut, recommandé) exige le couple exact
+#: `{issuer, subject}` de la fiche ; `email` (à activer par décision) accepte
+#: l'e-mail vérifié. OIDC Core §5.7 : un e-mail peut être réattribué, il n'est
+#: pas un identifiant unique — d'où le défaut sans e-mail.
+BINDING_SUBJECT = "subject"
+BINDING_EMAIL = "email"
+BINDING_MODES = (BINDING_SUBJECT, BINDING_EMAIL)
+DEFAULT_BINDING = BINDING_SUBJECT
+
+
+def binding(cfg) -> str:
+    """Mode de rattachement de l'hôte (`identity.binding`, `subject` par défaut).
+
+    Un mode inconnu est refusé (fail closed) : mieux vaut ne rien rattacher que
+    rattacher par un chemin que l'owner n'a pas choisi."""
+    raw = (getattr(cfg, "identity", None) or {}).get("binding")
+    mode = str(raw or DEFAULT_BINDING).strip().lower()
+    if mode not in BINDING_MODES:
+        raise OidcError("`identity.binding` inconnu : %r (%s)"
+                        % (raw, ", ".join(BINDING_MODES)))
+    return mode
+
+
+def human_for(canons, claims: dict, *, issuer: str = "",
+              mode: str = DEFAULT_BINDING) -> str | None:
     """`human:<id>` du membre que le jeton vérifié désigne, sinon None.
 
-    Deux rattachements, dans cet ordre : l'e-mail vérifié du jeton s'il figure
-    dans les `emails:` d'une fiche (option A de la proposition home#97), sinon
-    le couple `{issuer, subject}` s'il figure dans les `oidc_subjects:` d'une
-    fiche (option B). Strict : e-mail déclaré vérifié, `issuer` non vide pour
-    l'option B, et **un seul** membre correspondant dans l'ensemble des canons
-    (sinon None, fail closed)."""
+    `mode` vaut `subject` (défaut) ou `email` ; il vient de la décision de
+    l'owner (`identity.binding`), jamais du jeton :
+
+    * `subject` : le couple `{issuer, subject}` doit figurer dans les
+      `oidc_subjects:` d'une fiche (option B de la proposition home#97, la
+      recommandation) ; l'e-mail n'est pas regardé ;
+    * `email` : l'e-mail vérifié doit figurer dans les `emails:` d'une fiche
+      (option A) ; le `sub` n'est pas regardé. OIDC Core §5.7 : l'e-mail peut
+      être réattribué, ce mode reste un choix explicite.
+
+    Strict dans les deux cas : **un seul** membre correspondant dans l'ensemble
+    des canons, sinon None (fail closed)."""
+    if mode not in BINDING_MODES:
+        raise OidcError("mode de rattachement inconnu : %r" % (mode,))
     candidates = set()
-    email = str(claims.get("email") or "").strip().lower()
-    if email and claims.get("email_verified") is True:
-        for c in canons:
-            for m in getattr(c, "members", []):
-                if email in _member_emails(m):
-                    candidates.add("human:%s" % m.title)
-    subject = str(claims.get("sub") or "").strip()
-    if issuer and subject:
-        for c in canons:
-            for m in getattr(c, "members", []):
-                if subject in _member_subjects(m, issuer):
-                    candidates.add("human:%s" % m.title)
+    if mode == BINDING_EMAIL:
+        email = str(claims.get("email") or "").strip().lower()
+        if email and claims.get("email_verified") is True:
+            for c in canons:
+                for m in getattr(c, "members", []):
+                    if email in _member_emails(m):
+                        candidates.add("human:%s" % m.title)
+    else:
+        subject = str(claims.get("sub") or "").strip()
+        if issuer and subject:
+            for c in canons:
+                for m in getattr(c, "members", []):
+                    if subject in _member_subjects(m, issuer):
+                        candidates.add("human:%s" % m.title)
     return candidates.pop() if len(candidates) == 1 else None
 
 
@@ -309,11 +366,15 @@ def main(argv) -> int:
     p.add_argument("--issuer")
     p.add_argument("--client-id")
     p.add_argument("--domain", action="append", default=[])
+    p.add_argument("--binding", choices=list(BINDING_MODES), default=None,
+                   help="rattachement au canon : `subject` (défaut, recommandé) ou "
+                        "`email` (à activer par décision)")
     args = p.parse_args(argv)
     token = (sys.stdin.read() if args.token_file == "-"
              else open(args.token_file, encoding="utf-8").read()).strip()
     cfg = load_config()
     try:
+        mode = args.binding or binding(cfg)
         if args.issuer:
             choix = [Provider.from_dict({"issuer": args.issuer, "client_id": args.client_id,
                                          "domains": args.domain})]
@@ -330,7 +391,9 @@ def main(argv) -> int:
         print("ameesh identity : refusé — %s" % exc, file=sys.stderr)
         return 1
     from . import canon as canon_mod
-    human = human_for(canon_mod.load_configured(cfg), claims, issuer=provider.issuer)
+    human = human_for(canon_mod.load_configured(cfg), claims, issuer=provider.issuer,
+                      mode=mode)
     print(json.dumps({"sub": claims.get("sub"), "email": claims.get("email"),
-                      "issuer": provider.issuer, "human": human}, ensure_ascii=False))
+                      "issuer": provider.issuer, "binding": mode, "human": human},
+                     ensure_ascii=False))
     return 0 if human else 3

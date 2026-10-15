@@ -9,6 +9,7 @@ import json
 import secrets
 import time
 import unittest
+from unittest import mock
 
 from ameesh import canon, oidc, p256
 
@@ -17,6 +18,9 @@ from .webauthn_soft import SoftES256Key
 
 ISS = "https://idp.exemple.org"
 CLIENT = "ameesh-approve"
+#: DigestInfo DER de SHA-256 (RFC 8017 §9.2) — la signature des tests reste
+#: écrite à la main ; la vérification, elle, passe par l'extra `crypto` (L86).
+_SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
 def b64u(data: bytes) -> str:
@@ -65,7 +69,7 @@ class _CleRSA:
 
     def sign(self, message: bytes) -> bytes:
         k = (self.n.bit_length() + 7) // 8
-        t = oidc._SHA256_PREFIX + hashlib.sha256(message).digest()
+        t = _SHA256_PREFIX + hashlib.sha256(message).digest()
         em = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
         return pow(int.from_bytes(em, "big"), self.d, self.n).to_bytes(k, "big")
 
@@ -176,6 +180,38 @@ class VerificationTest(unittest.TestCase):
     def test_cle_rsa_trop_courte(self):
         self.assertFalse(oidc.rsa_verify(2 ** 1023 + 1, 65537, b"m", b"\x00" * 128))
 
+    def test_fournisseur_avec_chemin_supabase(self):
+        """Un issuer qui porte un chemin (`/auth/v1`, Supabase) est suivi tel quel."""
+        iss = "https://ref.supabase.co/auth/v1"
+        urls = []
+
+        def fetch(url):
+            urls.append(url)
+            if url.endswith("/.well-known/openid-configuration"):
+                return {"issuer": iss, "jwks_uri": iss + "/jwks"}
+            return {"keys": [self.rsa.jwk()]}
+
+        p = oidc.Provider(iss, CLIENT, ("exemple.org",))
+        claims = oidc.verify(jeton(self.rsa, "RS256", iss=iss), p,
+                             cache=oidc.KeyCache(fetch=fetch))
+        self.assertEqual(claims["iss"], iss)
+        self.assertEqual(urls, [iss + "/.well-known/openid-configuration", iss + "/jwks"])
+
+    def test_sans_extra_crypto_refus_explicite(self):
+        """Sans l'extra `crypto`, RS256 est refusé, jamais servi par un repli maison."""
+        import builtins
+        reel = builtins.__import__
+
+        def sans_crypto(name, *args, **kwargs):
+            if name == "cryptography" or name.startswith("cryptography."):
+                raise ImportError("cryptography absent (essai)")
+            return reel(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", new=sans_crypto):
+            with self.assertRaises(oidc.OidcError) as ctx:
+                oidc.rsa_verify(self.rsa.n, self.rsa.e, b"m", self.rsa.sign(b"m"))
+        self.assertIn("crypto", str(ctx.exception))
+
     def test_fournisseur_mal_configure(self):
         for raw in ({"issuer": "http://idp", "client_id": "c"}, {"issuer": ISS}):
             with self.assertRaises(oidc.OidcError):
@@ -183,18 +219,33 @@ class VerificationTest(unittest.TestCase):
 
 
 class RattachementTest(_TmpMixin, unittest.TestCase):
+    def test_mode_de_rattachement(self):
+        vide = type("Cfg", (), {})()
+        self.assertEqual(oidc.binding(vide), "subject")                    # défaut
+        self.assertEqual(oidc.binding(type("Cfg", (), {"identity": {}})()), "subject")
+        self.assertEqual(
+            oidc.binding(type("Cfg", (), {"identity": {"binding": "EMAIL"}})()), "email")
+        with self.assertRaises(oidc.OidcError):
+            oidc.binding(type("Cfg", (), {"identity": {"binding": "n'importe"}})())
+        with self.assertRaises(oidc.OidcError):
+            oidc.human_for([], {}, mode="n'importe")
+
     def test_membre_par_e_mail(self):
         root = self.example_copy()
         write(root, "membres/alice.md", fiche(type="Member", title="alice",
                                               emails=["Alice@exemple.org"]))
         c = canon.load(root, untrusted=True)
         claims = {"email": "alice@exemple.org", "email_verified": True}
-        self.assertEqual(oidc.human_for([c], claims), "human:alice")
-        self.assertIsNone(oidc.human_for([c], dict(claims, email_verified=False)))
-        self.assertIsNone(oidc.human_for([c], {"email": "x@exemple.org", "email_verified": True}))
+        self.assertEqual(oidc.human_for([c], claims, mode=oidc.BINDING_EMAIL), "human:alice")
+        self.assertIsNone(oidc.human_for([c], dict(claims, email_verified=False),
+                                         mode="email"))
+        self.assertIsNone(oidc.human_for([c], {"email": "x@exemple.org", "email_verified": True},
+                                         mode="email"))
+        self.assertIsNone(oidc.human_for([c], claims))          # défaut : le sujet, pas l'e-mail
         write(root, "membres/bruno.md", fiche(type="Member", title="bruno",
                                               emails=["alice@exemple.org"]))
-        self.assertIsNone(oidc.human_for([canon.load(root, untrusted=True)], claims))   # ambigu
+        self.assertIsNone(oidc.human_for([canon.load(root, untrusted=True)], claims,
+                                         mode="email"))                     # ambigu
 
     def test_membre_par_sujet(self):
         root = self.example_copy()
@@ -209,8 +260,9 @@ class RattachementTest(_TmpMixin, unittest.TestCase):
         self.assertIsNone(oidc.human_for([c], claims))                     # émetteur absent
         self.assertIsNone(oidc.human_for([c], claims, issuer="https://autre.example"))
         self.assertIsNone(oidc.human_for([c], {"sub": "sub-bruno"}, issuer=ISS))
+        self.assertIsNone(oidc.human_for([c], claims, issuer=ISS, mode="email"))
 
-    def test_e_mail_et_sujet_divergents(self):
+    def test_les_modes_ne_se_melangent_pas(self):
         root = self.example_copy()
         write(root, "membres/alice.md", fiche(type="Member", title="alice",
                                               emails=["alice@exemple.org"]))
@@ -221,9 +273,9 @@ class RattachementTest(_TmpMixin, unittest.TestCase):
             "---", "", "# bruno", ""]))
         c = canon.load(root, untrusted=True)
         claims = {"email": "alice@exemple.org", "email_verified": True, "sub": "sub-bruno"}
-        self.assertIsNone(oidc.human_for([c], claims, issuer=ISS))         # deux membres, refus
-        self.assertEqual(oidc.human_for([c], dict(claims, sub="sub-alice"), issuer=ISS),
-                         "human:alice")                                    # même membre : accord
+        self.assertEqual(oidc.human_for([c], claims, issuer=ISS), "human:bruno")   # sujet
+        self.assertEqual(oidc.human_for([c], claims, issuer=ISS, mode="email"),
+                         "human:alice")                                            # e-mail
 
     def test_boucle_locale_http_acceptee_pour_essai(self):
         p = oidc.Provider.from_dict({"issuer": "http://127.0.0.1:8080/realms/manaty",
