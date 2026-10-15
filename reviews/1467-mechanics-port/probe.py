@@ -2,7 +2,7 @@
 """Cross-branch #1467/#1616 probe; SQL/Git real, CI/provenance fixtures.
 
 PYTHONPATH=src ameesh heavy -- .venv/bin/python reviews/1467-mechanics-port/probe.py \
-    --supplier . --commit ddf1091d3a47c89ca8dcc1c445221af37d828b35
+    --supplier . --commit 488681e0dbb00f53a39f8244819b3faf362b74c1
 
 Only the supplier's exact mechanics.py object is loaded. No branch merge,
 canon checkout, production connection, runner installation or remote API.

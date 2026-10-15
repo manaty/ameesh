@@ -9,7 +9,8 @@ Withdrawal and promotion race on the target row. A successful withdrawal
 prevents the effect. If promotion wins, its claim is committed before the
 effect and withdrawal reports that reconciliation is needed. A process or
 network failure cannot roll this claim back into an active authorization.
-No CLI, implicit pilot, configuration activation, or runtime hook is added.
+The explicit pilot command lives in train_cli; no implicit pilot,
+configuration activation, or runtime hook is added here.
 """
 from __future__ import annotations
 

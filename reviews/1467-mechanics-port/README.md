@@ -1,7 +1,7 @@
 # Raccord #1467 / #1616 — 15 octobre 2026
 
 Préparation du consommateur, non gelée. Fournisseur exact :
-`ddf1091d3a47c89ca8dcc1c445221af37d828b35`, branche
+`488681e0dbb00f53a39f8244819b3faf362b74c1`, branche
 `lot/1616-process-params`. Il est injecté explicitement dans `Passage` ;
 aucune copie de son module n'est ajoutée à #1467.
 
@@ -22,10 +22,13 @@ nouvelle connexion, concurrence de runners et provenance inconnue.
 ```sh
 ameesh heavy -- env PYTHONPATH=src:. AMEESH_DRIVER=psycopg .venv/bin/python \
   reviews/1467-mechanics-port/probe.py --supplier . \
-  --commit ddf1091d3a47c89ca8dcc1c445221af37d828b35
+  --commit 488681e0dbb00f53a39f8244819b3faf362b74c1
 # Même commande avec AMEESH_DRIVER=psql pour le second pilote.
 ```
 
 Pas de suite du fournisseur rejouée, ni CI distante lancée. Cette preuve
 de port ne remplace pas ses avis indépendants, ne choisit pas un commit
 canon de production et ne constitue pas une activation du train.
+
+Requalification du 15 octobre après corrections Codex/Claude du fournisseur :
+les huit scénarios restent verts sur cette nouvelle tête avec psycopg et psql.

@@ -476,3 +476,36 @@ de #1374 sont réels ; les portes métier et effets distants du runtime restent
 simulés. Le contrôle avec une ancienne fonction de clé refuse les alias ; le
 contrôle avec la clé corrigée permet le parcours SQL publication/feu/promotion.
 Aucun fichier `land`, `fire` ou `merge_queue` n'a été modifié ici.
+
+## Commande pilote explicite (préparation, 15 octobre)
+
+`train_cli` expose le manifeste persistant et les opérations de feu sans
+construire le runtime, lire le canon, appeler Git/GitHub ou prendre un bail.
+Le projet doit exister dans `radar.projects` et déclarer sa cible. Cette
+commande ne configure ni n'active aucun passage du runner.
+
+```sh
+PYTHONPATH=src python -m ameesh.train_cli --project ameesh show > train-status.json
+jq '.plan' train-status.json > train-manifest.json
+# Après examen du manifeste complet :
+PYTHONPATH=src python -m ameesh.train_cli --project ameesh give --manifest train-manifest.json
+# Le numéro vient du reçu JSON de give, ou du champ fire.id de show :
+PYTHONPATH=src python -m ameesh.train_cli --project ameesh withdraw --manifest train-manifest.json --receipt 123
+```
+
+La session liée est résolue par `work.corrector(history=False)` ; aucun
+paramètre d'acteur ne peut lui substituer une identité. Le stockage compare
+le plan complet sous le verrou cible avant d'accorder le feu. Un fichier
+ancien ne peut donc pas autoriser le plan qui l'a remplacé. Le retrait exige
+le reçu courant exact, et reste disponible sans dépendre du lecteur canon
+ou du contrat CI. La réservation d'une promotion reste irréversible par
+cette commande et requiert alors la réconciliation déjà prévue.
+
+Quatre témoins de commande sur SQL réel sont verts avec psycopg et psql :
+lecture sans mutation, retrait/réattribution avec nouvel identifiant et session
+liée, refus de manifeste périmé/diagnostique, et parcours CLI par fichier avec
+fermeture de connexion. L'autorité pilote est simulée dans ces témoins ;
+aucun feu réel n'est donné. Les huit scénarios de port #1616 sont également
+verts avec les deux pilotes sur `488681e0dbb00f53a39f8244819b3faf362b74c1`.
+Restent le canon mécanique qualifié, le contrat complet Nexlink et le point
+d'appel du runner, puis les revues requises, avant gel et activation.
