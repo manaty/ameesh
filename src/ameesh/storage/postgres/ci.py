@@ -51,6 +51,18 @@ class CiResults(interface.CiResults):
             "SELECT %s FROM ci_runs WHERE repo = %%s AND status = 'running' ORDER BY run_id"
             % RUN_COLUMNS, (repo,))
 
+    def running_on(self, branches) -> list[dict]:
+        """#846 : tous dépôts confondus, les exécutions en cours d'une base."""
+        if not branches:
+            return []
+        return self.db.query(
+            """
+            SELECT %s FROM ci_runs
+             WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
+               AND status = 'running'
+             ORDER BY repo, run_id
+            """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
+
     def conclude(self, repo, run_id, status) -> bool:
         rows = self.db.query(
             """
