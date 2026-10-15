@@ -180,6 +180,20 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["work_item_id"], str(lot["id"]))
 
+    def test_profil_divergue_depot_differe_n_avertit_pas_sans_lot(self):
+        """#1614 (#1407) : un `--lot` résolu puis déposé en mode différé
+        (profil divergé, #858) est un rattachement effectif — l'avertissement
+        « has no open lot » ne doit pas apparaître (condition `item is None`
+        de b85c5e5ef), seule la raison du différé est dite."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        self.diverge("dev1")
+        proc = self.send("dev1", "À toi : reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
+        self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
+        self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
+
     def test_new_lot_pour_un_destinataire_non_reveillable_cree_sans_assigne(self):
         """#858 : `--new-lot` vers un agent non réveillable crée le lot sans
         assigné au lieu de perdre le message et la demande."""
