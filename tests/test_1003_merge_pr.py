@@ -66,6 +66,10 @@ def view(**over):
 class _Base(unittest.TestCase):
     LOT = 1003
     BRANCH = "lot/7-work"
+    #: familles simulées : ces bancs n'ont pas de base (`db=None`) et la porte
+    #: lit le registre ; l'indépendance des avis reste vérifiée, sur ce
+    #: dictionnaire (#1374 : la classe est un doute ici, deux avis distincts).
+    FAMILIES = {"aut1": "deepseek", "rev1": "codex", "rev2": "claude"}
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
@@ -106,25 +110,33 @@ class _Base(unittest.TestCase):
         for patch in (
                 mock.patch.object(work, "get", side_effect=self._lot_row),
                 mock.patch.object(work, "milestones",
-                                  side_effect=lambda db, n, *a, **kw: list(self.lot_marks))):
+                                  side_effect=lambda db, n, *a, **kw: list(self.lot_marks)),
+                mock.patch.object(merge_queue, "actor_family",
+                                  side_effect=lambda db, n: self.FAMILIES.get(
+                                      str(n or "").strip(), ""))):
             patch.start()
             self.addCleanup(patch.stop)
 
     def _lot_row(self, db, lot, *a, **kw):
         row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
-               "branch_target": self.lot_target, "title": "le lot", "app": "ameesh"}
+               "branch_target": self.lot_target, "title": "le lot", "app": "ameesh",
+               "assignee": "aut1"}
         if getattr(self, "lot_state", None):
             row["state"] = self.lot_state
             row["close_reason"] = "abandoned"
         return row
 
     def ready_marks(self, head=None, *, verdict="ok", sha=None):
-        """Le lot gelé sur `head` et son verdict ; `sha` déplace le verdict."""
+        """Le lot gelé sur `head` et ses deux avis indépendants (`verdict` porte
+        sur le premier, `sha` déplace les deux) : la classe est un doute ici
+        (cfg absent), donc deux avis de familles distinctes (#1374)."""
         head = head or self.head
         self.lot_marks = [
             {"id": 1, "kind": "frozen", "sha": head, "at_ts": 1.0},
             {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha or head,
-             "at_ts": 2.0},
+             "at_ts": 2.0, "actor": "rev1"},
+            {"id": 3, "kind": "verdict", "verdict": "ok", "sha": sha or head,
+             "at_ts": 3.0, "actor": "rev2"},
         ]
 
     def tip(self, ref="main"):
