@@ -16,6 +16,12 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+#: le graphe garanti du plan L161f ne prouve un fichier que par `import
+#: ameesh.x` / `from ameesh.x import y` : `from ameesh import x` ne charge le
+#: sous-module que si le paquet ne lie pas déjà le nom (#1339). Ces imports
+#: explicites certifient le chargement des deux fichiers au gel (#1770).
+import ameesh.mechanics  # noqa: F401
+import ameesh.prevalidation  # noqa: F401
 from ameesh import mechanics, prevalidation
 
 MECHANICS = """schema: ameesh-mechanics/1
