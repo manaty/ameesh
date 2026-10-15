@@ -317,7 +317,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('injected', self.units())
 
     def test_mode_refuses_unsupported_action(self):
-        p = self.run_vm('installer')
+        p = self.run_vm('publier')
         self.assertNotEqual(p.returncode, 0)
         self.assertFalse((self.state / 'ssh.log').exists())
 
