@@ -262,6 +262,21 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
     incomplets: list[dict] = []
     for dossier in dossiers:
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
+            # Un fichier de 0 octet n'a jamais reçu son schéma SQLite : la part
+            # a été interrompue avant d'écrire (un processus réellement mesuré
+            # écrit toujours le schéma, même sans ligne tracée). Le constat
+            # précède la lecture : CoverageData.read() initialiserait le
+            # fichier et masquerait le vide.
+            try:
+                vide = os.path.getsize(fichier) == 0
+            except OSError:
+                vide = False  # disparu entre le glob et ici : la lecture tranchera
+            if vide:
+                incomplets.append({
+                    "fichier": os.path.relpath(fichier, dossier),
+                    "erreur": "fichier vide (0 octet) : écriture interrompue avant le schéma",
+                })
+                continue
             from coverage import CoverageData, CoverageException
             donnees = CoverageData(basename=fichier)
             try:

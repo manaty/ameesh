@@ -368,6 +368,41 @@ class ArtefactIncompletTest(unittest.TestCase):
                          [os.path.join("cov", ".coverage")])
         self.assertIn(".coverage", carte.summary(c))
 
+    def test_artefact_vide_signale_sans_lecture(self):
+        """#1707 : 0 octet est écarté avant l'import de coverage lui-même."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-4"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage"
+        vide.write_bytes(b"")
+        with mock.patch.dict(sys.modules, {"coverage": None}):
+            c = carte.merge([str(part)], "abc")
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 0)
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertIn("0 octet", mesure["artefacts_incomplets"][0]["erreur"])
+        self.assertIn(".coverage", carte.summary(c))
+        self.assertEqual(vide.stat().st_size, 0)  # read() aurait écrit le schéma
+
+    @unittest.skipUnless(_coverage_installe(),
+                         "coverage requis pour un artefact réellement vide")
+    def test_fichier_coverage_vide_reel_non_compte(self):
+        """#1707 : un .coverage de 0 octet n'est pas un processus mesuré."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-4"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage"
+        vide.write_bytes(b"")
+        c = carte.merge([str(part)], "abc")
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 0)
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertEqual(vide.stat().st_size, 0)  # la lecture n'a pas eu lieu
+
 
 def _mesure_possible() -> bool:
     try:
