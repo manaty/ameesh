@@ -168,6 +168,49 @@ class InstallPilotTest(unittest.TestCase):
         # no guest runner is started by the install
         self.assertNotIn("+ systemctl enable --now ameesh-guest-runner@", out)
 
+    def test_offload_only_installs_the_guard_without_runner_nor_secret(self):
+        # #193 (L159h, b1 on the CI VM, decision #47757): the guard and its
+        # gate for install.sh --gate file; no guest runner, no agent, no
+        # secrets file: offloaded jobs carry no secret
+        res = self.dry("--allow-rootfs", "--offload-only")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn('"max_agents": 0', out)
+        self.assertIn("systemctl enable --now ameesh-guard.service", out)
+        self.assertIn("ameesh-gate.tmpfiles.conf", out)
+        self.assertNotIn("ameesh-guest-runner@.service (", out)
+        self.assertNotIn("guest.env", out)
+        self.assertNotIn("guest-deepseek", out)
+        self.assertIn("install.sh --gate file", out)
+        # the full pilot still writes them (the switch is what removes them)
+        out = self.dry("--allow-rootfs").stdout
+        self.assertIn("ameesh-guest-runner@.service (", out)
+        self.assertIn("/etc/ameesh/guest-deepseek6.env (0640 root:ameesh-guest)", out)
+
+    def test_offload_only_refuses_agents(self):
+        for args in (["--agent", "deepseek5"], ["--path", "/opt/node/bin"],
+                     ["--max-agents", "2"], ["--enable", "deepseek5"], ["--disable", "deepseek5"]):
+            with self.subTest(args=args):
+                res = self.dry("--allow-rootfs", "--offload-only", *args)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("--offload-only", res.stderr)
+        res = self.dry("--allow-rootfs", "--offload-only", "--max-agents", "0")
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_offload_only_check_wants_no_secret(self):
+        with open(os.path.join(self.host, "etc", "passwd"), "a", encoding="utf-8") as fh:
+            fh.write("ameesh-guest:x:998:998::/srv/ameesh-guest/home:/bin/bash\n")
+        out = self.run_script("--check", "--host", "vm-test", "--offload-only").stdout
+        self.assertIn("ok   no /etc/systemd/system/ameesh-guest-runner@.service (--offload-only)", out)
+        self.assertNotIn("AMEESH_DSN", out)
+        self.assertNotIn("git-credential-guest", out)
+        self.on_host("/etc/ameesh/guest.env", "AMEESH_DSN=x\n")
+        self.on_host("/etc/systemd/system/ameesh-guest-runner@.service", "[Service]\n")
+        out = self.run_script("--check", "--host", "vm-test", "--offload-only").stdout
+        self.assertIn("FAIL /etc/ameesh/guest.env present: a secrets file on a b1 host", out)
+        self.assertIn("FAIL /etc/systemd/system/ameesh-guest-runner@.service present: "
+                      "a guest runner on a b1 host", out)
+
     def test_the_dry_run_reads_the_test_host_only(self):
         # mesh-design #436: the tests never read the machine they run on
         # (its /etc/ameesh, its ameesh-guest user, its mounts, its units)
@@ -1182,6 +1225,43 @@ class InstallPilotTest(unittest.TestCase):
             else:
                 self.assertEqual(res.returncode, 0, (args, res.stderr))
 
+
+    def test_ci_vm_runbook_commands_run(self):
+        # PILOT-ci-vm.md (#193, b1 only): its offer is valid and its
+        # install-pilot.sh commands, dry run, never prepare an agent
+        import re
+        import shlex
+        from ameesh import capacity_guard
+        with open(os.path.join(GUEST, "PILOT-ci-vm.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        offer_text = re.search(r"```json\n(.*?)```", text, re.S).group(1)
+        offer, problems, unknown = capacity_guard.parse_lend(json.loads(offer_text))
+        self.assertEqual((problems, unknown), ([], []))
+        self.assertEqual(offer["reclaim"]["busy_units"], ["actions.runner.*"])
+        self.assertTrue(all(w.endswith("Europe/Paris") for w in offer["windows"]))
+        offer_file = os.path.join(self.host, "offer.json")
+        with open(offer_file, "w", encoding="utf-8") as fh:
+            fh.write(offer_text)
+        text = re.sub(r"\\\n\s*", "", text)
+        commands = []
+        for line in text.splitlines():
+            m = re.search(r"sudo deploy/guest/install-pilot\.sh([^`#|]*)", line)
+            if m:
+                commands.append(shlex.split(m.group(1).replace("[--purge]", "")))
+        self.assertGreaterEqual(len(commands), 5)
+        for args in commands:
+            self.assertIn("--offload-only", args + (["--offload-only"] if "--uninstall" in args else []))
+            args = [{"<vm>": "vm-test", "<offer.json>": offer_file}.get(a, a)
+                    for a in args if a != "--dry-run"]
+            if "--host" not in args:
+                args = ["--host", "vm-test", *args]
+            res = self.run_script("--allow-rootfs", *args) if "--lend" in args \
+                else self.run_script(*args)
+            if "--check" in args:
+                self.assertNotIn("install-pilot.sh:", res.stderr, args)
+            else:
+                self.assertEqual(res.returncode, 0, (args, res.stderr))
+                self.assertNotIn("guest-deepseek", res.stdout)
 
 def reading(ts, **over):
     row = {"sampled_ts": float(ts), "mem_available_bytes": 8 * GIB, "swap_used_bytes": 0,
