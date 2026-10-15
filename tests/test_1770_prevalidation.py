@@ -7,10 +7,13 @@ témoins bornés)."""
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import tempfile
 import unittest
 
 import ameesh.prevalidation  # noqa: F401  (preuve du chargement du fichier, plan L161f #1339)
-from ameesh import prevalidation as pv
+from ameesh import offload, prevalidation as pv
 
 A = "a" * 40
 B = "b" * 40
@@ -204,6 +207,27 @@ class ProofTest(unittest.TestCase):
         self.assertFalse(rapport["ok"])
         self.assertIn("run-red", rapport["causes"])
 
+    def test_fin_interrompue_refuse(self):
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow(flux_complet(statut_2="interrompu")))
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-incomplete", rapport["causes"])
+
+    def test_fin_statut_inconnu_refuse(self):
+        """Un statut autre que `succes` n'est jamais vert (P1 cx1).
+
+        `unknown`, `skipped` ou un statut vide ne disent pas que la part a
+        réussi : la preuve les compte comme incomplets, pas comme verts."""
+        for statut in ("unknown", "skipped", ""):
+            with self.subTest(statut=statut):
+                rapport = self.sel.proof(
+                    lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                    flow=pv.parse_flow(flux_complet(statut_2=statut)))
+                self.assertFalse(rapport["ok"], rapport)
+                self.assertIn("run-incomplete", rapport["causes"])
+                # la part fautive est nommée avec le statut observé
+                self.assertIn("psycopg:2", " ".join(rapport["detail"]))
+
     def test_run_rouge_de_loffload_refuse(self):
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "run-red", "exit": 1},
                                  flow=self.flow)
@@ -218,9 +242,10 @@ class ProofTest(unittest.TestCase):
         self.assertIn("head-moved", rapport["causes"])
 
     def test_arbre_verifie_recopie_dans_le_rapport(self):
+        tree = {"head": A, "snapshot": B, "plan": "plan.json"}
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
-                                 flow=self.flow, tree={"head": A, "clean": True})
-        self.assertEqual(rapport["tree"], {"head": A, "clean": True})
+                                 flow=self.flow, tree=tree)
+        self.assertEqual(rapport["tree"], tree)
 
     def test_selection_refusee_ne_produit_pas_de_vert(self):
         sel = pv.selection(plan_sain(), head=B)
@@ -237,6 +262,12 @@ class RunTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--fallback") + 1], "none")
         self.assertIn("--timeout", argv)
         self.assertIn("900", argv)
+
+    def test_argv_porte_le_snapshot_construit(self):
+        """Le contenu envoyé est figé par son identité : pas de photographie."""
+        argv = pv.offload_argv("vm-agents-1", "echo ok", snapshot=B)
+        self.assertEqual(argv[argv.index("--snapshot") + 1], B)
+        self.assertLess(argv.index("--snapshot"), argv.index("--"))
 
     def test_script_distant_par_part_et_marqueurs(self):
         sel = pv.selection(plan_sain(), head=A)
@@ -299,6 +330,83 @@ class RunTest(unittest.TestCase):
 
         result = pv.run_offload("vm-agents-1", "echo ko", runner=lambda *a, **k: Fake())
         self.assertEqual(result["outcome"], "run-red")
+
+
+class SnapshotIdentityTest(unittest.TestCase):
+    """Le contenu envoyé est **construit**, pas photographié (P1 cx1).
+
+    Repro cx1, vrai git : un plan non suivi, un fichier non suivi, puis un
+    fichier suivi marqué `assume-unchanged` et modifié — `git status` le dit
+    propre alors que `offload.snapshot()` remet le flag et embarque le contenu
+    modifié. Le geste fige donc l'arbre « SHA candidat + plan relu » par son
+    identité (`offload.snapshot_with`) et la passe à l'offload (`--snapshot`)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = self.tmp.name
+        self._git("init", "-q")
+        self._git("config", "user.email", "tests@ameesh.invalid")
+        self._git("config", "user.name", "tests")
+        self._write("service.py", "VERSION = 1\n")
+        self._git("add", "service.py")
+        self._git("commit", "-q", "-m", "init")
+        self.head = self._git("rev-parse", "HEAD")
+        self.plan_rel = "plan.json"
+        self.plan = '{"schema": "ameesh-test-plan/1"}\n'
+        self._write(self.plan_rel, self.plan)
+
+    def _git(self, *args: str) -> str:
+        proc = subprocess.run(["git", "-C", self.repo, *args],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def _write(self, name: str, text: str) -> None:
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _snapshot_files(self, snap: str) -> list[str]:
+        return self._git("ls-tree", "-r", "--name-only", snap).splitlines()
+
+    def test_arbre_propre_meme_identite_que_la_photographie(self):
+        """La formule d'identité est celle de l'offload : un arbre propre ne
+        change pas d'un cheveu entre `snapshot_with` et `snapshot`."""
+        construit = pv.pinned_snapshot(self.repo, self.head, self.plan_rel, self.plan)
+        self.assertEqual(construit, offload.snapshot(self.repo))
+
+    def test_contenu_envoye_est_le_sha_plus_le_plan(self):
+        self._write("runtime_config.py", "X = 2\n")
+        self._git("update-index", "--assume-unchanged", "service.py")
+        self._write("service.py", "VERSION = 999\n")
+        construit = pv.pinned_snapshot(self.repo, self.head, self.plan_rel, self.plan)
+        # la photographie de l'arbre de travail, elle, embarque le fichier
+        # modifié et le non-suivi : c'est exactement ce que la preuve refuse
+        self.assertNotEqual(construit, offload.snapshot(self.repo))
+        self.assertEqual(self._snapshot_files(construit), ["plan.json", "service.py"])
+        self.assertEqual(self._git("show", "%s:service.py" % construit), "VERSION = 1")
+
+    def test_flag_assume_unchanged_ne_trompe_pas_le_snapshot(self):
+        """`skip-worktree`/`assume-unchanged` : le statut ment, l'identité non."""
+        self._git("update-index", "--assume-unchanged", "service.py")
+        self._write("service.py", "VERSION = 999\n")
+        construit = pv.pinned_snapshot(self.repo, self.head, self.plan_rel, self.plan)
+        self.assertEqual(self._git("show", "%s:service.py" % construit), "VERSION = 1")
+
+    def test_plan_modifie_apres_lecture_refuse(self):
+        """Le plan prouvé est le texte relu : si le fichier change ensuite, la
+        construction porte le texte relu, pas la version du disque."""
+        construit = pv.pinned_snapshot(self.repo, self.head, self.plan_rel, self.plan)
+        self._write(self.plan_rel, '{"autre": true}\n')
+        # `git show` rend le blanc de fin rogné par `_git` : on compare le texte
+        # significatif, l'identité du blob restant celle du plan relu
+        self.assertEqual(self._git("show", "%s:plan.json" % construit),
+                         self.plan.strip())
+
+    def test_head_d_arbre_absent_refuse(self):
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.pinned_snapshot(self.repo, B, self.plan_rel, self.plan)
+        self.assertEqual(caught.exception.cause, "head-moved")
 
 
 class HostTest(unittest.TestCase):
