@@ -103,6 +103,40 @@ class FamilleAuGelTest(PgTestCase):
         self.assertIn("codex ou claude", body)
         self.assertNotIn("— claude (règle du pilote du 13/10)", body)
 
+    def test_un_tiers_qui_repose_le_gel_ne_change_pas_la_famille(self):
+        """#1525 : le pilote (claude) repose le gel d'un lot qu'il n'a jamais
+        tenu ; l'auteur reste a1, avec son harnais à son propre gel."""
+        self.turn("a1", "deepseek", offset=-10)
+        self.freeze()
+        self.turn("pilote", "claude", offset=-5)
+        self.freeze(actor="pilote")
+        body = self.body()
+        self.assertIn("- Auteur : a1 (harnais deepseek; gel reposé par pilote,"
+                      " qui n'a pas tenu le lot)", body)
+        self.assertIn("— codex (règle du pilote du 13/10)", body)
+
+    def test_un_gel_pose_par_un_seul_tiers_laisse_l_auteur_inconnu(self):
+        """#1525 : seul un tiers a gelé — ni sa famille ni celle de l'assigné
+        ne sont devinées ; le corps nomme l'acteur écarté."""
+        self.turn("pilote", "claude", offset=-5)
+        self.turn("a1", "deepseek", offset=-5)
+        self.freeze(actor="pilote")
+        body = self.body()
+        self.assertIn("- Auteur : inconnu (harnais non tracé au gel; gel reposé par"
+                      " pilote, qui n'a pas tenu le lot)", body)
+        self.assertIn("codex ou claude", body)
+
+    def test_un_ancien_assigne_qui_repose_le_gel_en_reste_l_auteur(self):
+        """#1525 : a2 a tenu le lot puis l'a rendu ; son gel compte."""
+        registry.upsert(self.db, "a2", harness="codex", host=self.cfg.host)
+        work.assign(self.db, self.lot, "a2", actor="mesh-design")
+        work.assign(self.db, self.lot, "a1", actor="mesh-design")
+        self.turn("a2", "codex", offset=-5)
+        self.freeze(actor="a2")
+        body = self.body()
+        self.assertIn("- Auteur : a2 (harnais codex)", body)
+        self.assertNotIn("gel reposé", body)
+
 
 if __name__ == "__main__":
     unittest.main()
