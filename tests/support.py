@@ -410,8 +410,11 @@ class PgTestCase(unittest.TestCase):
         base.update(extra)
         return child_env(**base)
 
-    def connect(self, schema: str | None = None):
-        return db_mod.connect(dataclasses.replace(self.cfg, schema=schema or self.schema))
+    def connect(self, schema: str | None = None, **overrides):
+        """Connexion au schéma du test ; `overrides` remplace des champs de la
+        configuration sur cette connexion (ex. `statement_timeout_ms`)."""
+        return db_mod.connect(dataclasses.replace(
+            self.cfg, schema=schema or self.schema, **overrides))
 
     def cli(self, *args: str, env: dict | None = None, stdin: str | None = None,
             timeout: float = 60.0) -> subprocess.CompletedProcess:
