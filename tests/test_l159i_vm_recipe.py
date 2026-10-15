@@ -23,7 +23,7 @@ class VMRecipe(unittest.TestCase):
         for flag in ("--user=10001:10001", "--userns=keep-id:uid=10001,gid=10001",
                      "--stop-timeout=100", "--read-only", "--cap-drop=ALL",
                      "--pull=never", "--http-proxy=false", "--memory=3072m",
-                     "--memory-swap=3072m", "--cpus=2"):
+                     "--memory-swap=3072m", "--cpus=2", "--pids-limit=512"):
             self.assertIn(flag, argv)
         self.assertIn('--env=AMEESH_HOST_GATE_LENDING=1', argv)
         self.assertIn("/run/ameesh-gate/state:/run/ameesh-gate/state:ro", argv)

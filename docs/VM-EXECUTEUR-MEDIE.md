@@ -5,8 +5,8 @@ service système à raccorder au garde de capacité. Aucune VM n'a été modifi�
 et aucune image n'a été construite par ce lot. Les contrôles hors ligne ne
 remplacent pas la recette d'acceptation sur la VM pilote.
 
-Base de travail : `lot/100-voie-b` (PR #216, encore ouverte lors de la
-préparation). Contrats : [image](IMAGE-EXECUTEUR.md),
+Base de travail : `main`, après reconstruction de la branche (la voie B,
+`lot/100-voie-b`, est fusionnée). Contrats : [image](IMAGE-EXECUTEUR.md),
 [API médiée](EXECUTEUR-MEDIEE.md),
 [conception L159](design/etudes/l159-capacite-des-hotes.md).
 
@@ -28,9 +28,10 @@ python -m ameesh.mediated_executor.vm_recipe /chemin/recette.json
 Le module rend des arguments Podman : image épinglée et déjà présente
 (`--pull=never`), racine en lecture seule, aucune capacité, uid/gid 10001,
 volume inscriptible, état de porte en lecture seule, acquittement inscriptible,
-code en lecture seule, `/tmp` en tmpfs, plafonds CPU et mémoire, arrêt par
-SIGTERM avec 100 secondes. Il refuse les champs supplémentaires, notamment
-les secrets et les modifications arbitraires de l'environnement de l'image.
+code en lecture seule, `/tmp` en tmpfs, plafonds CPU, mémoire et processus
+(512, la borne de la recette PROV-3), arrêt par SIGTERM avec 100 secondes. Il
+refuse les champs supplémentaires, notamment les secrets et les modifications
+arbitraires de l'environnement de l'image.
 
 La recette emploie Podman **rootless** sous l'identité dédiée `ameesh-guest`.
 `keep-id:uid=10001,gid=10001` traduit cette identité vers celle de l'image ;
@@ -48,7 +49,10 @@ sur la VM avant activation.
    classiques ; l'image utilise le relais de modèles.
 2. Préparer l'identité `ameesh-guest`, sans sudo ni groupe docker, ses plages
    subuid/subgid, Podman rootless et un volume séparé du disque de
-   l'application. Vérifier cgroups v2, délégation, horloge et disponibilité
+   l'application. Activer la persistance de son gestionnaire
+   (`loginctl enable-linger ameesh-guest`) : Podman rootless a besoin d'un
+   `XDG_RUNTIME_DIR`, donc de `/run/user/<uid>`, que la persistance crée au
+   démarrage. Vérifier cgroups v2, délégation, horloge et disponibilité
    locale de l'image dont le digest et la signature ont été contrôlés.
 3. Préparer le volume en `0700`, appartenant à `ameesh-guest`. Le garde
    contrôle `state_dir`, non inscriptible par l'invité ; `ack_dir` est
@@ -77,6 +81,11 @@ relance du seul code 1 avec délai croissant de 30 à 600 secondes ; arrêt
 pour les codes 2 à 5 ; effacement du volume dédié et attente d'un nouveau
 code après le code 6. Un échec du moteur Podman (125 à 127) est distinct
 d'une sortie de l'exécuteur et doit être signalé.
+
+Le superviseur exige **Python 3.11 ou plus** : l'effacement de révocation
+(code 6) emploie `shutil.rmtree(dir_fd=)`, absent avant. Sur 3.9/3.10 il
+refuse au démarrage, avant tout lancement, au lieu d'échouer au moment
+d'effacer le volume et de le laisser en place.
 
 Le code d'enrôlement est effacé au premier acquittement **du lancement
 courant** après enrôlement, au plus tard à sa fin, y compris sur erreur.
@@ -111,6 +120,12 @@ recette. `enroll_dir` est dédié, appartient à l'invité, et n'est inscriptibl
 que par lui et le propriétaire ; le conteneur le monte en lecture seule.
 Le service utilise `User=ameesh-guest`, `Slice=ameesh-guest.slice`,
 `Delegate=yes`, `KillMode=mixed`, `TimeoutStopSec=125` et `Restart=no`.
+Systemd ne pose pas `XDG_RUNTIME_DIR` pour un service système : la
+persistance de l'étape 2 crée `/run/user/<uid>`, et une extension de l'unité
+pose le chemin réel
+(`Environment=XDG_RUNTIME_DIR=/run/user/<uid>` ; `%U` vaut `0` dans le
+gestionnaire système, il ne suit pas `User=`). Sans cela, Podman rootless
+refuse de démarrer faute de répertoire d'exécution.
 Il ne reçoit aucun fichier d'environnement du mode classique. La délégation
 et les helpers subuid/subgid Podman doivent fonctionner : ajouter
 `NoNewPrivileges` au service peut empêcher `newuidmap`/`newgidmap`.
