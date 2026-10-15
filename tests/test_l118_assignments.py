@@ -32,6 +32,15 @@ class _Base(PgTestCase):
         registry.upsert(self.db, name, harness="claude", host=kw.pop("host", self.cfg.host),
                         **kw)
 
+    def diverge(self, name):
+        """#858 : agent du canon, admis à sa dernière évaluation, dont le profil
+        a divergé depuis (le prochain canon sync le réévaluera) : il n'est plus
+        réclamable, donc plus réveillable — sans être arrêté."""
+        self.db.execute(
+            "UPDATE agent_registry SET canon_ref = %s, placement_ok = true, "
+            "placement_profile = 'ancien' WHERE name = %s",
+            ("agents/%s.md" % name, name))
+
     def unread(self, name):
         return self.db.query("SELECT body, work_item_id, kind FROM agent_mailbox"
                              " WHERE recipient = %s ORDER BY id", (name,))
@@ -135,6 +144,70 @@ class MailLinksLotsTest(_Base):
                          [("CI plus rapide", "agent/dev2-ci")])
         self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(rows[0]["id"]))
         self.assertIn("created and assigned to dev2", proc.stdout)
+
+    def test_lot_d_un_destinataire_non_reveillable_part_quand_meme(self):
+        """#858 : profil divergé (admission en attente du prochain canon sync) —
+        le message ne doit pas être perdu avec le réveil ; le lot reste une
+        étiquette du fil et l'attribution est différée."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        self.diverge("dev1")
+        proc = self.send("dev1", "À toi : reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("lot #%d not assigned to dev1" % lot["id"], proc.stderr)
+        self.assertIn("profile diverged", proc.stderr)
+        self.assertIn("delivered to dev1", proc.stdout)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        rows = self.unread("dev1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["work_item_id"], str(lot["id"]))
+
+    def test_new_lot_pour_un_destinataire_non_reveillable_cree_sans_assigne(self):
+        """#858 : `--new-lot` vers un agent non réveillable crée le lot sans
+        assigné au lieu de perdre le message et la demande."""
+        self.diverge("dev2")
+        proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
+                         "--new-lot", "CI plus rapide", "--estimate", "2h", "--app", "p",
+                         "--new-project")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("created for dev2 without assignee", proc.stdout)
+        self.assertIn("not assigned to dev2", proc.stderr)
+        rows = work.list_items(self.db)
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["assignee"])
+        self.assertIsNone(rows[0]["branch"])       # pas la branche d'un lot non attribué
+        self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(rows[0]["id"]))
+
+    def test_erreur_du_lot_ou_course_non_avalee_comme_refus_destinataire(self):
+        """#858/R1 (mesh-design 23:10) : `assign` lève aussi pour une raison du
+        LOT ou de la course CAS (« already merged », « changed in the
+        meantime ») ; ce n'est pas un refus du DESTINATAIRE — l'erreur remonte
+        et rien n'est déposé, au lieu d'un faux « lot not assigned … » différé."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        for why in ("lot %d already merged: nothing to reassign" % lot["id"],
+                    "lot %d changed in the meantime: retry" % lot["id"]):
+            with mock.patch.dict(os.environ,
+                                 {"AMEESH_ALERT_ORCHESTRATORS": "orch"}), \
+                    mock.patch.object(assignments.work_mod, "assign",
+                                      side_effect=work.WorkError(why)):
+                with self.assertRaises(assignments.AssignmentError) as ctx:
+                    assignments.link_message(self.cfg, self.db, sender="orch",
+                                             recipient="dev1", lot=str(lot["id"]))
+            self.assertIn(why, str(ctx.exception))
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(self.unread("dev1"), [])
+
+    def test_lot_deja_livre_refuse_avant_depot(self):
+        """#858/R1 : un lot fermé/fusionné n'est pas un destinataire non
+        réveillable ; le rattachement refuse avant tout dépôt."""
+        lot = work.add(self.db, title="RT-9 : cercle de confiance")
+        work.merged(self.db, lot["id"], sha="a" * 40)
+        proc = self.send("dev1", "Reprends ce lot.", "--from", "orch",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("message not delivered", proc.stderr)
+        self.assertIn("already merged", proc.stderr)
+        self.assertEqual(self.unread("dev1"), [])
 
     def test_garde_d_attribution_rien_n_est_depose(self):
         proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",

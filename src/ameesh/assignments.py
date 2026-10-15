@@ -19,7 +19,13 @@ sous-utilisation se trompaient et la frise restait vide.
   un geste explicite, `ameesh work assign`. Un lot SANS agent assigné reste
   distribuable par l'historique de distribution (L94 ; le bureau distribue
   ainsi, canon §4).
-* `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
+  #858 : un refus de la garde qui ne tient qu'au DESTINATAIRE (profil
+  divergé en attendant le prochain canon sync, responsable manquant, agent
+  externe…) ne fait pas perdre le message — il est déposé, rattaché au lot,
+  l'attribution est différée et l'expéditeur est averti.
+* `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste ;
+  #858 : si le destinataire n'est pas attribuable à l'instant, le lot est
+  créé sans assigné et le message part quand même, avec l'avertissement.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
 désigne aucun lot connu reste une simple étiquette du fil, comme avant.
@@ -101,6 +107,31 @@ def resolve_lot(db, ref: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def _assignee_refusal(db, name: str, cfg) -> str | None:
+    """#858 : la raison pour laquelle la garde d'attribution (L37) refuse
+    `name` comme assigné, ou None s'il est attribuable.
+
+    Ne juge QUE le destinataire : un refus du lot lui-même (référence
+    ambiguë, lot déjà livré, estimation manquante, projet inconnu) n'est pas
+    de cette nature et reste fatal avant tout dépôt."""
+    try:
+        work_mod.check_assignee(db, name, cfg=cfg)
+    except work_mod.WorkError as exc:
+        return str(exc)
+    return None
+
+
+def _assignment_deferred(item: dict, recipient: str, why: str) -> str:
+    """#858 : l'avertissement d'une attribution différée — le message part
+    quand même, rattaché au lot, qui reste sans nouvel assigné."""
+    return ("lot #%d not assigned to %s: %s — the message is dropped anyway and "
+            "linked to lot #%d (the lot stays %s); to hand it over once %s can be "
+            "woken: ameesh work assign %d %s"
+            % (int(item["id"]), recipient, why, int(item["id"]),
+               (item.get("assignee") or "").strip() or "unassigned",
+               recipient, int(item["id"]), recipient))
+
+
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
@@ -111,8 +142,15 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
-    posée sur le lot qui n'en a pas. Lève AssignmentError si l'attribution
-    gardée refuse (rien n'est alors déposé).
+    posée sur le lot qui n'en a pas. Lève AssignmentError quand le LOT ne peut
+    pas être rattaché (rien n'est alors déposé).
+
+    #858 : un refus de la garde d'attribution qui ne tient qu'au DESTINATAIRE
+    (profil divergé en attendant le prochain canon sync, responsable manquant,
+    agent externe…) ne fait plus perdre le message : il est déposé, rattaché au
+    lot, l'attribution est différée et l'avertissement dit pourquoi. Un
+    message perdu emportait le réveil ; un réveil différé se rattrape à la
+    prochaine réclamation.
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -170,13 +208,21 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             # #506: read before the lot exists (it makes its project known)
             introduced = (work_projects.introduction(cfg, db, project, sender)
                           if new_project and app is not None else "")
-            item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
-                                source="mail", app=project, cfg=cfg, branch=branch,
+            # #858 : un destinataire momentanément non réveillable ne fait pas
+            # perdre le message : le lot est créé SANS assigné, l'attribution
+            # est différée et l'expéditeur est averti (même règle que --lot).
+            refusal = _assignee_refusal(db, recipient, cfg)
+            item = work_mod.add(db, title=title,
+                                assignee=None if refusal else recipient, actor=sender,
+                                source="mail", app=project, cfg=cfg,
+                                branch=None if refusal else branch,
                                 estimate=minutes, note=introduced, force=force,
                                 parent_lot=parent_lot)
-            if item.get("queue_warning"):
+            if not refusal and item.get("queue_warning"):
                 raise AssignmentError(_queued(item))
-            out.update(created=True, assigned=True, branch=item.get("branch"))
+            out.update(created=True, assigned=not refusal, branch=item.get("branch"))
+            if refusal:
+                out["warnings"].append(_assignment_deferred(item, recipient, refusal))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
         elif lot is not None:
@@ -209,14 +255,31 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                                 % (int(item["id"]), current, recipient, int(item["id"]),
                                    recipient))
                     else:
-                        done = work_mod.assign(db, int(item["id"]), recipient, actor=sender,
-                                               cfg=cfg, force=force)
-                        item = done["item"]
-                        if done.get("queue_warning"):
-                            raise AssignmentError(_queued(dict(item, **done)))
-                        out["assigned"] = True
-                        if done["check"].get("warning"):
-                            out["warnings"].append(done["check"]["warning"])
+                        # #858 : un refus de la garde d'attribution qui ne
+                        # tient qu'au DESTINATAIRE (profil divergé en attendant
+                        # le prochain canon sync, responsable manquant, agent
+                        # externe…) est différé : le message part quand même,
+                        # rattaché au lot, l'attribution est reportée.
+                        # R1 mesh-design (13/10 23:10) : une erreur du LOT ou
+                        # de la course CAS (« already merged », « changed in
+                        # the meantime ») n'est PAS un refus d'attribution —
+                        # elle remonte (AssignmentError, rien n'est déposé) au
+                        # lieu d'un faux avertissement différé. On ne juge donc
+                        # le destinataire qu'avant l'appel, et `assign` n'est
+                        # pas enveloppé.
+                        refusal = _assignee_refusal(db, recipient, cfg)
+                        if refusal:
+                            out["warnings"].append(
+                                _assignment_deferred(item, recipient, refusal))
+                        else:
+                            done = work_mod.assign(db, int(item["id"]), recipient,
+                                                   actor=sender, cfg=cfg, force=force)
+                            item = done["item"]
+                            if done.get("queue_warning"):
+                                raise AssignmentError(_queued(dict(item, **done)))
+                            out["assigned"] = True
+                            if done["check"].get("warning"):
+                                out["warnings"].append(done["check"]["warning"])
                 if branch and not item.get("branch") \
                         and (item.get("assignee") or "") == recipient:
                     item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
