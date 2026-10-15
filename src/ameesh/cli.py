@@ -641,7 +641,8 @@ def cmd_statusline(cfg: Config) -> int:
     # #1604 : le rendu est fréquent ; la ligne et l'état de la boîte sont
     # réutilisés quelques secondes par le chemin rapide (jamais bloquant).
     try:
-        fastmail.write_statusline(cfg, fastmail.statusline_key(data), ligne)
+        # #1628 : la clé porte le nom résolu, comme celle du chemin rapide.
+        fastmail.write_statusline(cfg, fastmail.statusline_key(data, name), ligne)
         if binding.ok:
             fastmail.note(cfg, name, pending=bool(unread), unread=unread)
     except Exception:
@@ -1045,6 +1046,10 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             _marque_boite(cfg, name, attente)
             return 0
         remise = _Remise(bk, name, binding)
+        #: #1628 : un drapeau local, pas `sys.exc_info()` — un `cmd_hook` appelé
+        #: depuis un `except` verrait l'exception extérieure et ne marquerait
+        #: jamais la boîte.
+        remise_ok = True
         try:
             msgs = remise.prendre(borne - etat["remis"] if etat is not None else None)
             avis = ""
@@ -1094,12 +1099,15 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             if etat is not None:
                 etat["remis"] += len(msgs)
                 _tour_ecrit(cfg, name, etat)
+        except Exception:
+            remise_ok = False
+            raise
         finally:
             remise.abandonner()
             # #1604 : marqueur posé seulement après un passage complet sans
             # exception (une base en panne ne doit pas se dire « rien à faire »),
             # et sans requête : la réservation sait ce qu'elle a laissé.
-            if sys.exc_info()[0] is None:
+            if remise_ok:
                 _marque_boite(cfg, name, remise.restants_apres())
     except Exception:
         return 0
