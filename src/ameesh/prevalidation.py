@@ -451,19 +451,27 @@ def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
                                  "arbre du SHA + plan non constructible: %s" % exc) from None
 
 
-def remote_plan_path(plan_path: str, root: str, *, runner=subprocess.run) -> str:
+def remote_plan_path(plan_path: str, root: str, *, head: str = "",
+                     runner=subprocess.run) -> str:
     """Le chemin du plan tel qu'il existe dans l'arbre envoyé à la VM.
 
-    Le script distant s'exécute dans le checkout temporaire : un chemin local
-    absolu n'y existe pas, et un fichier ignoré par git n'est pas transporté.
-    Les deux refusent (`selection-unsafe`) plutôt que de faire tourner autre
-    chose que la sélection annoncée."""
+    Le plan est un artefact relatif au dépôt, hors des chemins du SHA candidat :
+    il ne doit remplacer aucun fichier de ce SHA. Les chemins hors du dépôt ou
+    ignorés refusent aussi (`selection-unsafe`)."""
     absolute = os.path.abspath(plan_path)
     relative = os.path.relpath(absolute, os.path.abspath(root))
     if relative == os.pardir or relative.startswith(os.pardir + os.sep):
         raise PrevalidationError("selection-unsafe",
                                  "plan hors de l'arbre envoyé à la VM: %s" % plan_path)
     remote = relative.replace(os.sep, "/")
+    if head:
+        proc = runner(["git", "-C", root, "--literal-pathspecs", "ls-tree", head,
+                       "--", remote], capture_output=True, text=True)
+        if getattr(proc, "returncode", 1):
+            raise PrevalidationError("selection-unsafe", "chemin du plan invérifiable au SHA candidat")
+        if (getattr(proc, "stdout", "") or "").strip():
+            raise PrevalidationError("selection-unsafe",
+                                     "le plan remplacerait un chemin du SHA candidat: %s" % remote)
     proc = runner(["git", "-C", root, "check-ignore", "-q", "--", remote],
                   capture_output=True, text=True)
     if getattr(proc, "returncode", 1) == 0:
@@ -577,21 +585,30 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
 # la sélection doit rester dans ce que le canon déclare (#1770)
 # --------------------------------------------------------------------------
 
-def contract_modules(paths, repo: str = "") -> tuple[tuple[str, ...], str]:
+def contract_modules(paths, repo: str = "", *, head: str = "",
+                     runner=subprocess.run) -> tuple[tuple[str, ...], str]:
     """Les modules que les fichiers de contrat déclarés exigent, dans l'ordre.
 
     Même forme que `tests/parts/toujours.txt` (un module par ligne, sa raison
     après `#`, lignes vides et commentaires entiers ignorés). Un fichier
     déclaré illisible rend la cause : le canon déclare une garantie qu'on ne
-    peut pas relire, donc rien ne se prouve."""
+    peut pas relire, donc rien ne se prouve. Avec `head`, la lecture porte sur
+    les objets Git de ce commit, jamais sur les modifications locales."""
     modules: list[str] = []
     for path in paths or ():
         full = os.path.join(repo, str(path)) if repo else str(path)
-        try:
-            with open(full, "r", encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError as exc:
-            return (), "contrat déclaré illisible: %s (%s)" % (path, exc)
+        if head:
+            proc = runner(["git", "-C", repo or ".", "show", "%s:%s" % (head, path)],
+                          capture_output=True, text=True)
+            if getattr(proc, "returncode", 1):
+                return (), "contrat déclaré illisible au SHA candidat: %s" % path
+            text = getattr(proc, "stdout", "") or ""
+        else:
+            try:
+                with open(full, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except OSError as exc:
+                return (), "contrat déclaré illisible: %s (%s)" % (path, exc)
         for line in text.splitlines():
             name = line.split("#", 1)[0].strip()
             if name and name not in modules:
@@ -599,7 +616,8 @@ def contract_modules(paths, repo: str = "") -> tuple[tuple[str, ...], str]:
     return tuple(modules), ""
 
 
-def meets_canon(plan: dict, params, repo: str = "") -> tuple[bool, str]:
+def meets_canon(plan: dict, params, repo: str = "", *, head: str = "",
+                runner=subprocess.run) -> tuple[bool, str]:
     """La sélection du plan tient-elle exactement dans le canon ?
 
     Le canon déclare les classes retenues et les fichiers de contrat ; le plan
@@ -618,7 +636,8 @@ def meets_canon(plan: dict, params, repo: str = "") -> tuple[bool, str]:
     declared = tuple(getattr(params, "classes", ()) or ())
     if not declared:
         return False, "canon sans classes déclarées"
-    required, problem = contract_modules(getattr(params, "contracts", ()) or (), repo)
+    required, problem = contract_modules(getattr(params, "contracts", ()) or (), repo,
+                                        head=head, runner=runner)
     if problem:
         return False, problem
     contract = {str(m) for m in (plan.get("contract") or ())}
@@ -680,17 +699,12 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     allowed, why = host_allowed(name, local=local)
     if not allowed:
         raise PrevalidationError("no-vm", why)
-    # un seul arbre pour tout le geste : contrats lus, tête vérifiée, plan
-    # embarqué. `--repo` désigne cet arbre ; sans lui, le cwd.
+    # Les contrats et le contenu exécuté viennent du même SHA, jamais du disque.
+    # `--repo` désigne le dépôt ; sans lui, le cwd.
     root = os.path.abspath(cwd or repo or os.getcwd())
-    for path in getattr(params, "contracts", ()) or ():
-        full = os.path.join(root, str(path))
-        if not os.path.isfile(full):
-            raise PrevalidationError("selection-unsafe",
-                                     "contrat déclaré introuvable: %s" % path)
     text = plan_text(plan_path)
     plan = parse_plan(text, plan_path)
-    within, why = meets_canon(plan, params, root)
+    within, why = meets_canon(plan, params, root, head=head, runner=git_runner)
     chosen = selection(plan, head=head, base=base, plan_path=plan_path)
     if not chosen.ok:
         raise PrevalidationError(chosen.causes[0], chosen.why)
@@ -701,7 +715,7 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     ok_head, why_head, tree_head = head_state(root, head, runner=git_runner)
     if not ok_head:
         raise PrevalidationError("head-moved", why_head)
-    remote_plan = remote_plan_path(plan_path, root, runner=git_runner)
+    remote_plan = remote_plan_path(plan_path, root, head=head, runner=git_runner)
     pinned = (snapshotter or pinned_snapshot)(root, head, remote_plan, text)
     result = run_offload(name, remote_script(
         remote_plan, chosen.parts,

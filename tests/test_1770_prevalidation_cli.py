@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -87,6 +88,8 @@ def git_runner_for(head: str = A, ls_remote: str = "", ignored: bool = False):
             return _Proc(0 if ignored else 1, "")
         if "ls-remote" in argv:
             return _Proc(0, ls_remote)
+        if "show" in argv:
+            return _Proc(1, "")
         return _Proc(0, "")
     return run
 
@@ -436,6 +439,80 @@ class CommandTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["causes"], ["block-missing"])
         self.assertEqual(payload["schema"], pv.REPORT_SCHEMA)
+
+
+class CommitContentTest(unittest.TestCase):
+    """Vrai Git : contrats et code exécuté viennent du SHA, même sur arbre sale."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = self.tmp.name
+        self._git("init", "-q")
+        self._git("config", "user.email", "review@ameesh.invalid")
+        self._git("config", "user.name", "review")
+        self._write("contracts.txt", "test_cluster\n")
+        self._write("service.json", '{"enabled": true}\n')
+        self._git("add", ".")
+        self._git("commit", "-qm", "candidate")
+        self.head = self._git("rev-parse", "HEAD")
+
+    def _git(self, *args):
+        return subprocess.check_output(["git", "-C", self.repo, *args], text=True).strip()
+
+    def _write(self, name, text):
+        path = os.path.join(self.repo, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _validate(self, plan, *, plan_name="plan.json", contracts=("contracts.txt",)):
+        path = self._write(plan_name, json.dumps(plan))
+        self.transport = mock.Mock(return_value=_Proc(0, flux()))
+        return pv.validate(lot=1770, plan_path=path, head=self.head, host="vm1",
+                           params=params(contracts=contracts), repo=self.repo,
+                           runner=self.transport)
+
+    def test_contrat_local_altere_ne_reduit_pas_la_selection(self):
+        plan = plan_canon(head=self.head)
+        plan["contract"] = []
+        plan["classes"]["test_cluster"] = ["P2", "hors sélection"]
+        plan["parts"]["psycopg"][0]["modules"] = ["test_a"]
+        plan["selection"]["selected"] = 1
+        for text in ("test_a\n", "", None):
+            with self.subTest(local_contract=text):
+                if text is None:
+                    os.unlink(os.path.join(self.repo, "contracts.txt"))
+                else:
+                    self._write("contracts.txt", text)
+                with self.assertRaises(pv.PrevalidationError) as caught:
+                    self._validate(plan)
+                self.assertEqual(caught.exception.cause, "selection-unsafe")
+                self.assertIn("test_cluster", caught.exception.why)
+                self.transport.assert_not_called()
+
+    def test_contrat_absent_du_disque_est_lu_et_transporte_depuis_le_sha(self):
+        os.unlink(os.path.join(self.repo, "contracts.txt"))
+        report = self._validate(plan_canon(head=self.head))
+        self.assertTrue(report["ok"], report)
+        snapshot = report["tree"]["snapshot"]
+        self.assertEqual(self._git("show", snapshot + ":contracts.txt"), "test_cluster")
+        self.assertEqual(self._git("show", snapshot + ":service.json"), '{"enabled": true}')
+
+    def test_contrat_non_suivi_ne_complete_pas_le_sha(self):
+        self._write("untracked.txt", "test_cluster\n")
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            self._validate(plan_canon(head=self.head), contracts=("untracked.txt",))
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.transport.assert_not_called()
+
+    def test_plan_ne_remplace_pas_un_fichier_du_sha_meme_retire_de_l_index(self):
+        self._git("rm", "--cached", "--quiet", "service.json")
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            self._validate(plan_canon(head=self.head), plan_name="service.json")
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.assertIn("remplacerait", caught.exception.why)
+        self.transport.assert_not_called()
 
 
 class PersistenceTest(unittest.TestCase):

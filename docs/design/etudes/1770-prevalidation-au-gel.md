@@ -70,7 +70,8 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
 - sans canon relu (`--canon-commit` absent ou bloc absent) : refus
   `block-missing`, aucune exécution ;
 - contrôles avant tout run : hôte déclaré au canon (sinon `no-vm`) ; chaque
-  fichier de contrat déclaré est **relu** (un fichier illisible refuse) et son
+  fichier de contrat déclaré est **relu au SHA candidat**, depuis les objets
+  Git (un fichier absent de ce SHA ou illisible refuse), et son
   contenu lie la sélection : tout module qu'il nomme doit être exécuté, et le
   plan ne peut pas compter comme contrat un module absent de ces fichiers ;
   la sélection doit être exactement `classes du canon ∪ contrats` (tout module
@@ -84,7 +85,8 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   modification locale ne peuvent donc pas entrer dans la preuve (défaut trouvé
   par cx1 : `git status` les masquait alors que la photographie les
   embarquait). Le plan est un chemin **relatif** à cet arbre, refusé s'il en
-  sort (`selection-unsafe`) ou s'il est ignoré par git ; c'est le texte lu qui
+  sort (`selection-unsafe`), s'il est ignoré par git ou s'il remplacerait un
+  chemin du SHA candidat, même retiré de l'index local ; c'est le texte lu qui
   est embarqué, pas une relecture du disque au moment du run ;
 - délai du run : `timeout_seconds` du canon ; exécution par
   `ameesh offload run --fallback none` uniquement. Sur la VM, ce chemin est
