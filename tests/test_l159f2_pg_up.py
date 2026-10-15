@@ -90,6 +90,9 @@ elif cmd == "start":
     state[args[1]]["running"] = True
     save()
 elif cmd == "run":
+    # #1547 (N2) : ce que le shim d'un tour a laissé dans l'environnement
+    with open(os.environ["FAKE_DOCKER_LABEL_LOG"], "a") as f:
+        f.write((os.environ.get("AMEESH_CONTAINER_LABELS") or "") + "\n")
     vol = opt("-v").split(":", 1)[0]
     state[opt("--name")] = {"running": True, "volumes": [vol]}
     save()
@@ -107,11 +110,13 @@ class PgUpVolumeTest(unittest.TestCase):
         os.chmod(docker, 0o755)
         self.state = os.path.join(self.dir, "state.json")
         self.log = os.path.join(self.dir, "calls.log")
+        self.labels = os.path.join(self.dir, "labels.log")
         self.env = {
             "PATH": bin_dir + os.pathsep + "/usr/bin:/bin",
             "HOME": self.dir,
             "FAKE_DOCKER_STATE": self.state,
             "FAKE_DOCKER_LOG": self.log,
+            "FAKE_DOCKER_LABEL_LOG": self.labels,
         }
 
     def tearDown(self):
@@ -122,6 +127,7 @@ class PgUpVolumeTest(unittest.TestCase):
         with open(self.state, "w") as f:
             json.dump(containers, f)
         open(self.log, "w").close()
+        open(self.labels, "w").close()
         proc = subprocess.run(["bash", SCRIPT], env=dict(self.env, **env),
                               capture_output=True, text=True, timeout=60)
         with open(self.state) as f:
@@ -140,6 +146,20 @@ class PgUpVolumeTest(unittest.TestCase):
         proc, after, _ = self.run_script({}, AMEESH_PG_PASSWORD="x")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(after["ameesh-pg"]["volumes"], ["ameesh-pg-data"])
+
+    def test_the_shared_bench_never_receives_a_turn_label(self):
+        """#1547 (N2) : `env -u AMEESH_CONTAINER_LABELS` — même quand le shim
+        d'un tour pose l'étiquette dans l'environnement, le banc partagé n'en
+        hérite pas : il ne devient la ressource ni d'un tour ni d'un lot."""
+        proc, after, calls = self.run_script(
+            {}, AMEESH_PG_NAME="B", AMEESH_PG_PASSWORD="x",
+            AMEESH_CONTAINER_LABELS="ameesh.turn=t1,ameesh.agent=a1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue([c for c in calls if c[0] == "run"])   # le banc est créé
+        self.assertTrue(after["B"]["running"])
+        with open(self.labels) as f:
+            vues = f.read()
+        self.assertEqual(vues.strip(), "")     # docker n'a vu aucune étiquette
 
     def test_creation_on_a_mounted_volume_is_refused(self):
         other = {"autre": {"running": False, "volumes": ["partage"]}}

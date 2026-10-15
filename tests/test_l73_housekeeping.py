@@ -399,6 +399,24 @@ class ConteneursTest(_Tmp):
         self.assertEqual(moteur.remove("abc"), (True, ""))
         self.assertEqual(appels[-1], ["docker", "rm", "-f", "-v", "abc"])
 
+    def test_ps_a_est_le_seul_releve_des_arretes(self):
+        """#1547 (N2a) : `stopped=True` ajoute `-a` à l'argv réel de `ps` —
+        un conteneur arrêté n'est vu que par ce relevé ; sans lui, la lecture
+        reste celle des conteneurs en cours."""
+        appels = []
+
+        def run(argv, **_kw):
+            appels.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        moteur = containers.Runtime(binary="docker", run=run)
+        self.assertEqual(moteur.list_all(stopped=True), [])
+        self.assertEqual(appels[0], ["docker", "ps", "--no-trunc", "-a",
+                                     "--format", "{{json .}}"])
+        moteur.list_all()
+        self.assertEqual(appels[1], ["docker", "ps", "--no-trunc",
+                                     "--format", "{{json .}}"])
+
     def test_le_script_etiquette_run_et_create_seulement(self):
         faux = os.path.join(self.base, "vrai-bin")
         os.makedirs(faux)
@@ -894,6 +912,29 @@ class MenageDbTest(PgTestCase):
         # réalisation : le tour fini sans lot et la base du lot fermé partent
         menage.reap_containers(moteur, self.db, "pc")
         self.assertEqual(sorted(moteur.removed), ["12", "8"])
+
+    def test_le_releve_des_conteneurs_hors_tour_est_borne(self):
+        """#1547 (N3) : le journal ne garde qu'`OTHERS_TOP` conteneurs hors
+        tour, et le compte total dans `others_total` — la liste n'est plus
+        non bornée sur un hôte qui en porte beaucoup."""
+        def c(i):
+            return {"id": str(i), "name": "c-%d" % i, "image": "redis",
+                    "status": "Up", "labels": {}}
+
+        moteur = _FauxMoteur([c(i) for i in range(5)])
+        with mock.patch.object(menage, "OTHERS_TOP", 2):
+            essai = menage.reap_containers(moteur, self.db, "pc", dry_run=True)
+            self.assertEqual([o["name"] for o in essai["others"]], ["c-0", "c-1"])
+            self.assertEqual(essai["others_total"], 5)
+            menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                            runtime=moteur)
+        dernier = storage.of(self.db).housekeeping.last_measure("pc")[0]["data"]
+        self.assertEqual(len(dernier["containers"]["others"]), 2)
+        self.assertEqual(dernier["containers"]["others_total"], 5)
+        # un tour précis ne regarde que les siens : ni liste, ni compte
+        seul = menage.reap_containers(moteur, self.db, "pc", only_turn="encours")
+        self.assertIsNone(seul["others"])
+        self.assertIsNone(seul["others_total"])
 
     def _lecture(self, used: float) -> None:
         storage.of(self.db).hosts.record({
