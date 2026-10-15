@@ -44,7 +44,7 @@ import re
 
 from . import storage
 from . import work as work_mod
-from .canon import GitError, _git
+from .canon import GitError, NO_LAZY_FETCH, _git
 
 #: cible historique du relevé de contenu (`--target` explicite) ; sans lui,
 #: c'est la cible déclarée du lot ou du dépôt qui fait foi (#1005)
@@ -81,7 +81,13 @@ def _out(repo: str, *args: str) -> str | None:
 
 
 def _commit(repo: str, rev: str) -> str | None:
-    return _out(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}")
+    # #1749 : sonde de présence — pas de fetch paresseux (l'échec laisse un
+    # transport orphelin derrière lui dans un clone partiel).
+    proc = _git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}",
+                env_extra=NO_LAZY_FETCH)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace").strip()
 
 
 def _patch_ids(repo: str, *log_args: str) -> dict[str, str]:
