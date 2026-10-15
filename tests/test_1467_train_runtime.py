@@ -3,7 +3,7 @@
 import types
 from unittest import mock
 
-from ameesh import train, train_ci, train_fire, train_runtime, train_store, work
+from ameesh import land, merge_queue, train, train_ci, train_fire, train_runtime, train_store, work
 from .support import PgTestCase
 from .test_1467_train import MemoryPorts, row
 
@@ -48,11 +48,25 @@ class TrainRuntimeTest(PgTestCase):
 
     def test_queue_alias_is_refused_before_any_remote_effect(self):
         self.admissions.entries.side_effect = lambda: [dict(row(1), target="origin/main")]
-        result = self.engine.step(3600)
+        raw_key = lambda project, target: "%s:%s" % (project.name, target)
+        with mock.patch.object(land, "lock_key", side_effect=raw_key):
+            result = self.engine.step(3600)
         self.assertEqual(result["result"], "refused", result)
         self.assertIn("queue target alias", result["error"])
         self.repository.publish.assert_not_called()
         self.repository.promote.assert_not_called()
+
+    def test_alias_can_land_only_when_every_target_uses_the_shared_canonical_key(self):
+        # #1374's shared lock contract; retain the raw admission target in
+        # the manifest so a queue change still invalidates its identity.
+        key = lambda project, target: "%s:%s" % (project.name, merge_queue._remote_branch(target))
+        self.memory.rows[0]["target"] = "origin/main"
+        with mock.patch.object(land, "lock_key", side_effect=key):
+            ledger = train_store.Ledger(self.db, self.project, "refs/heads/main", "other")
+            self.assertEqual(ledger.key, self.ledger.key)
+            plan, _ = self.ready()
+            self.assertEqual(plan["members"][0]["target"], "origin/main")
+            self.assertEqual(self.engine.step(3602)["result"], "landed")
 
     def ready(self):
         outcome = self.engine.step(3600)

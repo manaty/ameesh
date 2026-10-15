@@ -8,11 +8,12 @@ from .train import TrainError
 
 class Ledger:
     def __init__(self, db, project, target, owner):
-        if target != merge_queue._remote_branch(target):
+        key = land.lock_key(project, target)
+        if key != land.lock_key(project, merge_queue._remote_branch(target)):
             raise TrainError("canonical target required for the shared train reservation")
         self.db = db
         self.ops = storage.of(db).work
-        self.key = land.lock_key(project, target)
+        self.key = key
         # land_lock allows the same owner to restart at a new epoch. A train
         # must have a different owner from ordinary single-lot land even when
         # both execute inside the same runner.

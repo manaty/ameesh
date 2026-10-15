@@ -44,7 +44,8 @@ class Runtime:
         rows = [row for row in self.admissions.entries()
                 if row["source"] == self.repository.source
                 and merge_queue._remote_branch(row["target"]) == self.target_branch]
-        if any(row["target"] != self.target_branch for row in rows):
+        if any(land.lock_key(self.repository.project, row["target"]) != self.ledger.key
+               for row in rows):
             raise TrainError("queue target alias does not share the canonical train reservation")
         return rows
 

@@ -181,12 +181,33 @@ la réservation du paquet. Lecture de `979f2e2b` : `fire._lock` prend seulement
 Ce bail par lot ne sérialise donc pas une fusion directe avec le train.
 Mesh-design demande le 15 octobre à 04:46 à l'auteur de #1374 de coordonner
 le bail cible commun, l'ordre de prise et un témoin train/direct. Ce code
-n'est pas encore intégré à cette branche. `Ledger` refuse les cibles alias
-(`origin/main`, `refs/heads/main`…) ; Runtime refuse aussi une admission
-alias de sa cible. Les autres voies de fusion doivent garantir la même clé
-canonique avant une activation concurrente : le refus côté train seul ne
-sérialise pas une autre voie utilisant une clé alias. Aucun CLI, branchement du runner
-ni profil actif n'est ajouté.
+n'est pas encore intégré à cette branche. La livraison `82a8a0f8` de #1374
+prend ce bail après `fire:<lot>` et emploie `land.LOCK_TTL_S` à la prise et
+au renouvellement. Son parent `c975eb0c` (correcteur cx1, courriers #48028 et
+#48030 du 15 octobre à 06:34) canonicalise `land.lock_key` pour `main`,
+`origin/main`, `refs/heads/main` et `refs/remotes/origin/main`. Ces deltas
+attendent leurs avis indépendants ; cette lecture de raccord ne les remplace
+pas et ne fusionne pas leur code.
+
+`Ledger` accepte désormais un alias seulement si la fonction partagée lui
+donne exactement la clé de sa cible canonique. Runtime exige la même égalité
+pour chaque admission. Avec l'ancienne fonction, les alias restent refusés
+avant tout effet ; avec le correctif partagé, ils emploient le même bail.
+La cible brute de chaque admission reste dans le manifeste et dans son
+identité : le raccord ne réécrit pas une génération ou une preuve de la file.
+Le refus côté train seul ne sérialise toujours pas une autre voie qui
+utiliserait une clé différente. Aucun CLI, branchement du runner ni profil
+actif n'est ajouté.
+
+Vérification du fournisseur #1465 à `4750fc09`, le 15 octobre : la restriction
+à HEAD et au committer du tour refuse un SHA arbitraire et un autre acteur,
+mais ne prouve pas encore la création dans le tour. Un témoin Git réel avec
+stockage simulé laisse un ancien commit sans reçu en HEAD, puis l'enregistre
+sous une nouvelle session, un nouveau tour et une autre famille du même
+acteur : `record_commit` accepte cette attribution. Aucun changement de SHA
+ni checkout n'est nécessaire. Le scénario a été transmis directement à
+impl07, copie dev4 et mesh-design ; aucun SQL du fournisseur n'a été exécuté
+ici. Le port de lecture reste explicite et aucun fournisseur n'est activé.
 
 Source du travail indépendant : mesh-design, message #45970 du 15 octobre
 à 04:06 et note du registre #1467 à 04:06, précisant que le hold ne concerne
@@ -245,7 +266,18 @@ les impactés, voire avoir sauté l'étape de tests. Il n'existe donc pas encore
 de contrat Nexlink complet utilisable. Orchestrateur a confié le raccord
 au chantier CI #1470 / mty-nxl-impl-01 (courrier du 15 octobre à 03:55,
 confirmé par mesh-design à 03:57), deux avis indépendants avant CI. Le SHA
-du gel permettra de reprendre l'audit ; aucun dispatch n'a été lancé ici.
+du gel permet de reprendre l'audit ; aucun dispatch n'a été lancé ici.
+
+Lecture de #1470 à `6553d3ae` le 15 octobre : le blob `change-set.mjs` devient
+`4f72857235625d74647fc393e8aade609faa976b`. Son classifieur force `full` sur
+`refs/heads/integration/train-*` pour `workflow_dispatch`, indépendamment du
+diff Git ; sa CLI évite même de calculer ce diff sur ces réfs. Trois témoins
+locaux supplémentaires confirment le dispatch complet, le maintien de la
+sélection sur une branche de lot et la CLI complète sans dépôt Git disponible.
+Le défaut précis du sélecteur est donc corrigé à cette tête. Cela ne fournit
+pas encore le contrat exécutable de tous les workflows : leurs jobs, scripts
+appelés et variantes de plateforme doivent être qualifiés et liés à leurs
+blobs avant un dispatch de train. Aucun contrat Nexlink implicite n'est ajouté.
 
 L'échec `queue add` sur le poste orchestrateur est dû au profil
 `critiques-2.json` sans `radar.projects`, alors que `radar-nexlink.json`
@@ -297,3 +329,13 @@ regel/réadmission, déplacement d'une branche source, nouveau prérequis,
 nouvelle tentative CI et réponse de push perdue sont éprouvés à travers
 Runtime et les reçus SQL réels. Les raccords externes et le runner restent
 à compléter avant gel et activation.
+
+Passe alias partagés : trois témoins ciblés psql verts sur la préparation,
+puis quatre témoins interbranches sur #1374 à `82a8a0f8`, verts sur psql et
+psycopg sous `ameesh heavy`. Le témoin de bail couvre les seize couples des
+quatre alias, dans les deux sens train/feu direct, et vérifie le TTL à la prise
+et au renouvellement. Les verrous SQL et les fonctions de clé/prise de bail
+de #1374 sont réels ; les portes métier et effets distants du runtime restent
+simulés. Le contrôle avec une ancienne fonction de clé refuse les alias ; le
+contrôle avec la clé corrigée permet le parcours SQL publication/feu/promotion.
+Aucun fichier `land`, `fire` ou `merge_queue` n'a été modifié ici.
