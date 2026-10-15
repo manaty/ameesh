@@ -17,6 +17,11 @@ le reste du code. Un sous-module par sujet :
   construction ; script autonome (bibliothèque standard seule, aucun import
   d'ameesh), installé seul et lancé en `python3 -I` : il lit `/proc`
   lui-même.
+* `turn_cgroup` : le cgroup v2 délégué d'un tour (L498) — création, placement,
+  `cgroup.events`, kill et enlèvement ; trampoline autonome (bibliothèque
+  standard seule, aucun import d'ameesh) lancé par son chemin de fichier, il
+  lit `/proc/self/cgroup` lui-même pour valider son placement avant l'exec du
+  harnais.
 
 Appuyé sur psutil (roues binaires Linux, macOS, Windows) ; sous Linux, un
 repli par `/proc` reste en place si psutil est absent.

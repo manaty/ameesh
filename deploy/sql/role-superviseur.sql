@@ -354,6 +354,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
+        -- L498 (0439) : le cgroup délégué du tour (chemin d'état, pas un secret)
+        'cgroup',
         'started_at', 'ended_at', 'status'
     ]),
     -- ménage (L73, 0045) : journal (chemins, tailles, commandes proposées)
