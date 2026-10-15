@@ -184,6 +184,13 @@ jobs:
       psycopg_parts: ${{ steps.plan.outputs.psycopg_parts }}
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
+      # the digest of the uploaded plan.json, read by every required consumer
+      # before it runs a part: the run's runtime token also serves the
+      # artifact API, so a job of the borrowed label could delete and replace
+      # this artifact before a "re-run failed jobs" (R1 Claude B4, #1256).
+      # A job output is written by this job alone and cannot be rewritten by
+      # another one, so it is the reference the parts check against.
+      plan_sha256: ${{ steps.plan_digest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -212,6 +219,9 @@ jobs:
             --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
             --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
+      - id: plan_digest
+        name: empreinte du plan (canal artefacts, #1256 B4)
+        run: echo "sha256=$(sha256sum plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: plan
@@ -328,6 +338,15 @@ jobs:
         with:
           name: plan
           path: ${{ runner.temp }}
+      - &plan_empreinte
+        name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
+        run: |
+          # the run's runtime token also serves the artifact API, and a job of
+          # the borrowed label runs after `plan`: it could delete this
+          # artifact and publish a forged one before a "re-run failed jobs".
+          # The digest comes from the plan job's own output, which no other
+          # job can rewrite; a part that does not match runs nothing.
+          echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | sha256sum -c -
       - &publier
         name: publication du flux en direct (check run)
         env:
@@ -415,6 +434,7 @@ jobs:
       - *base
       - *git
       - *plan
+      - *plan_empreinte
       - *publier
       - name: part ${{ matrix.part }}
         run: >-
