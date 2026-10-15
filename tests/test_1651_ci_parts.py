@@ -252,6 +252,17 @@ class ContractTest(_Contract):
         with self.assertRaisesRegex(ci_parts.PartsError, "not a path inside the repository"):
             ci_parts.due(project, self.base(), self.base(), self.repo)
 
+    def test_the_selector_runs_without_the_host_environment(self):
+        """Le sélecteur vient du dépôt : il ne voit pas les jetons ni les DSN
+        de l'hôte qui exécute la porte."""
+        with mock.patch.dict(os.environ, {"AMEESH_SENTINEL": "secret", "GH_TOKEN": "t"}):
+            env = ci_parts.selector_env("/root", "/home")
+        self.assertNotIn("AMEESH_SENTINEL", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertEqual(env["GITHUB_WORKSPACE"], "/root")
+        self.assertEqual(env["HOME"], "/home")
+        self.assertIn("PATH", env)
+
 
 class GateTest(_Contract):
     """La porte : 1/5 refuse, 5/5 autorise, absent/skipped/cancelled refusent,
