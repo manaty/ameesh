@@ -1,25 +1,30 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1305 — les dumps de sauvegarde ne sont lisibles que par ameesh.
 
-Le vrai `deploy/serveur/sauvegarder-base.sh` est exécuté, avec un faux
-`pg_dump` qui se comporte comme le vrai sur le point qui compte : il tronque le
-fichier existant sans changer son mode et note le mode qu'il voit à l'ouverture.
+Le vrai `deploy/serveur/sauvegarder-base.sh` est exécuté, avec un faux helper
+privé (`AMEESH_SAUVEGARDER_PRIVE`, #364/#1484) qui se comporte comme le vrai
+sur le point qui compte : il écrit le dump sans changer le mode du fichier et
+note le mode qu'il voit à l'ouverture. Un faux helper de rétention
+(`AMEESH_RETENTION_PRIVEE`) note les commandes reçues : le script ne supprime
+jamais un dump lui-même — le `find -delete` brut de 14 jours a disparu avec la
+rétention par catalogue privé — il passe par `expire-unregistered` puis
+`prune`, qui seuls expirent un candidat non inscrit et préservent les
+ensembles inscrits au catalogue.
+
 Le répertoire des dumps est redirigé par `AMEESH_SAUVEGARDES_DIR`, positionnée
 ici seulement (le service systemd ne la connaît pas) ; la machine et la date du
 dump du jour sont figées par de faux `hostname`/`date` du PATH. Aucune base,
 aucun réseau.
-
-#1309 — une ACL POSIX par défaut sur le répertoire donne son mode à un fichier
-NOUVEAU, que le umask ne corrige pas : le témoin dédié vérifie que le dump du
-jour est précréé et privé avant l'ouverture par `pg_dump`.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -34,25 +39,40 @@ ACL_DEFAUT_PERMISSIVE = struct.pack("<I", ACL_VERSION) + b"".join(
     struct.pack("<HHI", tag, 0o7, 0xFFFFFFFF)
     for tag in (ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER))
 
-FAKE_PG_DUMP = '''#!/usr/bin/env python3
-"""Faux pg_dump : note le mode vu à l'ouverture, puis écrit le dump."""
+# Faux helper privé : le vrai lance `pg_dump` ; celui-ci note le mode vu à
+# l'ouverture, puis tronque le fichier sans changer son mode, comme pg_dump.
+FAKE_HELPER = '''#!/usr/bin/env python3
+"""Faux helper privé : note le mode vu à l'ouverture, puis écrit le dump."""
+import json
 import os
 import sys
 
-args = sys.argv[1:]
-chemin = args[args.index("-f") + 1]
-try:
-    mode = "%o" % (os.stat(chemin).st_mode & 0o7777)
-except FileNotFoundError:
-    mode = "absent"
-with open(os.path.join(os.environ["FAKE_STATE"], "mode-ouverture"), "w") as fh:
-    fh.write(mode)
-with open(chemin, "w") as fh:  # tronque sans changer le mode, comme pg_dump
-    fh.write("dump %s\\n" % chemin)
+state = os.environ["FAKE_STATE"]
+argv = sys.argv[1:]
+with open(os.path.join(state, "helper-argv"), "a") as fh:
+    fh.write(json.dumps(argv) + "\\n")
+if argv and argv[0] == "dump":
+    chemin = argv[argv.index("--output") + 1]
+    try:
+        mode = "%o" % (os.stat(chemin).st_mode & 0o7777)
+    except FileNotFoundError:
+        mode = "absent"
+    with open(os.path.join(state, "mode-ouverture"), "w") as fh:
+        fh.write(mode)
+    with open(chemin, "w") as fh:  # tronque sans changer le mode
+        fh.write("dump %s\\n" % chemin)
 '''
 
-FAKE_CURL = '''#!/bin/sh
-exit 0
+# Faux helper de rétention : il note ses arguments et ne supprime rien, pour
+# que le témoin voie ce que le script demande au catalogue privé.
+FAKE_RETENTION = '''#!/usr/bin/env python3
+"""Faux helper de rétention : note la commande reçue, ne supprime rien."""
+import json
+import os
+import sys
+
+with open(os.path.join(os.environ["FAKE_STATE"], "retention-argv"), "a") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\\n")
 '''
 
 # Le nom du dump du jour dépend de la machine et de l'horloge : on les fige
@@ -69,7 +89,6 @@ HOTE = "hote-test"
 JOUR = "2026-01-02"
 
 
-
 class SauvegardesPriveesTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1305-")
@@ -79,14 +98,23 @@ class SauvegardesPriveesTest(unittest.TestCase):
         fakebin = os.path.join(self.tmp, "fakebin")
         os.makedirs(self.state)
         os.makedirs(fakebin, mode=0o755)
-        for nom, contenu in (("pg_dump", FAKE_PG_DUMP), ("curl", FAKE_CURL),
-                             ("hostname", FAKE_HOSTNAME), ("date", FAKE_DATE)):
+        for nom, contenu in (("hostname", FAKE_HOSTNAME), ("date", FAKE_DATE)):
             chemin = os.path.join(fakebin, nom)
+            with open(chemin, "w", encoding="utf-8") as fh:
+                fh.write(contenu)
+            os.chmod(chemin, 0o755)
+        self.helper = os.path.join(self.tmp, "faux-helper-prive.py")
+        self.retention = os.path.join(self.tmp, "faux-helper-retention.py")
+        for chemin, contenu in ((self.helper, FAKE_HELPER),
+                                (self.retention, FAKE_RETENTION)):
             with open(chemin, "w", encoding="utf-8") as fh:
                 fh.write(contenu)
             os.chmod(chemin, 0o755)
         self.env = dict(os.environ, FAKE_STATE=self.state,
                         AMEESH_SAUVEGARDES_DIR=self.dumps,
+                        AMEESH_PYTHON=sys.executable,
+                        AMEESH_SAUVEGARDER_PRIVE=self.helper,
+                        AMEESH_RETENTION_PRIVEE=self.retention,
                         PATH=fakebin + os.pathsep + os.environ.get("PATH", ""))
         # umask permissif de l'appelant : le script doit imposer le sien
         ancien = os.umask(0o022)
@@ -112,10 +140,20 @@ class SauvegardesPriveesTest(unittest.TestCase):
             os.utime(chemin, (vieux, vieux))
         return chemin
 
-    def mode_vu_par_pg_dump(self):
+    def mode_vu_par_le_helper(self):
         with open(os.path.join(self.state, "mode-ouverture"),
                   encoding="utf-8") as fh:
             return fh.read()
+
+    def helper_argv(self):
+        with open(os.path.join(self.state, "helper-argv"),
+                  encoding="utf-8") as fh:
+            return [json.loads(ligne) for ligne in fh if ligne.strip()]
+
+    def retention_argv(self):
+        with open(os.path.join(self.state, "retention-argv"),
+                  encoding="utf-8") as fh:
+            return [json.loads(ligne) for ligne in fh if ligne.strip()]
 
     def test_repertoire_cree_prive_et_dump_0600(self):
         self.assertFalse(os.path.exists(self.dumps))
@@ -123,9 +161,8 @@ class SauvegardesPriveesTest(unittest.TestCase):
         self.assertEqual(fait.returncode, 0, fait.stderr)
         self.assertEqual(self.mode(self.dumps), 0o700)
         self.assertEqual(self.mode(self.dump_du_jour()), 0o600)
-        # précréé sous le umask du script puis chmodé : pg_dump le voit privé,
-        # il ne le crée pas lui-même (#1309)
-        self.assertEqual(self.mode_vu_par_pg_dump(), "600")
+        # créé sous le umask du script (0700), pas restreint après coup
+        self.assertEqual(self.mode_vu_par_le_helper(), "absent")
 
     def test_repertoire_preexistant_0755_restreint(self):
         os.makedirs(self.dumps, mode=0o755)
@@ -143,9 +180,9 @@ class SauvegardesPriveesTest(unittest.TestCase):
         os.chmod(chemin, 0o644)
         fait = self.run_script()
         self.assertEqual(fait.returncode, 0, fait.stderr)
-        # pg_dump a bien vu 0600 à l'ouverture : le mode a été corrigé avant,
-        # sinon il aurait réécrit le fichier en 0644.
-        self.assertEqual(self.mode_vu_par_pg_dump(), "600")
+        # le helper a bien vu 0600 à l'ouverture : le mode a été corrigé avant,
+        # sinon pg_dump aurait réécrit le fichier en 0644.
+        self.assertEqual(self.mode_vu_par_le_helper(), "600")
         self.assertEqual(self.mode(chemin), 0o600)
         with open(chemin, encoding="utf-8") as fh:
             self.assertNotIn("ancien", fh.read())
@@ -159,13 +196,51 @@ class SauvegardesPriveesTest(unittest.TestCase):
         with open(chemin, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "intact\n")
 
-    def test_dump_de_plus_de_14_jours_supprime(self):
+    def test_dump_partage_non_normalise(self):
+        """Un dump à plusieurs liens est refusé comme partagé par le
+        catalogue : le script ne le réécrit pas, car changer son mode
+        changerait aussi celui des autres chemins du même inode."""
         os.makedirs(self.dumps)
-        chemin = self.dump_ancien("ameesh-vieux-2019-12-31.dump", "vieux\n",
-                                  age_jours=20)
+        chemin = self.dump_ancien("ameesh-vieux-2020-01-02.dump", "partage\n")
+        autre = os.path.join(self.tmp, "autre-chemin.dump")
+        os.link(chemin, autre)
         fait = self.run_script()
         self.assertEqual(fait.returncode, 0, fait.stderr)
-        self.assertFalse(os.path.exists(chemin))
+        self.assertEqual(self.mode(chemin), 0o644)
+        self.assertEqual(self.mode(autre), 0o644)
+        with open(chemin, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "partage\n")
+
+    def test_les_anciens_dumps_passent_par_la_retention_privee(self):
+        """Le script ne supprime jamais un dump lui-même : un ensemble inscrit
+        au catalogue survit, et le seul chemin d'expiration est le catalogue
+        privé (`expire-unregistered` puis `prune`, #364/#1484)."""
+        os.makedirs(self.dumps)
+        ancien = self.dump_ancien("ameesh-vieux-2019-12-31.dump", "vieux\n",
+                                  age_jours=20)
+        inscrit = self.dump_ancien("ameesh-%s-2019-12-30.dump" % HOTE,
+                                   "inscrit\n", age_jours=20)
+        fait = self.run_script()
+        self.assertEqual(fait.returncode, 0, fait.stderr)
+        # aucun `find -delete` brut : les deux fichiers sont encore là, privés,
+        # et l'inscrit n'a pas été réécrit.
+        self.assertTrue(os.path.exists(ancien), "un dump a été supprimé par le script")
+        self.assertTrue(os.path.exists(inscrit), "un ensemble inscrit a été supprimé")
+        self.assertEqual(self.mode(ancien), 0o600)
+        self.assertEqual(self.mode(inscrit), 0o600)
+        with open(inscrit, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "inscrit\n")
+        appels = self.retention_argv()
+        self.assertEqual(len(appels), 2, appels)
+        expire, prune = appels
+        self.assertIn("expire-unregistered", expire)
+        self.assertIn("--max-age", expire)
+        self.assertEqual(expire[expire.index("--max-age") + 1], "1209600")
+        self.assertIn("prune", prune)
+        for appel in appels:
+            self.assertIn("--root", appel)
+            self.assertEqual(appel[appel.index("--root") + 1], self.dumps)
+
 
     def poser_acl_defaut(self, repertoire):
         """Pose une ACL par défaut permissive sur le répertoire (#1309).
@@ -188,7 +263,9 @@ class SauvegardesPriveesTest(unittest.TestCase):
         return True
 
     def test_acl_par_defaut_neutre_le_dump_nouveau(self):
-        """Un dump créé pendant pg_dump reste privé malgré l'ACL du répertoire."""
+        """Un dump nouveau reste privé malgré une ACL par défaut permissive du
+        répertoire (#1309) : le helper réel publie un fichier déjà 0600 (#1484)
+        et la normalisation du script, après la rétention, couvre le reste."""
         os.makedirs(self.dumps)
         if not self.poser_acl_defaut(self.dumps):
             self.skipTest("ACL POSIX par défaut indisponible sur ce système")
@@ -207,10 +284,11 @@ class SauvegardesPriveesTest(unittest.TestCase):
                           "défaut")
         fait = self.run_script()
         self.assertEqual(fait.returncode, 0, fait.stderr)
-        # Précréé puis chmodé 0600 : pg_dump le voit privé à l'ouverture et ne
-        # peut pas lui donner le mode de l'ACL en le créant lui-même.
-        self.assertEqual(self.mode_vu_par_pg_dump(), "600")
+        # plus de précréation (#1309) : le helper refuse une sortie existante
+        # (#1484) ; le fichier naît sous l'ACL puis est normalisé 0600.
+        self.assertEqual(self.mode_vu_par_le_helper(), "absent")
         self.assertEqual(self.mode(self.dump_du_jour()), 0o600)
+
 
 
 if __name__ == "__main__":

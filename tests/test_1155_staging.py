@@ -575,9 +575,8 @@ class PosteMigrerTest(unittest.TestCase):
         (self.partage / 'src-current').symlink_to('src-%s' % self.tete[:7])
         p = self.run_poste('migrer', self.tete)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
-        self.assertIn('déjà installé', p.stdout)
-        self.assertFalse(any('migrate --additive-only' in l
-                             for l in self.log.read_text().splitlines()))
+        self.assertTrue(any('migrate --additive-only' in l
+                            for l in self.log.read_text().splitlines()))
         p = self.run_poste('migrer', '--additif-seulement', self.tete)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertTrue(any('migrate --additive-only' in l
