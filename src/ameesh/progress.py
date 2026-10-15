@@ -607,6 +607,8 @@ def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float) -> dict:
         "pace_cap": round(g.pace_cap(now, multiplier), 4),
         "elapsed": round(g.elapsed(now), 4),
         "resets_ts": _round(g.resets_at), "window_s": g.window_s,
+        # #1561 : quand le relevé a été produit (None : source non datée)
+        "read_at": _round(getattr(g, "read_at", None)),
         "exceeded": g.exceeded(now, multiplier=multiplier),
     }
 
@@ -619,6 +621,8 @@ def _account_view(row: dict) -> dict:
         "active": bool(row.get("active")), "forced": bool(row.get("forced")),
         "ok": bool(row.get("ok")), "reason": row.get("reason") or "",
         "next": bool(row.get("next")), "why": row.get("why") or "",
+        # #1561 : relevé périmé (non vérifié) ; ni perte ni échéance annoncées
+        "stale": bool(row.get("stale")),
         "expires_in_s": row.get("expires_in_s"),
         "gauges": [{
             "key": g["key"], "used": round(float(g["used"]), 4),
@@ -626,6 +630,7 @@ def _account_view(row: dict) -> dict:
             "pace_cap": round(float(g["cap"]), 4), "elapsed": round(float(g["elapsed"]), 4),
             "resets_ts": _round(g.get("resets_at")),
             "reset_passed": bool(g.get("reset_passed")),
+            "read_at": _round(g.get("read_at")),
         } for g in row.get("gauges") or []],
         "losses": [{"key": l["key"], "resets_ts": _round(l["resets_at"]),
                     "in_s": int(l["in_s"]), "lost": round(float(l["lost"]), 4)}

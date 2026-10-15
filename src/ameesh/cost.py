@@ -257,6 +257,9 @@ class Gauge:
     used: float                     #: 0..1 (le harnais publie des pourcents)
     resets_at: float | None         #: epoch, ou None si le harnais ne le dit pas
     window_s: float
+    #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
+    #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
+    read_at: float | None = None
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -373,6 +376,34 @@ class Gauge:
         if not self.resets_at or self.reset_passed(now):
             return None
         return float(self.resets_at), max(0.0, 1.0 - float(self.used or 0.0))
+
+
+def stale_reading(gauges, now: float) -> bool:
+    """Le relevé n'est plus un instantané courant du compte (#1561).
+
+    * **absent** (aucune jauge) : rien ne dit l'état du compte ;
+    * **partiel** : une fenêtre datée s'est remise à zéro alors qu'une autre
+      court encore — la fenêtre ouverte n'est plus qu'une borne inférieure
+      (le compte a pu servir depuis, ici ou ailleurs) ;
+    * **non daté** : l'âge du relevé (`read_at`) dépasse sa plus courte
+      fenêtre.
+
+    Un relevé dont **toutes** les fenêtres datées sont remises à zéro n'est
+    pas périmé : la suivante est vierge, 0 % (L71). Un relevé sans âge connu
+    n'est pas présumé périmé : une source qui ne date pas garde son sens, et
+    le choix la traite comme avant.
+    """
+    gauges = list(gauges)
+    if not gauges:
+        return True
+    dated = [g for g in gauges if g.resets_at]
+    if dated:
+        passed = [g.reset_passed(now) for g in dated]
+        return any(passed) and not all(passed)
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    return now - min(stamps) > min(g.window_s for g in gauges)
 
 
 @dataclass(frozen=True)
@@ -795,7 +826,7 @@ class CostBook:
             for line in reversed(self.events(agent, tail=True)):
                 if line.get("type") != "rate_limit_event":
                     continue
-                gauges = _claude_windows(line)
+                gauges = _claude_windows(line, mtime)
                 if gauges is None:
                     break
                 newest = (mtime, Gauges(gauges, _claude_overage(line)))
@@ -858,6 +889,10 @@ class CostBook:
             key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
         )[-CODEX_FILES:]
         for path in reversed(files):
+            try:
+                read_at = os.path.getmtime(path)
+            except OSError:
+                read_at = None
             limits = None
             for line in _read_tail(path, 2_000_000).splitlines():
                 line = line.strip()
@@ -884,6 +919,7 @@ class CostBook:
                     _fraction(value.get("used_percent"), percent=True),
                     _epoch(value.get("resets_at")),
                     minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
+                    read_at,
                 ))
             if gauges:
                 return Gauges(gauges, _codex_overage(limits, gauges))
@@ -1886,8 +1922,12 @@ def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
     return out
 
 
-def _claude_windows(event: dict) -> list | None:
-    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles."""
+def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
+    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
+
+    `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
+    précède le tour, ou la date du flux pour un flux sans marqueur.
+    """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
     if not isinstance(windows, dict):
@@ -1895,7 +1935,8 @@ def _claude_windows(event: dict) -> list | None:
     return [
         Gauge("claude", key, _fraction(value.get("utilization")),
               _epoch(value.get("resetsAt")),
-              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
+              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])),
+              read_at)
         for key, value in windows.items() if isinstance(value, dict)
     ]
 
@@ -2108,7 +2149,7 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
             except (TypeError, ValueError):
                 stamp = 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
-            gauges = _claude_windows(event)
+            gauges = _claude_windows(event, stamp)
             if gauges is not None:
                 readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
     return readings
