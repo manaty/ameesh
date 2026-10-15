@@ -1,0 +1,27 @@
+# 1343 — temoins cibles, candidat 3ffddb0418c487d61f0f517336360b23404bc515
+## A. tests.test_l161g_ci_gel (gel/etiquette + P2-3 marque/run + mode)
+........................................................................................
+----------------------------------------------------------------------
+Ran 88 tests in 0.081s
+
+OK
+l161g-exit:0
+## B. tests.test_l161f_plan + test_l744_ci_entrypoint + test_l161a_ci_sans_code + test_l161e_map + test_l932_ci_venv_cache + test_hermeticity_lint
+...........................................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmp496rzrq7/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmp29yyi1aq/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+....................................s..carte /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmp2dayciv9/absente.json.gz illisible ([Errno 2] No such file or directory: '/home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmp2dayciv9/absente.json.gz') : durées de tests/parts/durees.json
+............................
+----------------------------------------------------------------------
+Ran 168 tests in 55.275s
+
+OK (skipped=1)
+voisins-exit:0
+## C. tests.test_l161b_flow + tests.test_l161c_failures_realtime
+...ordre : diff depuis ref-qui-n-existe-pas illisible (Command '['git', 'diff', '--name-only', '--no-renames', 'ref-qui-n-existe-pas', 'HEAD']' returned non-zero exit status 1.) ; ordre alphabétique
+...............................
+----------------------------------------------------------------------
+Ran 34 tests in 77.843s
+
+OK
+l161bc-exit:0

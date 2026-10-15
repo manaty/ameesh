@@ -1,0 +1,31 @@
+# 1343 — temoins de discrimination du delta mode/run (candidat 3ffddb0418c487d61f0f517336360b23404bc515)
+# chaque mutation du delta 866764dc5..3ffddb0418c487d61f0f517336360b23404bc515 fait rougir ses temoins, puis restauration
+== M1 : la couverture des modes est retiree de _materialized (identifiant seul)
+FAIL: test_un_run_de_lot_rouge_ne_libere_pas_une_reservation_full (tests.test_l161g_ci_gel.RequestTest.test_un_run_de_lot_rouge_ne_libere_pas_une_reservation_full)
+FAIL: test_un_run_de_lot_ne_materialise_pas_une_marque_full (tests.test_l161g_ci_gel.ReservationTest.test_un_run_de_lot_ne_materialise_pas_une_marque_full)
+Ran 88 tests in 0.074s
+FAILED (failures=2)
+   unittest-exit=1 (attendu: 1)
+== M2 : materialisation neutralisee (_materialized -> False)
+FAIL: test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde (tests.test_l161g_ci_gel.RequestTest.test_un_run_rouge_ne_tient_plus_la_reservation_a_la_meme_seconde)
+FAIL: test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas (tests.test_l161g_ci_gel.RequestTest.test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas)
+FAIL: test_la_meme_seconde_ne_decide_pas (tests.test_l161g_ci_gel.ReservationTest.test_la_meme_seconde_ne_decide_pas)
+FAIL: test_un_run_de_lot_ne_materialise_pas_une_marque_full (tests.test_l161g_ci_gel.ReservationTest.test_un_run_de_lot_ne_materialise_pas_une_marque_full)
+FAIL: test_une_execution_superieure_materialise_la_marque (tests.test_l161g_ci_gel.ReservationTest.test_une_execution_superieure_materialise_la_marque)
+Ran 88 tests in 0.068s
+FAILED (failures=5)
+   unittest-exit=1 (attendu: 1)
+== M3 : la borne seen= est retiree (toute execution couvrante libere)
+FAIL: test_une_marque_posterieure_au_run_visible_tient_la_cle (tests.test_l161g_ci_gel.RequestTest.test_une_marque_posterieure_au_run_visible_tient_la_cle)
+FAIL: test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas (tests.test_l161g_ci_gel.RequestTest.test_une_reprise_invisible_apres_un_run_rouge_ne_repose_pas)
+FAIL: test_la_meme_seconde_ne_decide_pas (tests.test_l161g_ci_gel.ReservationTest.test_la_meme_seconde_ne_decide_pas)
+FAIL: test_une_execution_superieure_materialise_la_marque (tests.test_l161g_ci_gel.ReservationTest.test_une_execution_superieure_materialise_la_marque)
+Ran 88 tests in 0.071s
+FAILED (failures=4)
+   unittest-exit=1 (attendu: 1)
+== restauration : git checkout src/ameesh/ci.py (arbre propre)
+----------------------------------------------------------------------
+Ran 88 tests in 0.080s
+
+OK
+   unittest-exit=0 (attendu: 0)

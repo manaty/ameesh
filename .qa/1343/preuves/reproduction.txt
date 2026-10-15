@@ -1,0 +1,13 @@
+# 1343 — reproduction du constat P2-3 cx2 (NO-GO 4847) sur le candidat 3ffddb0418c487d61f0f517336360b23404bc515
+## sonde directe : marque {mode: full, seen: 0} + execution lot 12
+full/seen0 + (12,lot)  -> _materialized = False (attendu False)
+full/seen0 + (12,full) -> _materialized = True (attendu True)
+lot/seen0  + (12,lot)  -> _materialized = True (attendu True)
+full/seen12 + (11,full)-> _materialized = False (attendu False)
+## temoins nommes du delta
+..
+----------------------------------------------------------------------
+Ran 2 tests in 0.002s
+
+OK
+reproduction-exit:0

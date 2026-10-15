@@ -1,0 +1,190 @@
+From 3ffddb0418c487d61f0f517336360b23404bc515 Mon Sep 17 00:00:00 2001
+From: mty-amh-impl-04 <mty-amh-impl-04@ameesh.invalid>
+Date: Thu, 15 Oct 2026 07:20:08 +0000
+Subject: [PATCH] =?UTF-8?q?#1343=20:=20P2-3=20delta=20=E2=80=94=20un=20run?=
+ =?UTF-8?q?=20de=20lot=20ne=20mat=C3=A9rialise=20pas=20une=20marque=20full?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+cx2 NO-GO 4847 (sonde AST sur 866764dc5 : marque {mode: full, seen: 0} +
+run lot 12 => _materialized True). Le mode était perdu entre la liste des
+exécutions de la composition et la corrélation : `_request_once` passait
+`tuple(_run_id(r["row"]) for r in runs)` et `_materialized` ne comparait que
+les identifiants. Un run de lot, même rouge, libérait donc une réservation
+`full` encore invisible, et la demande de suite complète repartait.
+
+`runs` porte désormais des couples (identifiant, mode) et `_materialized`
+applique `_covers(run.mode, mark.mode)` : seul un run `full` matérialise une
+marque `full` ; un run de lot matérialise un lot, et un full le couvre.
+
+Témoins : unité (marque full, seen=0, run lot 12 => tenue ; run full 12 =>
+libérée) et bout en bout (marque full d'un autre porteur + run lot rouge
+visible + --force => aucune seconde étiquette, « already holds »). Les deux
+rougissent sur la sémantique d'avant (comparaison d'identifiants seule).
+---
+ src/ameesh/ci.py           | 35 ++++++++++++++++-------------
+ tests/test_l161g_ci_gel.py | 45 +++++++++++++++++++++++++++++++++-----
+ 2 files changed, 59 insertions(+), 21 deletions(-)
+
+diff --git a/src/ameesh/ci.py b/src/ameesh/ci.py
+index c2d5c45f8..a37a75ef0 100644
+--- a/src/ameesh/ci.py
++++ b/src/ameesh/ci.py
+@@ -921,23 +921,27 @@ def _run_id(row: dict) -> int:
+         return 0
+ 
+ 
+-def _materialized(mark: dict, runs: list[int]) -> bool:
++def _materialized(mark: dict, runs) -> bool:
+     """Une exécution visible matérialise-t-elle cette marque (P2-3) ?
+ 
+     Chaque marque `applied` enregistre `seen=` : le plus grand identifiant
+     d'exécution connu avant sa pose. Les identifiants des exécutions GitHub
+     croissent avec le temps : un run d'identifiant supérieur n'a pu naître
+     qu'après elle, donc la demande a produit son exécution et ne tient plus la
+-    clé. Une marque sans `seen=` (écrite avant #1343) n'est pas corrélable :
+-    elle tient la clé jusqu'au `ttl`, jamais libérée par une comparaison entre
+-    l'horloge de la base (marque, fractionnaire) et celle de GitHub (run, à la
+-    seconde) — c'est cette comparaison qui bloquait la reprise d'un run rouge
+-    né dans la même seconde que sa marque.
++    clé. `runs` porte des couples (identifiant, mode) : la couverture des modes
++    suit celle des exécutions (§ `_covers`) — un run de lot ne matérialise pas
++    une demande de suite complète, seul un `full` le fait (P2-3, cx2). Une
++    marque sans `seen=` (écrite avant #1343) n'est pas corrélable : elle tient
++    la clé jusqu'au `ttl`, jamais libérée par une comparaison entre l'horloge
++    de la base (marque, fractionnaire) et celle de GitHub (run, à la seconde) —
++    c'est cette comparaison qui bloquait la reprise d'un run rouge né dans la
++    même seconde que sa marque.
+     """
+     seen = mark.get("seen")
+     if seen is None:
+         return False
+-    return any(ident > seen for ident in runs)
++    return any(ident > seen and _covers(run_mode, mark["mode"])
++               for ident, run_mode in runs)
+ 
+ 
+ def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token: str, *,
+@@ -948,11 +952,12 @@ def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token
+     Une étiquette posée mais pas encore visible comme exécution dans l'API
+     GitHub tient la clé le temps du `ttl` ; `released` (demande refusée), les
+     marques périmées et celles que matérialise une exécution visible
+-    (`_materialized`) ne tiennent pas. `runs` porte les identifiants des
+-    exécutions visibles de la composition : la marque est libérée par
+-    corrélation d'identifiants, jamais par une comparaison d'horloges. La
+-    couverture des modes suit celle des exécutions (§ `_covers`) : un `full`
+-    réservé couvre une demande `lot` de la même composition, l'inverse non.
++    (`_materialized`) ne tiennent pas. `runs` porte les couples (identifiant,
++    mode) des exécutions visibles de la composition : la marque est libérée par
++    corrélation d'identifiants et de mode, jamais par une comparaison
++    d'horloges. La couverture des modes suit celle des exécutions (§ `_covers`) :
++    un `full` réservé couvre une demande `lot` de la même composition, l'inverse
++    non — et seul un run `full` matérialise une marque `full`.
+     Appelé sous le verrou de la ligne du lot, il lit les marques commitées des
+     autres processus ; le porteur courant est exclu (`token`).
+     """
+@@ -1393,11 +1398,11 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) ->
+                            "--force to request the CI again" % runs[-1]["mode"]}
+         #: P2 R1/P2-3 : une marque que matérialise une exécution visible (run
+         #: rouge court) ne tient plus la clé ; seule une demande encore
+-        #: invisible tient, et la corrélation est l'identifiant du run, pas
+-        #: l'horloge.
++        #: invisible tient, et la corrélation est le couple (identifiant, mode)
++        #: du run, pas l'horloge — un run de lot ne matérialise pas un `full`.
+         held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
+                                   now=time.time(),
+-                                  runs=tuple(_run_id(r["row"]) for r in runs))
++                                  runs=tuple((_run_id(r["row"]), r["mode"]) for r in runs))
+         if held:
+             note("released", "another request (token %s) already holds this composition"
+                  % held["token"])
+diff --git a/tests/test_l161g_ci_gel.py b/tests/test_l161g_ci_gel.py
+index 34aa53569..618c74d80 100644
+--- a/tests/test_l161g_ci_gel.py
++++ b/tests/test_l161g_ci_gel.py
+@@ -726,14 +726,29 @@ class ReservationTest(unittest.TestCase):
+         self.assertIsNone(ci.reservation_holder(lot, GEL, BASE, "full", "", now=now))
+         self.assertIsNotNone(ci.reservation_holder(lot, GEL, BASE, "lot", "", now=now))
+ 
++    def test_un_run_de_lot_ne_materialise_pas_une_marque_full(self):
++        """P2-3 (cx2 NO-GO 4847) : un run de lot, même d'un identifiant
++        supérieur, ne matérialise pas la marque `full` d'une demande encore
++        invisible — seul un run `full` la libère."""
++        now = time.time()
++        full = [porte("applied", mode="full", token="6" * 16, seen=0)]
++        self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "lot", "",
++                                                   now=now, runs=[(12, "lot")]))
++        self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "full", "",
++                                                   now=now, runs=[(12, "lot")]))
++        self.assertIsNone(ci.reservation_holder(full, GEL, BASE, "lot", "",
++                                                now=now, runs=[(12, "full")]))
++        self.assertIsNone(ci.reservation_holder(full, GEL, BASE, "full", "",
++                                                now=now, runs=[(12, "full")]))
++
+     def test_une_execution_superieure_materialise_la_marque(self):
+         now = time.time()
+         avant = [porte("applied", token="7" * 16, seen=4, ts=now - 300)]
+         self.assertIsNone(ci.reservation_holder(avant, GEL, BASE, "lot", "",
+-                                                now=now, runs=[12]))
++                                                now=now, runs=[(12, "lot")]))
+         apres = [porte("applied", token="7" * 16, seen=12, ts=now)]
+         self.assertIsNotNone(ci.reservation_holder(apres, GEL, BASE, "lot", "",
+-                                                   now=now, runs=[12]))
++                                                   now=now, runs=[(12, "lot")]))
+ 
+     def test_la_meme_seconde_ne_decide_pas(self):
+         # P2-3 : la marque (horodatage base, fractionnaire) et le run (GitHub,
+@@ -743,10 +758,10 @@ class ReservationTest(unittest.TestCase):
+         t = 1802563200.0
+         rouge = [porte("applied", token="7" * 16, seen=0, ts=t + 0.125)]
+         self.assertIsNone(ci.reservation_holder(rouge, GEL, BASE, "lot", "",
+-                                                now=t + 120, runs=[12]))
++                                                now=t + 120, runs=[(12, "lot")]))
+         invisible = [porte("applied", token="8" * 16, seen=12, ts=t + 0.125)]
+         self.assertIsNotNone(ci.reservation_holder(invisible, GEL, BASE, "lot", "",
+-                                                   now=t + 120, runs=[12]))
++                                                   now=t + 120, runs=[(12, "lot")]))
+ 
+     def test_une_marque_sans_watermark_tient_jusqu_au_ttl(self):
+         # une marque d'avant #1343 n'est pas corrélable : elle tient la clé
+@@ -754,9 +769,9 @@ class ReservationTest(unittest.TestCase):
+         now = time.time()
+         legacy = [porte("applied", token="9" * 16, seen=None, ts=now)]
+         self.assertIsNotNone(ci.reservation_holder(legacy, GEL, BASE, "lot", "",
+-                                                   now=now, runs=[12]))
++                                                   now=now, runs=[(12, "lot")]))
+         self.assertIsNone(ci.reservation_holder(legacy, GEL, BASE, "lot", "",
+-                                                now=now + ci.RESERVE_TTL_S, runs=[12]))
++                                                now=now + ci.RESERVE_TTL_S, runs=[(12, "lot")]))
+ 
+ 
+ class CancelPlanTest(GelTestCase):
+@@ -1142,6 +1157,24 @@ class RequestTest(GelTestCase):
+         self.assertEqual(gh.poses(), [LABEL_FULL], "le full couvre le lot")
+         self.assertEqual(len(notes), avant, "la demande lot recule avant toute note")
+ 
++    def test_un_run_de_lot_rouge_ne_libere_pas_une_reservation_full(self):
++        # P2-3 (cx2 NO-GO 4847) : la marque `full` d'un autre porteur reste
++        # tenue tant qu'aucun run `full` n'est visible ; un run de lot, même
++        # rouge et d'un identifiant supérieur, ne la matérialise pas — sans le
++        # correctif, la demande lot repartait et posait une seconde étiquette.
++        self.gele()
++        t = time.time()
++        self.events.append(marque("applied", mode="full", token="5" * 16,
++                                  ts=t + 0.125, seen=0))
++        api = Github(runs=[label_run(12, conclusion="failure", created=t)])
++        gh = Gh()
++        force = argparse.Namespace(**{**vars(self.args), "force": True})
++        with mock.patch.object(ci.time, "time", lambda: t + 120):
++            code, notes = self.run_cmd(api, gh, args=force)
++        self.assertEqual(code, 0)
++        self.assertEqual(gh.poses(), [], "un run de lot ne libère pas le full")
++        self.assertTrue(any("already holds" in n for n in notes), notes)
++
+     def test_une_reservation_lot_ne_couvre_pas_la_demande_full(self):
+         # P2 delta, garde : un `lot` réservé ne dispense pas du `full` ; la
+         # demande pleine part (le run `lot` ne prouve pas la suite complète).
+-- 
+2.43.0
+
