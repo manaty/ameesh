@@ -389,6 +389,20 @@ and the cap of 3 nudges, counted locally in
 `~/.local/state/agent-mesh/hooks/<nom>.stops`): a test compares the output of the
 v0 script and that of v1 for the four events.
 
+**Fast path of the hooks and the status line (#1604).** The `agent-mail`
+console script goes through `ameesh.entry`, which serves `statusline` and
+`hook <harness>` without importing `ameesh.cli` (database, psycopg). A local
+mailbox marker (`<state_dir>/mail/<agent>.json`) records the outcome of the
+last COMPLETE read: a `PostToolUse` hook skips the database only when the
+marker is fresh (`AMEESH_HOOK_FAST_TTL`, 15 s by default) and says there is
+nothing to deliver. `Stop`, `SessionStart` and `UserPromptSubmit` always go
+through the database; a local send (`send`, `forward`, `sweep`) invalidates the
+recipient's marker; the status line is cached for a few seconds
+(`AMEESH_STATUSLINE_TTL`, 5 s). The fast path delivers no mail and writes no
+registry: it cannot confuse an identity or a session, at worst it delays a
+delivery, which the next complete pass (at the latest the `Stop` hook) catches
+up.
+
 **Identity tied to the lease, never to the directory (mesh-design incident of 2026-10-09).**
 A session only has an identity if `AGENT_MAIL_NAME` is set; if
 `AMEESH_RUNNER_ID` and `AMEESH_LEASE_EPOCH` are set too (it is the
