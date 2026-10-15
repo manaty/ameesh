@@ -17,6 +17,7 @@ import http.client
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh import budget, fil, registry, serve, serve_actions, storage, work
 from ameesh import resources as res
@@ -104,6 +105,15 @@ class GuardsTest(PostMixin, unittest.TestCase):
         self.assertEqual((status, body["error"]), (404, "not_found"))
         status, _h, body = self.post("/api/v1/agents/a1/messages?x=1", {"text": "x"})
         self.assertEqual((status, body["error"]), (400, "bad_query"))
+
+    def test_a_refused_parameter_does_not_hide_the_405(self):
+        # #1497 N4 : the route exists for the other method; its parameter is
+        # never checked first (that was a 400 bad_path)
+        status, headers, _b = self.get("/api/v1/agents/bad%20name/stop")
+        self.assertEqual((status, headers.get("Allow")), (405, "POST"))
+        status, headers, _b = self.post("/api/v1/hosts/bad%20host", {})
+        self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD"))
+        self.assertEqual(self.writes, [])
 
     def test_without_a_writer_actions_are_unavailable(self):
         self._stop()
@@ -285,6 +295,58 @@ class ActionsPgTest(PostMixin, PgTestCase):
         status, _h, out = self.post("/api/v1/agents/ghost/stop", {"reason": "x"},
                                     key="key-0000000008")
         self.assertEqual(status, 404)
+
+    def test_a_deputy_is_a_trace_never_a_thread_sender(self):
+        # #1497 N1 : `human:X for human:Y` (L86) goes to meta.by; the thread's
+        # sender is the human who acts, as `_publish` does
+        ctx = serve.Context(cfg=self.cfg, human="human:deputy", on_behalf_of="human:owner")
+        with mock.patch.object(fil, "record", return_value=None) as record:
+            serve_actions._stop(ctx, self.db, {"agent": "a1"}, {"reason": "boucle"})
+            serve_actions._lower_cap(ctx, self.db, {}, {"window": "hour", "usd": 5,
+                                                        "agent": "a1"})
+        self.assertEqual(record.call_count, 2)
+        for call in record.call_args_list:
+            self.assertEqual(call.kwargs["sender"], "human:deputy")
+            self.assertEqual(call.kwargs["meta"]["by"], "human:deputy for human:owner")
+        self.assertIn("human:deputy for human:owner",
+                      registry.get(self.db, "a1")["status_text"])
+
+    def test_a_held_key_is_released_by_hand_only_when_unanswered(self):
+        # #1497 N2 : a key left reserved by an action that raised is freed by
+        # `ameesh serve --release-key`, never an answered one
+        api = storage.of(self.db).api_requests
+        api.reserve("human:owner", "key-0000000020", "2" * 64, retention_s=86400)
+        self.assertEqual(serve.release_key(self.cfg, "human:owner", "key-0000000020"), 0)
+        self.assertIsNone(api.reserve("human:owner", "key-0000000020", "2" * 64,
+                                      retention_s=86400))
+        api.complete("human:owner", "key-0000000020", 200, {"ok": True})
+        self.assertEqual(serve.release_key(self.cfg, "human:owner", "key-0000000020"), 1)
+        self.assertEqual(api.reserve("human:owner", "key-0000000020", "2" * 64,
+                                     retention_s=86400)["status"], 200)
+        self.assertEqual(serve.release_key(self.cfg, "human:owner", "bad key"), 2)
+
+    def test_the_purge_never_waits_on_a_locked_row(self):
+        # #1497 N3 : an expired row locked elsewhere is skipped, not waited on —
+        # a reservation holds one row lock only, so no lock cycle can form
+        self.db.execute("insert into api_idempotency (human, key, fingerprint, created_at)"
+                        " values ('human:owner', 'key-0000000030', %s,"
+                        " now() - interval '2 days')", ("3" * 64,))
+        holder, other = self.connect(), self.connect()
+        try:
+            other.execute("set lock_timeout = '3s'")
+            with holder.transaction() as tx:
+                tx.query("select key from api_idempotency where key = 'key-0000000030'"
+                         " for update")
+                self.assertIsNone(storage.of(other).api_requests.reserve(
+                    "human:owner", "key-0000000031", "4" * 64, retention_s=86400))
+            # once free, the next reservation purges it
+            storage.of(other).api_requests.reserve("human:owner", "key-0000000032",
+                                                   "5" * 64, retention_s=86400)
+            self.assertEqual(self.db.query("select key from api_idempotency"
+                                           " where key = 'key-0000000030'"), [])
+        finally:
+            holder.close()
+            other.close()
 
     def test_assign_to_a_human_never_external(self):
         status, _h, out = self.post("/api/v1/lots/%d/assign" % self.lot["id"],
