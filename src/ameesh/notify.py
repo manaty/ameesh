@@ -1080,6 +1080,7 @@ class Notifier:
                          % entry["alert"].get("type"))
                 continue
             self._resolved(key, entry, now)
+            self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
             if entry is None:
@@ -1090,6 +1091,7 @@ class Notifier:
                 if alert.get("type") in exploitation.ESCALATING:
                     entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
+                self._event(db, "alert.raised", key, alert)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
             elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
@@ -1303,6 +1305,21 @@ class Notifier:
             self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
 
     # -- levée ----------------------------------------------------------------
+    def _event(self, db, kind: str, key: str, alert: dict) -> None:
+        """L85: the alert in the event log (`GET /api/v1/events`); a base
+        error is said, never fatal to the pass."""
+        if self.dry_run or db is None:
+            return
+        from . import events
+        data = {name: alert.get(name) for name in ("agent", "lot", "host")
+                if alert.get(name) is not None}
+        try:
+            events.record(db, kind, ("alert:%s" % alert.get("type"))[:300],
+                          project=alert.get("project"), alert=alert.get("type"), key=key,
+                          **data)
+        except Exception as exc:  # noqa: BLE001 — the notification goes on
+            self.log("event %s not recorded: %s" % (kind, type(exc).__name__))
+
     def _raise(self, entry: dict, router: Router, now: float) -> None:
         alert = entry["alert"]
         first = entry["status"] == "nouvelle"
