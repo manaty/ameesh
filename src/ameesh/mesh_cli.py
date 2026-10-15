@@ -2708,7 +2708,8 @@ def cmd_cost(cfg: Config, args) -> int:
                 rythmes[ligne["harness"]] = ligne.get("pace_multiplier", 1.0)
         rows = book.report(accounts=actifs, multipliers=rythmes)
         for ligne in comptes:
-            ligne.pop("_gauges", None)
+            for cle in ("_gauges", "_limits", "_ceilings"):
+                ligne.pop(cle, None)
         if comptes:
             for row in rows:
                 if row["harness"] in actifs:
@@ -2845,7 +2846,8 @@ def cmd_accounts(cfg: Config, args) -> int:
         # L71 : `accounts list` est un affichage — aucun relevé écrit
         rows = accounts_mod.report(cfg, db, book, record=False)
         for row in rows:
-            row.pop("_gauges", None)
+            for cle in ("_gauges", "_limits", "_ceilings"):
+                row.pop(cle, None)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):

@@ -157,6 +157,10 @@ def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
 PACE_MARGIN = 0.10
+#: Plafond de rythme par défaut (0019 §2). Un compte peut régler le sien
+#: (`accounts.<harnais>[i].pace_ceiling`, #1176) et le relever dans les
+#: dernières heures de la fenêtre quand l'overage y est impossible
+#: (`pace_ceiling_end`).
 PACE_CEILING = 0.90
 #: L242b : plancher du rapport réel/estimé qui corrige l'estimation entre deux
 #: relevés de solde (`CostBook.paid_hour`) — jamais une dépense comptée nulle
@@ -260,16 +264,22 @@ class Gauge:
             return 1.0
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
-    def pace_cap(self, now: float, multiplier: float = 1.0) -> float:
-        """Le plafond de rythme : min(90 %, part écoulée × `multiplier` + 10 points).
+    def pace_cap(self, now: float, multiplier: float = 1.0,
+                 ceiling: float = PACE_CEILING) -> float:
+        """Le plafond de rythme : min(`ceiling`, part écoulée × `multiplier` + 10 points).
 
         `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
         compte (`accounts`, `pace_multiplier`, défaut 1.0), posé à 2.0 sur le
         compte principal Codex pour consommer sa réserve de forfait sans
         remise à zéro. Il ne touche que la part écoulée : l'utilisation
         relevée, les remises à zéro et les plafonds fixes ne changent pas.
+
+        `ceiling` (#1176) : le plafond du compte (`accounts`, `pace_ceiling`,
+        défaut `PACE_CEILING`), ou son plafond de fin de fenêtre
+        (`pace_ceiling_end`) quand le relèvement s'applique. Les autres termes
+        — marge, part écoulée, utilisation relevée — sont inchangés.
         """
-        return min(PACE_CEILING, self.elapsed(now) * multiplier + PACE_MARGIN)
+        return min(ceiling, self.elapsed(now) * multiplier + PACE_MARGIN)
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
@@ -282,7 +292,7 @@ class Gauge:
         return 0.0 if self.reset_passed(now) else self.used
 
     def held_cap(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0) -> float:
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float:
         """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
         jamais sous `PACE_MARGIN` quand une réserve s'applique.
 
@@ -301,17 +311,21 @@ class Gauge:
         * **fin de fenêtre** : le seuil plafonne à `PACE_CEILING − reserve`
           (80 % avec la réserve de 10 points) et ne suit plus l'écoulé —
           l'énoncé `max(écoulé, marge)` n'y vaut plus (#1028 N1).
+
+        `ceiling` (#1176) est transmis à `pace_cap` : le plafond du compte ou
+        son plafond de fin de fenêtre.
         """
-        cap = max(0.0, self.pace_cap(now, multiplier) - reserve)
+        cap = max(0.0, self.pace_cap(now, multiplier, ceiling) - reserve)
         return max(cap, PACE_MARGIN) if reserve else cap
 
     def exceeded(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0) -> bool:
-        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant."""
-        return self.used_at(now) >= self.held_cap(now, reserve, multiplier)
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> bool:
+        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant,
+        `ceiling` (#1176) est celui du compte."""
+        return self.used_at(now) >= self.held_cap(now, reserve, multiplier, ceiling)
 
     def free_at(self, now: float, reserve: float = 0.0,
-                multiplier: float = 1.0) -> float | None:
+                multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float | None:
         """L'heure où la fenêtre cesse de bloquer, ou None si elle ne la dit
         pas (`resets_at` absent).
 
@@ -328,11 +342,13 @@ class Gauge:
         `used ≥ held_cap ≥ PACE_MARGIN`, donc la part est déjà positive ; le
         plancher ne changeait rien pour `reserve ≥ PACE_MARGIN` et annonçait
         une libération trop tardive en dessous (le seuil, lui, garde le sien).
+
+        `ceiling` (#1176) est le plafond effectif du compte à `now`.
         """
         if not self.resets_at:
             return None
         used = self.used_at(now)
-        if used >= PACE_CEILING - reserve:
+        if used >= ceiling - reserve:
             return float(self.resets_at)
         share = (used + reserve - PACE_MARGIN) / multiplier
         share = min(max(share, 0.0), 1.0)
@@ -1876,12 +1892,26 @@ def _claude_overage(event: dict) -> Overage:
 
 def _codex_overage(limits: dict, gauges: list) -> Overage:
     """The overage flags of a Codex `rate_limits` object (L226b): credits
-    let the account go on, billed, once a window is at 100 %."""
+    let the account go on, billed, once a window is at 100 %.
+
+    #1176 (B1) : un objet `credits` vide, partiel, ou dont les champs ne sont
+    pas des booléens ne prouve RIEN — `capable` reste None (inconnu), et
+    aucun relèvement de fin de fenêtre ne s'appuie dessus. Seule une capacité
+    explicite (`has_credits` ou `unlimited` vrai) rend True ; une incapacité
+    n'est rendue False que si elle est explicite (`has_credits` faux) et non
+    contredite par `unlimited` vrai.
+    """
     credits = limits.get("credits")
     if not isinstance(credits, dict):
         return Overage()
-    capable = credits.get("has_credits") is True or credits.get("unlimited") is True
-    return Overage(capable, capable and any(g.used >= 1.0 for g in gauges))
+    has_credits, unlimited = credits.get("has_credits"), credits.get("unlimited")
+    if has_credits is True or unlimited is True:
+        capable: bool | None = True
+    elif has_credits is False:
+        capable = False
+    else:
+        capable = None
+    return Overage(capable, capable is True and any(g.used >= 1.0 for g in gauges))
 
 
 def _find_rate_limits(node, depth: int = 0):
