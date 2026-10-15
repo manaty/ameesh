@@ -1132,6 +1132,23 @@ def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
     return row
 
 
+def _notify_released(db: Db, item_id: int, *, blocker_state: str,
+                     blocker_reason: str = "", after_commit: list | None = None) -> list[dict]:
+    """L385 suite : la fermeture d'un lot réveille les agents des lots qui le
+    déclarent en prérequis explicite.
+
+    Appelé DANS la transaction de fermeture, après l'écriture de la transition
+    et sous le verrou de graphe : le courrier est committé avec la fermeture.
+    Il n'y a donc pas de fenêtre « fermeture commise, réveil non écrit » ; un
+    échec d'écriture annule la fermeture entière et la reprise refait les deux
+    (voir `work_dependencies.notify_released`). Le fil lisible est écrit après
+    le commit, par la liste `after_commit` que l'appelant exécute."""
+    from . import work_dependencies
+    return work_dependencies.notify_released(
+        db, int(item_id), blocker_state=blocker_state,
+        blocker_reason=blocker_reason, after_commit=after_commit)
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "") -> dict:
@@ -1149,6 +1166,13 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
     (`declared`, `ameesh work merged`), suivie de `extra`.
+
+    Dans la MÊME transaction que la transition, les agents des lots qui
+    déclarent ce lot en prérequis explicite et dont c'était la dernière attente
+    reçoivent un courrier durable (L385 suite) :
+    le réveil ne peut être ni perdu (un échec annule la fusion, la reprise
+    refait les deux) ni doublé (le verrou de graphe sérialise les fermetures,
+    une seule voit la dernière attente tomber).
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -1166,10 +1190,17 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             "declared" if declared else "seen",
             " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
             " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
+        threads: list = []
         try:
-            row = storage.of(db).work.close_merged(
-                item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-                frozen_id=frozen_id)
+            from . import work_dependencies
+            with db.transaction() as tx:
+                work_dependencies.lock(tx)
+                row = storage.of(tx).work.close_merged(
+                    item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
+                    frozen_id=frozen_id)
+                if row is not None:
+                    _notify_released(tx, item_id, blocker_state="merged",
+                                     after_commit=threads)
         except DbError as exc:
             # A refused module requirement is a per-lot result, allowing a
             # merge sweep to continue with other projects. Other DB errors
@@ -1178,6 +1209,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 raise
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": str(exc)}
+        # le fil externe après le commit seulement : un envoi annulé n'y
+        # laisse rien
+        for record in threads:
+            record(db.cfg, db)
         if row is not None:
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": "%s → merged" % state}
@@ -1232,7 +1267,14 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     Les trois portes sont exclusives. `--delivered` exige `--sha <tête relue>`
     (7 à 64 caractères hexadécimaux) : le jalon `delivered` porte ce SHA et
     compte comme livraison dans `estimates`. Un jalon `closed` est écrit dans
-    tous les cas ; rien ne reste ouvert par oubli."""
+    tous les cas ; rien ne reste ouvert par oubli.
+
+    Dans la MÊME transaction, les agents des lots qui déclarent ce lot en
+    prérequis explicite et dont c'était la dernière attente reçoivent un
+    courrier durable (L385 suite) : l'abandon libère
+    l'attente sans prouver la livraison, le dépendant doit réévaluer son
+    prérequis. Un échec du courrier annule la fermeture (reprise) ; le verrou
+    de graphe empêche deux fermetures de se doubler."""
     if sum((bool(abandoned), superseded_by is not None, bool(delivered))) != 1:
         raise WorkError("pass one of --abandoned, --superseded-by <id>, "
                         "--delivered --sha <reviewed head>")
@@ -1260,10 +1302,20 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     else:
         reason, base = "delivered", "delivered (head %s)" % head[:12]
     text = base + (" — %s" % note.strip() if note and note.strip() else "")
-    row = storage.of(db).work.close(
-        item_id, current=state, reason=reason,
-        superseded_by=int(superseded_by) if superseded_by is not None else None,
-        sha=head, actor=actor, note=text)
+    from . import work_dependencies
+    threads: list = []
+    with db.transaction() as tx:
+        work_dependencies.lock(tx)
+        row = storage.of(tx).work.close(
+            item_id, current=state, reason=reason,
+            superseded_by=int(superseded_by) if superseded_by is not None else None,
+            sha=head, actor=actor, note=text)
+        if row is not None:
+            _notify_released(tx, item_id, blocker_state="closed", blocker_reason=reason,
+                             after_commit=threads)
+    # le fil externe après le commit seulement : un envoi annulé n'y laisse rien
+    for record in threads:
+        record(db.cfg, db)
     if row is None:
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
