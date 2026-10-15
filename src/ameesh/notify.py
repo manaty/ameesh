@@ -110,7 +110,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain", "db_connections_high")
+                 "land_uncertain", "db_connections_high",
+                 # #513 : la dépense comptée s'écarte des soldes (barème faux)
+                 "budget_drift")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -194,6 +196,7 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
+    "budget_drift": "counted spend strays from the provider balance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
