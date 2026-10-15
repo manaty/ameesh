@@ -106,6 +106,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
 
+Les idées qui ne sont pas décidées vont dans le [sas d’explorations](docs/design/explorations/index.md) :
+un fichier par idée, `type: Exploration`, `status: exploration`, avec problème,
+intuitions et questions ouvertes. Ni lots proposés, ni dates, ni estimations,
+ni critère « fait » ; aucun lot, WorkPackage, backlog ou ligne de roadmap ne
+se déduit d’une exploration. Seule une décision explicite de l’owner,
+consignée dans `docs/design/decisions/`, permet la promotion en étude puis en
+lots. Les fiches de plan et de lot pointent vers l’étude décidée. La garde
+`tests.test_l1124_explorations` vérifie cette séparation dans le dépôt.
+
 ## Numérotation des versions
 
 Règle du propriétaire (2026-10-11). Le numéro `MAJEUR.MINEUR.CORRECTIF` dit
