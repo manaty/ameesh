@@ -1578,6 +1578,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         # L159c : plafond mémoire et slice des unités d'agent
         for line in hostcheck.memory_cap_lines(cfg, db):
             print(line)
+        # L498 : cgroup délégué par tour (unité déléguée, racine libre et
+        # inscriptible) — lecture seule, sans changer le verdict
+        for line in hostcheck.turn_cgroup_lines(cfg, db):
+            print(line)
     except db_mod.DbError:
         pass
     verdict = 0
