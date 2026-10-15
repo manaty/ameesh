@@ -70,6 +70,28 @@ l'ancienne ne compte plus. Aucun retour à une ancienne tête n'est possible :
 le gel est relu sous verrou, et un SHA qui n'est pas un identifiant de commit
 est refusé.
 
+## Le port Postgres (`src/ameesh/review_designation_pg.py`)
+
+Le `Port` est écrit, avec deux usages selon qui tient la transaction :
+
+- **au gel** (hook étroit, à brancher) : `PgPort(tx, after_commit=threads)` —
+  `commit` n'ouvre aucune transaction, écrit dans celle du jalon `frozen` et
+  laisse l'appelant vider `threads` après son commit ;
+- **hors hook** (reprise, CLI) : `PgPort(db)` — `commit` ouvre sa propre
+  transaction, verrouille la ligne du lot (`FOR NO KEY UPDATE`, le même verrou
+  que `add_milestone`), puis vide lui-même le fil après le commit.
+
+La marque d'idempotence est une ligne du journal du lot, préfixée par le lot
+et le jalon — `review-designation:<lot>:<gel>: {json}` — qui porte l'état, le
+nombre requis, les relecteurs, le SHA exact et les auteurs du contenu gelé.
+`recorded` la relit (la dernière ligne de ce gel fait foi) : un même gel
+rejoué ne renvoie pas de second courrier, une attente ne se renotifie pas,
+mais elle **cède** la place à la désignation quand la capacité revient, sur le
+même gel. Une marque illisible est refusée, jamais interprétée. Les courriers
+partent dans la même transaction (`mail.send(..., after_commit=…)`, motif
+#315) : un envoi annulé ne laisse ni marque, ni message, ni trace de fil.
+
+
 Une désignation est **finale** pour son gel ; une attente est un **marqueur
 réessayable** : une notification par gel, et si la capacité revient — ou si la
 preuve d'auteur arrive — la désignation remplace le marqueur pour le même gel,
@@ -123,10 +145,22 @@ l'ancienne tête ; gel qui bouge pendant l'écriture = reprise sur la nouvelle
 tête, trois mouvements = échec sans boucle ; tête invalide ou non gelée
 refusée.
 
+`tests/test_1617_review_designation_pg.py` — 13 tests sur base réelle (psql) :
+désignation écrite et courriers partis une fois, rejeu sans second courrier ;
+gel périmé refusé sans rien écrire (ni marque ni message) ; reprise du moteur
+sur la nouvelle tête ; attente notifiée une seule fois puis désignation sur le
+même gel ; attente sans destinataire refusée ; provenance d'auteur inconnue =
+attente, désignation quand la preuve arrive ; nouveau gel = nouvelle
+désignation, la marque de l'ancien gel reste attachée à sa tête ; transaction
+du hook (fil vidé après commit seulement) ; annulation = ni courrier ni marque.
+
 ## Reste avant activation
 
-- accord de port avec #1616 et #1467, puis écriture du port Postgres ;
-- branchement transactionnel au gel et commande de lecture ;
+- accord de port avec #1616 (adaptateur canon : règles, familles, `policy_ref`)
+  et #1467 (point d'appel) — cx3 a donné le 15/10 son accord pour un hook
+  étroit sur `work.milestone(kind=frozen)`, impl07 n'a pas encore répondu ;
+- branchement transactionnel au gel (callback après l'insertion du jalon dans
+  `add_milestone`) et commande de lecture ;
 - preuve de livraison sur un **gel réel** : désignation sans agent, tête exacte
   remise, durée et doublons mesurés (le compteur de courriers par gel) ;
 - deux avis indépendants hors auteur pour cette porte (sécurité de la chaîne
