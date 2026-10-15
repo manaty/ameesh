@@ -177,6 +177,139 @@ def latest_freeze(rows: list[dict]) -> dict | None:
     return max(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
 
 
+#: un identifiant de commit exploitable : 4 à 64 hexadécimaux (git abrège
+#: jusqu'à 4). La résolution en commit complet et unique reste au lecteur qui
+#: a le dépôt (#1756).
+_COMMIT_ID = re.compile(r"[0-9a-f]{4,64}")
+
+
+def commit_id(value) -> str:
+    """L'identifiant de commit d'un jalon, en minuscules (`''` sinon)."""
+    text = str(value or "").strip().lower()
+    return text if _COMMIT_ID.fullmatch(text) else ""
+
+
+def same_commit(a, b) -> bool:
+    """Deux identifiants qui nomment le même commit (préfixe admis, #1756)."""
+    a, b = commit_id(a), commit_id(b)
+    return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _freeze_mark(row: dict | None) -> dict | None:
+    """Un jalon lu, réduit à ce que la provenance d'un gel effectif expose."""
+    if row is None:
+        return None
+    return {"id": int(row.get("id") or 0), "kind": row.get("kind") or "",
+            "sha": commit_id(row.get("sha")), "verdict": row.get("verdict") or "",
+            "actor": row.get("actor") or "", "at_ts": row.get("at_ts")}
+
+
+def freeze_candidate(rows: list[dict]) -> dict:
+    """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
+    favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
+
+    `latest_freeze` rend le dernier gel *déclaré* — la frise, la fermeture sur
+    fusion et la classification s'y tiennent ; ici on rend un **candidat de
+    lecture** pour les lecteurs qui décident si un lot est prêt (composeur du
+    paquet horaire, §11bis). Aucune écriture, aucune date inventée : `origin`
+    dit si le gel est `frozen` (déclaré) ou `verdict` (dérivé du dernier avis
+    favorable), `declared` et `verdict` portent les jalons lus, `notes` les
+    observations non bloquantes, `causes` les refus (le SHA est alors vide).
+
+    Règles (celles de `progress._verdict_applies`, resserrées du « dernier
+    avis par relecteur, blocage jamais masqué » de la porte des avis) :
+
+    * gel et avis nommant le même commit (préfixe admis) : le gel déclaré ;
+    * avis favorable postérieur à un gel qui nomme un autre commit : le SHA
+      de l'avis, le gel déclaré étant périmé (rebase) ;
+    * gel postérieur à l'avis sur un autre commit : refus
+      `freeze-after-verdict`, un nouvel avis est dû sur la tête gelée (#1283) ;
+    * sans gel déclaré : le SHA de l'avis favorable ;
+    * avis sans commit : il ne vaut que par l'instant, le gel déclaré (s'il
+      existe) reste candidat, note `verdict-names-no-commit` ;
+    * aucun avis : le gel déclaré reste candidat (note `no-verdict` — la
+      classe légère n'exige pas d'avis) ; sans gel non plus, refus
+      `no-verdict` ;
+    * un `blocked` applicable n'est jamais masqué par le `ok` d'un autre
+      relecteur : refus `blocked-verdict`.
+
+    Le SHA rendu peut être abrégé : le lecteur qui a le dépôt le résout en un
+    commit complet **unique** et le confronte à la tête **publiée** (jamais
+    `branch_head`, une observation) ; un candidat qui n'est pas la tête
+    publiée est une exclusion nommée, jamais une omission."""
+    marks = list(rows or [])
+    freeze = latest_freeze(marks)
+    verdicts = [r for r in marks if r.get("kind") == "verdict"]
+
+    def newest(items):
+        if not items:
+            return None
+        return max(items, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+
+    last = newest(verdicts)
+    out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
+           "verdict": _freeze_mark(last), "causes": [], "notes": []}
+    f_sha = commit_id((freeze or {}).get("sha"))
+    f_at = float((freeze or {}).get("at_ts") or 0)
+    if freeze is not None and not f_sha:
+        out["notes"].append("declared-freeze-unusable")
+    v_sha = commit_id((last or {}).get("sha"))
+    v_at = float((last or {}).get("at_ts") or 0)
+
+    if last is None:
+        if f_sha:
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("no-verdict")
+            return out
+        out["causes"].append("no-verdict")
+        return out
+    if (last.get("verdict") or "ok") != "ok":
+        out["causes"].append("blocked-verdict")
+        return out
+    if f_sha and v_sha:
+        if same_commit(f_sha, v_sha):
+            out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
+        elif f_at > v_at:
+            out["causes"].append("freeze-after-verdict")
+            return out
+        else:
+            out.update(sha=v_sha, origin="verdict")
+            out["notes"].append("declared-freeze-stale")
+    elif v_sha:
+        out.update(sha=v_sha, origin="verdict")
+        if freeze is not None:
+            out["notes"].append("declared-freeze-stale")
+    elif f_sha and v_at >= f_at:
+        out.update(sha=f_sha, origin="frozen")
+        out["notes"].append("verdict-names-no-commit")
+    else:
+        out["causes"].append("verdict-names-no-commit")
+        return out
+
+    # Blocage applicable : le dernier avis de chaque relecteur sur le commit
+    # candidat (mêmes règles que la porte des avis, #1374).
+    by_actor: dict = {}
+    for v in verdicts:
+        cand = commit_id(v.get("sha"))
+        applies = same_commit(cand, out["sha"]) if cand else (
+            freeze is None or float(v.get("at_ts") or 0) >= f_at)
+        if not applies:
+            continue
+        actor = (v.get("actor") or "").strip()
+        seen = by_actor.get(actor)
+        if seen is None or (v.get("at_ts") or 0, int(v.get("id") or 0)) > \
+                (seen.get("at_ts") or 0, int(seen.get("id") or 0)):
+            by_actor[actor] = v
+    blocked = sorted({(v.get("actor") or "?") for v in by_actor.values()
+                      if (v.get("verdict") or "ok") != "ok"})
+    if blocked:
+        out.update(sha="", origin="")
+        out["causes"].append("blocked-verdict")
+        out["notes"].append("blocked by %s" % ", ".join(blocked))
+        return out
+    return out
+
+
 def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
                   default: str | None, candidates: list[str]) -> list[tuple[str, bool, bool]]:
     """#1005 : les refs où chercher le contenu gelé d'un lot, dans l'ordre, et
