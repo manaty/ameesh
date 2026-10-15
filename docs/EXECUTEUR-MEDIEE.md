@@ -16,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 64 opérations et la liste des 363 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 65 opérations et la liste des 363 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -59,12 +59,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Six
-lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
-sont servies aussi par `session/op`. Le test
+Comptes : 65 opérations, dont 26 lectures et 39 écritures. 55 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Sept
+lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et #423) :
+elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (427
+signature et les mêmes types. Il vérifie aussi que l'interface entière (428
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -764,3 +764,15 @@ Reste à faire pour un essai sur une vraie machine Windows ou Mac :
 - l'image signée (`deploy/executor-image`, dsh épinglé par empreinte), et
   sa taille (1,3 Go avec dsh par npm) ;
 - le hook `agent-mail` de dsh : l'essai n'a fait aucun appel `session/op`.
+
+
+## Agent name aliases (#423, L243b step 1)
+
+The compatible `agents.resolve_name(name, operation="lookup")` operation is
+served on `/op` and `/session/op`. It returns only the primary spelling (or the
+unchanged unknown name), with a server-side alias audit. It grants no access.
+The dispatcher resolves named agents and lease envelopes before checking scope
+and fencing; executor allowlists can use aliases. The agent's name, owner,
+epoch and host still have to satisfy the same authority checks. See
+[Agent aliases](AGENT-ALIASES.md) for collisions, signed mail and the deferred
+renaming/rollback migration.

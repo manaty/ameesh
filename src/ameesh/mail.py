@@ -75,6 +75,9 @@ def send(
     son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
     `work_item_id`.
     """
+    from .agent_names import resolve as resolve_agent_name
+    sender = resolve_agent_name(sender, db=db, operation="mail.send")
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.send")
     fil.ensure_readable(body, allow_structured)
     row = storage.of(db).mailbox.send(
         sender, recipient, body, host=host, kind=kind, payload=payload,
@@ -119,6 +122,8 @@ UNREAD_LIMIT = 200
 
 def unread(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
     """Messages non remis, du plus ancien au plus récent (comme la v0)."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.unread")
     return storage.of(db).mailbox.unread(recipient, limit)
 
 
@@ -129,6 +134,8 @@ def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dic
     executor reads `mailbox.unread` (admitted) and drops passive mail here,
     with the same rule as the SQL (`passive_reason`). Only the first
     `UNREAD_LIMIT` unread messages are looked at there."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_active")
     st = storage.of(db)
     if getattr(st, "driver", None) == "mediated":
         rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
@@ -138,6 +145,8 @@ def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dic
 
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     """Messages non remis marqués `payload.urgent` (interruption de tour, 0018)."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_urgent")
     return storage.of(db).mailbox.unread_urgent(recipient, limit)
 
 
@@ -191,6 +200,8 @@ def reserve(db: Db, recipient: str, owner: str | None, epoch: int | None, token:
     message rendu porte `deja_consigne` : une réservation antérieure n'a
     jamais été soldée (panne), il est peut-être déjà vu.
     """
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.reserve")
     return storage.of(db).mailbox.reserve(
         recipient, owner or None, epoch if owner else None, token, ids=ids,
         porteur=porteur, ttl_seconds=ttl_seconds, limit=limit)
@@ -203,12 +214,16 @@ def deliver(db: Db, recipient: str, owner: str | None, epoch: int | None, token:
     Rend les ids passés remis. Un id absent (bail perdu, réservation reprise)
     reste non remis : il sera re-livré, signalé.
     """
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.deliver")
     return storage.of(db).mailbox.deliver(recipient, owner or None,
                                           epoch if owner else None, token, ids)
 
 
 def release(db: Db, recipient: str, token: str, ids: Sequence[int]) -> int:
     """Annule la réservation `token` : rien n'a été montré."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.release")
     return storage.of(db).mailbox.release(recipient, token, ids)
 
 
@@ -353,6 +368,8 @@ def unread_counts(db: Db) -> dict[str, int]:
 
 
 def history(db: Db, recipient: str, limit: int = 50) -> list[dict]:
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.history")
     return storage.of(db).mailbox.history(recipient, limit)
 
 

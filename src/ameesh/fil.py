@@ -1193,6 +1193,9 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
     """
     ids: list[int] = []
     try:
+        from .agent_names import resolve
+        sender = resolve(sender, db=db, cfg=cfg, operation="thread.sender")
+        recipients = [resolve(r, db=db, cfg=cfg, operation="thread.recipient") for r in recipients]
         ids = [int(i) for i in mailbox_ids]
         transport = transport or transport_for(cfg)
         thread = ThreadRef(project or project_for(cfg), lot)

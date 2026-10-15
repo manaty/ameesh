@@ -118,6 +118,11 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
     refuse le harnais, le fournisseur, le modèle ou le mode d'identifiants
     (`canon.placement_violations`).
     """
+    from .agent_names import resolve
+    try:
+        agent = resolve(agent, canon=canon)
+    except ValueError as exc:
+        return Verdict(agent, host, False, str(exc))
     fiches = [a for a in canon.agents if a.title == agent]
     placements = canon.placements_of(agent)
     admission = placements[0] if len(placements) == 1 else None

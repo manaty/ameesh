@@ -5966,7 +5966,10 @@ class Runner:
         self.db = db
         self.host = cfg.host
         self.runner_id = cfg.runner
-        self.agents_filter = agents
+        from .agent_names import resolve
+        self.agents_filter = (list(dict.fromkeys(
+            resolve(n, db=self.db, operation="runner.filter") for n in agents))
+            if agents is not None else None)
         self.once = once
         self.wait = wait
         self.dry_run = dry_run
@@ -8686,6 +8689,8 @@ def cmd_register(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     parser.add_argument("--model", default=None)
     parser.add_argument("--budget", type=float, default=None)
     parsed = parser.parse_args(args)
+    from .agent_names import resolve
+    parsed.name = resolve(parsed.name, db=db, operation="runner.register")
     cwd = os.path.abspath(os.path.expanduser(parsed.cwd)) if parsed.cwd else None
     row = registry.upsert(
         db, parsed.name, chantier=parsed.chantier, harness=parsed.harness, host=cfg.host,
@@ -9036,6 +9041,8 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     """
     from . import attach as attach_mod
     from .platform import session_lock
+    from .agent_names import resolve
+    name = resolve(name, db=db, operation="lease.attach")
     agent = registry.get(db, name)
     if agent is None:
         print("unknown agent: %s" % name, file=sys.stderr)
