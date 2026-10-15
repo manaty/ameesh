@@ -58,7 +58,7 @@ class _Base(unittest.TestCase):
 
     def fake_process(self, pid: int, *, cwd: str = "/", fds=(), maps=(), comm: str = "bash",
                      argv0: str | None = None, state: str = "S",
-                     unreadable: bool = False) -> None:
+                     threads=(), unreadable: bool = False) -> None:
         d = os.path.join(self.proc, str(pid))
         os.makedirs(os.path.join(d, "fd"))
         _write(os.path.join(d, "comm"), text=comm + "\n")
@@ -67,6 +67,10 @@ class _Base(unittest.TestCase):
         _write(os.path.join(d, "stat"),
                text="%d (%s) %s 1 %d 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 100\n"
                     % (pid, comm, state, pid))
+        # ses fils : le meneur, puis `threads` (tid, état)
+        for tid, tstate in ((pid, state),) + tuple(threads):
+            _write(os.path.join(d, "task", str(tid), "stat"),
+                   text="%d (%s) %s 1 %d\n" % (tid, comm, tstate, pid))
         os.symlink(cwd, os.path.join(d, "cwd"))
         os.symlink("/usr/bin/" + comm, os.path.join(d, "exe"))
         os.symlink("/", os.path.join(d, "root"))
@@ -190,6 +194,15 @@ class UserPathsTest(_Base):
         self.fake_process(31, comm="timeout", unreadable=True)
         self.assertEqual(platform.user_paths().doubt(),
                          "process(es) of the user unreadable: 31 timeout")
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_leader_with_a_live_thread_is_still_a_doubt(self):
+        """Un meneur sorti (`Z`) dont un fil vit encore détient toujours ses
+        fichiers : il reste un doute, il ne libère pas le ménage."""
+        self.fake_process(33, comm="worker", state="Z", threads=((34, "S"),),
+                          unreadable=True)
+        self.assertEqual(platform.user_paths().doubt(),
+                         "process(es) of the user unreadable: 33 worker")
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_a_zombie_does_not_hold_the_housekeeping(self):

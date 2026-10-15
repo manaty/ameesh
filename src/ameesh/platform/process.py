@@ -774,10 +774,25 @@ def _zombie(pid: int) -> bool:
     et ses liens `/proc` sont illisibles sans qu'il y ait un doute à avoir
     (#1678, constat #1665 : un « timeout <defunct> » retenait tout le ménage
     des worktrees). Un stat illisible (disparu, autre utilisateur) : False —
-    le doute ordinaire s'applique."""
+    le doute ordinaire s'applique.
+
+    Le meneur d'un groupe dont un autre fil vit encore se lit aussi `Z` : il
+    n'est zombie que si tous ses fils (`/proc/<pid>/task`) le sont."""
     try:
-        return _stat_fields(pid)[0] == "Z"
-    except (OSError, IndexError):
+        if _stat_fields(pid)[0] != "Z":
+            return False
+        tasks = os.listdir(os.path.join(PROC, str(int(pid)), "task"))
+        for tid in tasks:
+            path = os.path.join(PROC, str(int(pid)), "task", tid, "stat")
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    data = fh.read()
+            except FileNotFoundError:
+                continue   # fil disparu entre-temps
+            if data[data.rindex(")") + 2:].split()[0] != "Z":
+                return False
+        return bool(tasks)
+    except (OSError, IndexError, ValueError):
         return False
 
 
