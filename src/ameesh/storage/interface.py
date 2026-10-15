@@ -519,9 +519,9 @@ class TurnCosts(Domain):
     @abc.abstractmethod
     def paid_lines(self, from_ts: float, *, harnesses: Sequence[str]) -> list[dict]:
         """L242b : les lignes de ces harnais écrites après `from_ts` (epoch),
-        hors lignes écartées : `{harness, account, ts, usd}`. Sert à
+        hors lignes écartées : `{agent, harness, account, ts, usd}`. Sert à
         rapprocher l'estimation des baisses de solde compte par compte et
-        intervalle par intervalle (`CostBook.paid_hour`)."""
+        intervalle par intervalle (`CostBook.paid_spent`)."""
 
     @abc.abstractmethod
     def unpriced(self, since_ts: float, prefix: str) -> list[dict]:

@@ -1179,6 +1179,10 @@ class HarnessAdapter:
             # outils voisins d'un harnais mise) est aussi visible du harnais
             base = out.get("PATH") or os.environ.get("PATH") or os.defpath
             out["PATH"] = os.pathsep.join([*prepend, base])
+        if self.key == "deepseek" and platform.is_linux():
+            from . import deepseek_cgroup
+            out["NODE_OPTIONS"] = deepseek_cgroup.node_options(
+                out.get("NODE_OPTIONS", os.environ.get("NODE_OPTIONS", "")))
         return out
 
     # -- lecture -----------------------------------------------------------
