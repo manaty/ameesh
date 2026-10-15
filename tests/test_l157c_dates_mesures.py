@@ -316,9 +316,11 @@ class SchedulePgTest(PgTestCase):
 
     def test_schedule_and_work_add(self):
         a = work.add(self.db, title="first", assignee="dev1", estimate=60, priority=1)
-        b = work.add(self.db, title="second", assignee="dev1", estimate=60)
+        # #540 : la file d'un agent au-delà d'un lot non démarré, forcée
+        b = work.add(self.db, title="second", assignee="dev1", estimate=60,
+                     force="test: a queue of lots (#540)")
         c = work.add(self.db, title="dated by hand", assignee="dev1", estimate=60,
-                     priority=3)
+                     priority=3, force="test: a queue of lots (#540)")
         storage.of(self.db).roadmap.plan_item(c["id"], {"start": "2030-01-01"},
                                               source="orchestrateur", actor="orch")
         # no table published: the lots' own estimates
@@ -344,7 +346,8 @@ class SchedulePgTest(PgTestCase):
 
         # a new assigned lot gets its dates at creation
         proc = self.mesh("work", "add", "--title", "new", "--assignee", "dev1",
-                         "--estimate", "1h", "--actor", "human:test")
+                         "--estimate", "1h", "--actor", "human:test",
+                         "--force", "test: a queue of lots (#540)")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("planned  : ", proc.stdout)
         self.assertIn("(reference p80 (table #", proc.stdout)

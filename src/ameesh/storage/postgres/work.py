@@ -10,6 +10,7 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import random
 import time
@@ -62,6 +63,10 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
+#: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
+#: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
+_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -75,6 +80,11 @@ MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
+
+#: #540 : verrou de transaction d'un agent : « a-t-il déjà un lot non démarré ? »
+#: et l'attribution qui suit passent l'une après l'autre
+PENDING_LOCK = ("SELECT pg_advisory_xact_lock("
+                "hashtextextended(current_schema() || ':pending_lot:' || %s, 0))")
 
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
@@ -194,10 +204,12 @@ class WorkItems(interface.WorkItems):
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
-            estimate_source=None, change_size=None, mark_item_id=None,
-            mark_note="", parent_lot=None) -> dict:
+            estimate_source=None, change_size=None, queued_note=None,
+            forced_note=None, mark_item_id=None, mark_note="",
+            parent_lot=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
+        #540 : `queued_note` (voir l'interface).
         L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
         si bien qu'un échec de la marque annule la création (et l'inverse).
         La ligne marquée est verrouillée **avant** l'insertion et la
@@ -210,24 +222,48 @@ class WorkItems(interface.WorkItems):
         edge rolls the creation back, the suite lot is never exposed ready);
         already finished, no edge is written (the suite is available at once)
         and the parent stays traced in the journal; unknown, everything is
-        rolled back. No number is ever guessed from the title or the body."""
+        rolled back. No number is ever guessed from the title or the body.
+
+        Les verrous sont pris dans l'ordre commun avec `assign` (revue R1
+        delta #540) : les lignes de lots d'abord (`mark_item_id` et
+        `parent_lot`, par identifiant croissant), le verrou d'agent ensuite.
+        `assign` verrouille la ligne du lot puis l'agent (`_pending`) ;
+        l'ordre inverse ici (agent puis parent) interbloquait l'ajout d'une
+        suite avec l'attribution de son parent."""
         with self.db.transaction() as tx:
+            # #540 : lignes de lots d'abord, par identifiant croissant, puis
+            # le verrou d'agent de `_pending` — même ordre que `assign`.
             marked = None
-            if mark_item_id is not None:
-                marked = tx.query(
-                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                    (int(mark_item_id),))
-                if not marked:
-                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
-                if str(issue_ref or "").strip():
-                    # le verrou sur la ligne marquée sérialise les créateurs :
-                    # le second relit la référence après le commit du premier
-                    duplicate = tx.query(
-                        "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
-                        " ORDER BY id LIMIT 1", (issue_ref,))
-                    if duplicate:
-                        raise DbError("issue_ref %s is already carried by lot #%d"
-                                      % (issue_ref, int(duplicate[0]["id"])))
+            parent = None
+            parent_id = None if parent_lot is None else int(parent_lot)
+            for lock_id in sorted({int(v) for v in (mark_item_id, parent_lot)
+                                   if v is not None}):
+                if lock_id == parent_id:
+                    parent = tx.query(
+                        "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
+                        (lock_id,))
+                    if not parent:
+                        raise DbError("parent lot %s: no such lot" % parent_lot)
+                if mark_item_id is not None and lock_id == int(mark_item_id):
+                    marked = tx.query(
+                        "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                        (lock_id,))
+                    if not marked:
+                        raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+            if mark_item_id is not None and str(issue_ref or "").strip():
+                # le verrou sur la ligne marquée sérialise les créateurs :
+                # le second relit la référence après le commit du premier
+                duplicate = tx.query(
+                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref,))
+                if duplicate:
+                    raise DbError("issue_ref %s is already carried by lot #%d"
+                                  % (issue_ref, int(duplicate[0]["id"])))
+            behind = (WorkItems(tx)._pending(assignee, None)
+                      if queued_note is not None and assignee else None)
+            if behind is not None:
+                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                                  else (None, queued_note.format(lot=behind)))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -251,15 +287,13 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if behind is not None:
+                item["forced_behind" if forced_note else "queued_behind"] = behind
             if parent_lot is not None:
                 # #1193: the explicit parent of a suite lot is linked in the
                 # same transaction as the creation — never a forgotten edge,
-                # and an edge failure never leaves the lot ready.
-                parent = tx.query(
-                    "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
-                    (int(parent_lot),))
-                if not parent:
-                    raise DbError("parent lot %s: no such lot" % parent_lot)
+                # and an edge failure never leaves the lot ready. The row was
+                # locked above, before the agent's lock (#540, ordre commun).
                 if parent[0]["state"] not in ("merged", "promoted", "closed"):
                     tx.execute(
                         "INSERT INTO work_item_dependencies(work_item_id, blocker_id,"
@@ -324,13 +358,46 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, note, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor,
+               queued_note=None, forced_note=None, take=False) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
-        en cours est effacée (issue `annulee` au registre)."""
+        en cours est effacée (issue `annulee` au registre). #540 :
+        `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
-            return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            behind = None
+            if (queued_note is not None or take) and assignee:
+                lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
+                               " WHERE id = %s FOR UPDATE", (int(item_id),))
+                if lot and lot[0]["fresh"]:
+                    behind = WorkItems(tx)._pending(assignee, int(item_id))
+            if behind is not None and take:
+                raise interface.PendingLot(behind)
+            if behind is not None:
+                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                                  else (None, queued_note.format(lot=behind)))
+            row = WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            if row is not None and behind is not None:
+                row["forced_behind" if forced_note else "queued_behind"] = behind
+            return row
+
+    def _pending(self, assignee, item_id) -> int | None:
+        """#540, dans la transaction ouverte et sous le verrou de l'agent : son
+        plus ancien lot ouvert qui l'occupe, autre que `item_id`, ou None.
+        L165b : n'occupent pas l'agent le lot qui attend un autre (`qa`,
+        `waiting_human`, `blocked`) ni celui dont le début est prévu après
+        aujourd'hui — le jour local du processus qui attribue, comme
+        `operations.listing`."""
+        today = _dt.date.today().isoformat()
+        self.db.query(PENDING_LOCK, (assignee,))
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
+            "   AND state NOT IN %s AND state NOT IN %s"
+            "   AND (planned_start IS NULL OR planned_start <= %%s)"
+            "   AND id <> %%s ORDER BY id LIMIT 1" % (_CLOSED, _WAITING_ON_OTHERS),
+            (assignee, today, int(item_id or 0)))
+        return int(rows[0]["id"]) if rows else None
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
         """`assign` dans la transaction ouverte ; `state` : celui exigé."""

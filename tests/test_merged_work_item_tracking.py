@@ -284,7 +284,8 @@ class MergeSweepTest(_Base):
         return _git(self.repo, "rev-parse", "HEAD")
 
     def lot(self, title="lot sans branche"):
-        return work.add(self.db, title=title, assignee="claude1", actor="orch")
+        return work.add(self.db, title=title, assignee="claude1", actor="orch",
+                        force="test: several lots for one agent (#540)")
 
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
@@ -767,7 +768,10 @@ class RealTargetTest(_Base):
              sha or _git(self.repo, "rev-parse", "HEAD"))
 
     def lot(self, title="lot sans branche"):
-        return work.add(self.db, title=title, assignee="claude1", actor="orch")
+        # #540 : le témoin #990 crée deux lots pour claude1 ; le second doit
+        # donc forcer la file d'équipe (même motif que MergeSweepTest.lot).
+        return work.add(self.db, title=title, assignee="claude1", actor="orch",
+                        force="test: several lots for one agent (#540)")
 
     def sync(self, **kw):
         return plan_git.sync_branches(self.db, host=self.cfg.host, **kw)
@@ -953,7 +957,8 @@ class CurrentLotTest(_Base):
     def test_ameesh_list_sans_lot_de_session_ferme(self):
         self.db.execute("UPDATE agent_registry SET session_work_item = %s WHERE name = 'claude1'",
                         (str(self.vieux["id"]),))
-        autre = work.add(self.db, title="autre", assignee="claude1")
+        autre = work.add(self.db, title="autre", assignee="claude1",
+                         force="test: second lot of claude1 (#540)")
         work.merged(self.db, self.vieux["id"], sha=SHA, actor="claude1")
         rows = exploitation.annotate(self.cfg, self.db, [{"name": "claude1"}])
         self.assertEqual((rows[0]["lot"]["id"], rows[0]["lot"]["source"]),
