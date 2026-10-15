@@ -81,6 +81,38 @@ class TransportTest(unittest.TestCase):
         last = self.expire()["last"]
         self.assertEqual((last.id, last.text), (ids[2], "second"))
 
+    def test_census_after_post_matches_a_full_read(self):
+        """#1670 : le census déduit par `post` de sa propre marche (réparation
+        d'une écriture interrompue) est celui d'une lecture complète — la plus
+        récente à date égale, une entrée en retard comprise — et il est écarté
+        dès qu'un autre écrivain ou une expiration touche le fichier."""
+        self.post(entry("old", 400), entry("first", 0))
+        self.post(entry("second", 0))
+        kept, last, end = self.transport.census_after_post(THREAD)
+        entries, whole_end = self.transport.census(THREAD)
+        self.assertEqual((kept, end), (len(entries), whole_end))
+        self.assertEqual((last["author"], last["excerpt"]), ("agent:alpha", "second"))
+        self.post(entry("late", 3))  # date ancienne, écrite en dernier
+        kept, last, end = self.transport.census_after_post(THREAD)
+        entries, whole_end = self.transport.census(THREAD)
+        self.assertEqual((kept, end), (len(entries), whole_end))
+        self.assertEqual(last["excerpt"], "second")
+        # un autre écrivain (autre instance) : le census retenu est écarté
+        fil.FileTransport(self.root).post(THREAD, entry("other", 0))
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+        self.post(entry("after", 0))
+        kept, last, end = self.transport.census_after_post(THREAD)
+        entries, whole_end = self.transport.census(THREAD)
+        self.assertEqual((kept, end), (len(entries), whole_end))
+        self.assertEqual(last["excerpt"], "after")
+        # une expiration réécrit le fil : le décalage du nouvel en-tête est pris
+        self.assertEqual(self.expire()["dropped"], 1)  # « old », en tête
+        self.post(entry("post-expiry", 0))
+        kept, last, end = self.transport.census_after_post(THREAD)
+        entries, whole_end = self.transport.census(THREAD)
+        self.assertEqual((kept, end), (len(entries), whole_end))
+        self.assertEqual(last["excerpt"], "post-expiry")
+
     def test_next_ids_continue_as_if_nothing_expired(self):
         twin = fil.FileTransport(os.path.join(self.root, "twin"))
         olds = [entry("old %d" % n, 400 + n, author="agent:a%d" % n) for n in range(3)]
@@ -371,6 +403,84 @@ class MediatedHostTest(TransportTest):
         threads.index.assert_not_called()
         threads.recount.assert_called_once()
         self.assertEqual(threads.recount.call_args.kwargs["kept"], 2)
+
+    def test_mediated_index_reuses_the_census_of_the_post(self):
+        """#1670 : le census vient de la marche faite par `post` (réparation
+        d'une écriture interrompue) ; l'indexation médiée ne relit pas le fil,
+        et le census porté est celui d'une lecture complète."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_not_called()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["last"]["entry_id"], external_id)
+        self.assertEqual(self.transport.census_after_post(THREAD) is not None, True)
+
+    def test_a_writer_between_post_and_index_forces_a_full_census(self):
+        """#1670 : dès que le fichier a bougé après le `post` (ici un second
+        écrivain), le census retenu est écarté et le fil est relu."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500))
+        db = self.remote_db()
+        e = entry("mine", 0)
+        external_id = self.transport.post(THREAD, e)
+        fil.FileTransport(self.root).post(THREAD, entry("other", 0, author="agent:gamma"))
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_called_once()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["kept"], 3)
+        # même date, écrite après : c'est la dernière du census complet
+        self.assertEqual(kwargs["last"]["author"], "agent:gamma")
+
+    def test_an_expiry_between_post_and_index_forces_a_full_census(self):
+        """#1670 : l'expiration réécrit le fil (renommage) ; le census du
+        `post` est caduc et l'index relit le nouveau fichier."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        self.assertEqual(self.expire()["dropped"], 1)
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_called_once()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual(kwargs["kept"], 2)
+
+    def test_a_torn_tail_is_repaired_and_not_reused_as_a_census(self):
+        """#1670 : quand `post` a dû réparer une écriture interrompue, le fil
+        est relu — la marche de réparation ne vaut pas census."""
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.post(entry("kept", 1))
+        raw = self.read_bytes()
+        with open(self.path, "wb") as fh:  # écriture interrompue en pleine entrée
+            fh.write(raw[:-4])
+        db = self.remote_db()
+        e = entry("new", 0)
+        external_id = self.transport.post(THREAD, e)
+        self.assertIsNone(self.transport.census_after_post(THREAD))
+        read = self.transport.census
+        with mock.patch.object(self.transport, "census", side_effect=read) as spy:
+            fil.index(db, cfg, self.transport, THREAD, e, external_id, mailbox_ids=[9])
+        spy.assert_called_once()
+        kwargs = db.storage.threads.recount.call_args.kwargs
+        entries, end = self.transport.census(THREAD)
+        self.assertEqual((kwargs["kept"], kwargs["end"]), (len(entries), end))
+        self.assertEqual([x.text for x in entries][-1], "new")
 
     def test_expiry_is_one_server_side_recount_of_the_rewritten_file(self):
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
