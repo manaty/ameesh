@@ -65,11 +65,17 @@ ameesh work list [--stale-after 6h] [--json]       EPIC column, waiting, stagnat
 ameesh work show <id> [--json]                     card, epic, PR, waiting
 ameesh work close <id> --abandoned                 lot that will not be done
 ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
+ameesh work close <id> --delivered --sha <head>    lot delivered outside the target (#988)
 ```
 
 `close` moves the lot to the terminal state `closed` and records a `closed` milestone:
 nothing stays open by oversight. A closed lot is **never reopened** by a
 merge observed later (the observation is reported).
+
+`--delivered --sha <reviewed head>` closes a lot whose deliverable (report, note,
+rehearsal) lives on a reviewed branch, without a merge into the target: the
+`delivered` milestone carries the reviewed head and the closing actor, and it
+counts as a delivery in `ameesh work estimates` (#988).
 
 For each unmerged lot, ameesh says **what it is waiting for and from whom**
 (`waiting_for`: `{what, who, label}`), derived from the state, the milestones (L10) and
@@ -79,6 +85,14 @@ human decision (by the card's lead), unblocking. An action of the lot
 waiting for a human (approval, reconciliation) takes precedence over everything; a
 blocking verdict only counts if it follows the last freeze. When ameesh does not know
 who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of guessing.
+The reviewer of a review can be **designated on entry to `qa`** (#705):
+`ameesh work move <id> qa --reviewer <agent>` — a registry name, or a human
+(`human:…`). A lot already in `qa` gets its reviewer with `ameesh work reviewer
+<id> <agent>`, without a build/`qa` round trip; only a human, an orchestrator or
+a design agent designates, never the lot's assignee. The wait then names that
+reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
+with no designated reviewer alerts the project's orchestrators, who must
+designate one.
 
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
@@ -88,7 +102,7 @@ duration, and the timeline no longer draws it as active.
 These rules live in a single module, `ameesh.stagnation`, called by
 `ameesh progress`, `ameesh work list/show` and the `stale_lot` alert of
 `ameesh alerts` (which keeps its one-word `waiting_for` field and adds
-`waiting`, the detailed form).
+`waiting`, the detailed form, and `project`).
 
 ## Observed merge: automatic closing
 
@@ -102,8 +116,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
 2. **the content**, in a local clone (read-only, no `fetch`):
 
    ```
-   ameesh work sync-merges --git-dir D [--target origin/main] [--repo owner/repo] [--dry-run] [--json]
+   ameesh work sync-merges --git-dir D [--target T] [--repo owner/repo] [--dry-run] [--json]
    ```
+
+   Without `--target`, the target is the lot's (`branch_target`), else the
+   repository's declared `git config ameesh.target`, else its default branch
+   (`origin/HEAD`, then main/master); when nothing is declared and that ref does
+   not carry the freeze, the integration refs (`develop`, `main`, `master`,
+   `release/*`) are tried and the closing names the one that delivered. An
+   explicit `--target` stays alone authoritative (a missing one is an error).
 
    only the lot's **last freeze** is authoritative (most recent `frozen`
    milestone, with its commit): an earlier freeze already merged proves nothing
@@ -152,7 +173,9 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
 
    any open state → `merged`, in one step, `merged` milestone with the commit.
 
-A lot absorbed by another is closed with `--superseded-by`.
+A lot absorbed by another is closed with `--superseded-by`; a lot delivered
+outside the target (its reviewed head stays on its branch) with
+`--delivered --sha <reviewed head>` (#988).
 
 ## GitHub projection
 

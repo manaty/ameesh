@@ -18,6 +18,13 @@ import unittest
 from . import support  # isolate the host's agent environment
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "test.sh"
+# #1207 : chaque temoin lance de vrais interpretes Python sous le script. La
+# R1 #1170 a signale le litteral de 15 s comme fragile sous charge CI, sans
+# aucun echec constate. Il reste un garde-fou anti-blocage, mais nomme et
+# mesure : 0,2 a 0,4 s par temoin au repos (module 10/10 en 2,2 s psycopg et
+# 3,9 s psql, #1207), donc 120 s gardent une marge >250x tout en restant tres
+# en dessous du plafond du job ou le module tourne (45 min psql, 30 min psycopg).
+WITNESS_TIMEOUT_S = 120
 
 
 class TestScriptSelectionTest(unittest.TestCase):
@@ -63,7 +70,7 @@ class TestScriptSelectionTest(unittest.TestCase):
     def run_selection(self, args, expected, *, named=False):
         done = subprocess.run(["bash", str(self.root / "scripts/test.sh"), *args],
                               cwd=self.root, env=self.env, text=True,
-                              capture_output=True, timeout=15)
+                              capture_output=True, timeout=WITNESS_TIMEOUT_S)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         events = (self.root / "events").read_text().splitlines()
         self.assertCountEqual(events, [f"{driver}:{test}" for driver in
@@ -108,6 +115,6 @@ class TestScriptSelectionTest(unittest.TestCase):
         done = subprocess.run(["bash", str(self.root / "scripts/test.sh"),
                                "-p", "test_*.py", "tests.test_alpha"],
                               cwd=self.root, env=self.env, text=True,
-                              capture_output=True, timeout=15)
+                              capture_output=True, timeout=WITNESS_TIMEOUT_S)
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse((self.root / "events").exists())

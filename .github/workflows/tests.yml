@@ -8,30 +8,37 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 4 parts, sur push vers main, integration/** ou release/**,
-#               et sur une PR de release (source ou cible release/** ou
-#               integration/**) ;
+#               en 4 parts, sur push vers main ou release/**, sur une PR de
+#               release (source ou cible release/** ou integration/**) et sur
+#               l'appel du portier de paquet (workflow_call, §12) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main, integration/** ou release/**, sur
-#               une PR de release (sans liste pilote) et à la main
-#               (workflow_dispatch).
+#               6 parts, sur push vers main ou release/**, sur une PR de
+#               release (sans liste pilote), à la main (workflow_dispatch) et
+#               sur l'appel du portier de paquet (workflow_call).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#
+# §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
+# `pull_request` de sa PR porte le check requis `tests` ; le portier
+# `.github/workflows/paquet.yml`, déclenché par `push integration/**`, n'appelle
+# cette suite (`workflow_call`) que si aucune PR ouverte ne couvre la tête
+# exacte, et son check n'est jamais nommé `tests` (incident #1342 : deux suites
+# complètes, l'agrégat rouge du run push annulé bloquait la PR #1050).
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
 # toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
 # migrations, objets globaux du cluster), avec repli sur la suite complète
 # quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
-# La suite complète tourne sur main, release/** et la branche d'intégration du
-# paquet (§12) : une PR de lot n'en déclenche plus, mais une PR de release
-# (source ou cible release/** ou integration/**), comme un push sur ces
-# branches, garde la suite complète, les deux pilotes, sans voie version/doc
-# ni liste pilote psql — y compris dans le plan de repli. Les règles de
-# refusion (a : delta de main disjoint, b : migrations seules) viendront
-# ensuite.
+# La suite complète tourne sur main, release/** et pour la branche d'intégration
+# du paquet (§12) par le run `pull_request` de sa PR ou, à défaut de PR couvrant
+# la tête, par le portier `paquet.yml` : une PR de lot n'en déclenche plus, mais
+# une PR de release (source ou cible release/** ou integration/**) garde la
+# suite complète, les deux pilotes, sans voie version/doc ni liste pilote psql —
+# y compris dans le plan de repli. Les règles de refusion (a : delta de main
+# disjoint, b : migrations seules) viendront ensuite.
 #
 # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
 # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
@@ -85,9 +92,14 @@
 name: tests
 
 on:
+  # §12 : une poussée sur integration/** ne déclenche plus cette suite
+  # directement. Le portier .github/workflows/paquet.yml décide — une tête de
+  # paquet n'a qu'une suite, celle de sa PR — et rappelle cette suite
+  # (workflow_call) quand aucune PR ouverte ne couvre la tête poussée.
   push:
-    branches: [main, "release/**", "integration/**"]
+    branches: [main, "release/**"]
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 # Une PR dépassée est annulée. Les pushes de main partagent un groupe :
@@ -114,13 +126,33 @@ env:
 # organisation. A pull request from a fork never reaches that host (the
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
+#
+# #1468 — priority pool. A few runners (label `ameesh-ci-prio`) are kept for
+# package and release runs and for the lots marked unblock/incident: they do
+# NOT carry `ameesh-ci`, so an ordinary job (which asks for `ameesh-ci`) can
+# never take them — adding a label while keeping `ameesh-ci` would reserve
+# nothing. Every runner, general or reserved, carries `ameesh-ci-pool`; a
+# priority job asks for it, so it takes the first idle runner of either group.
+# A run is priority when the switch `vars.AMEESH_CI_PRIO` is `on` and it is a
+# push (or the package gate's workflow_call) on integration/** or release/**,
+# a PR whose source or target is one of those branches, or a PR listed in
+# `vars.AMEESH_CI_PRIO_PRS` (JSON array of PR numbers: a repository variable,
+# writable with repository write access, set by the pilot for an unblock or
+# incident lot and recorded with its before/after value; setting it triggers
+# no run). Switch off or unset: every job
+# asks for `ameesh-ci`, as before. The routing only picks the runner: no
+# `if:`, no part, no required check depends on it, and no hosted runner is
+# ever added (a fork PR keeps ubuntu-latest, as before). The job-level
+# expression is the same everywhere (tests/test_1468_ci_prio.py);
+# docs/EXPLOITATION.md, « Runners prioritaires », gives the activation and
+# rollback steps; scripts/ci-queue-wait.py measures the queue wait per class.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # lot PR only; merge commit against its target), the branch context
   # (release PRs keep the full suite) and the plan of the run, from the map
   plan:
     name: plan
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     env:
       # #833 : sur une poussée, le diff va du commit d'avant la poussée
@@ -176,7 +208,7 @@ jobs:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     needs: plan
     if: needs.plan.outputs.psycopg != '[]'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -319,7 +351,7 @@ jobs:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     needs: plan
     if: needs.plan.outputs.psql != '[]'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
     # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
     # elle était annulée par le plafond de 30 min sans échec de test (PR #640,
@@ -388,11 +420,19 @@ jobs:
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
   # parts psql (sans psutil) par le repli /proc.
+  # #987 : image x64 explicite (`macos-26-intel`), pas `macos-latest` (macOS 26
+  # arm64) — le 13/10/2026, la capacité arm64 a annulé ce job après ~15 min
+  # sans runner (« not acquired by Runner of type hosted »), ce qui rougissait
+  # le check requis sans défaut de code. L'image est un runner standard
+  # (gratuit), pas un runner « large » payant (canon §3) ; le job ne teste que
+  # psutil et la couche plateforme, indifférents à l'architecture. Défense en
+  # profondeur : .github/workflows/relance-hosted.yml rejoue les jobs annulés
+  # faute de runner.
   platform-macos:
     name: plateforme macOS
     needs: plan
     if: needs.plan.outputs.code == 'true'
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
@@ -411,7 +451,7 @@ jobs:
     name: lecteurs de la doc
     needs: plan
     if: needs.plan.outputs.docs_only == 'true'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
@@ -429,7 +469,7 @@ jobs:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     steps:
@@ -460,7 +500,7 @@ jobs:
   version:
     name: version number
     if: github.event_name == 'pull_request'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -478,7 +518,7 @@ jobs:
     name: tests
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: bilan des parts

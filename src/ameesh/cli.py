@@ -3,16 +3,20 @@
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
   agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
-                 [--estimate 2h] [--app PROJECT]] [--queue]
+                 [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
                                                  from a declared orchestrator, --lot hands an
-                                                 unassigned work item to the recipient — an item
-                                                 already assigned to an agent needs a declared
-                                                 role or a human (#859) — and --new-lot creates it (L118),
+                                                 unassigned work item (or one held by a human)
+                                                 to the recipient — an item already held by an
+                                                 agent is never reassigned by mail, whoever
+                                                 holds it (#1066) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
+                                                 #540: a recipient who already has a work item
+                                                 not started does not get it (team queue, the
+                                                 message is not dropped) unless --force "reason";
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
@@ -243,8 +247,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
+    force = None
     for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--parent-lot",
-                 "--kind", "--estimate", "--app"):
+                 "--kind", "--estimate", "--app", "--force"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -265,6 +270,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 estimate = value if value is not None else ""
             elif flag == "--app":
                 app = value if value is not None else ""
+            elif flag == "--force":
+                # #540 : forcer la file d'équipe, avec sa raison (journal du lot)
+                force = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -451,14 +459,17 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
-        from . import assignments, plan_git
+        from . import assignments, plan_git, work
         try:
+            if (force or "").strip():
+                # #540 : l'auteur du forçage est l'identité de la session
+                sender = work.forcer(cfg, bk.db, sender)
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project,
+                estimate=estimate, app=app, new_project=new_project, force=force,
                 parent_lot=parent_lot)
-        except assignments.AssignmentError as exc:
+        except (assignments.AssignmentError, work.WorkError) as exc:
             print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]
@@ -468,9 +479,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             thread_meta = {"avertissement": "; ".join(linked["warnings"])}
         item = linked["lot"]
         if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
+            # #858 : un lot créé pour un destinataire non attribuable à
+            # l'instant est créé sans assigné (l'avertissement dit pourquoi).
+            if linked["created"]:
+                quoi = ("created and assigned to %s" % dest if linked["assigned"]
+                        else "created for %s without assignee" % dest)
+            else:
+                quoi = "assigned to %s" % dest if linked["assigned"] else "linked"
             print("lot #%d %s%s%s" % (
-                int(item["id"]), "created and assigned to %s" % dest if linked["created"]
-                else "assigned to %s" % dest if linked["assigned"] else "linked",
+                int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
         if payload.get("ack") and (linked["created"] or linked["assigned"]):
@@ -980,7 +997,10 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # conclure son tour — jamais tant qu'un travail lancé pendant le tour
         # tourne encore (processus de fond, conteneurs du tour) : il le saura,
         # et l'invitation viendra après.
-        tour = os.environ.get("AMEESH_TURN_ID") or ""
+        # L76 : un processus résident garde son environnement d'un tour à
+        # l'autre — le tour en cours est nommé dans un fichier
+        from . import resident_runner
+        tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
         etat = tour_lit(cfg, name, tour) if borne else None
         if etat is not None and etat["remis"] >= borne:

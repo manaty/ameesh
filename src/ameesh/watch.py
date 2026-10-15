@@ -18,15 +18,17 @@ the agent's thread. A timer whose watch was disabled, or moved to another
 host, sends nothing.
 
 A **wake** (`at`) is the one-shot of the same tooling: a systemd user timer
-`ameesh-watch-<agent>-<slug>.timer` that fires once and sends the agent its
-own message. Outside a turn nothing sets `AGENT_MAIL_NAME` (the runner sets
-it only for the session it launches), so the wake applies the identity by
-construction on its exec line (`env AGENT_MAIL_NAME=<agent> …`) and `watch
-fire` refuses to fire without it: seven hand-made watches lost their wake on
-2026-10-13 because their unit carried no identity (mesh-design, lot #1020).
-A wake lives in the user units directory of the host
-(`ameesh-watch-<agent>-<slug>.{service,timer,env,wake.json}`), is removed
-once it has fired, and needs no `agent_watches` row.
+`ameesh-wake-<len(agent)>-<agent>-<slug>.timer` that fires once and sends the
+agent its own message. Outside a turn nothing sets `AGENT_MAIL_NAME` (the
+runner sets it only for the session it launches), so the wake applies the
+identity by construction on its exec line (`env AGENT_MAIL_NAME=<agent> …`)
+and `watch fire` refuses to fire without it: seven hand-made watches lost
+their wake on 2026-10-13 because their unit carried no identity (mesh-design,
+lot #1020). A wake lives in the user units directory of the host
+(`ameesh-wake-<len(agent)>-<agent>-<slug>.{service,timer,env,wake.json}`), is
+removed once it has fired, and needs no `agent_watches` row. Its dedicated
+prefix and the length of the agent keep it away from the periodic watches and
+from the other wakes (lot #1039).
 """
 from __future__ import annotations
 
@@ -53,6 +55,12 @@ SENDER = "veille"
 DEFAULT_EVERY_S = 1800
 MIN_EVERY_S = 60
 UNIT_PREFIX = "ameesh-watch-"
+#: lot #1039: the one-shot wakes carry their own prefix. Named
+#: `ameesh-watch-<agent>-<slug>` they were exactly the units of the periodic
+#: watch of an agent called `<agent>-<slug>`: arming a wake stopped that
+#: watch's timer, overwrote its units and, after the firing, removed them —
+#: the watch was lost while its `agent_watches` row still showed it active.
+WAKE_PREFIX = "ameesh-wake-"
 #: the hand-written units L121 replaces (`ameesh-veille-<agent>.timer`)
 LEGACY_PREFIX = "ameesh-veille-"
 #: the directory of the user units (tests: a temporary one)
@@ -204,14 +212,20 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
 
 
 def wake_name(agent: str, slug: str, suffix: str) -> str:
-    """The name of one of the files of the wake `<slug>` of `agent`."""
-    return "%s%s-%s.%s" % (UNIT_PREFIX, agent, slug, suffix)
+    """The name of one of the files of the wake `<slug>` of `agent`.
+
+    `ameesh-wake-<len(agent)>-<agent>-<slug>.<suffix>`: the dedicated prefix
+    keeps a wake away from the periodic watch units (`ameesh-watch-<agent>.…`),
+    and the length of the agent makes the pair (agent, slug) readable back, so
+    `a`/`b-c` and `a-b`/`c` — which flatten to the same text — never share a
+    file (lot #1039)."""
+    return "%s%d-%s-%s.%s" % (WAKE_PREFIX, len(agent), agent, slug, suffix)
 
 
 def wake_env_name(agent: str, slug: str) -> str:
     """The pinned environment file of a wake (its own: disabling the periodic
     watch of the agent must not take the configuration of an armed wake)."""
-    return "%s%s-%s.env" % (UNIT_PREFIX, agent, slug)
+    return "%s%d-%s-%s.env" % (WAKE_PREFIX, len(agent), agent, slug)
 
 
 def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,

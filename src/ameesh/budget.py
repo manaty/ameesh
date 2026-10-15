@@ -239,10 +239,23 @@ def _fmt_usd(value) -> str:
 
 
 def change(cfg: Config, db, *, agent: str | None, window: int, usd: float | None,
-           actor: str) -> tuple[bool, float | None]:
-    """Pose (`usd`) ou retire (None) un plafond ; journalise base + fil."""
+           actor: str, lower_only: bool = False) -> tuple[bool, float | None]:
+    """Pose (`usd`) ou retire (None) un plafond ; journalise base + fil.
+
+    `lower_only` (L87, API) : BudgetError sauf si `usd` est sous le plafond en
+    vigueur, comparé sous le verrou de la ligne ; sans ligne, le plafond du
+    mesh est celui de la configuration (0 : aucun), et un agent sans plafond
+    propre n'en a aucun."""
     scope = agent or ""
-    changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor)
+    ceiling = None
+    if lower_only and not agent:
+        configured = resolve(cfg, [])
+        ceiling = (configured.per_hour if window == 3600 else configured.per_day) or None
+    try:
+        changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor,
+                                                  lower_only=lower_only, ceiling=ceiling)
+    except ValueError as exc:
+        raise BudgetError("refused: %s" % exc) from exc
     if changed:
         portee = "of agent %s" % agent if agent else "of the mesh"
         suite = "" if usd is not None else (

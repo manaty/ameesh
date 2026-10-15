@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Fusion d'un lot constatée par le CONTENU (lot L29), dans un clone git local.
 
-    ameesh work sync-merges --git-dir D [--target origin/main] [--repo owner/repo]
+    ameesh work sync-merges --git-dir D [--target T] [--repo owner/repo]
                             [--dry-run] [--json]
+
+Sans `--target` (#1005), la cible est celle du lot (`branch_target`), sinon
+celle du dépôt (`git config ameesh.target`), sinon sa branche par défaut
+(`origin/HEAD`, puis main/master) ; quand rien n'est déclaré et qu'elle ne
+porte pas le gel, les refs d'intégration reconnues (`develop`, `main`,
+`master`, `release/…`) sont essayées et la fermeture nomme celle qui a livré.
 
 Le nom d'un lot change (branche renommée entre gel et fusion), la fusion se
 fait par rebase, squash ou cherry-pick sans commit de fusion reconnaissable :
@@ -40,6 +46,8 @@ from . import storage
 from . import work as work_mod
 from .canon import GitError, _git
 
+#: cible historique du relevé de contenu (`--target` explicite) ; sans lui,
+#: c'est la cible déclarée du lot ou du dépôt qui fait foi (#1005)
 DEFAULT_TARGET = "origin/main"
 #: commits de la cible examinés au plus depuis la base commune (borne de coût)
 MAX_TARGET_COMMITS = 5000
@@ -163,15 +171,61 @@ def latest_freeze(rows: list[dict]) -> dict | None:
     return max(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
 
 
-def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: bool = False,
+def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
+                  default: str | None, candidates: list[str]) -> list[tuple[str, bool, bool]]:
+    """#1005 : les refs où chercher le contenu gelé d'un lot, dans l'ordre, et
+    `(ref, hors cible, ferme)`.
+
+    Une cible explicite (`--target`) ou déclarée par le lot (`branch_target`)
+    est seule à foi : elle ferme, jamais une autre ref. Sinon la cible
+    déclarée du dépôt (`ameesh.target`) fait foi de même, et les refs
+    d'intégration ne servent qu'à signaler le résidu. Sans aucune cible
+    déclarée : la cible par défaut du clone (`origin/HEAD`, puis main/master),
+    puis les refs d'intégration, qui ferment en se nommant. Sans cible par
+    défaut, les seules refs d'intégration examinées ferment."""
+    own = str(row.get("branch_target") or "").strip()
+    if target is not None:
+        return [(target, False, True)]
+    if own:
+        return [(own, False, True)]
+    if default is None:
+        return [(ref, bool(index), True) for index, ref in enumerate(candidates)]
+    to_try = [(default, False, True)]
+    to_try += [(ref, True, declared_repo is None) for ref in candidates]
+    return to_try
+
+
+def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                 limit: int = 1000) -> dict:
-    """Ferme les lots dont le contenu gelé est entré dans `target`."""
-    try:
-        if _commit(repo_dir, target) is None:
-            raise MergeProbeError("target %r not found in %s" % (target, repo_dir))
-    except GitError as exc:
-        raise MergeProbeError(str(exc)) from exc
+    """Ferme les lots dont le contenu gelé est entré dans la cible.
+
+    Sans `target` explicite (#1005), la cible est celle du lot
+    (`branch_target`), sinon celle du dépôt (`git config ameesh.target`),
+    sinon sa cible par défaut (`origin/HEAD`, puis main/master) ; quand rien
+    n'est déclaré et que cette cible ne porte pas le gel, les refs
+    d'intégration reconnues (`develop`, `main`, `master`, `release/…`) sont
+    essayées à leur tour et la fermeture nomme celle qui a livré. Une cible
+    explicite ou déclarée garde le sens d'origine : seule elle ferme, et son
+    absence est une erreur (`target %r not found in …`)."""
     st = storage.of(db)
+    if target is not None:
+        try:
+            if _commit(repo_dir, target) is None:
+                raise MergeProbeError("target %r not found in %s" % (target, repo_dir))
+        except GitError as exc:
+            raise MergeProbeError(str(exc)) from exc
+        declared_repo, default, candidates = None, target, []
+    else:
+        try:
+            declared_repo = declared_target(repo_dir)
+            default = default_target(repo_dir)
+            candidates = target_candidates(repo_dir, default)
+        except GitError as exc:
+            raise MergeProbeError(str(exc)) from exc
+        if default is None and candidates:
+            # aucun `origin/HEAD` ni main/master : la première ref
+            # d'intégration tient lieu de cible par défaut
+            default, candidates = candidates[0], candidates[1:]
     rows = [r for r in st.work.items(state=None, assignee=None, limit=limit)
             if r["state"] not in work_mod.MERGED_STATES and r["state"] != "closed"]
     declared: dict = {}
@@ -179,31 +233,78 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
         declared.setdefault(int(ms["work_item_id"]), []).append(ms)
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
-        freeze = latest_freeze(declared.get(int(row["id"]), []))
+        lot = int(row["id"])
+        freeze = latest_freeze(declared.get(lot, []))
         sha = ((freeze or {}).get("sha") or "").strip()
-        entry = {"work_item": int(row["id"]), "package": row.get("package_id"),
+        entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
+                 "target": None, "off_target": None,
                  "detail": ("last freeze has no commit (milestone frozen --sha)" if freeze
                             else "no freeze declared (milestone frozen --sha)")}
-        if sha:
+        if not sha:
+            results.append(entry)
+            continue
+        refs = _content_refs(row, target, declared_repo=declared_repo, default=default,
+                             candidates=candidates)
+        if not refs:
+            entry.update(result="no-target",
+                         detail="no target: `git config %s <branch>` in %s, or --target"
+                                % (TARGET_GIT_KEY, repo_dir))
+            results.append(entry)
+            continue
+        found_target = None              # la ref qui a livré le gel
+        found_proof = None
+        off_default = None               # la cible par défaut qu'elle n'est pas
+        first_ref = first_proof = None   # la ref autoritaire, pour le compte rendu
+        residue = None                   # une ref qui la porte sans pouvoir fermer
+        error = None
+        for ref, off, closes in refs:
             try:
-                found = probe(repo_dir, sha, target)
-            except GitError as exc:
-                raise MergeProbeError(str(exc)) from exc
-            entry.update(how=found["how"], ref=found["ref"], detail=found["detail"],
-                         sha=sha, result="open")
-        if entry["how"]:
-            if dry_run:
-                entry["result"] = "would-merge"
+                proof = probe(repo_dir, sha, ref)
+            except (MergeProbeError, GitError) as exc:
+                if off:
+                    residue = residue or "%s is unreadable (%s)" % (ref, exc)
+                    continue
+                error = str(exc)
+                break
+            if first_proof is None:
+                first_ref, first_proof = ref, proof
+            if not proof["merged"]:
+                continue
+            if closes:
+                found_target, found_proof, off_default = ref, proof, (default if off else None)
             else:
-                done = work_mod.close_merged(
-                    db, int(row["id"]), sha=entry["ref"] or "", actor="git:%s" % target,
-                    source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]))
-                entry["result"] = done["result"]
-                entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
+                residue = ("%s carries the frozen content (%s), but the declared target "
+                           "%s does not: declare `git config %s %s` to close it explicitly"
+                           % (ref, proof["how"], default, TARGET_GIT_KEY, ref))
+            break
+        if error is not None:
+            entry.update(result="error", detail=error)
+            results.append(entry)
+            continue
+        if found_target is None:
+            entry.update(target=first_ref, sha=sha, result="open",
+                         detail=first_proof["detail"] if first_proof else entry["detail"])
+            if residue:
+                entry.update(result="off-target", detail=residue)
+            results.append(entry)
+            continue
+        entry.update(target=found_target, off_target=off_default, how=found_proof["how"],
+                     ref=found_proof["ref"], sha=sha, result="open",
+                     detail=found_proof["detail"])
+        if dry_run:
+            entry["result"] = "would-merge"
+        else:
+            done = work_mod.close_merged(
+                db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
+                source="content (%s)" % entry["how"], frozen_id=int(freeze["id"]))
+            entry["result"] = done["result"]
+            detail = "%s — %s" % (entry["detail"], done["detail"])
+            entry["detail"] = detail
         results.append(entry)
-    return {"git_dir": repo_dir, "target": target, "dry_run": bool(dry_run),
-            "results": results,
+    return {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
+            "auto": target is None, "off_target": default if target is None else None,
+            "dry_run": bool(dry_run), "results": results,
             "merged": sum(1 for r in results if r["result"] == "merged")}
 
 
@@ -290,9 +391,11 @@ INTEGRATION_PREFIXES = ("release/",)
 #: #746 : refs d'intégration essayées au plus par dépôt et par relevé
 MAX_TARGET_CANDIDATES = 8
 #: une ligne `ameesh-work: <id>` désigne un lot précis (message d'un commit de
-#: fusion, ou corps d'une PR : `plan_github`)
+#: fusion, ou corps d'une PR : `plan_github`) ; le mot `final` après le numéro
+#: déclare cette PR comme la dernière étape du lot (#759)
 WORK_TRAILER_RE = re.compile(
-    r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})[ \t]*$")
+    r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})"
+    r"(?:[ \t]+(final))?[ \t]*$")
 #: L118b : une ligne `ameesh-work-partial: <id>` (corps d'une PR, message d'un
 #: commit de fusion) : la PR ne livre qu'une partie du lot, qui reste ouvert
 #: (lots parapluie, #139)
@@ -577,6 +680,15 @@ def short_branch(name: str | None) -> str:
 def partial_lots(body: str | None) -> set[int]:
     """Les lots qu'une PR déclare ne livrer qu'en partie (L118b)."""
     return {int(m.group(1)) for m in PARTIAL_TRAILER_RE.finditer(body or "")}
+
+
+def final_lots(body: str | None) -> set[int]:
+    """Les lots qu'une PR déclare livrer en dernier : une ligne
+    `ameesh-work: <id> final` (#759). Une PR finale ferme le lot, même si une
+    autre PR ouverte ou une branche déclarée y reste liée ; `ameesh-work-partial:`
+    l'emporte (une PR partielle ne ferme jamais)."""
+    return {int(m.group(1)) for m in WORK_TRAILER_RE.finditer(body or "")
+            if m.group(2)}
 
 
 def merge_citing(merges: list[dict], lot: int, *, since_ts: float | None = None,

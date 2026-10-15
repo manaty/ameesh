@@ -25,13 +25,15 @@ def federation(project="acme", names=None):
 class ModuleConfigurationTest(unittest.TestCase):
     def test_module_refusal_is_per_lot_but_other_database_errors_propagate(self):
         store = mock.Mock()
+        # MagicMock : la fermeture ouvre sa transaction (et prend le verrou de
+        # graphe) avant l'écriture du stockage.
         with mock.patch.object(work, "get", return_value={"id": 1, "state": "qa"}), \
                 mock.patch.object(work.storage, "of", return_value=store):
             store.work.close_merged.side_effect = db_mod.DbError("AMEESH_MODULE_RULE: evidence missing")
-            self.assertEqual(work.close_merged(mock.Mock(), 1)["result"], "refused")
+            self.assertEqual(work.close_merged(mock.MagicMock(), 1)["result"], "refused")
             store.work.close_merged.side_effect = db_mod.DbError("database connection lost")
             with self.assertRaises(db_mod.DbError):
-                work.close_merged(mock.Mock(), 1)
+                work.close_merged(mock.MagicMock(), 1)
     def test_it_cli_parses_artifact_options_after_lot_and_requests_isolated_execution(self):
         bound = identity.Binding(name="tester", source="runner", runner_id="r1", epoch=2, ok=True)
         with mock.patch.object(it, "item", return_value={"app": "acme"}), \
