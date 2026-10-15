@@ -201,15 +201,18 @@ class IdleCapacityTest(_Base):
     def test_lots_sans_assigne(self):
         self.agent("claude1")
         self.agent("codex2", "codex")
-        self.agent("frais", since_s=60)                     # au repos depuis 1 min
+        self.agent("frais", since_s=60)                     # sans lot actionnable
         self.agent("arrete", status="stopped", owner="")    # pas réveillable
         self.assertEqual(self.alertes(), [])                # rien n'attend
         lot = work.add(self.db, title="à prendre")
         out = self.alertes()
         self.assertEqual(len(out), 1)
         alerte = out[0]
+        # #1677 (b) : `frais` n'a aucun lot actionnable — le temps depuis son
+        # dernier tour (1 min) ne l'écarte plus du repos.
         self.assertEqual((alerte["reason"], alerte["agents"], alerte["lots"]),
-                         ("travail_en_attente", ["claude1", "codex2"], [lot["id"]]))
+                         ("travail_en_attente", ["claude1", "codex2", "frais"],
+                          [lot["id"]]))
         self.assertIn("Action: dispatch", alerte["detail"])
         self.assertEqual(alerte["responsible"], "human:proprio")
         # un agent avec un lot assigné ou du courrier n'est pas « au repos sans lot »
