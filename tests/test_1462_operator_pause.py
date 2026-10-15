@@ -183,6 +183,19 @@ class PauseTest(PgTestCase):
         self.assertTrue(row["operator_paused"])
         self.assertEqual(row["status"], "queued")
 
+    def test_due_rotation_waits_while_paused_without_cancelling(self):
+        self.change()
+        worker = object.__new__(AgentWorker)
+        threading.Thread.__init__(worker)
+        worker.db, worker.name, worker.proc = self.db, "worker", None
+        worker.rotation_forcee = "forced by restart"
+        worker.runner = mock.Mock()
+        with mock.patch.object(worker, "_held_by_pressure", return_value=False), \
+                mock.patch.object(worker, "_rotate", side_effect=AssertionError("rotated")), \
+                mock.patch.object(worker, "budget_ok", side_effect=AssertionError("budget")):
+            self.assertFalse(worker.maybe_rotate())
+        self.assertEqual(worker.rotation_forcee, "forced by restart")
+
     def test_historical_resume_cannot_queue_over_operator_pause(self):
         self.change()
         with self.assertRaisesRegex(reprise.RepriseError, "--operator"):
