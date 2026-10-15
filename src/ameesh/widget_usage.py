@@ -72,13 +72,14 @@ def snapshot_path(profile, *, directory=None, environ=None) -> str:
 
 
 def _fraction(value) -> float:
-    """Un `percent` en 0..1 (le widget publie déjà une part, pas un %)."""
+    """Un `percent` en 0..1 (le schéma 1 publie une part, pas un %).
+
+    Au-delà de 1, le seau est **à sec** (dépassement) : borné à 1, jamais
+    divisé par 100 — 1.05 lu 1 % rendrait le compte le plus libre."""
     try:
         number = float(value)
     except (TypeError, ValueError):
         return 0.0
-    if number > 1.0:            # tolérance : un widget qui publierait 0..100
-        number = number / 100.0
     return min(max(number, 0.0), 1.0)
 
 

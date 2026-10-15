@@ -61,6 +61,13 @@ def _harness(worker) -> str:
     return own_harness(worker)
 
 
+def session_model(worker, book) -> str:
+    """Le modèle du prochain tour de l'agent sur son harnais, comme le runner
+    le passe : celui du registre (`ameesh set <agent> model=…`), sinon l'état
+    local (`<state>/<agent>/model`) ; '' si aucun (#1580 tranche 3)."""
+    return (getattr(worker, "agent", None) or {}).get("model") or book.model_of(worker.name)
+
+
 def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None) -> str | None:
     """Choisit le compte du prochain tour. None : aucun compte déclaré.
 
@@ -90,7 +97,7 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
                                  critical=is_critical(worker), margin=bool(margin),
                                  # #1580 (tranche 3) : les seaux propres au
                                  # modèle de l'agent comptent pour lui seul
-                                 model=book.model_of(worker.name))
+                                 model=session_model(worker, book))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -146,9 +153,10 @@ def fallback(worker, reason: str, limits=None) -> str:
                     worker.db, worker.cfg.host, harness, items, book, agent=worker.name,
                     critical=True, session_account=session_account(worker, items)
                     if session_harness(worker) == harness else None,
-                    # #1580 (tranche 3) : même portée par modèle sous un
-                    # harnais emprunté
-                    model=book.model_of(worker.name))
+                    # #1580 (tranche 3) : sous un harnais emprunté, le tour
+                    # part sans modèle (runner) : modèle inconnu, les seaux
+                    # de modèle sont écartés
+                    model="")
                 if choice.profile is None or choice.auth_blocked:
                     continue
                 profile = choice.profile
@@ -761,7 +769,7 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
                 sick=auth_failure.failing(worker.db, worker.cfg.host, harness),
                 # #1580 (tranche 3) : le seau d'un autre modèle ne bloque pas
                 # le résumé de cet agent
-                model=book.model_of(worker.name))
+                model=session_model(worker, book))
         except Exception as exc:
             possible, raison = False, "state of the old account unreadable (%s)" % exc
         if not possible:

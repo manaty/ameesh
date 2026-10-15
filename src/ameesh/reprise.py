@@ -997,7 +997,7 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
                                                       or ()),
                              # #1580 (tranche 3) : le compte simulé pour cet
                              # agent tient compte de son modèle
-                             model=book.model_of(row["name"]))
+                             model=row.get("model") or book.model_of(row["name"]))
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
@@ -1018,7 +1018,8 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     except db_mod.DbError:
         sick = {}
     usable, raison = account_turn.summary_possible(
-        old, book, items, sick=sick, model=book.model_of(row["name"]))
+        old, book, items, sick=sick,
+        model=row.get("model") or book.model_of(row["name"]))
     if usable:
         out.update(keep=True, deterministic=False,
                    why="session %s (account %s) is not portable to %s; the old "
