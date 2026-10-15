@@ -245,3 +245,29 @@ class AccountBudgetTest(PgTestCase):
                 self.assertIn("budget : account openai-manaty", ligne["status_text"])
         finally:
             worker.watchdog_stop.set()
+
+    def test_resume_de_bascule_reserve_le_compte_reel_du_tour(self):
+        from .support import FAKEBIN
+        cfg = dataclasses.replace(self.cfg, budget_check_interval=0.0)
+        runner = Runner(cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "rotation")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("rotation", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "rotation", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "rotation"), lease)
+        # Le prochain compte a de la marge ; le résumé utilise encore l'ancien,
+        # épuisé. Il doit être refusé avant tout lancement du harnais.
+        self._spend("x", 99.0, billing=OPENAI)
+        worker._account = _profile(DEEPSEEK, harness="claude")
+        worker._account_override = _profile(OPENAI, harness="claude")
+        try:
+            with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
+                self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "t", "ids": []}))
+            self.assertEqual(self._usage(DEEPSEEK)["reserved"], 0.0)
+            self.assertEqual(self.db.query(
+                "select count(*)::int as n from turn_costs where agent = 'rotation'"
+            )[0]["n"], 0)
+            self.assertIn("budget : account openai-manaty", registry.get(
+                self.db, "rotation")["status_text"])
+        finally:
+            worker.watchdog_stop.set()

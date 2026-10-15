@@ -3865,7 +3865,9 @@ class AgentWorker(threading.Thread):
             return False
         # #1469 : réservation atomique du tour sur l'enveloppe du compte de
         # facturation, avant le marqueur ; refusée, le tour ne part pas
-        refus = account_budget.reserve(self.db, self.name, self._account)
+        # Un résumé de bascule peut imposer l’ancien compte : réserver
+        # celui appliqué au harnais, pas celui choisi pour le prochain tour.
+        refus = account_budget.reserve(self.db, self.name, compte)
         if refus:
             self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
             return False
