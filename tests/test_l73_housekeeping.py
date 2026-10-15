@@ -314,6 +314,23 @@ class WorktreeEtatTest(_Tmp):
         self.assertEqual(menage.named_lot("deepseek3-1665", "deepseek3"), 1665)
         self.assertIsNone(menage.named_lot("deepseek3-tmp", "deepseek3"))
         self.assertIsNone(menage.named_lot("nexlink-ds3-431", "deepseek3"))
+        # le nom de l'agent porte un chiffre : c'est le dernier groupe qui
+        # compte sous agent/review (l'id du lot, pas le suffixe de l'agent)
+        self.assertEqual(menage.cited_lot("agent/mty-nxl-impl-04-1229-x"), 1229)
+        self.assertIsNone(menage.cited_lot("agent/nx-compute-runner-n-n"))
+        self.assertIsNone(menage.cited_lot(""))
+
+    def test_registre_illisible_ne_prouve_rien(self):
+        """#1665 : un registre des lots illisible ne rattache rien (None),
+        sans faire échouer le ménage."""
+        class _Cassee:
+            @property
+            def work(self):
+                raise RuntimeError("registre illisible")
+
+        with mock.patch.object(menage.storage, "of", return_value=_Cassee()):
+            self.assertIsNone(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", "lot/12-x"))
+            self.assertIsNone(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""))
 
     def test_processus_dans_le_worktree(self):
         wt = os.path.join(self.base, "wt")
@@ -604,6 +621,8 @@ class MenageDbTest(PgTestCase):
         _git("worktree", "add", "-q", "--detach", par_dossier, cwd=main)
         etranger = os.path.join(self.tmp, "frere-etranger")
         _git("worktree", "add", "-q", etranger, "-b", "lot/%d-x" % autre, cwd=main)
+        inconnu = os.path.join(self.tmp, "frere-inconnu")
+        _git("worktree", "add", "-q", inconnu, "-b", "lot/999999-x", cwd=main)
         tour.end(lot="999", turn_id="t" * 32, db=self.db, host="pc")
         rows = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
         self.assertEqual(rows[par_branche]["lot"], str(lot))
@@ -611,6 +630,8 @@ class MenageDbTest(PgTestCase):
         self.assertEqual(rows[par_dossier]["lot"], str(lot))
         self.assertIsNone(rows[etranger]["lot"])
         self.assertTrue(rows[etranger]["detail"].startswith(menage.UNATTRIBUTED))
+        self.assertIsNone(rows[inconnu]["lot"])
+        self.assertTrue(rows[inconnu]["detail"].startswith(menage.UNATTRIBUTED))
 
     def test_worktree_non_attribue_rattache_a_son_lot_fini(self):
         """#1665 : un worktree déjà suivi « non attribué » dont la branche
