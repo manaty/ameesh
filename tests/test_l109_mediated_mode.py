@@ -217,6 +217,19 @@ class BailEtPanneTest(MedieBase):
         agent = {"name": "inge-front", "harness": "dsh", "cwd": self.tmp, "status": "queued"}
         return AgentWorker(runner, agent, lease)
 
+    def test_reglement_sans_reservation_locale_ne_bloque_pas_le_marqueur(self):
+        """#1469 : le backend médié n'a pas d'enveloppe de compte locale."""
+        worker = self._worker()
+        self.responder.script["pending_spend.clear"] = True
+        usage = types.SimpleNamespace(reread_tokens=0, session=None)
+        with mock.patch("ameesh.cost.CostBook") as book:
+            book.return_value.record.return_value = usage
+            self.assertTrue(worker._compta_ecrit({
+                "start": 0, "created_ts": 123.0, "turn": "prompt", "model": "m"}))
+        self.assertFalse(worker._compta_en_echec)
+        self.assertIn("pending_spend.clear", self.transport.ops())
+        self.assertFalse(any(op.startswith("budgets.") for op in self.transport.ops()))
+
     def test_provider_health_stays_on_the_relay_server(self):
         worker = self._worker()
         with mock.patch("ameesh.auth_failure.failing",

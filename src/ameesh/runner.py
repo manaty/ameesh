@@ -2594,7 +2594,10 @@ class AgentWorker(threading.Thread):
             # #1469 : la ligne écrite prend la place de la réservation ; une
             # réparation (tour interrompu, `incertain` par défaut) la garde
             # Un échec lève : le marqueur reste, la réparation règle par la clé.
-            account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
+            # Le backend médié ne réserve aucun compte local : la dépense
+            # fournisseur est comptée au relais, pas sur l'appareil (L111).
+            if not self.runner.mediated:
+                account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
             registry.pending_spend_clear(self.db, self.name)
             self._annonce_ram = ""
             self._compta_en_echec = False
