@@ -106,6 +106,24 @@ def _verdict_due(alert: dict) -> str:
                 sous_utilisation._duration(alert.get("value") or 0), lot, lot))
 
 
+def _stale_move(alert: dict, lot: int, who: str | None) -> str:
+    """L'action proposée pour un lot stagnant (#1773).
+
+    Un lot en qa dont l'attente est la fusion (gel + verdict acquis) est un
+    candidat de paquet/de file de fusion : relancer son assigné ou le
+    réassigner ne fait pas avancer la fusion. Le brief le dit — sans retirer
+    l'alerte (canon §4 : un lot sans mouvement se signale au pilote) ni les
+    portes de clôture, qui restent offertes plus bas."""
+    if alert.get("lot_state") == "qa" and alert.get("waiting_for") == "fusion":
+        return ("this lot is frozen with its verdict acquired: it is a candidate for its "
+                "merge packet/queue — no author action, do not nudge its assignee or "
+                "reassign it; the composer/pilot carries the merge")
+    if who:
+        return ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
+                "ameesh work assign %d <agent>" % (who, who, lot, lot))
+    return "assign it: ameesh work assign %d <agent>" % lot
+
+
 def _stale_lot(alert: dict) -> str:
     lot = int(alert["lot"])
     who = alert.get("agent")
@@ -115,11 +133,7 @@ def _stale_lot(alert: dict) -> str:
         sous_utilisation._duration(alert.get("value") or 0),
         "assigned to %s" % who if who else "unassigned",
         ", waiting for: %s" % alert["waiting_for"] if alert.get("waiting_for") else "")
-    if who:
-        move = ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
-                "ameesh work assign %d <agent>" % (who, who, lot, lot))
-    else:
-        move = "assign it: ameesh work assign %d <agent>" % lot
+    move = _stale_move(alert, lot, who)
     # L368: a dependency declared towards an open parent lot is a planned wait,
     # which already suppresses the alert and its 6 h reminder. The brief must
     # offer it, otherwise a stacked lot is triaged in vain every 6 h (#1642) ;

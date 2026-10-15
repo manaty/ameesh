@@ -66,6 +66,27 @@ class BriefsTest(unittest.TestCase):
         self.assertLess(text.index("ameesh work dependencies 42"),
                         text.index("ameesh mail send dev1"))
 
+    def test_stale_lot_candidat_de_paquet_ne_propose_pas_de_relance(self):
+        """#1773 : en qa, une attente de fusion (gel + verdict acquis) est un
+        candidat de paquet : le brief ne propose ni relance ni réassignation —
+        le composeur/pilote porte l'atterrissage — mais l'alerte reste, avec
+        les portes de clôture."""
+        candidat = dict(STALE, lot_state="qa", waiting_for="fusion")
+        text = alert_briefs.briefs(candidat, self.listing,
+                                   auditor_names=["auditeur"])["orch"]
+        self.assertIn("candidate for its merge packet/queue", text)
+        self.assertIn("do not nudge its assignee or reassign it", text)
+        self.assertNotIn("ameesh mail send dev1", text)
+        self.assertNotIn("ameesh work assign 42", text)
+        self.assertIn("ameesh work merged 42 --sha", text)
+        self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
+        self.assertIn("ameesh work close 42 --abandoned", text)
+        # un lot qui attend autre chose que sa fusion garde la relance
+        correction = dict(STALE, waiting_for="correction")
+        text = alert_briefs.briefs(correction, self.listing,
+                                   auditor_names=["auditeur"])["orch"]
+        self.assertIn("ameesh mail send dev1", text)
+
     def test_stale_lot_ne_reveille_pas_l_auditeur(self):
         """L713 : lu à la passe de l'auditeur, pas poussé ; les autres alertes si."""
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
