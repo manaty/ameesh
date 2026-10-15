@@ -5,7 +5,8 @@ from __future__ import annotations
 import dataclasses
 import os
 
-from . import canon, projects, storage, work
+from . import canon, mail, projects, storage, work
+from . import db as db_mod
 
 
 class WorkdirError(ValueError):
@@ -95,7 +96,8 @@ def mail_hold(cfg, db, agent, lot, *, canons=None) -> bool:
     n'est pas utilisable, ne se remet pas dans la session d'un autre lot — le
     hook le marquerait livré et l'exécuteur ne le verrait jamais pour ce lot.
     Faux pour le projet primaire, un projet non déclaré, un lot inconnu ou un
-    dossier prêt : ces messages suivent le flux normal."""
+    dossier prêt : ces messages suivent le flux normal. Un canon illisible ne
+    retient rien (flux normal), comme `problem` le fait pour son propre repli."""
     names = projects.agent_projects(agent)
     if len(names) < 2:                # mono-projet : pas de dossier secondaire
         return False
@@ -103,4 +105,78 @@ def mail_hold(cfg, db, agent, lot, *, canons=None) -> bool:
         lot_project = project(db, lot)
     except (WorkdirError, canon.CanonError):
         return False                  # lot inconnu : flux normal
+    if not lot_project or lot_project == names[0]:
+        return False                  # projet primaire : flux normal
+    try:
+        canons = canon.load_configured(cfg) if canons is None else canons
+    except canon.CanonError:
+        return False
     return bool(problem(cfg, agent, lot_project, canons=canons))
+
+
+def deliverable(cfg, db, agent, rows, *, deferred=None, canons=None) -> list[dict]:
+    """#811 R3 : les messages de `rows` remisables, ceux des lots retenus ôtés.
+
+    Même règle que `mail_hold`, appliquée à une page de non-lus : les lignes
+    portent leur lot (`work_item_id`, lu par `mail.unread`). `deferred(lot)`
+    dit une retenue déjà connue de l'appelant (mémoire de l'exécuteur) ; le
+    verdict est mémoïsé par lot, et un message sans lot passe. Mono-projet :
+    page rendue telle quelle."""
+    if not rows or len(projects.agent_projects(agent)) < 2:
+        return rows
+    if canons is None:
+        try:
+            canons = canon.load_configured(cfg)
+        except canon.CanonError:
+            return rows
+    verdicts = {}
+    gardes = []
+    for row in rows:
+        lot = str(row.get("work_item_id") or "").strip()
+        if lot and lot not in verdicts:
+            verdicts[lot] = bool((deferred and deferred(lot))
+                                 or mail_hold(cfg, db, agent, lot, canons=canons))
+        if lot and verdicts[lot]:
+            continue
+        gardes.append(row)
+    return gardes
+
+
+#: #811 R3 : messages lus par page en franchissant un préfixe retenu
+MAIL_PAGE = mail.UNREAD_LIMIT
+
+
+def deliverable_unread(cfg, db, agent, *, besoin, mode="unread", deferred=None) -> list[dict]:
+    """#811 R3 : les non-lus remisables, au-delà d'un préfixe qui les masquait.
+
+    `mail.unread` — et ses variantes — borne la lecture aux plus anciens : un
+    lot secondaire sans dossier peut remplir ce préfixe et cacher un message
+    remisable plus récent, au hook comme au pick. On lit donc par pages
+    croissantes, en écartant les messages retenus SANS les réserver ni les
+    marquer, jusqu'à `besoin` remisables ou la fin de la boîte. Mono-projet :
+    lecture simple, flux inchangé. Un backend qui borne lui-même la page
+    (exécuteur médié) ne fait pas boucler : on s'arrête quand la page ne
+    progresse plus."""
+    lire = {"unread": mail.unread, "active": mail.unread_active,
+            "urgent": mail.unread_urgent}[mode]
+    name = agent.get("name")
+    besoin = max(1, int(besoin))
+    if len(projects.agent_projects(agent)) < 2:
+        return lire(db, name, limit=besoin)
+    canons = None
+    try:
+        canons = canon.load_configured(cfg)
+    except canon.CanonError:
+        return lire(db, name, limit=besoin)
+    page = max(MAIL_PAGE, besoin)
+    lus = 0
+    while True:
+        rows = lire(db, name, limit=page)
+        try:
+            gardes = deliverable(cfg, db, agent, rows, deferred=deferred, canons=canons)
+        except db_mod.DbError:
+            return rows               # dossier illisible : page brute, rien perdu
+        if len(gardes) >= besoin or len(rows) < page or len(rows) <= lus:
+            return gardes
+        lus = len(rows)
+        page = page * 2

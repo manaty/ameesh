@@ -2500,27 +2500,6 @@ class AgentWorker(threading.Thread):
             log_async("[%s] lot workdir unreadable (%s)" % (self.name, exc))
             return False
 
-    def _mail_without_deferred_lots(self, messages: list[dict]) -> list[dict]:
-        """#811 (B1) : le courrier d'un lot secondaire différé reste non lu ;
-        les autres messages du tour passent (son dossier manque)."""
-        from . import projects as projects_mod
-        if not messages or len(projects_mod.agent_projects(self.agent)) < 2:
-            return messages
-        try:
-            ops = storage.of(self.db).operations
-            kept = []
-            for row in messages:
-                mid = int(row.get("id") or 0)
-                lots = ops.message_lots([mid]) if mid else []
-                if len(lots) == 1 and self._lot_workdir_blocked(lots[0]):
-                    continue
-                kept.append(row)
-            return kept
-        except db_mod.DbError as exc:
-            # une lecture en échec ne doit jamais perdre du courrier
-            log_async("[%s] deferred lot mail unreadable (%s)" % (self.name, exc))
-            return messages
-
     def workdir_ready(self) -> bool:
         """Garde de `pick()` pendant un blocage « dossier absent » (L35).
 
@@ -3320,7 +3299,12 @@ class AgentWorker(threading.Thread):
         # plein tour).
         if not account_turn.continuity(self):
             return None  # #389 r2 : rotation requise mais annulée, rien consommé
-        urgents = mail.unread_urgent(self.db, self.name)
+        # #811 (B1/R3) : un urgent d'un lot retenu attend comme les autres, et
+        # le préfixe retenu ne le masque plus ; les messages primaires passent.
+        from . import lot_workdir
+        urgents = lot_workdir.deliverable_unread(self.cfg, self.db, self.agent,
+                                                  besoin=50, mode="urgent",
+                                                  deferred=self._lot_deferred)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
             mid = int(refuse.get("id") or 0)
@@ -3328,10 +3312,6 @@ class AgentWorker(threading.Thread):
                 self._refus_vus.add(mid)
                 log("[%s] urgent from %s without interruption: sender not allowed "
                     "to interrupt" % (self.name, refuse.get("sender") or "?"))
-        if autorises:
-            # #811 (B1) : un urgent d'un lot secondaire sans dossier attend
-            # comme les autres ; les messages primaires restent servis.
-            autorises = self._mail_without_deferred_lots(autorises)
         if autorises:
             # Le prioritaire passe devant la consigne en attente : c'est lui qui
             # ouvre le tour, la consigne interrompue suivra (0018).
@@ -3358,14 +3338,20 @@ class AgentWorker(threading.Thread):
                 self.nudged = False
                 self._reprise_attach = False
                 return {"kind": "prompt", "prompt": prompt, "ids": [], "lot": lot}
-        messages = mail.unread(self.db, self.name)
+        # #811 (B1/R3) : le courrier d'un lot retenu attend, les autres
+        # messages du tour passent — et la lecture franchit un préfixe retenu
+        # qui masquerait un message remisable plus récent.
+        messages = lot_workdir.deliverable_unread(self.cfg, self.db, self.agent,
+                                                   besoin=mail.UNREAD_LIMIT,
+                                                   deferred=self._lot_deferred)
         if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
             # L125 : boîte pleine de courrier passif — les messages qui
             # réveillent, plus récents, ne doivent pas y rester invisibles
-            messages = mail.unread_active(self.db, self.name) + messages
-        # #811 (B1) : le courrier d'un lot secondaire sans dossier attend,
-        # les autres messages du tour passent.
-        messages = self._mail_without_deferred_lots(messages)
+            reveil = lot_workdir.deliverable_unread(self.cfg, self.db, self.agent,
+                                                     besoin=mail.UNREAD_LIMIT,
+                                                     mode="active",
+                                                     deferred=self._lot_deferred)
+            messages = reveil + messages
         if messages:
             spec = self._mail_spec(messages)
             if spec is not None:
