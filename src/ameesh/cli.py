@@ -89,6 +89,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
+from . import fastmail
 from . import fil, identity, mail, migrations, platform, registry, signing, storage
 from . import session_bindings as sb
 from .config import NAME_RE, Config
@@ -502,6 +503,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
+    # #1604 : un envoi local touche la boîte des destinataires de CET hôte ;
+    # leur marqueur local repasse à « à vérifier » sans attendre la base. Un
+    # destinataire d'un autre hôte n'a pas de marqueur ici : rien à faire.
+    for nom in set(targets) | set(cc):
+        fastmail.bump(cfg, nom)
     if skipped:
         print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
@@ -647,7 +653,16 @@ def cmd_statusline(cfg: Config) -> int:
     parts.append("\033[2m%s\033[0m" % short)
     if unread:
         parts.append("\033[33m✉ %d\033[0m" % unread)
-    print("  ·  ".join(parts))
+    ligne = "  ·  ".join(parts)
+    print(ligne)
+    # #1604 : le rendu est fréquent ; la ligne et l'état de la boîte sont
+    # réutilisés quelques secondes par le chemin rapide (jamais bloquant).
+    try:
+        fastmail.write_statusline(cfg, fastmail.statusline_key(data), ligne)
+        if binding.ok:
+            fastmail.note(cfg, name, pending=bool(unread), unread=unread)
+    except Exception:
+        pass
     return 0
 
 
@@ -683,25 +698,43 @@ class _Remise:
         self.jeton = mail.new_token()
         self.msgs: list[dict] = []
         self.ouverte = False
+        #: #1604 : la réservation a-t-elle pu laisser des non-lus derrière
+        #: elle (plafond atteint) ? Sert au marqueur de boîte, sans requête.
+        self.reste = 0
+        #: la remise a-t-elle été soldée (remise) ou abandonnée (rendue) ?
+        self.solde = False
 
     def prendre(self, limite: int | None = None) -> list[dict]:
         """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
         if not self.pg:
-            self.msgs = self.bk.unread(self.name)
-            if limite is not None:
-                self.msgs = self.msgs[:max(0, limite)]
+            tous = self.bk.unread(self.name)
+            self.msgs = tous if limite is None else tous[:max(0, limite)]
+            self.reste = len(tous) - len(self.msgs)
             return self.msgs
+        taille = 200 if limite is None else max(1, limite)
         rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
                             porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=200 if limite is None else max(1, limite))
+                            limit=taille)
         self.ouverte = bool(rows)
         self.msgs = [mail.normalize(row) for row in rows]
+        # une réservation pleine peut cacher des non-lus : on le dit (au pire
+        # pour rien, le prochain hook reviendra par le chemin complet).
+        self.reste = 1 if len(rows) >= taille else 0
         return self.msgs
+
+    def restants_apres(self) -> int:
+        """#1604 : non-lus restants après cette remise, sans nouvelle requête.
+
+        Une remise soldée a livré ses messages ; une remise abandonnée les a
+        rendus à la boîte. Dans les deux cas, `reste` compte ce que la
+        réservation n'a pas pu voir (plafond)."""
+        return (0 if self.solde else len(self.msgs)) + self.reste
 
     def _ids(self) -> list[int]:
         return [int(m["id"]) for m in self.msgs if m.get("id") is not None]
 
     def solder(self) -> None:
+        self.solde = True
         if not self.pg:
             self.bk.mark_read(self.name, self.msgs)
             return
@@ -811,33 +844,34 @@ def _attente(bk, name: str, hors: list[dict]) -> int:
         return 0
 
 
+def _marque_boite(cfg: Config, name: str, attente: int) -> None:
+    """#1604 : note l'état de la boîte après un passage COMPLET par la base.
+
+    Le chemin rapide du hook ne s'autorise à ne pas ouvrir la base que sur un
+    marqueur frais ; ce marqueur ne se pose donc qu'ici, après une lecture
+    réelle, et jamais sur une exception. Aucune requête : `attente` vient de la
+    réservation (ou du compte déjà lu). Best-effort : un cache qui échoue ne
+    fait pas échouer le hook."""
+    try:
+        fastmail.note(cfg, name, pending=bool(attente), unread=int(attente))
+    except Exception:
+        pass
+
+
 def _register_stamp(cfg: Config, name: str) -> str:
-    return os.path.join(cfg.state_dir, "hooks", name + ".inscription")
+    return fastmail.register_stamp(cfg, name)
 
 
 def _register_due(cfg: Config, name: str, key: list) -> bool:
     """L61 : l'inscription de cette session est-elle à refaire ? Oui si la
     clé (harnais, dossier, session, bail) a changé ou si la dernière date de
-    plus de REGISTER_EVERY_S. Un état local illisible : oui."""
-    try:
-        with open(_register_stamp(cfg, name), encoding="utf-8") as fh:
-            last = json.load(fh)
-        return (last.get("key") != key
-                or not 0 <= time.time() - float(last.get("ts") or 0) < REGISTER_EVERY_S)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return True
+    plus de REGISTER_EVERY_S. Un état local illisible : oui. #1604 : le même
+    format est relu sans base par le chemin rapide (`fastmail`)."""
+    return fastmail.register_due(cfg, name, key)
 
 
 def _register_done(cfg: Config, name: str, key: list) -> None:
-    path = _register_stamp(cfg, name)
-    try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = "%s.%d" % (path, os.getpid())
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"key": key, "ts": time.time()}, fh)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    fastmail.register_done(cfg, name, key)
 
 
 def hook_foreign_harness(tool: str) -> str:
@@ -956,6 +990,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # Only the agent's own harness may register sessions or deliver mail.
         _foreign_hook_refused(cfg, bk, name, tool, attendu, data.get("session_id"))
         return 0
+    if binding.source == "session" and binding.ok:
+        # #1604 : l'identité de CETTE session est notée localement pour que les
+        # hooks rapides (PostToolUse) n'aient pas à rouvrir la base ; le
+        # marqueur de boîte, lui, reste seul juge de ce qu'il y a à faire.
+        fastmail.remember_liaison(cfg, name, tool, str(data.get("session_id") or ""),
+                                  pid=(binding.session or {}).get("pid"))
     # L166 : sous bail, la session de l'agent est celle que l'exécuteur lit
     # dans le flux du harnais, jamais celle d'un hook. dsh déclenche les hooks
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
@@ -1020,6 +1060,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                         "additionalContext": avis_borne_travail(attente, borne, travail)}}):
                     etat["differe"] = True
             _tour_ecrit(cfg, name, etat)
+            # La borne n'a rien réservé : le marqueur dit le non-lu restant,
+            # pour que le chemin rapide ne conclue pas « rien à faire ».
+            _marque_boite(cfg, name, attente)
             return 0
         remise = _Remise(bk, name, binding)
         try:
@@ -1073,6 +1116,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 _tour_ecrit(cfg, name, etat)
         finally:
             remise.abandonner()
+            # #1604 : marqueur posé seulement après un passage complet sans
+            # exception (une base en panne ne doit pas se dire « rien à faire »),
+            # et sans requête : la réservation sait ce qu'elle a laissé.
+            if sys.exc_info()[0] is None:
+                _marque_boite(cfg, name, remise.restants_apres())
     except Exception:
         return 0
     return 0
@@ -1264,6 +1312,8 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     if not moved:
         print("no pending message for %s: nothing to forward" % old)
         return 0
+    # #1604 : le successeur local a du courrier neuf ; son marqueur le dit.
+    fastmail.bump(cfg, new)
     senders: dict = {}
     for row in moved:
         senders[row.get("sender") or "?"] = senders.get(row.get("sender") or "?", 0) + 1
@@ -1340,6 +1390,9 @@ def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
         print("  %s: re-delivery to %s refused — %s" % (
             action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
     if not result["dry_run"]:
+        # #1604 : les successeurs locaux ont du courrier neuf.
+        for action in result["forwarded"]:
+            fastmail.bump(cfg, action.get("new") or "")
         print("retention %d day(s); dead mail stays in the mailbox, marked expired"
               % result["days"])
     return 0
