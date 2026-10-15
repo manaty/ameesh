@@ -225,6 +225,47 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute("DROP OWNED BY %s" % q(writer))
             self.db.execute("DROP ROLE %s" % q(writer))
 
+    def test_controller_audit_checks_maintain_only_from_postgresql_17(self):
+        """MAINTAIN n'existe qu'à partir de PG17 : l'audit ne l'interroge pas avant."""
+        import tempfile
+        from pathlib import Path
+        q = db_mod.quote_ident
+        controller = 't_release_maintain_' + uuid.uuid4().hex[:8]
+        sql = Path(REPO,'deploy/sql/role-release-controller.sql')
+        text = sql.read_text()
+        self.assertIn("current_setting('server_version_num')",text)
+        env = dict(os.environ, PGOPTIONS='-c search_path='+self.schema)
+        def apply(path):
+            return subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
+                '-v','role='+controller,'-f',str(path)], env=env, text=True,
+                capture_output=True, timeout=60)
+        try:
+            # Avant PG17 (ou sur le banc 17) l'audit passe : le nom MAINTAIN
+            # n'est alors jamais demandé à has_table_privilege.
+            result = apply(sql)
+            self.assertEqual(result.returncode,0,result.stderr)
+            version = int(self.db.query("SELECT current_setting('server_version_num') AS v")[0]['v'])
+            if version < 170000:
+                return
+            self.db.execute('GRANT MAINTAIN ON host_release_fences TO %s' % q(controller))
+            # PG17 : MAINTAIN est un droit réel, l'audit le refuse.
+            result = apply(sql)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('unrelated write privilege',result.stderr)
+            # Même audit avec la version forcée avant 17 : la liste ne porte
+            # plus MAINTAIN, donc l'audit va au bout au lieu d'échouer sur un
+            # nom de droit inconnu.
+            with tempfile.TemporaryDirectory() as directory:
+                older = Path(directory)/'role-release-controller.sql'
+                older.write_text(text.replace("current_setting('server_version_num')::int",
+                                              '160000'))
+                result = apply(older)
+                self.assertEqual(result.returncode,0,result.stderr)
+        finally:
+            if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
+                self.db.execute('DROP OWNED BY %s' % q(controller))
+                self.db.execute('DROP ROLE %s' % q(controller))
+
     def test_inherited_policy_writes_make_executor_audit_fail(self):
         q = db_mod.quote_ident
         parent = "t_policy_parent_" + uuid.uuid4().hex[:8]
