@@ -650,7 +650,13 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
                             "issue reference and reserve again" % (
                                 item_id, migration_layout(item, cfg).label(item["migration"]),
                                 item.get("migration_repo"), item_id))
-    if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref")):
+    if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref"),
+                                             migration_repo=item.get("migration_repo")):
+        # #1654 : le CAS couvre aussi la réservation lue ; si l'issue n'a pas
+        # bougé, c'est une réservation arrivée entre la lecture et l'écriture.
+        again = get(db, item_id)
+        if again is not None and ((again.get("issue_ref") or "").strip() or None) == current:
+            raise WorkError("lot %s: migration reservation changed meanwhile, retry" % item_id)
         raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
     note(db, item_id, "issue_ref %s → %s" % (current or "—", clean or "—"), actor=actor)
     return get(db, item_id) or item

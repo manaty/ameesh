@@ -638,6 +638,41 @@ class CorrectionIssueRefTest(PgTestCase):
         self.assertIn("correction refused", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], "manaty/nexlink#1567")
 
+    def test_reservation_arrivee_entre_lecture_et_ecriture(self):
+        """#1654 : la lecture (garde du dépôt) et le CAS ne sont pas atomiques ;
+        une réservation prise entre les deux ne doit pas passer en silence. Le
+        CAS couvre la réservation lue : refus explicite, issue intacte."""
+        lot = self._lot()
+        observed = work.get(self.db, lot["id"])   # lue AVANT la réservation
+        nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                         NEXLINK.directory, ["376_b.sql"])
+        work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
+        live = work.get(self.db, lot["id"])
+        with mock.patch.object(work, "get", side_effect=[observed, live]):
+            with self.assertRaises(work.WorkError) as ctx:
+                work.set_issue_ref(self.db, lot["id"], "manaty/ameesh#1603",
+                                   actor="human:owner")
+        self.assertIn("reservation changed meanwhile", str(ctx.exception))
+        got = work.get(self.db, lot["id"])
+        self.assertEqual(got["issue_ref"], "manaty/nexlink#1567")
+        self.assertEqual((got["migration"], got["migration_repo"]), (453, "manaty/nexlink"))
+
+    def test_cas_storage_couvre_la_reservation_observee(self):
+        """#1654 : le storage resserre le CAS quand l'appelant fournit la
+        réservation lue ; sans observation, le CAS d'origine est conservé
+        (les appelants qui ne lisent pas la réservation ne changent pas)."""
+        lot = self._lot()
+        observed = work.get(self.db, lot["id"])
+        nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                         NEXLINK.directory, ["376_b.sql"])
+        work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
+        store = storage.of(self.db).work
+        self.assertFalse(store.set_issue_ref(lot["id"], "manaty/ameesh#1603",
+                                             current=observed["issue_ref"],
+                                             migration_repo=observed.get("migration_repo")))
+        self.assertTrue(store.set_issue_ref(lot["id"], "manaty/ameesh#1603",
+                                            current=observed["issue_ref"]))
+
 
 def _drivers():
     """Les pilotes présents : la passe psql de la CI tourne sans psycopg."""
