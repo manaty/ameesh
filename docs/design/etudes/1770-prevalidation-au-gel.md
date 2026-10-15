@@ -74,7 +74,11 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   contrats` (tout module en trop est un élargissement, tout module manquant un
   contrat perdu) ;
 - délai du run : `timeout_seconds` du canon ; exécution par
-  `ameesh offload run --fallback none` uniquement ;
+  `ameesh offload run --fallback none` uniquement. Sur la VM, ce chemin est
+  celui du guest L159b (jetons de concurrence `flock`, scope cgroup plafonné par
+  l'offre `policy.lend` de l'hôte) : aucune suite lourde n'est lancée hors de
+  lui, et il ne contourne pas `ameesh heavy`, qui reste l'outil des agents
+  natifs de l'hôte ;
 - après le run, si `--published-ref` est donnée, la référence est relue **au
   distant** (`git ls-remote`) : une tête qui a bougé invalide le rapport
   (`head-moved`) ;
