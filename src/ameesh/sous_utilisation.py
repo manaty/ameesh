@@ -642,14 +642,15 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     reçoit rien ; il n'est jamais cité dans sa propre liste."""
     if alert.get("type") != "idle_capacity":
         return {}
+    from . import projects as projects_mod
     by_name = {row["name"]: row for row in listing}
     titles = lot_titles or {}
     lots = [int(l) for l in alert.get("lots") or ()]
     out = {}
     for orch in list(alert.get("orchestrators") or ()) + list(alert.get("designers") or ()):
-        team = ((by_name.get(orch) or {}).get("team") or "").strip()
+        mine = set(projects_mod.agent_projects(by_name.get(orch) or {}))
         names = [n for n in alert.get("agents") or () if n != orch and (
-            not team or ((by_name.get(n) or {}).get("team") or "").strip() == team)]
+            not mine or mine & set(projects_mod.agent_projects(by_name.get(n) or {})))]
         if not names:
             continue
         parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "

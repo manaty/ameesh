@@ -215,7 +215,8 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         rows = registry.overview(db)
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
-        from .projects import agent_project, project_label
+        # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
+        from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
         if args.json:
@@ -252,7 +253,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                 status = "ext/" + status
             wip = build_by_agent.get(row["name"], 0)
             print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
-                row["name"][:20], project_label(row["project"])[:12],
+                row["name"][:20], project_label(agent_project_label(row))[:12],
                 (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0),
