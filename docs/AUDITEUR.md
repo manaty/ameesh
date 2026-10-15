@@ -767,9 +767,10 @@ migrations manquent ([BASCULE](BASCULE.md), « Migrer avant d'installer »).
 `retour` reste alors possible sans toucher à la base. Toute autre
 migration : il propose.
 
-Le redémarrage se fait **hors de son tour** : `redemarrer` attend que chaque
-persona soit hors tour, la sienne comprise, et attendrait sans fin s'il le
-lançait dans son propre tour. Il le confie à une unité transitoire, puis il
+Le redémarrage se fait **depuis une unité à part** : `redemarrer` arrête
+chaque persona (SIGTERM, drainage borné) avant de la relancer, la sienne
+comprise — lancé dans son propre tour, il se tuerait en cours de route avant
+les exécuteurs suivants. Il le confie donc à une unité transitoire, puis il
 finit son tour ; l'unité lui écrit à la fin. Pas `setsid` ni `nohup` : un
 processus détaché ainsi reste dans le groupe de contrôle de son exécuteur, et
 le redémarrage de cet exécuteur le tuerait en cours de route, avant les
