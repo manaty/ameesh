@@ -2863,8 +2863,10 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
-                 base: str, work_item_id: int | None, url: str | None) -> dict:
-        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
+                 base: str, work_item_id: int | None, url: str | None,
+                 workflow: str = "") -> dict:
+        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend.
+        `workflow` : le fichier de workflow qui l'a produite (#1110)."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:
@@ -2900,9 +2902,12 @@ class CiResults(Domain):
         """Note le message qui a signalé ces échecs (`(part, test)`)."""
 
     @abc.abstractmethod
-    def base_failures(self, repo: str, branch: str) -> dict:
-        """Dernière exécution conclue (verte ou rouge) de `branch` :
-        `{run_id, head_sha, tests}` (tests en échec), ou {} sans exécution."""
+    def base_failures(self, repo: str, branch: str, *, workflow: str = "") -> dict:
+        """Dernière exécution conclue (verte ou rouge) de `branch` **pour ce
+        workflow** : `{run_id, head_sha, tests}` (tests en échec), ou {} sans
+        exécution. Le workflow évite de comparer deux suites étrangères ; les
+        lignes antérieures à la migration 0433, toutes de l'ancien filtre
+        global `tests.yml`, y sont nommées."""
 
     @abc.abstractmethod
     def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
@@ -2914,8 +2919,14 @@ class CiResults(Domain):
 
     @abc.abstractmethod
     def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
-        """Par dépôt et par branche parmi `branches`, la dernière exécution
-        conclue verte ou rouge."""
+        """Par dépôt, branche et workflow, sur la dernière tête conclue de la
+        branche, l'exécution conclue verte ou rouge la plus récente."""
+
+    @abc.abstractmethod
+    def head_replaced(self, repo: str, branch: str, head_sha: str, run_id: int) -> bool:
+        """Vrai si une autre tête de cette branche a été vue après cette
+        exécution (une exécution de `run_id` supérieur) : son verdict serait
+        périmé."""
 
 
 class Handoffs(Domain):
