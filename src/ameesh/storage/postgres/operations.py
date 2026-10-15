@@ -97,6 +97,8 @@ class Operations(interface.Operations):
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
                    extract(epoch from r.lease_expires_at)::float8 AS lease_expires_ts,
                    extract(epoch from r.status_since)::float8     AS status_since_ts,
+                   -- #1521 : le début du motif affiché (status_text), pas du statut
+                   extract(epoch from r.status_reason_since)::float8 AS status_reason_since_ts,
                    extract(epoch from r.last_turn_at)::float8     AS last_turn_ts,
                    extract(epoch from r.updated_at)::float8       AS updated_ts,
                    extract(epoch from r.restart_requested_at)::float8 AS restart_requested_ts,

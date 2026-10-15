@@ -2272,7 +2272,7 @@ class Operations(Domain):
     @abc.abstractmethod
     def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
-        `status_since_ts`, bail
+        `status_since_ts`, début du motif affiché (`status_reason_since_ts`), bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
         `turn_label` du marqueur comptable), non-lus qui ouvriront un tour
         (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
