@@ -136,7 +136,7 @@ class TurnCosts(interface.TurnCosts):
         if not names:
             return []
         return self.db.query(
-            "select harness, account, extract(epoch from recorded_at)::float8 as ts,"
+            "select agent, harness, account, extract(epoch from recorded_at)::float8 as ts,"
             " usd::float8 as usd from turn_costs"
             " where recorded_at > to_timestamp(%s) and void_reason is null"
             " and source <> 'device'"

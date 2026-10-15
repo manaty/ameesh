@@ -221,25 +221,46 @@ jobs:
       # qui l'a construit (#932 — un venv de runner auto-hébergé porte un lien
       # absolu vers /home/runner/r<X>/_work/_tool/Python/... : la clé par
       # `runner.name` empêche un runner de restaurer le venv d'un autre ; les
-      # runners hébergés, au cache commun /opt/hostedtoolcache, gardent le leur).
+      # runners hébergés, au cache commun /opt/hostedtoolcache et au nom
+      # variable (« GitHub Actions N »), partagent la clé `hosted`, #1294).
+      #
+      # #1293 : la clé primaire est celle du run, donc unique ; la
+      # restauration passe par les clés partielles (`restore-keys`). Un venv
+      # restauré invalide est reconstruit **puis resauvé sous une clé neuve**
+      # (étape suivante) : `actions/cache` ne resauve pas sous une clé
+      # identique, si bien qu'un venv devenu invalide était reconstruit à
+      # chaque exécution sur ce runner.
       - id: venv
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-
       # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
       # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
-      # importer ses dépendances, sinon il est reconstruit (#932).
-      - name: dépendances (pilote psycopg)
+      # importer ses dépendances, sinon il est reconstruit (#932, #1293).
+      - id: deps
+        name: dépendances (pilote psycopg)
         run: |
-          if [ "${{ steps.venv.outputs.cache-hit }}" = "true" ] \
-             && .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
             echo "venv restauré du cache : valide"
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
             .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
+      # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
+      # prochaine exécution retrouve par `restore-keys`. Un sauvetage refusé
+      # (quota, course entre parts) ne fait pas rougir la part : la
+      # reconstruction reste correcte, seule la prochaine exécution repaie.
+      - if: steps.deps.outputs.reconstruit == '1'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .venv-ci
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
       - &base
         name: base jetable (sans fsync) et client psql
         run: |

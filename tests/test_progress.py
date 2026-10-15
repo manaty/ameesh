@@ -187,6 +187,41 @@ class BudgetTest(unittest.TestCase):
         self.assertFalse(plan["exceeded"])        # 80 % utilisé pour un plafond de 90 %
         self.assertAlmostEqual(plan["pace_cap"], 0.9)
 
+    def test_le_plan_d_un_compte_declare_suit_son_compte_actif(self):
+        # #1028 P2 (R1 cx2) : le plan d'un harnais à comptes déclarés porte la
+        # jauge ET le rythme du compte ACTIF. Le croisement « jauge du dossier
+        # par défaut (80 %), multiplicateur du compte actif (m2) » publiait
+        # 80 % / plafond 30 % / dépassé alors qu'aucun compte n'est dans cet
+        # état : primaire 80 %/m1 (inactif), secondaire 20 %/m2 (actif).
+        window = 7 * 86400.0
+        primaire = cost.Gauge("codex", "week", 0.80, NOW + 0.9 * window, window)
+        secondaire = cost.Gauge("codex", "week", 0.20, NOW + 0.9 * window, window)
+        comptes = [
+            {"harness": "codex", "account": "primaire", "active": False,
+             "pace_multiplier": 1.0, "gauges": [], "_gauges": [primaire]},
+            {"harness": "codex", "account": "secondaire", "active": True,
+             "pace_multiplier": 2.0, "gauges": [], "_gauges": [secondaire]},
+        ]
+        b = progress.build_budget([], [primaire], NOW, accounts=comptes)
+        self.assertEqual(len(b["plans"]), 1)
+        plan = b["plans"][0]
+        self.assertEqual(plan["used"], 0.20)          # la jauge du compte actif
+        self.assertAlmostEqual(plan["pace_cap"], 0.30)  # 2 × 10 % + 10 %
+        self.assertFalse(plan["exceeded"])            # le primaire l'est, pas lui
+        # harnais sans compte déclaré : jauge et rythme nominaux, le
+        # multiplicateur du compte actif ne fuit pas
+        libre = cost.Gauge("claude", "five_hour", 0.05, NOW + 0.9 * 3600, 3600)
+        b = progress.build_budget([], [libre], NOW, accounts=comptes)
+        plans = {p["harness"]: p for p in b["plans"]}
+        self.assertAlmostEqual(plans["claude"]["pace_cap"], 0.20)  # 10 % + 10 %
+        self.assertEqual(plans["claude"]["used"], 0.05)
+        self.assertEqual(plans["codex"]["used"], 0.20)  # compte actif, sans fuite
+        # sans compte déclaré : rien ne change
+        nomme = cost.Gauge("codex", "week", 0.25, NOW + 0.9 * window, window)
+        b = progress.build_budget([], [nomme], NOW)
+        self.assertAlmostEqual(b["plans"][0]["pace_cap"], 0.20)
+        self.assertTrue(b["plans"][0]["exceeded"])
+
 
 def _snap(**over):
     snap = {
