@@ -206,14 +206,20 @@ class EvaluateTest(unittest.TestCase):
         self.now = 1_800_000_000.0
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1075-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # L1078 : un compte DÉCLARÉ sans dossier lit le dossier par défaut du
+        # harnais, jamais le dossier ambiant de l'exécuteur (`None` ici) ; le
+        # livre factice est donc indexé sur les sessions de chaque compte.
+        primary_path = os.path.join(self.tmp, "codex-1")
         secondary_path = os.path.join(self.tmp, "codex-2")
+        os.makedirs(primary_path, mode=0o700)
         os.makedirs(secondary_path, mode=0o700)
         self.items = accounts.parse({"codex": [
-            {"name": "primaire", "pace_multiplier": 2.0},
+            {"name": "primaire", "path": primary_path, "pace_multiplier": 2.0,
+             "check_credentials": False},
             {"name": "secondaire", "path": secondary_path, "check_credentials": False},
         ]})["codex"]
         self.reading = [_gauge(0.25, self.now, 0.10)]
-        self.book = _Book({None: self.reading,
+        self.book = _Book({os.path.join(primary_path, "sessions"): self.reading,
                            os.path.join(secondary_path, "sessions"): self.reading})
 
     def test_same_reading_holds_secondary_and_passes_primary(self):
@@ -228,7 +234,8 @@ class EvaluateTest(unittest.TestCase):
 
     def test_reason_shows_the_multiplied_cap_not_a_falsified_reading(self):
         primary = self.items[0]
-        book = _Book({None: [_gauge(0.35, self.now, 0.10)]})
+        book = _Book({os.path.join(primary.home(), "sessions"):
+                      [_gauge(0.35, self.now, 0.10)]})
         ev = accounts.evaluate(book, primary, [primary], self.now, critical=True)
         self.assertFalse(ev.ok)
         # la part écoulée reste la vraie (10 %), seul le plafond vise plus haut
