@@ -991,7 +991,10 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # conclure son tour — jamais tant qu'un travail lancé pendant le tour
         # tourne encore (processus de fond, conteneurs du tour) : il le saura,
         # et l'invitation viendra après.
-        tour = os.environ.get("AMEESH_TURN_ID") or ""
+        # L76 : un processus résident garde son environnement d'un tour à
+        # l'autre — le tour en cours est nommé dans un fichier
+        from . import resident_runner
+        tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
         etat = tour_lit(cfg, name, tour) if borne else None
         if etat is not None and etat["remis"] >= borne:
