@@ -14,7 +14,6 @@ Base : origin/main `0dffda4ca`. Tête : `cbb1f1a39`. Inclus : 25. Écartés : 12
 - #1649 Claude : conserver Gauges.overage dans claude_gauges pour appliquer la garde arg — ameesh-dev4, tête gelée `d42257b12`, verdict ok de mty-amh-impl-04
 - #1656 Auto-fusion GitHub : empêcher une tête modifiée de fusionner sous un ancien feu  — mty-amh-impl-06, tête gelée `ba76aac96`, verdict ok de ameesh-dev1
 - #1665 Worktrees de lot : le runner et ameesh housekeeping les retirent après fusion ou — deepseek3, tête gelée `8f47e1374`, verdict ok de ameesh-cx1
-- #1677 Prise automatique aveugle : lots bloqués par des lots en qa jamais pris, inactiv — mty-amh-impl-07, tête gelée `bfb840c43`, verdict ok de ameesh-dev7
 - #193 L159h : prêt de capacité de la VM de CI, avec ses mainteneurs (isolement du grou — ameesh-dev4, tête gelée `2def8342c`, verdict ok de mty-amh-qa-01
 - #373 L85: event log and SSE — mty-amh-impl-07, tête gelée `e8fa1bf98`, verdict ok de ameesh-dev1
 - #376 L89: read screens — ameesh-cx2, tête gelée `205cb533f`, verdict ok de mty-amh-qa-01
@@ -154,3 +153,12 @@ Base : origin/main `0dffda4ca`. Tête : `cbb1f1a39`. Inclus : 25. Écartés : 12
 - #1716 #1690 N1 : une carte avec artefacts_incomplets peut restreindre le plan (bloc mu — mty-amh-impl-08 : plafond du paquet atteint
 - #1718 land : désarmement raté + gh pr list illisible ne doit pas rendre l'éjection sil — ameesh-dev7 : plafond du paquet atteint
 - #1720 Jauges Claude : read_at d'un flux sans marqueur = mtime du journal, surestime la — mty-amh-impl-03 : plafond du paquet atteint
+
+## Retiré après CI (bureau, 15/10 20:35)
+
+- #1677 — revert de sa fusion : test_l118 (libellé), test_l107 (op work.review_proposals non classée), test_l233b (lot d'un autre projet remis) rouges sur sa tête bfb840c43 ; registre paquets/retires.tsv.
+
+## Adaptations de test (bureau)
+
+- #373 : agent_mesh_overview.roles fermée (FERMEES, tests/test_cluster.py), aucun GRANT.
+- #1133 : faux systemd-run de test_1252 au chemin absolu.
