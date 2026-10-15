@@ -346,14 +346,15 @@ class Engine:
 
     def _red(self, state, now):
         state["failures"] += 1
+        state["diagnosis"] = copy.deepcopy(state["attempts"][-1]["ci"].get("diagnosis"))
         members = state["plan"]["suspects"]
         if self.policy.build_beta:
             # One complete CI per cutoff. A multi-lot failure alone proves
-            # no culprit; leave isolation to the pilot without dispatching
+            # no culprit; require factual diagnosis without dispatching
             # diagnostic halves or silently transferring a green result.
             state["phase"] = "paused"
             state = self._save(state)
-            self.ports.notify("build/beta packet CI red: pilot diagnosis required; "
+            self.ports.notify("build/beta packet CI red: factual diagnosis unknown; "
                               "no automatic diagnostic CI", state)
             return {"result": "paused"}
         if state["failures"] >= self.policy.max_failures:

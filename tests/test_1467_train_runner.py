@@ -351,3 +351,29 @@ class TrainRunnerTest(PgTestCase):
             self.passage().step(self.db, self.now)
         self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
         self.assertEqual(self.api_calls, [])
+
+    def test_red_packet_reports_unknown_causes_without_accusing_a_member_or_starting_more_ci(self):
+        passage = self.automatic_passage()
+        plan = passage.step(self.db, self.now)["plan"]
+        api = self.api
+        def failed(path):
+            rows = api(path)
+            if "/jobs?" in path:
+                rows[0]["jobs"][0]["conclusion"] = "failure"
+            elif "/runs?" in path:
+                rows[0]["workflow_runs"][0]["conclusion"] = "failure"
+            return rows
+        train_ci.GitHub._api.side_effect = failed
+        with mock.patch.object(train_ci.GitHub, "start") as start, \
+                mock.patch.object(train_git.Repository, "promote") as promote:
+            result = passage.step(self.db, self.now + 1)
+        self.assertEqual(result["result"], "paused", result)
+        report = self.ops.train_read(self.key)["diagnosis"]
+        self.assertEqual(report["packet"]["head"], plan["head"])
+        self.assertEqual(report["ci"][0]["attempt"], 1)
+        self.assertEqual(report["environment"]["status"], "unknown")
+        self.assertEqual(report["attribution"]["proven_lots"], [])
+        self.assertTrue(report["missing"])
+        start.assert_not_called()
+        promote.assert_not_called()
+        self.assertIsNone(passage.epoch)

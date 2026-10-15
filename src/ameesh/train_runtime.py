@@ -7,7 +7,7 @@ There is no fallback to a current registry, last verdict or journal note.
 """
 from __future__ import annotations
 
-from . import land, merge_queue, radar
+from . import land, merge_queue, radar, train_diagnosis
 from .train import TrainError, digest, identity, ordered
 
 
@@ -106,7 +106,10 @@ class Runtime:
         self.ci_adapter.start(plan)
 
     def ci(self, plan):
-        return self.ci_adapter.read(plan)
+        evidence = self.ci_adapter.read(plan)
+        if evidence.get("status") == "red" and evidence.get("complete") is True:
+            evidence = dict(evidence, diagnosis=train_diagnosis.unresolved(plan, evidence))
+        return evidence
 
     def authorize(self, plan):
         return self.fires.authorize(plan)

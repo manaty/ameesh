@@ -107,6 +107,12 @@ les seuls contrats qui l'exigent. Les champs de diagnostic
 `ci.environment_red` et `ci.faulty_lot` attendent encore un fournisseur
 qualifié de preuve locale et d'isolation ; un rouge global ne désigne aucun
 lot et ne prouve pas une dépendance à l'environnement.
+Le port factuel commun est décrit dans
+[`reviews/1467-diagnostics-contract`](../../../reviews/1467-diagnostics-contract/README.md).
+Runtime émet déjà le rapport `ameesh-train-diagnosis/1` sur un paquet rouge
+complet ; Engine conserve les deux résultats `unknown` et les faits manquants
+dans son état, sans exclusion ni nouvelle CI. Le fournisseur de règle n'est
+pas pris pour un fournisseur de preuve.
 
 Le fournisseur doit vérifier les familles réelles à la date des commits et
 verdicts, pour chaque auteur, à partir des sessions/tours historiques. Le nom
