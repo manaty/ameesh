@@ -40,6 +40,8 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
   tout le mesh (plusieurs `ameesh notify` ne se cumulent pas) ;
 * l'attribution est conditionnelle (assigné encore vide) : deux preneurs
   concurrents ne prennent pas le même élément.
+* une dépendance explicite encore ouverte exclut l'élément avant la borne
+  de sélection ; le graphe est revérifié dans la transaction de prise.
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
 sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
@@ -59,6 +61,8 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   `harness:<nom>` désigne son harnais ;
 * un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
   sa date ;
+* un lot avec une dépendance explicite encore ouverte attend son amont ;
+  les dépendances sont revérifiées dans la transaction de prise ;
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
@@ -424,7 +428,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     room = 0
     if idle_s > 0 and max_per_hour > 0:
         room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
-    queue = items(db, open_only=True, limit=200) if room > 0 else []
+    queue = st.work.backlog(open_only=True, limit=200, ready_only=True) if room > 0 else []
     if not lots and not queue:
         return []
     listing = st.operations.listing() if listing is None else listing
@@ -519,11 +523,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     break                   # agent non réveillable : au suivant
                 try:
                     # #540 : sous le verrou de l'agent, pas de second lot
-                    # non démarré (il en a reçu un depuis sa sélection)
+                    # non démarré (il en a reçu un depuis sa sélection).
+                    # #1242 (L165) : la prise ne vise qu'un lot intake dont
+                    # toutes les dépendances sont satisfaites.
                     done = st.work.assign(int(item["id"]), check["assignee"], current=None,
                                           note="%s par %s, au repos" % (LOT_TAKE_NOTE,
                                                                         check["assignee"]),
-                                          actor=SENDER, take=work.takes_rule(check))
+                                          actor=SENDER, take=work.takes_rule(check),
+                                          ready_only=True)
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 lots.remove(item)
@@ -546,7 +553,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
     # avant toute amélioration
-    if taken or sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
+    if taken or sous_utilisation.waiting_project_lots(
+            st.operations.open_lots_activity(500), db=db):
         return taken
     pool = candidates(idle_s)
     for row in pool:
@@ -579,7 +587,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 item.get("expected_value") or "")
             try:
                 done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                      note=note, actor=SENDER, take=work.takes_rule(check))
+                                      note=note, actor=SENDER, take=work.takes_rule(check),
+                                      ready_only=True)
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
             queue.remove(item)

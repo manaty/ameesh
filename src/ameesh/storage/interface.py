@@ -1342,7 +1342,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
                actor: str, queued_note: str | None = None,
-               forced_note: str | None = None, take: bool = False) -> dict | None:
+               forced_note: str | None = None, take: bool = False,
+               ready_only: bool = False) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`). #540 : avec
@@ -1350,7 +1351,11 @@ class WorkItems(Domain):
         un autre lot ouvert qui l'occupe (L165b, comme `add`) : il passe dans
         la file d'équipe (sans assigné) (`forced_note` de même). `take=True`
         (la prise automatique, `backlog.auto_take`) : même contrôle sous le
-        même verrou, mais le lot reste où il est et `PendingLot` est levée."""
+        même verrou, mais le lot reste où il est et `PendingLot` est levée.
+        `ready_only` (L165) exige un lot intake sans assigné dont toutes les
+        dépendances sont satisfaites ; vérifié sous verrou dans la même
+        transaction que l'attribution. La réservation manuelle garde son
+        comportement par défaut."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
@@ -1487,11 +1492,13 @@ class WorkItems(Domain):
         `app`: its project (L118c), empty when unknown."""
 
     @abc.abstractmethod
-    def backlog(self, *, open_only: bool, limit: int) -> list[dict]:
+    def backlog(self, *, open_only: bool, limit: int,
+                ready_only: bool = False) -> list[dict]:
         """Les éléments de la file dans l'ordre de prise (priorité, puis valeur
         décroissante, puis ancienneté). `open_only` : seulement ceux qu'on peut
         encore prendre (`intake`, sans assigné) ; sinon tous les éléments non
-        terminés."""
+        terminés. `ready_only` exclut les dépendances ouvertes avant la borne
+        pour la prise automatique ; la liste ordinaire les conserve."""
 
     @abc.abstractmethod
     def auto_takes_since(self, seconds: float, note_prefix: str) -> int:
@@ -1502,8 +1509,8 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def unassigned_lots(self, limit: int) -> list[dict]:
         """L165 : les lots du projet encore à confier (`intake`, sans assigné,
-        hors file d'amélioration), dans l'ordre de prise : priorité, puis
-        dates prévues (début, fin, livraison ; sans date en dernier), puis
+        hors file d'amélioration, sans dépendance ouverte), dans l'ordre de
+        prise : priorité, puis dates prévues (début, fin, livraison ; sans date en dernier), puis
         ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et

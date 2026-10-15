@@ -18,6 +18,7 @@ import time
 from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
+from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
 
 ITEM_COLUMNS = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
@@ -359,13 +360,31 @@ class WorkItems(interface.WorkItems):
         return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor,
-               queued_note=None, forced_note=None, take=False) -> dict | None:
+               queued_note=None, forced_note=None, take=False,
+               ready_only=False) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
         en cours est effacée (issue `annulee` au registre). #540 :
         `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
+            if ready_only:
+                # Même verrou que les éditions du graphe : une dépendance ne
+                # peut apparaître entre le contrôle et l'attribution. Verrouiller
+                # aussi les amonts empêche leur réouverture pendant la prise.
+                tx.execute(_DEPENDENCIES_LOCK)
+                rows = tx.query(
+                    "SELECT id, state, assignee FROM work_items"
+                    " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
+                    "                         WHERE work_item_id = %s)"
+                    " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
+                item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
+                if current is not None or item is None or item["state"] != "intake" \
+                        or item["assignee"] is not None:
+                    return None
+                if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
+                       for r in rows):
+                    return None
             behind = None
             if (queued_note is not None or take) and assignee:
                 lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
@@ -377,7 +396,8 @@ class WorkItems(interface.WorkItems):
             if behind is not None:
                 assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
                                   else (None, queued_note.format(lot=behind)))
-            row = WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            row = WorkItems(tx)._reassign(item_id, assignee, current,
+                                          "intake" if ready_only else None, note, actor)
             if row is not None and behind is not None:
                 row["forced_behind" if forced_note else "queued_behind"] = behind
             return row
@@ -1131,9 +1151,14 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
 
-    def backlog(self, *, open_only, limit) -> list[dict]:
+    def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:
         where = ("state = 'intake' AND assignee IS NULL" if open_only
                  else "state NOT IN %s" % _CLOSED)
+        if ready_only:
+            where += (" AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
+                      "                      JOIN work_items b ON b.id = d.blocker_id"
+                      "                     WHERE d.work_item_id = work_items.id"
+                      "                       AND b.state NOT IN %s)" % _CLOSED)
         return self.db.query(
             "SELECT %s FROM work_items WHERE type = 'improvement' AND %s"
             " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
