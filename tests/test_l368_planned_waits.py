@@ -6,9 +6,13 @@ import datetime
 import os
 import time
 import unittest
+from unittest import mock
 
-from ameesh import plan, planned_waits as W, progress, roadmap, stagnation, storage, work
+from ameesh import (mesh_cli, plan, planned_waits as W, progress, roadmap,
+                    stagnation, storage, work)
 from ameesh import work_dependencies as D
+from ameesh.storage import interface as SI
+from ameesh.storage.postgres.progress import Progress
 from tests.support import PgTestCase
 
 
@@ -147,6 +151,64 @@ class UnitTest(unittest.TestCase):
         label = D.wait_label(hold[1])
         self.assertTrue(label.startswith("hold by pilote since "), label)
         self.assertIsNone(D.wait_label(None))
+
+    def test_hold_prefixes_cover_the_exact_notes(self):
+        """#1664 B2 : les préfixes littéraux donnés au stockage couvrent
+        toutes les notes que `is_hold_note`/`is_lift_note` acceptent — le
+        filtre SQL ne peut pas manquer une retenue, et les notes ordinaires
+        qui les portent en préfixe restent filtrées par le motif exact."""
+        for text in ("hold: fenêtre", "HOLD: fenêtre",
+                     "unhold: feu", "UNHOLD: feu", "unhold : feu",
+                     "hold lifted: feu", "hold released: feu", "hold cleared: feu",
+                     "hold   lifted : feu"):
+            with self.subTest(text=text):
+                self.assertTrue(W.is_hold_note(text) or W.is_lift_note(text))
+                self.assertTrue(text.strip().lower().startswith(W.HOLD_NOTE_PREFIXES))
+        for text in ("triage: relevé", "unholding the gate", "threshold reached", ""):
+            self.assertFalse(W.is_hold_note(text) or W.is_lift_note(text))
+
+    def test_targeted_stream_holds_like_the_full_journal(self):
+        """#1664 B2 : le flux ciblé du stockage (transitions + notes hold/levée)
+        donne le même hold que le journal complet, sans le texte des notes
+        ordinaires ; une note portée par une transition est rendue avec elle."""
+        class Journal:
+            def __init__(self, events):
+                self.events = list(events)
+
+            def lot_events(self, ids):
+                gardes = {int(i) for i in ids}
+                return [e for e in self.events if int(e["work_item_id"]) in gardes]
+
+        def row(ident, state, note="", actor="dev7"):
+            return {"id": ident, "work_item_id": 1, "state": state, "note": note,
+                    "actor": actor, "created_ts": float(ident)}
+
+        bruit = "triage: " + "x" * 5000
+        journal = [row(1, "intake", "created"),
+                   row(2, "build", "prise"),
+                   row(3, "build", bruit),
+                   row(4, "build", "hold: fenêtre opérateur", actor="human:pilote"),
+                   row(5, "build", bruit),
+                   row(6, "qa", "hold: porte portée par la transition",
+                       actor="human:pilote"),
+                   row(7, "qa", bruit)]
+        flux = SI.Progress.lot_hold_events(Journal(journal), [1], W.HOLD_NOTE_PREFIXES)
+        notes = [str(e.get("note") or "") for e in flux]
+        self.assertNotIn(bruit, notes)
+        self.assertIn("hold: fenêtre opérateur", notes)
+        # la note portée par la transition est rendue avec la transition
+        porte = next(e for e in flux if e["id"] == 6)
+        self.assertEqual(porte["state"], "qa")
+        self.assertEqual(porte["note"], "hold: porte portée par la transition")
+        # le flux ciblé et le journal complet donnent le même hold
+        autorises = {"human:pilote"}
+        self.assertEqual(W.explicit_holds(journal, allowed=autorises),
+                         W.explicit_holds(flux, allowed=autorises))
+        self.assertEqual(W.explicit_holds(flux, allowed=autorises)[1]["since"], 6.0)
+        # sans préfixe, le flux ne porte que les transitions, sans note
+        transitions = SI.Progress.lot_hold_events(Journal(journal), [1], ())
+        self.assertEqual([e["id"] for e in transitions], [1, 2, 6])
+        self.assertTrue(all("note" not in e for e in transitions))
 
 
 class PgTest(PgTestCase):
@@ -340,3 +402,58 @@ class PgTest(PgTestCase):
         work.note(self.db, other["id"], "hold: fenêtre opérateur", actor="mesh-design")
         self.old(other)
         self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+
+    def test_hold_carried_by_a_transition_suppresses_then_the_next_move_lifts(self):
+        """#1664 B2 : un hold porté par une transition (`work move --note`) est
+        lu du flux ciblé ; la transition suivante le lève, comme le journal
+        complet."""
+        self.unbound()
+        lot = self.item("porte portée par une transition")
+        work.move(self.db, lot["id"], "build", note="hold: fenêtre opérateur",
+                  actor="human:pilote")
+        self.old(lot)
+        described = stagnation.describe(self.db, [work.get(self.db, lot["id"])],
+                                        now=self.now)[lot["id"]]
+        self.assertEqual(described["planned_wait"]["what"], "hold")
+        self.assertIsNone(described["stale"])
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now,
+                                 gantt=False)
+        held = {r["id"]: r for r in snap["lots"]}[lot["id"]]
+        self.assertEqual(held["planned_wait"]["what"], "hold")
+        self.assertIsNone(held["stale"])
+        # la transition suivante lève la retenue (build → blocked)
+        work.move(self.db, lot["id"], "blocked", actor="human:pilote")
+        self.old(lot)
+        self.assertIn(lot["id"],
+                      [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+
+    def test_grouped_views_read_the_targeted_stream_never_the_journal(self):
+        """#1664 B2 : avec un hold posé, les vues groupées (alerte, work list,
+        progrès) et le repli `planned_waits.read` lisent le flux ciblé du
+        stockage — jamais le journal complet (contrat #1647 conservé)."""
+        self.unbound()
+        lot = self.item("porte relue sans journal")
+        work.note(self.db, lot["id"], "hold: fenêtre opérateur", actor="human:pilote")
+        work.note(self.db, lot["id"], "triage: relevé de passage", actor="dev7")
+        self.old(lot)
+
+        def interdit(*_args, **_kwargs):
+            raise AssertionError(
+                "le journal complet est relu par une vue groupée (#1647/#1664)")
+
+        with mock.patch.object(Progress, "lot_events", interdit):
+            alertes = stagnation.stagnant_lots(self.db, now=self.now)
+            rows = mesh_cli.work_rows(self.db, limit=50)
+            snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now,
+                                     gantt=False)
+            waits = W.read(self.db, [work.get(self.db, lot["id"])], now=self.now,
+                           open_items=[])
+        self.assertEqual(alertes, [])
+        ligne = next(r for r in rows if int(r["id"]) == lot["id"])
+        self.assertEqual(ligne["planned_wait"]["what"], "hold")
+        self.assertIsNone(ligne["stale"])
+        vue = next(l for l in snap["lots"] if int(l["id"]) == lot["id"])
+        self.assertEqual(vue["planned_wait"]["what"], "hold")
+        self.assertIsNone(vue["stale"])
+        self.assertEqual(waits[lot["id"]]["what"], "hold")

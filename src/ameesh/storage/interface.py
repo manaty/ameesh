@@ -88,8 +88,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    grants          register reserve release live_reservations candidates
                    revoke get
    placements      recorded
-   progress        lots lot_events lot_milestones lot_actions actions agents costs
-                   packages package_items lot_messages
+   progress        lots lot_events lot_transitions lot_event_last lot_hold_events
+                   lot_milestones lot_actions actions agents costs packages
+                   package_items lot_messages
    projects        board
    decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
@@ -2110,6 +2111,21 @@ class Placements(Domain):
 # vue d'avancement (`ameesh progress`, L24) : lectures seules
 # --------------------------------------------------------------------------
 
+def _transitions(events) -> list[dict]:
+    """Lignes où l'état d'un lot change (la première de chaque lot en fait
+    partie), texte des notes écarté : la règle de `lot_transitions`, partagée
+    avec le repli de `lot_hold_events` (#1647, #1664)."""
+    out: list[dict] = []
+    previous: dict[int, str] = {}
+    for ev in events or ():
+        lot = int(ev["work_item_id"])
+        state = ev.get("state")
+        if lot not in previous or previous[lot] != state:
+            out.append({key: value for key, value in ev.items() if key != "note"})
+        previous[lot] = state
+    return out
+
+
 class Progress(Domain):
     """Lectures de la vue d'avancement (décision 0024) : lots et leur
     journal, actions, état des agents et grand livre des coûts. Aucune
@@ -2131,6 +2147,60 @@ class Progress(Domain):
     def lot_events(self, item_ids: Sequence[int]) -> list[dict]:
         """Journal COMPLET des transitions de ces lots (id, work_item_id,
         state, note, actor, created_ts), dans l'ordre d'écriture."""
+
+    def lot_transitions(self, item_ids: Sequence[int]) -> list[dict]:
+        """Transitions SEULES de ces lots (id, work_item_id, state, actor,
+        created_ts), dans l'ordre d'écriture : les lignes qui répètent l'état
+        précédent (notes) sont écartées, et leur texte n'est jamais lu. C'est
+        ce que demandent les vues groupées (`work list`, `progress`,
+        `roadmap`) : le journal complet ne sert qu'au détail d'un lot.
+
+        Lecture DÉRIVÉE (pas une opération du contrat médié) : le stockage
+        peut l'optimiser — agrégation SQL — sans changer ce que reçoit
+        l'appelant ; le repli ci-dessous lit `lot_events`."""
+        return _transitions(self.lot_events(item_ids))
+
+    def lot_event_last(self, item_ids: Sequence[int]) -> list[dict]:
+        """Dernier instant d'événement de chacun de ces lots (work_item_id,
+        last_ts) : l'activité du journal sans en lire les lignes — la borne
+        que `stagnation.last_activity` ajoute aux transitions. Lecture
+        DÉRIVÉE, repli sur `lot_events`."""
+        last: dict[int, float] = {}
+        for ev in self.lot_events(item_ids):
+            lot = int(ev["work_item_id"])
+            ts = ev.get("created_ts")
+            if ts is not None:
+                last[lot] = max(last.get(lot, float("-inf")), float(ts))
+        return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
+
+    def lot_hold_events(self, item_ids: Sequence[int],
+                        prefixes: Sequence[str]) -> list[dict]:
+        """Événements utiles à la lecture des retenues (#1664) : les
+        transitions d'état (une retenue tombe au changement d'état) et les
+        lignes dont la note commence par l'un des préfixes littéraux
+        `prefixes` (notes hold/levée), fusionnées par identifiant et ordonnées
+        comme le journal (`created_ts`, id). Une note portée par une transition
+        est rendue avec elle, et le texte des notes ordinaires n'est jamais lu
+        ni transmis.
+
+        Lecture DÉRIVÉE (pas une opération du contrat médié) : le pilote
+        PostgreSQL ne transfère que ces lignes ; le repli ci-dessous lit
+        `lot_events` une fois."""
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        wanted = tuple(str(prefix).lower() for prefix in prefixes if str(prefix))
+        events = list(self.lot_events(ids))
+        merged: dict[tuple[int, int], dict] = {}
+        for ev in _transitions(events):
+            merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        if wanted:
+            for ev in events:
+                note = str(ev.get("note") or "").strip().lower()
+                if note and note.startswith(wanted):
+                    merged[(int(ev["work_item_id"]), int(ev["id"]))] = dict(ev)
+        return sorted(merged.values(),
+                      key=lambda e: (float(e.get("created_ts") or 0.0), int(e["id"])))
 
     @abc.abstractmethod
     def lot_milestones(self, item_ids: Sequence[int]) -> list[dict]:

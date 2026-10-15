@@ -39,6 +39,16 @@ A lot is stale when it is open and inactive beyond the configured threshold
   not a pilot's and does not defer this alert; the two conventions are
   deliberately separate.
 
+Grouped views (`work list`, `progress --json`, the stale alert, the dependency
+labels) read the hold from a targeted storage stream
+(`Progress.lot_hold_events`: state transitions plus the `hold:`/lift notes,
+merged by event id), never from the full journal: ordinary note text is not
+read or transferred, the event order is preserved, and a state change still
+lifts the hold. A hold written on a transition
+(`ameesh work move <id> <state> --note "hold: …"`) is read with that
+transition. The exact hold/lift patterns remain those of `planned_waits`; the
+storage filter is only a literal-prefix pre-selection.
+
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
 text such as “after #123 merges” do not suppress it. An unresolved package

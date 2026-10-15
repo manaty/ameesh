@@ -509,7 +509,8 @@ def build(db, *, now: float | None = None, project: str | None = None,
         rows = [r for r in rows if project in (r.get("app"), r.get("workstream"))]
     ids = [int(r["id"]) for r in rows]
     events: dict = {}
-    for ev in st.progress.lot_events(ids):
+    # #1647 : les jalons réels ne lisent que les transitions, jamais les notes.
+    for ev in st.progress.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
     actions: dict = {}
     for act in st.progress.lot_actions(ids):

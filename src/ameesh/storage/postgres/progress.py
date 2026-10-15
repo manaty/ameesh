@@ -60,6 +60,57 @@ class Progress(interface.Progress):
             "  FROM work_item_events WHERE work_item_id IN (%s)"
             " ORDER BY id" % _marks(ids), tuple(ids))
 
+    def lot_transitions(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        # Seules les lignes où l'état change sortent : le texte des notes
+        # (des mégaoctets sur une liste de lots) n'est ni lu ni transféré.
+        return self.db.query(
+            "SELECT id, work_item_id, state, actor,"
+            "       extract(epoch from created_at)::float8 AS created_ts"
+            "  FROM (SELECT id, work_item_id, state, actor, created_at,"
+            "               lag(state) OVER (PARTITION BY work_item_id"
+            "                               ORDER BY id) AS prev"
+            "          FROM work_item_events WHERE work_item_id IN (%s)) marked"
+            " WHERE prev IS DISTINCT FROM state"
+            " ORDER BY id" % _marks(ids), tuple(ids))
+
+    def lot_event_last(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        return self.db.query(
+            "SELECT work_item_id,"
+            "       extract(epoch from max(created_at))::float8 AS last_ts"
+            "  FROM work_item_events WHERE work_item_id IN (%s)"
+            " GROUP BY work_item_id" % _marks(ids), tuple(ids))
+
+    def lot_hold_events(self, item_ids, prefixes) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        merged: dict[tuple[int, int], dict] = {}
+        for ev in self.lot_transitions(ids):
+            merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        wanted = [str(prefix).lower() for prefix in prefixes if str(prefix)]
+        if wanted:
+            # #1664 : seules les notes hold/levée sortent (préfixe littéral au
+            # début, espaces ASCII ôtés) : le texte des notes ordinaires (des
+            # mégaoctets sur une liste de lots) n'est ni lu ni transféré.
+            where = " OR ".join(["strpos(lower(btrim(note, E' \\t\\n\\r\\f\\v')), %s) = 1"]
+                                * len(wanted))
+            for ev in self.db.query(
+                    "SELECT id, work_item_id, state, note, actor,"
+                    "       extract(epoch from created_at)::float8 AS created_ts"
+                    "  FROM work_item_events"
+                    " WHERE work_item_id IN (%s) AND note IS NOT NULL AND (%s)"
+                    " ORDER BY id" % (_marks(ids), where),
+                    tuple(ids) + tuple(wanted)):
+                merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
+        return sorted(merged.values(),
+                      key=lambda e: (float(e.get("created_ts") or 0.0), int(e["id"])))
+
     def lot_milestones(self, item_ids) -> list[dict]:
         ids = [int(i) for i in item_ids]
         if not ids:

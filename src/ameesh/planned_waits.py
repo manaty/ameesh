@@ -24,6 +24,11 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 _HOLD = re.compile("^" + re.escape(LotSessions.HOLD_PREFIX), re.I)
 #: les notes de levée explicite ; un changement d'état du lot lève aussi.
 _LIFT = re.compile(r"^(?:unhold|hold\s+(?:lifted|released|cleared))\s*:", re.I)
+#: #1664 : préfixes littéraux donnés au stockage pour la lecture groupée ciblée
+#: (`Progress.lot_hold_events`) — un sur-ensemble de `_HOLD` et `_LIFT`
+#: (« hold » couvre `hold:` et `hold lifted:`…, « unhold » couvre `unhold:`).
+#: Le filtre exact reste ici (`is_hold_note`/`is_lift_note`).
+HOLD_NOTE_PREFIXES = ("hold", "unhold")
 
 
 def is_hold_note(text) -> bool:
@@ -82,6 +87,10 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
 def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     """Les holds posés par un pilote (#1664) — les seuls comptés par la
     stagnation.
+
+    `events` est le flux ciblé lu par le stockage
+    (`Progress.lot_hold_events` : transitions d'état + notes hold/levée), ou
+    un journal complet ; les deux donnent le même hold.
 
     Même autorisation que la correction d'état et la désignation du relecteur
     (`work.corrector`, rôles `work.CORRECTOR_ROLES`) : un humain, ou un agent
@@ -199,8 +208,10 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
          holds=None):
     """Grouped, unbounded truth reads; no query per candidate or dependency.
 
-    `holds` peut être fourni par un appelant qui a déjà lu le journal
-    (`explicit_holds`) : sinon il est lu ici, en une lecture groupée."""
+    `holds` peut être fourni par un appelant qui a déjà lu le flux ciblé
+    (`pilot_holds`) : sinon il est lu ici, en une lecture groupée (#1664) qui
+    ne transfère que les transitions et les notes hold/levée — jamais le
+    journal entier ni le texte des notes ordinaires."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -209,7 +220,7 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     if dependencies is None:
         dependencies = st.work_dependencies.for_items(ids)
     if holds is None:
-        holds = pilot_holds(db, st.progress.lot_events(ids))
+        holds = pilot_holds(db, st.progress.lot_hold_events(ids, HOLD_NOTE_PREFIXES))
     dates = {int(r["id"]): r for r in st.roadmap.item_plans(ids)}
     commitments = st.roadmap.commitments(statuses=["open"])
     packages = (packages if packages is not None else
