@@ -144,7 +144,8 @@ class RoleExecutorTest(PgTestCase):
         self.assertIsNone(cluster())
         proc = self.run_script(self.role)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("may not execute pg_control_system()", proc.stderr)
+        self.assertIn("may not execute pg_control_system()", proc.stderr,
+                      attendu(proc.stderr))
         self.db.execute("GRANT EXECUTE ON FUNCTION %s TO %s" % (
             functions, db_mod.quote_ident(self.role)))
         self.assertEqual(cluster(), own)
