@@ -132,6 +132,7 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 | `overview` | list | (L304) one card per entry of `projects`, same order: `{project, active, lots_open, lots_merged_in_window, agents_active, agents_working, spend_24h_usd, decisions_pending, milestone, warnings}`; `milestone` = the next unreached plan milestone carrying a lot of the project (earliest dated first, undated last) `{id, title, date, progress, lots_merged, lots_total}`, or null |
 | `decisions` | list | (L304) pending decision requests, oldest first, `ameesh-decision/1` items (`ameesh decisions --json`); filtered by `--project` on their `project` |
 | `versions` | object | (L160f, #497) the versions of the products and their next releases, `ameesh-versions/1` schema (see below); `null` never: `--no-versions` leaves it saying why it is empty |
+| `ci_suite` | object | (#1476) the duration of the full CI suite as the watcher saw it, per repository (`ameesh-ci-suite/1`, see below) |
 | `roadmap` | object \| null | (L96) the roadmap, `ameesh-roadmap/1` schema ([EXPLOITATION.md](EXPLOITATION.md), "Feuille de route" (roadmap) section); `null` with `--no-gantt` |
 | `projects` | list | (L62) the per-project view of `ameesh projects` (item schema: `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)); filtered by `--project` on the project name; at the top of the text and the page |
 | `lots` | list | see below, oldest to newest |
@@ -295,6 +296,35 @@ the database. Every datum read from GitHub (`last`, `last_tag`, `release`,
 `notes`) carries `source` and `read_ts`; those read from the database
 (`lots[]`, `merged_lots[]`, `pr`) say `ameesh work items`. The text render
 adds one line: `GitHub (api): read 3 min ago`.
+
+## `ci_suite` (#1476)
+
+How long the full CI suite takes, as the CI watcher (`ci_runs`, L161c) saw
+it: from its first sighting of a `tests.yml` run to the sighting that
+concluded it. GitHub's own creation instant is not kept, and the delay is
+bounded by the `ameesh notify` interval on both sides, so the median is
+right to within one interval.
+
+| Key | Meaning |
+|---|---|
+| `schema` | `"ameesh-ci-suite/1"` |
+| `window_days`, `target_s` | reading window (7 days) and the target the lot is measured against (15 min, #1476) |
+| `repos` | one entry per repository, by name |
+
+A `repos[]` entry: `{repo, runs, median_s, p80_s, last_s, last_concluded_ts,
+priority_runs, priority_median_s}`. Only **concluded** runs count (`success`
+or `failure`; a cancelled or superseded run has no suite duration) in the
+contexts that **guarantee** the full suite: a push or pull request whose
+source or target is `release/**` or `integration/**`, or a manual run
+(`workflow_dispatch`). A push to `main` is left out: an all-documentation
+pushed range takes the L161a fast lane there (the parts are skipped) and
+`ci_runs` keeps neither the plan mode nor the jobs, so counting it would pull
+the median down. The reading is bounded to the 500 most recent concluded runs
+**per repository**. `priority_runs` and `priority_median_s` restrict to the
+#1468 priority pool (`integration/**`, `release/**`): a push on `main` follows
+the merge of a package already validated on its integration branch and is not
+the critical path. The text render shows the median and p80 against the
+target; the page shows the same.
 
 ## `actions[]`
 
