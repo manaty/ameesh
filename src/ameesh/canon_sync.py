@@ -1792,6 +1792,8 @@ class MechanicsSync:
     schema: str = ""
     timezone: str = ""
     cutoffs: list[str] = field(default_factory=list)
+    #: cadence des paquets horaires (#1757) ; liste vide = aucune cadence déclarée
+    packets: list[str] = field(default_factory=list)
     max_in_build: int = 0
     ci: dict = field(default_factory=dict)
     reviews: dict = field(default_factory=dict)
@@ -1801,6 +1803,7 @@ class MechanicsSync:
     def to_dict(self) -> dict:
         out = {"status": self.status, "schema": self.schema,
                "timezone": self.timezone, "cutoffs": list(self.cutoffs),
+               "packets": list(self.packets),
                "max_in_build": self.max_in_build, "ci": dict(self.ci),
                "reviews": dict(self.reviews), "projects": list(self.projects)}
         if self.error:
@@ -1842,6 +1845,7 @@ def sync_mechanics(canon: Canon) -> MechanicsSync:
     done.schema = document.schema
     done.timezone = document.timezone
     done.cutoffs = list(document.cutoffs)
+    done.packets = list(document.packet_cutoffs)
     done.max_in_build = document.max_in_build
     done.ci = {"packet": document.ci_packet,
                "incident_label": document.ci_incident_label}
