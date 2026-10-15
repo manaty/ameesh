@@ -482,3 +482,30 @@ class PgTest(PgTestCase):
         self.assertEqual(vue["planned_wait"]["what"], "hold")
         self.assertIsNone(vue["stale"])
         self.assertEqual(waits[lot["id"]]["what"], "hold")
+
+    def test_targeted_stream_keeps_unicode_holds_and_lifts(self):
+        """Le filtre SQL garde les levées Unicode reconnues par le métier,
+        y compris les blancs de bord des notes de transition historiques."""
+        lot = self.item("porte Unicode")
+        # Déclarés dans le témoin, sans reprendre la constante de production.
+        spaces = "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680" + "".join(
+            chr(c) for c in range(0x2000, 0x200b)) + "\u2028\u2029\u202f\u205f\u3000"
+        notes = [text for s in spaces for text in
+                 (s + "hold: porte" + s, "unhold" + s + ": feu",
+                  "hold" + s + "lifted: feu")]
+        notes += ["hold lİfted: feu", "hold lıfted: feu", "hold releaſed: feu"]
+        self.assertTrue(all(W.is_hold_note(n) or W.is_lift_note(n) for n in notes))
+        bruit = "triage: " + "x" * 5000
+        self.db.execute(
+            "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+            " SELECT %s, 'intake', v.note, 'human:pilote' FROM (VALUES "
+            + ",".join(["(%s)"] * (len(notes) + 1)) + ") v(note)",
+            (lot["id"], *notes, bruit))
+        st = storage.of(self.db).progress
+        journal = st.lot_events([lot["id"]])
+        flux = st.lot_hold_events([lot["id"]], W.HOLD_NOTE_PATTERNS)
+        self.assertEqual([e["note"] for e in flux if "note" in e], notes)
+        faux = mock.Mock(lot_events=mock.Mock(return_value=journal))
+        self.assertEqual(flux, SI.Progress.lot_hold_events(
+            faux, [lot["id"]], W.HOLD_NOTE_PATTERNS))
+        self.assertEqual(W.explicit_holds(journal), W.explicit_holds(flux))

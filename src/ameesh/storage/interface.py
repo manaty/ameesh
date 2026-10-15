@@ -2112,6 +2112,13 @@ class Placements(Domain):
 # vue d'avancement (`ameesh progress`, L24) : lectures seules
 # --------------------------------------------------------------------------
 
+# Blancs de `str.strip`/`re` Unicode, explicites pour le lecteur ARE : sa
+# classe `\s` dépend de la locale et omet notamment l'espace insécable.
+HOLD_NOTE_WHITESPACE = ("\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+                        "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+                        "\u2028\u2029\u202f\u205f\u3000")
+
+
 def _transitions(events) -> list[dict]:
     """Lignes où l'état d'un lot change (la première de chaque lot en fait
     partie), texte des notes écarté : la règle de `lot_transitions`, partagée

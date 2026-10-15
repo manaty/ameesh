@@ -15,7 +15,7 @@ import re
 import time
 
 from . import plan, storage
-from .storage.interface import LotSessions
+from .storage.interface import HOLD_NOTE_WHITESPACE, LotSessions
 
 _LOT = re.compile(r"^(?:(?:task|lot)\s*#?\s*|#)?([0-9]{1,18})$", re.I)
 _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
@@ -23,7 +23,10 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 #: (règle 1, `LotSessions.HOLD_PREFIX`).
 _HOLD = re.compile("^" + re.escape(LotSessions.HOLD_PREFIX), re.I)
 #: les notes de levée explicite ; un changement d'état du lot lève aussi.
-_LIFT = re.compile(r"^(?:unhold|hold\s+(?:lifted|released|cleared))\s*:", re.I)
+_SPACE = "[" + HOLD_NOTE_WHITESPACE + "]"
+# Expliciter aussi les variantes Unicode de IGNORECASE absentes d'ARE.
+_LIFT = re.compile(
+    f"^(?:unhold|hold{_SPACE}+(?:l[iİı]fted|relea[sſ]ed|cleared)){_SPACE}*:", re.I)
 #: #1664 : motifs donnés au stockage pour la lecture groupée ciblée
 #: (`Progress.lot_hold_events`) — exactement `_HOLD` et `_LIFT` (syntaxe `re`
 #: côté repli, ARE côté pilote PostgreSQL) : toutes les notes hold/levée,
