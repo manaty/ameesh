@@ -114,6 +114,7 @@ class Ports(Protocol):
     def ci(self, plan: dict) -> dict: ...
     def authorize(self, plan: dict) -> dict: ...
     def promote(self, plan: dict, fire: dict, epoch: int) -> None: ...
+    def reconcile(self, plan: dict, fire: dict, epoch: int) -> dict: ...
     def quarantine(self, rows: list[dict], reason: str, epoch: int) -> None: ...
     def notify(self, reason: str, state: dict) -> None: ...
 
@@ -272,6 +273,7 @@ class Engine:
                 # Persist intent before the external effect. A lost response
                 # is reconciled; it must never restart the pre-merge path.
                 state["phase"] = "promoting"
+                state["fire"] = copy.deepcopy(fire)
                 state = self._save(state)
                 self.ports.promote(state["plan"], fire, self.epoch)
                 state["phase"] = "landed"
@@ -279,6 +281,11 @@ class Engine:
                 return {"result": "landed", "plan": state["plan"]}
             if state["phase"] == "promoting":
                 if self.ports.target() == state["plan"]["head"]:
+                    receipt = self.ports.reconcile(state["plan"], state["fire"], self.epoch)
+                    if not isinstance(receipt, dict) or receipt.get("state") != "landed" \
+                            or receipt.get("id") != state["fire"].get("id") \
+                            or digest(receipt.get("plan")) != digest(state["plan"]):
+                        raise TrainError("missing exact landed receipt after reconciliation")
                     state["phase"] = "landed"
                     state = self._save(state)
                     return {"result": "landed", "plan": state["plan"]}

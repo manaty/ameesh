@@ -927,6 +927,87 @@ class WorkItems(interface.WorkItems):
                 " RETURNING revision", (json.dumps(document), key, int(revision)))
             return dict(document, revision=int(rows[0]["revision"])) if rows else None
 
+    @staticmethod
+    def _train_fire(rows):
+        if not rows:
+            return None
+        row = dict(rows[0])
+        document = row.pop("document")
+        if isinstance(document, str):
+            document = json.loads(document)
+        return dict(document, **row)
+
+    def train_fire_read(self, key, plan_id) -> dict | None:
+        return self._train_fire(self.db.query(
+            "SELECT id, document, state, changed_by, owner, epoch,"
+            " extract(epoch from created_at)::float8 AS created_ts"
+            " FROM integration_train_fires WHERE target_key = %s AND plan_id = %s"
+            " ORDER BY id DESC LIMIT 1", (key, plan_id)))
+
+    def train_fire_give(self, key, document) -> dict | None:
+        with self.db.transaction() as tx:
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s FOR UPDATE", (key,)):
+                return None
+            # Serialize both a regrant and a plan revision with the claim.
+            rows = tx.query("SELECT document FROM integration_trains WHERE target_key = %s",
+                            (key,))
+            current = rows[0]["document"] if rows else {}
+            if isinstance(current, str):
+                current = json.loads(current)
+            if current.get("plan") != document["plan"] or current.get("phase") not in (
+                    "publishing", "ci-intent", "ci", "ready"):
+                return None
+            ops = WorkItems(tx)
+            old = ops.train_fire_read(key, document["plan"]["id"])
+            if old and old["state"] != "revoked":
+                return None
+            tx.execute("INSERT INTO integration_train_fires"
+                       " (target_key, plan_id, document, state, changed_by)"
+                       " VALUES (%s, %s, %s::jsonb, 'active', %s)",
+                       (key, document["plan"]["id"], json.dumps(document), document["actor"]))
+            return ops.train_fire_read(key, document["plan"]["id"])
+
+    def train_fire_change(self, key, fire_id, state, *, actor, owner=None, epoch=None) -> dict | None:
+        expected = {"revoked": "active", "promoting": "active", "landed": "promoting"}
+        if state not in expected:
+            raise ValueError("train fire transition: revoked | promoting | landed expected")
+        with self.db.transaction() as tx:
+            locks = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                             (key,))
+            if not locks:
+                return None
+            if state != "revoked":
+                if owner is None or epoch is None or locks[0]["owner"] != owner \
+                        or int(locks[0]["epoch"]) != epoch:
+                    return None
+                if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                                " AND expires_at > clock_timestamp()", (key,)):
+                    return None
+            rows = tx.query("SELECT document, owner, epoch FROM integration_train_fires"
+                            " WHERE target_key = %s AND id = %s AND state = %s FOR UPDATE",
+                            (key, int(fire_id), expected[state]))
+            if not rows:
+                return None
+            document = rows[0]["document"]
+            if isinstance(document, str):
+                document = json.loads(document)
+            if state != "revoked":
+                # The engine must have durably entered promoting on this
+                # exact plan, under the same target reservation.
+                if not tx.query("SELECT 1 FROM integration_trains WHERE target_key = %s"
+                                " AND document->>'phase' = 'promoting'"
+                                " AND document->'plan' = %s::jsonb",
+                                (key, json.dumps(document["plan"]))):
+                    return None
+                # A new live holder may finish a previous holder's claim
+                # after observing the exact remote head. It cannot reactivate
+                # the fire or retry the effect; business code supplies that
+                # fresh observation before requesting this transition.
+            tx.execute("UPDATE integration_train_fires SET state = %s, changed_by = %s,"
+                       " owner = %s, epoch = %s, updated_at = clock_timestamp() WHERE id = %s",
+                       (state, actor, owner, epoch, int(fire_id)))
+            return WorkItems(tx).train_fire_read(key, document["plan"]["id"])
+
     def queue(self, target=None) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"

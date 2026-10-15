@@ -1216,6 +1216,31 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def train_fire_read(self, key: str, plan_id: str) -> dict | None:
+        """#1467: latest persisted fire receipt, including withdrawn history."""
+
+    @abc.abstractmethod
+    def train_fire_give(self, key: str, document: dict) -> dict | None:
+        """#1467: append a fire for the current exact persisted plan.
+
+        Locks the target; refuses replacement of an active/claimed fire.
+        Caller authenticates the pilot on a declared role, never history.
+        """
+
+    @abc.abstractmethod
+    def train_fire_change(self, key: str, fire_id: int, state: str, *, actor: str,
+                          owner: str | None = None, epoch: int | None = None) -> dict | None:
+        """#1467: serialized revoke, promotion claim, or completion.
+
+        Claim requires the live train lease and persisted promotion intent.
+        It commits BEFORE any external effect; an uncertain claim never
+        becomes revocable or active again automatically. Completion requires
+        a live holder; a restarted holder first observes the exact remote
+        head in business code. A failed transition returns None.
+        No mediated operation or authority is granted by this interface.
+        """
+
+    @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
         """L160e (0058): the queue rows (of `target`, else every target),
         ranked first, then by arrival."""

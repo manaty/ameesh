@@ -116,15 +116,51 @@ ciblée du lot. Le choix de déploiement attend l'arbitrage demandé au bureau ;
 aucun run supplémentaire n'est imposé implicitement.
 
 Le feu de #1374 à `979f2e2b` porte un lot et son gel. Il ne constitue pas un
-feu machine complet de ce nouveau manifeste. Proposition de raccord : un
-enregistrement structuré contenant source, cible, base, commit, arbre,
-empreinte des membres et des preuves, acteur pilote et identité du feu,
-révocable ; aucune inférence à partir des notes. `authorize` relit ce fait et
-`promote` doit sérialiser la revalidation et le geste avec son retrait. Cela
-réutilise le feu d'un pilote agent et ne crée aucune approbation humaine.
-L'autorité déclarée se vérifie avec les gardes existantes, sans historique de
-délégation comme substitut. Le raccord doit aussi empêcher la voie de feu
-direct de #1374 de contourner la réservation du paquet.
+feu machine complet de ce nouveau manifeste. `train_fire.Fires` implémente
+désormais le reçu structuré du paquet : plan complet, empreinte JSON, acteur
+pilote authentifié et identifiant persistant. Cela couvre source, cible,
+base, commit, arbre, membres ordonnés avec leur génération et preuves. Un
+plan diagnostique, partiel ou modifié est refusé. Les tuples des preuves et
+leur représentation JSON en tableaux ont la même empreinte.
+
+Don et retrait passent par `work.corrector(history=False)`, la garde de rôle
+déclaré et d'identité de session utilisée par #1374. L'acteur du don est
+recontrôlé au moment d'autoriser et avant la promotion ; l'historique des
+attributions ne fournit aucune autorité. Aucun feu ne se déduit d'une note.
+Les reçus sont conservés dans `integration_train_fires`, extension de la
+migration additive réservée 0442 ; un nouveau don après retrait a un autre
+identifiant et ne réactive jamais l'ancien reçu. Les trois opérations de
+stockage ajoutées restent refusées par l'API médiée (total d'interface 391).
+
+Don, retrait et réservation de promotion verrouillent la même ligne cible
+`merge_locks`. Le premier retrait réussi empêche la promotion. Si la
+réservation de promotion gagne, elle exige le bail vivant et l'intention
+persistée `promoting` sur le plan exact ; son état est commis **avant** le
+geste externe. Un retrait arrivé ensuite indique qu'il faut réconcilier : il
+n'annonce jamais un succès pendant un push incertain. Cette réservation
+marque le début de la promotion ; elle n'est pas réactivée après exception,
+crash ou perte de réponse. Un nouvel appel ne rejoue pas le push.
+
+Après réservation, l'adaptateur de promotion doit relire les admissions, la
+CI complète courante et les gardes du dépôt, puis promouvoir le plan exact
+avec `Repository`. Le fournisseur renouvelle et contrôle aussi le bail juste
+avant ce geste. Le moteur conserve le reçu dans son intention de promotion.
+`Fires.reconcile` achève le reçu après redémarrage, sous un nouveau bail
+vivant, si une lecture fraîche prouve la cible sur le commit exact du train.
+Une cible encore sur la base ne suffit pas à prouver l'absence d'un push en
+vol : l'intention reste incertaine. Une cible divergente exige inspection.
+Le moteur ne déclare pas `landed` sans reçu réconcilié sur le plan et l'ID
+du feu exacts. Les raccords de ces validations et de la lecture distante
+restent à faire dans l'adaptateur runtime. Le raccord doit
+aussi empêcher la voie de feu direct de #1374 de contourner la réservation
+du paquet. Aucun CLI, branchement du runner ni profil actif n'est ajouté.
+
+Source du travail indépendant : mesh-design, message #45970 du 15 octobre
+à 04:06 et note du registre #1467 à 04:06, précisant que le hold ne concerne
+que les raccords externes #1465/#1470 ; la préparation du feu continue.
+Mesh-design confirme le schéma et demande les témoins de crash/reprise dans
+son courrier du 15 octobre à 04:14 ; ce cadrage ne vaut ni revue du code ni
+feu d'activation.
 
 ## Raccord des dépôts restant avant gel
 
@@ -198,6 +234,19 @@ Vérification du planificateur réel : les cinq blobs correspondent au contrat,
 et un plan push/integration répartit tous les modules dans quatre parts
 psycopg et six parts psql, sans sélection de lot ni voie doc/version.
 Les trois témoins SQL psql et psycopg du premier point de travail restent
-inchangés. Le prochain raccord dépend des sources exactes #1465 et de #1470 ;
-le fournisseur de feu structuré et sa sérialisation avec le retrait restent
-à implémenter avant gel et branchement au runner.
+inchangés. La passe suivante ajoute les témoins SQL du feu : liaison exacte,
+historique des retraits, ancien reçu, intention préalable, bail périmé,
+course retrait/réservation, crash entre réservation et push, push réussi
+dont la réponse est perdue, reprise sous un nouveau bail et absence de rejeu. Les
+raccords encore nécessaires avant gel sont le fournisseur exact #1465, le
+contrat Nexlink #1470, la vérification locale des sources CI avant push et
+l'adaptateur runtime (validation avant promotion, réconciliation des reçus,
+coordination avec #1374). Les revues et validations requises restent à
+obtenir ; cette préparation ne vaut pas autorisation d'activer le train.
+
+Passe feu/reprise : treize scénarios SQL du feu et trois du stockage sont
+verts avec psql et psycopg, sous `ameesh heavy`. Les tests ciblés
+moteur/Git/CI/historique et le contrat API sont verts (63 à la première
+passe, puis revalidation du moteur et ajout du refus de réconciliation sans
+reçu exact). Le diff est propre. Aucune suite complète ni CI distante n'a
+été lancée ; le lot reste `build`, non gelé.

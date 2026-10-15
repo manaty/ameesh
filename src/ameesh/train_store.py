@@ -8,6 +8,7 @@ from .train import TrainError
 
 class Ledger:
     def __init__(self, db, project, target, owner):
+        self.db = db
         self.ops = storage.of(db).work
         self.key = land.lock_key(project, target)
         # land_lock allows the same owner to restart at a new epoch. A train

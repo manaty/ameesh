@@ -95,6 +95,12 @@ class MemoryPorts:
         self.effects.append(("promote", plan["head"]))
         self.base = plan["head"]
 
+    def reconcile(self, plan, fire, epoch):
+        if self.base != plan["head"]:
+            raise train.TrainError("remote target does not prove promotion")
+        self.effects.append(("reconcile", plan["head"]))
+        return dict(id=fire["id"], state="landed", plan=copy.deepcopy(plan))
+
     def quarantine(self, rows, reason, epoch):
         ids = {r["work_item_id"] for r in rows}
         self.rows = [r for r in self.rows if r["work_item_id"] not in ids]
@@ -244,7 +250,28 @@ class TrainTest(unittest.TestCase):
         with self.assertRaises(OSError):
             engine.step(3601)
         self.assertEqual(self.ports.document["phase"], "promoting")
-        self.assertEqual(engine.step(3602)["result"], "landed")
+        self.assertEqual(self.ports.document["fire"], dict(id=1, head=plan["head"]))
+        self.ports.held = False  # holder died; a new process resumes the intent
+        resumed = train.Engine(self.ports, source=engine.source, target=engine.target,
+                               policy=engine.policy)
+        self.assertEqual(resumed.step(3602)["result"], "landed")
+        self.assertEqual([e[0] for e in self.ports.effects].count("promote"), 1)
+        self.assertEqual([e[0] for e in self.ports.effects].count("reconcile"), 1)
+
+    def test_reconciliation_needs_exact_landed_receipt_before_changing_phase(self):
+        engine = self.make()
+        plan = engine.step(3600)["plan"]
+        self.ports.ci_by_head[plan["head"]] = "green"
+        original = self.ports.promote
+        def lost(plan, fire, epoch):
+            original(plan, fire, epoch)
+            raise OSError("response lost")
+        self.ports.promote = lost
+        with self.assertRaises(OSError):
+            engine.step(3601)
+        self.ports.reconcile = lambda *args: None
+        self.assertEqual(engine.step(3602)["result"], "refused")
+        self.assertEqual(self.ports.document["phase"], "promoting")
         self.assertEqual([e[0] for e in self.ports.effects].count("promote"), 1)
 
     def test_bisect_then_retest_remaining_union(self):
