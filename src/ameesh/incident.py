@@ -16,10 +16,23 @@ Ce module porte la règle seule :
   `multiple` ou `none`, pas un nom ;
 * `open_incident` écrit le lot, **une seule fois** par exécution (identité
   portée par `issue_ref = ci-incident:<repo>:<run_id>`, quel que soit l'état du
-  lot), et **ne lève jamais** : un incident non écrit est rendu, pas propagé.
+  lot), et **ne lève jamais** : un incident non écrit est rendu, pas propagé ;
+* `consume` est le **consommateur de l'événement CI terminal** : il lit la
+  source courante du veilleur (`ci.latest_concluded`) sur la branche
+  d'intégration de chaque dépôt (`INTEGRATION`), ignore une tête remplacée, et
+  ouvre l'incident. L'atterrissage lui est fourni par `lands(repo, head_sha)`
+  (`[{sha, lot, author, summary, files}]`), par défaut `ci.landed_commits` (la
+  comparaison GitHub du client du veilleur). C'est le contrat demandé au train
+  #1467 : le manifeste persisté `integration_trains.plan` nomme les membres du
+  paquet (`work_item_id`, `frozen_sha`), et la comparaison de chaque membre
+  fournit ses fichiers — l'agrégat d'un paquet ne doit jamais accuser un lot du
+  changement d'un autre.
 
-Le relevé Git/API (commits de l'atterrissage, exécution rouge) reste chez
-l'appelant : ce module ne parle ni à GitHub ni au réseau.
+Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
+parle ni à GitHub ni au réseau. Limite connue : deux passages **concurrents**
+(deux hôtes dans la même fenêtre) peuvent ouvrir deux incidents pour la même
+exécution, faute de verrou partagé sur le run ; les passages successifs, eux,
+sont idempotents par `issue_ref`.
 """
 from __future__ import annotations
 
@@ -336,4 +349,80 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
             out["assigned"] = True
         except Exception as exc:  # noqa: BLE001 - l'incident reste dans la file
             out["why"] = "ouvert (auteur %s non assigné : %s)" % (author, type(exc).__name__)
+    return out
+
+
+#: la branche d'intégration de chaque dépôt et le projet correspondant (canon
+#: §11 bis : la suite complète tourne sur la branche d'intégration ; Nexlink
+#: `develop`, ameesh `main`). Un dépôt absent n'est pas surveillé ici.
+INTEGRATION = {
+    "manaty/ameesh": ("main", "ameesh"),
+    "manaty/nexlink": ("develop", "nexlink"),
+}
+
+
+def consume(db, *, integration=None, lands=None, actor: str = work.SYSTEM_SENDER) -> list[dict]:
+    """#1681 : ouvre les incidents des exécutions **terminales rouges** de la
+    branche d'intégration, une seule fois par exécution.
+
+    L'entrée est la source courante du veilleur (`ci.latest_concluded`, le
+    relevé de `ameesh notify`) : par dépôt, branche et workflow, l'exécution
+    conclue la plus récente sur la dernière tête. Une tête remplacée
+    (`ci.head_replaced`) est ignorée — un verdict périmé n'ouvre rien.
+
+    `lands(repo, head_sha)` rend les commits de l'atterrissage
+    (`[{sha, lot, author, summary, files}]`) : par défaut `ci.landed_commits`
+    (comparaison GitHub par le client du veilleur). `integration` remplace la
+    table `INTEGRATION` (`{repo: (branche, projet)}`), pour un hôte qui déclare
+    d'autres dépôts.
+
+    Rend une ligne par exécution examinée, ne lève jamais.
+    """
+    st = storage.of(db)
+    table = dict(integration or INTEGRATION)
+    if lands is None:
+        from . import ci
+        lands = ci.landed_commits
+    out: list[dict] = []
+    for repo, spec in table.items():
+        branch, app = spec if isinstance(spec, tuple) else (spec, "")
+        try:
+            rows = [r for r in st.ci.latest_concluded([branch]) if r.get("repo") == repo]
+        except Exception as exc:  # noqa: BLE001 - un dépôt illisible n'arrête pas les autres
+            out.append({"repo": repo, "branch": branch, "run_id": None, "id": None,
+                        "created": False, "why": "relevé illisible : %s" % type(exc).__name__})
+            continue
+        for row in rows:
+            if row.get("status") != "failure":
+                continue
+            run_id, head_sha = int(row["run_id"]), str(row.get("head_sha") or "")
+            line = {"repo": repo, "branch": branch, "app": app, "run_id": run_id, "id": None,
+                    "created": False, "status": "", "lot": None, "author": "",
+                    "assigned": False, "why": ""}
+            try:
+                if st.ci.head_replaced(repo, branch, head_sha, run_id):
+                    line["why"] = "tête remplacée : verdict périmé, aucun incident"
+                    out.append(line)
+                    continue
+            except Exception:  # noqa: BLE001 - garde indisponible : le relevé courant fait foi
+                pass
+            try:
+                failures = st.ci.failures(repo, run_id)
+            except Exception:  # noqa: BLE001 - sans échecs relevés, l'incident reste dû
+                failures = []
+            commits: list[dict] = []
+            try:
+                commits = list(lands(repo, head_sha))
+            except Exception as exc:  # noqa: BLE001 - sans preuve, aucune accusation
+                line["why"] = "atterrissage illisible : %s" % type(exc).__name__
+            result = open_incident(
+                db, repo=repo, branch=branch, run_id=run_id, head_sha=head_sha,
+                workflow=str(row.get("workflow") or ""), url=str(row.get("url") or ""),
+                modules=[f.get("module") for f in failures],
+                tests=[f.get("test") for f in failures],
+                commits=commits, app=app, actor=actor)
+            line.update(result)
+            if not line["why"]:
+                line["why"] = "ouvert"
+            out.append(line)
     return out

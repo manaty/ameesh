@@ -199,5 +199,164 @@ class TestOuverture(unittest.TestCase):
         self.assertIn("non assigné", out["why"])
 
 
+class _Api:
+    """Un client `gh api` figé : `{chemin: JSON}`, et les chemins appelés."""
+
+    def __init__(self, data):
+        self.data, self.calls = dict(data), []
+
+    def __call__(self, path):
+        self.calls.append(path)
+        if path not in self.data:
+            raise RuntimeError("404 %s" % path)
+        return self.data[path]
+
+
+class TestAtterrissage(unittest.TestCase):
+    """`ci.landed_commits` : les commits de l'atterrissage, lus à l'API."""
+
+    def _head(self, base):
+        return {"parents": [{"sha": base}]}
+
+    def test_un_seul_lot_les_fichiers_de_la_comparaison(self):
+        from ameesh import ci
+        api = _Api({
+            "repos/manaty/nexlink/commits/" + "h" * 40: self._head("b" * 40),
+            "repos/manaty/nexlink/compare/%s...%s" % ("b" * 40, "h" * 40): {
+                "commits": [{"sha": "c" * 40, "author": {"login": "deepseek4"},
+                             "commit": {"message": "feat: adresse\n\nameesh-work: 1598"}}],
+                "files": [{"filename": "mobile/src/a.ts"}]},
+        })
+        out = ci.landed_commits("manaty/nexlink", "h" * 40, api=api)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["lot"], 1598)
+        self.assertEqual(out[0]["author"], "deepseek4")
+        self.assertEqual(out[0]["files"], ["mobile/src/a.ts"])
+
+    def test_paquet_un_candidat_par_lot_et_ses_fichiers(self):
+        from ameesh import ci
+        api = _Api({
+            "repos/manaty/nexlink/commits/" + "h" * 40: self._head("b" * 40),
+            "repos/manaty/nexlink/compare/%s...%s" % ("b" * 40, "h" * 40): {
+                "commits": [{"sha": "c1", "author": {"login": "a1"},
+                             "commit": {"message": "lot 11\n\nameesh-work: 11"}},
+                            {"sha": "c2", "author": {"login": "a2"},
+                             "commit": {"message": "lot 12\n\nameesh-work: 12"}}],
+                "files": [{"filename": "mobile/src/a.ts"}, {"filename": "backend/src/b.ts"}]},
+            "repos/manaty/nexlink/commits/c1": {"files": [{"filename": "mobile/src/a.ts"}]},
+            "repos/manaty/nexlink/commits/c2": {"files": [{"filename": "backend/src/b.ts"}]},
+        })
+        out = ci.landed_commits("manaty/nexlink", "h" * 40, api=api)
+        self.assertEqual([c["lot"] for c in out], [11, 12])
+        self.assertEqual(out[0]["files"], ["mobile/src/a.ts"])
+        self.assertEqual(out[1]["files"], ["backend/src/b.ts"])
+
+    def test_sans_marqueur_un_candidat_sans_lot(self):
+        from ameesh import ci
+        api = _Api({
+            "repos/manaty/nexlink/commits/" + "h" * 40: self._head("b" * 40),
+            "repos/manaty/nexlink/compare/%s...%s" % ("b" * 40, "h" * 40): {
+                "commits": [{"sha": "c" * 40, "author": {"login": "x"},
+                             "commit": {"message": "chore: divers"}}],
+                "files": [{"filename": "mobile/src/a.ts"}]},
+        })
+        out = ci.landed_commits("manaty/nexlink", "h" * 40, api=api)
+        self.assertEqual(len(out), 1)
+        self.assertIsNone(out[0]["lot"])
+        self.assertEqual(out[0]["files"], ["mobile/src/a.ts"])
+
+
+class _CiStore:
+    def __init__(self, rows, failures=None, replaced=False, broken=False):
+        self.rows = list(rows)
+        self.failures_map = dict(failures or {})
+        self.replaced = replaced
+        self.broken = broken
+
+    def latest_concluded(self, branches):
+        if self.broken:
+            raise RuntimeError("base indisponible")
+        return list(self.rows)
+
+    def failures(self, repo, run_id):
+        return list(self.failures_map.get((repo, int(run_id)), []))
+
+    def head_replaced(self, repo, branch, head_sha, run_id):
+        return self.replaced
+
+
+class _Full:
+    """Le magasin : `ci` pour le relevé, `work` pour l'écriture."""
+
+    def __init__(self, ci_store, work_store):
+        self.ci, self.work = ci_store, work_store
+
+
+class TestConsommateur(unittest.TestCase):
+    """`incident.consume` : la source courante, la même tête, une fois."""
+
+    def _run(self, **over):
+        row = {"repo": "manaty/nexlink", "branch": "develop", "run_id": 501,
+               "head_sha": "h" * 40, "workflow": "tests.yml", "status": "failure",
+               "url": "https://exemple/501", "concluded_ts": "2026-10-15T14:00:00Z"}
+        row.update(over)
+        return row
+
+    def _db(self, ci_store, work_store):
+        return mock.patch.object(incident.storage, "of",
+                                 return_value=_Full(ci_store, work_store))
+
+    def test_rouge_designation_et_ouverture(self):
+        store = _Store()
+        lands = lambda repo, sha: [commit("c" * 40, 1598, ["mobile/src/a.ts"])]
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": "mobile/src/a.test.ts",
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9100}), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(), lands=lands)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["status"], "unique")
+        self.assertEqual(out[0]["lot"], 1598)
+        self.assertTrue(out[0]["created"])
+        self.assertEqual(out[0]["id"], 9100)
+        self.assertEqual(out[0]["app"], "nexlink")
+
+    def test_verte_aucun_incident(self):
+        with self._db(_CiStore([self._run(status="success")]), _Store()), \
+                mock.patch.object(incident.work, "add") as add:
+            out = incident.consume(object(), lands=lambda *a: [])
+        self.assertEqual(out, [])
+        add.assert_not_called()
+
+    def test_tete_remplacee_verdict_perime(self):
+        with self._db(_CiStore([self._run()], replaced=True), _Store()), \
+                mock.patch.object(incident.work, "add") as add:
+            out = incident.consume(object(), lands=lambda *a: [])
+        self.assertEqual(len(out), 1)
+        self.assertIn("périmé", out[0]["why"])
+        add.assert_not_called()
+
+    def test_releve_illisible_ne_leve_pas(self):
+        with self._db(_CiStore([], broken=True), _Store()):
+            out = incident.consume(object(), integration={"manaty/nexlink": ("develop", "nexlink")},
+                                   lands=lambda *a: [])
+        self.assertEqual(len(out), 1)
+        self.assertIn("illisible", out[0]["why"])
+
+    def test_un_depot_illisible_n_empeche_pas_l_autre(self):
+        class _Both:
+            ci = _CiStore([], broken=True)
+
+        with mock.patch.object(incident.storage, "of", return_value=_Both()), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9101}), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(object(), integration={"manaty/nexlink": ("develop", "nexlink"),
+                                                          "manaty/ameesh": ("main", "ameesh")},
+                                   lands=lambda *a: [])
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all("illisible" in line["why"] for line in out))
+
+
 if __name__ == "__main__":
     unittest.main()
