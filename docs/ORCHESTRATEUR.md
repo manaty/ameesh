@@ -648,12 +648,41 @@ restée 4 h fusionnée sans être déployée :
    numéro ou demande à l'agent de le faire en premier. Deux fichiers de même numéro dans
    `src/ameesh/migrations` sont refusés par la suite unitaire
    (`tests/test_l122_numeros_de_migration.py`, sans base).
-6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
+6. **Geler le périmètre d'une release à son ouverture** (L750/L756, #561/#566).
+   Quand le lot de release est ouvert, son périmètre se fige à un commit
+   **nommé** de sa cible : `ameesh release open <lot> --base <commit>`. Les
+   fusions de `main` postérieures au gel vont à la release suivante ; seuls les
+   correctifs d'un bloquant de cette release sont cherry-pickés sur
+   `release/x.y`, chacun avec sa propre exécution impactée. La suite **complète**
+   tourne une fois sur la tête gelée — une PR de version seule ne lance rien, et
+   une PR peut n'avoir suivi que le plan impacté. Avant de fusionner la PR de
+   version, `ameesh release check <lot>` refuse une branche dont la base a
+   bougé après le gel (le merge-base avec la cible n'est plus le périmètre) et
+   l'absence d'une exécution de suite complète (poussée ou lancement manuel)
+   verte sur la **tête fraîche** exacte : un commit postérieur au gel (correctif
+   cherry-pické) est certifié lui-même, jamais par la CI de l'ancien gel. La
+   suite complète se **déclare** par ses fichiers de workflow dans
+   `radar.projects.<p>.full_suite` (une identité — le fichier —, jamais un nom
+   d'affichage libre) ; chacun doit avoir tourné sur le commit exact, vert
+   **jobs compris**. Une entrée peut nommer ses jobs requis
+   (`{"path": …, "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des
+   impactés"]}`) : « nom * » couvre une famille de matrice (sinon égalité
+   stricte), un job requis doit exister et être vert, les autres doivent être
+   verts ou sautés (un job sauté par conception, `if:` sur l'événement ou les
+   chemins, ne bloque pas) et un job `tolerate` (`continue-on-error`) ne
+   certifie ni ne bloque. Une entrée réduite au chemin exige **tous** les jobs ;
+   un job illisible ne certifie rien, et le dispatch d'un workflow non déclaré
+   (docs seul) ne compte pas. Un écart
+   délibéré se justifie par `ameesh release reason <lot> --text "…"` ; le
+   périmètre et la raison vivent au journal du lot. La file de fusion applique
+   la même porte au lot de classe release qu'elle traverse
+   (`merge_queue.readiness`).
+7. **Essai à blanc avant toute étiquette de release.** Avant de poser une
    étiquette qui publie (application, installeur, image), le workflow de
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
    cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
    étiquette publiée : on pose la suivante.
-7. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
+8. **Publier chaque version** (L138). Une fois la PR de version fusionnée,
    `deploy/mise-a-jour/poste.sh publier <sha>` pose l'étiquette annotée
    `v<version>` sur ce commit de `main` (le numéro est celui de son
    `pyproject.toml`), la pousse et crée la release GitHub. Les notes viennent

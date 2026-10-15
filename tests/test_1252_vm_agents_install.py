@@ -112,8 +112,9 @@ import json, os, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
+# #1133 : chemin absolu, systemd-run n'étend pas %h
 assert args[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
-                    'EnvironmentFile=%h/.config/ameesh/env', '--'], args
+                    'EnvironmentFile=%s/.config/ameesh/env' % os.environ['HOME'], '--'], args
 with (state / 'systemd-run.log').open('a') as f:
     f.write(' '.join(args) + '\n')
 env = dict(os.environ, **json.loads((state / 'expected-env.json').read_text()))

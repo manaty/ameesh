@@ -834,9 +834,29 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note) -> dict:
+    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
+                      on_frozen=None, after_commit=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
-        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot."""
+        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
+
+        `on_frozen` (facultatif, #1617) : callback appelé **dans la
+        transaction** du jalon, juste après l'INSERT d'un jalon `frozen`, avec
+        `(tx, milestone, after_commit)`. Il écrit dans la même transaction que
+        le jalon — la désignation des relecteurs y dépose sa marque et ses
+        courriers atomiquement — et une exception annule le jalon avec elle.
+        `after_commit` est la liste des écritures de fil différées
+        (`mail.send(..., after_commit=…)`, motif #315) : `add_milestone` ne la
+        vide **pas**, c'est l'appelant qui tient le commit qui la vide après
+        son COMMIT. Sur une connexion racine le `with` commite, l'appelant vide
+        la liste juste après le retour ; dans une transaction déjà ouverte le
+        `with` imbriqué ne commite pas (psql et psycopg), et la vider ici
+        publierait le fil avant le commit externe — un rollback laisserait des
+        traces sans gel ni marque (revue codex cx2, B2). Sans callback ni
+        liste, rien ne change : le gel branché par défaut ne désigne personne.
+        Un `on_frozen` sur un autre kind est refusé."""
+        if on_frozen is not None and kind != "frozen":
+            raise ValueError("on_frozen only makes sense for the `frozen` milestone")
+        threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
@@ -849,7 +869,10 @@ class WorkItems(interface.WorkItems):
                 """,
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
-            return rows[0]
+            milestone = rows[0]
+            if on_frozen is not None:
+                on_frozen(tx, milestone, threads)
+        return milestone
 
     def delays(self, limit, *, ids=None) -> list[dict]:
         if ids is not None:

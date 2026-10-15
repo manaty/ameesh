@@ -235,7 +235,7 @@ class RunsOnTest(unittest.TestCase):
 
     def test_same_expression_on_every_linux_job(self):
         self.assertEqual(set(self.linux), {"plan", "psycopg", "psql", "doc-readers",
-                                           "bilan", "version", "tests"})
+                                           "bilan", "version", "tests", "fs-class"})
         self.assertEqual(len(set(self.linux.values())), 1, self.linux)
         # #987 x #1468 : le job requis tourne sur l'image x64 standard
         # (`macos-26-intel`) ; `macos-latest` (macOS 26 arm64) n'obtenait pas

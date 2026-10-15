@@ -1506,6 +1506,8 @@ def milestone(
     actor: str = "",
     verdict: str | None = None,
     note: str = "",
+    on_frozen=None,
+    after_commit: list | None = None,
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
@@ -1514,6 +1516,16 @@ def milestone(
     `closed` et `delivered` sont écrits automatiquement (transitions et
     fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
     frise.
+
+    `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
+    transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
+    laisse `after_commit` recevoir les écritures de fil différées
+    (`mail.send(..., after_commit=…)`) ; c'est **l'appelant** qui vide la liste
+    après le COMMIT qu'il tient (celui du `with` interne sur une connexion
+    racine, celui de sa propre transaction si l'appel est imbriqué : un `with`
+    imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
+    le raccord de la désignation des relecteurs se branche à l'activation du
+    lot #1617, pas ici.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))
@@ -1527,10 +1539,13 @@ def milestone(
                             % (verdict, ", ".join(VERDICTS)))
     elif verdict is not None:
         raise WorkError("a verdict only makes sense for the `verdict` milestone")
+    if on_frozen is not None and kind != "frozen":
+        raise WorkError("a freeze callback only makes sense for the `frozen` milestone")
     if get(db, item_id) is None:
         raise WorkError("lot %s not found" % item_id)
     return storage.of(db).work.add_milestone(
-        item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip())
+        item_id, kind, sha=sha.strip(), actor=actor, verdict=verdict, note=note.strip(),
+        on_frozen=on_frozen, after_commit=after_commit)
 
 
 def delays(db: Db, limit: int = 200, *, ids: Sequence[int] | None = None) -> list[dict]:
