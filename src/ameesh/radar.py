@@ -251,7 +251,7 @@ def parse_settings(raw) -> Settings:
         if not isinstance(protected, (list, tuple)) or not all(
                 isinstance(p, str) and p.strip() for p in protected):
             raise SettingsError("%s.protected: a list of target globs expected" % where)
-        required = value.get("required_statuses") or {}
+        required = value.get("required_statuses", {})
         if not isinstance(required, dict) or not all(
                 isinstance(g, str) and g.strip() and isinstance(p, str) and p.strip()
                 for g, p in required.items()):

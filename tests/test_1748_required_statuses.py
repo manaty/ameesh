@@ -63,6 +63,15 @@ class SettingsTest(unittest.TestCase):
             with self.subTest(branch=branch):
                 self.assertEqual(radar.required_statuses(PROJECT, branch), ("lot/",))
 
+    def test_falsey_malformed_settings_cannot_disable_required_statuses(self):
+        for bad in ([], "", 0, False, None):
+            with self.subTest(bad=bad), self.assertRaises(radar.SettingsError):
+                radar.parse_settings({"projects": {"p": {
+                    "repo": "/r", "required_statuses": bad}}})
+        for config in ({"repo": "/r"}, {"repo": "/r", "required_statuses": {}}):
+            project = radar.parse_settings({"projects": {"p": config}}).projects["p"]
+            self.assertEqual(project.required_statuses, ())
+
 
 class RollupTest(unittest.TestCase):
     required = ("lot/",)
