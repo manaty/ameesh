@@ -91,32 +91,37 @@ _COMMANDES = {
 #: commandes dont les arguments positionnels sont des identifiants
 _POS_IDENT = frozenset(("pr", "issue", "run", "workflow", "release", "label",
                         "repo", "cache", "api"))
-#: options d'identifiant : leur valeur est consignée si elle en a la forme
+#: options d'identifiant : leur valeur est consignée si elle en a la forme,
+#: pour les commandes de `_POS_IDENT` seulement
 _SURES = frozenset((
     "--repo", "-R", "--branch", "--head", "--base", "-B", "--match-head-commit",
-    "--label", "--add-label", "--remove-label", "--workflow", "--json",
+    "--label", "--add-label", "--remove-label", "--workflow",
     "--method", "-X", "--state", "--limit", "-L", "--status", "--event",
     "--user", "--commit", "--ref", "--job", "--attempt", "--author",
     "--assignee", "--milestone", "--hostname", "--org", "--env", "--name"))
 #: options à valeur libre : leur valeur n'est jamais consignée
 _LIBRES = frozenset((
-    "--body", "-b", "--body-file", "-F", "--title", "-t", "--field", "-f",
+    "--body", "-b", "--json", "--body-file", "-F", "--title", "-t", "--field", "-f",
     "--raw-field", "--header", "-H", "--input", "--jq", "-q", "--template",
     "--message", "-m", "--notes", "--notes-file", "-n", "--search", "-S",
     "--subject", "--env-file", "--app", "-a", "--reviewer", "-r",
     "--add-reviewer", "--remove-reviewer", "--add-assignee",
     "--remove-assignee", "--visibility", "--description", "-d", "--key",
-    "--cache", "--hostname-env", "--target", "--tag", "--discussion-category"))
-#: options sans valeur : l'argument suivant n'est pas leur valeur
+    "--cache", "--target", "--tag", "--discussion-category", "--comment", "-c"))
+#: options sans valeur **dans toutes les sous-commandes** de gh : l'argument
+#: suivant n'est pas leur valeur. Une option booléenne ici, à valeur ailleurs
+#: (`--comment`/`-c` : booléen de `pr review`, texte de `pr close`), n'y est
+#: pas : traitée comme option à valeur, elle masque au pire un argument de
+#: trop, jamais l'inverse. Vérifié contre l'aide de gh 2.100 (224 commandes) :
+#: `-h`, `-i`, `-w` ont une valeur dans certaines sous-commandes, ils n'y sont pas.
 _BOOLS = frozenset((
     "--auto", "--squash", "--merge", "--rebase", "--delete-branch",
-    "--admin", "--disable-auto", "--draft", "--web", "-w", "--yes", "-y",
-    "--force", "--paginate", "--silent", "--include", "-i", "--verbose",
+    "--admin", "--disable-auto", "--draft", "--web", "--yes", "-y",
+    "--force", "--paginate", "--silent", "--include", "--verbose",
     "--exit-status", "--failed", "--log", "--log-failed", "--watch", "--fill",
-    "--fill-first", "--fill-verbose", "--help", "-h", "--no-maintainer-edit",
-    "--approve", "--comment", "-c", "--request-changes", "--close", "--slurp",
-    "--prerelease", "--latest", "--generate-notes", "--verify-tag",
-    "--clobber", "--debug", "--ready", "--undo", "--compact", "--interval-off"))
+    "--fill-first", "--fill-verbose", "--help", "--no-maintainer-edit",
+    "--approve", "--request-changes", "--slurp", "--prerelease",
+    "--generate-notes", "--verify-tag", "--clobber", "--undo"))
 
 
 def _valeur(v):
@@ -127,8 +132,11 @@ def _valeur(v):
 
 def _positionnel(a):
     chemin, q, _ = a.partition("?")
-    v = _valeur(chemin)
-    return v + "?[valeur]" if q and v == chemin else v
+    tete = "/" if chemin.startswith("/") else ""
+    v = tete + _valeur(chemin[len(tete):])
+    if v != chemin:
+        return "[jeton]" if _JETON.search(chemin) else "[valeur]"
+    return v + "?[valeur]" if q else v
 
 
 def _option(a):
@@ -144,10 +152,21 @@ def _option(a):
 
 
 def sanitize_argv(argv):
-    out, mots, attente = [], [], None
+    # Les positionnels ne sont consignés qu'avant la première option : après,
+    # une erreur d'arité (booléen pris pour option à valeur ou l'inverse) ne
+    # peut que masquer davantage, jamais faire passer une valeur pour un
+    # identifiant.
+    out, mots, attente, option_vue = [], [], None, False
+
+    def sure(nom):
+        # une option d'identifiant ne l'est que pour les commandes connues
+        # (`--user` est booléen de `secret set`, `--status` de `codespace`)
+        return nom in _SURES and bool(mots) and mots[0] in _POS_IDENT \
+            and mots[-1] != "[commande]"
+
     for i, a in enumerate(argv):
         if attente is not None:
-            out.append(_valeur(a) if attente in _SURES else "[valeur]")
+            out.append(_valeur(a) if sure(attente) else "[valeur]")
             attente = None
             continue
         if a == "--":
@@ -155,6 +174,7 @@ def sanitize_argv(argv):
             out.extend("[valeur]" for _ in argv[i + 1:])
             break
         if a.startswith("-") and a != "-":
+            option_vue = True
             nom, v = _option(a)
             if nom is None:
                 # booléen ou non, on ne sait pas : plus rien n'est consigné
@@ -162,12 +182,14 @@ def sanitize_argv(argv):
                 out.extend("[valeur]" for _ in argv[i + 1:])
                 break
             if v is not None:
-                out.append(nom + "=" + (_valeur(v) if nom in _SURES else "[valeur]"))
+                out.append(nom + "=" + (_valeur(v) if sure(nom) else "[valeur]"))
             else:
                 out.append(nom)
                 attente = None if nom in _BOOLS else nom
             continue
-        if not mots:
+        if option_vue:
+            out.append("[jeton]" if _JETON.search(a) else "[valeur]")
+        elif not mots:
             mots.append(a if a in _COMMANDES else "[commande]")
             out.append(mots[-1])
         elif len(mots) == 1 and _COMMANDES.get(mots[0]):
