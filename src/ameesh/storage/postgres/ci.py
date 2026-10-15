@@ -9,6 +9,7 @@ from .. import interface
 
 RUN_COLUMNS = """
     repo, run_id, head_sha, branch, event, base, work_item_id, status, superseded_by, url,
+    workflow,
     extract(epoch from first_seen_at)::float8 AS first_seen_ts,
     extract(epoch from concluded_at)::float8 AS concluded_ts,
     urgent_message_id, verdict_message_id
@@ -33,17 +34,20 @@ class CiResults(interface.CiResults):
         return rows[0] if rows else None
 
     def open_run(self, repo, run_id, *, head_sha, branch, event, base, work_item_id,
-                 url) -> dict:
+                 url, workflow="") -> dict:
         rows = self.db.query(
             """
-            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id, url)
-            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
+            INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base, work_item_id,
+                                 url, workflow)
+            VALUES (%%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s, %%s)
             ON CONFLICT (repo, run_id) DO UPDATE
-               SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id)
+               SET work_item_id = coalesce(ci_runs.work_item_id, excluded.work_item_id),
+                   workflow = coalesce(nullif(excluded.workflow, ''), ci_runs.workflow)
             RETURNING %s
             """ % RUN_COLUMNS,
             (repo, int(run_id), head_sha, branch, event or "", base or "main",
-             int(work_item_id) if work_item_id is not None else None, url))
+             int(work_item_id) if work_item_id is not None else None, url,
+             workflow or ""))
         return rows[0]
 
     def running(self, repo) -> list[dict]:
@@ -119,18 +123,21 @@ class CiResults(interface.CiResults):
                 " WHERE repo = %s AND run_id = %s AND part = %s AND test = %s",
                 (int(message_id), repo, int(run_id), part, test))
 
-    def base_failures(self, repo, branch) -> dict:
+    def base_failures(self, repo, branch, *, workflow="") -> dict:
+        # strictement la même suite : les lignes antérieures à la migration
+        # 0433, toutes de `tests.yml`, y sont nommées (#1110, R1 P2-2)
         rows = self.db.query(
             """
             WITH last AS (
                 SELECT run_id, head_sha FROM ci_runs
                  WHERE repo = %s AND branch = %s AND status IN ('success', 'failure')
+                   AND workflow = %s
                  ORDER BY concluded_at DESC, run_id DESC LIMIT 1
             )
             SELECT last.run_id, last.head_sha, f.test
               FROM last LEFT JOIN ci_test_failures f
                 ON f.repo = %s AND f.run_id = last.run_id
-            """, (repo, branch, repo))
+            """, (repo, branch, workflow or "", repo))
         if not rows:
             return {}
         return {"run_id": rows[0]["run_id"], "head_sha": rows[0]["head_sha"],
@@ -156,14 +163,31 @@ class CiResults(interface.CiResults):
             " ORDER BY first_seen_at DESC, run_id DESC LIMIT %%s" % RUN_COLUMNS,
             (int(work_item_id), int(limit)))
 
+    def head_replaced(self, repo, branch, head_sha, run_id) -> bool:
+        rows = self.db.query(
+            """
+            SELECT 1 FROM ci_runs
+             WHERE repo = %s AND branch = %s AND head_sha <> %s AND run_id > %s
+             LIMIT 1
+            """, (repo, branch, head_sha or "", int(run_id)))
+        return bool(rows)
+
     def latest_concluded(self, branches) -> list[dict]:
         if not branches:
             return []
         return self.db.query(
             """
-            SELECT DISTINCT ON (repo, branch) %s
+            WITH current AS (
+                SELECT DISTINCT ON (repo, branch) repo, branch, head_sha
+                  FROM ci_runs
+                 WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
+                   AND status IN ('success', 'failure')
+                 ORDER BY repo, branch, run_id DESC
+            )
+            SELECT DISTINCT ON (repo, branch, workflow) %s
               FROM ci_runs
-             WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
+             WHERE (repo, branch, head_sha) IN
+                   (SELECT repo, branch, head_sha FROM current)
                AND status IN ('success', 'failure')
-             ORDER BY repo, branch, concluded_at DESC, run_id DESC
+             ORDER BY repo, branch, workflow, concluded_at DESC, run_id DESC
             """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
