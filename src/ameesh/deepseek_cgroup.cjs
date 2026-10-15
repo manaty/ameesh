@@ -234,8 +234,9 @@ function installLoader(rejectProvider = false) {
         if (!info) return loaded;
         if (!providerFile(fileURLToPath(url))) return loaded;
         if (rejectProvider) throw new Error('dsh provider is not allowed in a worker thread');
-        if (loaded.format !== 'module') throw new Error('unexpected provider module format');
-        if (loaded.source === null || loaded.source === undefined) throw new Error('provider source is unavailable for verification');
+        // Not the reviewed ESM form (e.g. a CommonJS override): unreviewed too.
+        if (loaded.format !== 'module') throw new Unavailable(`unexpected provider module format at ${info.file}`);
+        if (loaded.source === null || loaded.source === undefined) throw new Unavailable('provider source is unavailable for verification');
         const source = typeof loaded.source === 'string' ? loaded.source : Buffer.from(loaded.source).toString('utf8');
         const hash = verifySource(info, source);
         if (entryURLs.has(url) && hash !== INDEX_HASH) throw new Unavailable('provider export does not select the reviewed runtime entry');

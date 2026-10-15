@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from . import support  # isolate the host's agent environment
-from ameesh import adapters, deepseek_cgroup
+from ameesh import adapters, deepseek_cgroup, harnesses
 from ameesh.runner import AgentWorker
 
 
@@ -137,10 +137,20 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                 "type": "module", "exports": {".": "./index.js"}}))
             (provider / "index.js").write_text('export const ran = "PROVIDER 0.2 RAN";\n')
             (dsh / "lib/bin.mjs").write_text(
+                '#!/usr/bin/env node\n'
                 'const { ran } = await import("@deepseek-ai/dsh-subprocess-local");\n'
                 'console.log(ran, JSON.stringify(process.env.NODE_OPTIONS || ""));\n')
+            (dsh / "lib/bin.mjs").chmod(0o755)
+            # Launched like the runner: the absolute npm link /opt/node/bin/dsh,
+            # here through AMEESH_DSH_BIN; the guard follows it to the package.
+            link = Path(tmp) / "opt/node/bin/dsh"
+            link.parent.mkdir(parents=True)
+            link.symlink_to("../lib/node_modules/@deepseek-ai/dsh/lib/bin.mjs")
+            resolution = adapters.resolve_harness(harnesses.get("deepseek"), bins={}, env={
+                "AMEESH_DSH_BIN": str(link), "PATH": os.environ["PATH"], "AMEESH_HARNESS_SEARCH": ""})
+            self.assertEqual(resolution.path, str(link))
             env = dict(os.environ, NODE_OPTIONS=deepseek_cgroup.node_options("--max-old-space-size=256"))
-            result = subprocess.run([NODE, str(dsh / "lib/bin.mjs")], env=env,
+            result = subprocess.run([resolution.path], env=env,
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, 'PROVIDER 0.2 RAN "--max-old-space-size=256"\n')
@@ -174,6 +184,23 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                 self.assertIn("WARNING: DeepSeek cgroup protection unavailable, running dsh without it", result.stderr)
                 self.assertIn(str(provider / "package.json"), result.stderr)
                 self.assertIn(hashlib.sha256(source.encode()).hexdigest(), result.stderr)
+
+    def test_commonjs_profile_provider_under_hooks_warns_and_runs(self):
+        # #1460: hooks installed, a CommonJS (unreviewed) override is no 127 either.
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "node_modules/@deepseek-ai/dsh-subprocess-local"
+            provider.mkdir(parents=True)
+            (provider / "package.json").write_text(json.dumps({
+                "name": "@deepseek-ai/dsh-subprocess-local", "version": "0.3.0", "main": "index.js"}))
+            (provider / "index.js").write_text('console.log("COMMONJS PROVIDER RAN");\n')
+            entry = Path(tmp) / "entry.cjs"
+            entry.write_text('require("@deepseek-ai/dsh-subprocess-local");\n')
+            code = ("require(" + json.dumps(str(deepseek_cgroup.PRELOAD)) + ").installLoader();"
+                    "require(" + json.dumps(str(entry)) + ");")
+            result = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "COMMONJS PROVIDER RAN\n")
+            self.assertIn("running dsh without it: unexpected provider module format", result.stderr)
 
     def test_preload_path_with_spaces_and_quotes_still_activates(self):
         with tempfile.TemporaryDirectory() as tmp:
