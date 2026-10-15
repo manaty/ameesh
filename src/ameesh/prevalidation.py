@@ -15,10 +15,19 @@ d'agents, jamais sur le poste de l'owner.
 
 La preuve est lue dans la sortie de la VM : le flux `ameesh-test-event/1`
 (événements `fin` par part, modules réellement exécutés = événements `test`)
-et le marqueur de durée. Le rapport porte lot, SHA complet, base, commit de
-carte, modules exécutés, hôte, résultat et durée ; un changement de tête
-pendant la validation l'invalide. Ce rapport n'est pas un verdict : il ne
-remplace aucune relecture (#1617, #1756).
+et le marqueur de durée. Elle est **exhaustive** : chaque part attendue doit
+avoir sa fin verte, chaque module attendu doit avoir été exécuté, et les
+modules du rapport sont ceux réellement vus — jamais ceux du plan.
+
+Le geste lie la tête prouvée à ce qui part sur la VM : `--repo` (ou le cwd)
+désigne l'arbre unique dont les contrats sont lus, dont l'état est vérifié
+(HEAD = `--sha`, aucune modification suivie), qui est photographié par
+l'offload et qui doit transporter le plan (`--plan`, chemin relatif refusé
+hors de l'arbre ou ignoré par git). La tête est relue après le run, en local
+et, si `--published-ref` est nommée, au distant : un mouvement pendant la
+validation invalide le rapport. Le rapport porte lot, SHA complet, base,
+commit de carte, modules exécutés, hôte, résultat et durée ; il n'est pas un
+verdict et ne remplace aucune relecture (#1617, #1756).
 """
 from __future__ import annotations
 
@@ -112,6 +121,11 @@ def _missing(problem: str) -> bool:
             or "illisible" in text or "unreadable" in text)
 
 
+def part_label(part: dict) -> str:
+    """L'étiquette d'une part : celle du marqueur écrit par le script distant."""
+    return "%s:%s" % (part.get("driver"), part.get("part"))
+
+
 @dataclass(frozen=True)
 class Selection:
     """La sélection à exécuter, ou les causes de son refus (`ok` faux).
@@ -134,43 +148,74 @@ class Selection:
         return not self.causes
 
     def proof(self, *, lot: int, host: str, run: dict, flow: dict | None = None,
-              head_after: str = "") -> dict:
+              head_after: str = "", tree: dict | None = None) -> dict:
         """Le rapport de prévalidation, sans effet de verdict.
 
         `run` : `{"outcome", "exit", "seconds"}` ; `flow` : le flux lu
-        (`modules`, `tests`, `fins`). `head_after` : la tête publiée relue
-        après le run ; si elle diffère du SHA validé, le rapport est invalidé
-        (`head-moved`) et ne vaut rien."""
+        (`modules`, `tests`, `fins_par_part`). `head_after` : la tête relue
+        après le run (locale et/ou publiée) ; si elle diffère du SHA validé, le
+        rapport est invalidé (`head-moved`). `tree` : l'état vérifié de l'arbre
+        envoyé (tête observée, propreté), recopié dans le rapport.
+
+        La preuve est **exhaustive** : chaque part attendue doit avoir sa fin
+        verte, chaque module attendu doit avoir été exécuté, et les modules du
+        rapport sont ceux réellement vus — jamais ceux du plan (une preuve ne
+        s'invente pas)."""
         flow = flow or {}
         causes = list(self.causes)
         if head_after and not _same_commit(head_after, self.head):
             causes.append("head-moved")
+        executed = tuple(sorted(str(m) for m in (flow.get("modules") or ())))
+        fins_par_part = flow.get("fins_par_part") or {}
+        planned_parts = tuple(sorted(part_label(p) for p in self.parts))
+        # une part rouge et une part sans fin ne disent pas la même chose :
+        # la première a tourné et échoué, la seconde n'a pas rendu son verdict
+        red = [p for p in planned_parts if fins_par_part.get(p) == "echec"]
+        unfinished = [p for p in planned_parts
+                      if p not in fins_par_part or fins_par_part.get(p) == "interrompu"]
+        missing_modules = [m for m in self.modules if m not in set(executed)]
+        detail: list[str] = []
         outcome = run.get("outcome") or ""
         if causes:
             outcome = "refused"
         elif outcome == "green":
-            fins = list(flow.get("fins") or ())
-            if not fins or any(f != "succes" for f in fins):
-                outcome = "run-incomplete" if any(
-                    f == "interrompu" for f in fins) or not fins else "run-red"
-                causes.append(outcome)
+            if red:
+                outcome = "run-red"
+                causes.append("run-red")
+                detail.append("parts rouges: %s" % ", ".join(red[:4]))
+            elif unfinished:
+                outcome = "run-incomplete"
+                causes.append("run-incomplete")
+                detail.append("parts sans fin verte: %s" % ", ".join(unfinished[:4]))
+            elif missing_modules:
+                outcome = "run-incomplete"
+                causes.append("run-incomplete")
+                detail.append("modules planifiés non exécutés: %s"
+                              % ", ".join(sorted(missing_modules)[:4]))
         else:
             causes.append(outcome)
         unique: list[str] = []
         for cause in causes:
             if cause not in unique:
                 unique.append(cause)
-        return {
+        report = {
             "schema": REPORT_SCHEMA,
             "lot": int(lot), "sha": self.head, "base": self.base,
-            "card": self.card_commit, "modules": sorted(flow.get("modules") or self.modules),
+            "card": self.card_commit,
+            # les modules EXÉCUTÉS seulement : le plan ne remplit jamais la preuve
+            "modules": list(executed),
             "planned": list(self.modules),
+            "missing": sorted(missing_modules),
             "parts": list(flow.get("parts") or ()),
+            "planned_parts": list(planned_parts),
             "tests": flow.get("tests"),
             "host": host, "outcome": outcome,
             "exit": run.get("exit"), "seconds": run.get("seconds"),
-            "causes": unique, "ok": not unique,
+            "causes": unique, "ok": not unique, "detail": detail,
         }
+        if tree is not None:
+            report["tree"] = tree
+        return report
 
 
 def read_plan(path: str) -> dict:
@@ -318,8 +363,7 @@ def remote_script(plan_path: str, parts: Sequence[dict],
         driver = _q(str(part.get("driver")))
         numero = _q(str(part.get("part")))
         fichier = '"$flux/part-%d.jsonl"' % index
-        lignes.append('echo "%s%s:%s"' % (PART_MARK, str(part.get("driver")),
-                                          part.get("part")))
+        lignes.append('echo "%s%s"' % (PART_MARK, part_label(part)))
         lignes.append("%s %s run --plan %s --part %s --driver %s"
                       " --flow %s >/dev/null 2>&1 || ec=$?"
                       % (python, lanceur, _q(plan_path), numero, driver, fichier))
@@ -327,6 +371,66 @@ def remote_script(plan_path: str, parts: Sequence[dict],
     lignes += ["fin=$(date +%s)", 'echo "%s$((fin-debut))"' % SECONDS_MARK,
                "rm -rf \"$flux\"", "exit $ec"]
     return "\n".join(lignes)
+
+
+# --------------------------------------------------------------------------
+# la liaison tête / arbre / plan : ce qui part sur la VM est ce qui est prouvé
+# --------------------------------------------------------------------------
+
+def resolved_head(root: str, *, runner=subprocess.run) -> str:
+    """Le HEAD résolu du dépôt `root` (`""` si git ne peut pas le lire)."""
+    proc = runner(["git", "-C", root, "rev-parse", "HEAD"],
+                  capture_output=True, text=True)
+    if getattr(proc, "returncode", 1):
+        return ""
+    return (getattr(proc, "stdout", "") or "").strip()
+
+
+def snapshot_state(root: str, head: str, *,
+                   runner=subprocess.run) -> tuple[bool, str, str]:
+    """L'arbre envoyé à l'offload est-il exactement la tête `head`, propre ?
+
+    Rend `(ok, cause, tête observée)`. L'offload photographie l'arbre de
+    travail (suivi et non suivi, ignorés exclus) : sans cette garde, le rapport
+    certifierait un SHA que l'arbre envoyé ne porte pas. Toute modification
+    suivie (index ou travail) refuse : la preuve porterait du code non
+    commité."""
+    got = resolved_head(root, runner=runner)
+    if not got:
+        return False, "dépôt illisible (git rev-parse HEAD dans %s)" % root, ""
+    if not _same_commit(got, head):
+        return False, ("arbre à %s, tête annoncée %s"
+                       % (got[:12], (head or "—")[:12])), got
+    proc = runner(["git", "-C", root, "status", "--porcelain", "--untracked-files=no"],
+                  capture_output=True, text=True)
+    if getattr(proc, "returncode", 1):
+        return False, "état du dépôt illisible (git status)", got
+    dirty = (getattr(proc, "stdout", "") or "").strip()
+    if dirty:
+        return False, ("arbre modifié depuis %s: %s"
+                       % (got[:12], dirty.splitlines()[0])), got
+    return True, "", got
+
+
+def remote_plan_path(plan_path: str, root: str, *, runner=subprocess.run) -> str:
+    """Le chemin du plan tel qu'il existe dans l'arbre envoyé à la VM.
+
+    Le script distant s'exécute dans le checkout temporaire : un chemin local
+    absolu n'y existe pas, et un fichier ignoré par git n'est pas transporté.
+    Les deux refusent (`selection-unsafe`) plutôt que de faire tourner autre
+    chose que la sélection annoncée."""
+    absolute = os.path.abspath(plan_path)
+    relative = os.path.relpath(absolute, os.path.abspath(root))
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        raise PrevalidationError("selection-unsafe",
+                                 "plan hors de l'arbre envoyé à la VM: %s" % plan_path)
+    remote = relative.replace(os.sep, "/")
+    proc = runner(["git", "-C", root, "check-ignore", "-q", "--", remote],
+                  capture_output=True, text=True)
+    if getattr(proc, "returncode", 1) == 0:
+        raise PrevalidationError("selection-unsafe",
+                                 "plan ignoré par git, non transporté: %s" % remote)
+    return remote
 
 
 def _q(value: str) -> str:
@@ -428,26 +532,64 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
 # la sélection doit rester dans ce que le canon déclare (#1770)
 # --------------------------------------------------------------------------
 
-def meets_canon(plan: dict, params) -> tuple[bool, str]:
+def contract_modules(paths, repo: str = "") -> tuple[tuple[str, ...], str]:
+    """Les modules que les fichiers de contrat déclarés exigent, dans l'ordre.
+
+    Même forme que `tests/parts/toujours.txt` (un module par ligne, sa raison
+    après `#`, lignes vides et commentaires entiers ignorés). Un fichier
+    déclaré illisible rend la cause : le canon déclare une garantie qu'on ne
+    peut pas relire, donc rien ne se prouve."""
+    modules: list[str] = []
+    for path in paths or ():
+        full = os.path.join(repo, str(path)) if repo else str(path)
+        try:
+            with open(full, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            return (), "contrat déclaré illisible: %s (%s)" % (path, exc)
+        for line in text.splitlines():
+            name = line.split("#", 1)[0].strip()
+            if name and name not in modules:
+                modules.append(name)
+    return tuple(modules), ""
+
+
+def meets_canon(plan: dict, params, repo: str = "") -> tuple[bool, str]:
     """La sélection du plan tient-elle exactement dans le canon ?
 
-    Le canon déclare les classes retenues ; le plan porte la classe de chaque
-    module (`classes`) et la liste des contrats. La sélection doit être
-    exactement `classes déclarées ∪ contrats` : un module en trop serait un
-    élargissement, un module manquant un contrat perdu. Sans classes lisibles,
-    rien ne se prouve : refus."""
+    Le canon déclare les classes retenues et les fichiers de contrat ; le plan
+    porte la classe de chaque module (`classes`) et la liste des contrats qu'il
+    a retenus. La sélection doit être exactement `classes déclarées ∪ contrats`
+    du plan, **et** les contrats ne se déclarent pas tout seuls :
+
+    - tout module listé par un fichier de contrat déclaré doit être exécuté ;
+    - le plan ne peut pas compter comme contrat un module absent de ces
+      fichiers (un contrat inventé n'est pas une garantie du canon).
+
+    Sans classes lisibles, rien ne se prouve : refus."""
     classes = plan.get("classes") if isinstance(plan, dict) else None
     if not isinstance(classes, dict) or not classes:
         return False, "plan sans classes : la sélection ne se prouve pas"
     declared = tuple(getattr(params, "classes", ()) or ())
     if not declared:
         return False, "canon sans classes déclarées"
+    required, problem = contract_modules(getattr(params, "contracts", ()) or (), repo)
+    if problem:
+        return False, problem
     contract = {str(m) for m in (plan.get("contract") or ())}
+    chosen = set(planned_modules(plan))
+    if required:
+        absent = sorted(set(required) - chosen)
+        if absent:
+            return False, "contrats déclarés absents de la sélection: %s" % ", ".join(absent[:3])
+        invented = sorted(contract - set(required))
+        if invented:
+            return False, ("contrats hors des fichiers déclarés: %s"
+                           % ", ".join(invented[:3]))
     expected = {str(m) for m, entry in classes.items()
                 if isinstance(entry, (list, tuple)) and entry
                 and str(entry[0]) in declared}
     expected |= contract
-    chosen = set(planned_modules(plan))
     missing = sorted(expected - chosen)
     extra = sorted(chosen - expected)
     if missing:
@@ -493,29 +635,49 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     allowed, why = host_allowed(name, local=local)
     if not allowed:
         raise PrevalidationError("no-vm", why)
+    # un seul arbre pour tout le geste : contrats lus, état vérifié, snapshot
+    # envoyé, plan embarqué. `--repo` désigne cet arbre ; sans lui, le cwd.
+    root = os.path.abspath(cwd or repo or os.getcwd())
     for path in getattr(params, "contracts", ()) or ():
-        full = os.path.join(repo, str(path)) if repo else str(path)
+        full = os.path.join(root, str(path))
         if not os.path.isfile(full):
             raise PrevalidationError("selection-unsafe",
                                      "contrat déclaré introuvable: %s" % path)
     plan = read_plan(plan_path)
-    within, why = meets_canon(plan, params)
+    within, why = meets_canon(plan, params, root)
     chosen = selection(plan, head=head, base=base, plan_path=plan_path)
     if not chosen.ok:
         raise PrevalidationError(chosen.causes[0], chosen.why)
     if not within:
         raise PrevalidationError("selection-unsafe", why)
+    # ce que l'offload envoie, c'est l'arbre de travail : il doit porter la tête
+    # exacte, sans modification suivie, et le plan doit y être transporté
+    ok_tree, why_tree, tree_head = snapshot_state(root, head, runner=git_runner)
+    if not ok_tree:
+        raise PrevalidationError("head-moved", why_tree)
+    remote_plan = remote_plan_path(plan_path, root, runner=git_runner)
     result = run_offload(name, remote_script(
-        plan_path, chosen.parts,
+        remote_plan, chosen.parts,
         parts_script=getattr(params, "parts_script", None) or ""),
         timeout=int(getattr(params, "timeout_seconds", 0) or 0),
-        cwd=cwd, env=env, runner=runner, executable=executable)
-    after = ""
+        cwd=root, env=env, runner=runner, executable=executable)
+    # la tête est relue APRÈS le run : l'arbre local d'abord (a-t-il bougé
+    # pendant l'exécution ?), la référence publiée ensuite si elle est nommée.
+    # Une relecture impossible ne vaut pas « inchangée » : elle invalide.
+    observed = resolved_head(root, runner=git_runner)
+    after = "" if _same_commit(observed, head) else (observed or "illisible")
     if published_ref:
-        after = published_head(published_ref, repo=repo or ".", remote=remote,
-                               runner=git_runner)
+        remote_head = published_head(published_ref, repo=root, remote=remote,
+                                     runner=git_runner)
+        if not _same_commit(remote_head, head):
+            after = remote_head
+    # le rapport dit ce qui a été vérifié : l'arbre local toujours, la
+    # référence publiée seulement quand l'opérateur l'a nommée
+    tree = {"head": tree_head, "clean": True}
+    if published_ref:
+        tree["published_ref"] = published_ref
     return chosen.proof(lot=lot, host=name, run=result, flow=result.get("flow"),
-                        head_after=after)
+                        head_after=after, tree=tree)
 
 
 def record(conn, report: dict) -> None:
@@ -545,7 +707,8 @@ def add_parsers(work_sub, func) -> None:
     parser.add_argument("--plan", required=True, help="plan L161f (scripts/test-plan.py)")
     parser.add_argument("--host", required=True, help="VM agents (jamais le poste local)")
     parser.add_argument("--base", default="")
-    parser.add_argument("--repo", default="", help="dépôt du lot (contrats, tête publiée)")
+    parser.add_argument("--repo", default="",
+                        help="arbre du lot : contrats, état vérifié, snapshot envoyé")
     parser.add_argument("--canon-repo", default="")
     parser.add_argument("--canon-commit", default="", help="commit exact du canon relu")
     parser.add_argument("--project", default="ameesh")
