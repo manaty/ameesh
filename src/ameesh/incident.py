@@ -9,11 +9,12 @@ désigne l'auteur du lot fautif d'après la **carte d'impact** des tests en
 
 Ce module porte la règle seule :
 
-* `attribute` est **pure** — elle croise les tests en échec (leur module, le
-  chemin du fichier de test) avec les commits candidats de l'atterrissage et
-  leurs fichiers, et rend soit un lot unique (l'accusation), soit plusieurs
-  candidats, soit rien. Jamais d'accusation sans preuve : un doute rend
-  `multiple` ou `none`, pas un nom ;
+* `attribute` est **pure** — elle croise les tests en échec (leur module) avec
+  les commits de l'atterrissage et leurs fichiers, **par les liens qualifiés**
+  du port `test→fichiers` (`links_of` sur la carte mesurée `ameesh-carte/1`) :
+  elle rend un lot candidat unique, plusieurs candidats, ou rien. Sans carte
+  (`links=None`), elle rend `unknown` : rien n'est affirmé. Jamais d'accusation
+  sans preuve — un candidat n'est pas une culpabilité ;
 * `open_incident` écrit le lot, **une seule fois** par exécution (identité
   portée par `issue_ref = ci-incident:<repo>:<run_id>`, quel que soit l'état du
   lot), et **ne lève jamais** : un incident non écrit est rendu, pas propagé ;
@@ -49,19 +50,6 @@ PLACEHOLDERS = (
     "<suite>", "<snapshots>", "<snapshots en échec>", "<hors test>", "<module>",
     "<échec agrégé non rattaché>", "<échec du module>", "<erreurs non rattachées>",
 )
-#: les fichiers d'infrastructure de test d'un paquet : leur changement peut
-#: faire échouer n'importe quelle suite du même paquet
-INFRA = (
-    "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-    "tsconfig.json", "jest.config.js", "jest.config.cjs", "jest.config.mjs",
-    "jest.config.ts", "jest.setup.js", "jest.setup.ts",
-    "vitest.config.ts", "vitest.config.mts", "vitest.config.js",
-)
-#: les fichiers de la racine qui gouvernent tous les paquets
-ROOT_INFRA = ("package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
-              "tsconfig.json", "tsconfig.base.json")
-INFRA_PREFIXES = ("scripts/ci/", ".github/workflows/")
-INFRA_PARTS = ("/__mocks__/", "/test-utils/", "/setupTests.")
 
 
 def ref_of(repo: str, run_id: int) -> str:
@@ -77,65 +65,71 @@ def _norm(path: str) -> str:
     return text.lstrip("/")
 
 
-def _stem(path: str) -> str:
-    """Le nom de fichier sans son extension de test (`.spec`, `.test`)."""
+def _module_key(path: str) -> str:
+    """Le nom de module de test d'un chemin (`tests/test_x.py` -> `test_x`)."""
     name = posixpath.basename(_norm(path))
-    for suffix in (".spec.tsx", ".spec.ts", ".spec.js", ".spec.mjs",
-                   ".test.tsx", ".test.ts", ".test.js", ".test.mjs"):
-        if name.endswith(suffix):
-            return name[: -len(suffix)]
     stem, dot, _ = name.rpartition(".")
     return stem if dot else name
 
 
-def _infra(changed: str, module: str) -> bool:
-    """Le fichier change-t-il l'infrastructure de test du paquet de `module` ?
+def links_of(carte: dict) -> dict:
+    """Le port `liens test→fichiers`, lu dans une carte **mesurée**.
 
-    Un `package.json` de `mobile/` ne peut pas expliquer l'échec d'un test de
-    `backend/` : les fichiers de paquet ne sont reliés qu'au même premier
-    segment de chemin. Les lockfiles et configurations de la racine, eux,
-    gouvernent tous les paquets ; `scripts/ci/**` et les workflows aussi.
+    Inverse une carte `ameesh-carte/1` (`scripts/map.py`) en
+    `{module de test: {fichiers}}` : un fichier est relié au test qui l'a
+    réellement exécuté (`blocs.<fichier>.<bloc>.modules`), lu
+    (`donnees.<fichier>`), ou atteint par une migration qu'il touche
+    (`migrations.<fichier>` -> `tables.<table>`, une migration sans table
+    connue étant reliée à tous les tests — comme la carte).
+
+    Aucun lien n'est déclaré ni deviné : c'est l'adaptateur du port commun
+    demandé par cx3 (#1681), pas un second producteur de carte. Sans carte sur
+    l'hôte, l'appelant passe `links=None` et `attribute` rend `unknown`.
     """
-    path = _norm(changed)
-    if not path:
-        return False
-    base = posixpath.basename(path)
-    same_package = path.split("/")[0] == _norm(module).split("/")[0]
-    if path.startswith(INFRA_PREFIXES):
-        return True
-    if "/" not in path and base in ROOT_INFRA:
-        return True
-    if not same_package:
-        return False
-    if base in INFRA:
-        return True
-    return any(part in "/" + path for part in INFRA_PARTS)
+    liens: dict = {}
+
+    def add(module: str, fichier: str) -> None:
+        module, fichier = (module or "").strip(), _norm(fichier)
+        if module and fichier:
+            liens.setdefault(module, set()).add(fichier)
+
+    for fichier, blocs in (carte.get("blocs") or {}).items():
+        for bloc in (blocs or {}).values():
+            for module in (bloc or {}).get("modules") or ():
+                add(module, fichier)
+    for fichier, modules in (carte.get("donnees") or {}).items():
+        for module in modules or ():
+            add(module, fichier)
+    tables = carte.get("tables") or {}
+    migrations = carte.get("migrations") or {}
+    all_tests = set(liens)
+    for fichier, created in migrations.items():
+        touched = set(created or ())
+        if not touched:
+            modules = all_tests
+        else:
+            modules = set()
+            for table in touched:
+                modules.update(tables.get(table) or ())
+        for module in modules:
+            add(module, fichier)
+    return liens
 
 
-def related(module: str, changed: str) -> bool:
-    """Vrai si le changement de `changed` peut expliquer l'échec de `module`.
-
-    Règle volontairement **étroite** : aucun graphe d'imports ici. Sont
-    reliés le fichier de test lui-même, un fichier de son répertoire ou d'un
-    sous-répertoire, la source du même nom (paire `x.spec.ts` / `x.ts`), et
-    l'infrastructure de test de son paquet. Un lien plus lointain (import
-    indirect) rend `none` et laisse le pilote trancher, plutôt qu'une
-    accusation fausse.
-    """
-    module, changed = _norm(module), _norm(changed)
-    if not module or not changed:
-        return False
-    if module == changed:
-        return True
-    if _infra(changed, module):
-        return True
-    if _stem(module) == _stem(changed):
-        return True
-    directory = posixpath.dirname(module)
-    other = posixpath.dirname(changed)
-    if directory == other:
-        return True
-    return bool(directory) and other.startswith(directory + "/")
+def _link_files(links, module: str):
+    """Les fichiers que `links` relie au module de test, ou None sans port."""
+    if links is None:
+        return None
+    if callable(links):
+        try:
+            files = links(module)
+        except Exception:  # noqa: BLE001 - un port muet ne relie rien
+            return set()
+        return {_norm(f) for f in (files or ())}
+    for key in (module, _norm(module), _module_key(module)):
+        if key in links:
+            return {_norm(f) for f in (links[key] or ())}
+    return set()
 
 
 def attributable(modules: Iterable[str]) -> list[str]:
@@ -158,32 +152,45 @@ def _lot_of(commit: dict) -> Optional[int]:
         return None
 
 
-def attribute(modules: Iterable[str], commits: Iterable[dict]) -> dict:
-    """La carte d'impact : tests en échec × commits candidats -> lot fautif.
+def attribute(modules: Iterable[str], commits: Iterable[dict], links=None) -> dict:
+    """La carte d'impact : tests en échec × commits de l'atterrissage.
 
     `modules` : chemins des fichiers de test en échec (le champ `module` du
     flux CI). `commits` : `[{sha, lot, author, summary, files}]`, les commits
-    de l'atterrissage, chacun avec ses fichiers modifiés.
+    de l'atterrissage, chacun avec ses fichiers modifiés. `links` : le port
+    `test→fichiers` **qualifié** — soit `{module: fichiers}`, soit un appelable
+    `module -> fichiers` ; `links_of(carte)` en construit un depuis la carte
+    mesurée, et `None` signifie « pas de carte sur cet hôte ».
 
     Rend `{status, lot, author, candidates, modules}` où `status` vaut :
 
-    * `unique` — un seul lot désigné (l'accusation, avec ses preuves) ;
-    * `multiple` — plusieurs lots candidats : aucun n'est accusé ;
+    * `unique` — un seul lot **candidat** (jamais une preuve de culpabilité) ;
+    * `multiple` — plusieurs lots candidats : aucun n'est désigné ;
     * `unattributed` — des commits reliés, mais aucun lot identifiable ;
-    * `none` — des fichiers de test en échec, mais aucun commit relié ;
+    * `none` — des liens qualifiés, mais aucun commit relié ;
+    * `unknown` — **aucun lien qualifié disponible** (carte absente) : rien
+      n'est affirmé, pas même un candidat ;
     * `unattributable` — aucun fichier de test exploitable (agrégat, panne).
 
     Un commit sans lot (`lot` absent) reste un candidat sans nom : il ne peut
-    pas fonder une accusation, mais il interdit `unique`.
+    pas fonder une désignation, mais il interdit `unique`.
     """
     mods = attributable(modules)
+    out = {"status": "unattributable", "lot": None, "author": "",
+           "candidates": [], "modules": mods}
+    if not mods:
+        return out
+    if links is None:
+        out["status"] = "unknown"
+        return out
     candidates: list[dict] = []
     for commit in commits or ():
         files = [_norm(f) for f in (commit.get("files") or ())]
         hits: list[dict] = []
         for module in mods:
+            covered = _link_files(links, module) or set()
             for changed in files:
-                if related(module, changed):
+                if changed in covered:
                     hits.append({"module": module, "file": changed})
         if not hits:
             continue
@@ -197,10 +204,7 @@ def attribute(modules: Iterable[str], commits: Iterable[dict]) -> dict:
         })
     lots = {c["lot"] for c in candidates if c["lot"] is not None}
     unnamed = [c for c in candidates if c["lot"] is None]
-    out = {"status": "unattributable", "lot": None, "author": "",
-           "candidates": candidates, "modules": mods}
-    if not mods:
-        return out
+    out["candidates"] = candidates
     if not candidates:
         out["status"] = "none"
         return out
@@ -217,12 +221,12 @@ def attribute(modules: Iterable[str], commits: Iterable[dict]) -> dict:
 
 
 def title_of(*, branch: str, run_id: int, workflow: str = "", attribution: Optional[dict] = None) -> str:
-    """Le titre de l'incident : l'exécution, et le lot désigné s'il est unique."""
+    """Le titre de l'incident : l'exécution, et le lot candidat s'il est unique."""
     where = "%s%s" % (branch or "?", " (%s)" % workflow if workflow else "")
     out = "INCIDENT CI %s rouge — run %s" % (where, int(run_id))
     attribution = attribution or {}
     if attribution.get("status") == "unique" and attribution.get("lot"):
-        out += " — lot #%s désigné" % attribution["lot"]
+        out += " — lot #%s candidat" % attribution["lot"]
     return out
 
 
@@ -243,13 +247,16 @@ def body_of(*, repo: str, branch: str, run_id: int, head_sha: str = "", workflow
         "- Statut de l'attribution : **%s**." % (attribution.get("status") or "?"),
     ]
     if attribution.get("status") == "unique" and attribution.get("lot"):
-        lines.append("- Lot fautif désigné : #%s (auteur %s), par la carte d'impact "
-                     "des tests en échec." % (attribution["lot"], author or "?"))
+        lines.append("- Lot **candidat** : #%s (auteur %s), d'après les liens mesurés "
+                     "test→fichier (`ameesh-carte/1`) — un candidat, pas une preuve de "
+                     "culpabilité." % (attribution["lot"], author or "?"))
     else:
-        lines.append("- Aucun lot n'est accusé : %s."
-                     % {"multiple": "plusieurs candidats",
+        lines.append("- Aucun lot n'est désigné : %s."
+                     % {"multiple": "plusieurs lots candidats, à trancher par le pilote",
                         "unattributed": "des commits reliés, mais aucun lot identifiable",
-                        "none": "aucun commit relié",
+                        "none": "des liens qualifiés, mais aucun commit relié",
+                        "unknown": "carte d'impact absente : aucun lien test→fichier "
+                                   "qualifié sur cet hôte, rien n'est affirmé",
                         "unattributable": "échec non rattaché à un fichier de test"}
                      .get(attribution.get("status"), "attribution incomplète"))
     if mods:
@@ -260,7 +267,7 @@ def body_of(*, repo: str, branch: str, run_id: int, head_sha: str = "", workflow
         lines += ["- %s" % " ".join(str(t).split())[:160] for t in names[:20]]
     candidates = attribution.get("candidates") or []
     if candidates:
-        lines += ["", "Candidats (commits de l'atterrissage reliés) :"]
+        lines += ["", "Candidats (commits de l'atterrissage reliés par la carte) :"]
         for candidate in candidates[:10]:
             lines.append("- `%s` lot %s %s — %s"
                          % ((candidate.get("sha") or "?")[:12],
@@ -272,8 +279,8 @@ def body_of(*, repo: str, branch: str, run_id: int, head_sha: str = "", workflow
         "À faire :",
         "- lot de correction **prioritaire** (§2) : il passe avant tout nouveau travail ;",
         "- reproduire l'échec sur la tête d'atterrissage, corriger à la source, témoin rouge d'abord ;",
-        "- si l'attribution n'est pas unique, le pilote tranche : la carte d'impact est "
-        "dans ce corps, aucun auteur n'est accusé sans preuve.",
+        "- le lot candidat reste un candidat : si l'attribution n'est pas `unique`, ou si "
+        "elle est `unknown`, le pilote tranche ; aucun auteur n'est accusé sans preuve.",
         "",
         "Ouvert une seule fois par exécution (`%s`)." % ref_of(repo, run_id),
     ]
@@ -298,20 +305,22 @@ def _open(ops, ref: str) -> Optional[dict]:
 def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = "",
                   workflow: str = "", url: str = "", modules: Iterable[str] = (),
                   tests: Iterable[str] = (), commits: Iterable[dict] = (), app: str = "",
-                  actor: str = work.SYSTEM_SENDER) -> dict:
+                  links=None, actor: str = work.SYSTEM_SENDER) -> dict:
     """Ouvre l'incident d'une exécution rouge d'atterrissage, s'il n'existe pas.
 
     Rend `{id, created, status, lot, author, assigned, why}` — ne lève jamais.
+    `links` est le port `test→fichiers` qualifié passé à `attribute` : sans
+    lui, le statut est `unknown` et aucun lot n'est désigné.
+
     Le lot est créé `bug` priorité 1, **sans assigné** (une création assignée
-    refuserait un auteur non réveillable et perdrait l'incident), puis
-    l'auteur désigné par une attribution `unique` est assigné si le registre
-    l'accepte ; sinon l'incident reste dans la file de l'équipe et le corps
-    porte le nom.
+    refuserait un auteur non réveillable et perdrait l'incident), puis l'auteur
+    du lot **candidat** (`unique`) est assigné si le registre l'accepte ;
+    sinon l'incident reste dans la file de l'équipe et le corps porte le nom.
     """
     ref = ref_of(repo, run_id)
     out = {"id": None, "created": False, "status": "", "lot": None, "author": "",
            "assigned": False, "why": ""}
-    attribution = attribute(modules, commits)
+    attribution = attribute(modules, commits, links)
     out.update({"status": attribution["status"], "lot": attribution.get("lot"),
                 "author": attribution.get("author") or ""})
     ops = storage.of(db).work
@@ -361,7 +370,8 @@ INTEGRATION = {
 }
 
 
-def consume(db, *, integration=None, lands=None, actor: str = work.SYSTEM_SENDER) -> list[dict]:
+def consume(db, *, integration=None, lands=None, links=None,
+            actor: str = work.SYSTEM_SENDER) -> list[dict]:
     """#1681 : ouvre les incidents des exécutions **terminales rouges** de la
     branche d'intégration, une seule fois par exécution.
 
@@ -374,7 +384,9 @@ def consume(db, *, integration=None, lands=None, actor: str = work.SYSTEM_SENDER
     (`[{sha, lot, author, summary, files}]`) : par défaut `ci.landed_commits`
     (comparaison GitHub par le client du veilleur). `integration` remplace la
     table `INTEGRATION` (`{repo: (branche, projet)}`), pour un hôte qui déclare
-    d'autres dépôts.
+    d'autres dépôts. `links` est le port `test→fichiers` qualifié
+    (`links_of(carte)`) : sans carte sur l'hôte, l'attribution est `unknown` et
+    aucun lot n'est désigné.
 
     Rend une ligne par exécution examinée, ne lève jamais.
     """
@@ -420,7 +432,7 @@ def consume(db, *, integration=None, lands=None, actor: str = work.SYSTEM_SENDER
                 workflow=str(row.get("workflow") or ""), url=str(row.get("url") or ""),
                 modules=[f.get("module") for f in failures],
                 tests=[f.get("test") for f in failures],
-                commits=commits, app=app, actor=actor)
+                commits=commits, app=app, links=links, actor=actor)
             line.update(result)
             if not line["why"]:
                 line["why"] = "ouvert"

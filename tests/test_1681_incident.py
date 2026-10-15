@@ -6,11 +6,13 @@ d'intégration échoue après un atterrissage, l'outil ouvre le lot de correctio
 prioritaire et désigne l'auteur du lot fautif d'après la carte d'impact — sans
 accuser sans preuve.
 
-Témoins : la règle pure (`attribute` : un seul lot, plusieurs candidats, aucun,
-non rattachable), l'identité d'une exécution (`ref_of`), et l'écriture
-(`open_incident`) : une seule fois par exécution, jamais d'exception propagée,
-l'auteur désigné assigné quand le registre l'accepte et le lot rendu à la file
-sinon.
+Témoins : la règle (`attribute` : un seul candidat, plusieurs, aucun, inconnu
+faute de carte), le port des liens mesurés (`links_of` sur une carte
+`ameesh-carte/1`), l'identité d'une exécution (`ref_of`), l'atterrissage lu à
+l'API (`ci.landed_commits`, dont le paquet composé du train), et l'écriture
+(`open_incident`, `consume`) : une seule fois par exécution, jamais d'exception
+propagée, l'auteur du lot candidat assigné quand le registre l'accepte et le
+lot rendu à la file sinon.
 """
 from __future__ import annotations
 
@@ -25,83 +27,138 @@ def commit(sha: str, lot, files, author: str = "deepseek4", summary: str = "trav
 
 
 class TestCarteImpact(unittest.TestCase):
-    """`attribute` : la règle seule, sans réseau ni magasin."""
+    """`attribute` : des liens qualifiés, jamais une preuve de culpabilité."""
 
-    def test_lot_unique_designe(self):
+    MODULE = "mobile/src/features/pages/screens/PageEditScreen.test.tsx"
+    FILE = "mobile/src/features/pages/screens/PageEditScreen.tsx"
+
+    def test_sans_liens_qualifies_inconnu(self):
+        out = incident.attribute([self.MODULE], [commit("a" * 40, 1598, [self.FILE])])
+        self.assertEqual(out["status"], "unknown")
+        self.assertIsNone(out["lot"])
+        self.assertEqual(out["candidates"], [])
+
+    def test_lot_unique_candidat(self):
         out = incident.attribute(
-            ["mobile/src/features/pages/screens/PageEditScreen.test.tsx"],
-            [commit("a" * 40, 1598, ["mobile/src/features/pages/screens/PageEditScreen.tsx"]),
-             commit("b" * 40, 1111, ["backend/src/other/thing.ts"])])
+            [self.MODULE],
+            [commit("a" * 40, 1598, [self.FILE]),
+             commit("b" * 40, 1111, ["backend/src/other/thing.ts"])],
+            links={self.MODULE: [self.FILE]})
         self.assertEqual(out["status"], "unique")
         self.assertEqual(out["lot"], 1598)
         self.assertEqual(out["author"], "deepseek4")
-        self.assertEqual([h["file"] for h in out["candidates"][0]["hits"]],
-                         ["mobile/src/features/pages/screens/PageEditScreen.tsx"])
+        self.assertEqual([h["file"] for h in out["candidates"][0]["hits"]], [self.FILE])
 
-    def test_source_du_meme_nom_dans_un_autre_repertoire(self):
-        self.assertTrue(incident.related("backend/src/a/foo.spec.ts", "backend/src/b/foo.ts"))
-        self.assertFalse(incident.related("backend/src/a/foo.spec.ts", "backend/src/b/bar.ts"))
+    def test_port_appelable(self):
+        seen = []
 
-    def test_infrastructure_du_meme_paquet_seulement(self):
-        self.assertTrue(incident.related("mobile/src/a/b.test.ts", "mobile/package.json"))
-        self.assertFalse(incident.related("mobile/src/a/b.test.ts", "backend/package.json"))
-        self.assertTrue(incident.related("mobile/src/a/b.test.ts", "scripts/ci/related-tests.mjs"))
+        def links(module):
+            seen.append(module)
+            return [self.FILE]
 
-    def test_descente_dans_un_sous_repertoire_du_module(self):
-        self.assertTrue(incident.related("mobile/src/a/b.test.ts", "mobile/src/a/deep/c.ts"))
-        self.assertFalse(incident.related("mobile/src/a/deep/b.test.ts", "mobile/src/a/c.ts"))
+        out = incident.attribute([self.MODULE], [commit("a" * 40, 1598, [self.FILE])],
+                                 links=links)
+        self.assertEqual(out["status"], "unique")
+        self.assertEqual(seen, [self.MODULE])
 
-    def test_plusieurs_candidats_aucune_accusation(self):
+    def test_port_muet_ne_relie_rien(self):
+        def links(module):
+            raise RuntimeError("carte illisible")
+
+        out = incident.attribute([self.MODULE], [commit("a" * 40, 1598, [self.FILE])],
+                                 links=links)
+        self.assertEqual(out["status"], "none")
+
+    def test_plusieurs_candidats_aucune_designation(self):
         out = incident.attribute(
-            ["mobile/src/a/b.test.ts"],
-            [commit("a" * 40, 1598, ["mobile/src/a/b.ts"]),
-             commit("b" * 40, 1600, ["mobile/src/a/c.ts"])])
+            [self.MODULE],
+            [commit("a" * 40, 1598, [self.FILE]),
+             commit("b" * 40, 1600, [self.FILE])],
+            links={self.MODULE: [self.FILE]})
         self.assertEqual(out["status"], "multiple")
         self.assertIsNone(out["lot"])
         self.assertEqual(len(out["candidates"]), 2)
 
-    def test_commit_sans_lot_interdit_l_accusation(self):
+    def test_commit_sans_lot_interdit_la_designation(self):
         out = incident.attribute(
-            ["mobile/src/a/b.test.ts"],
-            [commit("a" * 40, 1598, ["mobile/src/a/b.ts"]),
-             commit("b" * 40, None, ["mobile/src/a/b.ts"])])
+            [self.MODULE],
+            [commit("a" * 40, 1598, [self.FILE]),
+             commit("b" * 40, None, [self.FILE])],
+            links={self.MODULE: [self.FILE]})
         self.assertEqual(out["status"], "multiple")
         self.assertIsNone(out["lot"])
 
-    def test_aucun_commit_relie(self):
-        out = incident.attribute(["mobile/src/a/b.test.ts"], [commit("a" * 40, 1598, ["backend/x.ts"])])
+    def test_lien_sans_commit_relie(self):
+        out = incident.attribute([self.MODULE], [commit("a" * 40, 1598, ["backend/x.ts"])],
+                                 links={self.MODULE: [self.FILE]})
         self.assertEqual(out["status"], "none")
         self.assertIsNone(out["lot"])
 
     def test_commits_relies_sans_lot(self):
-        out = incident.attribute(["mobile/src/a/b.test.ts"], [commit("a" * 40, None, ["mobile/src/a/b.ts"])])
+        out = incident.attribute([self.MODULE], [commit("a" * 40, None, [self.FILE])],
+                                 links={self.MODULE: [self.FILE]})
         self.assertEqual(out["status"], "unattributed")
 
+    def test_module_hors_carte_ne_relie_rien(self):
+        out = incident.attribute([self.MODULE], [commit("a" * 40, 1598, [self.FILE])],
+                                 links={"tests/test_autre.py": [self.FILE]})
+        self.assertEqual(out["status"], "none")
+
     def test_echec_agrege_non_rattachable(self):
-        out = incident.attribute(["<suite>", ""], [commit("a" * 40, 1598, ["mobile/src/a/b.ts"])])
+        out = incident.attribute(["<suite>", ""], [commit("a" * 40, 1598, [self.FILE])],
+                                 links={self.MODULE: [self.FILE]})
         self.assertEqual(out["status"], "unattributable")
         self.assertEqual(out["modules"], [])
 
     def test_modules_dedoublonnes(self):
-        out = incident.attribute(
-            ["mobile/src/a/b.test.ts", "./mobile/src/a/b.test.ts"],
-            [commit("a" * 40, 1598, ["mobile/src/a/b.ts"])])
-        self.assertEqual(out["modules"], ["mobile/src/a/b.test.ts"])
+        out = incident.attribute([self.MODULE, "./" + self.MODULE],
+                                 [commit("a" * 40, 1598, [self.FILE])],
+                                 links={self.MODULE: [self.FILE]})
+        self.assertEqual(out["modules"], [self.MODULE])
         self.assertEqual(len(out["candidates"][0]["hits"]), 1)
 
-    def test_ref_et_titres(self):
+    def test_ref_titres_et_corps(self):
         self.assertEqual(incident.ref_of("manaty/nexlink", 12345),
                          "ci-incident:manaty/nexlink:12345")
         unique = {"status": "unique", "lot": 1598}
-        self.assertIn("lot #1598", incident.title_of(branch="develop", run_id=1, attribution=unique))
+        title = incident.title_of(branch="develop", run_id=1, attribution=unique)
+        self.assertIn("lot #1598 candidat", title)
         body = incident.body_of(repo="manaty/nexlink", branch="develop", run_id=1,
-                                modules=["mobile/src/a/b.test.ts"], tests=["b > échoue"],
+                                modules=[self.MODULE], tests=["b > échoue"],
                                 attribution=unique, author="deepseek4")
         self.assertIn("ci-incident:manaty/nexlink:1", body)
         self.assertIn("prioritaire", body)
-        multiple = incident.body_of(repo="manaty/nexlink", branch="develop", run_id=2,
-                                    modules=["mobile/src/a/b.test.ts"], attribution={"status": "multiple"})
-        self.assertIn("aucun lot n'est accusé".lower(), multiple.lower())
+        self.assertIn("candidat, pas une preuve", body)
+        unknown = incident.body_of(repo="manaty/nexlink", branch="develop", run_id=2,
+                                   modules=[self.MODULE], attribution={"status": "unknown"})
+        self.assertIn("carte d'impact absente", unknown)
+
+
+class TestLiens(unittest.TestCase):
+    """`links_of` : le port test→fichiers, lu dans la carte mesurée."""
+
+    def test_carte_mesuree(self):
+        carte = {
+            "blocs": {"src/ameesh/ci.py": {"<module>": {"modules": ["test_ci"]},
+                                           "main": {"modules": ["test_ci", "test_cli"]}}},
+            "donnees": {"tests/parts/durees.json": ["test_parts"]},
+            "tables": {"ci_runs": ["test_ci"]},
+            "migrations": {"0442_train.sql": ["ci_runs"], "0999_vide.sql": []},
+        }
+        liens = incident.links_of(carte)
+        self.assertEqual(liens["test_ci"],
+                         {"src/ameesh/ci.py", "0442_train.sql", "0999_vide.sql"})
+        self.assertEqual(liens["test_cli"], {"src/ameesh/ci.py", "0999_vide.sql"})
+        self.assertEqual(liens["test_parts"],
+                         {"tests/parts/durees.json", "0999_vide.sql"})
+        # une migration sans table connue est reliée à tous les tests (la carte)
+        self.assertIn("0999_vide.sql", liens["test_parts"])
+
+    def test_cle_de_module(self):
+        carte = {"blocs": {"src/ameesh/ci.py": {"<module>": {"modules": ["test_ci"]}}}}
+        liens = incident.links_of(carte)
+        self.assertEqual(incident._link_files(liens, "tests/test_ci.py"),
+                         {"src/ameesh/ci.py"})
 
 
 class _Store:
@@ -117,86 +174,6 @@ class _Store:
 class _Ops:
     def __init__(self, work_store):
         self.work = work_store
-
-
-class TestOuverture(unittest.TestCase):
-    """`open_incident` : une écriture par exécution, jamais d'exception levée."""
-
-    def _db(self, ops):
-        return mock.patch.object(incident.storage, "of", return_value=ops)
-
-    def test_creation_puis_idempotence(self):
-        store = _Store()
-        created = {"id": 9001}
-        with self._db(_Ops(store)), \
-                mock.patch.object(incident.work, "add", return_value=created) as add, \
-                mock.patch.object(incident.work, "assign") as assign:
-            out = incident.open_incident(
-                object(), repo="manaty/nexlink", branch="develop", run_id=77, app="nexlink",
-                modules=["mobile/src/a/b.test.ts"],
-                commits=[commit("a" * 40, 1598, ["mobile/src/a/b.ts"])])
-            self.assertTrue(out["created"])
-            self.assertEqual(out["id"], 9001)
-            self.assertTrue(out["assigned"])
-            self.assertEqual(add.call_args.kwargs["issue_ref"], "ci-incident:manaty/nexlink:77")
-            self.assertEqual(add.call_args.kwargs["priority"], 1)
-            self.assertIsNone(add.call_args.kwargs.get("assignee"))
-            assign.assert_called_once()
-
-            store.rows.append({"id": 9001, "issue_ref": "ci-incident:manaty/nexlink:77",
-                               "state": "intake"})
-            again = incident.open_incident(
-                object(), repo="manaty/nexlink", branch="develop", run_id=77,
-                modules=["mobile/src/a/b.test.ts"],
-                commits=[commit("a" * 40, 1598, ["mobile/src/a/b.ts"])])
-            self.assertFalse(again["created"])
-            self.assertEqual(again["id"], 9001)
-            self.assertIn("déjà ouvert", again["why"])
-            self.assertEqual(add.call_count, 1)
-
-    def test_echec_d_ecriture_rendu_jamais_leve(self):
-        store = _Store()
-        with self._db(_Ops(store)), \
-                mock.patch.object(incident.work, "add", side_effect=RuntimeError("magasin indisponible")), \
-                mock.patch.object(incident.work, "assign") as assign:
-            out = incident.open_incident(
-                object(), repo="manaty/nexlink", branch="develop", run_id=78,
-                modules=["mobile/src/a/b.test.ts"],
-                commits=[commit("a" * 40, None, ["mobile/src/a/b.ts"])])
-        self.assertIsNone(out["id"])
-        self.assertFalse(out["created"])
-        self.assertIn("non ouvert", out["why"])
-        self.assertEqual(out["status"], "unattributed")
-        assign.assert_not_called()
-
-    def test_course_perdue_rend_le_gagnant(self):
-        store = _Store()
-        winner = {"id": 9002, "issue_ref": "ci-incident:manaty/nexlink:79", "state": "intake"}
-
-        def losing_add(*_a, **_k):
-            store.rows.append(winner)
-            raise RuntimeError("verrou")
-
-        with self._db(_Ops(store)), \
-                mock.patch.object(incident.work, "add", side_effect=losing_add), \
-                mock.patch.object(incident.work, "assign"):
-            out = incident.open_incident(object(), repo="manaty/nexlink", branch="develop", run_id=79)
-        self.assertEqual(out["id"], 9002)
-        self.assertFalse(out["created"])
-        self.assertIn("course perdue", out["why"])
-
-    def test_auteur_non_assignable_le_lot_reste_dans_la_file(self):
-        store = _Store()
-        with self._db(_Ops(store)), \
-                mock.patch.object(incident.work, "add", return_value={"id": 9003}), \
-                mock.patch.object(incident.work, "assign", side_effect=RuntimeError("non réveillable")):
-            out = incident.open_incident(
-                object(), repo="manaty/nexlink", branch="develop", run_id=80,
-                modules=["mobile/src/a/b.test.ts"],
-                commits=[commit("a" * 40, 1598, ["mobile/src/a/b.ts"], author="agent-arrêté")])
-        self.assertTrue(out["created"])
-        self.assertFalse(out["assigned"])
-        self.assertIn("non assigné", out["why"])
 
 
 class _Api:
@@ -265,6 +242,119 @@ class TestAtterrissage(unittest.TestCase):
         self.assertIsNone(out[0]["lot"])
         self.assertEqual(out[0]["files"], ["mobile/src/a.ts"])
 
+    def test_paquet_compose_n_attribue_aucun_fichier(self):
+        from ameesh import ci
+        api = _Api({
+            "repos/manaty/nexlink/commits/" + "h" * 40: {"parents": [{"sha": "b" * 40}]},
+            "repos/manaty/nexlink/compare/%s...%s" % ("b" * 40, "h" * 40): {
+                "commits": [{"sha": "calc", "author": {"login": "train"},
+                             "commit": {"message": "paquet\n\nameesh-work: 11\n\nameesh-work: 12"}}],
+                "files": [{"filename": "mobile/src/a.ts"}, {"filename": "backend/src/b.ts"}]},
+        })
+        out = ci.landed_commits("manaty/nexlink", "h" * 40, api=api)
+        self.assertEqual([c["lot"] for c in out], [11, 12])
+        self.assertEqual([c["files"] for c in out], [[], []])
+        self.assertEqual(incident.attribute(["mobile/src/a.test.ts"], out)["status"], "unknown")
+        self.assertEqual(incident.attribute(["mobile/src/a.test.ts"], out,
+                                            links={"mobile/src/a.test.ts": ["mobile/src/a.ts"]}
+                                            )["status"], "none")
+
+
+class TestOuverture(unittest.TestCase):
+    """`open_incident` : une écriture par exécution, jamais d'exception levée."""
+
+    MODULE = "mobile/src/a/b.test.ts"
+    FILE = "mobile/src/a/b.ts"
+
+    def _db(self, ops):
+        return mock.patch.object(incident.storage, "of", return_value=ops)
+
+    def test_creation_puis_idempotence(self):
+        store = _Store()
+        created = {"id": 9001}
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", return_value=created) as add, \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.open_incident(
+                object(), repo="manaty/nexlink", branch="develop", run_id=77, app="nexlink",
+                modules=[self.MODULE], commits=[commit("a" * 40, 1598, [self.FILE])],
+                links={self.MODULE: [self.FILE]})
+            self.assertTrue(out["created"])
+            self.assertEqual(out["id"], 9001)
+            self.assertTrue(out["assigned"])
+            self.assertEqual(add.call_args.kwargs["issue_ref"], "ci-incident:manaty/nexlink:77")
+            self.assertEqual(add.call_args.kwargs["priority"], 1)
+            self.assertIsNone(add.call_args.kwargs.get("assignee"))
+            assign.assert_called_once()
+
+            store.rows.append({"id": 9001, "issue_ref": "ci-incident:manaty/nexlink:77",
+                               "state": "intake"})
+            again = incident.open_incident(
+                object(), repo="manaty/nexlink", branch="develop", run_id=77,
+                modules=[self.MODULE], commits=[commit("a" * 40, 1598, [self.FILE])],
+                links={self.MODULE: [self.FILE]})
+            self.assertFalse(again["created"])
+            self.assertEqual(again["id"], 9001)
+            self.assertIn("déjà ouvert", again["why"])
+            self.assertEqual(add.call_count, 1)
+
+    def test_sans_carte_aucune_designation(self):
+        store = _Store()
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9004}), \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.open_incident(
+                object(), repo="manaty/nexlink", branch="develop", run_id=81,
+                modules=[self.MODULE], commits=[commit("a" * 40, 1598, [self.FILE])])
+        self.assertEqual(out["status"], "unknown")
+        self.assertIsNone(out["lot"])
+        assign.assert_not_called()
+
+    def test_echec_d_ecriture_rendu_jamais_leve(self):
+        store = _Store()
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", side_effect=RuntimeError("magasin indisponible")), \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.open_incident(
+                object(), repo="manaty/nexlink", branch="develop", run_id=78,
+                modules=[self.MODULE], commits=[commit("a" * 40, None, [self.FILE])],
+                links={self.MODULE: [self.FILE]})
+        self.assertIsNone(out["id"])
+        self.assertFalse(out["created"])
+        self.assertIn("non ouvert", out["why"])
+        self.assertEqual(out["status"], "unattributed")
+        assign.assert_not_called()
+
+    def test_course_perdue_rend_le_gagnant(self):
+        store = _Store()
+        winner = {"id": 9002, "issue_ref": "ci-incident:manaty/nexlink:79", "state": "intake"}
+
+        def losing_add(*_a, **_k):
+            store.rows.append(winner)
+            raise RuntimeError("verrou")
+
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", side_effect=losing_add), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.open_incident(object(), repo="manaty/nexlink", branch="develop", run_id=79)
+        self.assertEqual(out["id"], 9002)
+        self.assertFalse(out["created"])
+        self.assertIn("course perdue", out["why"])
+
+    def test_auteur_non_assignable_le_lot_reste_dans_la_file(self):
+        store = _Store()
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9003}), \
+                mock.patch.object(incident.work, "assign", side_effect=RuntimeError("non réveillable")):
+            out = incident.open_incident(
+                object(), repo="manaty/nexlink", branch="develop", run_id=80,
+                modules=[self.MODULE], commits=[commit("a" * 40, 1598, [self.FILE],
+                                                       author="agent-arrêté")],
+                links={self.MODULE: [self.FILE]})
+        self.assertTrue(out["created"])
+        self.assertFalse(out["assigned"])
+        self.assertIn("non assigné", out["why"])
+
 
 class _CiStore:
     def __init__(self, rows, failures=None, replaced=False, broken=False):
@@ -295,6 +385,10 @@ class _Full:
 class TestConsommateur(unittest.TestCase):
     """`incident.consume` : la source courante, la même tête, une fois."""
 
+    MODULE = "mobile/src/a.test.ts"
+    FILE = "mobile/src/a.ts"
+    LINKS = {MODULE: [FILE]}
+
     def _run(self, **over):
         row = {"repo": "manaty/nexlink", "branch": "develop", "run_id": 501,
                "head_sha": "h" * 40, "workflow": "tests.yml", "status": "failure",
@@ -306,15 +400,15 @@ class TestConsommateur(unittest.TestCase):
         return mock.patch.object(incident.storage, "of",
                                  return_value=_Full(ci_store, work_store))
 
-    def test_rouge_designation_et_ouverture(self):
+    def test_rouge_candidat_et_ouverture(self):
         store = _Store()
-        lands = lambda repo, sha: [commit("c" * 40, 1598, ["mobile/src/a.ts"])]
+        lands = lambda repo, sha: [commit("c" * 40, 1598, [self.FILE])]
         with self._db(_CiStore([self._run()],
-                               {("manaty/nexlink", 501): [{"module": "mobile/src/a.test.ts",
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
                                                            "test": "a > casse"}]}), store), \
                 mock.patch.object(incident.work, "add", return_value={"id": 9100}), \
                 mock.patch.object(incident.work, "assign"):
-            out = incident.consume(object(), lands=lands)
+            out = incident.consume(object(), lands=lands, links=self.LINKS)
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["status"], "unique")
         self.assertEqual(out[0]["lot"], 1598)
@@ -322,17 +416,29 @@ class TestConsommateur(unittest.TestCase):
         self.assertEqual(out[0]["id"], 9100)
         self.assertEqual(out[0]["app"], "nexlink")
 
+    def test_sans_carte_inconnu(self):
+        store = _Store()
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9102}), \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.consume(object(), lands=lambda *a: [commit("c" * 40, 1598, [self.FILE])])
+        self.assertEqual(out[0]["status"], "unknown")
+        self.assertIsNone(out[0]["lot"])
+        assign.assert_not_called()
+
     def test_verte_aucun_incident(self):
         with self._db(_CiStore([self._run(status="success")]), _Store()), \
                 mock.patch.object(incident.work, "add") as add:
-            out = incident.consume(object(), lands=lambda *a: [])
+            out = incident.consume(object(), lands=lambda *a: [], links=self.LINKS)
         self.assertEqual(out, [])
         add.assert_not_called()
 
     def test_tete_remplacee_verdict_perime(self):
         with self._db(_CiStore([self._run()], replaced=True), _Store()), \
                 mock.patch.object(incident.work, "add") as add:
-            out = incident.consume(object(), lands=lambda *a: [])
+            out = incident.consume(object(), lands=lambda *a: [], links=self.LINKS)
         self.assertEqual(len(out), 1)
         self.assertIn("périmé", out[0]["why"])
         add.assert_not_called()
@@ -340,7 +446,7 @@ class TestConsommateur(unittest.TestCase):
     def test_releve_illisible_ne_leve_pas(self):
         with self._db(_CiStore([], broken=True), _Store()):
             out = incident.consume(object(), integration={"manaty/nexlink": ("develop", "nexlink")},
-                                   lands=lambda *a: [])
+                                   lands=lambda *a: [], links=self.LINKS)
         self.assertEqual(len(out), 1)
         self.assertIn("illisible", out[0]["why"])
 
@@ -353,24 +459,9 @@ class TestConsommateur(unittest.TestCase):
                 mock.patch.object(incident.work, "assign"):
             out = incident.consume(object(), integration={"manaty/nexlink": ("develop", "nexlink"),
                                                           "manaty/ameesh": ("main", "ameesh")},
-                                   lands=lambda *a: [])
+                                   lands=lambda *a: [], links=self.LINKS)
         self.assertEqual(len(out), 2)
         self.assertTrue(all("illisible" in line["why"] for line in out))
-
-
-    def test_paquet_compose_n_attribue_aucun_fichier(self):
-        from ameesh import ci
-        api = _Api({
-            "repos/manaty/nexlink/commits/" + "h" * 40: {"parents": [{"sha": "b" * 40}]},
-            "repos/manaty/nexlink/compare/%s...%s" % ("b" * 40, "h" * 40): {
-                "commits": [{"sha": "calc", "author": {"login": "train"},
-                             "commit": {"message": "paquet\n\nameesh-work: 11\n\nameesh-work: 12"}}],
-                "files": [{"filename": "mobile/src/a.ts"}, {"filename": "backend/src/b.ts"}]},
-        })
-        out = ci.landed_commits("manaty/nexlink", "h" * 40, api=api)
-        self.assertEqual([c["lot"] for c in out], [11, 12])
-        self.assertEqual([c["files"] for c in out], [[], []])
-        self.assertEqual(incident.attribute(["mobile/src/a.test.ts"], out)["status"], "none")
 
 
 if __name__ == "__main__":
