@@ -968,6 +968,13 @@ class InstallPilotTest(unittest.TestCase):
         # codex #383 r1 P1: the absolute paths recorded, never /home, /tmp,
         # /work nor the --root of the command line; the last created first
         with tempfile.TemporaryDirectory() as tmp:
+            # #1256 (dev4, 15/10): an agent TMPDIR such as
+            # …/.menage/tmp/<agent>~<id> is rightly refused by the purge guard
+            # (any character outside [A-Za-z0-9/._-]): this fixture cannot be
+            # built there. The guard is not to be relaxed — the test says so
+            # instead of failing on the machine's TMPDIR.
+            if not all(c.isascii() and (c.isalnum() or c in "/._-") for c in tmp):
+                self.skipTest("TMPDIR is not a purgeable path: %s" % tmp)
             made = os.path.join(tmp, "guest")
             for d in ("work", "tmp", "home"):
                 os.makedirs(os.path.join(made, d))
