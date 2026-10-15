@@ -2674,8 +2674,10 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
-        lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
+        son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
+        celle de son paquet ou du parent, sinon son `app`). Les plus
+        anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
+        filtrage des attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def state_lots_activity(self, state: str, limit: int | None) -> list[dict]:
