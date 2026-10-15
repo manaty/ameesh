@@ -205,7 +205,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """La ligne de l'agent, ou None."""
+        """Agent by primary or alias; alias resolutions are durably audited."""
+
+    @abc.abstractmethod
+    def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
+        """Resolve a spelling and audit aliases; unknown names stay unchanged."""
 
     @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:

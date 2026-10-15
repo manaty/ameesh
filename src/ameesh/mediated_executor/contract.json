@@ -111,6 +111,48 @@
    "rules": []
   },
   {
+   "name": "agents.resolve_name",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "aggregate"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {},
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "operation",
+     "kind": "keyword",
+     "schema": {
+      "type": "string"
+     },
+     "required": false,
+     "default": "lookup"
+    }
+   ],
+   "result": {
+    "type": "string"
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "Name resolution grants no authority; every changed spelling is audited."
+   ],
+   "session": true
+  },
+  {
    "name": "agents.cwd_used",
    "write": false,
    "transport": "op",
@@ -3337,7 +3379,7 @@
    },
    "rules": [
     "name = agent du jeton de session",
-    "rendu : {lease_owner, lease_epoch, status, live} (clés du pilote, lues par registry.lease_matches)"
+    "rendu : {name, lease_owner, lease_epoch, status, live} (name = nom primaire résolu ; clés du pilote, lues par registry.lease_matches)"
    ]
   },
   {
@@ -3957,7 +3999,7 @@
   }
  ],
  "refused": {
-  "interface_total": 411,
+  "interface_total": 412,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",

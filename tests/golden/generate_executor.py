@@ -121,7 +121,8 @@ ARGS = {  # op: (args, kwargs, résultat)
                           "end": 4096}, 4096),
  "work.mark_delegate_turn": ([AG, [812], "délégation : tour de inge-front sur le lot"], {}, [812]),
  # session
- "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True}),
+ "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True,
+                             "name": AG}),
  "agents.overview": ([], {}, [{"name": AG, "role": "ingénieur", "team": "ingénieur", "chantier": "site",
                                 "canon_governed": True, "status": "running"},
                                {"name": "coord", "role": "coordinateur", "team": "coordinateur", "chantier": "site",

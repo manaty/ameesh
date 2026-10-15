@@ -396,6 +396,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if dest != "all" and not NAME_RE.match(dest):
         print("invalid recipient", file=sys.stderr)
         return 2
+    from .agent_names import resolve
+    names_db = bk.db if bk.kind == "pg" else None
+    sender = resolve(sender, db=names_db, cfg=cfg, operation="mail.sender")
+    dest = resolve(dest, db=names_db, cfg=cfg, operation="mail.recipient")
+    cc = [resolve(n, db=names_db, cfg=cfg, operation="mail.copy") for n in cc]
     # L125 : les copies — ni au destinataire, ni à soi, sans doublon ; un
     # agent inconnu est refusé avant tout dépôt
     cc = [n for i, n in enumerate(cc) if n not in (dest, sender) and n not in cc[:i]]
@@ -599,6 +604,9 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
                   file=sys.stderr)
             return 1
         name = binding.name
+    if bk.kind != "pg":
+        from .agent_names import resolve
+        name = resolve(name, cfg=cfg, operation="mail.inbox")
     msgs = bk.unread(name)
     verdicts = verdicts_for(bk, msgs)
     for msg in msgs:
@@ -1020,6 +1028,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     event = data.get("hook_event_name") or ""
     try:
         bk, _warning = backend_mod.open_backend(cfg)
+        if bk.kind == "pg":
+            bk.db._agent_primary_names = set()
     except Exception:
         bk = backend_mod.FileBackend(cfg)
     # L'identité vient de l'environnement (le runner la pose), jamais du dossier :
@@ -1794,6 +1804,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "alias":
             return cmd_alias(cfg, rest)
         bk, warning = backend_mod.open_backend(cfg)
+        if bk.kind == "pg":
+            bk.db._agent_primary_names = set()
         if warning:
             print(warning, file=sys.stderr)
         if command == "send":

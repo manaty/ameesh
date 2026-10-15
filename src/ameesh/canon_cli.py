@@ -737,7 +737,12 @@ def _taken_agent_names(canons: list, db) -> set:
     toujours (courrier, fils, lots et sessions continuent de le citer). Les
     alias de #423 s'ajouteront ici quand ils existeront."""
     names = {agent.title for canon in canons if canon.readable for agent in canon.agents}
-    names |= {row["name"] for row in registry.overview(db) if row.get("name")}
+    names |= {alias for c in canons if c.readable for agent in c.agents
+              for alias in (agent.aliases or [])}
+    for row in registry.overview(db):
+        if row.get("name"):
+            names.add(row["name"])
+        names.update(row.get("aliases") or [])
     return names
 
 

@@ -186,6 +186,8 @@ def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
             print(json.dumps({"operation": row,
                               "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
             return 0
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="handoff.agent")
         binding = identity.resolve_binding(cfg, db)
         if not binding.ok or binding.name != args.agent:
             work.corrector(cfg, db)
@@ -1917,6 +1919,8 @@ def cmd_set(cfg: Config, args) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db, defer=True)
+        from .agent_names import resolve
+        args.agent = resolve(args.agent, db=db, operation="settings.permission_mode")
         agent = registry.get(db, args.agent)
         if agent is None:
             print("unknown agent: %s" % args.agent, file=sys.stderr)
