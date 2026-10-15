@@ -73,10 +73,11 @@ témoins unitaires du service couvrent aussi ses connexions et ses réveils.
 
 La limite absolue du probe et son TTL sont des valeurs de test. Une source
 qualifiée doit fournir la limite d'exploitation ; aucune durée métier n'est
-déduite du TTL SQL. Le changement de clé #1374 demande aussi une réconciliation
-explicite des anciens tickets et baux, sans substitution silencieuse. Ces deux
-entrées ont été demandées au pilote le 15 octobre à 16:41. Mesh-design a
-confirmé à 16:45 l'absence de plafond dans le canon `579c64d` et la mécanique
+déduite du TTL SQL. Le changement de clé #1374 demande aussi le drainage
+explicite des anciens tickets et baux, selon le protocole de déploiement
+ci-dessous. Ces deux entrées ont été demandées au pilote le 15 octobre à
+16:41. Mesh-design a confirmé à 16:45 l'absence de plafond dans le canon
+`579c64d` et la mécanique
 candidate `430e65921`, et demandé les sources au bureau et à l'auteur de #1374.
 Le pilote autorise le 15 octobre à 18:14 le port injecté avec refus si la valeur
 manque. Le fournisseur impl07 confirme à 18:18 qu'aucune source adoptée ni
@@ -84,25 +85,57 @@ aucun champ compilé de réservation n'existe ; sa proposition de deux heures
 attend une décision de l'owner et n'est pas consommée ici. Aucun profil actif,
 champ canon, migration de ticket ou source de durée n'est installé.
 
-## Transition des anciennes clés
+## Contrat de déploiement : transition des anciennes clés
 
-Source : note de l'auteur impl08 dans #1374 du 15 octobre à 16:53, transmise
-par mesh-design à 16:58. Les anciennes formes pour ameesh sont
-`ameesh:origin/main`, `ameesh:refs/heads/main` et
-`ameesh:refs/remotes/origin/main` ; la forme canonique est `ameesh:main`.
-Pour Nexlink, les mêmes formes de `develop` convergent vers
-`nexlink:develop`. Les formes observées avec plusieurs préfixes doivent aussi
-être inventoriées : `_remote_branch` ne retire qu'un préfixe.
+Sources : note de l'auteur impl08 dans #1374 du **15 octobre 2026 à 16:53**,
+transmise par mesh-design à 16:58 ; qualification de préparation au journal
+#1467 par mesh-design à **19:05**, confirmée par le courrier **#61892**.
+La qualification porte sur `land.lock_key` à
+`86ebebedb87f9e0634fd7d2b3439edbd261a0a60` et `packet_reservation` à
+`a68f54790f7c3bdb1ed5088544bcf7c54e221b7e`.
+
+| Cible réelle | Clés historiques à inventorier | Clé canonique |
+| --- | --- | --- |
+| ameesh/main | `ameesh:origin/main`, `ameesh:refs/heads/main`, `ameesh:refs/remotes/origin/main` | `ameesh:main` |
+| nexlink/develop | `nexlink:origin/develop`, `nexlink:refs/heads/develop`, `nexlink:refs/remotes/origin/develop` | `nexlink:develop` |
+
+L'inventaire inclut aussi la clé canonique et toute autre forme observée
+pour la même cible réelle. `_remote_branch` retire un seul préfixe :
+`refs/heads/origin/main` devient `origin/main`, pas `main`. La table ne ferme
+donc pas à elle seule l'union des clés à contrôler.
 
 `begin` recalcule la clé, mais `renew` et `observe` conservent le `ticket.key`
 persisté. Un ancien ticket vivant peut donc renouveler une ligne brute pendant
 qu'un écrivain nouveau acquiert la ligne canonique. Une table vide à un relevé
 antérieur ne prouve pas l'exclusion au déploiement.
 
-La bascule doit inventorier les lignes des deux formes et les tickets JSON,
-barrer les nouvelles acquisitions sur l'union des formes pendant le drainage,
-laisser les anciens titulaires terminer ou expirer, puis vérifier l'absence
-d'ancienne ligne vivante **et** d'ancien écrivain capable de réacquérir.
-Aucun ticket vivant n'est renommé : clé, propriétaire et époque restent liés.
-Le relevé de l'auteur (tables vides vers 16:5x) doit être refait au dernier
-geste. Ce contrat n'effectue aucune purge, migration de ticket ni action hôte.
+L'opérateur du déploiement applique le protocole sur chaque cible concernée :
+
+1. Inventorier l'union des clés historiques, canoniques et observées dans les
+   lignes `merge_locks`, les entrées `merge_queue` et les tickets JSON persistés,
+   notamment `integration_trains.document.reservation`. Rapprocher les tickets
+   de leur ligne par `(key, owner, epoch)` et relever les échéances ; inventorier
+   également les anciennes versions encore capables d'acquérir ou renouveler.
+2. Barrer les nouvelles acquisitions sur cette union pendant le drainage.
+   Les anciens titulaires terminent ou expirent sur leur clé d'origine ;
+   une sortie terminale qualifiée d'`observe` libère par l'appel exact
+   `land_unlock(key, owner, epoch)`. Un vert CI conserve la réservation.
+   Le TTL renouvelable n'est pas un délai maximal garanti de drainage.
+3. Juste avant la bascule, sous cette même barrière, refaire l'inventaire et
+   vérifier ensemble l'absence d'ancien ticket/bail vivant et l'absence de
+   tout ancien écrivain capable de réacquérir. Une ligne ancienne avec
+   `owner IS NOT NULL` et `expires_at > clock_timestamp()` reste vivante.
+   Un ticket ou une version non rapprochés ne prouvent pas le drainage.
+4. Basculer seulement lorsque ces deux conditions sont établies, en conservant
+   la barrière jusqu'à ce que les écrivains utilisent la clé canonique.
+   Consigner cible, instant du contrôle, versions des écrivains, inventaire
+   clés/tickets et preuves des deux conditions avec le geste de déploiement.
+
+Les identités `(key, owner, epoch)` des tickets vivants restent immuables :
+aucune purge, aucun renommage et aucun namespace parallèle ne découlent de ce
+contrat. Le relevé vide de l'auteur vers **14:5xZ le 15 octobre** est historique ;
+il ne vaut pas preuve au futur geste et doit être repris par l'opérateur.
+
+Cette condition concerne la transition de version #1374/#1467. La qualification
+de préparation permet de documenter ce protocole ; elle n'atteste ni son
+exécution, ni une activation. Les préparations indépendantes continuent.

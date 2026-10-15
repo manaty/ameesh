@@ -600,8 +600,22 @@ sans suspendre les préparations indépendantes ; impl07, courrier du même jour
 à 18:18, confirme l'absence de limite adoptée et de champ compilé dans le canon
 `579c64dc` ou la mécanique `430e65921`. Sa proposition de deux heures reste à
 décider par l'owner ; elle ne configure pas ce consommateur. La sélection du
-fournisseur et du champ qualifié, le protocole de transition des anciennes
-clés et les autres raccords d'activation demeurent externes à cette préparation.
+fournisseur et du champ qualifié demeure externe à cette préparation.
+
+Le protocole de transition des anciennes clés #1374 est désormais qualifié
+pour préparation par mesh-design au journal #1467 le 15 octobre à 19:05
+(courrier #61892), après lecture de la note impl08 du même jour à 16:53.
+Il est intégré au
+[contrat de déploiement de la réservation](../../../reviews/1467-reservation-port/README.md#contrat-de-déploiement--transition-des-anciennes-clés) :
+inventaire de l'union des clés et des tickets JSON, drainage sous barrière,
+identités des tickets vivants immuables. `begin` recalcule `land.lock_key`,
+mais `renew` et `observe` conservent `ticket.key` ; une nouvelle clé canonique
+n'exclut donc pas un ancien titulaire sur une clé brute. Au dernier geste,
+l'opérateur doit établir à la fois l'absence d'ancien ticket/bail vivant et
+l'impossibilité pour tout ancien écrivain de réacquérir, avant la bascule.
+Le relevé vide du 15 octobre vers 14:5xZ est historique et doit être refait.
+Ce contrat de transition ne fournit aucune purge, aucun renommage ni namespace
+parallèle ; aucune opération DB/hôte ni activation n'a été exécutée ici.
 
 Le raccord événementiel est désormais borné par la qualification du pilote
 du 15 octobre à 18:53 : verdict et conclusion CI émettent leur signal dans
