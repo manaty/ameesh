@@ -2446,7 +2446,8 @@ class WorkflowTest(unittest.TestCase):
         # #1343 (canon §3, home 66) : une poussée sur une PR de LOT ne lance
         # plus rien — la CI part au gel, par l'étiquette `ci-lot-<sha>` /
         # `ci-full-<sha>` posée sur la PR (`pull_request` `types: [labeled]`).
-        # Les poussées main/release/integration gardent la suite complète.
+        # Les poussées main/release gardent la suite complète ; celles
+        # d'integration/** passent par le portier paquet.yml (§12).
         # Le dispatch manuel reste un point d'entrée d'exploitation : hors PR,
         # il ne peut pas satisfaire un check requis de PR ; la porte de gel,
         # elle, n'existe que sur le parcours PR.
@@ -2454,7 +2455,9 @@ class WorkflowTest(unittest.TestCase):
                       '"release/**", "integration/**"]\n', self.text)
         self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
         self.assertIn("\n  workflow_dispatch:\n", self.text)
-        self.assertIn("if: github.event_name == 'pull_request'", self.text)
+        # ancré sur l'étape gel : le `if` du job version ne doit pas suffire.
+        self.assertIn("        id: gel\n        if: github.event_name == 'pull_request'\n",
+                      self.text)
 
     def test_label_gate_exact_frozen_sha_and_composition(self):
         # #1343 : le job plan ne teste que la composition demandée — étiquette
