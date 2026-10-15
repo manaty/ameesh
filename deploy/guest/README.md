@@ -16,6 +16,7 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
 | `ameesh-job-launcher`, `ameesh-job-launcher.py` | the root-owned entry point of a job (L159b2), installed as `/usr/local/lib/ameesh-guest/ameesh-job-launcher` and admitted to the job user by a sudoers rule |
 | `job-postgres.sh` | a throwaway Postgres per job, rootless Podman (`/usr/local/lib/ameesh-guest/job-postgres`) |
 | `profiles/*.json` | what a job gets before its command: dependency cache, variables, hooks (`/etc/ameesh-guest/profiles/`) |
+| `ci-runners.sh`, `ameesh-guest-ci@.service`, `ci-runner-gate.py` | lot #1256: GitHub Actions runners of the guest, for a temporary loan of CI capacity from another project's VM; `--prepare` installs `ci-runner-gate.py` as the unit's `ExecStart`, so the runner obeys the guard's gate; plan and gates in [`PILOT-ci-nexlink.md`](PILOT-ci-nexlink.md) |
 
 ## Owner's steps
 

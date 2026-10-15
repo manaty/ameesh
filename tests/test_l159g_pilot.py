@@ -200,6 +200,30 @@ class InstallPilotTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("`memory_max` required", res.stderr)
 
+    def test_agent_units_widens_the_guard_to_the_ci_units(self):
+        # lot #1256: a host that also lends to GitHub Actions runners passes a
+        # glob that covers both kinds of guest units; the guard stops/starts
+        # them, and the application's own `actions.runner.*` are never matched
+        res = self.dry("--allow-rootfs", "--agent-units", "ameesh-guest-*.service")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('"agent_units": "ameesh-guest-*.service"', res.stdout)
+
+    def test_agent_units_stay_in_the_guest_namespace(self):
+        # #1256 R1 : `*.service` et `*runner*.service` correspondent aussi aux
+        # unités `actions.runner.*` de l'application, que le garde arrête au
+        # SIGKILL ; le motif doit rester dans le namespace de l'invité
+        for pattern in ("actions.runner.*.service", "*.service", "*runner*.service",
+                        "ameesh-guest-runner@*"):
+            with self.subTest(pattern=pattern):
+                res = self.dry("--allow-rootfs", "--agent-units", pattern)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("guest namespace expected", res.stderr)
+        # un motif du namespace invité qui ne vise aucune unité connue est
+        # refusé aussi : un garde qui ne couvre rien ne protège rien
+        res = self.dry("--allow-rootfs", "--agent-units", "ameesh-guest-nothing@*.service")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("matches no guest unit", res.stderr)
+
     def test_a_legacy_offer_the_previous_reader_accepted_installs(self):
         # mesh-design #459 r4c: a refused `disk_paths` and a size the previous
         # reader truncated to <= 0 drop the offer; the guard starts closed and
