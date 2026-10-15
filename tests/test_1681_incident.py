@@ -601,6 +601,100 @@ class TestConsommateur(unittest.TestCase):
         self.assertIsNone(out[0]["lot"])
         assign.assert_not_called()
 
+    def test_port_contextuel_qualifie_la_ligne(self):
+        store = _Store()
+        seen = []
+
+        def links_for(repo, sha):
+            seen.append((repo, sha))
+            return {self.MODULE: [self.FILE]}
+
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9130}), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(
+                object(), lands=lambda *a: [commit("c" * 40, 1598, [self.FILE])],
+                links_for=links_for)
+        self.assertEqual(seen, [("manaty/nexlink", "h" * 40)])
+        self.assertEqual(out[0]["status"], "unique")
+        self.assertEqual(out[0]["lot"], 1598)
+        self.assertEqual(out[0]["links"], "qualifiée (dépôt + tête)")
+
+    def test_port_contextuel_none_ne_reprend_pas_la_carte_globale(self):
+        store = _Store()
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9131}), \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.consume(
+                object(), lands=lambda *a: [commit("c" * 40, 1598, [self.FILE])],
+                links=self.LINKS, links_for=lambda repo, sha: None)
+        self.assertEqual(out[0]["status"], "unknown")
+        self.assertIsNone(out[0]["lot"])
+        self.assertEqual(out[0]["links"], "absente")
+        assign.assert_not_called()
+
+    def test_port_contextuel_illisible_garde_l_incident(self):
+        store = _Store()
+
+        def broken(repo, sha):
+            raise RuntimeError("carte absente")
+
+        with self._db(_CiStore([self._run()],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9132}):
+            out = incident.consume(object(), lands=lambda *a: [], links_for=broken)
+        self.assertEqual(out[0]["links"], "illisible : RuntimeError")
+        self.assertEqual(out[0]["status"], "unknown")
+        self.assertTrue(out[0]["created"])
+
+    def test_port_contextuel_par_depot_et_tete(self):
+        rows = [self._run(), self._run(repo="manaty/ameesh", branch="main", run_id=502,
+                                       head_sha="g" * 40)]
+        store = _Store()
+        seen = []
+
+        def links_for(repo, sha):
+            seen.append((repo, sha))
+            return {self.MODULE: [self.FILE]} if repo == "manaty/nexlink" else None
+
+        failures = {("manaty/nexlink", 501): [{"module": self.MODULE, "test": "a > casse"}],
+                    ("manaty/ameesh", 502): [{"module": self.MODULE, "test": "a > casse"}]}
+        with self._db(_CiStore(rows, failures), store), \
+                mock.patch.object(incident.work, "add",
+                                  side_effect=[{"id": 9133}, {"id": 9134}]), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.consume(
+                object(), lands=lambda *a: [commit("c" * 40, 1598, [self.FILE])],
+                links_for=links_for)
+        self.assertEqual(sorted(seen), sorted([("manaty/nexlink", "h" * 40),
+                                               ("manaty/ameesh", "g" * 40)]))
+        self.assertEqual({line["repo"]: line["status"] for line in out},
+                         {"manaty/nexlink": "unique", "manaty/ameesh": "unknown"})
+        self.assertEqual({line["repo"]: line["links"] for line in out},
+                         {"manaty/nexlink": "qualifiée (dépôt + tête)",
+                          "manaty/ameesh": "absente"})
+
+    def test_port_contextuel_sans_tete_observee_non_appele(self):
+        store = _Store()
+        called = []
+        with self._db(_CiStore([self._run(head_sha="")],
+                               {("manaty/nexlink", 501): [{"module": self.MODULE,
+                                                           "test": "a > casse"}]}), store), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9135}), \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.consume(
+                object(), lands=lambda *a: [], links=self.LINKS,
+                links_for=lambda repo, sha: called.append((repo, sha)))
+        self.assertEqual(called, [])
+        self.assertEqual(out[0]["status"], "unknown")
+        self.assertEqual(out[0]["links"], "absente (sans tête observée)")
+        assign.assert_not_called()
+
     def test_verte_aucun_incident(self):
         with self._db(_CiStore([self._run(status="success")]), _Store()), \
                 mock.patch.object(incident.work, "add") as add:

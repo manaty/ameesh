@@ -34,7 +34,10 @@ Ce module porte la règle seule :
   #1467 : le manifeste persisté `integration_trains.plan` nomme les membres du
   paquet (`work_item_id`, `frozen_sha`), et la comparaison de chaque membre
   fournit ses fichiers — l'agrégat d'un paquet ne doit jamais accuser un lot du
-  changement d'un autre.
+  changement d'un autre. La carte d'impact elle aussi se qualifie par ligne :
+  `links_for(repo, head_sha)` (#1467) rend la carte du dépôt et de la tête
+  exacts, `None` laissant `unknown` — une carte globale, valable pour tous les
+  dépôts et toutes les têtes, attribuerait le lot d'un autre paquet.
 
 Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
 parle ni à GitHub ni au réseau. Limite connue : deux passages **concurrents**
@@ -528,8 +531,27 @@ INTEGRATION = {
 }
 
 
-def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
-            actor: str = work.SYSTEM_SENDER) -> list[dict]:
+def _qualified_card(links_for, repo: str, head_sha: str):
+    """La carte qualifiée sur (dépôt, tête) rendue par le port `links_for`.
+
+    Rend `(carte, verdict)`. Le port est appelé **par ligne**, sur la tête
+    observée : `None`, une exception, ou une tête non observée signifie « pas de
+    carte qualifiée » — le statut reste `unknown`, jamais de repli sur une carte
+    globale, qui attribuerait le lot d'un autre dépôt ou d'une autre tête.
+    """
+    if not head_sha:
+        return None, "absente (sans tête observée)"
+    try:
+        card = links_for(repo, head_sha)
+    except Exception as exc:  # noqa: BLE001 - un lecteur muet ne qualifie rien
+        return None, "illisible : %s" % type(exc).__name__
+    if card is None:
+        return None, "absente"
+    return card, "qualifiée (dépôt + tête)"
+
+
+def consume(db, *, integration=None, lands=None, links=None, links_for=None,
+            diagnoses=None, actor: str = work.SYSTEM_SENDER) -> list[dict]:
     """#1681 : ouvre les incidents des exécutions **terminales rouges** de la
     branche d'intégration, une seule fois par exécution.
 
@@ -545,6 +567,15 @@ def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
     d'autres dépôts. `links` est le port `test→fichiers` qualifié
     (`links_of(carte)`) : sans carte sur l'hôte, l'attribution est `unknown` et
     aucun lot n'est désigné.
+
+    `links_for(repo, head_sha)` est le port **contextualisé** : appelé par ligne
+    avant l'ouverture, il rend la carte `test→fichiers` du dépôt et de la tête
+    exacts, ou `None`. Quand il est fourni, il qualifie chaque ligne et `links`
+    ne sert plus ; `None`, une exception ou une tête non observée laissent le
+    statut `unknown` — jamais de repli sur une carte globale, qui attribuerait
+    le lot d'un autre dépôt ou d'une autre tête. Sans `links_for`, `links` garde
+    son sens (carte globale, rétrocompatible). La lecture est rendue par ligne
+    dans `links` (`qualifiée (dépôt + tête)`, `absente`, `illisible : …`).
 
     `diagnoses(repo, head_sha)` rend le rapport factuel commun
     (`ameesh-train-diagnosis/1`, #1467) du paquet atterri, ou None. Il n'est lu
@@ -574,7 +605,7 @@ def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
             run_id, head_sha = int(row["run_id"]), str(row.get("head_sha") or "")
             line = {"repo": repo, "branch": branch, "app": app, "run_id": run_id, "id": None,
                     "created": False, "status": "", "lot": None, "author": "",
-                    "assigned": False, "why": "", "diagnosis": ""}
+                    "assigned": False, "why": "", "diagnosis": "", "links": ""}
             try:
                 if st.ci.head_replaced(repo, branch, head_sha, run_id):
                     line["why"] = "tête remplacée : verdict périmé, aucun incident"
@@ -613,12 +644,18 @@ def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
                                                if report is not None else "absent"))
             else:
                 line["diagnosis"] = "absent"
+            if links_for is not None:
+                # carte qualifiée sur le dépôt et la tête exacts : None reste
+                # unknown, jamais de repli sur une carte globale
+                card, line["links"] = _qualified_card(links_for, repo, head_sha)
+            else:
+                card, line["links"] = links, ("globale" if links is not None else "absente")
             result = open_incident(
                 db, repo=repo, branch=branch, run_id=run_id, head_sha=head_sha,
                 workflow=str(row.get("workflow") or ""), url=str(row.get("url") or ""),
                 modules=[f.get("module") for f in failures],
                 tests=[f.get("test") for f in failures],
-                commits=commits, app=app, links=links, diagnosis=diagnosis, actor=actor)
+                commits=commits, app=app, links=card, diagnosis=diagnosis, actor=actor)
             earlier = line["why"]
             line.update(result)
             if earlier:
