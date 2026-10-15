@@ -257,6 +257,12 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import projects
         return projects.main(rest)
     if command == "serve":
+        if "--exec-only" in rest:
+            # L108 : l'API d'exécuteur médiée (/api/exec/v1). `serve.main`
+            # (L84) ne connaît pas --exec-only : le routeur doit trancher
+            # avant, sinon le serveur médié reste inatteignable (#743).
+            from .mediated_executor import server
+            return server.main(rest)
         # L84: read API, local mode
         from . import serve
         return serve.main(rest)
@@ -315,10 +321,6 @@ def _dispatch(argv: list[str] | None) -> int:
     if command in ACTION_COMMANDS:
         from . import actions_cli
         return actions_cli.main(argv)
-    if command == "serve":
-        # L108 : l'API d'exécuteur médiée ; L84 y ajoutera l'interface
-        from .mediated_executor import server
-        return server.main(rest)
     if command in ("host", "device"):
         # L110 : enrôlement et identité des exécuteurs médiés
         from . import host_cli

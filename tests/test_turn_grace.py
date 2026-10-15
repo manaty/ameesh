@@ -25,7 +25,7 @@ from unittest import mock
 from ameesh import background, config as config_mod, mail, platform, registry, storage
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import EMPTY_CONFIG, FAKEBIN, PgTestCase
 
 
 def _p(pid, ppid, name, pgid=100, zombie=False) -> dict:
@@ -586,10 +586,10 @@ class ReglagesTest(_Base):
         self.assertEqual(config_mod.Config().turn_mail_max, 20)
         self.assertEqual(config_mod.Config().turn_grace_seconds, 1200)
         cfg = config_mod.load(env={"AMEESH_TURN_GRACE_SECONDS": "60",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.turn_grace_seconds, 60.0)
         cfg = config_mod.load(env={"AMEESH_TURN_GRACE_SECONDS": "-3",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.turn_grace_seconds, 1200.0)
 
     def test_ameesh_set_turn_grace_seconds(self):
