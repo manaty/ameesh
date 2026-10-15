@@ -12,7 +12,7 @@ from ameesh import db as db_mod, migration_reservations as reservations, radar, 
 from ameesh.storage.postgres.work import WorkItems
 
 from .support import PgTestCase
-from .test_l160b_radar import MIG, make_repo
+from .test_l160b_radar import MIG, _git, make_repo
 
 TEXT = '''| Number | Lot | Who | State |
 |---|---|---|---|
@@ -158,7 +158,13 @@ class RunPassReservationTest(PgTestCase):
             self.cfg,
             radar={"projects": {"p": {"repo": repo, "github": "acme/product",
                                       "migrations": MIG}}})
-        lines = radar.run_pass(cfg, self.db, ci=None)
+        # #1335 R1 cx2 : la sonde ne lit que les cibles certifiées (#1333) ;
+        # la pointe publiée est simulée lisible et à jour, comme sur un dépôt
+        # réel — sans elle, le delta du lot n'est pas certifié et la sonde se
+        # tait à juste titre (témoin dédié dans test_1333_radar_cible).
+        with mock.patch.object(radar, "published_tip",
+                               return_value=_git(repo, "rev-parse", "main")):
+            lines = radar.run_pass(cfg, self.db, ci=None)
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0]["error"], None)
         self.assertEqual(lines[0]["summary"]["unreserved_migrations"], 1)
