@@ -220,6 +220,23 @@ class WidgetUsageTest(unittest.TestCase):
         self._ecrit("claude-secondary.json", payload, mtime=self.now - 6 * HEURE)
         self.assertIsNone(widget_usage.read(profil, now=self.now, directory=self.dossier))
 
+    def test_reading_carries_its_date(self):
+        """#1648: a snapshot's buckets carry the reading date (`updatedAt`,
+        mtime fallback), so the caller can compare two dated sources."""
+        profil = _profil(self.compte, "secondaire")
+        self._ecrit("claude-secondary.json", self._instantane(
+            updatedAt=_iso(self.now - 4 * HEURE)))
+        vus = widget_usage.read(profil, now=self.now, directory=self.dossier)
+        self.assertIsNotNone(vus)
+        self.assertEqual(len({round(g.read_at or 0, 3) for g in vus}), 1)
+        self.assertAlmostEqual(vus[0].read_at, self.now - 4 * HEURE, delta=1)
+        payload = self._instantane()
+        payload.pop("updatedAt")
+        self._ecrit("claude-secondary.json", payload, mtime=self.now - 30)
+        vus = widget_usage.read(profil, now=self.now, directory=self.dossier)
+        self.assertIsNotNone(vus)
+        self.assertAlmostEqual(vus[0].read_at, self.now - 30, delta=1)
+
     def test_directory_from_environment_variable(self):
         with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
             self.assertEqual(widget_usage.usage_dir(), self.dossier)
@@ -398,6 +415,50 @@ class GaugesOfTest(unittest.TestCase):
                 vus = accounts.gauges_of(self.book, profil, [a, b], now=self.now)
                 self.assertEqual([g.key for g in vus], ["five_hour"])
                 self.assertAlmostEqual(vus[0].used, 0.8)   # the log, not the widget
+
+    def _fable_snapshot(self, age: float) -> None:
+        self._ecrit({"schemaVersion": 1, "ready": True,
+                     "updatedAt": _iso(self.now - age),
+                     "limits": [
+                         {"label": "Session (5-hour)", "percent": 0.2,
+                          "resetsAt": _iso(self.now + 4 * HEURE)},
+                         {"label": "Weekly (7-day)", "percent": 0.3,
+                          "resetsAt": _iso(self.now + 6 * JOUR)},
+                         {"label": "Fable Weekly", "title": "Fable Weekly",
+                          "percent": 0.0, "resetsAt": _iso(self.now + 6 * JOUR)}]})
+
+    def _dated_journal(self, age: float) -> Gauges:
+        return Gauges([Gauge("claude", "five_hour", 0.8, self.now + HEURE,
+                             5 * HEURE, read_at=self.now - age)],
+                      Overage(True, False))
+
+    def test_newer_journal_beats_the_widget(self):
+        """#1648: a 4 h old widget (still inside its short window) no longer
+        masks a journal dated one minute ago. The journal wins — the model
+        buckets come back with the widget's next reading."""
+        self._fable_snapshot(4 * HEURE)
+        self.book = SimpleNamespace(claude_gauges=lambda **kw: self._dated_journal(60))
+        profil = _profil(self.compte, "primaire")
+        with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
+            vus = accounts.gauges_of(self.book, profil, [profil],
+                                     model="claude-fable-5", now=self.now)
+        self.assertEqual([g.key for g in vus], ["five_hour"])
+        self.assertAlmostEqual(vus[0].used, 0.8)
+        self.assertTrue(vus.overage.capable)        # the journal's overage
+        self.assertEqual(accounts._read_at_of(vus), self.now - 60)
+
+    def test_newer_widget_keeps_its_model_buckets(self):
+        """Reverse: journal dated 10 min ago, widget 30 s ago — the widget
+        wins, model bucket included (#1580 behaviour kept)."""
+        self._fable_snapshot(30)
+        self.book = SimpleNamespace(claude_gauges=lambda **kw: self._dated_journal(600))
+        profil = _profil(self.compte, "primaire")
+        with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
+            vus = accounts.gauges_of(self.book, profil, [profil],
+                                     model="claude-fable-5", now=self.now)
+        self.assertEqual([g.key for g in vus],
+                         ["five_hour", "seven_day", "seven_day@fable"])
+        self.assertTrue(vus.overage.capable)        # taken from the journal
 
 
 class ChooseAvecWidgetTest(_Base):
