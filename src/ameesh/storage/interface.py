@@ -1469,8 +1469,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
-                      verdict: str | None, note: str) -> dict:
-        """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend."""
+                      verdict: str | None, note: str, on_frozen=None,
+                      after_commit: list | None = None) -> dict:
+        """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
+
+        `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
+        transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
+        `after_commit` reçoit les écritures de fil différées et la méthode les
+        vide après le commit. Absents, rien ne change."""
 
     @abc.abstractmethod
     def delays(self, limit: int, *, ids: Sequence[int] | None = None) -> list[dict]:

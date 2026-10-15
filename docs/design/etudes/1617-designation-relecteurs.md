@@ -9,10 +9,10 @@ work_item: 1617
 Le lot #1617 (sous-lot #1606 point 4, canon home §7) remplace le choix manuel
 du relecteur par une sélection déterministe, au moment du gel. Constat du
 15 octobre : dix-huit lots attendaient sans relecteur, jusqu'à 42 h. La
-préparation ci-dessous est **locale et inactive** : aucun hook n'est branché,
-aucun profil ni runner n'est modifié, aucune CI n'est déclenchée, et rien ne
-désigne de relecteur en production tant que les revues et le raccord ne sont
-pas acquis.
+préparation ci-dessous est **locale et inactive** : le hook étroit du gel est
+branché mais aucun appelant ne fournit de callback, aucun profil ni runner
+n'est modifié, aucune CI n'est déclenchée, et rien ne désigne de relecteur en
+production tant que les revues et le paquet ne sont pas acquis.
 
 Sources : canon home PR86 §7 et #1606 point 4 ; politique versionnée PR85
 (`review_policies.train_reviews`, schéma `ameesh-train-reviews-policy/1`) ;
@@ -105,14 +105,20 @@ relecteur choisi au hasard.
 Ce qui doit venir de l'extérieur, et de qui :
 
 - **règles et familles** : de la compilation canon de #1616 (ou du lecteur
-  `train_policy.Versioned` de #1467 en attendant) ; le repli local
-  (`claude`, `codex`, `deepseek`, mêmes valeurs que `train_review.FAMILIES`)
-  est un paramètre `families`, pas une constante de politique ;
+  `train_policy.Versioned` de #1467 en attendant) ; impl07 a livré le 15/10 le
+  contrat `mechanics.load(repo, commit, project)` (tête `ddf1091d`, schéma
+  `ameesh-train-reviews-policy/1`) : `.rules` → `[(r.paths, r.reviews) …]`
+  mappés en `Rule`, `.families` + `.exclude_author_family` +
+  `.distinct_families` pour l'indépendance, `.reviews_for(paths)` pour
+  `required`/`risk` ; le repli local (`claude`, `codex`, `deepseek`, mêmes
+  valeurs que `train_review.FAMILIES`) reste un paramètre `families` tant que
+  la PR85 n'est pas fusionnée ;
 - **required, base, tête exacte, classe, commit de canon** : de l'adaptateur
-  au gel, à partir du `Requirement` déjà calculé par #1467
-  (`train_policy.Versioned`) — cx3 a confirmé le 15/10 que le runner de #1467
-  ne voit pas le gel à l'écriture et que le raccord se fait par un hook étroit
-  au gel, pas dans `train*` ;
+  au gel, à partir de `mechanics.load` (#1616) ou du `Requirement` déjà calculé
+  par #1467 (`train_policy.Versioned`) — cx3 a confirmé le 15/10 que le runner
+  de #1467 ne voit pas le gel à l'écriture et que le raccord se fait par un
+  hook étroit au gel, pas dans `train*` ; `policy_ref` est `rules.commit` (le
+  SHA exact de la politique, refusé s'il n'est pas un commit) ;
 - **auteurs et correcteurs** : des reçus exacts de #1465
   (`review_provenance.receipt_for_commit`), jamais d'une note ou d'une
   assignation ; l'assigné du lot reste un auteur au minimum. La collecte doit
@@ -120,18 +126,28 @@ Ce qui doit venir de l'extérieur, et de qui :
   et n'est pas appelable ici. Une preuve manquante est passée en
   `unknown_authors` (attente), jamais ignorée.
 
-## Le hook (non branché)
+## Le hook (branché, inactif)
 
-Point d'accord avec cx3 (#1467, 15/10 10:21) : un hook **étroit** sur
+Point d'accord avec cx3 (#1467, 15/10 10:46) : un hook **étroit** sur
 `work.milestone(kind=frozen)`, sans modifier les modules `train*` ni coder de
-politique en dur. L'écriture du jalon tient déjà le verrou de la ligne du lot
-(`storage.postgres.work.add_milestone`) ; le raccord doit faire tenir dans la
-**même transaction** la marque idempotente, les courriers et le journal, le
-fil lisible étant écrit après le commit (`mail.send(..., after_commit=…)`).
-La signature du `Port` ci-dessus est la surface à qualifier avec #1616
-(adaptateur canon) et #1467 (point d'appel) ; ni `work.py` ni `review_lot.py`
-ni `train*` ne sont touchés avant cet accord. La CLI
-(`ameesh work reviewers <lot>` ou équivalent) viendra au même moment.
+politique en dur ; cx3 laisse le branchement à ce lot et confirme que #1467 ne
+touche ni `work.py` ni `storage/postgres/work.py`. Le raccord est branché :
+
+- `work.milestone(..., on_frozen=…, after_commit=…)` transmet au stockage ;
+- `storage.postgres.work.add_milestone` appelle `on_frozen(tx, milestone,
+  after_commit)` **dans la transaction du jalon**, juste après l'INSERT du
+  `frozen` — le port `PgPort(tx, after_commit=…)` y écrit la marque et les
+  courriers atomiquement —, puis vide `after_commit` **après le commit**
+  (`mail.send(..., after_commit=…)`, motif #315). Une exception du callback
+  annule le jalon avec tout ce qu'il portait ; `on_frozen` sur un autre kind
+  est refusé.
+
+**Rien n'est activé** : le défaut est `on_frozen=None`, la CLI `work milestone`
+ne fournit aucun callback, et un gel ne désigne donc personne. Le raccord est
+prouvé par 4 tests base réelle : le jalon et la désignation ne sont visibles
+que dans la transaction, le fil externe n'est vidé qu'après le commit, une
+exception annule le jalon, la marque et les courriers, et le callback est
+refusé hors d'un `frozen`.
 
 ## Vérification
 
@@ -147,7 +163,7 @@ l'ancienne tête ; gel qui bouge pendant l'écriture = reprise sur la nouvelle
 tête, trois mouvements = échec sans boucle ; tête invalide ou non gelée
 refusée.
 
-`tests/test_1617_review_designation_pg.py` — 15 tests sur base réelle (psql) :
+`tests/test_1617_review_designation_pg.py` — 19 tests sur base réelle (psql) :
 désignation écrite et courriers partis une fois, rejeu sans second courrier ;
 un second écrivain (autre connexion) sous le verrou rend la marque de la base
 sans remailer ; gel périmé refusé sans rien écrire (ni marque ni message) ;
@@ -157,18 +173,26 @@ inconnu du registre refusé (un courrier qui ne réveille personne) ; provenance
 d'auteur inconnue = attente, désignation quand la preuve arrive ; nouveau gel =
 nouvelle désignation, la marque de l'ancien gel reste attachée à sa tête ;
 transaction du hook (fil vidé après commit seulement) ; annulation = ni
-courrier ni marque.
+courrier ni marque. Les 4 tests du raccord du gel : sans callback le gel ne
+désigne personne ; le callback voit le jalon dans sa transaction (invisible
+d'une autre connexion) et y écrit la désignation, le fil n'étant vidé qu'après
+le commit ; une exception du callback annule le jalon, la marque et les
+courriers ; le callback est refusé hors d'un `frozen`.
 
 ## Reste avant activation
 
-- accord de port avec #1616 (adaptateur canon : règles, familles, `policy_ref`)
-  et #1467 (point d'appel) — cx3 a donné le 15/10 son accord pour un hook
-  étroit sur `work.milestone(kind=frozen)`, impl07 n'a pas encore répondu ;
-- branchement transactionnel au gel (callback après l'insertion du jalon dans
-  `add_milestone`) et commande de lecture ; l'adaptateur fournit aussi le
-  pilote à notifier (`notify`) : aucune source machine unique du pilote de
-  projet n'existe aujourd'hui, et le port refuse un destinataire vide ou hors
-  du registre ;
+- accords de port acquis : cx3 (#1467, 15/10 10:46) laisse le branchement du
+  hook étroit ici et ne touche ni `work.py` ni `storage/postgres/work.py` ;
+  impl07 (#1616) a livré `mechanics.load(repo, commit, project)` (tête
+  `ddf1091d`) ; l'adaptateur canon reste à écrire ;
+- l'adaptateur d'activation : règles et familles de `mechanics.load`, `required`
+  et `risk` de `reviews_for(paths)`, `policy_ref = rules.commit`, pilote à
+  notifier (`notify`) — aucune source machine unique du pilote de projet
+  n'existe aujourd'hui, et le port refuse un destinataire vide ou hors du
+  registre —, et décision explicite sur l'échec de désignation (le callback
+  transactionnel annule le gel s'il lève) ;
+- la commande de lecture / reprise (`ameesh work reviewers <lot>` ou
+  équivalent) pour rattraper un gel resté sans désignation ;
 - preuve de livraison sur un **gel réel** : désignation sans agent, tête exacte
   remise, durée et doublons mesurés (le compteur de courriers par gel) ;
 - deux avis indépendants hors auteur pour cette porte (sécurité de la chaîne
