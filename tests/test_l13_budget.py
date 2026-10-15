@@ -323,7 +323,7 @@ class BudgetGateTest(PgTestCase):
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
         try:
             with mock.patch.dict(os.environ, env, clear=False), \
-                    mock.patch("ameesh.registry.pending_spend_put",
+                    mock.patch("ameesh.registry.pending_spend_begin",
                                side_effect=db_mod.DbError("base indisponible")):
                 self.assertFalse(worker.run_turn(
                     {"kind": "prompt", "prompt": "tour", "ids": []}))
