@@ -238,10 +238,22 @@ class JournalTest(Base):
                      ("api", "-H", "Authorization: Bearer " + secret, "user"),
                      ("api", "-f", "x=ZZZghp_" + "B" * 36, "graphql"),
                      ("api", "repos/o/r/pulls?access_token=" + secret),
-                     ("pr", "create", "--title", secret, "--fill")):
+                     ("pr", "create", "--title", secret, "--fill"),
+                     # R2 cx3 : une valeur commençant par un tiret reste la valeur
+                     ("secret", "set", "DEMO", "--body", "-R" + secret),
+                     ("secret", "set", "DEMO", "--body", "--head=" + secret),
+                     # positionnel libre d'une commande sans identifiant
+                     ("search", "code", secret),
+                     # booléen connu, puis option inconnue : rien n'est consigné après
+                     ("pr", "create", "--no-maintainer-edit", "--body", secret),
+                     ("pr", "create", "--inconnue", "--body", secret),
+                     ("pr", "create", "--inconnue", "--head=" + secret),
+                     ("[commande]", secret),
+                     ("pr", "inconnue", secret),
+                     ("pr", "view", "--", secret)):
             self.assertEqual(self.lancer(env, *args).returncode, 3)
         texte = (next((self.state / "github").glob("gestes-*.jsonl"))).read_text()
-        self.assertEqual(len(texte.splitlines()), 7)
+        self.assertEqual(len(texte.splitlines()), 16)
         self.assertNotIn(secret, texte)
         self.assertNotIn("ZZZ", texte)
         self.assertNotIn("Bearer", texte)
@@ -254,9 +266,13 @@ class JournalTest(Base):
         self.assertEqual(gi.sanitize_argv(
             ["api", "-X", "POST", "repos/manaty/ameesh/actions/runs/1/cancel"]),
             ["api", "-X", "POST", "repos/manaty/ameesh/actions/runs/1/cancel"])
-        # une option inconnue : sa valeur éventuelle n'est pas consignée
-        self.assertEqual(gi.sanitize_argv(["run", "list", "--inconnue", "abc"]),
-                         ["run", "list", "--inconnue", "[valeur]"])
+        # une option inconnue : rien n'est consigné après elle
+        self.assertEqual(gi.sanitize_argv(["run", "list", "--inconnue", "abc", "-R", "o/r"]),
+                         ["run", "list", "[option]", "[valeur]", "[valeur]", "[valeur]"])
+        self.assertEqual(gi.sanitize_argv(["secret", "set", "DEMO", "--repo", "o/r"]),
+                         ["secret", "set", "[valeur]", "--repo", "o/r"])
+        self.assertEqual(gi.sanitize_argv(["search", "code", "motif"]),
+                         ["search", "code", "[valeur]"])
 
     def test_stderr_ferme_et_journal_impossible_la_commande_part(self):
         env, _ = self.env_tour()

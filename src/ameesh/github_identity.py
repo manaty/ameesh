@@ -55,28 +55,68 @@ ENV_REAL = "AMEESH_GH_REAL"
 ENV_JOURNAL = "AMEESH_GH_JOURNAL"
 ENV_ROLE = "AMEESH_GH_ROLE"
 #: le filtre du journal, partagé par le `gh` généré (qui l'embarque) et par
-#: ce module (`sanitize_argv`). Liste blanche : ne sont consignés que la
-#: sous-commande, les noms d'options et les identifiants (numéros, SHA,
-#: branches, dépôts, chemins d'API sans requête). Toute valeur libre (corps,
-#: titre, en-tête, `-f clé=valeur`, `--body` d'un secret) devient `[valeur]`,
-#: et un jeton reconnaissable `[jeton]`, quelle que soit sa longueur : rien
-#: n'est tronqué, donc rien n'est masqué à moitié.
+#: ce module (`sanitize_argv`). Liste blanche sémantique : ne sont consignés
+#: que la commande et la sous-commande connues, les noms d'options connues,
+#: la valeur d'une option d'identifiant (`--repo`, `--match-head-commit`…) et,
+#: pour les seules commandes dont les positions sont des identifiants (`pr`,
+#: `run`, `api`…), leurs arguments de forme identifiant. Tout le reste devient
+#: `[valeur]`, un jeton reconnaissable `[jeton]`. Une option qui attend une
+#: valeur prend l'argument suivant quel qu'il soit, même commençant par un
+#: tiret, comme gh ; après une option inconnue (booléen ou non, on ne sait
+#: pas), plus rien n'est consigné. Rien n'est tronqué.
 SANITIZE = r"""
 _JETON = re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}")
 _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#:@+-]{0,99}")
-#: options dont la valeur, si c'est un identifiant, est consignée
+#: commandes et sous-commandes consignées en clair
+_COMMANDES = {
+    "pr": {"list", "view", "create", "merge", "close", "reopen", "edit", "checks",
+           "comment", "review", "ready", "diff", "checkout", "status", "update-branch",
+           "lock", "unlock"},
+    "issue": {"list", "view", "create", "close", "reopen", "edit", "comment",
+              "status", "lock", "unlock", "delete", "transfer", "pin", "unpin"},
+    "run": {"list", "view", "cancel", "rerun", "watch", "delete", "download"},
+    "workflow": {"list", "view", "run", "enable", "disable"},
+    "release": {"list", "view", "create", "edit", "delete", "upload", "download"},
+    "label": {"list", "create", "edit", "delete", "clone"},
+    "repo": {"view", "list", "clone", "create", "edit", "fork", "sync",
+             "set-default"},
+    "cache": {"list", "delete"},
+    "secret": {"list", "set", "delete"},
+    "variable": {"list", "set", "get", "delete"},
+    "search": {"code", "commits", "issues", "prs", "repos"},
+    "auth": {"status", "token", "login", "logout", "setup-git", "refresh",
+             "switch"},
+    "api": None, "status": None, "browse": None,
+}
+#: commandes dont les arguments positionnels sont des identifiants
+_POS_IDENT = frozenset(("pr", "issue", "run", "workflow", "release", "label",
+                        "repo", "cache", "api"))
+#: options d'identifiant : leur valeur est consignée si elle en a la forme
 _SURES = frozenset((
     "--repo", "-R", "--branch", "--head", "--base", "-B", "--match-head-commit",
     "--label", "--add-label", "--remove-label", "--workflow", "--json",
     "--method", "-X", "--state", "--limit", "-L", "--status", "--event",
     "--user", "--commit", "--ref", "--job", "--attempt", "--author",
     "--assignee", "--milestone", "--hostname", "--org", "--env", "--name"))
+#: options à valeur libre : leur valeur n'est jamais consignée
+_LIBRES = frozenset((
+    "--body", "-b", "--body-file", "-F", "--title", "-t", "--field", "-f",
+    "--raw-field", "--header", "-H", "--input", "--jq", "-q", "--template",
+    "--message", "-m", "--notes", "--notes-file", "-n", "--search", "-S",
+    "--subject", "--env-file", "--app", "-a", "--reviewer", "-r",
+    "--add-reviewer", "--remove-reviewer", "--add-assignee",
+    "--remove-assignee", "--visibility", "--description", "-d", "--key",
+    "--cache", "--hostname-env", "--target", "--tag", "--discussion-category"))
 #: options sans valeur : l'argument suivant n'est pas leur valeur
 _BOOLS = frozenset((
-    "--auto", "--squash", "--merge", "--rebase", "--delete-branch", "-d",
-    "--admin", "--disable-auto", "--draft", "--web", "--yes", "-y", "--force",
-    "--paginate", "--silent", "--include", "-i", "--verbose", "--exit-status",
-    "--failed", "--log", "--log-failed", "--watch", "--fill", "--help", "-h"))
+    "--auto", "--squash", "--merge", "--rebase", "--delete-branch",
+    "--admin", "--disable-auto", "--draft", "--web", "-w", "--yes", "-y",
+    "--force", "--paginate", "--silent", "--include", "-i", "--verbose",
+    "--exit-status", "--failed", "--log", "--log-failed", "--watch", "--fill",
+    "--fill-first", "--fill-verbose", "--help", "-h", "--no-maintainer-edit",
+    "--approve", "--comment", "-c", "--request-changes", "--close", "--slurp",
+    "--prerelease", "--latest", "--generate-notes", "--verify-tag",
+    "--clobber", "--debug", "--ready", "--undo", "--compact", "--interval-off"))
 
 
 def _valeur(v):
@@ -91,34 +131,52 @@ def _positionnel(a):
     return v + "?[valeur]" if q and v == chemin else v
 
 
+def _option(a):
+    # (nom, valeur collée ou None) ; nom None si l'option est inconnue
+    if a.startswith("--"):
+        nom, egal, v = a.partition("=")
+        v = v if egal else None
+    else:
+        nom, v = a[:2], (a[2:] or None)
+    if nom in _SURES or nom in _LIBRES or (nom in _BOOLS and v is None):
+        return nom, v
+    return None, v
+
+
 def sanitize_argv(argv):
-    out, attente = [], None
-    for a in argv:
-        if attente is not None and not a.startswith("-"):
+    out, mots, attente = [], [], None
+    for i, a in enumerate(argv):
+        if attente is not None:
             out.append(_valeur(a) if attente in _SURES else "[valeur]")
             attente = None
             continue
-        attente = None
-        if a == "--" or a == "-" or not a.startswith("-"):
-            out.append(a if a in ("--", "-") else _positionnel(a))
-        elif a.startswith("--"):
-            nom, egal, v = a.partition("=")
-            if not _IDENT.fullmatch(nom[2:]) or _JETON.search(nom):
-                out.append("--[option]")
-            elif egal:
+        if a == "--":
+            out.append("--")
+            out.extend("[valeur]" for _ in argv[i + 1:])
+            break
+        if a.startswith("-") and a != "-":
+            nom, v = _option(a)
+            if nom is None:
+                # booléen ou non, on ne sait pas : plus rien n'est consigné
+                out.append("[option]")
+                out.extend("[valeur]" for _ in argv[i + 1:])
+                break
+            if v is not None:
                 out.append(nom + "=" + (_valeur(v) if nom in _SURES else "[valeur]"))
             else:
                 out.append(nom)
                 attente = None if nom in _BOOLS else nom
+            continue
+        if not mots:
+            mots.append(a if a in _COMMANDES else "[commande]")
+            out.append(mots[-1])
+        elif len(mots) == 1 and _COMMANDES.get(mots[0]):
+            mots.append(a if a in _COMMANDES[mots[0]] else "[commande]")
+            out.append(mots[-1])
+        elif mots[0] in _POS_IDENT and mots[-1] != "[commande]":
+            out.append(_positionnel(a))
         else:
-            nom, reste = a[:2], a[2:]
-            if not _IDENT.fullmatch(nom[1:]):
-                out.append("-[option]")
-            elif reste:
-                out.append(nom + (_valeur(reste) if nom in _SURES else "[valeur]"))
-            else:
-                out.append(nom)
-                attente = None if nom in _BOOLS else nom
+            out.append("[valeur]")
     return out
 """
 _ns: dict = {"re": re}
