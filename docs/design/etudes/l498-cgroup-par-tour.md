@@ -223,13 +223,21 @@ Not fixed, or deliberately out of the first slice:
    containers keep the label route; mediated execution keeps the local code and
    leaves remote process control unchanged. First target: the user runners on
    ameesh-agents-1, then the mesh server and the guest.
-2. **owner — requested, pending** (grouped request attached to #498):
-   authorization for the unit settings on a canary host (`Delegate=yes`,
-   `DelegateSubgroup=runner`; guest: `ProtectControlGroups=no` on the runner
-   unit) and for the measurement window. No unit, weight or freeze change is
-   part of this study.
-3. **First slice — answered with 1**: user runners on ameesh-agents-1 only,
-   then the mesh server and the guest.
+2. **owner — answered (13/10 20:39, signed, decision #21611, option b)**:
+   the unit settings are authorized on the canary host only — `Delegate=yes`,
+   `DelegateSubgroup=runner` on the executor unit — with the guest left
+   unchanged (`ProtectControlGroups=no` is **not** authorized for now) and
+   measurements before any extension. No weight or freeze change. Proof:
+   owner key `smichea`, approval #21, exact answer: "b b — … canari
+   ameesh-agents-1 seulement, invité inchangé, mesures avant toute
+   extension".
+3. **First slice — confirmed**: user runners on ameesh-agents-1 only; the
+   mesh server and the guest come later, on measurement results and a new
+   owner agreement.
 
-Implementation starts after #490 merges; the measurement window is framed with
-mesh-design before any switch.
+The blocker #490 merged on 2026-10-15 (PR #470, commit `748efffd0768`), so
+implementation starts now, on this branch. Order kept from the route
+decision: code and witness tests first (inert wherever delegation is
+unavailable), then the measurement window is framed with mesh-design, then
+the canary unit settings are applied, then the measurements; any extension
+beyond the canary needs the owner again.
