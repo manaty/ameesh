@@ -336,10 +336,14 @@ class CatchUpWitnessTest(_Witness):
             " WHERE work_item_id = %s AND kind = 'merged'", (lot,))
         self.assertFalse(review_lot.catch_up_eligible(self.db, lot),
                          "fusion antérieure à la borne : rien n'est dû")
+        # une classe lisible ouvrirait la relecture : seule la borne l'empêche
+        # (une classe en panne serait avalée par `open_for_merge`, best effort,
+        # et ne distinguerait pas le correctif)
         with mock.patch.object(review_lot, "class_at_merge",
-                               side_effect=RuntimeError("classe non lue hors bornes")):
+                               return_value={"class": "light", "why": "témoin"}) as klass:
             again = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
         self.assertEqual(again["result"], "already", again)
+        klass.assert_not_called()
         self.assertEqual(self.review_lots(lot), [], "relecture historique non due")
         with mock.patch.object(review_lot, "class_at_merge",
                                return_value={"class": "light", "why": "témoin"}):
