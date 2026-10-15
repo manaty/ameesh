@@ -190,8 +190,15 @@ class Mechanics:
         """
         risk, reviews = "light", 0
         for path in paths:
+            if not isinstance(path, str):
+                raise MechanicsError("path is not a repository path: %r" % path)
+            try:
+                path.encode("utf-8")
+                review.classify(self.review_policy, [path])
+            except (UnicodeError, review.ReviewError) as exc:
+                raise MechanicsError("path is not a repository path: %r" % path) from exc
             clean = review.normalize_path(path)
-            if clean != path or "\ufffd" in path:
+            if clean != path or "\ufffd" in path or "\0" in path:
                 # un chemin non décodable (octets remplacés) ne se classe pas :
                 # le deviner ferait passer un fichier sensible pour léger
                 raise MechanicsError("path is not a repository path: %r" % path)
@@ -424,7 +431,7 @@ def _federation(repo: str, commit: str) -> dict:
 
 
 def _declared(mapping, key: str, where: str) -> dict:
-    if not isinstance(mapping, dict) or key not in mapping:
+    if not isinstance(mapping, dict) or key not in mapping or not isinstance(mapping[key], dict):
         raise MechanicsError("%s is required" % where)
     return mapping[key]
 
@@ -439,16 +446,19 @@ def _review_policy(federation: dict, project: str, commit: str
         raise MechanicsError("project %r is not declared under risk_classes.projects"
                              % project)
     declaration = scoped[project]
-    if not isinstance(declaration, dict) or "default" not in declaration \
-            or set(declaration) - {"default", "rules"}:
+    if not isinstance(declaration, dict) or set(declaration) != {"default", "rules"}:
         raise MechanicsError("complete risk classification required for project %r" % project)
+    if not isinstance(declaration["rules"], list) or any(
+            not isinstance(rule, dict) or set(rule) != {"paths", "class"}
+            for rule in declaration["rules"]):
+        raise MechanicsError("explicit risk rules required for project %r" % project)
     policy, problems = review.parse(declaration)
     if problems:
         raise MechanicsError("risk classification of %r is unusable: %s"
                              % (project, "; ".join(sorted({text for _code, _sev, text
                                                             in problems}))))
     counts = _declared(policies, "train_reviews", "review_policies.train_reviews")
-    if not isinstance(counts, dict) or counts.get("schema") != TRAIN_REVIEWS_SCHEMA:
+    if set(counts) != {"schema", "projects"} or counts.get("schema") != TRAIN_REVIEWS_SCHEMA:
         raise MechanicsError("unknown train review policy schema: %r"
                              % (counts.get("schema") if isinstance(counts, dict) else counts))
     projects = _declared(counts, "projects", "review_policies.train_reviews.projects")

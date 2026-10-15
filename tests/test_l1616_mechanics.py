@@ -227,6 +227,43 @@ class TestRules(MechanicsTest):
         with self.assertRaises(mechanics.MechanicsError):
             rules.reviews_for(["src/ameesh/\ufffd.sql"])
 
+    def test_unclassifiable_paths_never_receive_zero_reviews(self):
+        repo = self.repo()
+        rules = mechanics.load(repo.root, repo.git("rev-parse", "HEAD"), "ameesh")
+        for path in ("", "/src/ameesh/mechanics.py", "../src/ameesh/mechanics.py",
+                     "C:/src/ameesh/mechanics.py", r"src\ameesh\mechanics.py",
+                     "src/ameesh/\udcff.py", "src/ameesh/x\0.py", None):
+            with self.subTest(path=path), self.assertRaises(mechanics.MechanicsError):
+                rules.reviews_for(["README.md", path])
+        self.assertEqual(rules.reviews_for(["src/ameesh/mechanics.py"]),
+                         mechanics.ReviewNeed("sensitive", 2))
+
+    def test_malformed_federation_blocks_refuse_with_mechanics_error(self):
+        from ameesh import canon
+        import copy
+        original = canon.load_yaml(FEDERATION, use_pyyaml=False)
+        changes = [
+            (("review_policies", "risk_classes", "projects"), None),
+            (("review_policies", "risk_classes", "projects"), "ameesh"),
+            (("review_policies", "train_reviews", "projects"), None),
+            (("review_policies", "train_reviews", "projects"), "ameesh"),
+            (("review_policies", "train_reviews", "surprise"), True),
+            (("review_policies", "risk_classes", "projects", "ameesh", "rules"),
+             [{"paths": ["**"], "class": "light", "surprise": True}]),
+        ]
+        for keys, value in changes:
+            declaration = copy.deepcopy(original)
+            target = declaration
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            with self.subTest(keys=keys), self.assertRaises(mechanics.MechanicsError):
+                mechanics._review_policy(declaration, "ameesh", "0" * 40)
+        declaration = copy.deepcopy(original)
+        del declaration["review_policies"]["risk_classes"]["projects"]["ameesh"]["rules"]
+        with self.assertRaises(mechanics.MechanicsError):
+            mechanics._review_policy(declaration, "ameesh", "0" * 40)
+
     def test_unknown_risk_class_key_is_refused(self):
         repo = self.repo(federation_text=FEDERATION.replace(
             "        default: light", "        default: light\n        rulez: []", 1))
