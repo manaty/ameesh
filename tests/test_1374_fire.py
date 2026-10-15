@@ -293,6 +293,27 @@ class TargetKeyTest(unittest.TestCase):
             with self.subTest(target=target):
                 self.assertEqual(land.lock_key(project, target), "ameesh:main")
 
+    def test_target_lease_takes_the_train_ttl(self):
+        """Le bail de cible se prend sous `land.LOCK_TTL_S` (le TTL du train),
+        pas sous le TTL court du bail de feu."""
+        seen = []
+
+        class Ops:
+            def land_lock(self, key, owner, ttl, *, epoch=None):
+                seen.append((key, ttl, epoch))
+                return 7
+
+        ops = Ops()
+        project = types.SimpleNamespace(name="ameesh")
+        with mock.patch.object(fire.storage, "of", return_value=mock.Mock(work=ops)):
+            handle, blocked = fire._target_lock(mock.Mock(), project, "main")
+        self.assertFalse(blocked)
+        self.assertEqual(seen[0], ("ameesh:main", land.LOCK_TTL_S, None))
+        self.assertTrue(fire._renew(handle, land.LOCK_TTL_S))
+        self.assertEqual(seen[1], ("ameesh:main", land.LOCK_TTL_S, 7))
+        if land.LOCK_TTL_S != fire.LOCK_TTL_S:
+            self.assertNotEqual(seen[0][1], fire.LOCK_TTL_S)
+
 
 class ActTest(unittest.TestCase):
     """Le routage d'un passage : verdicts avant PR/file/CI, fusion au geste
@@ -308,7 +329,7 @@ class ActTest(unittest.TestCase):
         names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
                  "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
                  "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
-                 "_leave_queue", "_fresh", "_renew", "_target_lock")
+                 "_leave_queue", "_fresh", "_renew", "_target_lock", "_unlock")
         with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched:
             patched["_repo_of"].return_value = None
             patched["_slug"].return_value = "manaty/ameesh"
@@ -331,7 +352,8 @@ class ActTest(unittest.TestCase):
             patched["_leave_queue"].return_value = False
             patched["_fresh"].return_value = fresh if fresh is not None else (self.ROW, marks)
             patched["_renew"].return_value = renew
-            patched["_target_lock"].return_value = (None, True) if target_blocked else (None, False)
+            patched["_target_lock"].return_value = ((None, True) if target_blocked
+                                                    else (mock.sentinel.cible, False))
             out = fire._act(None, None, self.ROW, marks, gh=lambda *a, **k: None,
                             dry_run=dry_run, repo=None, cache={})
         return out, patched
@@ -422,6 +444,17 @@ class ActTest(unittest.TestCase):
         calls["_merge_pr"].assert_not_called()
         calls["_disarm"].assert_not_called()
         calls["_reconcile"].assert_not_called()
+
+    def test_direct_merge_renews_the_target_lease_at_the_train_ttl(self):
+        """Le bail de cible, renouvelé juste avant le geste, l'est au TTL du
+        train (`land.LOCK_TTL_S`) ; le TTL court du feu ne vaut que pour
+        `fire:<lot>`."""
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, _status())
+        self.assertEqual(out["result"], "merged")
+        self.assertEqual(calls["_renew"].call_args_list[-1].args,
+                         (mock.sentinel.cible, land.LOCK_TTL_S))
+        calls["_unlock"].assert_called_once_with(mock.sentinel.cible)
 
     def test_stale_auto_merge_is_disarmed_before_merging(self):
         marks = _marks(_mark("frozen", A), _mark("fire", A))

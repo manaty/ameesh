@@ -548,17 +548,20 @@ def _unlock(handle) -> None:
         pass
 
 
-def _renew(handle) -> bool:
+def _renew(handle, ttl: float = LOCK_TTL_S) -> bool:
     """Le bail est-il encore le nôtre ? Le renouvelle au passage (#1374, P2-6).
 
     Appelé juste avant chaque geste externe : plusieurs appels `gh` peuvent
     dépasser la durée du bail, et un second hôte le reprendrait pendant que le
-    premier continue. Un détenteur périmé rend `busy` et n'agit pas."""
+    premier continue. Un détenteur périmé rend `busy` et n'agit pas.
+
+    `ttl` est celui du bail : `LOCK_TTL_S` pour `fire:<lot>`, le TTL du train
+    (`land.LOCK_TTL_S`) pour le bail de cible partagé avec lui."""
     if handle is None:          # dry-run, ou test sans bail
         return True
     ops, owner, epoch, key = handle
     try:
-        return ops.land_lock(key, owner, LOCK_TTL_S, epoch=epoch) is not None
+        return ops.land_lock(key, owner, ttl, epoch=epoch) is not None
     except Exception:  # noqa: BLE001 - bail illisible : on ne mute pas
         return False
 
@@ -939,13 +942,18 @@ def _target_lock(db, project, target: str):
     `(handle, True)` : un autre hôte tient `land.lock_key(project, target)` :
     aucun geste. `(None, False)` sans projet ni cible déclarés : il n'y a pas de
     train à croiser. Le bail est pris après `fire:<lot>` et jamais avant, le
-    train ne prenant jamais `fire:<lot>` : pas de cycle."""
+    train ne prenant jamais `fire:<lot>` : pas de cycle.
+
+    Le TTL est celui du train (`land.LOCK_TTL_S`, réglable par
+    `AMEESH_LAND_LOCK_TTL`), pas celui du bail de feu : c'est le même bail que
+    le train renouvelle, et un détenteur direct qui expirerait plus tôt que le
+    TTL annoncé rendrait la cible au train en cours de geste."""
     if project is None or not target:
         return None, False
     ops = storage.of(db).work
     owner = "fire:%s:%d" % (socket.gethostname(), os.getpid())
     key = land.lock_key(project, target)
-    epoch = ops.land_lock(key, owner, LOCK_TTL_S)
+    epoch = ops.land_lock(key, owner, land.LOCK_TTL_S)
     return ((ops, owner, epoch, key), False) if epoch is not None else (None, True)
 
 
@@ -1007,7 +1015,7 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
         # bail : aucun geste tant qu'il ne l'a pas rendue (#1467)
         return {"lot": lot, "result": "busy"}
     try:
-        if not _renew(handle) or not _renew(cible):
+        if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
         ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
         if ok:
