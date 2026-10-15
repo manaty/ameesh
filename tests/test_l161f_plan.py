@@ -1899,11 +1899,16 @@ class WorkflowTest(unittest.TestCase):
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
-        # décide), le push vers la branche d'intégration du paquet, main et
-        # release/** porte la suite complète ; le check requis reste
-        # l'agrégat « tests ».
-        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        # décide), main et release/** portent la suite complète ; le check
+        # requis reste l'agrégat « tests ». #1410 : une poussée sur la branche
+        # d'intégration du paquet ne déclenche plus ce workflow — une tête de
+        # paquet n'a qu'une suite, celle de sa PR ; le portier paquet.yml
+        # appelle la suite (workflow_call) quand aucune PR ouverte ne couvre
+        # la tête exacte.
+        self.assertIn('branches: [main, "release/**"]', self.text)
+        self.assertNotIn('"integration/**"]', self.text)
         self.assertIn("\n  pull_request:\n", self.text)
+        self.assertIn("\n  workflow_call:\n", self.text)
         self.assertIn("L1211", self.text)
         self.assertIn("tests/parts/toujours.txt", self.text)
         self.assertIn("une PR de release", self.text)
