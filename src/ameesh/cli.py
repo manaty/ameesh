@@ -1222,7 +1222,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             if etat is not None:
                 etat["remis"] += len(msgs)
                 _tour_ecrit(cfg, name, etat)
-        except Exception:
+        except BaseException:
+            # BaseException : une interruption (Ctrl-C, SystemExit) en cours de
+            # remise ne doit pas non plus poser le marqueur.
             remise_ok = False
             raise
         finally:
