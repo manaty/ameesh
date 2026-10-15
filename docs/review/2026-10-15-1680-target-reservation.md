@@ -1,6 +1,6 @@
 # #1680 — réservation de la cible pendant la CI de paquet
 
-Source : demande orchestrateur du 15/10 15:46, sous-lot 2 de #1607 ; propriétaire codex3. Code ameesh, rattachement fonctionnel Nexlink conservé. Préparation sur `review/codex3-1680-packet-reservation`, base main `7dea502cd9093690befdd4e7ea176588f2e63f34`. Aucun profil ni train activé.
+Source : demande orchestrateur du 15/10 15:46, sous-lot 2 de #1607 ; propriétaire codex3. Code ameesh, rattachement fonctionnel Nexlink conservé. Préparation sur `review/codex3-1680-packet-reservation`, base initiale main `7dea502cd9093690befdd4e7ea176588f2e63f34`, puis refusion propre sur main courant `3df9a1ee39f01a6cc32324b9569b22176bbe24d2`. Aucun profil ni train activé.
 
 Le train #1467 conserve le bail `merge_locks` pendant la CI mais ne le renouvelle qu'aux passages. Son auteur a confirmé le 15/10 15:52 sur f63d1b37 : TTL 1800 s, aucune maintenance entre événements, aucune réservation de CI extérieure au train. #1374 reprend ce même bail pour le feu direct ; `merge_pr` n'en prenait aucun. Aucun second ordonnanceur ou table de réservation n'est ajouté.
 
@@ -30,6 +30,8 @@ Un `gh pr merge` brut ou un git push indépendant ne consulte pas la base ameesh
 
 ## Validation
 
-Tests ciblés via `ameesh heavy -- scripts/test.sh tests.test_1680_packet_reservation tests.test_1003_merge_pr` : **62 tests verts avec chacun des deux pilotes psql et psycopg** (124 exécutions, PostgreSQL réel pour les dix témoins de réservation). Les témoins de réservation utilisent PostgreSQL réel, horloge de décision injectée et expiration SQL explicite, sans sommeil ni CI distante. Le banc purge la table indépendante merge_locks entre scénarios dans son seul schéma jetable. Round-trip du ticket JSON et refus des champs ajoutés/schéma manquant vérifiés séparément (trois cas). Vérification syntaxique et diff-check propres.
+Tests ciblés via `ameesh heavy -- scripts/test.sh tests.test_1680_packet_reservation tests.test_1003_merge_pr tests.test_l160e2_land.LeaseDbTest` : **69 tests verts avec chacun des deux pilotes psql et psycopg sur main 3df9a1ee** (138 exécutions, dont les dix témoins de réservation et les sept témoins existants de compatibilité du bail en PostgreSQL réel). La première validation sur la base initiale comptait 62 tests verts par pilote. Les témoins de réservation utilisent PostgreSQL réel, horloge de décision injectée et expiration SQL explicite, sans sommeil ni CI distante. Le banc purge la table indépendante merge_locks entre scénarios dans son seul schéma jetable. Round-trip du ticket JSON et refus des champs ajoutés/schéma manquant vérifiés séparément (trois cas). Vérification syntaxique et diff-check propres.
 
 Relecture indépendante requise avant fusion (concurrence et garde SQL de bail). Aucun run distant, fusion, profil système, CI de lot ou activation effectué par codex3.
+
+Contrôle après refusion : main touche storage/interface et storage/postgres/work ; les changements sont réunis sans conflit. Le port, merge_pr et les deux fichiers de tests restent inchangés. Validation ciblée de la composition et LeaseDbTest terminées : 69/69 sur chaque pilote, sortie globale 0. Journal conservé dans le TMPDIR de codex3 (`1680-combined-validation.log`, marqueur `.exit` à 0).
