@@ -14,16 +14,20 @@ chaque passage un relevé (`Watcher.tick`) :
    de `github.projects` (une requête par dépôt) ; les workflows suivis d'un
    dépôt sont ceux que déclare `github.projects.<projet>.workflows`, sinon —
    quand le dépôt ne publie pas `tests.yml` — les workflows actifs découverts
-   (`actions/workflows`) : un dépôt dont les suites portent d'autres noms
-   (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est plus ignoré en
-   silence (#1110). Chaque exécution porte son fichier de workflow, pour que
-   le verdict nomme la suite concernée ; chacune est rattachée à un lot : par
+   (`actions/workflows`) qui ont la forme d'une suite (#1483 : les workflows
+   d'exploitation — déploiement, sonde — ne rendent pas de verdict de bruit ;
+   s'ils sont écartés, ils sont journalisés) : un dépôt dont les suites portent
+   d'autres noms (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est
+   plus ignoré en silence (#1110). Chaque exécution porte son fichier de
+   workflow, pour que le verdict nomme la suite concernée ; chacune est
+   rattachée à un lot : par
    sa branche (`work_items.branch`, L118), sinon par la ligne
    `ameesh-work: <id>` de son commit de tête (une fusion dans main) ; une
    exécution courte peut naître et finir entre deux passages sans jamais être
    vue « en cours » : un rattrapage borné des exécutions récemment terminées
    les découvre, rend leur verdict et réveille l'agent — une seule fois, et
-   jamais pour une tête déjà remplacée (#1110) ;
+   jamais pour une tête déjà remplacée (sauf sur une branche de base, où
+   chaque tête porte un lot différent : #1110, #1483) ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
@@ -46,11 +50,12 @@ L125 :
   d'autres workflows de la même tête tournent encore, le dit — un vert de
   `backend-suite.yml` n'est pas « la CI est verte » ;
 * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
-  de la base (la cible de la PR, sinon main ; pour main, l'exécution
-  précédente de main) n'est jamais imputé à l'auteur : pas d'urgent, une ligne
-  dans le verdict.
+  de la base (la cible de la PR, sinon la base du dépôt —
+  `github.projects.<projet>.base`, `main` par défaut, `develop` pour Nexlink :
+  #1483 ; pour une base, l'exécution précédente de la même suite) n'est jamais
+  imputé à l'auteur : pas d'urgent, une ligne dans le verdict.
 
-Une exécution rouge sur main lève aussi l'alerte `ci_main_red`
+Une exécution rouge sur une branche de base lève aussi l'alerte `ci_main_red`
 (`exploitation`, poussée par `ameesh notify` au responsable humain) : #846,
 dès qu'un échec est relevé sur une exécution de main encore en cours, sans
 attendre ses jobs agrégateurs — un job rouge sans événement de test publié
@@ -62,6 +67,7 @@ Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas enco
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime
 
@@ -75,6 +81,15 @@ WORKFLOWS = ("tests.yml",)
 #: avant de réessayer après un échec de l'API
 DISCOVERY_TTL = 3600.0
 DISCOVERY_RETRY = 300.0
+#: #1483 : un workflow *découvert* n'est suivi que s'il a la forme d'une suite
+#: de tests. Sans liste déclarée, la découverte suivait tous les workflows
+#: actifs : sur un dépôt comme Nexlink (déploiements, sondes, synchronisation),
+#: chaque exécution terminée rendait un verdict de bruit à l'auteur du lot. La
+#: liste déclarée (`github.projects.<projet>.workflows`) reste le moyen
+#: explicite de suivre un workflow au nom inhabituel, et les workflows écartés
+#: sont journalisés une fois — aucun n'est ignoré en silence.
+SUITE_RE = re.compile(r"(?:^|[-_.])(?:suites?|tests?|invariants?|e2e)(?:[-_.]|$)",
+                      re.IGNORECASE)
 #: états GitHub d'une exécution pas encore conclue que le relevé lit : une
 #: exécution en attente d'un runner est vue dès la poussée, avant que
 #: l'exécution qu'elle remplace soit annulée
@@ -86,9 +101,16 @@ CATCHUP_WINDOW = 3600.0
 #: préfixe du nom des check runs publiés par `scripts/ci-flow.py publish`
 CHECK_PREFIX = "tests (flux)"
 SCHEMA = "ameesh-test-event/1"
-#: branches de base : une exécution n'y est jamais remplacée, et ses échecs
-#: servent de référence au rouge hérité
+#: branches de base par défaut : une exécution n'y est jamais remplacée, et ses
+#: échecs servent de référence au rouge hérité. Un dépôt dont la base n'est pas
+#: `main` — Nexlink, dont la base est `develop` — la déclare dans
+#: `github.projects.<projet>.base` (#1483).
 BASE_BRANCHES = ("main",)
+#: #1483 : taille des pages de listes d'exécutions du veilleur (l'API GitHub
+#: plafonne à 100). À 50, une file de plus de 50 exécutions — tous workflows
+#: confondus — pouvait cacher une exécution suivie, que seul le rattrapage
+#: rendait, une heure plus tard.
+LIST_PER_PAGE = 100
 ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
@@ -213,12 +235,19 @@ def failed_jobs_of(check_runs, run_id: int) -> list[str]:
     return sorted(out)
 
 
-def lot_of_run(run: dict, lots: list[dict]) -> int | None:
+def _base_set(branches) -> frozenset:
+    """Les branches de base, en minuscules : la comparaison d'une branche
+    GitHub ne dépend pas de la casse (#1483)."""
+    return frozenset(str(b).casefold() for b in (branches or BASE_BRANCHES))
+
+
+def lot_of_run(run: dict, lots: list[dict], bases=BASE_BRANCHES) -> int | None:
     """Le lot d'une exécution : par sa branche (lots ouverts), sinon par la
-    ligne `ameesh-work:` de son commit de tête."""
+    ligne `ameesh-work:` de son commit de tête. `bases` : les branches de base
+    du dépôt (#1483), sur lesquelles aucune branche de lot n'est cherchée."""
     from .plan_git import WORK_TRAILER_RE
     branch = (run.get("head_branch") or "").casefold()
-    if branch and branch not in BASE_BRANCHES:
+    if branch and branch not in _base_set(bases):
         for lot in lots:
             if (lot.get("branch") or "").casefold() == branch:
                 return int(lot["id"])
@@ -227,13 +256,28 @@ def lot_of_run(run: dict, lots: list[dict]) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def base_of(run: dict) -> str:
-    """La branche de référence du rouge hérité : la cible de la PR, sinon main."""
+def base_of(run: dict, default: str = BASE_BRANCHES[0]) -> str:
+    """La branche de référence du rouge hérité : la cible de la PR, sinon la
+    base du dépôt (`default`, #1483 : `develop` pour Nexlink)."""
     for pr in run.get("pull_requests") or ():
         ref = ((pr.get("base") or {}).get("ref")) or ""
         if ref:
             return ref
-    return BASE_BRANCHES[0]
+    return default
+
+
+def _obsolete_head(run: dict, lot: dict | None, bases=BASE_BRANCHES) -> bool:
+    """#1161 : la branche du lot connaît une tête plus récente (`branch_head`,
+    posé par le relevé des branches) que celle de l'exécution — son verdict
+    porterait sur une tête remplacée, et l'exécution de remplacement peut être
+    `pending`, invisible au veilleur. Le silence vaut mieux qu'un faux vert.
+    Jamais sur une branche de base (#1483) : chaque tête y a son lot, et le
+    relevé normal n'y remplace jamais rien."""
+    branch = run.get("head_branch") or ""
+    if not branch or branch.casefold() in _base_set(bases):
+        return False
+    known = (lot or {}).get("branch_head") or ""
+    return bool(known) and (run.get("head_sha") or "") != known
 
 
 # --------------------------------------------------------------------------
@@ -425,6 +469,10 @@ class Watcher:
         #: avertissements déjà journalisés par ce passage de service
         self._warned_workflows: set = set()
         self.ttl = None if ttl is None else float(ttl)
+        #: #1483 : workflows découverts écartés (pas une suite), listes
+        #: d'exécutions tronquées — journalisés une fois par passage
+        self._warned_skipped: set = set()
+        self._warned_truncated: set = set()
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -451,6 +499,17 @@ class Watcher:
         if not settings.projects or settings.host != getattr(self.cfg, "host", None):
             return []
         return sorted(set(settings.projects.values()))
+
+    def bases(self, repo: str) -> tuple:
+        """Les branches de base d'un dépôt (#1483) : celles que déclare
+        `github.projects.<projet>.base`, en tête (la première est la référence
+        d'un push hors PR), puis `BASE_BRANCHES` — `main` reste une base même
+        quand le dépôt déclare `develop` : traitée en branche de lot, chaque
+        tête de main y remplacerait la précédente et retirerait son verdict,
+        comme `ci_main_red` la lit déjà."""
+        settings = self.settings()
+        declared = settings.bases_for(repo) if settings else None
+        return tuple(dict.fromkeys(tuple(declared or ()) + BASE_BRANCHES))
 
     def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
         """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
@@ -482,8 +541,13 @@ class Watcher:
         """Les workflows suivis d'un dépôt : la liste déclarée
         (`github.projects.<projet>.workflows`) si elle existe, sinon le défaut
         L161 tant que le dépôt publie `tests.yml`, sinon les workflows actifs
-        découverts — un dépôt dont les suites portent d'autres noms n'est
-        jamais ignoré en silence (#1110)."""
+        découverts qui ont la forme d'une suite de tests (#1110, #1483 : un
+        workflow d'exploitation — déploiement, sonde, synchronisation — ne rend
+        pas de verdict de bruit à l'auteur du lot). Les workflows écartés sont
+        journalisés, et la liste déclarée les suit explicitement ; si aucun
+        workflow découvert ne ressemble à une suite, le comportement de #1110
+        est conservé (tous suivis) pour qu'aucune suite au nom inhabituel ne
+        soit perdue."""
         settings = self.settings()
         declared = settings.workflows_for(repo) if settings else None
         found = self.discovered_workflows(repo)
@@ -498,7 +562,34 @@ class Watcher:
             return WORKFLOWS
         if WORKFLOWS[0] in found:
             return WORKFLOWS
-        return found
+        suites = tuple(w for w in found if SUITE_RE.search(w))
+        if not suites:
+            if (repo, "") not in self._warned_skipped:
+                self._warned_skipped.add((repo, ""))
+                self.log("CI %s: no discovered workflow looks like a test suite, "
+                         "following all of them (#1110)" % repo)
+            return found
+        skipped = tuple(w for w in found if w not in suites)
+        if skipped and (repo, skipped) not in self._warned_skipped:
+            self._warned_skipped.add((repo, skipped))
+            self.log("CI %s: discovered workflow(s) not followed (not a test suite): %s; "
+                     "declare them in github.projects to follow them"
+                     % (repo, ", ".join(skipped)))
+        return suites
+
+    def _listed(self, repo: str, status: str) -> list[dict]:
+        """La liste des exécutions d'un état (#1483), page `LIST_PER_PAGE`.
+        Une liste tronquée est journalisée une fois : au-delà, une exécution
+        suivie peut rester cachée derrière une file d'autres workflows."""
+        data = self.api("repos/%s/actions/runs?status=%s&per_page=%d"
+                        % (repo, status, LIST_PER_PAGE)) or {}
+        runs = list(data.get("workflow_runs") or ())
+        total = int(data.get("total_count") or 0)
+        if total > len(runs) and (repo, status) not in self._warned_truncated:
+            self._warned_truncated.add((repo, status))
+            self.log("CI %s: %s run list truncated (%d of %d), a followed run may "
+                     "be seen late" % (repo, status, len(runs), total))
+        return runs
 
     def tick(self, db) -> list[dict]:
         """Un relevé de chaque dépôt ; rend les envois et retraits."""
@@ -529,22 +620,22 @@ class Watcher:
     def watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
         followed = set(self.followed_workflows(repo))
+        bases = self.bases(repo)
         live = {}
         for status in LIVE_STATUSES:
-            data = self.api("repos/%s/actions/runs?status=%s&per_page=50" % (repo, status)) or {}
-            for r in data.get("workflow_runs") or ():
+            for r in self._listed(repo, status):
                 if workflow_of(r.get("path")) in followed:
                     live.setdefault(int(r["id"]), r)
         lots = [r for r in st.work.open_for_sweep(500) if r.get("branch")]
         out: list[dict] = []
         for run_id in sorted(live):
-            out += self._follow(db, repo, live[run_id], lots)
+            out += self._follow(db, repo, live[run_id], lots, bases)
         # #747 : fin de l'attente d'un runner, distincte de la durée des tests
         st.ci.mark_started(repo, [i for i, r in live.items()
                                   if r.get("status") == "in_progress"])
         # les exécutions courtes, nées et finies entre deux passages, n'ont
         # jamais été vues « en cours » : rattrapage borné (#1110)
-        out += self._catch_up(db, repo, lots, followed)
+        out += self._catch_up(db, repo, lots, followed, bases)
         # les lignes que ce passage conclut sont figées AVANT les envois : le
         # verdict d'un workflow ne cite pas comme « encore en cours » un
         # workflow conclu dans le même passage (#1110)
@@ -557,7 +648,7 @@ class Watcher:
             if (run.get("status") or "") == "completed":
                 finishing[int(row["run_id"])] = run
         for row in running:
-            out += self._failures(db, repo, row)
+            out += self._failures(db, repo, row, bases)
             run = finishing.get(int(row["run_id"]))
             if run is None:
                 continue
@@ -572,15 +663,18 @@ class Watcher:
         self._guard(db, repo)
         return out
 
-    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
+    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str],
+                  bases=BASE_BRANCHES) -> list[dict]:
         """Les exécutions terminées entre deux passages (#1110) : une exécution
         courte n'est jamais vue « en cours », donc jamais conclue sans ce
         rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
-        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
-        la même branche est ignorée (pas de verdict périmé)."""
+        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée est
+        ignorée (pas de verdict périmé) — **sauf sur une branche de base**
+        (#1483) : chaque tête de `main` porte un lot différent, le relevé normal
+        n'y remplace jamais rien, et écarter la tête M1 quand M2 est déjà
+        relevée perdait le verdict et le réveil du lot fusionné avec M1."""
         st = storage.of(db)
-        data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
-        runs = list(data.get("workflow_runs") or ())
+        runs = self._listed(repo, "completed")
         # les exécutions que ce passage conclut (relevé normal compris) sont
         # figées AVANT les envois : un verdict du rattrapage ne cite pas comme
         # « encore en cours » un workflow conclu dans le même passage (#1110)
@@ -598,13 +692,21 @@ class Watcher:
                 continue
             head = run.get("head_sha") or ""
             branch = run.get("head_branch") or ""
-            if st.ci.head_replaced(repo, branch, head, run_id):
+            if branch.casefold() not in _base_set(bases) \
+                    and st.ci.head_replaced(repo, branch, head, run_id):
                 continue
-            out += self._follow(db, repo, run, lots)
+            # #1161/#1483 : une tête du lot déjà remplacée (`branch_head`) ne
+            # rend pas de verdict — la même garde que `_follow` sur une ligne
+            # connue ; l'exécution de remplacement peut être `pending`.
+            lot = lot_of_run(run, lots, bases)
+            row_lot = next((l for l in lots if int(l["id"]) == lot), None) if lot else None
+            if _obsolete_head(run, row_lot, bases):
+                continue
+            out += self._follow(db, repo, run, lots, bases)
             row = st.ci.run(repo, run_id)
             if row is None or (run.get("status") or "") != "completed":
                 continue
-            out += self._failures(db, repo, row)
+            out += self._failures(db, repo, row, bases)
             pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
                        and r.get("branch") == branch
                        and int(r["run_id"]) not in settled]
@@ -771,7 +873,8 @@ class Watcher:
                 self.log("CI %s: guard scan incomplete (%s): %d/%d runs, %d calls, "
                          "nothing published" % (repo, reason, covered, runs_seen, calls))
 
-    def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
+    def _follow(self, db, repo: str, run: dict, lots: list[dict],
+                bases=BASE_BRANCHES) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; une exécution
         connue sans lot rattaché l'est dès que la branche du lot est posée
         (#1321), tant que sa tête est encore celle de la branche ; elle
@@ -787,7 +890,7 @@ class Watcher:
                 # `recipient_of(None)` et le verdict part à personne.
                 # `open_run` est idempotent (coalesce côté stockage) : il ne
                 # remplit que le lien encore vide.
-                lot = lot_of_run(run, lots)
+                lot = lot_of_run(run, lots, bases)
                 row = None
                 if lot is not None:
                     row = next((l for l in lots if int(l["id"]) == lot), None)
@@ -798,10 +901,11 @@ class Watcher:
                 # l'exécution de remplacement peut être `pending`, invisible
                 # au veilleur (#1161). Le silence vaut mieux qu'un faux vert.
                 known_head = (row or {}).get("branch_head") or ""
-                if lot is not None and (not known_head or head == known_head):
+                if lot is not None and not _obsolete_head(run, row, bases):
                     st.ci.open_run(repo, run_id, head_sha=head,
                                    branch=run.get("head_branch") or "",
-                                   event=run.get("event") or "", base=base_of(run),
+                                   event=run.get("event") or "",
+                                   base=base_of(run, default=bases[0]),
                                    work_item_id=lot, url=run.get("html_url"))
                     self.log("CI %s run %s: lot #%s linked (branch set later)"
                              % (repo, run_id, lot))
@@ -811,11 +915,12 @@ class Watcher:
             return []
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
-                       base=base_of(run), work_item_id=lot_of_run(run, lots),
+                       base=base_of(run, default=bases[0]),
+                       work_item_id=lot_of_run(run, lots, bases),
                        url=run.get("html_url"), workflow=workflow_of(run.get("path")),
                        created_at=run.get("created_at"))
         branch = run.get("head_branch") or ""
-        if not branch or branch in BASE_BRANCHES:
+        if not branch or branch.casefold() in _base_set(bases):
             return []
         out = []
         old = st.ci.supersede(repo, branch, run.get("head_sha") or "", run_id)
@@ -829,17 +934,17 @@ class Watcher:
                             "by": run.get("head_sha"), "withdrawn": withdrawn})
         return out
 
-    def _failures(self, db, repo: str, row: dict) -> list[dict]:
+    def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES) -> list[dict]:
         """Les échecs nouveaux d'une exécution suivie, et leur message."""
         from . import work
         st = storage.of(db)
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
-        self._record_failed_jobs(st, repo, row, checks.get("check_runs"))
+        self._record_failed_jobs(st, repo, row, checks.get("check_runs"), bases)
         if not events:
             return []
-        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
+        reference = st.ci.base_failures(repo, row.get("base") or bases[0],
                                         workflow=row.get("workflow")
                                         or workflow_of(row.get("path")))
         if reference and int(reference["run_id"]) == int(row["run_id"]):
@@ -889,13 +994,15 @@ class Watcher:
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
-    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs) -> None:
-        """#846 : sur une branche de base, un job déjà en échec est un main
-        rouge, même sans événement de test publié (panne d'installation, délai
+    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs,
+                            bases=BASE_BRANCHES) -> None:
+        """#846 : sur une branche de base, un job déjà en échec est un rouge de
+        la base, même sans événement de test publié (panne d'installation, délai
         dépassé). Relevé ici pour que `ci.main_red` alerte sans attendre la
         conclusion de l'exécution. Aucun courrier n'en part : `_failures` ne
-        signale que les événements de test (part `job` mise à part)."""
-        if row.get("branch") not in BASE_BRANCHES:
+        signale que les événements de test (part `job` mise à part). `bases` :
+        les branches de base du dépôt (#1483)."""
+        if (row.get("branch") or "").casefold() not in _base_set(bases):
             return
         for job in failed_jobs_of(check_runs, int(row["run_id"])):
             st.ci.add_failure(repo, int(row["run_id"]), part=JOB_PART, test=job,
@@ -959,7 +1066,7 @@ def describe(record: dict) -> str:
 # alerte ci_main_red
 # --------------------------------------------------------------------------
 
-def main_red(db) -> list[dict]:
+def main_red(db, bases=BASE_BRANCHES) -> list[dict]:
     """Les exécutions des branches de base qui sont rouges : la dernière
     exécution conclue de chaque workflow (un succès d'une suite ne masque pas
     l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
@@ -969,17 +1076,20 @@ def main_red(db) -> list[dict]:
     workflow est écartée : une exécution supprimée ou introuvable (l'API rend
     `{}`) n'est jamais conclue, et son job rouge garderait l'alerte, qui bloque
     les déploiements, sans fin (#1453).
+    `bases` : toutes les branches de base configurables des dépôts (#1483 ;
+    `Settings.all_bases`, le défaut `BASE_BRANCHES` restant à la charge de
+    l'appelant).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
     out, newest = [], {}
-    for row in st.ci.latest_concluded(BASE_BRANCHES):
+    for row in st.ci.latest_concluded(bases):
         key = (row["repo"], row["branch"], row.get("workflow"))
         newest[key] = max(newest.get(key, 0), int(row["run_id"]))
         if row.get("status") != "failure":
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
-    for row in st.ci.running_on(BASE_BRANCHES):
+    for row in st.ci.running_on(bases):
         if int(row["run_id"]) < newest.get(
                 (row["repo"], row["branch"], row.get("workflow")), 0):
             continue
