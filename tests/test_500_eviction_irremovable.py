@@ -608,6 +608,37 @@ class EvictionTest(unittest.TestCase):
         self.assertEqual(result["after"], B)
         self.assertFalse(result["over_quota"])
 
+    def test_dry_run_counts_a_linked_inode_once_with_a_link_outside(self):
+        # #1190 N (R2 Claude): the cache pass scans several directories under
+        # one root, and `_files` de-duplicates a hard-linked inode only inside
+        # one call. Two cache names plus a third link outside the root were
+        # counted twice by the dry run (`unremovable`, `files`) while the real
+        # pass removed the second cache name and reported the inode once. The
+        # dry run must announce the real pass.
+        c1 = os.path.join(self.mine, "cache-a")
+        c2 = os.path.join(self.mine, "cache-b")
+        os.makedirs(c1)
+        os.makedirs(c2)
+        linked = os.path.join(c1, "link")
+        _write(linked, size=5, age_s=10 * HOUR)     # 5 bytes: one 4096 block
+        os.link(linked, os.path.join(c2, "link"))
+        outside = os.path.join(self.base, "outside")
+        os.link(linked, outside)                    # out of the root: never scanned
+        filler = os.path.join(c1, "filler")
+        _write(filler, size=3 * B, age_s=9 * HOUR)  # newer: evicted after the inode
+        dry = menage.evict_lru([c1, c2], self.root, 2 * B, dry_run=True)
+        real = menage.evict_lru([c1, c2], self.root, 2 * B)
+        for key in ("before", "after", "evicted", "files", "unremovable",
+                    "over_quota", "blocked"):
+            self.assertEqual(dry[key], real[key], key)
+        self.assertEqual(real["files"], 2)
+        self.assertEqual(real["unremovable"], B)
+        self.assertEqual(real["evicted"], 3 * B)
+        self.assertTrue(os.path.exists(outside),
+                        "the link outside the root was removed")
+        self.assertFalse(os.path.exists(linked))
+        self.assertFalse(os.path.exists(filler))
+
     def test_a_hard_link_that_cannot_be_removed_keeps_the_inode_counted(self):
         # r6 (codex P2 r5): the inode is only freed when its last name is; a
         # name in a directory this user cannot write keeps the whole inode

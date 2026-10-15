@@ -1245,7 +1245,14 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     credited only when its LAST name goes (`st_nlink == 1` at the fresh check
     before the unlink; dry-run reads it from the scan) — a name the walk did
     not see (protected subtree, another root, another filesystem) keeps the
-    inode counted and reported as unremovable."""
+    inode counted and reported as unremovable.
+
+    #1190 N (R2 Claude): the cache pass scans several directories under one
+    root, and `_files` de-duplicates an inode inside one call only, so a
+    hard-linked inode is yielded once per scanned directory. The pass
+    remembers the inodes whose fate it decided (`handled`): the later names
+    are counted once, like the real pass which removes them as links of the
+    inode — the dry run then announces the same `unremovable` and `files`."""
     now = time.time() if now is None else float(now)
     try:
         root_dev = os.stat(root).st_dev
@@ -1301,10 +1308,22 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
         blocked = unremovable > quota
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
+        handled: set = set()           # #1190 N: inodes whose fate this pass decided
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
             if blocked or counted <= quota:
                 break
+            if (st.st_dev, st.st_ino) in handled:
+                # #1190 N: a hard-linked inode is a candidate once per scanned
+                # directory. The real pass removed the other names as links of
+                # the inode before deciding its fate; the dry run does not
+                # touch the disk, so the later entries leave `counted` here
+                # instead of being reported a second time as unremovable (and
+                # a second file).
+                if path not in uncounted:
+                    counted -= size
+                    uncounted.add(path)
+                continue
             if any(_in_subtree(path, d) for d in protected):
                 # #500 r4 (codex P2 r3): the subtree became protected during
                 # the pass (`.git` appeared, mount point): its bytes are not
@@ -1387,6 +1406,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     failed.append(path)
                     break
             files += 1
+            handled.add((st.st_dev, st.st_ino))   # #1190 N: later names counted once
             if freed:
                 # #530: a name removed from an inode another hard link still
                 # holds frees no byte; only the last link credits the quota.
