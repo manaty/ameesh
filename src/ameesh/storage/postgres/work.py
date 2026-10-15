@@ -1162,7 +1162,8 @@ class WorkItems(interface.WorkItems):
             rows = self.db.query(
                 "UPDATE merge_locks SET expires_at = clock_timestamp()"
                 " + %s * interval '1 second'"
-                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                " WHERE target = %s AND owner = %s AND epoch = %s"
+                " AND expires_at > clock_timestamp() RETURNING epoch",
                 (float(ttl_s), key, owner, int(epoch)))
             return int(rows[0]["epoch"]) if rows else None
         rows = self.db.query(

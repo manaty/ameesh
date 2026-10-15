@@ -103,7 +103,11 @@ class _Base(unittest.TestCase):
         self.lot_target = "main"
         self.lot_marks = []
         self.ready_marks()
+        # These Git/PR fixtures simulate storage. #1680's real shared-lease
+        # exclusion and fencing are exercised by test_1680_packet_reservation.
+        self.writer = mock.Mock()
         for patch in (
+                mock.patch("ameesh.packet_reservation.WriterLease", return_value=self.writer),
                 mock.patch.object(work, "get", side_effect=self._lot_row),
                 mock.patch.object(work, "milestones",
                                   side_effect=lambda db, n, *a, **kw: list(self.lot_marks))):
@@ -161,6 +165,23 @@ class _Base(unittest.TestCase):
 
 
 class GuardTest(_Base):
+    def test_reserved_packet_target_prevents_merge_construction(self):
+        from ameesh.packet_reservation import ReservationError
+        self.writer.acquire.side_effect = ReservationError("target reserved")
+        with mock.patch.object(merge_pr, "_fetch") as fetch:
+            with self.assertRaisesRegex(merge_pr.MergePrError, "reserved"):
+                self.merge(self.gh())
+        fetch.assert_not_called()
+        self.assertEqual(self.tip(), self.base)
+
+    def test_lost_target_lease_prevents_the_remote_push(self):
+        from ameesh.packet_reservation import ReservationError
+        self.writer.refresh.side_effect = ReservationError("reservation lost before push")
+        with self.assertRaisesRegex(merge_pr.MergePrError, "lost before push"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+        self.writer.release.assert_called_once()
+
     def test_dry_run_builds_the_merge_commit_without_pushing(self):
         gh = self.gh()
         out = self.merge(gh, dry_run=True)

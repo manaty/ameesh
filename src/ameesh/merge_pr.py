@@ -93,8 +93,9 @@ import re
 import shutil
 import tempfile
 import time
+from types import SimpleNamespace
 
-from . import land, merge_queue, migrations, plan_git, radar, resolutions, work
+from . import land, merge_queue, migrations, packet_reservation, plan_git, radar, resolutions, work
 from .canon import FETCH_TIMEOUT, GitError
 
 #: the path that makes the API refuse the merge
@@ -521,6 +522,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
 
     owner = work_dir or _scratch()
+    reservation = None
     temporary = work_dir is None
     try:
         state = (view.get("state") or "").upper()
@@ -551,6 +553,17 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         if _branch_name(ready.get("target")) != _branch_name(target):
             raise MergePrError("lot #%d is queued for %s, not %s: merge it on its own target"
                                % (lot, ready.get("target") or "?", target))
+        # #1680: use the queue's exact target spelling and project identity.
+        # Before #1374 lands, origin/develop and develop are distinct keys;
+        # inventing a canonical key here would bypass the installed queue.
+        lease_project = project
+        if lease_project is None:
+            app = (work.get(db, lot).get("app") or "").strip()
+            if not app:
+                raise MergePrError("cannot reserve an undeclared target project")
+            lease_project = SimpleNamespace(name=app)
+        reservation = packet_reservation.WriterLease(db, lease_project, ready["target"])
+        reservation.acquire()
         api_base = (view.get("baseRefOid") or "").lower()
         merge_state = (view.get("mergeStateStatus") or "").upper()
 
@@ -651,6 +664,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
             return evidence
 
         ref = "refs/heads/%s" % target
+        reservation.refresh()
         try:
             proc = _run(owner, "push", "--quiet", "--no-verify",
                         "--force-with-lease=%s:%s" % (ref, tip), push_url,
@@ -687,7 +701,11 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                 % (merge_sha[:12], target, final or "?", merged_sha[:12] or "?",
                    target, remote_tip[:12] or "?"))
         return evidence
+    except packet_reservation.ReservationError as exc:
+        raise MergePrError(str(exc)) from exc
     finally:
+        if reservation is not None:
+            reservation.release()
         if temporary:
             shutil.rmtree(owner, ignore_errors=True)
 
