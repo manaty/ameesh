@@ -221,7 +221,12 @@ class Mechanics:
         """
         if isinstance(paths, (str, bytes)):
             raise MechanicsError("a list of repository paths is required")
-        paths = list(paths)
+        try:
+            paths = list(paths)
+        except TypeError as exc:
+            # une entrée non itérable (None, un nombre…) est un appel hors
+            # contrat : elle refuse par MechanicsError, jamais par TypeError
+            raise MechanicsError("a list of repository paths is required") from exc
         if not paths:
             # un changement sans fichier ne se classe pas : zéro avis serait un repli
             raise MechanicsError("no path to classify")
