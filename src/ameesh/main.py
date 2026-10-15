@@ -65,6 +65,11 @@
         | identity <agent> [--json]
         the gh commands run by agents, journaled per turn (who cancelled,
         merged, labelled), and the GitHub identity an agent resolves to (#1645);
+  ameesh identity verify [JETON|-] [--issuer U --client-id C] [--domain D]
+                         [--binding subject|email]
+        vérifie un jeton d'identité OIDC et le rattache au canon (le couple
+        `{issuer, subject}` d'une fiche Member par défaut, `emails` sur choix
+        explicite) : L86, lot #377 ; sortie 3 si aucun membre ne correspond ;
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -330,6 +335,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "session":
         from . import session_backup
         return session_backup.main(rest)
+    if command == "identity":
+        # L86 (0033 §4) : identité des humains par OIDC et rattachement au canon
+        from . import oidc
+        return oidc.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat

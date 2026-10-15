@@ -241,6 +241,20 @@ cycles. `canon show --json` preserves these relationships, and each agent's
 card type, roles and harness preference list. These cards declare the relationships; authorisation
 enforcement belongs to subsequent v2 work.
 
+**OIDC identity of human members** (L86, lot #377; decision 0033 §4) — the
+provider chosen by the organisation says *who* the human is, the canon says
+*what they are*. `ameesh.oidc` verifies the token signature (RS256 through the
+`crypto` extra, ES256 through `p256.py`), then binds the verified token to one
+member: by default the exact `{issuer, subject}` pair of `oidc_subjects:`
+(option B, the recommendation — OIDC Core §5.7, an e-mail can be reassigned),
+or the verified e-mail of `emails:` (option A) when the owner explicitly sets
+`identity.binding: email`. The choice between them belongs to the owner
+(proposal manaty/home#97, 0033 phase 2): `oidc_subjects:` lists
+`{issuer, subject}` pairs, stable when the e-mail changes. A verified
+token bound to exactly one member gives `human:<id>`; otherwise it is bound to
+nobody (fail closed). Signing in grants no approval: the passkey remains the
+authority (0012).
+
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
 
 ```yaml
