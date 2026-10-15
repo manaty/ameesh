@@ -102,6 +102,11 @@ s'enregistre (`ok` faux). Le rapport n'est pas un verdict : il ne remplace ni
 #1617 (désignation au gel) ni #1756 (gel dérivé), et son écriture n'active
 aucune règle.
 
+Le rapport est **imprimé avant l'écriture** : tant que 0450 n'est pas déployée
+(cas de la preuve d'avant fusion), l'écriture échoue en `SchemaMissing`,
+l'avertissement nomme la cause et `ameesh migrate`, et le sort du run ne change
+pas — un run réel ne se perd jamais parce que la table manque.
+
 Tant que le bloc canon n'est pas publié, la commande refuse donc toujours :
 c'est l'effet voulu de l'ordre de mise en service.
 
