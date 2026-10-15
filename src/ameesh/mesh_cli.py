@@ -1315,6 +1315,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "land":   # merge of the head of the queue (L160e2)
             from . import land
             return land.run(cfg, db, args)
+        if args.work_command == "merge-pr":   # REL-11 (#1003) : fusion hors API gh
+            from . import merge_pr
+            return merge_pr.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -1342,7 +1345,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
-                note=introduced)
+                note=introduced, parent_lot=args.parent_lot)
             print("lot #%d created in %s: %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan: %s)" % item["package_id"] if item.get("package_id") else "",
@@ -2332,6 +2335,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--budget", type=float, default=None)
     pw_add.add_argument("--actor", default="")
     pw_add.add_argument("--package", default=None, help="WorkPackage card of the work item (L29)")
+    pw_add.add_argument("--parent-lot", type=int, default=None, metavar="LOT",
+                        help="#1193: parent of a suite lot: its blocking prerequisite, linked "
+                             "with the creation (unknown parent refused)")
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")
@@ -2478,6 +2484,8 @@ def build_parser() -> argparse.ArgumentParser:
     merge_queue.add_parser(work_sub, cmd_work)  # merge queue per target (L160e)
     from . import land
     land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
+    from . import merge_pr
+    merge_pr.add_parser(work_sub, cmd_work)  # fusion hors API gh (REL-11, #1003)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
@@ -2674,10 +2682,12 @@ def cmd_cost(cfg: Config, args) -> int:
             print("accounts: invalid configuration: %s" % exc, file=sys.stderr)
             comptes = []
         actifs = {}
+        rythmes = {}
         for ligne in comptes:
             if ligne["active"]:
                 actifs[ligne["harness"]] = (ligne["account"], ligne["_gauges"])
-        rows = book.report(accounts=actifs)
+                rythmes[ligne["harness"]] = ligne.get("pace_multiplier", 1.0)
+        rows = book.report(accounts=actifs, multipliers=rythmes)
         for ligne in comptes:
             ligne.pop("_gauges", None)
         if comptes:
@@ -2729,7 +2739,9 @@ def _cost_report_reads(cfg: Config, db) -> None:
         comptes = []
     actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
               for ligne in comptes if ligne["active"]}
-    book.report(accounts=actifs)
+    rythmes = {ligne["harness"]: ligne.get("pace_multiplier", 1.0)
+               for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs, multipliers=rythmes)
     _real_spend_24h(db)
 
 

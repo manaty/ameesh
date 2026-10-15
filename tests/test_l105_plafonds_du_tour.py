@@ -20,7 +20,7 @@ from ameesh import adapters, cli, mail, registry, storage
 from ameesh.mesh_cli import parse_duration
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import EMPTY_CONFIG, FAKEBIN, PgTestCase
 
 
 class LectureDuFluxTest(unittest.TestCase):
@@ -200,10 +200,10 @@ class DureeMaximaleTest(_Base):
         self.assertEqual(config_mod.Config().turn_mail_max, 20)  # 5 avant le 2026-10-11
         cfg = config_mod.load(env={"AMEESH_TURN_MAX_SECONDS": "600",
                                    "AMEESH_TURN_MAIL_MAX": "2",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual((cfg.turn_max_seconds, cfg.turn_mail_max), (600.0, 2))
         cfg = config_mod.load(env={"AMEESH_TURN_MAIL_MAX": "nan",
-                                   "AMEESH_CONFIG": "/nulle-part.json"})
+                                   "AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.turn_mail_max, 20)
 
 

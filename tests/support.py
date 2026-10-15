@@ -67,9 +67,14 @@ for _name in list(os.environ):
 #: ~/.config/agent-mesh/config.json) n'est jamais lue : ses canons imposent un
 #: responsable humain, fixent fils et hôte. Les tests de configuration posent
 #: leur propre AMEESH_CONFIG. HOME reste celui du poste (~/.pgpass du banc).
-ABSENT_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "absent.json")
-os.environ["AMEESH_CONFIG"] = ABSENT_CONFIG
-os.environ["AGENT_MESH_CONFIG"] = ABSENT_CONFIG
+#: « Aucune config » se dit par un fichier VIDE mais EXISTANT : un chemin
+#: explicite absent est refusé (#1127), et un chemin absent ne peut donc plus
+#: servir de sentinelle.
+EMPTY_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "empty.json")
+with open(EMPTY_CONFIG, "w", encoding="utf-8") as _fh:
+    _fh.write("{}\n")
+os.environ["AMEESH_CONFIG"] = EMPTY_CONFIG
+os.environ["AGENT_MESH_CONFIG"] = EMPTY_CONFIG
 # la surcharge AMEESH_CODEX_SESSIONS prime sur CODEX_HOME : jamais héritée
 os.environ.pop("AMEESH_CODEX_SESSIONS", None)
 TEST_DSN = os.environ.get(
