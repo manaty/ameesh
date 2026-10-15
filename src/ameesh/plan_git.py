@@ -40,7 +40,10 @@ absorbé par un autre ou remplacé se clôt par `ameesh work close <id>
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import tempfile
 
 from . import storage
 from . import work as work_mod
@@ -114,11 +117,71 @@ def _diff_patch_id(repo: str, base: str, head: str) -> str | None:
     return next(iter(ids), None)
 
 
+def _applies(repo: str, tree: str, patch: bytes, *, reverse: bool = False) -> bool:
+    """Le diff `patch` s'applique (ou se défait, `reverse`) sur l'arbre `tree`.
+
+    L'arbre est porté par un index temporaire (`GIT_INDEX_FILE`) : ni le
+    worktree ni l'index réels du dépôt ne sont lus ou écrits. Un arbre
+    illisible rend False — l'appelant ne conclut alors pas au retrait."""
+    scratch = tempfile.mkdtemp(prefix="ameesh-apply-")
+    try:
+        env = {"GIT_INDEX_FILE": os.path.join(scratch, "index")}
+        if _git(repo, "read-tree", tree, env=env).returncode != 0:
+            return False
+        args = ["apply", "--cached", "--check"]
+        if reverse:
+            args.append("--reverse")
+        return _git(repo, *args, "-", stdin=patch, env=env).returncode == 0
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _content_gone(repo: str, sha: str, head: str) -> str | None:
+    """`sha` est ancêtre de `head`, mais son contenu n'y est plus : la raison,
+    sinon None.
+
+    Une composition retirée du paquet (revert) laisse le commit ancêtre et
+    défait son diff : l'ascendance seule ne prouve alors plus rien (constat
+    qa-01, #498 / 043e14d8e). Le contenu est jugé là quand le diff du gel se
+    défait sur l'arbre de la cible, et retiré quand il s'y réapplique
+    proprement. Arbres évolués (les deux échouent) : seuls les fichiers
+    ajoutés par le lot et disparus, ou supprimés et revenus, prouvent le
+    retrait — un doute ne conclut jamais au retrait."""
+    parent = _out(repo, "rev-parse", "--verify", "--quiet", sha + "^1")
+    if parent is None:
+        return None
+    diff = _git(repo, "diff", "--no-color", parent, sha)
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return None
+    forward = _applies(repo, head, diff.stdout)
+    reverse = _applies(repo, head, diff.stdout, reverse=True)
+    if forward and not reverse:
+        return "its diff applies to the tree again"
+    if reverse and not forward:
+        return None
+    # les deux échouent (arbres évolués) : seuls les chemins ajoutés disparus
+    # ou supprimés revenus prouvent le retrait
+    status = _out(repo, "diff", "--name-status", parent, sha)
+    for line in (status or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        kind, path = parts[0][:1], parts[-1]
+        present = _out(repo, "rev-parse", "--verify", "--quiet",
+                       "%s:%s" % (head, path)) is not None
+        if kind == "A" and not present:
+            return "the file %s it added is no longer in the tree" % path
+        if kind == "D" and present:
+            return "the file %s it deleted is back in the tree" % path
+    return None
+
+
 def probe(repo: str, sha: str, target: str) -> dict:
     """Le commit `sha` est-il entré dans `target` ? Rend `{merged, how, ref, detail}`.
 
     `how` : ancestor | patch-id | squash ; `ref` : le commit de la cible qui
-    porte le contenu (le gel lui-même s'il est ancêtre)."""
+    porte le contenu (le gel lui-même s'il est ancêtre). Un ancêtre dont le
+    contenu a été retiré (revert d'une composition) n'est pas fusionné."""
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
@@ -129,6 +192,11 @@ def probe(repo: str, sha: str, target: str) -> dict:
         return {"merged": False, "how": None, "ref": None,
                 "detail": "commit %s not in the repository" % sha[:12]}
     if _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0:
+        gone = _content_gone(repo, frozen, head)
+        if gone:
+            return {"merged": False, "how": None, "ref": None,
+                    "detail": "%s is an ancestor of %s but its content is no longer in the "
+                              "tree (composition reverted): %s" % (frozen[:12], target, gone)}
         return {"merged": True, "how": "ancestor", "ref": frozen,
                 "detail": "%s is an ancestor of %s" % (frozen[:12], target)}
     base = _out(repo, "merge-base", frozen, head)
@@ -589,6 +657,11 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
         return seen() or mention("branch %s not found (neither local nor origin/)" % branch)
     if _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0:
         if not _on_first_parent(repo, tip, head):
+            gone = _content_gone(repo, tip, head)
+            if gone:
+                return dict(out, detail="%s (%s) entered %s through a merge commit but its "
+                                        "content is no longer in the tree (composition "
+                                        "reverted): %s" % (branch, tip[:12], target, gone))
             return dict(out, merged=True, how="ancestor", ref=tip,
                         detail="%s (%s) entered %s through a merge commit"
                                % (branch, tip[:12], target))
