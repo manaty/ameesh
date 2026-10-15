@@ -52,10 +52,6 @@ SELECT format('REVOKE EXECUTE ON FUNCTION %I.ameesh_module_agent(text) FROM %I',
 -- Module policy writes belong exclusively to isolated canon synchronization.
 SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
               :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
--- Only the independently enrolled release controller may write these fences.
-SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.%I FROM %I', :'schema', name, :'role')
-  FROM unnest(ARRAY['host_release_operations','host_release_fences','host_release_fence_receipts']) name
- WHERE to_regclass(format('%I.%I', :'schema', name)) IS NOT NULL \gexec
 -- #326 r4: the key journal's order is the server's; no setval on its ids
 SELECT format('REVOKE UPDATE ON SEQUENCE %I.key_events_id_seq FROM %I', :'schema', :'role')
  WHERE to_regclass(format('%I.key_events_id_seq', :'schema')) IS NOT NULL \gexec
@@ -159,13 +155,13 @@ BEGIN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
                 END IF;
             END LOOP;
-        ELSIF item.relname IN ('project_modules','host_release_operations','host_release_fences','host_release_fence_receipts') THEN
+        ELSIF item.relname = 'project_modules' THEN
             IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
-                violations := violations || format('missing SELECT on %s', item.relname);
+                violations := violations || 'missing SELECT on project_modules';
             END IF;
             FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
                 IF has_table_privilege(r, item.oid, privilege) THEN
-                    violations := violations || format('forbidden %s on %s', privilege, item.relname);
+                    violations := violations || format('forbidden %s on project_modules', privilege);
                 END IF;
             END LOOP;
         ELSE

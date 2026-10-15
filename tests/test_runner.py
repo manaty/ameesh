@@ -710,7 +710,17 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
-        env = self.env(AMEESH_TEST_SLEEP="12", AMEESH_LEASE_TTL="3")
+        # Le témoin mesure la clôture au bail perdu, pas la porte d'hôte réelle
+        # de la machine (en CI, l'hôte se retire : draining, user_active).
+        # Garde factice : un hôte prêté exige `file`, mais l'état lu est celui
+        # du banc (disponible), pas le fichier réel de l'hôte.
+        gate_state = os.path.join(self.tmp, "gate-available.json")
+        with open(gate_state, "w", encoding="utf-8") as fh:
+            fh.write('{"schema": "ameesh-host-state/1", "state": "available", "seq": 1}\n')
+        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
+                       AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
+                       AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
+                       AMEESH_HOST_GATE_FALLBACK="available")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
@@ -718,7 +728,7 @@ class RunnerTest(PgTestCase):
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
             self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=15)
+                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=60)
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=10)

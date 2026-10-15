@@ -120,14 +120,19 @@ def _stale_lot(alert: dict) -> str:
                 "ameesh work assign %d <agent>" % (who, who, lot, lot))
     else:
         move = "assign it: ameesh work assign %d <agent>" % lot
+    # L368: a dependency declared towards an open parent lot is a planned wait,
+    # which already suppresses the alert and its 6 h reminder. The brief must
+    # offer it, otherwise a stacked lot is triaged in vain every 6 h (#1642) ;
+    # #1261 le disait déjà « the alert stops while the wait is planned ».
+    hold = ("if the lot is parked on another open lot, declare the dependency that stops "
+            "the reminders (the alert stops while the wait is planned): "
+            "ameesh work dependencies %d --add <blocker>" % lot)
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
-            "--sha <reviewed head>; if the lot is parked on another open lot, declare the "
-            "dependency (the alert stops while the wait is planned): "
-            "ameesh work dependencies %d --add <blocker>; otherwise %s; if it is no longer "
-            "needed: ameesh work close %d --abandoned (or --superseded-by <id>)."
-            % (head, lot, lot, lot, move, lot))
+            "--sha <reviewed head>; %s; otherwise %s; if it is no longer needed: ameesh work "
+            "close %d --abandoned (or --superseded-by <id>)."
+            % (head, lot, lot, hold, move, lot))
 
 
 def _plan_underused(alert: dict) -> str:

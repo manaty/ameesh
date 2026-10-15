@@ -74,8 +74,7 @@ policy:
       cpu_pressure_max: 20%       # PSI cpu "some", avg60, outside the guest
       memory_pressure_max: 2%     # PSI memory "some", avg60
       busy_units: ["actions.runner.*"]   # systemd unit patterns (CI jobs)
-      busy_tasks: ["Runner.Worker"]      # a unit counts only with such a task in its cgroup
-      busy_max: 4                 # requires busy_units; >= warns, > stops the guest
+      busy_max: 4                 # requires busy_units
       io_pressure_max: 20%        # PSI io "some", avg60 (ameesh guard, L159e)
       disk_free_min: 10GiB        # watched free space under this (ameesh guard, L159e)
       disk_paths: ["/", "/srv/ameesh-guest"]   # filesystems watched (ameesh guard, L159e)
@@ -110,17 +109,6 @@ policy:
   explicit null is refused for every `reclaim` key: it is not an absent
   key, and it used to disable a threshold or fall back to a default,
   silently. A `%` sign is single (`20%%` is not 20).
-- **`busy_units` compte des jobs, pas des unités chargées** (#1256) : sans
-  `busy_tasks`, chaque unité active qui correspond compte (juste quand le job
-  *est* l'unité — une unité transitoire ou un scope). Avec `busy_tasks` (une
-  liste de motifs, sous-chaînes de la ligne de commande d'une tâche), une
-  unité ne compte que si une tâche de **son propre cgroup** correspond : un
-  service d'écoute CI persistant reste `active` entre deux jobs et ne compte
-  donc plus à tort. La portée par cgroup est ce qui tient les workers d'un
-  autre invité hors du compte. Un cgroup illisible compte (un job qu'on ne
-  peut pas exclure ne doit pas faire gagner l'invité). `busy_max` : à
-  `busy >= busy_max` l'invité est averti (niveau 1), à `busy > busy_max` il
-  est arrêté (niveau 3). `busy_tasks` sans `busy_units` est refusé.
 - Mise à jour d'une offre existante : les graphies de `disk_paths` que le
   lecteur précédent acceptait nomment les mêmes dossiers et sont lues
   normalisées au lieu de faire refuser l'offre — plusieurs slashes de tête
@@ -169,7 +157,7 @@ and `lendable` when these are objects. A value that is not measured is
 | `tmp_path`, `tmp_fstype`, `tmp_size_bytes`, `tmp_used_bytes` | `/tmp` and its use (L73) |
 | `on_ac`, `battery_percent`, `metered` | power supply and metered network; `null` on a VM |
 | `user_idle_s` | seconds since the last input; `null` on a VM |
-| `busy` | application jobs in progress (CI jobs); with `busy_tasks`, a matched unit only counts when one of its cgroup's tasks matches — an idle persistent listener stays out; a unit whose cgroup is unreadable counts; `null` without `busy_units` |
+| `busy` | application activity units in progress (CI jobs); `null` without `busy_units` |
 | `lendable` | `{cpu, memory_bytes, disk_bytes}`, capped by the offer; `null` when nothing could be computed |
 
 On a VM, the guest is the cgroups `ameesh-guest.slice` and

@@ -37,9 +37,6 @@
   agent-mesh housekeeping [--dry-run | --apply] [--json] agent cleanup (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   conflict radar between work items (L160b)
   agent-mesh ci status <item> [--limit N] [--json]      live CI, failures (L161c)
-  agent-mesh ci run <item> [--avis N] [--exception …]   the CI of a frozen lot, once,
-        [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
-  agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
@@ -1327,9 +1324,6 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "merge-pr":   # REL-11 (#1003) : fusion hors API gh
             from . import merge_pr
             return merge_pr.run(cfg, db, args)
-        if args.work_command == "fire":   # #1374 : le feu du pilote au gel
-            from . import fire
-            return fire.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -2274,45 +2268,6 @@ def build_parser() -> argparse.ArgumentParser:
                              help="maximum runs shown (default 5)")
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
     p_ci_status.set_defaults(func=cmd_ci)
-    # #1343 (canon §3) : la CI d'un lot part au gel, après les verdicts requis,
-    # par une étiquette `ci-lot-<sha>`/`ci-full-<sha>` posée sur la PR.
-    p_ci_run = ci_sub.add_parser(
-        "run", help="request the CI of a frozen lot, once, on the frozen head, "
-                    "by the ci-lot/ci-full label (#1343)")
-    p_ci_run.add_argument("id", type=int, help="work item number")
-    p_ci_run.add_argument("--sha", default="", help="the frozen commit (default: the "
-                          "last `frozen` milestone)")
-    p_ci_run.add_argument("--avis", type=int, default=1,
-                          help="required independent verdicts on the frozen commit: "
-                               "0 (lot léger), 1 (sensible), 2 (SQL/sécurité/prod)")
-    p_ci_run.add_argument("--exception", choices=("incident", "unblock"), default="",
-                          help="incident|unblock: CI in parallel of the review, marked "
-                               "(canon §3); requires --reason")
-    p_ci_run.add_argument("--reason", default="",
-                          help="why (the exception, the full suite): written to the lot")
-    p_ci_run.add_argument("--full", action="store_true",
-                          help="whole suite (release, package, explicit request), not the "
-                               "lot selection; requires --reason")
-    p_ci_run.add_argument("--force", action="store_true",
-                          help="request the CI again although this composition already "
-                               "ran, none green (red or cancelled): explicit resumption")
-    p_ci_run.add_argument("--repo", default="", help="owner/name (default: the lot's "
-                          "issue_ref or github.projects)")
-    p_ci_run.add_argument("--dry-run", action="store_true",
-                          help="decide and print, pose no label")
-    p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
-    p_ci_run.set_defaults(func=cmd_ci)
-    p_ci_cancel = ci_sub.add_parser(
-        "cancel", help="cancel the open runs of a lot that do not carry its frozen commit")
-    p_ci_cancel.add_argument("id", type=int, help="work item number")
-    p_ci_cancel.add_argument("--all", action="store_true",
-                             help="also cancel the run of the frozen commit")
-    p_ci_cancel.add_argument("--repo", default="", help="owner/name (default: the lot's "
-                             "issue_ref or github.projects)")
-    p_ci_cancel.add_argument("--dry-run", action="store_true",
-                             help="list the runs, cancel nothing")
-    p_ci_cancel.add_argument("--json", action="store_true", help="`ameesh-ci-cancel/1` report")
-    p_ci_cancel.set_defaults(func=cmd_ci)
 
     p_models = sub.add_parser("models", help="model catalog (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
@@ -2577,11 +2532,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms = work_sub.add_parser(
         "milestone", help="declare a timeline milestone (freeze, verdict) — R19")
     pw_ms.add_argument("id", type=int)
-    # le feu (#1374) a sa propre commande (`ameesh work fire`) : lui seul
-    # contrôle qu'il porte sur le gel courant et retire l'auto-fusion.
-    pw_ms.add_argument("kind", choices=["frozen", "verdict"],
-                       help="frozen (branch frozen) or verdict (review delivered); "
-                            "the pilot's fire is `ameesh work fire`")
+    pw_ms.add_argument("kind", choices=list(work.MANUAL_KINDS),
+                       help="frozen (branch frozen) or verdict (review delivered)")
     pw_ms.add_argument("--sha", default="", help="the frozen or reviewed commit")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
@@ -2604,8 +2556,6 @@ def build_parser() -> argparse.ArgumentParser:
     land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
     from . import merge_pr
     merge_pr.add_parser(work_sub, cmd_work)  # fusion hors API gh (REL-11, #1003)
-    from . import fire
-    fire.add_parser(work_sub, cmd_work)  # feu du pilote au gel (#1374)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")

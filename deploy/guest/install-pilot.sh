@@ -20,10 +20,6 @@
 #   --agent NAME         a guest agent: its secrets file is prepared
 #                        (repeatable; default deepseek6, deepseek1)
 #   --max-agents N       guest agents at once, for the guard (default 2)
-#   --agent-units PATTERN  systemd glob of the guest's units the guard stops
-#                        and starts (default: ameesh-guest-runner@*.service);
-#                        a host that also lends to CI runners passes
-#                        --agent-units 'ameesh-guest-*.service' (lot #1256)
 #   --lend FILE          the offer, JSON: the `policy.lend` of the canon's
 #                        Host fiche (default: the one printed by --dry-run)
 #   --root DIR           the guest's volume (default /srv/ameesh-guest; a
@@ -102,7 +98,6 @@ STATE=$ETC/pilot-install.state
 HOST=$(hostname -s)
 AGENTS=()
 MAX_AGENTS=2
-AGENT_UNITS=""
 LEND=""
 EXTRA_PATH=()
 GUARD_MODE=""
@@ -122,7 +117,7 @@ say() { echo "== $*"; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host|--agent|--max-agents|--agent-units|--lend|--root|--path|--guard-mode|--set-guard-mode|\
+    --host|--agent|--max-agents|--lend|--root|--path|--guard-mode|--set-guard-mode|\
     --canon|--repo|--dsh-from)
       [ $# -ge 2 ] || die "$1 needs a value" ;;
   esac
@@ -130,7 +125,6 @@ while [ $# -gt 0 ]; do
     --host) HOST=$2; shift 2 ;;
     --agent) AGENTS+=("$2"); shift 2 ;;
     --max-agents) MAX_AGENTS=$2; shift 2 ;;
-    --agent-units) AGENT_UNITS=$2; shift 2 ;;
     --lend) LEND=$2; shift 2 ;;
     --root) ROOT=$2; shift 2 ;;
     --path) EXTRA_PATH+=("$2"); shift 2 ;;
@@ -161,30 +155,6 @@ valid_name() { case "$1" in ''|*[!a-z0-9_-]*|-*) return 1 ;; esac; }
 valid_name "$HOST" || die "invalid --host $HOST"
 for a in "${AGENTS[@]}" "${TARGETS[@]}"; do valid_name "$a" || die "invalid agent name $a"; done
 case "$MAX_AGENTS" in ''|*[!0-9]*) die "invalid --max-agents $MAX_AGENTS" ;; esac
-# the guard's unit glob: a guest pattern only, never the application's own
-# `actions.runner.*` (those are what the guard counts as the application).
-# #1256 R1 : le motif doit être **dans le namespace de l'invité** — `*.service`
-# ou `*runner*.service` correspondent aussi aux unités `actions.runner.*` de
-# l'application, que le garde arrête au SIGKILL ; un motif qui les atteint est
-# refusé ici, et un motif qui ne vise aucune unité de l'invité aussi (un garde
-# qui ne couvre rien est un garde qui ne protège rien).
-if [ -n "$AGENT_UNITS" ]; then
-  case "$AGENT_UNITS" in
-    ameesh-guest-*.service) ;;
-    *) die "--agent-units: the guest namespace expected (ameesh-guest-*.service), not $AGENT_UNITS" ;;
-  esac
-  case "$AGENT_UNITS" in
-    *[!A-Za-z0-9_.@*:-]*) die "--agent-units: unexpected character in $AGENT_UNITS" ;;
-  esac
-  python3 -I - "$AGENT_UNITS" <<'PY' || die "--agent-units $AGENT_UNITS matches no guest unit, or matches the application's: refused"
-import fnmatch, sys
-pattern = sys.argv[1]
-if fnmatch.fnmatch("actions.runner.manaty-nexlink.nexlink-ci-3-1.service", pattern):
-    sys.exit(1)
-sys.exit(0 if any(fnmatch.fnmatch(u, pattern) for u in
-                  ("ameesh-guest-runner@1.service", "ameesh-guest-ci@1.service")) else 1)
-PY
-fi
 case "$GUARD_MODE" in ''|observe|enforce) ;; *) die "--guard-mode observe|enforce" ;; esac
 [ "$MODE" != guard-mode ] || [ -n "$GUARD_MODE" ] || die "--set-guard-mode observe|enforce"
 case "$ROOT" in /*) ;; *) die "--root must be absolute" ;; esac
@@ -1178,16 +1148,10 @@ if offer is not None:
     else:
         print("warning: %s is not a volume of its own: disk_max is indicative only" % root,
               file=sys.stderr)
-config = {"host": sys.argv[2], "max_agents": int(sys.argv[3]),
-          "work_path": sys.argv[5], "lend": lend}
-# lot #1256: a host that also lends to CI runners widens the glob so the
-# guard stops and starts them with the agent units; absent, the default of
-# guard.py applies (ameesh-guest-runner@*.service), as before
-if sys.argv[10]:
-    config["agent_units"] = sys.argv[10]
-print(json.dumps(config, indent=2))
+print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
+                  "work_path": sys.argv[5], "lend": lend}, indent=2))
 ' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY" "$ROOT_MOUNTED" \
-  "$(at "$ROOT")" "${AGENT_UNITS:-}") \
+  "$(at "$ROOT")") \
   || die "offer or volume refused"
 
 # PATH of the runners: the directory of the DeepSeek harness (`dsh`)
