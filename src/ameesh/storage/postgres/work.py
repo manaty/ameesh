@@ -1419,6 +1419,45 @@ class WorkItems(interface.WorkItems):
             "          w.created_ts, w.id"
             " LIMIT %%s") % item_columns(self.db), (int(limit),))
 
+    def review_proposals(self, limit, *, proposal_prefix, window_s=21600.0) -> list[dict]:
+        """#1677 (c) : les lots en `qa` qui attendent un geste de relecture —
+        sans verdict (une relecture est due) ou à dernier verdict bloquant (une
+        correction est due) — avec leur auteur, leur branche et leur tête gelée.
+
+        La prise y apparie un agent au repos d'une autre famille que l'auteur
+        (canon §2). Un lot déjà muni d'un relecteur désigné (0421) a un
+        destinataire : il n'est pas proposé. Un lot sans tête gelée n'a rien à
+        relire. Un lot dont la proposition date de moins de `window_s` (note
+        `proposal_prefix…` au journal) est écarté : deux passages ne proposent
+        pas le même lot deux fois."""
+        reviewer_guard = "   AND coalesce(w.reviewer, '') = ''" if has_reviewer(self.db) else ""
+        last_verdict = (
+            "(SELECT m.verdict FROM work_item_milestones m"
+            "  WHERE m.work_item_id = w.id AND m.kind = 'verdict'"
+            "  ORDER BY m.at DESC, m.id DESC LIMIT 1)")
+        frozen_sha = (
+            "(SELECT m.sha FROM work_item_milestones m"
+            "  WHERE m.work_item_id = w.id AND m.kind = 'frozen'"
+            "  ORDER BY m.at DESC, m.id DESC LIMIT 1)")
+        return self.db.query(
+            "SELECT w.id, w.title, w.state, w.assignee, w.app, w.team, w.priority,"
+            "       w.branch, " + frozen_sha + " AS frozen_sha,"
+            "       " + last_verdict + " AS last_verdict"
+            "  FROM work_items w"
+            " WHERE w.state = 'qa'"
+            "   AND w.assignee IS NOT NULL AND btrim(w.assignee) <> ''"
+            "   AND left(w.assignee, 6) <> 'human:'"
+            "   AND " + frozen_sha + " IS NOT NULL"
+            + reviewer_guard +
+            "   AND coalesce(" + last_verdict + ", '') <> 'ok'"
+            "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+            "                    WHERE e.work_item_id = w.id"
+            "                      AND starts_with(e.note, %s)"
+            "                      AND e.created_at > now() - make_interval(secs => %s))"
+            " ORDER BY coalesce(w.priority, 2), w.id"
+            " LIMIT %s",
+            (str(proposal_prefix), float(window_s), int(limit)))
+
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(
             """
