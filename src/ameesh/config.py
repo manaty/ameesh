@@ -401,6 +401,11 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: identité des humains par OIDC (L86, 0033 §4) : la clé `identity` de
+    #: l'hôte (`providers` : issuer, client_id, domains), lue par
+    #: `ameesh.oidc`. Jamais de secret ici : un client OIDC public suffit pour
+    #: vérifier un jeton.
+    identity: dict = field(default_factory=dict)
     #: L109 : exécuteur médié (`backend: mediated`) — URL du serveur du mesh
     #: (`/api/exec/v1`) et fichier 0600 du jeton d'accès de l'exécuteur (la
     #: source réelle du jeton est l'identité de l'exécuteur, L110). Dans la
