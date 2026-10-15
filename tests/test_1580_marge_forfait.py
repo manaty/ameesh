@@ -327,3 +327,39 @@ class GardesMargeTest(unittest.TestCase):
                                       fleet={"dev1": "deepseek", "cx1": "codex"})
         self.assertEqual((prop.movable, prop.moves), (0, ()))
         self.assertIn("gauge readings unreadable for test", prop.text())
+
+    def test_report_garde_le_compte_illisible_sans_lever(self):
+        """#1600 : `accounts list` liste le compte en erreur au lieu de lever.
+
+        Le chemin d'affichage (`mesh_cli.cmd_accounts` -> `report`) tourne AVANT
+        `rebalance.proposal` : sans garde ici, une jauge illisible fait tomber la
+        commande avant même d'atteindre `_offer`.
+        """
+        cfg = SimpleNamespace(accounts={"codex": [{"name": "bon", "hourly_usd": 1},
+                                                  {"name": "mauvais", "hourly_usd": 1}]},
+                              host="test")
+        gauge = cost.Gauge("codex", "long", 0.03, 1_000_000.0 + 6 * JOUR, 7 * JOUR)
+        book = mock.Mock(db=object())
+        book.codex_gauges.return_value = [gauge]
+        book.spent.return_value = 0
+        vrai = accounts.evaluate
+
+        def evaluate_ou_illisible(book_, profile, items, now_, **kw):
+            if profile.name == "mauvais":
+                raise RuntimeError("jauge illisible")
+            return vrai(book_, profile, items, now_, **kw)
+
+        with (mock.patch.object(accounts, "check", return_value=[]),
+              mock.patch.object(accounts, "evaluate", side_effect=evaluate_ou_illisible)):
+            rows = accounts.report(cfg, None, book, now=1_000_000.0, record=False)
+        par_nom = {row["account"]: row for row in rows}
+        self.assertEqual(sorted(par_nom), ["bon", "mauvais"])
+        self.assertTrue(par_nom["bon"]["ok"])
+        self.assertFalse(par_nom["mauvais"]["ok"])
+        self.assertIn("gauge readings unreadable", par_nom["mauvais"]["reason"])
+        self.assertIn("jauge illisible", par_nom["mauvais"]["reason"])
+        self.assertEqual(par_nom["mauvais"]["gauges"], [])
+        # l'affichage texte garde la ligne du compte, avec sa raison
+        texte = accounts.format_rows(rows)
+        self.assertIn("mauvais", texte)
+        self.assertIn("gauge readings unreadable", texte)
