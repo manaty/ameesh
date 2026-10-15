@@ -1,38 +1,37 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1617 — désignation automatique des relecteurs au gel (canon §7, #1606 point 4).
+"""#1617 — automatic designation of reviewers at freeze (canon §7, #1606 point 4).
 
-Le canon §2 demande, pour un lot sensible gelé, « une relecture par une autre
-famille de modèle (deux pour SQL, sécurité ou prod) ». Jusqu'ici un agent
-choisissait le relecteur à la main, et le 15/10 dix-huit lots attendaient sans
-relecteur, jusqu'à 42 h. Ce module fait la **sélection** : il prend la
-politique versionnée (`review_policies.train_reviews`, lue par #1616/#1467),
-la tête gelée exacte et le registre, et rend soit des relecteurs désignés avec
-leur courrier, soit un **état d'attente explicite** avec une notification de
-capacité — jamais une admission implicite.
+Canon §2 requires, for a frozen sensitive lot, "a review by another model
+family (two for SQL, security or prod)". Until now an agent chose the reviewer
+by hand, and on 15/10 eighteen lots waited without a reviewer, for up to 42 h.
+This module does the **selection**: it takes the versioned policy
+(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head
+and the registry, and returns either designated reviewers with their mail, or
+an **explicit waiting state** with a capacity notification — never an implicit
+admission.
 
-Ce que le module ne fait pas, volontairement :
+What the module deliberately does not do:
 
-- il ne relit ni le canon, ni le registre, ni la base : la politique lui est
-  donnée en règles déjà analysées, les candidats en lignes déjà lues, et le
-  raccord réel (verrou du lot, marque idempotente, courriers) est un `Port`
-  injecté. La sélection est ainsi testable seule, et les lecteurs restent ceux
-  de #1616 (canon compilé) et #1467 (`train_policy.Versioned`) ;
-- il n'infère **jamais** une famille du nom ou de l'assignation d'un agent :
-  la seule source est la famille réelle de la session
-  (`registry.live_harness`, #1037 / L242b) ;
-- il ne compte ni ne requalifie des verdicts : le nombre requis vient du
-  maximum des règles par chemin, l'indépendance des avis rendus reste celle de
-  #1465/#1467 (`train_review.qualify`), et un gel nouveau invalide la
-  désignation périmée au lieu de la réutiliser.
+- it reads neither the canon, nor the registry, nor the database: the policy is
+  given to it as already parsed rules, the candidates as already read rows, and
+  the real hookup (lot lock, idempotent mark, mails) is an injected `Port`.
+  Selection is thus testable on its own, and the readers remain those of #1616
+  (compiled canon) and #1467 (`train_policy.Versioned`);
+- it **never** infers a family from an agent's name or assignment: the only
+  source is the session's real family (`registry.live_harness`, #1037 / L242b);
+- it neither counts nor requalifies verdicts: the required number comes from
+  the maximum of the rules per path, the independence of the rendered opinions
+  remains that of #1465/#1467 (`train_review.qualify`), and a new freeze
+  invalidates the stale designation instead of reusing it.
 
-Idempotence : la désignation est liée au **jalon `frozen`** (son identifiant et
-son SHA exact), pas au lot. Un même gel rejoué rend la désignation déjà
-enregistrée sans renvoyer de courrier ; un gel nouveau (nouveau jalon, nouveau
-SHA) est un autre objet, donc une nouvelle désignation — l'ancienne ne compte
-plus. Une désignation est **finale** pour son gel ; une attente est un marqueur
-**réessayable** (une notification par gel, la désignation la remplace si la
-capacité ou la preuve revient). Le `Port` refuse d'écrire pour un gel qui n'est
-plus le dernier : aucun retour à une ancienne tête.
+Idempotence: the designation is tied to the **`frozen` milestone** (its
+identifier and its exact SHA), not to the lot. The same freeze replayed returns
+the already recorded designation without sending a second mail; a new freeze
+(new milestone, new SHA) is another object, hence a new designation — the old
+one no longer counts. A designation is **final** for its freeze; a waiting
+state is a **retryable** marker (one notification per freeze, the designation
+replaces it if capacity or evidence comes back). The `Port` refuses to write
+for a freeze that is no longer the latest: no return to an old head.
 """
 from __future__ import annotations
 
@@ -42,63 +41,75 @@ from typing import Iterable, Mapping, Optional, Protocol, Sequence
 
 from . import review
 
-#: le schéma de la politique versionnée dont viennent les règles (PR85, #1467)
-SCHEMA = "ameesh-train-reviews-policy/1"
-#: états rendus par la sélection
+#: states returned by the selection
 DESIGNATED = "designated"
 WAITING = "waiting"
 NONE = "none"
-#: un harnais qui n'est pas une famille de modèle (registre sans session)
+#: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
-#: les familles de repli tant que le canon compilé (#1616) ne les déclare pas :
-#: mêmes valeurs que `train_review.FAMILIES`, à passer en paramètre dès que la
-#: déclaration machine « familles et indépendance » est disponible
+#: fallback families as long as the compiled canon (#1616) does not declare
+#: them: same values as `train_review.FAMILIES`, to be passed as a parameter as
+#: soon as the machine declaration "families and independence" is available
 KNOWN_FAMILIES = frozenset(("claude", "codex", "deepseek"))
-#: les états du registre qui interdisent la désignation
+#: the registry states that forbid designation
 UNAVAILABLE_STATUS = frozenset(("stopped", "paused"))
-#: les préfixes de `status_text` d'une pause d'exploitation ou de budget
+#: the `status_text` prefixes of an operations or budget pause
 PAUSE_PREFIXES = ("paused", "budget : ")
-#: un SHA de commit (complet ou abrégé) : un nom de branche n'est pas un gel
+#: a commit SHA (full or abbreviated): a branch name is not a freeze
 _SHA = re.compile(r"[0-9a-f]{7,64}")
 
 
+def _same_freeze(left: str, right: str) -> bool:
+    """The same freeze: equality, or a prefix of at least 7 characters on both sides.
+
+    A `frozen` milestone may carry an abbreviated SHA (finding #1617: milestone
+    6281 carries "cbe0d00db") while the collector has the full SHA: strict
+    equality wrongly declared `FreezeMoved` (#1775, N1).
+    """
+    left, right = str(left or "").strip().lower(), str(right or "").strip().lower()
+    if left == right:
+        return True
+    short, long_ = (left, right) if len(left) <= len(right) else (right, left)
+    return len(short) >= 7 and long_.startswith(short)
+
+
 class DesignationError(ValueError):
-    """Entrée refusée : le module ne devine pas, il refuse avec un motif."""
+    """Refused input: the module does not guess, it refuses with a reason."""
 
 
 class StaleFreeze(DesignationError):
-    """Le gel examiné n'est plus le dernier : le `Port` n'a **rien** écrit.
+    """The examined freeze is no longer the latest: the `Port` wrote **nothing**.
 
-    Une désignation périmée ne se réutilise pas : le moteur relit le dernier
-    gel et recommence (jamais un retour à une ancienne tête)."""
+    A stale designation is not reused: the engine re-reads the latest freeze and
+    starts over (never a return to an old head)."""
 
 
 class FreezeMoved(StaleFreeze):
-    """Le gel a bougé pendant l'écriture : rien n'a été écrit, et les entrées
-    du gel examiné (chemins, auteurs, classe) ne valent plus.
+    """The freeze moved during the write: nothing was written, and the inputs of
+    the examined freeze (paths, authors, class) no longer hold.
 
-    Le moteur ne désigne pas avec les entrées d'une autre tête : l'appelant
-    recollecte les chemins, auteurs et la classe du **nouveau** gel, puis
-    rejoue. Un SHA de courrier changé ne suffit pas (revue Codex cx2, B1)."""
+    The engine does not designate with the inputs of another head: the caller
+    recollects the paths, authors and class of the **new** freeze, then replays.
+    A changed mail SHA is not enough (Codex review cx2, B1)."""
 
 
 # --------------------------------------------------------------------------
-# la politique : nombre d'avis requis par chemin
+# the policy: number of required opinions per path
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Rule:
-    """Une règle de la politique versionnée : des motifs et un nombre d'avis.
+    """A rule of the versioned policy: patterns and a number of opinions.
 
-    `paths` sont des motifs de la même famille que `review.compile_glob`
-    (`**`, `*`, `?`, `[...]`), compilés une fois à la construction. `reviews`
-    vaut 1 ou 2 : la politique ne connaît pas d'autre nombre (PR85), et un
-    zéro déclaré serait une règle qui ne dit rien.
+    `paths` are patterns of the same family as `review.compile_glob`
+    (`**`, `*`, `?`, `[...]`), compiled once at construction. `reviews` is 1
+    or 2: the policy knows no other number (PR85), and a declared zero would be
+    a rule that says nothing.
     """
 
     paths: tuple[str, ...]
     reviews: int
-    #: les motifs compilés, dans l'ordre déclaré
+    #: the compiled patterns, in declared order
     regexes: tuple = field(default=(), compare=False, repr=False)
 
     def __post_init__(self):
@@ -120,11 +131,14 @@ class Rule:
 
 
 def rules_of(declaration) -> tuple[Rule, ...]:
-    """Les règles d'une déclaration `train_reviews.projects.<projet>.rules`.
+    """The rules of a `train_reviews.projects.<project>.rules` declaration.
 
-    Forme stricte (celle de PR85, déjà validée par #1467) : une liste, chaque
-    entrée `{paths: [...], reviews: 1|2}`. Toute autre forme est refusée — pas
-    de repli permissif : une politique illisible ne désigne personne.
+    Strict shape, the one `ameesh.mechanics` (#1616) requires at the same
+    commit: the project entry is exactly `{rules: [...]}`, each rule exactly
+    `{paths: [...], reviews: 1|2}`, with no unknown key. Any other shape is
+    refused — no permissive fallback: an unreadable policy designates nobody.
+    (The `ameesh-train-reviews-policy/1` schema dresses the whole `train_reviews`
+    object, not the project entry: it has nothing to do here.)
     """
     if not isinstance(declaration, dict) or set(declaration) != {"rules"} \
             or not isinstance(declaration["rules"], list) or not declaration["rules"]:
@@ -139,11 +153,11 @@ def rules_of(declaration) -> tuple[Rule, ...]:
 
 
 def required_count(rules: Sequence[Rule], paths: Iterable[str]) -> int:
-    """Le nombre d'avis requis pour ces chemins : le **maximum** des règles.
+    """The number of opinions required for these paths: the **maximum** of the rules.
 
-    Un chemin qu'aucune règle ne couvre vaut zéro : c'est la règle du léger
-    (« zéro pour light hors règle », PR85). La couverture des chemins non
-    légers est vérifiée par le lecteur de la politique (#1467), pas ici.
+    A path that no rule covers counts as zero: that is the light rule ("zero for
+    light outside a rule", PR85). Coverage of non-light paths is checked by the
+    policy reader (#1467), not here.
     """
     rules = tuple(rules or ())
     highest = 0
@@ -155,17 +169,18 @@ def required_count(rules: Sequence[Rule], paths: Iterable[str]) -> int:
 
 
 # --------------------------------------------------------------------------
-# les candidats : famille réelle, disponibilité, charge
+# the candidates: real family, availability, load
 # --------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Candidate:
-    """Un relecteur possible, tel que le registre le décrit.
+    """A possible reviewer, as the registry describes it.
 
-    `family` est la famille **réelle** de la session
-    (`registry.live_harness`) ; `available` et `load` viennent du registre et
-    du nombre de lots ouverts. Le module ne complète rien : une famille vide
-    ou un harnais hors des familles connues rend le candidat inéligible.
+    `family` is the **real** family of the session
+    (`registry.live_harness`); `available` and `load` come from the registry
+    and from the number of open lots. The module completes nothing: an empty
+    family or a harness outside the known families makes the candidate
+    ineligible.
     """
 
     name: str
@@ -182,13 +197,14 @@ class Candidate:
 
 
 def live_family(row: Mapping, *, families=KNOWN_FAMILIES) -> str:
-    """La famille réelle d'une ligne du registre, jamais l'étiquette déclarée.
+    """The real family of a registry row, never the declared label.
 
-    `registry.live_harness` (importé ici en local pour que le module reste
-    importable sans base) préfère `session_harness` au harnais déclaré : un
-    agent qui emprunte un harnais (L242b) est de la famille sous laquelle il
-    tourne. Un harnais hors des familles connues n'est pas une famille ; la
-    liste des familles vient du canon compilé (#1616) dès qu'il la déclare.
+    `registry.live_harness` (imported locally here so the module remains
+    importable without a database) prefers `session_harness` over the declared
+    harness: an agent that borrows a harness (L242b) is of the family under
+    which it runs. A harness outside the known families is not a family; the
+    family list comes from the compiled canon (#1616) as soon as it declares
+    it.
     """
     from . import registry
     family = str(registry.live_harness(dict(row or {})) or "").strip().lower()
@@ -196,13 +212,13 @@ def live_family(row: Mapping, *, families=KNOWN_FAMILIES) -> str:
 
 
 def is_available(row: Mapping) -> bool:
-    """La disponibilité au registre : ni arrêté, ni en pause, ni session humaine.
+    """Availability in the registry: neither stopped, nor paused, nor a human session.
 
-    Un agent en tour reste disponible : le courrier l'attend et ouvre son tour
-    suivant. Sont indisponibles un agent `stopped`/`paused`, une session
-    `externe` (jamais menée par l'exécuteur, L46) et une pause d'exploitation
-    ou de budget (`status_text` « paused… » ou « budget : … »). Une ligne sans
-    mode ni statut lisibles est refusée : le doute ne désigne personne.
+    An agent in a turn remains available: the mail waits for it and opens its
+    next turn. Unavailable are a `stopped`/`paused` agent, an `external` session
+    (never run by the executor, L46) and an operations or budget pause
+    (`status_text` "paused…" or "budget : …"). A row with no readable mode or
+    status is refused: doubt designates nobody.
     """
     row = dict(row or {})
     if (row.get("mode") or "execute") != "execute":
@@ -216,12 +232,12 @@ def is_available(row: Mapping) -> bool:
 
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
                              project: str = "", families=KNOWN_FAMILIES) -> list[Candidate]:
-    """Les candidats d'un projet : famille réelle, dispo, charge des lots ouverts.
+    """The candidates of a project: real family, availability, load of open lots.
 
-    `loads` associe un nom au nombre de lots ouverts (`build`/`qa`) ; absent,
-    la charge vaut zéro. `project` (l'`app` du lot) restreint aux agents de la
-    même équipe : un lot ameesh se relit par un agent ameesh. Un projet vide
-    ne filtre pas — l'appelant sait ce qu'il fait.
+    `loads` maps a name to the number of open lots (`build`/`qa`); when absent,
+    the load is zero. `project` (the lot's `app`) restricts to agents of the
+    same team: an ameesh lot is reviewed by an ameesh agent. An empty project
+    does not filter — the caller knows what it is doing.
     """
     loads = loads or {}
     wanted = (project or "").strip()
@@ -243,15 +259,15 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
 
 
 # --------------------------------------------------------------------------
-# la sélection : deux familles distinctes, hors auteurs et correcteurs
+# the selection: two distinct families, excluding authors and fixers
 # --------------------------------------------------------------------------
 
 def families_of(authors: Iterable) -> tuple[set, set]:
-    """`(noms, familles)` interdits, tirés des auteurs du contenu gelé.
+    """`(names, families)` forbidden, drawn from the authors of the frozen content.
 
-    Un auteur est `{"name", "family"}` : l'assigné du lot et chaque correcteur
-    qui a poussé sur la tête (preuves exactes #1465). Une famille inconnue ne
-    se devine pas : `select` attend alors au lieu de désigner (voir
+    An author is `{"name", "family"}`: the lot's assignee and each fixer who
+    pushed onto the head (exact evidence #1465). An unknown family is not
+    guessed: `select` then waits instead of designating (see
     `unknown_families`).
     """
     names, families = set(), set()
@@ -267,10 +283,10 @@ def families_of(authors: Iterable) -> tuple[set, set]:
 
 
 def unknown_families(authors: Iterable) -> list[str]:
-    """Les auteurs dont la famille réelle est inconnue (vide ou étiquette).
+    """The authors whose real family is unknown (empty or a label).
 
-    Sans leur famille, l'indépendance d'un relecteur ne se prouve pas : un
-    relecteur de la même famille réelle serait désigné sans le savoir."""
+    Without their family, a reviewer's independence cannot be proven: a reviewer
+    of the same real family would be designated without anyone knowing."""
     return sorted({str((a or {}).get("name") or "").strip() for a in authors or ()
                    if str((a or {}).get("family") or "").strip().lower()
                    in PLACEHOLDER_FAMILIES})
@@ -278,22 +294,22 @@ def unknown_families(authors: Iterable) -> list[str]:
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
            families=KNOWN_FAMILIES) -> dict:
-    """Choisit `required` (1 ou 2) relecteurs indépendants et les moins chargés.
+    """Chooses `required` (1 or 2) independent and least-loaded reviewers.
 
-    - la famille de chaque relecteur diffère de celle de **chaque** auteur ou
-      correcteur, et pour deux avis les deux familles diffèrent entre elles
-      (canon §2) ;
-    - la famille vient de la session réelle (`Candidate.family`), jamais du nom ;
-    - un candidat indisponible, sans famille connue, ou auteur lui-même est
-      écarté ;
-    - un auteur dont la famille réelle est inconnue (vide ou étiquette) fait
-      **attendre** la désignation : sans elle, l'indépendance d'un relecteur ne
-      se prouve pas (canon §2) ;
-    - à charge égale, l'ordre des noms tranche : la sélection est déterministe.
+    - each reviewer's family differs from that of **every** author or fixer, and
+      for two opinions the two families differ from each other (canon §2);
+    - the family comes from the real session (`Candidate.family`), never from
+      the name;
+    - an unavailable candidate, without a known family, or an author itself is
+      discarded;
+    - an author whose real family is unknown (empty or a label) makes the
+      designation **wait**: without it, a reviewer's independence is not proven
+      (canon §2);
+    - at equal load, the order of names decides: the selection is deterministic.
 
-    Rend `{state, required, reviewers, missing, why, forbidden}` : `waiting`
-    quand il manque des familles indépendantes ou qu'une famille d'auteur est
-    inconnue, avec le nombre manquant — jamais une admission implicite.
+    Returns `{state, required, reviewers, missing, why, forbidden}`: `waiting`
+    when independent families are missing or an author family is unknown, with
+    the missing count — never an implicit admission.
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
@@ -304,15 +320,15 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
         return out
     unknown = unknown_families(authors)
     if unknown:
-        # Un auteur sans famille réelle connue : l'indépendance ne se prouve
-        # pas, on attend au lieu d'écarter le seul nom (canon §2).
+        # An author with no known real family: independence is not proven,
+        # so we wait instead of discarding the only name (canon §2).
         out.update({"state": WAITING, "missing": required,
                     "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
     eligible = [c for c in candidates or ()
                 if c.eligible(forbidden_names=names, forbidden_families=forbidden,
                               families=families)]
-    # un seul candidat par famille : le moins chargé, puis le nom
+    # a single candidate per family: the least loaded, then the name
     best: dict[str, Candidate] = {}
     for candidate in eligible:
         family = candidate.family.strip().lower()
@@ -342,148 +358,149 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
 
 
 # --------------------------------------------------------------------------
-# les courriers : la tête exacte, ou la capacité manquante
+# the mails: the exact head, or the missing capacity
 # --------------------------------------------------------------------------
 
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
                      risk: str = "", policy_ref: str = "") -> str:
-    """Le courrier qui remet au relecteur la tête exacte et sa place.
+    """The mail that hands the reviewer the exact head and its place.
 
-    Le SHA est écrit en entier, avec son jalon `frozen` : le verdict devra le
-    citer tel quel (`ameesh work milestone <lot> verdict ok --sha <sha>`). Le
-    relecteur qui corrige devient auteur de sa correction : son propre avis ne
-    compte plus (canon §2), la sélection suivante l'écartera.
+    The SHA is written in full, with its `frozen` milestone: the verdict will
+    have to cite it as-is (`ameesh work milestone <lot> verdict ok --sha <sha>`).
+    The reviewer who fixes becomes an author of their fix: their own opinion no
+    longer counts (canon §2), the next selection will discard them.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
     row = dict(lot or {})
-    who = ", ".join(str((a or {}).get("name") or "") for a in authors or () if a) or "inconnu"
+    who = ", ".join(str((a or {}).get("name") or "") for a in authors or () if a) or "unknown"
     lines = [
-        "Désignation automatique au gel (canon §2, #1617) : relecture %d/%d du lot #%s."
+        "Automatic designation at freeze (canon §2, #1617): review %d/%d of lot #%s."
         % (rank, required, row.get("id")),
         "",
-        "Lot : #%s « %s »" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
-        "- Gel : jalon frozen #%s, tête exacte %s." % (fid, sha),
-        "- Auteur(s) du contenu gelé : %s." % who,
+        "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
+        "- Freeze: frozen milestone #%s, exact head %s." % (fid, sha),
+        "- Author(s) of the frozen content: %s." % who,
     ]
     if base:
-        lines.append("- Diff à relire : `git diff %s..%s` (%s)."
-                     % (base[:12], sha[:12], risk or "classe inconnue"))
+        lines.append("- Diff to review: `git diff %s..%s` (%s)."
+                     % (base[:12], sha[:12], risk or "unknown class"))
     else:
-        lines.append("- À relire : la tête %s (%s)." % (sha[:12], risk or "classe inconnue"))
+        lines.append("- To review: head %s (%s)." % (sha[:12], risk or "unknown class"))
     if policy_ref:
-        lines.append("- Politique de revue : %s (deux avis pour SQL, sécurité ou prod)."
+        lines.append("- Review policy: %s (two opinions for SQL, security or prod)."
                      % policy_ref)
     lines += [
-        "- Ta famille : %s — les avis rendus viennent de familles distinctes, hors "
-        "celles des auteurs." % ((reviewer or {}).get("family") or "?"),
+        "- Your family: %s — rendered opinions come from distinct families, "
+        "outside those of the authors." % ((reviewer or {}).get("family") or "?"),
         "",
-        "À faire :",
-        "- lire le diff **de cette tête exacte** et vérifier les cas limites ;",
-        "- rendre le verdict : `ameesh work milestone %s verdict ok|blocked --sha %s` ;"
+        "To do:",
+        "- read the diff **of this exact head** and check the edge cases;",
+        "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
-        "- corriger toi-même un défaut bloquant et pousser sur la branche du lot "
-        "(canon §2) : tu deviens alors auteur de ta correction, ton avis sur la "
-        "nouvelle tête ne compte plus, un autre relecteur reprend ;",
-        "- un défaut non bloquant va au backlog, il ne bloque pas la fusion ;",
-        "- ne relance pas les suites : les tests ciblés sont à l'auteur, la CI "
-        "tourne sur la tête gelée quand les avis requis sont acquis.",
+        "- fix a blocking defect yourself and push to the lot branch "
+        "(canon §2): you then become the author of your fix, your opinion on the "
+        "new head no longer counts, another reviewer takes over;",
+        "- a non-blocking defect goes to the backlog, it does not block the merge;",
+        "- do not rerun the suites: targeted tests are the author's job, CI "
+        "runs on the frozen head once the required opinions are acquired.",
         "",
-        "Ce courrier vient du gel : si la branche bouge, un nouveau gel annule cette "
-        "désignation et une nouvelle tête te sera remise.",
+        "This mail comes from the freeze: if the branch moves, a new freeze cancels "
+        "this designation and a new head will be handed to you.",
     ]
     return "\n".join(lines)
 
 
 def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
                      why: str, families: str = "") -> str:
-    """La notification d'attente : aucun relecteur indépendant désignable.
+    """The waiting notification: no independent reviewer can be designated.
 
-    Elle dit ce qui manque — capacité de relecture ou preuve d'auteur — et ne
-    demande aucune admission : le lot reste en attente du nombre d'avis requis.
+    It states what is missing — review capacity or author evidence — and asks
+    for no admission: the lot remains waiting for the required number of
+    opinions.
     """
     row = dict(lot or {})
     return "\n".join([
-        "Désignation au gel impossible (canon §2, #1617) — relecture en attente.",
+        "Designation at freeze impossible (canon §2, #1617) — review pending.",
         "",
-        "Lot : #%s « %s »" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
-        "- Gel : jalon frozen #%s, tête %s." % ((freeze or {}).get("id"),
+        "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
+        "- Freeze: frozen milestone #%s, head %s." % ((freeze or {}).get("id"),
                                                 str((freeze or {}).get("sha") or "")[:12]),
-        "- Avis requis : %d ; manquants : %d." % (required, missing),
-        "- Motif : %s" % why,
-    ] + (["- Familles disponibles : %s." % families] if families else []) + [
+        "- Required opinions: %d; missing: %d." % (required, missing),
+        "- Reason: %s" % why,
+    ] + (["- Available families: %s." % families] if families else []) + [
         "",
-        "Aucune admission implicite : le lot reste en attente de ses avis. Rétablir "
-        "la capacité ou la preuve manquante (une autre famille de modèle au "
-        "registre, un relecteur disponible, la provenance exacte des commits) puis "
-        "relancer la désignation.",
+        "No implicit admission: the lot remains pending its opinions. Restore the "
+        "missing capacity or evidence (another model family in the registry, an "
+        "available reviewer, the exact provenance of the commits) then rerun the "
+        "designation.",
     ])
 
 
 # --------------------------------------------------------------------------
-# le raccord : une seule écriture transactionnelle côté Port
+# the hookup: a single transactional write on the Port side
 # --------------------------------------------------------------------------
 
 
 class Port(Protocol):
-    """Le raccord réel : base, registre et courrier. Le moteur ne fait aucun E/S.
+    """The real hookup: database, registry and mail. The engine does no I/O.
 
-    `commit` est **la** transaction : elle verrouille le lot, recontrôle que
-    `freeze` est toujours le dernier gel — sinon elle lève `StaleFreeze` sans
-    rien écrire (aucun retour à une ancienne tête) —, recontrôle la marque
-    idempotente du gel (un appel concurrent rend la désignation du gagnant,
-    sans second courrier) et dépose les courriers dans la même transaction.
+    `commit` is **the** transaction: it locks the lot, rechecks that `freeze` is
+    still the latest freeze — otherwise it raises `StaleFreeze` without writing
+    anything (no return to an old head) —, rechecks the idempotent mark of the
+    freeze (a concurrent call returns the winner's designation, without a
+    second mail) and deposits the mails in the same transaction.
 
-    Une **désignation est finale** pour son gel : rejouée, elle rend la même
-    chose sans second courrier. Une **attente** est un marqueur réessayable :
-    une notification par gel, et si la capacité revient (ou la preuve
-    d'auteur), la désignation remplace le marqueur pour le même gel — les
-    courriers aux relecteurs ne partent qu'alors, une seule fois.
+    A **designation is final** for its freeze: replayed, it returns the same
+    thing without a second mail. A **waiting state** is a retryable marker: one
+    notification per freeze, and if capacity comes back (or author evidence),
+    the designation replaces the marker for the same freeze — the mails to the
+    reviewers only leave then, once.
     """
 
     def latest_freeze(self, lot: int) -> Optional[dict]:
-        """Le dernier jalon `frozen` du lot : `{id, sha}`, ou None."""
+        """The lot's latest `frozen` milestone: `{id, sha}`, or None."""
 
     def recorded(self, lot: int, freeze_id: int) -> Optional[dict]:
-        """La désignation déjà enregistrée pour **ce** gel, ou None."""
+        """The designation already recorded for **this** freeze, or None."""
 
     def commit(self, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping], policy_ref: str = "",
                notify: str = "", messages: Sequence[Mapping] = ()) -> dict:
-        """Écrit la désignation du gel en une transaction et rend sa forme."""
+        """Writes the freeze's designation in one transaction and returns its shape."""
 
 
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families=KNOWN_FAMILIES) -> dict:
-    """Désigne les relecteurs du dernier gel du lot, ou dit pourquoi il attend.
+    """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
-    `policy` porte les règles déjà analysées (`Rule` ou déclaration
-    `{rules: [...]}`) ; `risk` est la classe lue par le lecteur de politique
-    (`light` ou `sensitive`) et sert de garde : une classe non légère sans
-    aucun avis requis est un refus, jamais un zéro silencieux. `port` fait
-    l'écriture (voir `Port`). Rend la désignation : `{state, required,
-    reviewers, missing, why, freeze}` avec `replayed` quand elle existait déjà.
+    `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
+    declaration); `risk` is the class read by the policy reader (`light` or
+    `sensitive`) and serves as a guard: a non-light class with no required
+    opinion is a refusal, never a silent zero. `port` does the write (see
+    `Port`). Returns the designation: `{state, required, reviewers, missing,
+    why, freeze}` with `replayed` when it already existed.
 
-    `unknown_authors` nomme les commits du gel dont la provenance exacte
-    (#1465) est inconnue : sans elle, l'indépendance d'un relecteur ne peut pas
-    être établie, donc la désignation attend au lieu de deviner — un état
-    explicite, jamais un repli.
+    `unknown_authors` names the commits of the freeze whose exact provenance
+    (#1465) is unknown: without it, a reviewer's independence cannot be
+    established, so the designation waits instead of guessing — an explicit
+    state, never a fallback.
 
-    Le gel est relu **une fois**, et les entrées fournies (chemins, auteurs,
-    classe) sont celles de ce gel : si le `Port` refuse un gel devenu périmé
-    (`StaleFreeze`, rien n'a été écrit), `apply` lève `FreezeMoved` — désigner
-    la nouvelle tête avec les chemins ou les auteurs de l'ancienne serait une
-    admission implicite. L'appelant recollecte les entrées du nouveau gel,
-    puis rejoue.
+    The freeze is re-read **once**, and the provided inputs (paths, authors,
+    class) are those of this freeze: if the `Port` refuses a freeze that has
+    become stale (`StaleFreeze`, nothing was written), `apply` raises
+    `FreezeMoved` — designating the new head with the old paths or authors
+    would be an implicit admission. The caller recollects the inputs of the new
+    freeze, then replays.
 
-    `freeze_sha` nomme le gel dont l'appelant a tiré ces entrées : s'il n'est
-    plus le dernier gel au moment de la lecture, `apply` lève aussi
-    `FreezeMoved` sans rien écrire — un gel arrivé entre la collecte et
-    l'appel ne reçoit jamais les entrées de l'ancien.
+    `freeze_sha` names the freeze from which the caller drew these inputs: if it
+    is no longer the latest freeze at read time, `apply` also raises
+    `FreezeMoved` without writing anything — a freeze that arrived between
+    collection and the call never receives the old inputs.
     """
     item = dict(lot_item or {})
     lot = int(item.get("id") or 0)
@@ -508,7 +525,7 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     if not _SHA.fullmatch(expected):
         raise DesignationError(
             "the inputs of lot #%d name freeze %r, not a commit id" % (lot, freeze_sha))
-    if expected != sha:
+    if not _same_freeze(expected, sha):
         raise FreezeMoved(
             "the inputs of lot #%d were collected for freeze %s, the last freeze is %s:"
             " nothing written; recollect the paths, authors and class of the new"
@@ -526,8 +543,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out["replayed"] = True
         return out
     if unknown:
-        # Une preuve d'auteur manquante interdit de prouver l'indépendance :
-        # attente explicite, notification, aucun relecteur désigné.
+        # A missing author proof forbids proving independence: explicit
+        # waiting, notification, no reviewer designated.
         why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
                % (len(unknown), ", ".join(unknown[:5])))
         selection = {"state": WAITING, "required": required, "reviewers": [],
@@ -536,9 +553,9 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families)
     if selection["state"] == WAITING and existing:
-        # L'attente de ce gel est déjà enregistrée et notifiée : on n'en
-        # renvoie pas une seconde, mais la sélection a été retentée — si la
-        # capacité est revenue, la branche ci-dessous désigne enfin.
+        # The waiting state of this freeze is already recorded and notified: we
+        # do not send a second one, but the selection was retried — if capacity
+        # came back, the branch below finally designates.
         out = dict(existing)
         out["replayed"] = True
         return out
@@ -567,8 +584,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                            why=selection["why"], authors=authors, policy_ref=policy_ref,
                            notify=notify, messages=tuple(messages))
     except StaleFreeze as exc:
-        # Rien n'a été écrit. Les entrées fournies valaient pour l'ancien gel :
-        # les recollecter pour le nouveau avant de rejouer (B1, revue codex cx2).
+        # Nothing was written. The provided inputs held for the old freeze:
+        # recollect them for the new one before replaying (B1, codex review cx2).
         raise FreezeMoved(
             "the freeze of lot #%d moved during the write (was %s): nothing written; "
             "recollect the paths, authors and class of the new freeze, then retry"
