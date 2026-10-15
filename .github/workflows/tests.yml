@@ -8,30 +8,37 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 4 parts, sur push vers main, integration/** ou release/**,
-#               et sur une PR de release (source ou cible release/** ou
-#               integration/**) ;
+#               en 4 parts, sur push vers main ou release/**, sur une PR de
+#               release (source ou cible release/** ou integration/**) et sur
+#               l'appel du portier de paquet (workflow_call, §12) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main, integration/** ou release/**, sur
-#               une PR de release (sans liste pilote) et à la main
-#               (workflow_dispatch).
+#               6 parts, sur push vers main ou release/**, sur une PR de
+#               release (sans liste pilote), à la main (workflow_dispatch) et
+#               sur l'appel du portier de paquet (workflow_call).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#
+# §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
+# `pull_request` de sa PR porte le check requis `tests` ; le portier
+# `.github/workflows/paquet.yml`, déclenché par `push integration/**`, n'appelle
+# cette suite (`workflow_call`) que si aucune PR ouverte ne couvre la tête
+# exacte, et son check n'est jamais nommé `tests` (incident #1342 : deux suites
+# complètes, l'agrégat rouge du run push annulé bloquait la PR #1050).
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
 # toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
 # migrations, objets globaux du cluster), avec repli sur la suite complète
 # quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
-# La suite complète tourne sur main, release/** et la branche d'intégration du
-# paquet (§12) : une PR de lot n'en déclenche plus, mais une PR de release
-# (source ou cible release/** ou integration/**), comme un push sur ces
-# branches, garde la suite complète, les deux pilotes, sans voie version/doc
-# ni liste pilote psql — y compris dans le plan de repli. Les règles de
-# refusion (a : delta de main disjoint, b : migrations seules) viendront
-# ensuite.
+# La suite complète tourne sur main, release/** et pour la branche d'intégration
+# du paquet (§12) par le run `pull_request` de sa PR ou, à défaut de PR couvrant
+# la tête, par le portier `paquet.yml` : une PR de lot n'en déclenche plus, mais
+# une PR de release (source ou cible release/** ou integration/**) garde la
+# suite complète, les deux pilotes, sans voie version/doc ni liste pilote psql —
+# y compris dans le plan de repli. Les règles de refusion (a : delta de main
+# disjoint, b : migrations seules) viendront ensuite.
 #
 # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
 # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
@@ -85,9 +92,14 @@
 name: tests
 
 on:
+  # §12 : une poussée sur integration/** ne déclenche plus cette suite
+  # directement. Le portier .github/workflows/paquet.yml décide — une tête de
+  # paquet n'a qu'une suite, celle de sa PR — et rappelle cette suite
+  # (workflow_call) quand aucune PR ouverte ne couvre la tête poussée.
   push:
-    branches: [main, "release/**", "integration/**"]
+    branches: [main, "release/**"]
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 # Une PR dépassée est annulée. Les pushes de main partagent un groupe :
