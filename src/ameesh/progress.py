@@ -517,6 +517,32 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
 # budget
 # --------------------------------------------------------------------------
 
+def _effective_pace(gauges: list, accounts: list[dict] | None) -> dict:
+    """{(harnais, fenêtre) : (multiplicateur, plafond effectif)} (#1227 N3).
+
+    `accounts.report` porte le plafond effectif par compte (#1176) ;
+    `book.gauges()` ne nomme pas le compte de son relevé. On ne s'en sert donc
+    que quand un seul compte déclaré du harnais porte la fenêtre : plusieurs
+    comptes, ou aucune information, gardent le défaut (90 %, ×1) — jamais un
+    plafond attribué au hasard.
+    """
+    keys = {(g.harness, g.key) for g in gauges}
+    found: dict = {}
+    for row in accounts or []:
+        harness = row.get("harness")
+        multiplier = float(row.get("pace_multiplier") or 1.0)
+        for gauge in row.get("gauges") or []:
+            key = (harness, gauge.get("key"))
+            if key not in keys:
+                continue
+            ceiling = float(gauge.get("pace_ceiling") or cost_mod.PACE_CEILING)
+            if key in found and found[key] != (multiplier, ceiling):
+                found[key] = None            # plusieurs comptes : ambigu
+            else:
+                found.setdefault(key, (multiplier, ceiling))
+    return found
+
+
 def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
                  paid_harnesses: Iterable[str] | None = None,
                  hourly_cap: float = cost_mod.DEFAULT_HOURLY_USD,
@@ -582,11 +608,25 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     # `pace_cap` et `exceeded` ne décriraient plus aucun compte (R1 #1028,
     # P2). Le rendu texte écarte ces harnais, déjà montrés compte par compte ;
     # le JSON garde la même valeur qu'`accounts.report`.
+    # #1227 N3 : le plafond effectif du compte (#1176, relèvement de fin de
+    # fenêtre compris) accompagne son rythme ; les jauges du dossier par
+    # défaut ne reçoivent le réglage déclaré que s'il n'est pas ambigu (un
+    # seul compte porte la fenêtre) — jamais un plafond attribué au hasard.
     actifs = {row["harness"]: row for row in (accounts or []) if row.get("active")}
-    plans = [_plan_view(g, now, 1.0) for g in gauges if g.harness not in actifs]
+    settings = _effective_pace(gauges, accounts)
+    plans = []
+    for g in gauges:
+        if g.harness in actifs:
+            continue                    # rendu compte par compte ci-dessous
+        multiplier, ceiling = (settings.get((g.harness, g.key))
+                               or (1.0, cost_mod.PACE_CEILING))
+        plans.append(_plan_view(g, now, multiplier, ceiling))
     for harness, row in actifs.items():
         multiplicateur = float(row.get("pace_multiplier") or 1.0)
-        plans.extend(_plan_view(g, now, multiplicateur)
+        ceilings = {g.get("key"): float(g.get("pace_ceiling") or cost_mod.PACE_CEILING)
+                    for g in row.get("gauges") or []}
+        plans.extend(_plan_view(g, now, multiplicateur,
+                                ceilings.get(g.key, cost_mod.PACE_CEILING))
                      for g in row.get("_gauges") or [])
     return {
         "currency": "USD",
@@ -600,16 +640,17 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     }
 
 
-def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float) -> dict:
+def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float,
+               ceiling: float = cost_mod.PACE_CEILING) -> dict:
     """Un plan de `budget.plans` : la jauge et le rythme du même compte."""
     return {
         "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-        "pace_cap": round(g.pace_cap(now, multiplier), 4),
+        "pace_cap": round(g.pace_cap(now, multiplier, ceiling), 4),
         "elapsed": round(g.elapsed(now), 4),
         "resets_ts": _round(g.resets_at), "window_s": g.window_s,
         # #1561 : quand le relevé a été produit (None : source non datée)
         "read_at": _round(getattr(g, "read_at", None)),
-        "exceeded": g.exceeded(now, multiplier=multiplier),
+        "exceeded": g.exceeded(now, multiplier=multiplier, ceiling=ceiling),
     }
 
 
