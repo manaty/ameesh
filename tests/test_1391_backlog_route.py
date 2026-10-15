@@ -7,7 +7,8 @@ avec sa valeur et son chantier), regroupé avec les autres défauts mineurs du
 même chantier ». Sur ameesh, un P2 de la classe sensible bloque encore.
 
 Témoins : suite N détectée et orientée, suite de tests légitime non signalée
-(sans masquer un N explicite), suivis ordinaires silencieux, bloquant nommé
+(sans masquer un N explicite), suivis ordinaires silencieux, négation de
+« bloquant » et régression explicitement mineure orientées, bloquant nommé
 (B/B1/P1/incident/panne) prioritaire même avec une référence N historique, P2
 sensible conservé, avertissement rendu par les deux points d'entrée de création
 (`work add`, `mail --new-lot`), consigne injectée au relecteur d'après fusion
@@ -96,6 +97,25 @@ class FollowupHintTest(unittest.TestCase):
         # cite qu'une référence N historique.
         self.assertEqual(backlog.followup_hint(
             title="P1 : corriger la panne", source="issue du N2 de la R1"), "")
+
+    def test_a_negated_blocking_word_is_not_a_blocking_defect(self):
+        # R2 cx2, P2 : « non bloquant » / « pas bloquant » qualifie le défaut,
+        # ce n'est pas une occurrence positive de « bloquant » : la suite mineure
+        # garde sa route vers le backlog.
+        for title in (
+            "non bloquant : simplifier le diagnostic",
+            "pas bloquant : améliorer le libellé",
+        ):
+            self.assertIn("backlog", backlog.followup_hint(title=title), title)
+        # un « bloquant » positif reste prioritaire, même avec un marqueur N
+        self.assertEqual(backlog.followup_hint(
+            title="N2 : défaut bloquant confirmé par la mesure"), "")
+
+    def test_an_explicit_minor_regression_goes_to_the_backlog(self):
+        # R2 cx2, P2 : « régression » ne vaut pas à lui seul un bloquant ; avec
+        # un marqueur mineur explicite (N2), la suite va au backlog.
+        out = backlog.followup_hint(title="N2 : régression cosmétique du libellé")
+        self.assertIn("backlog", out)
 
     def test_a_plain_french_suite_keeps_its_lot(self):
         # « suite à / suite au » : du français ordinaire, souvent une demande

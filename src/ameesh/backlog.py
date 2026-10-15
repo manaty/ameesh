@@ -154,7 +154,9 @@ STANDALONE_N = re.compile(r"(?:^|[\s\[(\"«])N\b")
 TEST_SUITE = re.compile(
     r"suites? (?:de |des |du )?tests?\b|tests?[ -]?suites?\b|suites? compl[eè]?tes?\b"
     r"|suites? ci\b", re.I)
-#: un défaut bloquant (B/P1), un incident réel, une panne : le lot est légitime
+#: un défaut bloquant (B/P1), un incident réel, une panne, une régression : le
+#: lot est légitime — sauf régression explicitement mineure (N/P2/P3), voir
+#: `followup_hint`
 BLOCKING_DEFECT = re.compile(
     r"(?:^|[\s\[(\"«])(?:b[0-9]+\b|bloquant\w*)|(?:^|[\s\[(\"«])p1\b"
     r"|\bincidents?\b|\bpannes?\b|\bindisponib\w*|\br[eé]gressions?\b", re.I)
@@ -184,10 +186,13 @@ def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
     d'humain et un incident réel passent. On ne signale que ce qui porte un
     marqueur explicite de suite (N1/N2, P2/P3, « suite #lot », « suivi d'une
     relecture », « non bloquant »). Un défaut bloquant nommé (B/B1, P1,
-    incident, panne, régression) garde son lot même quand le titre ou la source
-    cite une suite N : le marqueur non bloquant ne dégrade pas un bloquant
-    (R1 cx2, P2 1). Une locution de suite de **tests** est neutralisée avant
-    l'examen : elle ne vaut pas marqueur, mais ne masque pas un N/P2/P3
+    incident, panne) garde son lot même quand le titre ou la source cite une
+    suite N : le marqueur non bloquant ne dégrade pas un bloquant (R1 cx2,
+    P2 1). « non bloquant »/« pas bloquant » nie le bloquant, ce n'est pas une
+    occurrence positive ; une régression annoncée explicitement mineure
+    (N/P2/P3) reste une suite mineure, « régression » ne valant pas à lui seul
+    un bloquant (R2 cx2, P2). Une locution de suite de **tests** est neutralisée
+    avant l'examen : elle ne vaut pas marqueur, mais ne masque pas un N/P2/P3
     explicite (R1 cx2, P2 3). « Suivi »/« follow-up » ne vaut marqueur que
     visant une relecture ou une référence ; « suivi des coûts mensuels » reste
     du travail ordinaire, sans avertissement (R1 cx2, P2 2)."""
@@ -206,7 +211,17 @@ def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
         return ""
     # Un bloquant explicite (B/B1, P1, incident, panne) est prioritaire : il
     # garde son lot même avec une référence N historique (R1 cx2, P2 1).
-    if BLOCKING_DEFECT.search(text) or BLOCKING_B.search(text):
+    # « non bloquant » / « pas bloquant » qualifie le défaut : ce n'est pas une
+    # occurrence positive de « bloquant ». Une régression peut être
+    # explicitement mineure (N/P2/P3), sans annuler B/P1/incident/panne.
+    blocking_text = re.sub(r"\b(?:non[ -]?bloquant\w*|pas bloquant\w*)", " ",
+                           text, flags=re.I)
+    explicit_minor = bool(re.search(
+        r"(?:^|[\s\[(\"«])(?:n[0-9]+\b|p[23]\b|non[ -]?bloquant\w*|pas bloquant)",
+        text, re.I) or STANDALONE_N.search(text))
+    if explicit_minor:
+        blocking_text = re.sub(r"\br[eé]gressions?\b", " ", blocking_text, flags=re.I)
+    if BLOCKING_DEFECT.search(blocking_text) or BLOCKING_B.search(text):
         return ""
     where = " --app %s" % app if app else ""
     short = " ".join(str(title or "").split())[:60]
