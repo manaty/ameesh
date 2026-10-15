@@ -556,3 +556,193 @@ liste des exclusions (#748, #963, #775) et des points de suivi (§5).
   (relectures d'après fusion #419/#1019/#1038/#1048/#786/#1125/#1261 à désigner au moment de
   la fusion) ; CI complète unique sur le gel final, puis fusion du paquet (§12). Le paquet 1
   (#1342) et le présent paquet restent distincts ; aucune CI individuelle n'est relancée.
+
+## 16. Addendum du 14/10 20:4xZ — union rejouée sur `main` `2458ec053` (#1339), candidat du paquet suivant
+
+- **Avancée de `main`** : `0532faed4` → `2458ec053` (PR #1024, lot #1339, fusionnée
+  20:23:12Z). Delta = 3 fichiers : `docs/EXPLOITATION.md`, `scripts/test-plan.py`,
+  `tests/test_l161f_plan.py` (889 insertions / 25 suppressions). Intersection avec les
+  23 fichiers du paquet : `docs/EXPLOITATION.md` seule ; les deux autres fichiers de #1339
+  sont hors paquet et pris tels quels de `main`.
+
+- **Union rejouée** : `merge-tree(gel ab4d76e04, main 2458ec053)` **rc=0**, aucune
+  résolution. Union = `3a29bf9dc2656a05799a4f05d7c2baae944f125e`, arbre
+  `1f6618ead1580250488faac82251cf43f79fe186`, parents `2458ec053` + `ab4d76e04`.
+
+- **Constance** : delta de l'union vs `main` = **exactement les 23 fichiers** du paquet ;
+  delta de l'union vs le candidat `ab4d76e04` = `docs/EXPLOITATION.md` + les 2 fichiers
+  #1339 de `main` ; les 22 autres blobs du paquet sont inchangés, `git diff --check`
+  propre, 0 marqueur de conflit.
+
+- **`docs/EXPLOITATION.md`** : blob d'union
+  `d406c7ae0e7a0c13c500c1c7e59dcc0acae0236c` = `main` `adb7fbaf` + contributions
+  #1048 (18 lignes), #1125 (7 lignes) et #759 (4 lignes / 1 remplacement) ; patch-id
+  `-U0` de la contribution du paquet identique avant (`0532faed4 → ab4d76e04`) et après
+  (`2458ec053 → union`) = `5b2d78b6e5cb273a597b64d17d11dcdba24c8d99` ; le texte #1339
+  (« Blocks without a measure ») est conservé ; 0 marqueur.
+
+- **Gel** : le commit qui porte cet addendum, delta vs l'union = **ce manifeste seul**
+  (§16). L'ancien gel `ab4d76e04` et l'union `79170f49` restent intacts ; le candidat du
+  paquet suivant est désormais ce gel §16, sur `main` `2458ec053`.
+
+- **Aucun geste distant** : aucun push de branche, aucun run, aucun close/reopen, aucune
+  fusion. `origin/integration/vague-suivante-1204` = `276e6ec56` inchangée.
+
+- **Réfs atelier** (publiées après ce commit) : `refs/atelier/1204/union-2458ec05` =
+  `3a29bf9dc2656a05799a4f05d7c2baae944f125e` ; `refs/atelier/1204/gel-2458ec05` = le
+  commit qui porte cet addendum.
+
+- **Suites** : qualification pilote du nouvel arbre/gel ; avis et feu dus au titre du
+  paquet (§12) ; CI complète unique sur le gel final, puis fusion du paquet. Aucune
+  cible auteur déclenchée (composition propre, sans adaptation).
+
+## 17. Addendum du 14/10 23:2xZ — résolution #1176 × #1342 vérifiée, #1372 qualifiée, pré-composition du paquet suivant (pas un gel)
+
+- **Avancées de `main`** : `2458ec05` → `9e916f66` (#1379, PR #1056,
+  `tests/test_l161f_plan.py` seul) → `ef4461b5` (#976, PR #777, 14 fichiers). Rejeu à
+  blanc de l'union §16 `3a29bf9d` sur `ef4461b5` : `merge-tree` **rc=0**, arbre
+  `b876a1fd` ; delta vs `main` = les **23 fichiers** du candidat §16 (22 fichiers de
+  lots + ce manifeste) ; delta vs union = `tests/test_l161f_plan.py` (#1379) + les
+  14 fichiers #976 ; 22/23 blobs constants, `docs/EXPLOITATION.md` recomposée
+  uniquement ; patch-id `-U0` de la contribution du candidat (`ef4461b5` → union
+  rejouée) constant `5b2d78b6e5cb273a597b64d17d11dcdba24c8d99`. Base du prochain
+  rejeu ≥ `ef4461b5`.
+
+- **Nouveau candidat #1176** (plafond de rythme par compte ; sensible argent +
+  autorisations/budget) : résolution d'intégration avec le paquet 1 publiée par dev3
+  (mail 43478, 23:14:30Z) — `refs/ameesh/resolutions/1176/1342` =
+  `fc881acf7a36d9adee2afd6fdddf79751ecc4ae8` (parents `24701c985b5a` lot +
+  `7c15ee010038` paquet 1 ; merge-base `c4fa14a23b07` ; arbre `cbd199779b79`).
+  Vérification de première main (docs-01, 23:2xZ) :
+  - delta vs paquet 1 = **exactement les 5 fichiers du lot** (`src/ameesh/accounts.py`,
+    `src/ameesh/cost.py`, `src/ameesh/mesh_cli.py`, `docs/COMPTES.md`,
+    `tests/test_1176_pace_ceiling.py`) ; les **945 autres blobs** de l'arbre sont
+    identiques à `7c15ee010` ; 0 marqueur de conflit ; `diff --check` vs paquet 1
+    propre (les 2 constats `platform/tool_cgroups.py:56` et
+    `tests/test_1075_pace_multiplier.py:122` sont ceux du côté paquet 1, déjà connus).
+  - constance des deux contributions : patch-id `-U0` **constant** (apport #1176 et
+    apport paquet 1) sur `accounts.py` (`314d0cd2` d'union), `mesh_cli.py`
+    (`952a66af`) et `COMPTES.md` (`28e04d66`) ; `test_1176` apporté tel quel
+    (blob `8fdb3363` = tête du lot). `cost.py` (`417fa393`) : seules différences =
+    **reformulation de docstring** ; l'ensemble des lignes modifiées du paquet 1 est
+    intégralement présent et l'apport #1176 aussi (le delta symétrique ne contient que
+    des lignes de docstring) ; aucune ligne de code perdue d'un côté ou de l'autre.
+  - observation non bloquante (N, docstring seule) : dans `free_at`, le texte conservé
+    dit encore ``(`PACE_CEILING` moins la réserve)`` alors que le code prend désormais
+    `ceiling` ; la phrase ajoutée `` `ceiling` (#1176) est le plafond effectif du compte
+    à `now` `` lève l'ambiguïté. À verser à la R2 Claude de #1176 (#1098), non bloquant.
+  - tests : 309 ciblés OK (déclaré par l'auteur, non rejoués — canon §3). **R2 Claude
+    réelle + feu nominatif sur #1176 restent dus** ; admission au paquet conditionnée à
+    ces portes.
+
+- **#1372** (canon injecté : projection courte de la carte Process ; sensible consignes,
+  auteur docs-01) : CI unique PR #1057, run `38649911876` (`pull_request`, tête
+  `5502cdf746`) **SUCCESS** terminal à 23:17:49Z ; jobs exécutés verts (plan, version
+  number, macOS, `psql` 1-3/3, `psycopg` 1-4/4, flux, bilan des impactés, agrégat
+  `tests`) ; seul « lecteurs de la doc » sauté (légitime : lot sans doc). R2 Codex
+  mesh-design GO 0 B/0 N sur la même tête. **Candidat au paquet suivant (§12), sans
+  fusion individuelle.**
+
+- **Pré-composition locale du paquet suivant** (aucune poussée de branche, aucun run,
+  aucun sondage) : chaîne **rc=0, aucune résolution** — base `fc881acf` (paquet 1 +
+  #1176) → `3a29bf9d` (union §16, dix lots) → `0bcd2ae7` (#1316) → `dca8a83e` (#1144)
+  → `20d37285f` (#1364) → `579fd3c9` (#1219) → `0367684e` (#1277) → `0a391728` (#1247)
+  → `784e9ea6` (#1323) → `5502cdf74` (#1372) → `e5568991` (#354) = arbre `bd27613b`,
+  commit local `10586031` (branche locale non poussée). Chaque étape n'ajoute que les
+  fichiers de son lot (23, 3, 1, 4, 2, 3, 1, 10, 3, 6) ; `diff --check` vs `main` :
+  seuls les 2 constats préexistants du paquet 1, aucun du paquet suivant ; 0 marqueur.
+
+- **#354/PR1045** (candidat supplémentaire, pilote 23:00Z) : composé **sans conflit**
+  (6 fichiers : `deploy/guest/*`, `src/ameesh/platform/offload_shell.py`,
+  `tests/test_l159b_offload.py`) ; admission après #1342, comme les autres.
+
+- **Réfs atelier** : le commit qui porte cet addendum est publié sous
+  `refs/atelier/1204/precomp-1176` (delta vs la pré-composition = ce manifeste seul) —
+  **preuve de constance réversible, pas un gel**. Les gels §15/§16 (`ab4d76e04`,
+  `daba615e`) et l'union §16 `3a29bf9d` restent intacts ; aucun ref n'est réécrit.
+
+- **État #1342** (lecture `gh`, 23:2xZ) : PR #1050 OPEN, tête `7c15ee010`,
+  `mergeStateStatus` BLOCKED, auto-merge retiré ; le bureau rafraîchit la tête sur
+  `main` `ef4461b54`, relance la CI complète unique, puis renouvelle le feu exact et
+  l'auto-merge `--match-head-commit` (§12). Aucun sondage.
+
+- **Suites** : après fusion #1342 → rejeu **définitif** sur `main` réelle
+  (base ≥ `ef4461b5`), manifeste final des membres admis, gel, publication,
+  **CI complète unique** (§12), feu pilote distinct, fusion du paquet.
+
+## 18. Addendum du 15/10 00:5xZ — main `e4e4c85c` (paquet 1 #1342 fusionné, #1277 fusionné), composition **admissible** du paquet 2 (gel candidat, 16 lots)
+
+- **Fusion du paquet 1** : PR #1050 `MERGED` à 00:16:41Z ; tête `8c713b3c1`, CI complète du run
+  `pull_request` `38653689969` verte (`tests` SUCCESS 00:06:39Z) ; l'agrégat du run `push`
+  `38653682693` (annulé, agrégat lancé après l'annulation) était rouge — incident signalé au
+  pilote à 00:1xZ, sans effet : la fusion a bien eu lieu. `main` = `60ceed02b1` (parents
+  `ef4461b54` + `8c713b3c1`, arbre `6a9ece94` = arbre de la tête). Vérifié de première main.
+
+- **Rejeu définitif de la pré-composition §17 sur main réelle** : `merge-tree(c144fe7e,
+  60ceed02b)` **rc=0**, arbre `884f57db` = prédiction publiée, aucun delta. Trois des membres
+  de cette chaîne n'ont pas leurs portes fermées (#1176, #1247, #1323 : R2 Claude due,
+  dispositif #1098) : ils sortent du paquet (voir exclusions). `#1277`, lui, a été **fusionné
+  individuellement** par son auteur (lot léger, PR #991, 00:21:43Z) : `main` = `e4e4c85c` ;
+  sa marche est retirée de la composition, contenu identique (blobs `CONTRIBUTING.md`,
+  `scripts/rebase-lot.sh`, `tests/test_1277_rebase_sujet.py` constants — l'arbre final
+  `183a497f` est le même qu'avec la marche, donc aucune perte).
+
+- **Composition admissible (16 lots), rc=0 à chaque étape, aucune résolution** : base
+  `merge(union §16 3a29bf9d, main e4e4c85c)` = `43f5bb7b` (arbre `c2236415`), puis
+  `0bcd2ae7` #1316 → `dca8a83e` #1144 → `20d37285f` #1364 → `579fd3c9` #1219 →
+  `5502cdf74` #1372 → `e5568991` #354. Arbre final
+  **`183a497fd021da351cc73f4ad801c7faf2cc8aec`**, commit
+  `779090aa1256bfd595d06c0c780d54cc13b321c2`. Delta vs `main` = **39 fichiers** (38 fichiers
+  de lots + ce manifeste) ; delta vs arbre §17 `884f57db` = **exactement les fichiers de
+  #1176, #1247 et #1323** (retirés) + ce manifeste ; 0 marqueur, `diff --check` propre. Les
+  étapes n'ajoutent que les fichiers de leur lot (3, 1, 4, 2, 3, 6) et les blobs des membres
+  restent constants : `chat.py` `69e638a9`, `test_l79_chat_terminal.py` `5fd448e9`,
+  `test-hermeticity-lint.py` `f3ea2d0e`, `test_hermeticity_lint.py` `ee1bc3f1`,
+  `EXECUTEUR-MEDIEE.md` `a906548c`, `lecteurs-doc.txt` `88d67794`, `test_l107` `f7bdee0f`,
+  `fakebin/dsh` `4f92012f`, `test_l224` `cae2b2c2`, `alert_briefs.py` `dbb9e2d3`,
+  `test_l132` `7aff92ef`, `l243-projects-and-names.md` `15b721dc`, `carte.yml` `9e4cb9f1`,
+  `test_1316` `1c39d41a`, `test_1314` `5f4efd7f`, `veille.md` `ebb4d846`, `canon.py`
+  `822c375a`, `reprise.py` `be2c5432`, `test_l1372` `703958b6`.
+
+- **Lots admis (16)** : les **10 de l'union §16** — 287, 419, 857, 1019, 1038, 1048, 786,
+  1125, 1261, 759 (classes, PR, dépendances et avis au §15, inchangés ; têtes gelées
+  revérifiées à 00:2xZ : 672 `a2e3c60de181`, 402 `79ebee0636f6`, 700 `c1d3271c82ba`,
+  791 `9dfcb03e146d`, 806 `5bc72a02e9ad`, 808 `1e7475317f83`, 1016 `94c8125378d1`,
+  876 `0fe458c221ed`, 992 `9964316b2d85`, 749 `b35a3af1ac26`, Y3 `494e7916`) — plus **6
+  ajoutés** :
+
+| lot | classe | source / candidat | avis |
+|---|---|---|---|
+| #1316 | sensible CI hors prod | branche `lot/1316-dispatch-carte` @`710f763dd` ; union `0bcd2ae7` | R1 Codex cx1 **FAVORABLE** (21:01Z sur `710f763dd`) |
+| #1144 | légère (`docs/EXPLOITATION.md`) | PR 877 @`7e550dac` ; union `dca8a83e` | avis qa-01 DeepSeek GO 0 B/0 N ; relecture d'après fusion due |
+| #1364 | sensible consignes | branche `lot/1364-consignes-sobriete` @`20d37285f` | R1 Codex mesh-design GO 0 B/0 N |
+| #1219 | légère | PR 990 @`5267b591` ; union `579fd3c9` | relecture d'après fusion désignée cx1/Codex (mesh-design 13:39) |
+| #1372 | sensible consignes | PR 1057 @`5502cdf74` | CI unique verte (run `38649911876`, 23:17:49Z) ; R1+R2 Codex mesh-design GO 0 B/0 N |
+| #354 | sensible prod (UID dédié) | PR 1045 @`e5568991` | R1 Codex 4551 + R2 Claude 4579 acquis, B fermés |
+
+- **Exclusions motivées** :
+  - #1176 (PR 905 @`24701c98`) : R2 Claude réelle + feu nominatif dus (#1098) ; résolution
+    `fc881acf` prête → paquet suivant.
+  - #1247 (PR 1001 @`9f9bd3cf`) : R2 Claude due (#1098) → paquet suivant.
+  - #1323 (PR 1013 @`e111e0db`) : R2 Claude due (#1098) + atterrissage #1155 → paquet suivant.
+  - #748 (R2 Claude réelle, #1098), #963 (#706 non satisfaite ; reprise documentaire en
+    cours, auteur docs-01), #775 (ordre #711 puis retarget) : maintenues.
+  - Candidats non mûrs : #1114+#917 (R1 auditeur + R2 dev2 en cours), #540 (R2 dev2),
+    #1359 (verdicts), #1227 (résolution/1342 `f97fd0bd`), #796 (avis bornés sur la
+    résolution à désigner, R2 #1098).
+
+- **Portes dues au titre du paquet** : qualification pilote de la composition ; **CI complète
+  unique** sur le gel (suite des deux pilotes, parts réellement exécutées) ; relectures
+  d'après fusion des lots légers (419, 1019, 1038, 786, 1125, 1261, 1144, 1219) à désigner au
+  moment de la fusion ; feu pilote distinct ; fusion du paquet.
+
+- **Réfs atelier (réversibles, aucun run)** : `refs/atelier/1204/union-e4e4c85c` =
+  `43f5bb7b` ; `refs/atelier/1204/precomp-admissible-e4e4c85c` = `779090aa` ;
+  `refs/atelier/1204/gel-e4e4c85c` = le commit qui porte cet addendum. Les refs antérieures
+  (`ab4d76e0`, `daba615e`, `fd0a9d01`, `c144fe7e`) restent intactes ;
+  `integration/vague-suivante-1204` = `276e6ec56` inchangée, **ancêtre du gel → poussée ff
+  possible** (vérifié).
+
+- **Suites** : au go du pilote, poussée ff du gel, CI complète unique §12, feu, fusion.
+  #1176/#1247/#1323 et les candidats non mûrs restent pour le paquet suivant ; #1277 est
+  déjà dans `main` (clôture par le sweep).
