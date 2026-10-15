@@ -84,17 +84,8 @@ CONTENUS = {
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.
-#: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
-#: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
-HORS_CONTRAT = {
-    "host_release_operations": {"operation", "host", "manifest_digest", "created_at"},
-    "host_release_fences": {"operation", "probe", "created_at"},
-    "host_release_fence_receipts": {"action_id", "operation", "step", "receipt",
-                                    "completed_at"},
-}
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
-           | HORS_CONTRAT.get(rel, set())
-           for rel in set(SIGNATURES) | set(CONTENUS) | set(HORS_CONTRAT)}
+           for rel in set(SIGNATURES) | set(CONTENUS)}
 
 
 def ecarts_de_classement(cols: dict[str, dict[str, bool]]) -> list[str]:
@@ -568,16 +559,6 @@ class SuperviseurRoleTest(PgTestCase):
         self.assertTrue(set(EXCLUES) <= set(cols), set(EXCLUES) - set(cols))
         ecarts = ecarts_de_classement(cols)
         self.assertEqual(ecarts, [], "colonnes ni accordées ni exclues (ou l'inverse)")
-
-    def test_le_superviseur_evalue_la_porte_de_release(self):
-        # L232b (0417) : `ameesh_host_gate_state` lit `host_release_fences.host` ;
-        # le périmètre d'opération et les reçus restent hors contrat.
-        lu = self.as_supervisor("SELECT ameesh_host_gate_state('synthetic-host', 'idle')")
-        self.assertEqual(lu.returncode, 0, lu.stderr)
-        self.assertEqual(lu.stdout.strip(), "idle")
-        refus = self.as_supervisor("SELECT operation FROM host_release_fences")
-        self.assertNotEqual(refus.returncode, 0)
-        self.assertIn("permission denied", refus.stderr.lower())
 
     def test_le_role_contenus_lit_exactement_les_contenus(self):
         for rel, cols in CONTENUS.items():

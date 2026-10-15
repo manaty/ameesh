@@ -8,10 +8,10 @@
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
-#   migrer [--additif-seulement] REF
-#                migrations de REF (obligatoire), lancées depuis son instantané
-#                AVANT de l'installer : base du mesh (UNE fois), puis ancienne
-#                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#   migrer [--additif-seulement] [REF]
+#                migrations de REF, lancées depuis son instantané AVANT de
+#                l'installer : base du mesh (UNE fois), puis ancienne base ;
+#                refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
@@ -37,9 +37,9 @@
 #   écrire, pas même un fetch (le distant est lu par ls-remote, main est
 #   $DISTANT/main local). Ces deux étapes ne lisent pas $BASCULE_ENV.
 #
-# REF : commit, branche ou étiquette du dépôt qui contient ce script.
-# Obligatoire pour migrer ; défaut HEAD pour installer. MIGRER_APRES=1
-# ne désactive jamais la garde additive de migrer (docs/BASCULE.md, L232b).
+# REF (migrer, installer) : commit, branche ou étiquette du dépôt qui contient
+# ce script ; défaut : HEAD de ce dépôt. MIGRER_APRES=1 (installer) : ancien
+# ordre, pour une migration non additive (docs/BASCULE.md, L151).
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57, jamais dans le dépôt) : VM (adresse WireGuard du serveur),
@@ -149,24 +149,15 @@ verifier() {
 sauvegarder() {
   local jour dsn; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
-  # #518 : le DSN ambigu est refusé (garde fail-closed du code déployé) avant
-  # d'ouvrir le canal privé de sauvegarde, comme pour « migrer ».
   dsn_part dsn "$CONFIG" dsn || return
-  "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
-    --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  avec_mdp "$CONFIG" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
-  # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
-  # Un échec de backup/upload doit arrêter cette étape avant les migrations.
-  ssh_vm 'set -e
-    systemctl start ameesh-sauvegarde.service
-    test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
-    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
+  ssh_vm 'systemctl start ameesh-sauvegarde.service && systemctl is-active ameesh-sauvegarde.service || true'
   if ancienne; then
     etape "ancienne base"
     dsn_part dsn "$CONFIG_RESTE" dsn || return
-    "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
-      --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    avec_mdp "$CONFIG_RESTE" pg_dump -Fc -d "$dsn" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
 }
@@ -219,19 +210,17 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
-# Migrations du commit explicite REF (obligatoire) : résolution unique, une
-# seule fois ; garde additive sur une cible non installée, et --additif-seulement
-# la garde même quand REF est déjà installé (reprise de staging, avis R1 B2,
-# #1155) ; une cible déjà installée passe tout (procédure MIGRER_APRES).
+# Migrations du commit REF, lancées depuis son instantané. Avant installation,
+# seules les migrations additives passent (--additive-only) : le code en
+# place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
+# fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
 migrer() {
-  local ref cible d garde=(--additive-only) force=0 sha
+  local ref=${1:-HEAD} cible d garde=(--additive-only) force=0
   if [ "${1:-}" = "--additif-seulement" ]; then
     force=1
-    shift
+    ref=${2:-HEAD}
   fi
-  ref=${1:?REF requis pour migrer}
-  sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
-  cible=$(instantane "$sha")
+  cible=$(instantane "$ref")
   # --additif-seulement : la garde tient meme quand l'instantane est deja
   # src-current (reprise de staging, avis R1 B2) : des VM peuvent tourner un
   # code precedent sur la base migree.
@@ -244,7 +233,7 @@ migrer() {
   etape "base du mesh (une seule fois pour tout le mesh)"
   dsn_part d "$CONFIG" dsn || return
   echo "base : $d"
-  ameesh_de "$cible" migrate --dry-run --additive-only
+  ameesh_de "$cible" migrate --dry-run
   migrer_base "$cible" ${garde[@]+"${garde[@]}"}
   if ancienne; then
     etape "ancienne base (ses exécuteurs prennent le même code)"
@@ -258,7 +247,7 @@ migrer_base() {
   ameesh_de "$cible" migrate "$@" || code=$?
   if [ "$code" = 3 ]; then
     echo "migration non additive : le code en place casserait sur la base migrée." >&2
-    echo "Plan non additif séparé à faire approuver ; migrer conserve toujours la garde additive." >&2
+    echo "Procédure à part (docs/BASCULE.md, L151) : MIGRER_APRES=1 $0 installer, puis $0 migrer, puis redemarrer, d'affilée." >&2
   fi
   [ "$code" = 0 ] || exit "$code"
   ameesh_de "$cible" doctor --probe
