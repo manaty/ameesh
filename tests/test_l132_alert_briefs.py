@@ -92,6 +92,16 @@ class BriefsTest(unittest.TestCase):
         # le choix est stable et réparti : le lot suivant va à l'autre
         self.assertEqual(list(alert_briefs.briefs(dict(alert, lot=43), listing)),
                          ["orch-b"])
+        # B1 bureau : le vivier est d'abord restreint au PROJET du lot (#705) ;
+        # sans ce filtre, le lot 43 partait à orch-b (projet b) et un lot
+        # ameesh pouvait n'être briefé qu'à un orchestrateur d'un autre projet.
+        projet_a = dict(alert, project="a")
+        self.assertEqual(list(alert_briefs.briefs(projet_a, listing)), ["orch"])
+        self.assertEqual(list(alert_briefs.briefs(dict(projet_a, lot=43), listing)),
+                         ["orch"])
+        # projet sans orchestrateur : repli sur tous, choix par lot inchangé
+        self.assertEqual(list(alert_briefs.briefs(dict(alert, project="c"), listing)),
+                         ["orch"])
         # L713 : le stale_lot sans assigné ne réveille pas l'auditeur (il le lit
         # à sa passe) ; l'orchestrateur choisi reste le seul destinataire
         briefs = alert_briefs.briefs(alert, listing, auditor_names=["auditeur"])

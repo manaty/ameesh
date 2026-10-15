@@ -360,7 +360,13 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
             # est vide et `_of_teams` rend tous les orchestrateurs. Deux d'entre
             # eux ont traité le même brief en 60 s (course #894/#895) : un seul
             # destinataire.
-            chosen = _one_orchestrator(out, by_name, alert.get("lot"))
+            # B1 bureau (15/10) : le vivier est d'abord restreint au PROJET du
+            # lot (#705 `_of_project` ; l'alerte porte `project`), sans quoi un
+            # lot ameesh peut n'être briefé qu'à un orchestrateur d'un autre
+            # projet, qui ne peut ni l'assigner ni le suivre — avant #1026 le
+            # brief partait à tous, donc l'orchestrateur du projet le recevait.
+            pool = _of_project(list(out), by_name, alert.get("project"), teams)
+            chosen = _one_orchestrator(pool, by_name, alert.get("lot"))
             out = {name: out[name] for name in chosen}
         if kind in ("estimate_bias", "waiting_without_question") \
                 and alert.get("agent") in by_name:
