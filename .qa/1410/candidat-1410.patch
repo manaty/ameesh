@@ -1,0 +1,860 @@
+From b7bbe71902c63b6dcda57408c9d2025a45ddb97d Mon Sep 17 00:00:00 2001
+From: mty-amh-impl-04 <mty-amh-impl-04@ameesh.invalid>
+Date: Thu, 15 Oct 2026 00:01:53 +0000
+Subject: [PATCH] =?UTF-8?q?#1410=20:=20une=20t=C3=AAte=20de=20paquet=20ne?=
+ =?UTF-8?q?=20lance=20qu'une=20seule=20suite=20compl=C3=A8te?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tests.yml ne se déclenche plus sur push integration/** : le portier
+.github/workflows/paquet.yml, déclenché par ces poussées, lit les PR
+ouvertes (scripts/test-plan.py couverture, API GitHub en lecture seule)
+et n'appelle la suite (workflow_call) que si aucune PR ouverte ne porte
+exactement la tête poussée (head.sha == github.sha, base main,
+release/** ou integration/**). Un push sans PR, une tête non couverte
+ou une API illisible gardent la suite complète : le repli est toujours
+« la suite tourne ». Le portier ne lit jamais un run et son check n'est
+jamais nommé tests : aucune validation n'est déduite d'un autre run.
+
+Incident #1342 : la poussée de la branche d'intégration déclenchait deux
+suites complètes sur la même tête, deux checks requis tests ; l'agrégat
+du run push annulé (if: always()) est resté rouge et a bloqué la
+PR #1050.
+
+Preuves auteur sur cette tête : tests.test_1410_paquet_ci_unique 20/20,
+tests.test_l755_workflow_timeouts + l161f + l744 + l161a + hermeticity +
+test_plan + 899 = 196/196, lint d'herméticité 0 constat sur les 3
+fichiers de test modifiés, py_compile OK. Aucun run de CI déclenché par
+ce commit de lot (seuls main et release/** déclenchent tests.yml).
+---
+ .github/workflows/paquet.yml         |  80 ++++++++
+ .github/workflows/tests.yml          |  40 ++--
+ docs/EXPLOITATION.md                 |  14 ++
+ scripts/test-plan.py                 | 166 ++++++++++++++++
+ tests/test_1410_paquet_ci_unique.py  | 271 +++++++++++++++++++++++++++
+ tests/test_l161f_plan.py             |  13 +-
+ tests/test_l755_workflow_timeouts.py |  79 +++++++-
+ 7 files changed, 644 insertions(+), 19 deletions(-)
+ create mode 100644 .github/workflows/paquet.yml
+ create mode 100644 tests/test_1410_paquet_ci_unique.py
+
+diff --git a/.github/workflows/paquet.yml b/.github/workflows/paquet.yml
+new file mode 100644
+index 000000000..ba27746ee
+--- /dev/null
++++ b/.github/workflows/paquet.yml
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# §12 : une tête de paquet ne lance qu'une seule suite complète.
++#
++# Une poussée sur une branche d'intégration déclenchait deux suites complètes :
++# le run `push integration/**` de tests.yml et le run `pull_request` de la PR
++# ouverte sur la même tête. Les deux portaient le check requis `tests` sur le
++# même commit ; annuler l'un laissait l'agrégat rouge de l'autre et bloquait la
++# fusion (incident #1342 : run push 38653682693 annulé, PR #1050 bloquée par
++# son `tests` en échec).
++#
++# tests.yml ne se déclenche plus sur `push integration/**`. Ce portier, lui,
++# lit les PR ouvertes de la branche poussée (`scripts/test-plan.py couverture`,
++# API GitHub en lecture seule) :
++#   - une PR ouverte porte exactement la tête poussée : la suite complète est
++#     déjà portée par son run `pull_request`, le portier n'appelle rien. Son
++#     propre check n'est jamais nommé `tests` : aucune validation ne peut être
++#     déduite de l'existence d'un autre run ;
++#   - aucune PR, une PR sur une autre tête, une base hors du périmètre de
++#     tests.yml, une API illisible : la suite complète tourne ici, par
++#     `workflow_call` de tests.yml. Un push sans PR garde donc sa validation,
++#     et le repli est toujours « la suite tourne ».
++#
++# Le portier ne lit jamais un run et ne touche à aucun run existant : le run
++# conservé (celui de la PR) garde son statut. Seule la concurrence ci-dessous
++# remplace un portier périmé de la même branche par le suivant.
++name: paquet
++
++on:
++  push:
++    branches: ["integration/**"]
++
++# une poussée plus récente remplace le portier de la même branche : une tête
++# dépassée n'a plus de décision à porter, et sa suite éventuelle n'a plus
++# d'objet.
++concurrency:
++  group: paquet-${{ github.ref }}
++  cancel-in-progress: true
++
++# la suite appelée publie ses flux (checks: write, L161c) et le portier lit
++# les PR (pull-requests: read) ; lui-même n'écrit aucun check.
++permissions:
++  contents: read
++  pull-requests: read
++  checks: write
++
++jobs:
++  # décide si une PR ouverte couvre exactement cette tête ; ne regarde que des
++  # PR, jamais un run.
++  couverture:
++    name: couverture (PR ouverte sur cette tête)
++    runs-on: [self-hosted, linux, ameesh-ci]
++    timeout-minutes: 5
++    permissions:
++      contents: read
++      pull-requests: read
++    outputs:
++      covered: ${{ steps.pr.outputs.covered }}
++      covered_pr: ${{ steps.pr.outputs.covered_pr }}
++    steps:
++      - uses: actions/checkout@v4
++      # le repli est dans la commande : contexte incomplet, API illisible ou
++      # non listée écrivent covered=false et sortent 0 — la suite tourne.
++      - id: pr
++        name: PR ouverte sur cette tête ?
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: >-
++          python3 scripts/test-plan.py couverture
++          --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" --sha "$GITHUB_SHA"
++          --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
++
++  # aucune PR ne couvre la tête : la suite complète tourne ici (push sans PR).
++  # `always()` : si le portier échoue, sa sortie est vide (covered ≠ true) et
++  # la suite part quand même — un portier en panne ne supprime jamais une
++  # validation.
++  suite:
++    name: suite complète du paquet
++    needs: couverture
++    if: always() && needs.couverture.outputs.covered != 'true'
++    uses: ./.github/workflows/tests.yml
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 517f0ac5a..864ddb9c7 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -8,30 +8,37 @@
+ # propre Postgres :
+ #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
+ #               en une à quatre parts selon l'estimation ; la suite complète,
+-#               en 4 parts, sur push vers main, integration/** ou release/**,
+-#               et sur une PR de release (source ou cible release/** ou
+-#               integration/**) ;
++#               en 4 parts, sur push vers main ou release/**, sur une PR de
++#               release (source ou cible release/** ou integration/**) et sur
++#               l'appel du portier de paquet (workflow_call, §12) ;
+ #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
+ #               et le contrat, plus la liste « always » déclenchée (#749), en
+ #               une à trois parts (#947 : huit jobs se partagent chaque hôte
+ #               auto-hébergé, une part unique de ~24 min au repos atteignait le
+ #               plafond de 30 min sous saturation) ; la suite complète, en
+-#               6 parts, sur push vers main, integration/** ou release/**, sur
+-#               une PR de release (sans liste pilote) et à la main
+-#               (workflow_dispatch).
++#               6 parts, sur push vers main ou release/**, sur une PR de
++#               release (sans liste pilote), à la main (workflow_dispatch) et
++#               sur l'appel du portier de paquet (workflow_call).
+ # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+ #
++# §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
++# `pull_request` de sa PR porte le check requis `tests` ; le portier
++# `.github/workflows/paquet.yml`, déclenché par `push integration/**`, n'appelle
++# cette suite (`workflow_call`) que si aucune PR ouverte ne couvre la tête
++# exacte, et son check n'est jamais nommé `tests` (incident #1342 : deux suites
++# complètes, l'agrégat rouge du run push annulé bloquait la PR #1050).
++#
+ # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
+ # toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
+ # migrations, objets globaux du cluster), avec repli sur la suite complète
+ # quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
+-# La suite complète tourne sur main, release/** et la branche d'intégration du
+-# paquet (§12) : une PR de lot n'en déclenche plus, mais une PR de release
+-# (source ou cible release/** ou integration/**), comme un push sur ces
+-# branches, garde la suite complète, les deux pilotes, sans voie version/doc
+-# ni liste pilote psql — y compris dans le plan de repli. Les règles de
+-# refusion (a : delta de main disjoint, b : migrations seules) viendront
+-# ensuite.
++# La suite complète tourne sur main, release/** et pour la branche d'intégration
++# du paquet (§12) par le run `pull_request` de sa PR ou, à défaut de PR couvrant
++# la tête, par le portier `paquet.yml` : une PR de lot n'en déclenche plus, mais
++# une PR de release (source ou cible release/** ou integration/**) garde la
++# suite complète, les deux pilotes, sans voie version/doc ni liste pilote psql —
++# y compris dans le plan de repli. Les règles de refusion (a : delta de main
++# disjoint, b : migrations seules) viendront ensuite.
+ #
+ # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
+ # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
+@@ -85,9 +92,14 @@
+ name: tests
+ 
+ on:
++  # §12 : une poussée sur integration/** ne déclenche plus cette suite
++  # directement. Le portier .github/workflows/paquet.yml décide — une tête de
++  # paquet n'a qu'une suite, celle de sa PR — et rappelle cette suite
++  # (workflow_call) quand aucune PR ouverte ne couvre la tête poussée.
+   push:
+-    branches: [main, "release/**", "integration/**"]
++    branches: [main, "release/**"]
+   pull_request:
++  workflow_call:
+   workflow_dispatch:
+ 
+ # Une PR dépassée est annulée. Les pushes de main partagent un groupe :
+diff --git a/docs/EXPLOITATION.md b/docs/EXPLOITATION.md
+index 778a0e436..1c7ac15c9 100644
+--- a/docs/EXPLOITATION.md
++++ b/docs/EXPLOITATION.md
+@@ -5592,6 +5592,20 @@ complète, les deux pilotes, sans voie version seule ni documentation seule ni
+ liste pilote psql — le workflow transmet les branches (`--base-ref`,
+ `--head-ref`), et le plan de repli suit la même règle.
+ 
++**Une seule suite par tête de paquet (§12).** `tests.yml` ne se déclenche plus
++sur `push integration/**` : le portier `.github/workflows/paquet.yml`, lui
++déclenché par ces poussées, lit les PR ouvertes de la branche
++(`scripts/test-plan.py couverture`, API GitHub en lecture seule) et n'appelle
++`tests.yml` (`workflow_call`) que si aucune ne porte la tête poussée
++exactement (`head.sha == github.sha`, base `main`, `release/**` ou
++`integration/**`). Une PR ouverte qui couvre la tête garde donc la seule suite
++complète de cette tête — celle de son run `pull_request`, qui porte le check
++requis `tests` —, et le check du portier n'est jamais nommé `tests` : aucune
++validation n'est déduite de l'existence d'un autre run. Un push sans PR (ou
++dont la tête n'est pas couverte, ou dont l'API est illisible) garde sa suite
++complète, exécutée par le portier. Le portier ne lit jamais un run et ne
++touche à aucun run existant.
++
+ ## Échecs de CI au courrier de l'agent du lot (L161c)
+ 
+ Après une poussée, l'agent n'attend plus la CI dans son tour (ni
+diff --git a/scripts/test-plan.py b/scripts/test-plan.py
+index 502141ea8..1c81f3535 100644
+--- a/scripts/test-plan.py
++++ b/scripts/test-plan.py
+@@ -9,6 +9,8 @@
+     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
+                                [--summary F]
+     scripts/test-plan.py tally leaks.json [leaks.json…]
++    scripts/test-plan.py couverture [--repo OWNER/REPO] [--ref REFS] [--sha SHA]
++                                    [--api URL] [--github-output F] [--summary F]
+ 
+ `plan` runs once per CI run (job `plan` of .github/workflows/tests.yml) and
+ decides, for every test module, its class and the parts it runs in; every
+@@ -114,6 +116,22 @@ P3). `leaks` reads the plan and the part streams of a run and writes one
+ record (`ameesh-test-leaks/1`), kept as the `leaks` artifact; `tally`
+ aggregates records for the two-week review (L161i): phase 2 requires fewer
+ than 1 leak per 50 PRs.
++
++**Coverage of a package push** (`couverture`, canon §12). A package
++integration branch pushed while its PR is open used to launch two full
++suites — the `push integration/**` run and the `pull_request` run of
++tests.yml — both carrying the required `tests` check on the same head; the
++cancelled one left its aggregate red (incident #1342, PR #1050). tests.yml
++no longer triggers on `push integration/**`; the gate
++`.github/workflows/paquet.yml` reads the branch's open pull requests (GitHub
++API, read-only) and asks this command whether one carries exactly the pushed
++head (`head.sha == github.sha`, base `main`, `release/**` or
++`integration/**`). If so, the suite is already carried by that PR's
++`pull_request` run and the gate calls nothing; otherwise — no PR, another
++head, a base outside tests.yml's scope, unreadable API, incomplete context —
++it calls tests.yml (`workflow_call`) so a push without a PR keeps its full
++suite. The decision never reads a run: no success is inferred from another
++run's existence, and the fallback is always "the suite runs".
+ """
+ from __future__ import annotations
+ 
+@@ -130,6 +148,8 @@ import pathlib
+ import re
+ import subprocess
+ import sys
++import urllib.parse
++import urllib.request
+ 
+ REPO = pathlib.Path(__file__).resolve().parent.parent
+ SCRIPTS = REPO / "scripts"
+@@ -1199,6 +1219,138 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
+     return out
+ 
+ 
++# -- paquet : une seule suite par tête (canon §12) --------------------------
++#
++# Une poussée sur la branche d'intégration d'un paquet et la PR ouverte sur
++# cette branche déclenchaient deux suites complètes, deux runs portant le même
++# check requis `tests` sur la même tête : annuler l'un laissait l'agrégat rouge
++# de l'autre (incident #1342, PR #1050 bloquée par le `tests` du run push
++# annulé). tests.yml ne se déclenche plus sur `push integration/**` ; le
++# portier .github/workflows/paquet.yml lit les PR ouvertes et n'appelle la
++# suite que si aucune ne couvre la tête exacte. La décision ne regarde jamais
++# un run : aucune réussite n'est déduite de l'existence d'un autre run.
++
++#: préfixe des branches d'intégration de paquet (canon §12)
++PACKAGE_PREFIX = "integration/"
++#: la base d'une PR de paquet (canon §12)
++PR_BASE = "main"
++#: une PR dont la source ou la cible est sous ces préfixes est une PR de
++#: release : elle déclenche tests.yml (canon §3)
++PR_BASE_PREFIXES = ("release/", "integration/")
++
++
++def pr_base_covered(base: str | None) -> bool:
++    """True si une PR sur cette base déclenche tests.yml (canon §3, §12)."""
++    base = (base or "").strip()
++    return base == PR_BASE or base.startswith(PR_BASE_PREFIXES)
++
++
++def couverture_decision(pulls, sha: str) -> dict:
++    """La PR ouverte qui couvre exactement la tête `sha`, sinon rien.
++
++    Ne lit que des PR ouvertes : aucune lecture de run, donc aucune réussite
++    déduite d'un autre run. Une PR dont la tête n'est pas ce commit exact ne
++    couvre pas la poussée (une nouvelle tête reprend sa décision), et une PR
++    dont la base ne déclenche pas tests.yml ne couvre rien : dans tous les
++    autres cas la suite tourne (repli sûr).
++    """
++    sha = (sha or "").strip()
++    same_head = []
++    for pr in pulls or []:
++        if (pr.get("state") or "open") != "open":
++            continue
++        head = ((pr.get("head") or {}).get("sha") or "").strip()
++        if head != sha:
++            continue
++        same_head.append(pr)
++        base = (pr.get("base") or {}).get("ref") or ""
++        if not pr_base_covered(base):
++            continue
++        number = pr.get("number")
++        return {"covered": True, "pr": number,
++                "why": f"PR #{number} (base {base}) couvre la tête {sha[:12]}"}
++    if same_head:
++        pr = same_head[0]
++        base = (pr.get("base") or {}).get("ref") or "?"
++        return {"covered": False, "pr": None,
++                "why": (f"PR #{pr.get('number')} est sur cette tête mais sa base "
++                        f"{base} ne déclenche pas tests.yml : la suite tourne")}
++    if pulls:
++        return {"covered": False, "pr": None,
++                "why": "PR ouvertes mais aucune sur cette tête exacte : la suite tourne"}
++    return {"covered": False, "pr": None,
++            "why": "aucune PR ouverte sur cette branche : la suite tourne"}
++
++
++def pulls_open(repo: str, branch: str, api: str, token: str, opener=None) -> list:
++    """Les PR ouvertes dont la tête est `branch` (API GitHub, lecture seule).
++
++    `head=owner:branch` filtre côté serveur ; 100 par page suffit pour une
++    branche d'intégration, et une lecture incomplète fait tourner la suite
++    (jamais l'inverse). Une erreur d'API ou de réseau remonte à l'appelant,
++    qui la traduit en repli sûr.
++    """
++    owner = repo.split("/", 1)[0]
++    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}",
++                                    "per_page": "100"})
++    url = f"{api.rstrip('/')}/repos/{repo}/pulls?{query}"
++    request = urllib.request.Request(url, headers={
++        "Accept": "application/vnd.github+json",
++        "Authorization": f"Bearer {token}",
++        "X-GitHub-Api-Version": "2022-11-28",
++        "User-Agent": "ameesh-tests-plan",
++    })
++    lire = opener or urllib.request.urlopen
++    with lire(request, timeout=20) as response:
++        data = json.loads(response.read().decode("utf-8"))
++    if not isinstance(data, list):
++        raise ValueError(f"payload inattendu ({type(data).__name__})")
++    return data
++
++
++def couverture_texte(out: dict, ref: str) -> str:
++    """Le résumé lisible de la décision, pour le journal du portier."""
++    etat = "couverte" if out["covered"] else "non couverte"
++    suite = ("la suite complète est portée par le run `pull_request` de tests.yml"
++             if out["covered"] else
++             "la suite complète tourne dans ce run (`paquet.yml`)")
++    return f"poussée {ref} : {etat} — {out['why']}\n{suite}\n"
++
++
++def couverture(args) -> int:
++    """Le portier `paquet.yml` : la poussée est-elle couverte par une PR ?
++
++    Repli sûr : contexte incomplet, ref hors `integration/**`, API illisible
++    ou non listée — la suite tourne, jamais l'inverse. Sortie toujours 0 :
++    l'échec du portier ne doit pas supprimer la validation de la branche.
++    """
++    out = {"covered": False, "pr": None, "why": ""}
++    branch = (args.ref or "").removeprefix("refs/heads/")
++    if not (args.repo and branch and args.sha):
++        out["why"] = "contexte incomplet (repo, ref ou sha) : la suite tourne"
++    elif not branch.startswith(PACKAGE_PREFIX):
++        out["why"] = f"poussée hors {PACKAGE_PREFIX}** : rien à dédupliquer"
++    else:
++        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
++        try:
++            pulls = pulls_open(args.repo, branch, args.api, token)
++            out = couverture_decision(pulls, args.sha)
++        except Exception as exc:  # noqa: BLE001 - repli sûr : la suite tourne
++            out = {"covered": False, "pr": None,
++                   "why": (f"PR illisibles ({type(exc).__name__}: {exc}) : "
++                           "la suite tourne")}
++    text = couverture_texte(out, args.ref or branch)
++    if args.github_output:
++        with open(args.github_output, "a", encoding="utf-8") as fh:
++            fh.write(f"covered={'true' if out['covered'] else 'false'}\n")
++            fh.write(f"covered_pr={out['pr'] if out['pr'] is not None else ''}\n")
++    if args.summary:
++        with open(args.summary, "a", encoding="utf-8") as fh:
++            fh.write(f"### Couverture de la poussée\n\n{text}")
++    print(text, end="")
++    return 0
++
++
+ def doc_readers(classes: dict, card: dict,
+                 modules: list[str]) -> tuple[list[str], list[str]]:
+     """Readers of a documentation-only change, judged with a usable map: the
+@@ -1557,8 +1709,22 @@ def main(argv: list[str] | None = None) -> int:
+     p.add_argument("--summary")
+     p = sub.add_parser("tally", help="leaks over many runs")
+     p.add_argument("records", nargs="+")
++    p = sub.add_parser("couverture",
++                       help="cette poussée de paquet est-elle couverte par une PR ouverte ?")
++    p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
++                   help="owner/repo (défaut : $GITHUB_REPOSITORY)")
++    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
++                   help="github.ref de la poussée (défaut : $GITHUB_REF)")
++    p.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""),
++                   help="tête poussée (défaut : $GITHUB_SHA)")
++    p.add_argument("--api", default=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
++                   help="racine de l'API GitHub (défaut : $GITHUB_API_URL)")
++    p.add_argument("--github-output", help="appends the job outputs to this file")
++    p.add_argument("--summary", help="appends the Markdown summary to this file")
+     args = ap.parse_args(argv)
+ 
++    if args.command == "couverture":
++        return couverture(args)
+     if args.command == "plan":
+         card, why = _load_map(args.map)
+         if card is None and args.map:
+diff --git a/tests/test_1410_paquet_ci_unique.py b/tests/test_1410_paquet_ci_unique.py
+new file mode 100644
+index 000000000..218a30b4d
+--- /dev/null
++++ b/tests/test_1410_paquet_ci_unique.py
+@@ -0,0 +1,271 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++"""#1410 — une tête de paquet ne lance qu'une seule suite complète.
++
++Une poussée sur `integration/**` déclenchait le run `push` de tests.yml, et la
++PR ouverte sur la même tête son run `pull_request` : deux suites complètes,
++deux checks `tests` sur le même commit. Annuler l'un laissait l'agrégat rouge
++de l'autre (incident #1342 : run push 38653682693 annulé, PR #1050 bloquée par
++son `tests` en échec).
++
++Le correctif est un delta de déclenchement (§12) : tests.yml ne se déclenche
++plus sur `push integration/**` ; le portier `.github/workflows/paquet.yml`, lui
++déclenché par ces poussées, lit les PR ouvertes (`scripts/test-plan.py
++couverture`) et n'appelle la suite (`workflow_call`) que si aucune ne porte la
++tête poussée exactement. La décision ne lit jamais un run : aucune réussite
++n'est déduite de l'existence d'un autre run, le repli est « la suite tourne ».
++
++Sans base ni réseau : décision pure, lecture d'API simulée, lecture des
++workflows.
++"""
++from __future__ import annotations
++
++import contextlib
++import importlib.util
++import io
++import json
++import pathlib
++import tempfile
++import unittest
++import urllib.error
++import urllib.parse
++from unittest import mock
++
++REPO = pathlib.Path(__file__).resolve().parent.parent
++_spec = importlib.util.spec_from_file_location("test_plan_1410", REPO / "scripts" / "test-plan.py")
++plan = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(plan)
++
++WORKFLOWS = REPO / ".github" / "workflows"
++TESTS = (WORKFLOWS / "tests.yml").read_text(encoding="utf-8")
++PAQUET = (WORKFLOWS / "paquet.yml").read_text(encoding="utf-8")
++
++SHA = "a" * 40
++AUTRE = "b" * 40
++
++
++def _pr(number=1, head=SHA, base="main", state="open"):
++    return {"number": number, "state": state,
++            "head": {"sha": head, "ref": "integration/paquet-1"},
++            "base": {"ref": base}}
++
++
++def _sans_commentaires(text: str) -> str:
++    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
++
++
++def _bloc_on(text: str) -> str:
++    """Les lignes du bloc `on:` (indentées), commentaires compris."""
++    lignes = text.splitlines()
++    debut = next(i for i, l in enumerate(lignes) if l.startswith("on:"))
++    corps = []
++    for ligne in lignes[debut + 1:]:
++        if ligne.strip() and not ligne[0].isspace():
++            break
++        corps.append(ligne)
++    return "\n".join(corps)
++
++
++def _bloc_job(text: str, nom: str) -> str:
++    """Le bloc du job `nom` (indentation de deux espaces)."""
++    lignes = text.splitlines()
++    debut = next(i for i, l in enumerate(lignes) if l.startswith("  %s:" % nom))
++    fin = next((i for i in range(debut + 1, len(lignes))
++                if lignes[i].startswith("  ") and not lignes[i].startswith("    ")),
++               len(lignes))
++    return "\n".join(lignes[debut:fin])
++
++
++class Reponse:
++    def __init__(self, payload: bytes):
++        self.payload = payload
++
++    def read(self):
++        return self.payload
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++
++class CouvertureDecisionTest(unittest.TestCase):
++    """La décision ne regarde que des PR : jamais un run."""
++
++    def test_une_pr_ouverte_sur_la_tete_couvre(self):
++        out = plan.couverture_decision([_pr(7)], SHA)
++        self.assertTrue(out["covered"])
++        self.assertEqual(out["pr"], 7)
++        self.assertIn("couvre la tête", out["why"])
++
++    def test_une_autre_tete_ne_couvre_pas(self):
++        # nouvelle tête : la décision se reprend sur le sha exact
++        out = plan.couverture_decision([_pr(7, head=AUTRE)], SHA)
++        self.assertFalse(out["covered"])
++        self.assertIn("aucune sur cette tête exacte", out["why"])
++
++    def test_aucune_pr_ne_couvre_pas(self):
++        out = plan.couverture_decision([], SHA)
++        self.assertFalse(out["covered"])
++        self.assertIn("aucune PR ouverte", out["why"])
++
++    def test_une_pr_fermee_ne_couvre_pas(self):
++        out = plan.couverture_decision([_pr(7, state="closed")], SHA)
++        self.assertFalse(out["covered"])
++
++    def test_les_bases_du_perimetre_couvrent(self):
++        for base in ("main", "release/1.10", "integration/paquet-2"):
++            out = plan.couverture_decision([_pr(7, base=base)], SHA)
++            self.assertTrue(out["covered"], base)
++
++    def test_une_base_hors_perimetre_ne_couvre_pas(self):
++        # une PR dont la base ne déclenche pas tests.yml ne porte pas la suite
++        for base in ("lot/xyz", "develop", ""):
++            out = plan.couverture_decision([_pr(7, base=base)], SHA)
++            self.assertFalse(out["covered"], base)
++            self.assertIn("ne déclenche pas tests.yml", out["why"])
++
++    def test_la_premiere_pr_du_perimetre_gagne(self):
++        pulls = [_pr(1, head=AUTRE), _pr(2, base="lot/xyz"), _pr(3)]
++        out = plan.couverture_decision(pulls, SHA)
++        self.assertTrue(out["covered"])
++        self.assertEqual(out["pr"], 3)
++
++
++class PullsOpenTest(unittest.TestCase):
++
++    def test_filtre_entetes_et_lecture(self):
++        vus = []
++
++        def opener(request, timeout=None):
++            vus.append((request, timeout))
++            return Reponse(json.dumps([_pr(7)]).encode("utf-8"))
++
++        pulls = plan.pulls_open("manaty/ameesh", "integration/paquet-1",
++                                "https://api.github.com", "jeton", opener=opener)
++        self.assertEqual(pulls, [_pr(7)])
++        request, timeout = vus[0]
++        parsed = urllib.parse.urlparse(request.full_url)
++        self.assertEqual(parsed.path, "/repos/manaty/ameesh/pulls")
++        query = urllib.parse.parse_qs(parsed.query)
++        self.assertEqual(query["state"], ["open"])
++        self.assertEqual(query["head"], ["manaty:integration/paquet-1"])
++        self.assertEqual(query["per_page"], ["100"])
++        self.assertEqual(request.get_header("Authorization"), "Bearer jeton")
++        self.assertEqual(timeout, 20)
++
++    def test_un_payload_non_liste_est_une_erreur(self):
++        def opener(request, timeout=None):
++            return Reponse(b'{"message": "Not Found"}')
++
++        with self.assertRaises(ValueError):
++            plan.pulls_open("manaty/ameesh", "integration/paquet-1",
++                            "https://api.github.com", "jeton", opener=opener)
++
++
++class CouvertureCommandeTest(unittest.TestCase):
++    """Le portier : repli sûr et sorties `covered`/`covered_pr`, toujours 0."""
++
++    def _run(self, pulls=None, erreur=None, ref="refs/heads/integration/paquet-1",
++             sha=SHA, repo="manaty/ameesh"):
++        appels = []
++
++        def faux(nom_repo, branche, api, token, opener=None):
++            appels.append((nom_repo, branche, api, token))
++            if erreur is not None:
++                raise erreur
++            return pulls if pulls is not None else []
++
++        with tempfile.TemporaryDirectory() as tmp:
++            sortie = pathlib.Path(tmp) / "github-output"
++            resume = pathlib.Path(tmp) / "summary"
++            with mock.patch.object(plan, "pulls_open", faux), \
++                    contextlib.redirect_stdout(io.StringIO()):
++                code = plan.main(["couverture", "--repo", repo, "--ref", ref, "--sha", sha,
++                                  "--github-output", str(sortie), "--summary", str(resume)])
++            return code, sortie.read_text(encoding="utf-8"), resume.read_text(encoding="utf-8"), appels
++
++    def test_pr_ouverte_sur_la_tete(self):
++        code, sortie, resume, appels = self._run(pulls=[_pr(7)])
++        self.assertEqual(code, 0)
++        self.assertIn("covered=true", sortie)
++        self.assertIn("covered_pr=7", sortie)
++        self.assertIn("couverte", resume)
++        self.assertEqual(appels[0][1], "integration/paquet-1")
++
++    def test_tete_non_couverte(self):
++        code, sortie, _, _ = self._run(pulls=[_pr(7, head=AUTRE)])
++        self.assertEqual(code, 0)
++        self.assertIn("covered=false", sortie)
++        self.assertIn("covered_pr=\n", sortie)
++
++    def test_api_illisible_replie_sur_la_suite(self):
++        # une API illisible fait tourner la suite, jamais l'inverse
++        code, sortie, resume, _ = self._run(erreur=urllib.error.URLError("boom"))
++        self.assertEqual(code, 0)
++        self.assertIn("covered=false", sortie)
++        self.assertIn("la suite tourne", resume)
++
++    def test_contexte_incomplet_replie_sur_la_suite(self):
++        code, sortie, _, appels = self._run(repo="")
++        self.assertEqual(code, 0)
++        self.assertIn("covered=false", sortie)
++        self.assertEqual(appels, [], "aucune lecture d'API sans contexte")
++
++    def test_ref_hors_paquet_ne_lit_rien(self):
++        code, sortie, _, appels = self._run(ref="refs/heads/main")
++        self.assertEqual(code, 0)
++        self.assertIn("covered=false", sortie)
++        self.assertEqual(appels, [], "aucune lecture d'API hors integration/**")
++
++
++class DeclenchementTest(unittest.TestCase):
++    """Le delta de déclenchement, lu dans les deux workflows."""
++
++    def test_tests_yml_ne_part_plus_sur_une_poussee_de_paquet(self):
++        on = _sans_commentaires(_bloc_on(TESTS))
++        self.assertNotIn("integration/**", on,
++                         "une poussée de paquet ne doit plus déclencher tests.yml")
++        self.assertIn('branches: [main, "release/**"]', on)
++
++    def test_tests_yml_reste_appelable_et_requis(self):
++        on = _sans_commentaires(_bloc_on(TESTS))
++        self.assertIn("workflow_call:", on)
++        self.assertIn("workflow_dispatch:", on)
++        self.assertIn("pull_request:", on)
++        # le check requis garde son job d'agrégat, nommé `tests`
++        self.assertRegex(TESTS, r"(?m)^  tests:")
++
++    def test_paquet_yml_declenche_la_suite_conditionnellement(self):
++        on = _sans_commentaires(_bloc_on(PAQUET))
++        self.assertIn("push:", on)
++        self.assertIn('branches: ["integration/**"]', on)
++        suite = _bloc_job(PAQUET, "suite")
++        self.assertIn("uses: ./.github/workflows/tests.yml", suite)
++        self.assertIn("needs: couverture", suite)
++        self.assertIn("if: always() && needs.couverture.outputs.covered != 'true'", suite,
++                      "portier en échec : sa sortie vide fait tourner la suite")
++
++    def test_le_portier_decide_sur_les_pr_et_jamais_sur_un_run(self):
++        gate = _bloc_job(PAQUET, "couverture")
++        self.assertIn("scripts/test-plan.py couverture", gate)
++        self.assertIn("pull-requests: read", gate)
++        self.assertNotIn("checks: write", gate, "le portier n'écrit aucun check")
++        self.assertNotIn("actions/runs", PAQUET)
++        self.assertNotIn("gh run", PAQUET)
++
++    def test_le_portier_ne_porte_jamais_le_check_requis(self):
++        # le check du portier n'est jamais nommé `tests` : aucune validation
++        # ne peut être déduite de l'existence d'un autre run.
++        self.assertNotRegex(PAQUET, r"(?m)^  tests:")
++        self.assertIn("name: couverture (PR ouverte sur cette tête)", PAQUET)
++
++    def test_le_portier_est_borne_et_concurrence(self):
++        # canon §3 : chaque job de CI porte une durée maximale
++        self.assertIn("timeout-minutes: 5", _bloc_job(PAQUET, "couverture"))
++        self.assertIn("cancel-in-progress: true", PAQUET)
++        self.assertIn("group: paquet-${{ github.ref }}", PAQUET)
++
++
++if __name__ == "__main__":  # pragma: no cover
++    unittest.main()
+diff --git a/tests/test_l161f_plan.py b/tests/test_l161f_plan.py
+index b525226e7..5cecd9a0c 100644
+--- a/tests/test_l161f_plan.py
++++ b/tests/test_l161f_plan.py
+@@ -1899,11 +1899,16 @@ class WorkflowTest(unittest.TestCase):
+ 
+     def test_lot_branch_triggers_and_full_suite_events(self):
+         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
+-        # décide), le push vers la branche d'intégration du paquet, main et
+-        # release/** porte la suite complète ; le check requis reste
+-        # l'agrégat « tests ».
+-        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
++        # décide), main et release/** portent la suite complète ; le check
++        # requis reste l'agrégat « tests ». #1410 : une poussée sur la branche
++        # d'intégration du paquet ne déclenche plus ce workflow — une tête de
++        # paquet n'a qu'une suite, celle de sa PR ; le portier paquet.yml
++        # appelle la suite (workflow_call) quand aucune PR ouverte ne couvre
++        # la tête exacte.
++        self.assertIn('branches: [main, "release/**"]', self.text)
++        self.assertNotIn('"integration/**"]', self.text)
+         self.assertIn("\n  pull_request:\n", self.text)
++        self.assertIn("\n  workflow_call:\n", self.text)
+         self.assertIn("L1211", self.text)
+         self.assertIn("tests/parts/toujours.txt", self.text)
+         self.assertIn("une PR de release", self.text)
+diff --git a/tests/test_l755_workflow_timeouts.py b/tests/test_l755_workflow_timeouts.py
+index de9254a4a..63d489d81 100644
+--- a/tests/test_l755_workflow_timeouts.py
++++ b/tests/test_l755_workflow_timeouts.py
+@@ -7,6 +7,11 @@ retenir un runner pendant des heures. » Le plafond retenu ici est 60 minutes :
+ la règle interdit des heures, pas une valeur précise, et le maximum en place à
+ l'ouverture du lot est 40 (`carte.yml`, job `mesure`).
+ 
++#1410 : GitHub refuse `timeout-minutes` sur un job qui appelle un workflow
++réutilisable (`uses:`), la clé n'existe que pour un job à étapes. Ces jobs
++portent donc leur borne dans le workflow appelé : celui-ci doit être local et
++chacun de ses jobs doit déclarer son `timeout-minutes` (vérifié ici).
++
+ PyYAML n'est pas une dépendance du projet : le venv de la CI n'installe que
+ psycopg, cryptography et psutil, et les tests qui lisent du YAML se sautent
+ quand il manque (`tests/test_cluster.py`). Ce module lit donc le sous-ensemble
+@@ -31,6 +36,8 @@ MAX_TIMEOUT_MINUTES = 60
+ _JOB = re.compile(r"""^  (?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+)):\s*(?:#.*)?$""")
+ #: Le timeout du job : clé indentée de 4 (celle d'une étape est plus profonde).
+ _JOB_TIMEOUT = re.compile(r"""^    timeout-minutes:\s*["']?(\d+)["']?\s*(?:#.*)?$""")
++#: L'appel d'un workflow réutilisable : clé de job, indentée de 4.
++_JOB_USES = re.compile(r"""^    uses:\s*["']?([^"'#\s]+)["']?\s*(?:#.*)?$""")
+ 
+ 
+ def job_timeouts(text: str) -> dict[str, int | None]:
+@@ -61,6 +68,36 @@ def job_timeouts(text: str) -> dict[str, int | None]:
+     return timeouts
+ 
+ 
++def caller_jobs(text: str) -> dict[str, str]:
++    """Les jobs qui appellent un workflow réutilisable : job → cible `uses:`.
++
++    GitHub refuse `timeout-minutes` sur ces jobs ; leur borne est portée par
++    les jobs du workflow appelé, que `WorkflowTimeoutsTest` vérifie.
++    """
++    appels: dict[str, str] = {}
++    current: str | None = None
++    in_jobs = False
++    for line in text.splitlines():
++        if not line.strip() or line.lstrip().startswith("#"):
++            continue
++        indent = len(line) - len(line.lstrip(" "))
++        if indent == 0:
++            in_jobs = line.split(":", 1)[0].strip() == "jobs"
++            current = None
++            continue
++        if not in_jobs:
++            continue
++        if indent == 2:
++            match = _JOB.match(line)
++            current = next((name for name in match.groups() if name), None) if match else None
++            continue
++        if indent == 4 and current is not None:
++            match = _JOB_USES.match(line)
++            if match:
++                appels[current] = match.group(1)
++    return appels
++
++
+ class WorkflowTimeoutsTest(unittest.TestCase):
+     def workflows(self) -> list[Path]:
+         files = sorted(WORKFLOWS.glob("*.yml"))
+@@ -69,14 +106,36 @@ class WorkflowTimeoutsTest(unittest.TestCase):
+ 
+     def test_chaque_job_declare_son_timeout(self):
+         for path in self.workflows():
+-            timeouts = job_timeouts(path.read_text(encoding="utf-8"))
++            text = path.read_text(encoding="utf-8")
++            appeles = caller_jobs(text)
++            timeouts = job_timeouts(text)
+             with self.subTest(workflow=path.name):
+                 self.assertTrue(timeouts, "aucun job lu dans %s" % path.name)
+             for job, value in timeouts.items():
++                if job in appeles:
++                    continue  # #1410 : `uses:` refuse timeout-minutes ; voir le test voisin
+                 with self.subTest(workflow=path.name, job=job):
+                     self.assertIsNotNone(
+                         value, "%s/%s : timeout-minutes manquant" % (path.name, job))
+ 
++    def test_un_job_appele_est_borne_par_les_jobs_de_l_appele(self):
++        # #1410 : la borne d'un job `uses:` est celle des jobs du workflow
++        # appelé ; l'appel doit rester local et chaque job appelé être borné.
++        for path in self.workflows():
++            for job, cible in caller_jobs(path.read_text(encoding="utf-8")).items():
++                with self.subTest(workflow=path.name, job=job):
++                    self.assertTrue(cible.startswith("./.github/workflows/"),
++                                    "%s/%s : appel non local (%s)" % (path.name, job, cible))
++                    appele = ROOT / cible[2:]
++                    self.assertTrue(appele.exists(),
++                                    "%s/%s : workflow appelé absent (%s)" % (path.name, job, cible))
++                    timeouts = job_timeouts(appele.read_text(encoding="utf-8"))
++                    self.assertTrue(timeouts, "aucun job lu dans %s" % appele.name)
++                    for nom, valeur in timeouts.items():
++                        self.assertIsNotNone(
++                            valeur, "%s (appelé par %s/%s) : timeout-minutes manquant"
++                            % (nom, path.name, job))
++
+     def test_le_plafond_est_respecte(self):
+         for path in self.workflows():
+             for job, value in job_timeouts(path.read_text(encoding="utf-8")).items():
+@@ -110,6 +169,24 @@ class WorkflowTimeoutsTest(unittest.TestCase):
+         )
+         self.assertEqual(job_timeouts(text), {"a": None, "b": 10, "c:d": 5, "d": None})
+ 
++    def test_le_parseur_reconnait_un_appel_de_workflow(self):
++        text = (
++            "name: ci\n"
++            "on:\n"
++            "  push:\n"
++            "jobs:\n"
++            "  a:\n"
++            "    uses: ./.github/workflows/appele.yml\n"
++            "  b:\n"
++            "    runs-on: ubuntu-latest\n"
++            "    timeout-minutes: 5\n"
++            "    steps:\n"
++            "      - uses: actions/checkout@v4\n"
++        )
++        self.assertEqual(caller_jobs(text), {"a": "./.github/workflows/appele.yml"})
++        self.assertEqual(job_timeouts(text), {"a": None, "b": 5})
++
+ 
+ if __name__ == "__main__":  # pragma: no cover
+     unittest.main()
++
+-- 
+2.43.0
+

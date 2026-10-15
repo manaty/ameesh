@@ -1,0 +1,8 @@
+ .github/workflows/paquet.yml         |  80 +++++++++++
+ .github/workflows/tests.yml          |  40 ++++--
+ docs/EXPLOITATION.md                 |  14 ++
+ scripts/test-plan.py                 | 166 +++++++++++++++++++++
+ tests/test_1410_paquet_ci_unique.py  | 271 +++++++++++++++++++++++++++++++++++
+ tests/test_l161f_plan.py             |  13 +-
+ tests/test_l755_workflow_timeouts.py |  79 +++++++++-
+ 7 files changed, 644 insertions(+), 19 deletions(-)

@@ -1,0 +1,12 @@
+...........................................................................................................map: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmp63fxvt8w/carte.json.gz: Not a gzipped file (b'no')
+..plan: KeyError: 'blocs'; fallback plan
+........plan: ValueError: /home/ameesh/.local/state/ameesh/.menage/tmp/mty-amh-impl-04/tmpmagkmumh/toujours.txt : module(s) inconnu(s) : test_gone_long_ago; fallback plan
+....................................................ameesh fil: work item #2: lot closed (abandoned): merge seen (o/r#20), not reopened
+..............................::warning title=plafond du job à 80 %::⚠ 80 % du plafond du job atteint : 24 min 00 s écoulées sur 30 min.
+....::warning title=plafond du job à 80 %::⚠ 80 % du plafond du job atteint : 24 min 00 s écoulées sur 30 min.
+..................
+----------------------------------------------------------------------
+Ran 221 tests in 237.647s
+
+OK
+EXIT=0
