@@ -136,6 +136,32 @@ def _applies(repo: str, tree: str, patch: bytes, *, reverse: bool = False) -> bo
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def _introduced_range(repo: str, sha: str, head: str) -> tuple[str, str] | None:
+    """Le gel et sa base commune avec la cible avant sa première introduction.
+
+    Un gel vide (`commit --allow-empty`) ne porte aucun diff propre : la
+    preuve de contenu du lot part de cette base, sans les autres membres de
+    la fusion (#1776). None quand l'entrée n'est pas une fusion (avance
+    rapide), quand `sha` n'est pas ancêtre de `head`, ou quand git ne peut
+    pas la lire — un doute ne conclut jamais au retrait."""
+    if _git(repo, "merge-base", "--is-ancestor", sha, head).returncode != 0:
+        return None
+    out = _out(repo, "rev-list", "--topo-order", "--reverse", "--merges",
+               "--ancestry-path", "%s..%s" % (sha, head))
+    if not out:
+        return None
+    # Traverser aussi les branches de paquet : --first-parent masque leur
+    # fusion du lot. La première entrée topologique par un parent secondaire
+    # isole le lot, plutôt que le diff de tous les membres du paquet.
+    for entry in out.split():
+        parents = (_out(repo, "rev-list", "--parents", "-n", "1", entry) or "").split()
+        if len(parents) >= 3 and _git(
+                repo, "merge-base", "--is-ancestor", sha, parents[1]).returncode == 1:
+            base = _out(repo, "merge-base", parents[1], sha)
+            return (base, sha) if base else None
+    return None
+
+
 def _content_gone(repo: str, sha: str, head: str) -> str | None:
     """`sha` est ancêtre de `head`, mais son contenu n'y est plus : la raison,
     sinon None.
@@ -144,15 +170,26 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
     défait son diff : l'ascendance seule ne prouve alors plus rien (constat
     qa-01, #498 / 043e14d8e). Le contenu est jugé là quand le diff du gel se
     défait sur l'arbre de la cible, et retiré quand il s'y réapplique
-    proprement. Arbres évolués (les deux échouent) : seuls les fichiers
-    ajoutés par le lot et disparus, ou supprimés et revenus, prouvent le
-    retrait — un doute ne conclut jamais au retrait."""
+    proprement. Un gel vide ne porte aucun diff : sa preuve est le delta de
+    son entrée dans la cible (#1776). Arbres évolués (les deux échouent) :
+    seuls les fichiers ajoutés par le lot et disparus, ou supprimés et
+    revenus, prouvent le retrait — un doute ne conclut jamais au retrait."""
     parent = _out(repo, "rev-parse", "--verify", "--quiet", sha + "^1")
     if parent is None:
         return None
-    diff = _git(repo, "diff", "--no-color", parent, sha)
-    if diff.returncode != 0 or not diff.stdout.strip():
+    proof, proof_parent = sha, parent
+    diff = _git(repo, "diff", "--no-color", "--binary", proof_parent, proof)
+    if diff.returncode != 0:
         return None
+    if not diff.stdout.strip():
+        # gel vide : isoler son contenu à son entrée, y compris dans un paquet.
+        entry = _introduced_range(repo, sha, head)
+        if entry is None:
+            return None
+        proof_parent, proof = entry
+        diff = _git(repo, "diff", "--no-color", "--binary", proof_parent, proof)
+        if diff.returncode != 0 or not diff.stdout.strip():
+            return None
     forward = _applies(repo, head, diff.stdout)
     reverse = _applies(repo, head, diff.stdout, reverse=True)
     if forward and not reverse:
@@ -161,12 +198,14 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
         return None
     # les deux échouent (arbres évolués) : seuls les chemins ajoutés disparus
     # ou supprimés revenus prouvent le retrait
-    status = _out(repo, "diff", "--name-status", parent, sha)
-    for line in (status or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) < 2:
+    status = _out(repo, "diff", "--name-status", "-z", proof_parent, proof)
+    fields = iter((status or "").split("\0"))
+    for kind in fields:
+        path = next(fields, "")
+        if kind.startswith(("R", "C")):
+            next(fields, None)       # les renommages/copies portent deux chemins
+        if kind not in ("A", "D") or not path:
             continue
-        kind, path = parts[0][:1], parts[-1]
         present = _out(repo, "rev-parse", "--verify", "--quiet",
                        "%s:%s" % (head, path)) is not None
         if kind == "A" and not present:
@@ -648,6 +687,10 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     def mention(why: str) -> dict:
         sha = merge_mentioning(repo, branch, head, since_ts)
         if sha:
+            gone = _content_gone(repo, sha, head)
+            if gone:
+                return dict(out, detail="merge commit %s that cites %s was reverted: %s"
+                                        % (sha[:12], branch, gone))
             return dict(out, merged=True, how="message", ref=sha,
                         detail="merge commit %s of %s that cites %s" % (sha[:12], target,
                                                                           branch))
@@ -1111,7 +1154,13 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
             partial = (merge, "merge commit %s declares itself partial "
                        "(\"ameesh-work-partial: %d\"): lot kept open"
                        % (merge["sha"][:12], lot))
+    reverted = None
     for merge in citing:
+        gone = _content_gone(repo, merge["sha"], _commit(repo, target))
+        if gone:
+            reverted = "merge commit %s of %s was reverted: %s" % (
+                merge["sha"][:12], target, gone)
+            continue
         number = merge_pr_number(merge["message"])
         if not number:
             cited = merge
@@ -1199,22 +1248,26 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     if held and cited is None and (partial or not proven):
         found = dict(found or {"tip": None, "ahead": False, "ref": None},
                      merged=False, how="partial", detail=held)
-    elif found is not None and found["merged"]:
-        pass
-    elif cited:
-        found = dict(found or {"tip": None, "ahead": False}, merged=True,
-                     how=cited["how"], ref=cited["sha"],
-                     detail=_citation(cited, lot, target),
-                     note=_citation(cited, lot, target, sha=False))
-    elif content is not None:
-        found = content
-    elif found is None:
-        found = {"merged": False, "how": None, "ref": None, "tip": None,
-                 "ahead": False,
-                 "detail": "no merge commit of %s names the lot "
-                           "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
-                           % (target, lot, lot, ", nor \"#%d\" in a title" % lot
-                              if hashes[repo] else "")}
+    if found is None or not found["merged"]:
+        if cited:
+            found = dict(found or {"tip": None, "ahead": False}, merged=True,
+                         how=cited["how"], ref=cited["sha"],
+                         detail=_citation(cited, lot, target),
+                         note=_citation(cited, lot, target, sha=False))
+        elif reverted:
+            # #1776 : un contenu retiré (revert d'une composition) prime sur
+            # la preuve par contenu : l'ascendance du gel ne prouve plus rien.
+            found = dict(found or {"tip": None, "ahead": False}, merged=False,
+                         how=None, ref=None, detail=reverted)
+        elif content is not None:
+            found = content
+        elif found is None:
+            found = {"merged": False, "how": None, "ref": None, "tip": None,
+                     "ahead": False,
+                     "detail": "no merge commit of %s names the lot "
+                               "(line \"ameesh-work: %d\", nor a merge of lot/%d-…%s)"
+                               % (target, lot, lot, ", nor \"#%d\" in a title" % lot
+                                  if hashes[repo] else "")}
     return {"found": found, "branch": branch, "implicit": implicit, "row": row}
 
 
