@@ -22,9 +22,10 @@ from .support import PgTestCase
 from .test_l75_resident import claude_doc
 
 
-def _result(**usage):
-    """A finished turn's `TurnResult`, reduced to the usage it carries."""
-    return types.SimpleNamespace(usage=usage)
+def _result(compact=None, **usage):
+    """A finished turn's `TurnResult`, reduced to the usage it carries (and
+    the native compaction it reported, L81 T3)."""
+    return types.SimpleNamespace(usage=usage, compact=compact)
 
 
 class TurnRereadTest(unittest.TestCase):
@@ -106,6 +107,19 @@ class MaintenanceTest(unittest.TestCase):
             context=199_999, window=200_000, reread=1_000, session_reread=1_000,
             share=0), "")
 
+    def test_compaction_does_not_loop_while_a_request_is_fresh(self):
+        self.assertEqual(resident_runner.maintenance(
+            context=100_000, window=200_000, reread=1_000, session_reread=1_000,
+            since_compact=10, compact_retry_s=600), "")
+        self.assertEqual(resident_runner.maintenance(
+            context=100_000, window=200_000, reread=1_000, session_reread=1_000,
+            since_compact=601, compact_retry_s=600), resident_runner.COMPACT)
+        # a fresh request never masks a harder bound
+        self.assertEqual(resident_runner.maintenance(
+            context=100_000, window=200_000, reread=15_000_000,
+            session_reread=15_000_000, cap=15_000_000,
+            since_compact=10, compact_retry_s=600), resident_runner.ROTATE)
+
 
 class ResidentMeasurementTest(unittest.TestCase):
     def _process(self) -> resident_runner.ResidentProcess:
@@ -148,6 +162,21 @@ class ResidentMeasurementTest(unittest.TestCase):
                                context_window=200_000))
         self.assertEqual(rp.maintenance_due(reread_max=50_000_000),
                          resident_runner.ALERT)
+
+    def test_native_compaction_follows_the_after_and_holds_the_next_one(self):
+        rp = self._process()
+        rp.record_turn(_result(input_tokens=150_000, context_tokens=150_000,
+                               context_window=200_000))
+        self.assertEqual(rp.maintenance_due(), resident_runner.COMPACT)
+        rp.compact_requested()
+        self.assertEqual(rp.maintenance_due(), "")   # no loop while it lands
+        rp.record_turn(_result(compact={"pre": 150_000, "post": 30_000},
+                               input_tokens=150_000, context_tokens=150_000,
+                               context_window=200_000))
+        self.assertEqual(rp.compactions, 1)
+        self.assertEqual((rp.compact_pre, rp.compact_post), (150_000, 30_000))
+        self.assertEqual(rp.last_context, 30_000)    # the measure follows the after
+        self.assertEqual(rp.maintenance_due(), "")
 
 
 class ResidentRotationTest(PgTestCase):
@@ -248,6 +277,49 @@ class ResidentRotationTest(PgTestCase):
         worker._dernier_humain = time.monotonic() - resident_runner.QUIET_S - 1
         self.assertTrue(worker.maybe_rotate())
         self.assertIsNone(worker.resident)
+
+    def test_half_the_window_compacts_between_two_turns(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_CONTEXT": "600",
+                                          "FAKE_CLAUDE_WINDOW": "1000"}):
+            _runner, worker = self._worker(resident_reread_max="0")
+            self.assertTrue(self._turn(worker, "premier"))
+            rp = worker.resident
+            self.assertEqual((rp.last_context, rp.context_window), (600, 1000))
+            self.assertEqual(worker._resident_maintenance(), resident_runner.COMPACT)
+            self.assertTrue(worker.maybe_rotate())
+            self.assertEqual(rp.compactions, 1)
+            self.assertEqual((rp.compact_pre, rp.compact_post), (600, 120))
+            self.assertEqual(rp.last_context, 120)   # the measure follows the after
+            self.assertEqual(worker._resident_maintenance(), "")   # no loop
+            self.assertTrue(any("Session compacted" in t for t in self._states()))
+            self.assertIn("/compact", self._prompts())
+
+    def test_a_compaction_without_boundary_does_not_loop(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_CONTEXT": "600",
+                                          "FAKE_CLAUDE_WINDOW": "1000",
+                                          "FAKE_COMPACT_SKIP": "1"}):
+            _runner, worker = self._worker(resident_reread_max="0")
+            self.assertTrue(self._turn(worker, "premier"))
+            rp = worker.resident
+            self.assertFalse(worker.maybe_rotate())  # one attempt, nothing landed
+            self.assertEqual(rp.compactions, 0)
+            self.assertEqual(self._prompts().count("/compact"), 1)
+            self.assertEqual(worker._resident_maintenance(), "")  # cooldown
+            self.assertFalse(worker.maybe_rotate())  # no second attempt
+            self.assertEqual(self._prompts().count("/compact"), 1)
+            self.assertTrue(any("no compact_boundary" in t for t in self._states()))
+
+    def test_a_recent_human_message_holds_the_compaction(self):
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_CONTEXT": "600",
+                                          "FAKE_CLAUDE_WINDOW": "1000"}):
+            _runner, worker = self._worker(resident_reread_max="0")
+            self.assertTrue(self._turn(worker, "premier"))
+            worker._dernier_humain = time.monotonic()
+            self.assertFalse(worker.maybe_rotate())
+            self.assertNotIn("/compact", self._prompts())
+            worker._dernier_humain = time.monotonic() - resident_runner.QUIET_S - 1
+            self.assertTrue(worker.maybe_rotate())
+            self.assertEqual(worker.resident.compactions, 1)
 
 
 if __name__ == "__main__":

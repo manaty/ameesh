@@ -1515,10 +1515,10 @@ class AgentWorker(threading.Thread):
     def _resident_maintain(self, decision: str) -> bool:
         """L81 (étude §6.2/§6.3) : exécute la décision d'entretien d'une
         session résidente — la rotation (quand calme pour le seuil de relu
-        cumulé, sans attendre pour le plafond dur). Rend True si la session a
-        été tournée : le processus est alors fermé et le prochain tour en
-        ouvre un neuf sur le résumé (étude §6.3). La compaction native (T3)
-        viendra ici, quand calme."""
+        cumulé, sans attendre pour le plafond dur), la compaction native
+        (quand calme). Rend True si l'entretien a eu lieu : pour une rotation
+        le processus est alors fermé et le prochain tour en ouvre un neuf sur
+        le résumé (étude §6.3)."""
         from . import resident_runner
         with self.lock:
             rp = self.resident
@@ -1533,6 +1533,12 @@ class AgentWorker(threading.Thread):
             raison = ("resident session re-read: %d tokens (threshold %.0f)"
                       % (rp.session_reread, resident_runner.reread_max(
                           self._state_read(resident_runner.REREAD_MAX_SETTING))))
+        elif decision == resident_runner.COMPACT:
+            if self._humain_recent():
+                return False
+            if not self._rotation_allowed():
+                return False
+            return self._native_compact(rp)
         else:
             return False
         if not self._rotation_allowed():
@@ -1540,6 +1546,41 @@ class AgentWorker(threading.Thread):
         if not self._rotate(raison):
             return False
         self._close_resident("rotated: %s" % raison)
+        return True
+
+    def _native_compact(self, rp) -> bool:
+        """L81 (étude §6.2) : compaction native du résident — `/compact` servi
+        comme un message entre deux tours, quand calme. Le harnais rapporte
+        alors une frontière (`compact_boundary`) et la session continue ; sans
+        frontière, la compaction n'a pas eu lieu et le délai de reprise
+        (`COMPACT_RETRY_S`, porté par le processus) évite la boucle."""
+        from . import resident_runner
+        avant = rp.compactions
+        rp.compact_requested()
+        ok = self.run_turn({"kind": "prompt",
+                            "prompt": resident_runner.COMPACT_COMMAND, "ids": []})
+        courant = self.resident or rp
+        if not ok:
+            log_async("[%s] native compaction cancelled: the turn did not complete"
+                      % self.name)
+            self._fil_note("Native compaction cancelled: the turn did not complete. "
+                           "The session goes on.",
+                           meta={"action": "compaction", "etat": "annulee"})
+            return False
+        if courant.compactions <= avant:
+            log_async("[%s] native compaction: no compact_boundary reported "
+                      "(context %s)" % (self.name, courant.last_context))
+            self._conversation_state(
+                "Native compaction asked (%s): the harness reported no "
+                "compact_boundary; the session goes on."
+                % resident_runner.COMPACT_COMMAND,
+                meta={"action": "compaction", "etat": "sans-frontiere"})
+            return False
+        self._conversation_state(
+            "Session compacted: context %s → %s tokens."
+            % (courant.compact_pre, courant.compact_post),
+            meta={"action": "compaction", "pre": courant.compact_pre,
+                  "post": courant.compact_post})
         return True
 
     def _rotation_allowed(self) -> bool:
