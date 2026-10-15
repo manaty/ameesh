@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest.mock import patch
 
 from ameesh import backlog, exploitation, notify, registry, storage, sous_utilisation, work
 
@@ -95,6 +96,83 @@ class FileTest(_Base):
 
 
 class PriseTest(_Base):
+    def test_lot_du_projet_bloque_laisse_prendre_l_amelioration(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        lot = work.add(self.db, title="projet bloque")
+        item = self.element("amelioration prete", 50)
+        storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+
+        self.assertEqual([t["item"]["id"] for t in self.take(dry_run=True)], [item["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+
+        # Un projet dont l'amont est satisfait reprend la priorite sur la file.
+        work.close(self.db, amont["id"], abandoned=True)
+        self.agent("claude2")
+        self.element("autre amelioration", 50)
+        self.assertEqual(self.take(), [])
+
+    def test_capacite_idle_ne_propose_pas_un_lot_du_projet_bloque(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        lot = work.add(self.db, title="projet bloque")
+        storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+        listing = storage.of(self.db).operations.listing()
+
+        def alertes(**kw):
+            return sous_utilisation.idle_capacity(
+                self.db, listing, self.now, [], idle_s=30, paid=("deepseek",), **kw)
+
+        self.assertEqual(alertes(), [])
+        self.assertEqual(alertes(lots=storage.of(self.db).operations.open_lots_activity(500)), [])
+        work.close(self.db, amont["id"], abandoned=True)
+        self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
+        self.assertIn("#%d" % lot["id"], alertes()[0]["detail"])
+
+    def test_dependance_ouverte_laisse_prendre_l_amelioration_prete(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        bloque = self.element("prioritaire mais bloque", 90)
+        pret = self.element("pret", 50)
+        storage.of(self.db).work_dependencies.add(bloque["id"], amont["id"], actor="test")
+
+        self.assertEqual([i["id"] for i in storage.of(self.db).work.backlog(
+            open_only=True, limit=1, ready_only=True)], [pret["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+        # La liste de la file continue d'afficher les éléments bloqués.
+        self.assertIn(bloque["id"], [i["id"] for i in backlog.items(self.db)])
+
+        work.close(self.db, amont["id"], abandoned=True)
+        self.agent("claude2")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [bloque["id"]])
+
+    def test_dependance_ajoutee_apres_selection_refuse_l_amelioration(self):
+        self.agent("claude1")
+        amont = work.add(self.db, title="amont", assignee="human:proprio")
+        bloque = self.element("devient bloque", 90)
+        pret = self.element("reste pret", 50)
+        check = work.check_assignee
+        added = False
+
+        def add_dependency(*args, **kwargs):
+            nonlocal added
+            if not added:
+                storage.of(self.db).work_dependencies.add(
+                    bloque["id"], amont["id"], actor="test")
+                added = True
+            return check(*args, **kwargs)
+
+        with patch.object(work, "check_assignee", side_effect=add_dependency):
+            out = self.take()
+        self.assertEqual([t["item"]["id"] for t in out], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+        self.assertFalse(self.db.query("SELECT id FROM agent_mailbox WHERE work_item_id = %s",
+                                       (str(bloque["id"]),)))
+        self.assertFalse(any(e["note"].startswith(backlog.AUTO_TAKE_NOTE)
+                             for e in work.events(self.db, bloque["id"])))
+
     def test_prise_de_plus_forte_valeur_et_courrier(self):
         self.agent("claude1")
         bas = self.element("doc", 20)
@@ -132,17 +210,22 @@ class PriseTest(_Base):
         self.assertEqual(storage.of(self.db).work.auto_takes_since(3600, backlog.AUTO_TAKE_NOTE), 2)
 
     def test_forfait_avant_token(self):
+        # #754 : le forfait passe d'abord ; ce qu'il laisse part aux agents au
+        # token dans le même passage, sans `--take-paid` ni veto d'équipe.
         self.agent("deepseek1", "deepseek", since_s=5 * HEURE)
         self.agent("claude1", since_s=HEURE)
-        self.element("dette", 50)
-        self.element("doc", 40)
+        haut = self.element("dette", 50)
+        bas = self.element("doc", 40)
         out = self.take(max_per_hour=5)
-        self.assertEqual([t["agent"] for t in out], ["claude1"])
-        out = self.take(max_per_hour=5, allow_paid=True,
-                        alerts=[{"type": "balance_low"}])
-        self.assertEqual(out, [])
-        out = self.take(max_per_hour=5, allow_paid=True)
-        self.assertEqual([t["agent"] for t in out], ["deepseek1"])
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("claude1", haut["id"]), ("deepseek1", bas["id"])])
+
+    def test_prise_au_token_jamais_sous_balance_low(self):
+        # #754 : un agent au token reste écarté pendant une alerte
+        # `balance_low`, même sans agent au forfait libre.
+        self.agent("deepseek1", "deepseek")
+        self.element("dette", 50)
+        self.assertEqual(self.take(alerts=[{"type": "balance_low"}]), [])
 
     def test_garde_fous_budget_et_hote(self):
         self.agent("claude1")
@@ -150,13 +233,34 @@ class PriseTest(_Base):
         self.assertEqual(self.take(budget_check=lambda a: "plafond atteint"), [])
         self.assertEqual(self.take(alerts=[{"type": "host_pressure", "host": self.cfg.host}]),
                          [])
-        # un agent du mesh en pause budget : aucune prise
+        # #754 : un agent du mesh en pause budget ne prend rien lui-même,
+        # mais il n'empêche plus les autres agents libres de prendre (un
+        # forfait au seuil ne doit pas arrêter ceux qui ont du budget).
         self.agent("claude2", status="blocked")
         self.db.execute("UPDATE agent_registry SET status_text = 'budget : plafond'"
                         " WHERE name = 'claude2'")
-        self.assertEqual(self.take(), [])
+        self.assertEqual([t["agent"] for t in self.take()], ["claude1"])
         self.db.execute("UPDATE agent_registry SET status_text = '' WHERE name = 'claude2'")
-        self.assertEqual(len(self.take()), 1)
+        # claude1 a pris le seul élément : la pause levée n'ouvre pas de prise
+        self.assertEqual(self.take(), [])
+
+    def test_prise_au_token_quand_le_forfait_est_au_seuil(self):
+        # #754 (owner, 13/10) : « quand les forfaits Claude sont au seuil, le
+        # travail passe à DeepSeek » — à défaut d'agent au forfait, l'agent
+        # au token de la même équipe prend l'élément.
+        self.agent("claude1", status="blocked")
+        self.db.execute("UPDATE agent_registry SET status_text = 'budget : plafond'"
+                        " WHERE name = 'claude1'")
+        self.agent("deepseek1", "deepseek")
+        item = self.element("dette", 50)
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("deepseek1", item["id"])])
+        # ... mais un forfait libre passe toujours devant
+        self.db.execute("UPDATE work_items SET assignee = NULL, state = 'intake',"
+                        " updated_at = now() WHERE id = %s", (item["id"],))
+        self.agent("claude3")
+        self.assertEqual([t["agent"] for t in self.take()], ["claude3"])
 
     def test_equipe_et_capacites(self):
         self.agent("web1", team="web", capabilities=["read"])
@@ -240,8 +344,7 @@ class AlerteEtNotifyTest(_Base):
         ncfg = notify.parse_config({})
         notifier = notify.Notifier(self.cfg, ncfg, log=lambda t: None, emit=records.append,
                                    clock=lambda: self.now,
-                                   take={"idle_s": 1800.0, "max_per_hour": 2,
-                                         "allow_paid": False})
+                                   take={"idle_s": 1800.0, "max_per_hour": 2})
         notifier.run_pass(self.db, thresholds=_seuils())
         prises = [r for r in records if r["event"] == "auto_take"]
         self.assertEqual([(r["agent"], r["lot"]) for r in prises], [("claude1", item["id"])])

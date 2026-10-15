@@ -12,6 +12,9 @@ class WorkDependencies(Contract):
     def __init__(self, db):
         self.db = db
 
+    def lock(self):
+        self.db.execute(_LOCK)
+
     @staticmethod
     def _journal(tx, item_id, blocker_id, action, actor):
         tx.execute("INSERT INTO work_item_events(work_item_id, state, note, actor, created_at)"

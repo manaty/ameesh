@@ -183,7 +183,7 @@ runner is running.
 
 **Several canons** (manaty + Acme, L42): `canons` in
 `config.json` or `AMEESH_CANONS` — see
-[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-decision-0031). The first
+[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-l43--décision-0031). The first
 remains the default canon; a host with a single canon changes nothing. Since
 L44 (migration 0035), each canon synchronizes its humans' passkeys
 into its own registry: give a `ref` to each entry of `canons`, or
@@ -723,7 +723,8 @@ only publish**.
    ```bash
    python3 -m venv /tmp/ameesh-l35 && /tmp/ameesh-l35/bin/pip install -q <dépôt ameesh au gel L35>
    git clone -q <url du dépôt du canon> /tmp/canon-l35     # throwaway copy, ~/canon intact
-   AMEESH_CONFIG=/tmp/aucune-config.json /tmp/ameesh-l35/bin/ameesh canon check \
+   printf '{}\n' > /tmp/ameesh-config-vide.json            # chemin explicite = fichier existant (#1127)
+   AMEESH_CONFIG=/tmp/ameesh-config-vide.json /tmp/ameesh-l35/bin/ameesh canon check \
        --canon /tmp/canon-l35 --ref origin/<branche-PR> --host pc-smichea
    #   expected: 0 errors, no host-policy-invalid, admission-cwd-inherited
    #   or host-work-dir-missing

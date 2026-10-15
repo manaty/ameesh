@@ -7,7 +7,7 @@ import os
 import types
 from unittest import mock
 
-from ameesh import db as db_mod, registry, storage, session_backup as sb
+from ameesh import accounts, db as db_mod, registry, storage, session_backup as sb
 from .support import PgTestCase
 
 
@@ -29,6 +29,15 @@ class RestoreGuardTest(PgTestCase):
         self.destination = os.path.join(self.args.home, "s1.jsonl")
         with open(self.destination, "w") as fh:
             fh.write("live transcript")
+
+    def declared_home(self, path):
+        """Déclare le profil `config_dir` qui prouve le home de restore-a (N #782)."""
+        # session_id doit rester posé : le déclencheur 0033 efface le compte
+        # quand la session est oubliée.
+        self.db.execute("UPDATE agent_registry SET session_id = 's1', "
+                        "session_account = 'compte-a' WHERE name = 'restore-a'")
+        profile = accounts.Profile(harness="codex", name="compte-a", path=path)
+        return mock.patch.object(accounts, "profiles", return_value=[profile])
 
     def test_active_status_and_live_or_unknown_lease_refuse_before_download(self):
         for status, owner, expires in (("running", None, None),
@@ -60,11 +69,13 @@ class RestoreGuardTest(PgTestCase):
         """L731: --home must not overwrite a foreign home without the flag."""
         foreign = os.path.join(self.tmp, "other-agent-home")
         os.makedirs(foreign)
+        own = os.path.join(self.tmp, "own-home")
+        os.makedirs(own)
         self.args.home = foreign
         destination = os.path.join(foreign, "s1.jsonl")
         with open(destination, "w") as fh:
             fh.write("other agent live transcript")
-        with mock.patch.object(sb, "get") as get:
+        with self.declared_home(own), mock.patch.object(sb, "get") as get:
             with self.assertRaisesRegex(sb.BackupError, "not the home of restore-a"):
                 sb.restore_agent(self.db, self.cfg, self.conf, self.args)
         get.assert_not_called()
@@ -76,15 +87,17 @@ class RestoreGuardTest(PgTestCase):
         with mock.patch.object(sb, "_agent_home",
                                side_effect=sb.BackupError("boom")), \
                 mock.patch.object(sb, "get") as get:
-            with self.assertRaisesRegex(sb.BackupError, "cannot identify the home of restore-a"):
+            with self.assertRaisesRegex(
+                    sb.BackupError,
+                    "cannot identify the home of restore-a.*--allow-other-agent"):
                 sb.restore_agent(self.db, self.cfg, self.conf, self.args)
         get.assert_not_called()
 
     def test_explicit_home_of_the_key_owner_is_allowed(self):
         own = os.path.join(self.tmp, "own-home")
         os.makedirs(own)
-        with mock.patch.dict(os.environ, {"CODEX_HOME": own}):
-            self.args.home = own
+        self.args.home = own
+        with self.declared_home(own):
             restored = sb.restore_agent(self.db, self.cfg, self.conf, self.args)
         self.assertEqual(restored[2], ["s1.jsonl"])
         with open(os.path.join(own, "s1.jsonl")) as fh:
@@ -95,8 +108,8 @@ class RestoreGuardTest(PgTestCase):
         os.makedirs(own)
         link = os.path.join(self.tmp, "own-home-link")
         os.symlink(own, link)
-        with mock.patch.dict(os.environ, {"CODEX_HOME": own}):
-            self.args.home = link
+        self.args.home = link
+        with self.declared_home(own):
             restored = sb.restore_agent(self.db, self.cfg, self.conf, self.args)
         self.assertEqual(restored[2], ["s1.jsonl"])
         with open(os.path.join(own, "s1.jsonl")) as fh:
@@ -218,8 +231,11 @@ class RestoreGuardTest(PgTestCase):
     def test_cli_explicit_home_outside_the_key_owner_needs_the_flag(self):
         foreign = os.path.join(self.tmp, "other-agent-home")
         os.makedirs(foreign)
-        with mock.patch('ameesh.config.load', return_value=types.SimpleNamespace(
-                session_backup={"target": self.conf.target, "encrypt": False})), \
+        own = os.path.join(self.tmp, "own-home")
+        os.makedirs(own)
+        with self.declared_home(own), \
+                mock.patch('ameesh.config.load', return_value=types.SimpleNamespace(
+                    session_backup={"target": self.conf.target, "encrypt": False})), \
                 mock.patch.object(db_mod, "connect", return_value=self.db), \
                 mock.patch.object(self.db, "close"), \
                 mock.patch.object(sb, "get") as get, \
@@ -238,7 +254,7 @@ class RestoreGuardTest(PgTestCase):
                         session_backup={"target": self.conf.target, "encrypt": False})), \
                     mock.patch.object(db_mod, "connect", return_value=self.db), \
                     mock.patch.object(self.db, "close"), \
-                    mock.patch.object(sb, "_agent_home", return_value=(self.args.home, ())), \
+                    mock.patch.object(sb, "_agent_home", return_value=self.args.home), \
                     mock.patch.object(sb, "get") as get, \
                     mock.patch('sys.stderr', io.StringIO()) as err:
                 self.assertEqual(sb.main(["restore", "restore-b", "--key", self.key,

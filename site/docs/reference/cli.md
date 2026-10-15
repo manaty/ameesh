@@ -251,7 +251,6 @@ ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION  # reserve
 | `notify --dry-run` | print what would be sent; send nothing, write no state |
 | `notify --take-idle` | auto-take from the improvement backlog: wakeable agent idle without a lot for S seconds (default 1800; 0 disables; L119) |
 | `notify --take-max-per-hour` | auto-takes per sliding hour, whole mesh (default 2) |
-| `notify --take-paid` | let pay-per-token agents take too (after subscription agents; never during `balance_low`) |
 | `notify --test` | a test message on each channel of that human (exit 0 if all pass, 1 otherwise, 2 without a channel) |
 | `restart --wait` | wait up to S seconds for the runner to apply the request |
 | `adopt --account` | look for the session file under this declared account only |
@@ -341,8 +340,8 @@ ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
-ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID)
-ameesh work sync-merges [--dry-run] [--json]          # close frozen lots whose content is merged (L29)
+ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA)
+ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
 ameesh work measure [<id>…] [--no-ci] [--json]        # actual time per phase, merged diff size (L157c)
@@ -370,7 +369,9 @@ idempotent and visible in `work show`. `work set-app` corrects a
 lot's project and `work backfill-app` fills the uniquely inferred ones, both
 with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 (`--none` detaches it),
-`work close` closes an abandoned or superseded lot, and `work sync-merges`
+`work close` closes an abandoned, superseded or delivered-outside-target lot
+(`--delivered --sha <reviewed head>`: the `delivered` milestone carries the
+head and counts as a delivery in `estimates`, #988), and `work sync-merges`
 closes the frozen lots whose content is already merged (L29). `work schedule`
 proposes the planned dates of open assigned lots at the p80 of the L157
 reference table (`--apply` writes), and `work measure` records the actual time
@@ -422,10 +423,10 @@ work awaits it** (no open lot, unread mail, pending prompt or open session lot)
 **and no project lot waits for a taker**. The take mail forbids any
 irreversible or production step (deploy, merge, data deletion, production
 server, committed spend): the agent proposes it to a human. Subscription agents
-first; pay-per-token agents only with `--take-paid`, never during
-`balance_low`; nothing while a budget cap is reached or the agent's host is
-under pressure, on low battery or not ready; at most `--take-max-per-hour` (2)
-takes per sliding hour for the whole mesh.
+first; what they leave is taken by pay-per-token agents in the same pass, never
+during `balance_low`; nothing while a budget cap is reached or the agent's host
+is under pressure, on low battery or not ready; at most `--take-max-per-hour`
+(2) takes per sliding hour for the whole mesh.
 
 Since v1.4.0, `work add --assignee` and `work assign` give a lot only to an
 agent ameesh can **wake** (known, in `execute` mode, admitted on its host, with

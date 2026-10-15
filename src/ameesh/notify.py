@@ -4,7 +4,7 @@
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
-                [--take-idle S] [--take-max-per-hour N] [--take-paid]
+                [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
                 [--handoff-max-per-hour N] [--handoff-idle S]
         follows the operations alerts (`ameesh alerts --follow`, same
@@ -91,6 +91,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
                  "ci_main_red",
+                 # #845 : la garde de la CI — runner busy sans job (panne) et
+                 # file au-delà du SLO de 15 min (capacité)
+                 "ci_runner_stuck", "ci_queue_saturated",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
                  # L225 : des tours sans tarif au barème échappent à la dépense
@@ -105,12 +108,18 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #1268 : un agent critique enchaîne les échecs de tour réels
+                 "critical_turn_failures",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain", "db_connections_high")
+                 "land_uncertain", "db_connections_high",
+                 # #513 : la dépense comptée s'écarte des soldes (barème faux)
+                 "budget_drift",
+                 # #532: a local PgBouncer pool queues its mesh clients
+                 "pgbouncer_pool_waiting")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -135,6 +144,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
+    "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -144,6 +154,9 @@ TYPE_LABELS = {
     "long_turn": "long turn",
     "session_too_big": "session too big",
     "stale_lot": "stale lot",
+    # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
+    # humains si le type est dans `notify.types`
+    "slo_breach": "internal deadline (SLO) overdue",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
@@ -175,6 +188,8 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "estimate bias",
     "ci_main_red": "CI red on main",
+    "ci_runner_stuck": "CI runner busy with no job running",
+    "ci_queue_saturated": "CI queue beyond its SLO",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",
@@ -192,18 +207,26 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    # #1268 : deux échecs de tour réels d'affilée sur un agent critique
+    "critical_turn_failures": "critical agent failing turns",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
+    "budget_drift": "counted spend strays from the provider balance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing", "critical_budget_pause", "owner_key_registered",
-                "land_uncertain", "db_connections_high")
+                "credential_failing", "critical_budget_pause", "critical_turn_failures",
+                "owner_key_registered",
+                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
 QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
+#: types qu'un passage observe depuis la configuration de l'hôte seule, sans
+#: la base du mesh : la console du pool PgBouncer local (#532). Une panne de
+#: base ne les résout jamais, et ne les cache pas non plus.
+LOCAL_TYPES = ("pgbouncer_pool_waiting",)
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -787,7 +810,12 @@ class DrySender:
 
 class Router:
     """Le destinataire humain d'une alerte (une instance par passage : les
-    lectures — registre, lots, paquets, canon — sont faites au plus une fois)."""
+    lectures — registre, lots, paquets, canon — sont faites au plus une fois).
+
+    `db` peut être None pour un passage sans la base (`Notifier.run_local_pass`,
+    #532) : le registre et les lots ne sont alors pas lisibles, et la route se
+    limite au champ `responsible` de l'alerte, à la fiche d'hôte du canon et au
+    destinataire par défaut."""
 
     def __init__(self, cfg: Config, db, ncfg: NotifyConfig):
         self.cfg, self.db, self.ncfg = cfg, db, ncfg
@@ -797,8 +825,8 @@ class Router:
 
     def agents(self) -> dict:
         if self._agents is None:
-            self._agents = {row["name"]: row
-                            for row in storage.of(self.db).operations.listing()}
+            self._agents = {} if self.db is None else {
+                row["name"]: row for row in storage.of(self.db).operations.listing()}
         return self._agents
 
     def agent_responsible(self, name) -> str | None:
@@ -807,7 +835,7 @@ class Router:
         return (self.agents().get(name) or {}).get("responsible")
 
     def lot_responsible(self, lot) -> str | None:
-        if lot is None:
+        if lot is None or self.db is None:
             return None
         try:
             item = storage.of(self.db).work.get(int(lot))
@@ -838,6 +866,14 @@ class Router:
 
     def resolve(self, alert: dict) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
+        if "owner" in (alert.get("targets") or ()):
+            # #789 t2 (canon §9) : un dépassement critique (P1) escalade au
+            # propriétaire — `notify.default_human`, comme le dit la
+            # documentation de ce module. La cible prime le `responsible` de
+            # l'agent, qui peut être un pilote : un P1 ne s'arrête pas à lui.
+            human = normalize_human(self.ncfg.default_human)
+            if human:
+                return human, "defaut"
         if alert.get("type") == "module_deviation":
             # A project procedure finding belongs to the lot, even when its
             # assignee (or their host/responsible human) belongs elsewhere.
@@ -967,7 +1003,10 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
-         "decision", "grouped")
+         "decision", "grouped",
+         # #789 t2 (canon §9) : un P1 garde son niveau et ses cibles dans
+         # l'état — la livraison au propriétaire et la résolution les relisent
+         "critical", "targets")
 
 
 # --------------------------------------------------------------------------
@@ -1012,7 +1051,16 @@ class Notifier:
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
         notifications = group_orphan_lots(current, router.resolve)
-        wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
+        # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
+        # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
+        # perd pas — elle atteint l'humain même si son type a été retiré de
+        # `notify.types` ; c'est le comportement par défaut qui tient le
+        # contrat « un P1 escalade au propriétaire ». Les dépassements
+        # ordinaires restent filtrables : `slo_breach` s'ajoute à
+        # `notify.types` pour les recevoir sur les canaux humains.
+        wanted = {key_of(a): a for a in notifications
+                  if a.get("type") in self.ncfg.types
+                  or "owner" in (a.get("targets") or ())}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
         # Persisted deliveries from an older routing policy must not retry or
@@ -1026,7 +1074,8 @@ class Notifier:
             if key in wanted:
                 continue
             entry = active.pop(key)
-            if entry["alert"].get("type") not in self.ncfg.types:
+            if entry["alert"].get("type") not in self.ncfg.types \
+                    and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
@@ -1079,6 +1128,70 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    def run_local_pass(self, now: float | None = None) -> list:
+        """Un passage sans la base du mesh : la console du pool local (#532).
+
+        Le notifieur atteint la base à travers ce même pool : quand
+        `max_client_conn` refuse tout le monde, sa connexion ordinaire échoue
+        alors que la console, elle, répond encore. Ce passage lit donc la
+        console depuis `cfg` seule, puis lève, retente et résout les alertes de
+        `LOCAL_TYPES` — sans connexion ni lecture préalable de la base. Les
+        autres livraisons en cours sont laissées telles quelles : une alerte
+        non observée n'est jamais résolue. Une console illisible est
+        journalisée et ne change rien."""
+        now = float(self.clock() if now is None else now)
+        records: list = []
+        self._records = records
+        from . import pgbouncer_local
+        try:
+            current = pgbouncer_local.probe(self.cfg)
+        except db_mod.Unavailable as exc:
+            self.log("local pool console unreadable (%s): active local alerts kept"
+                     % exc)
+            return records
+        router = Router(self.cfg, None, self.ncfg)
+        wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
+        active = self.state["active"]
+        for key, alert in wanted.items():
+            entry = active.get(key)
+            if entry is None:
+                entry = active[key] = {
+                    "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                    "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
+                    "channels": {}}
+                self._raise(entry, router, now)
+            elif entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
+                # un responsable (ou une route) a pu apparaître depuis
+                self._raise(entry, router, now)
+            else:
+                self._retry(entry, "raised", now)
+        self._local_resolutions(wanted, now)
+        return records
+
+    def _local_resolutions(self, wanted: dict, now: float) -> None:
+        """Résout les alertes locales que la console ne montre plus, et retente
+        les résolutions en vol. Les autres types ne sont jamais touchés : la
+        base peut simplement être non observée."""
+        for key in list(self.state["active"]):
+            if key in wanted:
+                continue
+            entry = self.state["active"][key]
+            if entry["alert"].get("type") not in LOCAL_TYPES:
+                continue
+            del self.state["active"][key]
+            if entry["alert"].get("type") not in self.ncfg.types:
+                self.log("[%s] removed from notify.types: forgotten without resolution"
+                         % entry["alert"].get("type"))
+                continue
+            self._resolved(key, entry, now)
+        for key in list(self.state["resolved"]):
+            entry = self.state["resolved"][key]
+            if entry["alert"].get("type") not in LOCAL_TYPES:
+                continue
+            self._retry(entry, "resolved", now)
+            if not self._pending(entry):
+                del self.state["resolved"][key]
 
     def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
         """Adopt persisted per-lot deliveries before checking for resolutions.
@@ -1270,9 +1383,10 @@ class Notifier:
     def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
         orchestrateurs et à l'auditeur, avec l'action attendue
-        (`alert_briefs`). Une fois à la levée, une relance si l'alerte dure
-        `REMIND_AFTER_S` ; indépendant de `notify.types` (qui ne règle que
-        l'humain). Jamais fatal au passage."""
+        (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 : il le lit
+        à sa passe, `ameesh alerts --json`). Une fois à la levée, une relance
+        si l'alerte dure `REMIND_AFTER_S` ; indépendant de `notify.types` (qui
+        ne règle que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
         alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
         for key in list(sent):
@@ -1324,8 +1438,11 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
-            if kind in URGENT_TYPES:
-                payload["urgent"] = True        # L242b (5) : le point de l'auditeur
+            # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
+            # (un P1) est propagée au courrier d'agent ; le type reste la
+            # règle générale (L242b (5) : le point de l'auditeur).
+            if kind in URGENT_TYPES or alert.get("urgent"):
+                payload["urgent"] = True
             for field_ in ("module", "rule", "project", "declaration_id", "subject",
                            "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):
@@ -1633,10 +1750,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
                         help="maximum auto-takes per rolling hour, for the whole mesh "
                              "(default 2)")
-    parser.add_argument("--take-paid", action="store_true",
-                        default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
-                        help="allow auto-take by pay-per-token agents (after plan agents; "
-                             "never during balance_low)")
+    # #754 : la prise par un agent au token est acquise — après les forfaits,
+    # jamais sous `balance_low` (owner, 13/10) ; l'ancien `--take-paid` reste
+    # accepté, sans effet, pour les unités qui le passent encore.
+    parser.add_argument("--take-paid", action="store_true", help=argparse.SUPPRESS)
     # L165 : prise d'un lot non assigné de l'équipe, avant la file
     parser.add_argument("--take-lot-idle", type=float,
                         default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
@@ -1687,7 +1804,6 @@ def take_settings(args) -> dict | None:
     if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "allow_paid": bool(getattr(args, "take_paid", False)),
             "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
 
 
@@ -1747,6 +1863,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     db = None
     try:
         while True:
+            # #532 : la console du pool local se lit depuis `cfg` seule, avant
+            # la base — c'est ce qui fait survivre l'alerte au refus qu'elle
+            # signale, puisque la base passe par ce même pool.
+            notifier.run_local_pass()
+            if not args.dry_run:
+                save_state(path, notifier.state)
             try:
                 if db is None:
                     db = db_mod.connect(cfg)

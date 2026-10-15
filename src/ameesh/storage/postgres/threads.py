@@ -66,6 +66,22 @@ class Threads(interface.Threads):
             params = (json.dumps(trace, ensure_ascii=False),) + params
         self.db.execute(sql, params)
 
+    def recount(self, *, project, lot, transport, host, location, kept, last, end) -> int:
+        """L361b : une seule opération d'index pour un hôte médié — verrou de
+        la ligne, recomptage depuis le census du fichier, expiration. Le
+        fichier a déjà été réécrit par l'hôte, sous son propre verrou ; un
+        recomptage plus récent (`counted_until` au-delà de `end`) fait foi.
+        Un `counted_until` égal à `end` est repris : à fin logique constante,
+        seule une expiration change le fil."""
+        counted = self.lock(project=project, lot=lot, transport=transport, host=host,
+                            location=location)
+        end = int(end)
+        if counted is not None and counted > end:
+            return counted
+        self.expired(project=project, lot=lot, transport=transport, host=host,
+                     kept=int(kept), last=last, end=end)
+        return end
+
     def indexed(self) -> list[dict]:
         return self.db.query(
             """

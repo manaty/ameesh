@@ -29,10 +29,25 @@ on:
       - .github/workflows/carte.yml
   workflow_dispatch:
 
-# dernier commit seulement : une carte plus récente rend la précédente inutile
+# #1314 — une carte de main n'est jamais annulée par la poussée suivante : la
+# mesure est longue, la main bouge toutes les quelques minutes, et
+# `cancel-in-progress: true` ne publiait presque jamais de carte (runs
+# 38558057012, 38560201871, 38570320372 annulés), d'où des PR qui ne
+# sélectionnaient plus rien. Même règle que tests.yml (#824) : GitHub garde un
+# run en cours et un seul en attente, remplacé par le suivant, donc la carte
+# publiée est toujours celle de la main la plus récente. Une PR qui touche la
+# mesure garde son propre groupe, annulé quand une poussée le dépasse : une
+# mesure dépassée n'a plus d'objet.
+#
+# #1316 — le dispatch ne partage plus le groupe de main : GitHub annule le run
+# en attente d'un groupe quand un nouveau run y entre, donc un dispatch (même
+# hors main) pouvait remplacer la carte de main en attente et la perdre. Comme
+# tests.yml (#824, décision owner #17605), le dispatch garde une identité par
+# run : il ne remplace plus rien. Contrepartie assumée : un dispatch manuel
+# peut courir à côté d'une mesure de main.
 concurrency:
-  group: carte-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
-  cancel-in-progress: true
+  group: carte-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -126,7 +141,7 @@ jobs:
           path: ${{ runner.temp }}/mesure
           include-hidden-files: true  # cov/.coverage.*
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 1
 
   carte:
     name: carte

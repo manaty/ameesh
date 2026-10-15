@@ -35,10 +35,14 @@ HOUR = "23:59"
 #: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude.
 OPPOSITE = {"claude": "codex", "deepseek": "codex", "codex": "claude"}
 UNKNOWN_FAMILY = "codex ou claude"
-#: la règle du canon §2, recopiée dans le corps du lot
+#: la règle du canon §2, recopiée dans le corps du lot (consigne injectée au
+#: relecteur, avec la route du défaut non bloquant — owner du 15/10/2026)
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
-            "correction, qui passe avant tout nouveau travail ; les autres deviennent des "
-            "lots de suite (canon §2)")
+            "correction, qui passe avant tout nouveau travail ; un défaut **non bloquant** "
+            "(N, P2, P3) ne crée pas de lot : il va au backlog "
+            "(`ameesh work backlog add --title … --value … --score …`), regroupé avec les "
+            "autres défauts mineurs du même chantier (canon §2, owner du 15/10/2026 ; sur "
+            "ameesh, un P2 de la classe sensible bloque encore)")
 
 
 def ref_of(lot: int) -> str:
@@ -63,7 +67,12 @@ def reviewer_family(harness: Optional[str]) -> str:
 
 
 def _author(db, name: str) -> dict:
-    """Le harnais de l'auteur du lot, si le registre le connaît."""
+    """Le harnais de l'auteur du lot, si le registre le connaît.
+
+    #1037 : c'est celui de sa session VIVANTE (`registry.live_harness`), pas
+    seulement son harnais déclaré — L242b fait tourner un agent sous un
+    harnais emprunté, et la relecture doit venir d'une autre famille que
+    celle qui a réellement produit le travail."""
     name = (name or "").strip()
     if not name:
         return {"name": "", "harness": ""}
@@ -72,7 +81,7 @@ def _author(db, name: str) -> dict:
         row = registry.get(db, name) or {}
     except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
         return {"name": name, "harness": ""}
-    return {"name": name, "harness": str(row.get("harness") or "")}
+    return {"name": name, "harness": registry.live_harness(row)}
 
 
 def _open(ops, ref: str) -> Optional[dict]:
