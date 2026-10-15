@@ -116,6 +116,8 @@ class InstallerTest(unittest.TestCase):
     def test_reviewed_layout_modes_do_not_follow_the_caller_umask(self):
         # §3 : le témoin 0711 ne dépend pas de l'umask de la session qui lance
         # la suite. Un umask restrictif donnerait 0700 au dépôt de versions.
+        # Fixture only: the production layout is covered by
+        # test_real_layout_publishes_reviewed_modes_under_a_restrictive_umask.
         previous=os.umask(0o077)
         try:
             self.system.layout(self.bundle)
@@ -125,6 +127,39 @@ class InstallerTest(unittest.TestCase):
                              ('/opt/ameesh-release/store',0o711)):
             root=self.root/logical.lstrip('/')
             self.assertEqual(stat.S_IMODE(root.stat().st_mode),mode,logical)
+
+    def test_real_layout_publishes_reviewed_modes_under_a_restrictive_umask(self):
+        # L1631: the production layout, not only the fixture above, must publish
+        # the reviewed modes under a restrictive umask. mkdir(2) masks the mode,
+        # so a fresh install under umask 077 used to fail the private-root check
+        # on the tree it had just created; an existing directory is never
+        # repaired, even a more restrictive one.
+        sandbox=Path(self.root)/'sandbox'; sandbox.mkdir(mode=0o700)
+        existing=sandbox/'usr/local/libexec'; existing.mkdir(parents=True,mode=0o700)
+        real_stat=Path.stat
+        def root_owned(path,*,follow_symlinks=True):
+            # The sandbox is not root-owned; only the ownership check is faked.
+            info=real_stat(path,follow_symlinks=follow_symlinks)
+            fields=list(info); fields[4]=0
+            return os.stat_result(fields)
+        def sandboxed(logical):
+            text=str(logical)
+            return Path(str(sandbox)+text if text.startswith('/') else text)
+        previous=os.umask(0o077)
+        try:
+            with mock.patch.object(installer.account.os,'geteuid',return_value=0):
+                host=installer.LinuxHost()
+            with mock.patch.object(installer,'Path',side_effect=sandboxed), \
+                    mock.patch.object(Path,'stat',root_owned), \
+                    mock.patch.object(installer.runtime,'trusted',
+                                      side_effect=lambda path: Path(path)):
+                self.assertTrue(host.layout(self.bundle))
+        finally:
+            os.umask(previous)
+        for logical,mode in installer.DIRECTORIES.items():
+            created=sandbox/logical.lstrip('/')
+            expected=0o700 if created==existing else mode
+            self.assertEqual(stat.S_IMODE(created.stat().st_mode),expected,logical)
 
     def test_lost_activation_reply_rechecks_configuration_and_never_recreates_account(self):
         original=self.system.activate_ssh_configuration; lost=[False]
