@@ -11,14 +11,14 @@ Ce que ces tests protègent :
   base, et un courrier en attente est remis même avec un marqueur frais ;
 * le marqueur lui-même : posé après un passage complet, invalidé par un envoi
   local, et un cache de barre d'état de quelques secondes ;
-* le coût : le chemin rapide n'importe pas le paquet complet et son temps CPU
-  reste très en dessous d'un import de `ameesh.cli`.
+* le coût d'import : le vrai sous-processus rapide ne charge ni `ameesh.cli`,
+  ni le backend, ni psycopg. Le CPU se mesure après installation (protocole
+  du lot #1604), sans seuil dépendant de la machine dans la CI (#1785).
 """
 from __future__ import annotations
 
 import json
 import os
-import resource
 import subprocess
 import sys
 import tempfile
@@ -234,38 +234,62 @@ class HookRapideTest(PgTestCase):
         self.assertEqual(frais.returncode, 0, frais.stderr)
         self.assertNotIn("✉", frais.stdout)
 
-    # -- coût --------------------------------------------------------------
-    def test_temoin_cout_cpu_du_chemin_rapide(self):
-        """Témoin de coût : le chemin rapide reste loin d'un import complet."""
-        env = self._marqueur_frais()
-        charge = ("import sys; sys.argv = ['agent-mail', 'hook', 'claude'];"
-                  "import ameesh.entry as e; e.main()")
+    # -- suites de la relecture (#1628) ------------------------------------
 
-        def cpu_enfants() -> float:
-            usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-            return usage.ru_utime + usage.ru_stime
+    def test_statusline_ne_partage_pas_la_ligne_entre_deux_agents(self):
+        """#1628 N1 : sans session_id, deux sessions d'un même dossier ne
+        partagent plus la ligne en cache."""
+        dossier = os.path.join(self.tmp, "sl-1628")
+        os.makedirs(dossier, exist_ok=True)
+        payload = json.dumps({"workspace": {"current_dir": dossier}})
+        alpha = self.entry("statusline", env=self.env(AGENT_MAIL_NAME="alpha"),
+                           stdin=payload)
+        self.assertEqual(alpha.returncode, 0, alpha.stderr)
+        self.assertIn("alpha", alpha.stdout)
+        # le second appel est dans la fenêtre du cache : sans le nom dans la
+        # clé, il rendrait la ligne d'alpha (l'ancien défaut)
+        beta = self.entry("statusline", env=self.env(AGENT_MAIL_NAME="beta"),
+                          stdin=payload)
+        self.assertEqual(beta.returncode, 0, beta.stderr)
+        self.assertIn("beta", beta.stdout)
+        self.assertNotIn("alpha", beta.stdout)
 
-        avant = cpu_enfants()
-        rapide = subprocess.run([sys.executable, "-c", charge],
-                                input=self._posttooluse(), capture_output=True,
-                                text=True, timeout=60, env=env, cwd=self.tmp)
-        cout_rapide = cpu_enfants() - avant
-        self.assertEqual(rapide.returncode, 0, rapide.stderr)
+    def test_cle_de_statusline_departage_agents_et_sessions(self):
+        """#1628 N1 : nom d'agent et transcript_path entrent dans la clé."""
+        base = {"workspace": {"current_dir": self.tmp}}
+        cles = {
+            fastmail.statusline_key(dict(base, session_id="s1"), "alpha"),
+            fastmail.statusline_key(dict(base), "beta"),
+            fastmail.statusline_key(dict(base, transcript_path="/t/1"), "alpha"),
+            fastmail.statusline_key(dict(base, transcript_path="/t/2"), "alpha"),
+        }
+        self.assertEqual(len(cles), 4)
+        # même session, même nom : même clé (le cache fonctionne toujours)
+        self.assertEqual(fastmail.statusline_key(dict(base, session_id="s1"), "alpha"),
+                         fastmail.statusline_key(dict(base, session_id="s1"), "alpha"))
 
-        avant = cpu_enfants()
-        lourd = subprocess.run([sys.executable, "-c", "import ameesh.cli"],
-                               capture_output=True, text=True, timeout=120, env=env,
-                               cwd=self.tmp)
-        cout_lourd = cpu_enfants() - avant
-        self.assertEqual(lourd.returncode, 0, lourd.stderr)
+    def test_marqueur_pose_meme_appele_depuis_un_except(self):
+        """#1628 N2 : le marqueur ne dépend plus de l'exception extérieure."""
+        env = self.env(AGENT_MAIL_NAME="alpha")
+        charge = json.dumps({"hook_event_name": "PostToolUse", "cwd": self.tmp,
+                             "session_id": "sess-exc"})
+        code = (
+            "import io, sys\n"
+            "sys.argv = ['agent-mail', 'hook', 'claude']\n"
+            "sys.stdin = io.StringIO(%r)\n"
+            "from ameesh import cli\n"
+            "try:\n"
+            "    raise RuntimeError('exterieure')\n"
+            "except RuntimeError:\n"
+            "    rc = cli.main()\n"
+            "print('rc', rc)\n"
+        ) % charge
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                              text=True, timeout=60, env=env, cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("rc 0", proc.stdout)
+        marque = fastmail.read_marker(self.cfg, "alpha")
+        self.assertIsNotNone(marque, "un appel depuis un except ne doit pas "
+                                     "empêcher le marqueur")
+        self.assertFalse(marque["pending"])
 
-        self.assertLess(cout_rapide, cout_lourd,
-                        "le chemin rapide coûte %.3fs CPU, l'import complet %.3fs"
-                        % (cout_rapide, cout_lourd))
-        # borne relative, jamais en secondes : le CPU d'un démarrage Python
-        # dépend de la machine (runner lent, cache .pyc froid), pas son rapport
-        # à l'import complet mesuré dans le même processus (mesuré : 0,05 contre
-        # 0,30 s). Une régression qui réimporterait le paquet atteint ce rapport.
-        self.assertLess(cout_rapide, cout_lourd / 2,
-                        "chemin rapide : %.3fs CPU, plus de la moitié d'un import "
-                        "complet (%.3fs)" % (cout_rapide, cout_lourd))

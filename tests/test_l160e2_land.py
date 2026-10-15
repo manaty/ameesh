@@ -492,6 +492,38 @@ class StaleExecutorTest(_Land):
         self.assertEqual(out["result"], "landed", out)
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)  # nothing pushed
 
+    def test_reverted_composition_is_not_already_landed(self):
+        """#1776 : une composition revertée sur la cible laisse le gel ancêtre
+        sans son contenu ; le raccourci « already landed » ne peut pas la
+        livrer — le lot est éjecté avec la marche à suivre."""
+        self.queued(4)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "composition", "lot/4-d")
+        _git(self.repo, "revert", "-m", "1", "--no-edit", "HEAD")
+        _git(self.repo, "push", "-q", "origin", "main")
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("content", self.fake.queue_rows[4]["reason"])
+        self.assertIn("revert", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)  # nothing pushed
+        self.assertNotEqual(self.fake.queue_rows[4]["state"], "landed")
+        self.assertIn("ameesh work queue add 4", self.sent[-1][1])
+
+    def test_local_empty_freeze_already_in_the_target_is_landed(self):
+        """#1776 : un gel vide (commit --allow-empty) dont le contenu est
+        toujours dans la cible reste « already landed » — la preuve de contenu
+        ne le prend pas pour un retrait."""
+        _git(self.repo, "checkout", "-q", "lot/4-d")
+        _git(self.repo, "commit", "--allow-empty", "-q", "-m", "gel vide")
+        _git(self.repo, "push", "-q", "origin", "lot/4-d")
+        _git(self.repo, "checkout", "-q", "main")
+        self.queued(4)
+        _git(self.repo, "push", "-q", "origin", "lot/4-d:main")   # earlier epoch
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)  # nothing pushed
+
     def test_pr_target_moved_since_the_merge_is_not_merged(self):
         self.project = dataclasses.replace(self.project, land="pr")
         gh = FakeGh()

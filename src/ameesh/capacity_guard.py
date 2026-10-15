@@ -60,7 +60,7 @@ LEND_KEYS = LEND_CAPS + ("cpu_weight", "agent_memory_max", "windows", "reclaim",
 #: as a `host-lend-unknown` warning
 GUARD_RECLAIM_KEYS = ("io_pressure_max", "disk_free_min", "disk_paths")
 RECLAIM_KEYS = ("memory_available_min", "cpu_pressure_max", "memory_pressure_max",
-                "busy_units", "busy_max") + GUARD_RECLAIM_KEYS
+                "busy_units", "busy_tasks", "busy_max") + GUARD_RECLAIM_KEYS
 DEFAULT_DRAIN_SECONDS = 90
 DEFAULT_CALM_SECONDS = 600
 #: systemd `CPUWeight=` bounds
@@ -447,6 +447,21 @@ def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list, 
                 PROBLEM_INVALID, "`busy_units`: list of systemd unit patterns expected"))
         else:
             out["busy_units"] = [u.strip() for u in units]
+    if raw.get("busy_tasks") is not None:
+        # #1256 : un service d'écoute CI reste `active` entre deux jobs ; le
+        # motif de tâche (sous-chaîne de la ligne de commande, cherchée dans le
+        # cgroup de l'unité) est ce qui distingue un job en cours d'un
+        # écouteur au repos
+        tasks = raw["busy_tasks"]
+        if isinstance(tasks, str):
+            tasks = [tasks]
+        if not isinstance(tasks, list) or not tasks or not all(
+                isinstance(t, str) and t.strip() and len(t.strip()) <= 200
+                and not any(c in t for c in "\0\n\r") for t in tasks):
+            problems.append(LendProblem(
+                PROBLEM_INVALID, "`busy_tasks`: list of task patterns expected"))
+        else:
+            out["busy_tasks"] = [t.strip() for t in tasks]
     if raw.get("busy_max") is not None:
         busy = _positive_int(raw["busy_max"], 0)
         if busy is None:
@@ -455,4 +470,6 @@ def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list, 
             out["busy_max"] = busy
     if "busy_max" in out and "busy_units" not in out:
         problems.append(LendProblem(PROBLEM_INVALID, "`busy_max` without `busy_units`"))
+    if "busy_tasks" in out and "busy_units" not in out:
+        problems.append(LendProblem(PROBLEM_INVALID, "`busy_tasks` without `busy_units`"))
     return out, problems, sorted(str(k) for k in raw if k not in RECLAIM_KEYS)
