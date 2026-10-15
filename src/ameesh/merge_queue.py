@@ -193,7 +193,7 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
 
 
 def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
-              commit_ci=None, cfg=None) -> dict:
+              commit_ci=None, full_ci=None, cfg=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr, class, class_why}`; QueueError says what is missing. Commit ids are
     resolved to full ones before being compared; `ci` (`radar.github_ci(...,
@@ -210,6 +210,12 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     are traced in the queue note. The target resolved here (`branch_target`,
     then the project's, then the repository's default) carries through the
     classification and the admission (revue #544 r2).
+
+    L756 (#566): a lot of class **release** must additionally certify its
+    frozen head with a **full-suite** run — a push or a manual dispatch,
+    never the impacted-only plan of a pull request (`full_ci`,
+    `radar.full_suite_ci` by default when the project declares a GitHub
+    repository).
 
     The CI is required **explicitly**: for a project without `ci_required`,
     `ci=None` (no reader) and a reader that answers nothing are refused, like
@@ -263,6 +269,12 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
                             if verdict else "", klass.get("class") or "?"))
+    # L756 (#566): un lot de classe release ne se contente pas du check de sa
+    # PR — une PR de version seule ne lance rien, et une PR peut n'avoir suivi
+    # que le plan impacté. Il lui faut une exécution de la suite complète
+    # (poussée ou lancement manuel) verte sur la tête gelée exacte.
+    if klass.get("class") == lot_class.RELEASE:
+        required_full_ci(project, tip, full_ci, lot=lot)
     needs_commit_ci = project is not None and getattr(project, "ci_required", False)
     status = None
     if ci is None:
@@ -365,14 +377,57 @@ def _required_ci(project, sha: str, commit_ci=None) -> None:
         raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
 
 
+def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
+    """L756 (#566): a release lot certifies its frozen head with a **full
+    suite** run — a push or a manual dispatch, never the impacted-only plan of
+    a pull request, and never the empty check of a version-only PR. The suite
+    is the one the project **declares** (`radar.projects.<p>.full_suite`,
+    workflow files resolved to identities): each declared workflow must have
+    run on the exact head, green, its jobs included (`skipped`/`neutral`/unread
+    jobs certify nothing). QueueError otherwise (no run, running, missing, red,
+    unreadable); `full_ci` reads the runs (`radar.full_suite_ci` by default
+    when the project has a GitHub repo)."""
+    from . import plan_github, radar
+    who = "lot #%s" % lot if lot is not None else "this lot"
+    reader = full_ci
+    if reader is None:
+        if project is None or not getattr(project, "github", ""):
+            raise QueueError("%s is class release: no full-suite reader (project without a "
+                             "GitHub repository) — a full run on the frozen head %s is required"
+                             % (who, sha[:12]))
+        reader = lambda one: radar.full_suite_ci(project, one)
+    try:
+        runs = reader(sha)
+    except plan_github.GithubError as exc:
+        raise QueueError("cannot read the full-suite runs on the frozen head %s (%s): try again "
+                         "once gh works" % (sha[:12], exc)) from exc
+    if not runs or not runs.get("runs"):
+        raise QueueError("%s is class release: no full-suite run (push or manual dispatch) on "
+                         "the frozen head %s yet (push it, let the workflow run)"
+                         % (who, sha[:12]))
+    if runs.get("pending"):
+        raise QueueError("the full suite on the frozen head %s is still running (%s)"
+                         % (sha[:12], ", ".join(runs["pending"])))
+    if runs.get("missing"):
+        raise QueueError("%s is class release: the declared full suite did not run on the "
+                         "frozen head %s (%s) — a green run of each declared workflow is "
+                         "required" % (who, sha[:12], ", ".join(runs["missing"])))
+    if runs.get("failed"):
+        raise QueueError("the full suite on the frozen head %s is red (%s)"
+                         % (sha[:12], ", ".join(runs["failed"])))
+    if not runs.get("green"):
+        raise QueueError("the full suite on the frozen head %s is not green" % sha[:12])
+    return runs
+
+
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None, commit_ci=None, cfg=None) -> dict:
+          clone=None, commit_ci=None, full_ci=None, cfg=None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes."""
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
     ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project,
-                      commit_ci=commit_ci, cfg=cfg)
+                      commit_ci=commit_ci, full_ci=full_ci, cfg=cfg)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
         source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s" % (
