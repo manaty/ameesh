@@ -48,6 +48,12 @@ SIGNATURES = {
     "executor_assertion_jti": {"jti"},
     "executors": {"public_key", "device_attestation"},
     "exec_idempotency": {"response"},
+    # L87 (0440) : clés d'idempotence de l'API et réponses rejouables — même
+    # nature que `exec_idempotency` ; tout est fermé tant que la classification
+    # d'état n'est pas tranchée (correctif fermé 27665f633, décision pilote
+    # 15/10 : conservation des droits actuels, aucun GRANT modifié).
+    "api_idempotency": {"human", "key", "fingerprint", "status", "response",
+                        "created_at", "done_at"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }
