@@ -454,11 +454,19 @@ jobs:
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
   # parts psql (sans psutil) par le repli /proc.
+  # #987 : image x64 explicite (`macos-26-intel`), pas `macos-latest` (macOS 26
+  # arm64) — le 13/10/2026, la capacité arm64 a annulé ce job après ~15 min
+  # sans runner (« not acquired by Runner of type hosted »), ce qui rougissait
+  # le check requis sans défaut de code. L'image est un runner standard
+  # (gratuit), pas un runner « large » payant (canon §3) ; le job ne teste que
+  # psutil et la couche plateforme, indifférents à l'architecture. Défense en
+  # profondeur : .github/workflows/relance-hosted.yml rejoue les jobs annulés
+  # faute de runner.
   platform-macos:
     name: plateforme macOS
     needs: plan
     if: needs.plan.outputs.code == 'true'
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
