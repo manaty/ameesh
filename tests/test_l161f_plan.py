@@ -2107,8 +2107,17 @@ def _run_bodies(text: str) -> list[str]:
 
 
 _BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+# #1559: the value YAML reads is the same expression whatever the spacing
+# inside `${{ }}` and whether the scalar is quoted (`"${{ … }}"`,
+# `'${{ … }}'`), and a tab or extra spaces after the colon still open the
+# mapping value. Everything else stays an escape (fail closed).
+_BRANCH_REF_EXPR = r"\$\{\{\s*github\.(?:base|head)_ref\s*\}\}"
 _BRANCH_REF_ENV = re.compile(
-    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+    "^[A-Z][A-Z0-9_]*:[ \t]+(?:"
+    + _BRANCH_REF_EXPR
+    + '|"' + _BRANCH_REF_EXPR + '"'
+    + "|'" + _BRANCH_REF_EXPR + "'"
+    + r")[ \t]*(?:#.*)?$")
 _ANY_KEY = re.compile(
     r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
@@ -2181,12 +2190,16 @@ def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
         if j not in structural or not line.strip() or line.lstrip().startswith("#"):
             continue
         dash, key = _dash_column(line), _key_column(line)
+        # #1559: an anchor or a tag before the key (`- &s env:`) does not
+        # change the mapping; only node properties are seen through, a scalar
+        # on the way still fails the witness.
+        _, content = _node_properties(line[key:])
         if key < col:
-            if not _BARE_KEY.match(line[key:]) or (
-                    first and line[key:].split(":", 1)[0] != "env"):
+            if not _BARE_KEY.match(content) or (
+                    first and content.split(":", 1)[0] != "env"):
                 return False
         elif dash is not None and dash < col:
-            if first or not _ITEM.match(line[key:]):
+            if first or not _ITEM.match(content):
                 return False
         else:
             continue
@@ -2334,10 +2347,40 @@ class RunBodiesTest(unittest.TestCase):
                              '          HEAD_REF: ${{ github.head_ref }}\n',
             "env first in the item": '      - env:\n'
                                      '          BASE_REF: ${{ github.base_ref }}\n',
+            # #1559: YAML reads the same env value under these legitimate
+            # spellings; only the semantics must count, not the exact form.
+            "quoted value": '      - name: s\n        env:\n'
+                            '          HEAD_REF: "${{ github.head_ref }}"\n'
+                            '        run: echo "$HEAD_REF"\n',
+            "single quoted value": '      - name: s\n        env:\n'
+                                   "          BASE_REF: '${{ github.base_ref }}'\n"
+                                   '        run: echo "$BASE_REF"\n',
+            "no inner spaces": '      - name: s\n        env:\n'
+                               '          HEAD_REF: ${{github.head_ref}}\n'
+                               '        run: echo "$HEAD_REF"\n',
+            "two spaces after colon": '      - name: s\n        env:\n'
+                                      '          BASE_REF:  ${{ github.base_ref }}\n'
+                                      '        run: echo "$BASE_REF"\n',
+            "anchor before the env key": '      - &s env:\n'
+                                         '          BASE_REF: ${{ github.base_ref }}\n'
+                                         '        run: echo "$BASE_REF"\n',
         }
         for name, step in allowed.items():
             with self.subTest(name=name):
                 self.assertEqual([], _branch_ref_escapes(steps + step))
+        # #1559: the same values, read by YAML in a `run:` body instead of an
+        # `env:` value, stay escapes: the witness follows the semantics.
+        for name, body in {
+            "quoted": 'BASE_REF: "${{ github.base_ref }}"\n',
+            "single quoted": "BASE_REF: '${{ github.base_ref }}'\n",
+            "no inner spaces": 'HEAD_REF: ${{github.head_ref}}\n',
+            "two spaces after colon": 'BASE_REF:  ${{ github.base_ref }}\n',
+        }.items():
+            with self.subTest(run=name):
+                self.assertNotEqual([], _branch_ref_escapes(
+                    steps + '      - run: |\n          ' + body))
+        self.assertNotEqual([], _branch_ref_escapes(
+            steps + '      - &s run: |\n          BASE_REF: ${{ github.base_ref }}\n'))
         self.assertEqual([], _branch_ref_escapes(
             "env:\n  BASE_REF: ${{ github.base_ref }}\n"
             "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
