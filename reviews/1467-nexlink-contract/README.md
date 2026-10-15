@@ -60,17 +60,24 @@ la demande ; aucune seconde liste d'empreintes n'est conservée. Ce périmètre
 est une déclaration d'audit, pas un analyseur de dépendances arbitraires : un
 import vers un nouveau répertoire demande de compléter sa qualification.
 
-Trois portées restent explicites dans `scope_questions` :
+Les frontières suivantes sont qualifiées par le pilote dans le fil
+`ameesh/1467`, courrier mesh-design du 15 octobre à 15:20:34, reprenant la
+qualification projet de mty-nxl-impl-01. `qualified_boundaries` les conserve
+séparément du contrat de code encore à qualifier :
 
 - `scripts/ci/scripts-suite.mjs` exclut
   `scripts/deploy-workflow-shell.test.mjs`, confié à `deploy-api.yml` ; ce
-  workflow de déploiement ne fait pas partie des vingt suites candidates.
-  L'auteur de #1470 a été saisi du raccord de ce témoin pur à une suite code.
+  témoin appartient à la porte dispatch de déploiement. Ce workflow ne fait
+  pas partie des vingt suites candidates ; cette frontière ne demande ni
+  extension de #1470 ni CI supplémentaire ou dispatch de déploiement.
 - Jest mobile exclut les `.live.test.tsx` ; la baseline website couvre
   Vitest et le mock Playwright d'assistance distante, pas toute la recette
-  e2e staging. La portée « complète » doit préciser cette frontière.
-- Les matrices desktop hébergées et le pont appareil dépendent de variables
-  et d'autorisations propres, à qualifier par le pilote.
+  e2e staging. Les tests live de performance mobile et la recette e2e staging
+  restent dans leurs qualifications respectives.
+
+La liste complète des vingt suites de code, les matrices desktop hébergées
+et le pont appareil restent dans `scope_questions`, à qualifier par le
+pilote. Les deux derniers dépendent de variables et d'autorisations propres.
 
 Les références d'actions GitHub, les capacités et variables des runners, les
 installations npm sans verrou de `shared/compute` et `shared/page-host`, et

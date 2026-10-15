@@ -552,7 +552,10 @@ inactif ne pourrait pas bloquer une fusion directe déjà armée sur GitHub.
 
 La carte Nexlink est complétée par
 [`reviews/1467-nexlink-contract/README.md`](../../../reviews/1467-nexlink-contract/README.md)
-et son inventaire reproductible de scripts/configurations. L'exclusion du
-témoin `deploy-workflow-shell` et les frontières perf mobile/e2e website sont
-signalées à #1470 pour qualification projet. Ce travail reste préparatoire,
-sans CI distante ni activation.
+et son inventaire reproductible de scripts/configurations. La qualification
+projet transmise par mesh-design le 15 octobre à 15:20 distingue la porte
+dispatch de déploiement (`deploy-workflow-shell`), la performance mobile
+locale et la recette e2e staging de la baseline de code. Ces frontières
+figurent dans `qualified_boundaries`, sans extension de #1470 ni deuxième
+CI. La liste complète des vingt workflows et les portées des plateformes
+optionnelles restent à qualifier avant un contrat exécutable.

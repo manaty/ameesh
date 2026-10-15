@@ -58,6 +58,7 @@ def inventory(repo, candidate, scope):
         "candidate": {"base": candidate["base"], "lot_1470": candidate["lot_1470"]},
         "groups": groups,
         "unique_paths": len({path for paths in groups.values() for path in paths}),
+        "qualified_boundaries": scope["qualified_boundaries"],
         "scope_questions": scope["scope_questions"],
         "external_inputs": scope["external_inputs"],
     }

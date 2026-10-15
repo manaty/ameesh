@@ -50,9 +50,14 @@
       "desktop/host/vendor/**"
     ]
   },
+  "qualified_boundaries": {
+    "source": "mesh-design, ameesh/1467 thread, 2026-10-15T15:20:34+02:00, reporting project qualification from mty-nxl-impl-01",
+    "deployment_dispatch_gate": "scripts/deploy-workflow-shell.test.mjs belongs to the deployment dispatch gate deploy-api.yml, outside the twenty candidate code workflows; no deployment dispatch or extra code-suite CI follows from its exclusion",
+    "mobile_performance": "mobile live performance tests belong to local performance qualification, outside the standard code workflow baseline",
+    "website_staging_e2e": "general website staging e2e tests belong to staging qualification, outside the Vitest and remote-assistance Playwright mock baseline"
+  },
   "scope_questions": [
-    "scripts/deploy-workflow-shell.test.mjs belongs to deploy-api.yml and is excluded by scripts-suite.mjs; that deployment workflow is outside the twenty candidate code workflows",
-    "mobile live performance tests and general website staging e2e tests are outside the standard workflow baseline",
+    "the project pilot must still qualify the complete twenty-workflow code contract",
     "hosted desktop matrices and the compute device bridge depend on external variables and authorization"
   ],
   "external_inputs": [
