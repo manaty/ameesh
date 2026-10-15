@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import canon, lot_workdir, registry, storage, work
+from ameesh import backlog, canon, lot_workdir, mail, registry, storage, work
 from ameesh.runner import AgentWorker
 
 from . import test_l165c_sessions_par_lot as sessions
@@ -104,11 +104,61 @@ class RoutingTest(sessions._Base):
         self.assertFalse(self.worker.run_turn(spec))
         self.assertEqual(registry.get(self.db, 'worker')['session_id'], 'session-A')
         self.assertEqual(registry.get(self.db, 'worker')['session_work_item'], str(self.a))
-        self.assertFalse(self.worker.workdir_ready())
-        os.mkdir(self.secondary)
+        # #811 B1 : aucun blocage global — seul le lot B attend son dossier
         self.assertTrue(self.worker.workdir_ready())
+        self.assertTrue(self.worker._lot_deferred(str(self.b)))
+        os.mkdir(self.secondary)
+        self.assertFalse(self.worker._lot_deferred(str(self.b)))  # dossier revenu
         self.tour(self.worker, self.b, 'retry B', session='session-B')
         self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self.secondary)
+
+    def test_foreign_or_unknown_lot_never_blocks_the_agent(self):
+        """#811 B1 : un lot d'un projet NON déclaré par l'agent, ou inconnu,
+        tourne dans le cwd primaire comme avant L243-4 — jamais le blocage
+        « dossier absent »."""
+        os.rmdir(self.secondary)
+        self.assertEqual(self.worker._resolve_workdir(lot='999999'), self.primary)
+        self.assertFalse(self.worker._lot_workdir_secondary)
+        self.db.execute("UPDATE agent_registry SET projects='{alpha}' WHERE name='worker'")
+        self.tour(self.worker, self.b, 'B chez le primaire', session='session-B')
+        row = registry.get(self.db, 'worker')
+        self.assertEqual(row['session_cwd'], self.primary)
+        self.assertNotEqual(row['status'], 'blocked')
+
+    def test_missing_secondary_mail_waits_primary_mail_passes(self):
+        """#811 B1 : dossier secondaire absent — seul son courrier attend ; le
+        courrier primaire du même agent passe, dans le cwd primaire."""
+        os.rmdir(self.secondary)
+        mail.send(self.db, 'orch', 'worker', 'B plus tard', work_item_id=str(self.b))
+        spec = self.worker.rotate_for_lot(self.worker.pick())
+        self.assertTrue(spec.get('lot_switch_failed'))
+        self.assertFalse(self.worker.run_turn(spec))
+        self.assertTrue(self.worker.workdir_ready())          # aucun blocage global
+        self.assertTrue(self.worker._lot_deferred(str(self.b)))
+        self.assertEqual(len(mail.unread(self.db, 'worker')), 1)  # B reste non lu
+        self.tour(self.worker, self.a, 'A maintenant', session='session-A')
+        self.assertEqual(registry.get(self.db, 'worker')['session_cwd'], self.primary)
+
+    def test_pending_prompt_for_missing_secondary_keeps_primary_mail(self):
+        """#811 B1 : une fois le lot secondaire différé, la consigne qui lui
+        serait rattachée reste en attente au lieu de consommer le tour ; le
+        courrier primaire passe."""
+        os.rmdir(self.secondary)
+        mail.send(self.db, 'orch', 'worker', 'B plus tard', work_item_id=str(self.b))
+        spec = self.worker.rotate_for_lot(self.worker.pick())
+        self.assertTrue(spec.get('lot_switch_failed'))
+        self.assertFalse(self.worker.run_turn(spec))          # B est différé
+        # B est le seul lot assigné ouvert : la consigne lui serait rattachée.
+        self.db.execute('UPDATE work_items SET assignee = NULL WHERE id = %s', (self.a,))
+        self.db.execute("UPDATE agent_registry SET pending_prompt = 'consigne'"
+                        " WHERE name = 'worker'")
+        mail.send(self.db, 'orch', 'worker', 'A maintenant', work_item_id=str(self.a))
+        spec = self.worker.pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.get('lot'), str(self.a))
+        self.assertIn('A maintenant', spec['prompt'])
+        agent = registry.get(self.db, 'worker')
+        self.assertIn('consigne', agent.get('pending_prompt') or '')   # non consommée
 
     def test_mediated_secondary_cannot_use_primary_depot(self):
         self.worker.runner.mediated = True
@@ -165,3 +215,25 @@ class PickupTest(consumers.PriseMultiProjetsTest):
         self.assertEqual(self.take(dry_run=True), [])
         self.assertFalse(any((e.get('note') or '').startswith('L243-4:')
                              for e in work.events(self.db, item['id'])))
+
+    def test_undeclared_project_is_not_noted(self):
+        """#811 N1 : un lot hors du périmètre déclaré de l'agent est écarté
+        sans note L243-4 — pas une note par agent sur chaque élément."""
+        self.multi()
+        item = self.lot('hors périmètre', app='nexlink')
+        agent = {'name': 'm1', 'projects': ['ameesh'], 'cwd': self.tmp}
+        self.assertFalse(backlog._directory_ready(self.cfg, self.db, agent, item,
+                                                  'nexlink', canons=[], dry_run=False))
+        self.assertEqual([e['note'] for e in work.events(self.db, item['id'])
+                          if (e.get('note') or '').startswith('L243-4:')], [])
+
+
+class FitTest(unittest.TestCase):
+    def test_lot_fits_lit_le_projet_du_dossier(self):
+        """#811 N2 : une équipe déclarée ne fait pas passer un lot d'un autre
+        dépôt — `lot_fits` lit le même projet que le dossier (`app`)."""
+        multi = {'team': 'ameesh', 'projects': ['ameesh', 'nexlink'],
+                 'capabilities': [], 'harness': 'deepseek'}
+        self.assertTrue(backlog.lot_fits({'app': 'nexlink', 'lot_team': 'ameesh'}, multi))
+        self.assertFalse(backlog.lot_fits({'app': 'autre', 'lot_team': 'ameesh'}, multi))
+        self.assertTrue(backlog.lot_fits({'lot_team': 'ameesh'}, multi))   # sans app

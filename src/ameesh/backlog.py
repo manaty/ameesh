@@ -314,12 +314,19 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
+def _lot_project(item: dict) -> str:
+    """Le projet d'un lot pour le dossier de travail : son dépôt (`app`)
+    d'abord, son équipe ensuite — même clé que `lot_workdir.project` (#811 N2 :
+    `lot_fits` filtrait sur `lot_team`, le dossier se résout sur `app`)."""
+    return (item.get("app") or item.get("lot_team") or item.get("team") or "").strip()
+
+
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None) -> bool:
     """Le lot vise-t-il un des projets de l'agent, et l'agent sait-il le faire ?
     Une capacité exigée `harness:<nom>` désigne le harnais de l'agent."""
     if auditor and not auditor_may_take(item, agent["name"], card):
         return False
-    team = (item.get("lot_team") or "").strip()
+    team = _lot_project(item)
     from . import projects as projects_mod
     if not team or team not in projects_mod.agent_projects(agent):   # L243: membre
         return False
@@ -341,7 +348,9 @@ def _directory_ready(cfg, db, agent, item, project, *, canons, dry_run):
     reason = lot_workdir.problem(cfg, agent, project, canons=canons)
     if reason is None:
         return True
-    if not dry_run:
+    # #811 N1 : hors périmètre (raison vide) — aucune note ; un projet déclaré
+    # qui attend son dossier est noté une fois par lot.
+    if not dry_run and reason:
         note = "L243-4: %s cannot pick up project %s: %s" % (agent["name"], project, reason)
         if not any(e.get("note") == note for e in work.events(db, item["id"])):
             work.note(db, item["id"], note, actor=SENDER)
@@ -476,8 +485,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"])):
                     continue
-                if not _directory_ready(cfg, db, agent, item,
-                                        (item.get("app") or item["lot_team"]).strip(),
+                if not _directory_ready(cfg, db, agent, item, _lot_project(item),
                                         canons=canons, dry_run=dry_run):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
@@ -534,8 +542,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not fits(item, agent, auditor=row["name"] in auditors,
                         card=auditors.get(row["name"])):
                 continue
-            team = (item.get("team") or "").strip()
-            if not _directory_ready(cfg, db, agent, item, (item.get("app") or team).strip(),
+            if not _directory_ready(cfg, db, agent, item, _lot_project(item),
                                     canons=canons, dry_run=dry_run):
                 continue
             if dry_run:
