@@ -693,6 +693,37 @@ class MenageDbTest(PgTestCase):
         self.assertTrue(os.path.isdir(non_pousse))
         self.assertIn("orphelin-propre", _git("branch", "--list", "orphelin-propre", cwd=main))
 
+    def test_lot_fini_non_integre_retire_apres_24h(self):
+        """#1665 : un lot fini (clos) dont le worktree est propre et poussé
+        mais NON intégré n'était que gardé (L73b) ; il part après 24 h
+        d'inactivité, comme un orphelin, et sa branche reste."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        fini = self._lot("fini")
+        wt = self._suivi(main, "fini-non-integre", fini)
+        _write(os.path.join(wt, "travail.txt"), 3)
+        _git("add", ".", cwd=wt)
+        _git("commit", "-q", "-m", "travail", cwd=wt)
+        _git("push", "-q", "origin", "fini-non-integre", cwd=wt)
+        work.close(self.db, fini, abandoned=True)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        tot = time.time() + 2 * 3600
+        p = plan(now=tot)[wt]
+        self.assertEqual(p["action"], "garde")
+        self.assertIn("not integrated", p["detail"])
+        loin = time.time() + 30 * 24 * 3600
+        p = plan(now=loin)[wt]
+        self.assertEqual(p["action"], "retrait")
+        self.assertIn("idle for more than 24 h", p["detail"])
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(wt))
+        self.assertIn("fini-non-integre", _git("branch", "--list", "fini-non-integre", cwd=main))
+
     def test_garde_fous_age_tour_en_cours_verrou_et_integration(self):
         main = _repo(self.tmp)
         fini = self._lot("fini")
