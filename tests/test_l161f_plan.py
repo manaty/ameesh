@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -1817,33 +1818,486 @@ class LeaksTest(unittest.TestCase):
         self.assertEqual(out["not_counted"], 1)
 
 
+def _key_column(line: str) -> int:
+    """Column of the YAML key: indentation, then an optional `- `."""
+    col = len(line) - len(line.lstrip(" "))
+    if line[col:].startswith("- "):
+        col += 2
+        while col < len(line) and line[col] == " ":
+            col += 1
+    return col
+
+
+def _block_header(token: str) -> bool:
+    """Does the token after `key:` open a block scalar?
+
+    `|`, `>`, their indentation and chomping indicators in either order
+    (`|2`, `>-2`, `|-2`) and a trailing comment (`| # ...`) are all headers,
+    never an inline body (#1247).
+    """
+    token = token.split("#", 1)[0].strip()
+    return bool(token) and token[0] in "|>" and all(
+        char.isdigit() or char in "+-" for char in token[1:])
+
+
+def _block_body(lines: list[str], i: int, key_col: int) -> tuple[str, int]:
+    """Body of the block scalar opened on line `i`, and the next line."""
+    body, j = [], i + 1
+    while j < len(lines):
+        nxt = lines[j]
+        if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= key_col:
+            break
+        body.append(nxt)
+        j += 1
+    return "\n".join(body), j
+
+
+def _node_properties(token: str) -> tuple[str | None, str]:
+    """Strip the node properties that may precede a `run:` value.
+
+    A plain scalar never starts with `&` or `!`: `&name` anchors the node and
+    `!tag` / `!!tag` types it, in either order. Both must be seen through, so
+    that the block header behind them opens the body and the anchor is
+    registered (#1247).
+    """
+    name = None
+    while token[:1] in ("&", "!"):
+        if token[0] == "&":
+            match = re.match(r"^&([A-Za-z0-9_.-]+)\s*", token)
+            if not match:
+                break
+            name = match.group(1)
+        else:
+            match = re.match(r"^![^\s]*\s*", token)
+            if not match:
+                break
+        token = token[match.end():]
+    return name, token
+
+
+def _declaration(lines: list[str], i: int) -> tuple[str | None, str, int]:
+    """Anchor declared on line `i`: `(name, value, next line)`.
+
+    `(None, "", next)` when the line declares none. A block body is skipped
+    whole, so that shell text inside a scalar is never read as structure and a
+    declaration only reaches the aliases that follow it.
+    """
+    col = _key_column(lines[i])
+    match = re.match(r"^[^\s:#][^:#]*:[ \t]*(?P<rest>.*)$", lines[i][col:])
+    if not match:
+        return None, "", i + 1
+    name, rest = _node_properties(match.group("rest").strip())
+    if _block_header(rest):
+        value, j = _block_body(lines, i, col)
+        return (name, value, j) if name else (None, "", j)
+    if not name:
+        return None, "", i + 1
+    # #1247 R2: a flow scalar may go on over the more indented lines, and an
+    # empty value is a node on the next lines; the anchor holds all that text,
+    # which is still read as structure.
+    more, _ = _block_body(lines, i, col)
+    return name, "\n".join(filter(None, (rest, more))), i + 1
+
+
 def _run_bodies(text: str) -> list[str]:
-    """Le texte de chaque bloc `run:` de tests.yml (inline ou littéral)."""
-    bodies: list[str] = []
+    """Text of every `run:` body in tests.yml.
+
+    Covers inline scalars, block scalars (`|`, `>`, `|2`, `>-2`, header
+    comment), the list form (`- run:`), node properties (`&anchor`, `!tag`)
+    and aliases (`run: *anchor`). An alias is resolved at its point of use:
+    a declaration that follows it never replaces the one it names (#1247).
+    No body may escape the gate witness that forbids `github.base_ref` /
+    `github.head_ref` inside a `run:` block.
+    """
     lines = text.splitlines()
+    anchors: dict[str, str] = {}
+    bodies: list[str] = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
+        col = _key_column(line)
+        stripped = line[col:]
         if not stripped.startswith("run:"):
+            name, value, i = _declaration(lines, i)
+            if name:
+                anchors[name] = value
+            continue
+        token = stripped[len("run:"):].strip()
+        name, token = _node_properties(token)
+        if token.startswith("*"):
+            alias = token[1:].split("#", 1)[0].strip()
+            if alias not in anchors:
+                # #1247 R2: an anchor the scanner cannot read (sequence item,
+                # flow node) fails the witness instead of dropping the body.
+                raise ValueError(f"run: *{alias}: anchor not readable by the witness")
+            bodies.append(anchors[alias])
             i += 1
             continue
-        inline = stripped[len("run:"):].strip()
-        if inline and inline not in ("|", ">", "|-", ">-", "|+", ">+"):
-            bodies.append(inline)
-            i += 1
+        if token and not _block_header(token):
+            # #1247 R2: a plain or quoted scalar may go on over the more
+            # indented lines.
+            more, j = _block_body(lines, i, col)
+            body = "\n".join(filter(None, (token, more)))
+            if name:
+                anchors[name] = body
+            bodies.append(body)
+            i = j
             continue
-        body, j = [], i + 1
-        while j < len(lines):
-            nxt = lines[j]
-            if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= indent:
-                break
-            body.append(nxt)
-            j += 1
-        bodies.append("\n".join(body))
+        body, j = _block_body(lines, i, col)
+        if name:
+            anchors[name] = body
+        bodies.append(body)
         i = j
     return bodies
+
+
+_BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+_BRANCH_REF_ENV = re.compile(
+    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+_ANY_KEY = re.compile(
+    r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
+_ITEM = re.compile(r"^(?:&[A-Za-z0-9_.-]+\s*)?(?:#.*)?$|^[A-Za-z0-9_.-]+:(?:\s|$)")
+
+
+def _dash_column(line: str) -> int | None:
+    col = len(line) - len(line.lstrip(" "))
+    return col if line[col:].startswith("- ") or line[col:] == "-" else None
+
+
+def _left_open(content: str) -> bool:
+    """Does a quoted scalar or a flow collection go on past this line?"""
+    # Fail closed on an opening delimiter after whitespace or a YAML flow
+    # separator, whatever key, explicit value marker or property precedes it.
+    # A plain scalar with an unmatched delimiter may be refused; permitting it
+    # could hide a quoted/flow continuation whose indentation YAML ignores.
+    depth, quote, i = 0, None, 0
+    while i < len(content):
+        char = content[i]
+        start = i == 0 or content[i - 1].isspace() or content[i - 1] in "[{,:"
+        if quote == '"':
+            if char == "\\":
+                i += 1
+            elif char == '"':
+                quote = None
+        elif quote == "'":
+            if content[i:i + 2] == "''":
+                i += 1
+            elif char == "'":
+                quote = None
+        elif char == "#" and (i == 0 or content[i - 1] in " \t"):
+            break
+        elif char in "\"'" and (start or depth):
+            quote = char
+        elif char in "{[" and (start or depth):
+            depth += 1
+        elif char in "}]" and depth:
+            depth -= 1
+        i += 1
+    return quote is not None or depth > 0
+
+
+def _structural_lines(lines: list[str]) -> set[int]:
+    """Lines that are YAML structure, outside every block scalar body."""
+    keep, i = set(), 0
+    while i < len(lines):
+        keep.add(i)
+        dash, col = _dash_column(lines[i]), _key_column(lines[i])
+        content = lines[i][col:]
+        match = _ANY_KEY.match(content)
+        _, rest = _node_properties((match.group("rest") if match else content).strip())
+        if _block_header(rest):
+            _, i = _block_body(lines, i, col if match or dash is None else dash)
+        else:
+            i += 1
+    return keep
+
+
+def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a key of an `env:` mapping, itself under mapping keys only?
+
+    Every ancestor must be a bare block key (or a sequence item that opens a
+    mapping): a scalar on the way (block, quoted, flow, plain) would make the
+    line its text, not an environment variable.
+    """
+    col, first = _key_column(lines[k]), True
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if key < col:
+            if not _BARE_KEY.match(line[key:]) or (
+                    first and line[key:].split(":", 1)[0] != "env"):
+                return False
+        elif dash is not None and dash < col:
+            if first or not _ITEM.match(line[key:]):
+                return False
+        else:
+            continue
+        first, col = False, key if dash is None else dash
+    return not first
+
+
+def _branch_ref_escapes(text: str) -> list[str]:
+    """Lines where a branch name could reach something other than `env:`.
+
+    #1247 R2: `_run_bodies` does not parse every form (quoted key, `run :`,
+    flow mapping), so the witness also closes on the structure: a branch name
+    is only allowed as `NAME: ${{ github.<x>_ref }}` in a real `env:`
+    mapping, and no quoted scalar or flow collection may go on past its line
+    (a YAML loader ignores indentation inside them).
+    """
+    lines = text.splitlines()
+    structural = _structural_lines(lines)
+    escapes = []
+    for k, line in enumerate(lines):
+        col = _key_column(line)
+        if k in structural and _left_open(line[col:]):
+            escapes.append(line)
+        elif _BRANCH_REF.search(line) and not (
+                k in structural and _dash_column(line) is None
+                and _BRANCH_REF_ENV.match(line[col:])
+                and _under_env(lines, k, structural)):
+            escapes.append(line)
+    return escapes
+
+
+class RunBodiesTest(unittest.TestCase):
+    """#1247: no exotic `run:` body escapes the merge-gate witness."""
+
+    def test_flow_scalar_continuation_lines_are_read(self):
+        # #1247 R2: plain and double-quoted scalars go on over the more
+        # indented lines; `X: ...` is legal inside the quoted one.
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: echo start
+                      "${{ github.base_ref }}"
+                  - run: "echo start
+                      HEAD: ${{ github.head_ref }}"
+                    name: next
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.head_ref", bodies[1])
+        self.assertNotIn("name:", bodies[1])
+
+    def test_anchor_whose_value_is_on_the_next_lines(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_unreadable_anchor_fails_the_witness(self):
+        # #1247 R2: an anchor on a sequence item is not read; its alias must
+        # not be dropped silently.
+        text = textwrap.dedent("""\
+            x-commands:
+              - &cmd |
+                echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        with self.assertRaises(ValueError):
+            _run_bodies(text)
+
+    def test_branch_ref_only_in_a_real_env_mapping(self):
+        # #1247 R2 (B1 mesh-design, qa01): the form of the line is not enough,
+        # it must be a key of a real `env:` mapping; and no quoted scalar or
+        # flow collection may go on past its line (a YAML loader reads it
+        # whatever the indentation of the next lines).
+        steps = "jobs:\n  a:\n    steps:\n"
+        escapes = {
+            "quoted run key": '      - "run": |\n'
+                              '          BASE_REF: ${{ github.base_ref }}\n',
+            "space before colon": '      - run : |\n'
+                                  '          HEAD_REF: ${{ github.head_ref }}\n',
+            "flow mapping": '      - {run: "echo start\n'
+                            '          BASE_REF: ${{ github.base_ref }}"}\n',
+            "quoted scalar over env": '      - name: s\n        run: "echo\n'
+                                      '        env:\n'
+                                      '          BASE_REF: ${{ github.base_ref }}"\n',
+            "flow mapping over env": '      - {name: s, run: "echo\n    env:\n'
+                                     '      BASE_REF: ${{ github.base_ref }}"}\n',
+            "env inside a block": '      - "run": |\n          env:\n'
+                                  '            BASE_REF: ${{ github.base_ref }}\n',
+            "block sequence item": '      - |\n        env:\n'
+                                   '          BASE_REF: ${{ github.base_ref }}\n',
+            "explicit key": '      - ? run\n        : |\n'
+                            '          BASE_REF: ${{ github.base_ref }}\n',
+            "inline mention": '      - {name: x, run: "echo ${{ github.base_ref }}"}\n',
+            "run value": '      - run: ${{ github.head_ref }}\n',
+        }
+        for name, step in escapes.items():
+            with self.subTest(name=name):
+                self.assertNotEqual([], _branch_ref_escapes(steps + step))
+        allowed = {
+            "step env, comments": '      - name: s\n        env:  # x\n'
+                                  '          BASE_REF: ${{ github.base_ref }}  # y\n'
+                                  '        run: echo "$BASE_REF"\n',
+            "anchored step": '      - &s\n        name: s\n        env:\n'
+                             '          HEAD_REF: ${{ github.head_ref }}\n',
+            "env first in the item": '      - env:\n'
+                                     '          BASE_REF: ${{ github.base_ref }}\n',
+        }
+        for name, step in allowed.items():
+            with self.subTest(name=name):
+                self.assertEqual([], _branch_ref_escapes(steps + step))
+        self.assertEqual([], _branch_ref_escapes(
+            "env:\n  BASE_REF: ${{ github.base_ref }}\n"
+            "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
+
+    def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
+        # YAML ignores indentation inside quotes, even after an anchor/tag.
+        # The apparent root env below is still text of the run scalar.
+        for key in ("run", '"run"', "run "):
+            for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
+                               "&cmd !!str"):
+                text = (f"jobs:\n  a:\n    steps:\n      - {key}: {properties} \"echo\n"
+                        "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
+                with self.subTest(key=key, properties=properties):
+                    self.assertNotEqual([], _branch_ref_escapes(text))
+
+    def test_explicit_mapping_value_properties_cannot_hide_a_scalar(self):
+        # The YAML value starts after `:`, independently of the explicit key.
+        # Quoted scalar continuation ignores the apparent root env's indent.
+        for key in ("run", '"run"'):
+            for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
+                               "&cmd !!str"):
+                text = (f"jobs:\n  a:\n    steps:\n      - ? {key}\n"
+                        f"        : {properties} \"echo\n"
+                        "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
+                with self.subTest(key=key, properties=properties):
+                    self.assertNotEqual([], _branch_ref_escapes(text))
+
+    def test_block_headers_indicators_and_comment(self):
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: |2
+                      echo "${{ github.base_ref }}"
+                  - run: >-2
+                      echo "${{ github.head_ref }}"
+                  - run: |- # header comment
+                      echo ok
+                  - run: echo inline
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(4, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.head_ref", bodies[1])
+        self.assertEqual("echo ok", bodies[2].strip())
+        self.assertEqual("echo inline", bodies[3])
+
+    def test_list_form_does_not_swallow_the_next_key(self):
+        text = textwrap.dedent("""\
+            steps:
+              - run: |2
+                  echo "${{ github.base_ref }}"
+                name: suite
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertNotIn("name:", bodies[0])
+
+    def test_alias_resolves_the_anchored_block(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd |2
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+                  - run: echo inline
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertEqual("echo inline", bodies[1])
+
+    def test_alias_of_an_inline_anchor_keeps_the_quoted_hash(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd "echo # ${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_anchor_on_the_run_line_still_opens_the_block(self):
+        # #1247 R1 (P2): `- run: &cmd |` both declares the anchor and opens
+        # the block; the body must not be taken for the inline value `&cmd |`.
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: &cmd |
+                      echo "${{ github.base_ref }}"
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.base_ref", bodies[1])
+
+    def test_tag_before_the_block_header_still_opens_the_block(self):
+        # #1247: a tag is the same class as an anchor (`run: !!str |`).
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: !!str |
+                      echo "${{ github.base_ref }}"
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_alias_resolves_at_its_point_of_use(self):
+        # #1247 R1: an alias names the declaration that precedes it; the last
+        # declaration of the file must not replace it retroactively.
+        text = textwrap.dedent("""\
+            x-first: &cmd |
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            x-last: &cmd |
+              echo benign
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertNotIn("benign", bodies[0])
+
+    def test_only_run_keys_are_read(self):
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                runs-on: ubuntu-latest
+                run-name: build
+                steps:
+                  - run: echo hi
+            """)
+        self.assertEqual(["echo hi"], _run_bodies(text))
 
 
 class WorkflowTest(unittest.TestCase):
@@ -1896,6 +2350,7 @@ class WorkflowTest(unittest.TestCase):
         for body in _run_bodies(self.text):
             self.assertNotIn("github.base_ref", body)
             self.assertNotIn("github.head_ref", body)
+        self.assertEqual([], _branch_ref_escapes(self.text))
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
