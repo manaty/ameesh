@@ -87,6 +87,28 @@ REQUIRE_DB = os.environ.get(
 #: permissif rendait leurs sous-répertoires groupables et la suite rouge.
 os.umask(0o022)
 
+#: #749 : préfixe des sorties négatives volontaires qu'un test surface dans le
+#: journal. Le bilan de la suite complète (`scripts/test-parallele.sh`) cherche
+#: un verdict unittest en début de ligne (`^(Ran |OK|FAILED)`) : une sortie
+#: qu'un test attend exprès — « ROLE CONTRACT FAILED » (message de production
+#: de deploy/sql/role-executor.sql), « FAILED: neither the cache nor a local
+#: npm ci » — ne doit pas pouvoir passer pour un échec. On la préfixe au
+#: moment où le test la surface (message d'assertion) ; on ne renomme jamais
+#: le message de production à la source (décision mesh-design 13/10/2026,
+#: #749 point 3). Convention figée par tests/test_expected_output.py.
+ATTENDU = "attendu: "
+
+
+def attendu(texte: str) -> str:
+    """#749 : préfixe chaque ligne d'une sortie négative volontaire.
+
+    À passer en message d'assertion quand le test vérifie un échec attendu :
+    `self.assertIn("refusé", proc.stderr, attendu(proc.stderr))`. La
+    vérification porte sur la sortie brute ; seule la trace écrite au journal
+    est préfixée."""
+    return "\n".join(ATTENDU + ligne if ligne else ligne
+                     for ligne in texte.splitlines())
+
 
 def apply_authenticators(db, members, **kwargs) -> dict:
     """CONTEXTE DE TEST EXPLICITE (tests de L6, sans canon git) : écrit le
