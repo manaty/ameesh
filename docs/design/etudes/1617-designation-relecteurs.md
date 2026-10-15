@@ -163,7 +163,10 @@ du hook (fil vidé après commit seulement) ; annulation = ni courrier ni marque
   et #1467 (point d'appel) — cx3 a donné le 15/10 son accord pour un hook
   étroit sur `work.milestone(kind=frozen)`, impl07 n'a pas encore répondu ;
 - branchement transactionnel au gel (callback après l'insertion du jalon dans
-  `add_milestone`) et commande de lecture ;
+  `add_milestone`) et commande de lecture ; l'adaptateur fournit aussi le
+  pilote à notifier (`notify`) : aucune source machine unique du pilote de
+  projet n'existe aujourd'hui, et le port refuse un destinataire vide ou hors
+  du registre ;
 - preuve de livraison sur un **gel réel** : désignation sans agent, tête exacte
   remise, durée et doublons mesurés (le compteur de courriers par gel) ;
 - deux avis indépendants hors auteur pour cette porte (sécurité de la chaîne
