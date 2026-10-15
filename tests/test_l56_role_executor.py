@@ -202,7 +202,7 @@ class RoleExecutorTest(PgTestCase):
                         try:
                             proc = run_writers()
                             self.assertNotEqual(proc.returncode, 0)
-                            self.assertIn("has a member with TEMP", proc.stderr)
+                            self.assertIn("has a member with TEMP", proc.stderr, attendu(proc.stderr))
                         finally:
                             self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
                                             (q(self.database), q(member)))
@@ -216,7 +216,7 @@ class RoleExecutorTest(PgTestCase):
                         try:
                             proc = run_writers()
                             self.assertNotEqual(proc.returncode, 0)
-                            self.assertIn("has a member with TEMP", proc.stderr)
+                            self.assertIn("has a member with TEMP", proc.stderr, attendu(proc.stderr))
                         finally:
                             self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
                                             (q(self.database), q(grantee)))
@@ -232,7 +232,7 @@ class RoleExecutorTest(PgTestCase):
                                         (q(other), q(member), "TRUE" if inherit else "FALSE"))
                         proc = run_writers()
                         self.assertNotEqual(proc.returncode, 0)
-                        self.assertIn("has a member with TEMP", proc.stderr)
+                        self.assertIn("has a member with TEMP", proc.stderr, attendu(proc.stderr))
                 self.db.execute("REVOKE %s FROM %s" % (q(other), q(member)))
                 proc = run_writers()
                 self.assertEqual(proc.returncode, 0, proc.stderr)
