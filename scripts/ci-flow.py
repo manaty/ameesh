@@ -37,8 +37,12 @@ un résumé qui le dit, jamais une erreur : l'étape tourne `if: always()`.
 L161c — `publish` suit le fichier pendant la part (en arrière-plan) et tient
 le check run « tests (flux) <part> » de la tête poussée : chaque échec y
 entre dès qu'il est écrit, en annotation (lisible dans la PR) et en ligne JSON
-dans la sortie du check run, entre `MARKER` et la fin du bloc. C'est ce que
-relève `ameesh notify` (`ameesh.ci`) pour l'envoyer à l'agent du lot. Il
+dans la sortie du check run, entre `MARKER` et la fin du bloc. Chaque ligne
+publiée porte l'attempt de sa part (`GITHUB_RUN_ATTEMPT`, #901) : lors d'une
+relance (`gh run rerun`), le check run de l'attempt précédent peut être encore
+le dernier publié pendant que la nouvelle tentative est en file ; sans cette
+marque, `ameesh notify` imputerait ses anciens échecs à la relance. C'est ce
+que relève `ameesh notify` (`ameesh.ci`) pour l'envoyer à l'agent du lot. Il
 s'arrête à la ligne `fin`. `close` (étape `if: always()`) le termine dans
 tous les cas, et le crée s'il n'existe pas encore. Sans jeton, ou si GitHub
 refuse (PR d'une fourche : jeton en lecture seule), rien n'est publié et
@@ -292,8 +296,12 @@ MAX_ANNOTATIONS = 50
 CONCLUSIONS = {"succes": "success", "echec": "failure", "interrompu": "cancelled"}
 
 
-def _failure_line(ev: dict, lignes: int | None) -> str:
+def _failure_line(ev: dict, lignes: int | None, attempt: int) -> str:
     ev = dict(ev)
+    # #901 : la provenance (l'attempt qui a publié cette ligne) est écrite avec
+    # l'événement ; le relevé enregistre chaque échec sous son attempt et
+    # n'impute à une relance que les lignes de l'attempt courant.
+    ev["attempt"] = int(attempt)
     if lignes == 0:
         ev.pop("extrait", None)
     elif lignes is not None and ev.get("extrait"):
@@ -304,12 +312,16 @@ def _failure_line(ev: dict, lignes: int | None) -> str:
     return json.dumps(ev, ensure_ascii=False)
 
 
-def check_output(events: list[dict], alerte: dict | None = None) -> dict:
+def check_output(events: list[dict], attempt: int = 1,
+                 alerte: dict | None = None) -> dict:
     """`output` du check run : titre, résumé, et le bloc des échecs.
 
+    `attempt` est l'attempt GitHub de la part (défaut 1) : il est porté par
+    chaque ligne d'échec publiée (#901).
     `alerte` (#899) : l'alerte de plafond, une fois publiée ; elle se voit dans
     le titre et le résumé, et voyage en ligne JSON `type: alerte` du bloc, que
     `ameesh.ci.events_of` ignore (seuls les échecs de test le concernent)."""
+    attempt = int(attempt or 1)
     debut = next((e for e in events if e.get("type") == "debut"), {})
     fin = next((e for e in events if e.get("type") == "fin"), None)
     tests = [e for e in events if e.get("type") == "test"]
@@ -337,7 +349,7 @@ def check_output(events: list[dict], alerte: dict | None = None) -> dict:
         taille += len(ligne) + 1
     for i, e in enumerate(echecs):
         for garde in ((None if i < FULL_EXCERPTS else FOLLOWING_LINES), 0):
-            ligne = _failure_line(e, garde)
+            ligne = _failure_line(e, garde, attempt)
             if taille + len(ligne) + 1 < MAX_TEXT - 200:
                 lignes.append(ligne)
                 taille += len(ligne) + 1
@@ -375,6 +387,12 @@ class GitHub:
         self.api = env.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
         self.tete = env.get("AMEESH_CI_TETE") or env.get("GITHUB_SHA", "")
         run = env.get("GITHUB_RUN_ID", "")
+        # #901 : l'attempt de la part (relance `gh run rerun`), publié avec
+        # chaque échec pour que le relevé ne relise pas l'attempt précédent.
+        try:
+            self.attempt = max(1, int(env.get("GITHUB_RUN_ATTEMPT") or 1))
+        except (TypeError, ValueError):
+            self.attempt = 1
         self.lien = ("%s/%s/actions/runs/%s" % (env.get("GITHUB_SERVER_URL", "https://github.com"),
                                                 self.depot, run) if run else None)
 
@@ -429,7 +447,8 @@ class Publication:
     def push(self, events: list[dict], conclusion: str | None = None,
              alerte: dict | None = None) -> bool:
         """Crée ou met à jour le check run ; False si GitHub refuse."""
-        output = check_output(events, alerte)
+        attempt = int(getattr(self.gh, "attempt", 1) or 1)
+        output = check_output(events, attempt=attempt, alerte=alerte)
         echecs = [e for e in events if e.get("type") == "test"
                   and e.get("statut") in FAILURES]
         vus = set(self.etat.get("annotes") or ())
@@ -440,7 +459,9 @@ class Publication:
             if not self.etat.get("id"):
                 self.etat["id"] = self.gh.create(self.nom, output)
                 if conclusion:
-                    self.gh.update(self.etat["id"], check_output(events, alerte), conclusion)
+                    self.gh.update(self.etat["id"],
+                                   check_output(events, attempt=attempt, alerte=alerte),
+                                   conclusion)
             else:
                 self.gh.update(int(self.etat["id"]), output, conclusion)
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
