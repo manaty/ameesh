@@ -143,6 +143,10 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
         % (merged_sha[:12] if merged_sha else "<sha>"),
         "- livrer le verdict (`ameesh work milestone %d verdict ok|blocked --sha %s`) ;"
         % (int(lot), merged_sha or "<sha>"),
+        "- si un défaut **non bloquant** se corrige en moins de 5 minutes, le corriger "
+        "et pousser la correction sur la cible : le relecteur corrige lui-même dès le "
+        "premier tour (canon §2, home#81) ; les autres défauts non bloquants vont au "
+        "backlog ;",
         "- %s." % BLOCKING,
         "",
         "Ce lot n'est assigné à personne : il est dans la file de l'équipe, le premier "
