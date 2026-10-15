@@ -26,10 +26,17 @@ build:
 ci:
   packet: full
   incident_label: ci-full
+  environment_red: does_not_block
+  faulty_lot: removed_without_new_review
 reviews:
   families: [claude, codex, deepseek]
   exclude_author_family: true
   distinct_families: true
+merge:
+  named_fire: false
+  repeat_freeze: false
+  on_green_packet: true
+  post_merge_red: forward_or_revert
 projects: {}
 """
 
@@ -184,9 +191,28 @@ class TestRules(MechanicsTest):
         self.assertEqual(rules.max_in_build, 2)
         self.assertEqual(rules.ci_packet, "full")
         self.assertEqual(rules.ci_incident_label, "ci-full")
+        self.assertEqual(rules.ci_environment_red, "does_not_block")
+        self.assertEqual(rules.ci_faulty_lot, "removed_without_new_review")
         self.assertEqual(rules.families, ("claude", "codex", "deepseek"))
         self.assertTrue(rules.exclude_author_family)
         self.assertTrue(rules.distinct_families)
+        # §11 bis, allègements 15/10/2026 14:45 : fusion sans feu nominatif.
+        self.assertFalse(rules.merge_named_fire)
+        self.assertFalse(rules.merge_repeat_freeze)
+        self.assertTrue(rules.merge_on_green_packet)
+        self.assertEqual(rules.merge_post_merge_red, "forward_or_revert")
+
+    def test_changed_ci_and_merge_rules_are_compiled(self):
+        repo = self.repo()
+        text = (MECHANICS.replace("environment_red: does_not_block", "environment_red: blocks")
+                .replace("named_fire: false", "named_fire: true")
+                .replace("post_merge_red: forward_or_revert", "post_merge_red: freeze"))
+        repo.write("processus/mecanique.yaml", text)
+        head = repo.commit("regles de fusion")
+        rules = mechanics.load(repo.root, head, "ameesh")
+        self.assertEqual(rules.ci_environment_red, "blocks")
+        self.assertTrue(rules.merge_named_fire)
+        self.assertEqual(rules.merge_post_merge_red, "freeze")
 
     def test_changed_limit_and_families_are_compiled(self):
         repo = self.repo()
@@ -298,6 +324,20 @@ class TestStrictness(MechanicsTest):
             "zero build": MECHANICS.replace("max_in_build: 2", "max_in_build: 0"),
             "text build": MECHANICS.replace("max_in_build: 2", 'max_in_build: "2"'),
             "bad ci": MECHANICS.replace("packet: full", "packet: parfois"),
+            "bad environment red": MECHANICS.replace("environment_red: does_not_block",
+                                                     "environment_red: parfois"),
+            "bad faulty lot": MECHANICS.replace("faulty_lot: removed_without_new_review",
+                                                "faulty_lot: parfois"),
+            "missing merge": MECHANICS.replace("""merge:
+  named_fire: false
+  repeat_freeze: false
+  on_green_packet: true
+  post_merge_red: forward_or_revert
+""", ""),
+            "bad post merge red": MECHANICS.replace("post_merge_red: forward_or_revert",
+                                                    "post_merge_red: parfois"),
+            "text merge boolean": MECHANICS.replace("on_green_packet: true",
+                                                    'on_green_packet: "true"'),
             "text boolean": MECHANICS.replace("exclude_author_family: true",
                                               'exclude_author_family: "true"'),
             "empty families": MECHANICS.replace("families: [claude, codex, deepseek]",

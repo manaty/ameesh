@@ -6,10 +6,14 @@ mécanique, ce que l'outillage exécute sans agent :
 
 - `cutoffs` et `timezone` : les coupures du train, en heure locale IANA ;
 - `build.max_in_build` : le plafond de lots en développement par agent ;
-- `ci.packet` et `ci.incident_label` : une suite par paquet, l'étiquette qui
-  autorise exceptionnellement la CI d'un lot ;
+- `ci.packet`, `ci.incident_label`, `ci.environment_red`, `ci.faulty_lot` :
+  une suite par paquet, l'étiquette qui autorise exceptionnellement la CI d'un
+  lot, le sort d'un rouge seulement en CI (vert en local) et celui d'un lot
+  fautif ;
 - `reviews.families`, `exclude_author_family`, `distinct_families` : les
-  familles de modèle et l'indépendance des avis.
+  familles de modèle et l'indépendance des avis ;
+- `merge.named_fire`, `repeat_freeze`, `on_green_packet`, `post_merge_red` :
+  la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -41,16 +45,23 @@ FEDERATION_PATH = "federation.yaml"
 TRAIN_REVIEWS_SCHEMA = "ameesh-train-reviews-policy/1"
 #: modes de CI par paquet acceptés
 CI_PACKETS = ("full", "impacted", "none")
+#: sort d'un test rouge seulement en CI et vert en local (§11 bis, 15/10/2026 14:45)
+ENVIRONMENT_RED = ("does_not_block", "blocks")
+#: sort d'un lot fautif dans la CI du paquet (§11 bis)
+FAULTY_LOT = ("removed_without_new_review", "reviewed")
+#: sort d'un rouge découvert après la fusion (§11 bis)
+POST_MERGE_RED = ("forward_or_revert", "freeze")
 
 _TIME = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
 _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
-_DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "build", "ci", "reviews", "projects")
+_DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "build", "ci", "reviews", "merge", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "build", "ci")
 _BUILD_KEYS = ("max_in_build",)
-_CI_KEYS = ("packet", "incident_label")
+_CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
+_MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
 
 
 class MechanicsError(canon.CanonError):
@@ -71,6 +82,8 @@ class ProjectOverride:
     max_in_build: int | None = None
     ci_packet: str | None = None
     ci_incident_label: str | None = None
+    ci_environment_red: str | None = None
+    ci_faulty_lot: str | None = None
 
 
 @dataclass(frozen=True)
@@ -83,9 +96,15 @@ class Document:
     max_in_build: int
     ci_packet: str
     ci_incident_label: str
+    ci_environment_red: str
+    ci_faulty_lot: str
     families: tuple[str, ...]
     exclude_author_family: bool
     distinct_families: bool
+    merge_named_fire: bool
+    merge_repeat_freeze: bool
+    merge_on_green_packet: bool
+    merge_post_merge_red: str
     overrides: tuple[ProjectOverride, ...] = ()
 
     def override(self, project: str) -> ProjectOverride | None:
@@ -101,10 +120,16 @@ class Document:
             "cutoffs": list(self.cutoffs),
             "build": {"max_in_build": self.max_in_build},
             "ci": {"packet": self.ci_packet,
-                   "incident_label": self.ci_incident_label},
+                   "incident_label": self.ci_incident_label,
+                   "environment_red": self.ci_environment_red,
+                   "faulty_lot": self.ci_faulty_lot},
             "reviews": {"families": list(self.families),
                         "exclude_author_family": self.exclude_author_family,
                         "distinct_families": self.distinct_families},
+            "merge": {"named_fire": self.merge_named_fire,
+                      "repeat_freeze": self.merge_repeat_freeze,
+                      "on_green_packet": self.merge_on_green_packet,
+                      "post_merge_red": self.merge_post_merge_red},
             "projects": sorted(item.name for item in self.overrides),
         }
 
@@ -138,9 +163,15 @@ class Mechanics:
     max_in_build: int
     ci_packet: str
     ci_incident_label: str
+    ci_environment_red: str
+    ci_faulty_lot: str
     families: tuple[str, ...]
     exclude_author_family: bool
     distinct_families: bool
+    merge_named_fire: bool
+    merge_repeat_freeze: bool
+    merge_on_green_packet: bool
+    merge_post_merge_red: str
     review_policy: review.ReviewPolicy
     rules: tuple[ReviewRule, ...]
     source: str = ""
@@ -230,10 +261,16 @@ class Mechanics:
             "cutoffs": list(self.cutoffs),
             "build": {"max_in_build": self.max_in_build},
             "ci": {"packet": self.ci_packet,
-                   "incident_label": self.ci_incident_label},
+                   "incident_label": self.ci_incident_label,
+                   "environment_red": self.ci_environment_red,
+                   "faulty_lot": self.ci_faulty_lot},
             "reviews": {"families": list(self.families),
                         "exclude_author_family": self.exclude_author_family,
                         "distinct_families": self.distinct_families},
+            "merge": {"named_fire": self.merge_named_fire,
+                      "repeat_freeze": self.merge_repeat_freeze,
+                      "on_green_packet": self.merge_on_green_packet,
+                      "post_merge_red": self.merge_post_merge_red},
             "review_rules": [{"paths": list(rule.paths), "reviews": rule.reviews}
                              for rule in self.rules],
         }
@@ -292,7 +329,7 @@ def _timezone(value, where: str) -> str:
     return value
 
 
-def _ci(value, where: str) -> tuple[str, str]:
+def _ci(value, where: str) -> tuple[str, str, str, str]:
     data = _mapping(value, where, _CI_KEYS)
     packet = data.get("packet")
     if packet not in CI_PACKETS:
@@ -300,7 +337,27 @@ def _ci(value, where: str) -> tuple[str, str]:
     label = data.get("incident_label")
     if not isinstance(label, str) or not _LABEL.fullmatch(label):
         raise MechanicsError("%s.incident_label: a label is required" % where)
-    return packet, label
+    environment = data.get("environment_red")
+    if environment not in ENVIRONMENT_RED:
+        raise MechanicsError("%s.environment_red: %s expected"
+                             % (where, " | ".join(ENVIRONMENT_RED)))
+    faulty = data.get("faulty_lot")
+    if faulty not in FAULTY_LOT:
+        raise MechanicsError("%s.faulty_lot: %s expected" % (where, " | ".join(FAULTY_LOT)))
+    return packet, label, environment, faulty
+
+
+def _merge(value, where: str) -> tuple[bool, bool, bool, str]:
+    """La règle de fusion du paquet (§11 bis, allègements 15/10/2026 14:45)."""
+    data = _mapping(value, where, _MERGE_KEYS)
+    post = data.get("post_merge_red")
+    if post not in POST_MERGE_RED:
+        raise MechanicsError("%s.post_merge_red: %s expected"
+                             % (where, " | ".join(POST_MERGE_RED)))
+    return (_boolean(data.get("named_fire"), where + ".named_fire"),
+            _boolean(data.get("repeat_freeze"), where + ".repeat_freeze"),
+            _boolean(data.get("on_green_packet"), where + ".on_green_packet"),
+            post)
 
 
 def _families(value, where: str) -> tuple[str, ...]:
@@ -329,7 +386,7 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         data = _mapping(block, scope, _OVERRIDE_KEYS)
         timezone = cutoffs = None
         max_in_build = None
-        packet = label = None
+        packet = label = environment = faulty = None
         if "timezone" in data:
             timezone = _timezone(data["timezone"], scope + ".timezone")
         if "cutoffs" in data:
@@ -339,10 +396,12 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
             max_in_build = _positive_int(build.get("max_in_build"),
                                          scope + ".build.max_in_build")
         if "ci" in data:
-            packet, label = _ci(data["ci"], scope + ".ci")
+            packet, label, environment, faulty = _ci(data["ci"], scope + ".ci")
         out.append(ProjectOverride(name=name, timezone=timezone, cutoffs=cutoffs,
                                    max_in_build=max_in_build, ci_packet=packet,
-                                   ci_incident_label=label))
+                                   ci_incident_label=label,
+                                   ci_environment_red=environment,
+                                   ci_faulty_lot=faulty))
     return tuple(out)
 
 
@@ -363,7 +422,9 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                              % (source, SCHEMA, parsed.get("schema")))
     build = _mapping(parsed.get("build"), source + ".build", _BUILD_KEYS)
     reviews = _mapping(parsed.get("reviews"), source + ".reviews", _REVIEWS_KEYS)
-    packet, label = _ci(parsed.get("ci"), source + ".ci")
+    packet, label, environment, faulty = _ci(parsed.get("ci"), source + ".ci")
+    named_fire, repeat_freeze, on_green, post_merge = _merge(parsed.get("merge"),
+                                                             source + ".merge")
     return Document(
         schema=SCHEMA,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
@@ -372,11 +433,17 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                                    source + ".build.max_in_build"),
         ci_packet=packet,
         ci_incident_label=label,
+        ci_environment_red=environment,
+        ci_faulty_lot=faulty,
         families=_families(reviews.get("families"), source + ".reviews.families"),
         exclude_author_family=_boolean(reviews.get("exclude_author_family"),
                                        source + ".reviews.exclude_author_family"),
         distinct_families=_boolean(reviews.get("distinct_families"),
                                    source + ".reviews.distinct_families"),
+        merge_named_fire=named_fire,
+        merge_repeat_freeze=repeat_freeze,
+        merge_on_green_packet=on_green,
+        merge_post_merge_red=post_merge,
         overrides=_overrides(parsed.get("projects"), source + ".projects"),
     )
 
@@ -526,9 +593,18 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
         ci_incident_label=(override.ci_incident_label if override
                            and override.ci_incident_label
                            else document.ci_incident_label),
+        ci_environment_red=(override.ci_environment_red if override
+                            and override.ci_environment_red
+                            else document.ci_environment_red),
+        ci_faulty_lot=(override.ci_faulty_lot if override and override.ci_faulty_lot
+                       else document.ci_faulty_lot),
         families=document.families,
         exclude_author_family=document.exclude_author_family,
         distinct_families=document.distinct_families,
+        merge_named_fire=document.merge_named_fire,
+        merge_repeat_freeze=document.merge_repeat_freeze,
+        merge_on_green_packet=document.merge_on_green_packet,
+        merge_post_merge_red=document.merge_post_merge_red,
         review_policy=policy,
         rules=rules,
         source="%s@%s:%s" % (repo, commit, PATH),
