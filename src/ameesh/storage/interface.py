@@ -625,7 +625,8 @@ class ApiRequests(Domain):
     def reserve(self, human: str, key: str, fingerprint: str, *,
                 retention_s: int) -> dict | None:
         """Reserves (human, key) for the request `fingerprint`, in ONE
-        transaction, after purging the rows older than `retention_s`. None when
+        transaction, after purging the rows older than `retention_s` (a purge
+        that never waits on a locked row, #1497 N3). None when
         the key is new (the caller acts); otherwise the row in place:
         fingerprint, status, response (status and response None while the
         first request is still running)."""

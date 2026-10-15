@@ -228,7 +228,8 @@ def _stop(ctx, db, params, body) -> dict:
     from . import exploitation
     reason = _text(body, "reason", limit=exploitation.STOP_REASON_MAX)
     try:
-        return exploitation.stop(ctx.cfg, db, params["agent"], reason, actor=actor(ctx))
+        return exploitation.stop(ctx.cfg, db, params["agent"], reason, actor=actor(ctx),
+                                 sender=ctx.human)
     except exploitation.StopRefused as exc:
         raise ActionError(404 if exc.code == "unknown_agent" else 400,
                           "not_found" if exc.code == "unknown_agent" else "bad_body",
@@ -283,7 +284,8 @@ def _lower_cap(ctx, db, params, body) -> dict:
     agent = _name(body, "agent", required=False)
     try:
         changed, old = budget.change(ctx.cfg, db, agent=agent, window=window, usd=float(usd),
-                                     actor=actor(ctx), lower_only=True)
+                                     actor=actor(ctx), lower_only=True,
+                                     sender=ctx.human)
     except budget.BudgetError as exc:
         raise ActionError(409, "not_a_lowering", str(exc)) from exc
     return {"scope": agent or "mesh", "window": body["window"], "usd": float(usd),

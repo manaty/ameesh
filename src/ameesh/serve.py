@@ -412,6 +412,13 @@ def match(path: str) -> tuple[Route, dict] | None:
     return None
 
 
+def _has_shape(items, path: str) -> bool:
+    """Whether `path` has the shape of one of `items`, its parameters NOT
+    checked (#1497 N4): it decides a 405 (the route exists, not for this
+    method) — a parameter refused there would turn it into a 400 `bad_path`."""
+    return any(item.regex.match(path) for item in items)
+
+
 def match_action(path: str) -> tuple[serve_actions.Action, dict] | None:
     for action in ACTIONS:
         m = action.regex.match(path)
@@ -658,7 +665,8 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
         if row["status"] is None:
             return 409, _err("idempotency_in_progress",
                              "the first request with this Idempotency-Key has not answered, "
-                             "or its outcome is unknown: check before acting again"), False
+                             "or its outcome is unknown: check before acting again, then "
+                             "release the key with `ameesh serve --release-key KEY`"), False
         return row["status"], row["response"], True
     try:
         result = action.build(ctx, db, params, body)
@@ -669,7 +677,9 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
                              "by": ctx.human, "for": serve_actions.principal(ctx),
                              "result": result}
     # any other exception leaves the key reserved: the action may have been
-    # done, a retry must not do it twice (409 above)
+    # done, a retry must not do it twice (409 above). Once the human has
+    # checked, `ameesh serve --release-key KEY` frees it (#1497 N2) instead of
+    # waiting for the 24 h purge.
     if status >= 500:
         requests.release(ctx.human, key)
         return status, data, False
@@ -922,7 +932,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         found = match(url.path)
         if found is None:
-            if match_action(url.path) is not None:
+            if _has_shape(ACTIONS, url.path):
                 self._error(405, "method_not_allowed", "this route acts: POST",
                             (("Allow", "POST"),))
                 return
@@ -958,7 +968,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         found = match_action(url.path)
         if found is None:
-            if (match(url.path) is not None or url.path == WELL_KNOWN or url.path == UI
+            if (_has_shape(ROUTES, url.path) or url.path == WELL_KNOWN or url.path == UI
                     or url.path.startswith(UI + "/")):
                 self._error(405, "method_not_allowed", "this route reads: GET or HEAD",
                             (("Allow", "GET, HEAD"),))
@@ -1308,7 +1318,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--organisation", help="organisation named by /.well-known/ameesh")
     parser.add_argument("--openapi", action="store_true",
                         help="print the OpenAPI 3.1 document and exit")
+    parser.add_argument("--release-key", metavar="KEY",
+                        help="release an Idempotency-Key of the human whose action never "
+                             "answered (409 idempotency_in_progress), once its outcome has "
+                             "been checked, and exit; an answered key is never released")
     return parser
+
+
+def release_key(cfg, human: str, key: str) -> int:
+    """#1497 N2 : frees a reservation left by an action that raised (outcome
+    unknown), so the same request can be sent again with its key. Only an
+    unanswered reservation goes: a stored response stays (it is the replay)."""
+    if not _IDEMPOTENCY_RE.match(key or ""):
+        print("ameesh serve: invalid Idempotency-Key", file=sys.stderr)
+        return 2
+    try:
+        released = db_writer(cfg)(
+            lambda db: storage.of(db).api_requests.release(human, key))
+    except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
+        print("ameesh serve: database unavailable: %s" % exc, file=sys.stderr)
+        return 1
+    if not released:
+        print("ameesh serve: no unanswered reservation of %s for this key" % human,
+              file=sys.stderr)
+        return 1
+    print("ameesh serve: Idempotency-Key released for %s" % human)
+    return 0
 
 
 def dump_openapi() -> str:
@@ -1326,6 +1361,9 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_mod.load()
     try:
         human = owner(cfg, args.human)
+        if args.release_key is not None:
+            # no token: the database is the authority here, not the HTTP API
+            return release_key(cfg, human, args.release_key)
         path = token_file(args.token_file)
         token = load_token(path)
     except ValueError as exc:
