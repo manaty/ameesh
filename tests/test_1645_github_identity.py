@@ -266,6 +266,21 @@ class JournalTest(Base):
         self.assertNotIn("ZZZ", texte)
         self.assertNotIn("Bearer", texte)
 
+    def test_un_booleen_pris_pour_option_a_valeur_ne_decale_rien(self):
+        # R4 cx3, qa-01 : `-a` est booléen pour `pr review`, `--body` y prend
+        # donc `--head=…` comme corps libre ; de même pour un groupe `-ab`
+        secret = "SYNTHETIC_PRIVATE_1645"
+        for args in (["pr", "review", "1", "-a", "--body", "--head=" + secret],
+                     ["pr", "review", "1", "-a", "--body", "-R" + secret],
+                     ["pr", "review", "1", "-r", "-b", "--head=" + secret],
+                     ["pr", "review", "1", "--comment", "--body", "-R" + secret],
+                     ["pr", "create", "-d", "--body", "--head=" + secret],
+                     ["pr", "merge", "12", "-m", "--body", "-R" + secret],
+                     ["label", "create", "X", "-f", "--description", "--head=" + secret],
+                     ["pr", "review", "1", "-ab", "--head=" + secret],
+                     ["pr", "review", "1", "-ab", "--head", secret]):
+            self.assertNotIn(secret, " ".join(gi.sanitize_argv(args)), args)
+
     def test_les_identifiants_utiles_restent_consignes(self):
         sha = "e4e90fa07bf4f2ead10ff6822057bc2fef37d6ab"
         args = ["pr", "merge", "1256", "--auto", "--squash", "--match-head-commit",
