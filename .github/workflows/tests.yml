@@ -480,7 +480,9 @@ jobs:
     env:
       AMEESH_DRIVER: psycopg
       FLUX_NOM: tests (flux) autre-FS ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+      AMEESH_PLAFOND_MIN: "45"
     steps:
+      - *debut
       - uses: actions/checkout@v4
       - *dsn
       - id: py
@@ -490,15 +492,36 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - id: venv
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
-      - name: dépendances (pilote psycopg)
-        if: steps.venv.outputs.cache-hit != 'true'
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-
+      # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
+      # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
+      # importer ses dépendances, sinon il est reconstruit (#932, #1293).
+      - id: deps
+        name: dépendances (pilote psycopg)
         run: |
-          python -m venv .venv-ci
-          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
+            echo "venv restauré du cache : valide"
+          else
+            rm -rf .venv-ci
+            python -m venv .venv-ci
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            echo "reconstruit=1" >> "$GITHUB_OUTPUT"
+          fi
+      # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
+      # prochaine exécution retrouve par `restore-keys`. Un sauvetage refusé
+      # (quota, course entre parts) ne fait pas rougir la part : la
+      # reconstruction reste correcte, seule la prochaine exécution repaie.
+      - if: steps.deps.outputs.reconstruit == '1'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .venv-ci
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
       - *base
       - *git
       - *plan
