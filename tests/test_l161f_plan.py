@@ -1017,6 +1017,45 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
                                               guaranteed=True), {"src/ameesh/db.py"})
 
+    def test_reassigned_exit_symbols_stay_conservative(self):
+        # #1474 : un symbole de terminaison réaffecté (`sys = ...`, puis un
+        # `bye = ...` sur un nom importé de sys/os) n'est pas suivi — la
+        # réaffectation peut être conditionnelle, donc la preuve reste coupée :
+        # une preuve perdue, jamais une preuve fausse. L'arête de sélection
+        # possible est conservée.
+        known = {"src/ameesh/db.py"}
+        reassigned = {
+            "sys rebindé": "import sys\n"
+                           "sys = None\n"
+                           "sys.exit(1)\n"
+                           "import ameesh.db\n",
+            "sys rebindé sans sortie": "import sys\n"
+                                       "class Fake:\n"
+                                       "    @staticmethod\n"
+                                       "    def exit(code):\n"
+                                       "        return None\n"
+                                       "sys = Fake\n"
+                                       "sys.exit(0)\n"
+                                       "import ameesh.db\n",
+            "exit importé puis rebindé": "from sys import exit as bye\n"
+                                         "bye = print\n"
+                                         "bye('x')\n"
+                                         "import ameesh.db\n",
+            "exit builtin rebindé": "exit = print\n"
+                                    "exit('x')\n"
+                                    "import ameesh.db\n",
+            "os._exit aliasé puis rebindé": "from os import _exit as bye\n"
+                                            "bye = print\n"
+                                            "bye('x')\n"
+                                            "import ameesh.db\n",
+        }
+        for why, source in reassigned.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
         # prouve pas que `ameesh/db.py` est chargé — le paquet peut lier le nom
