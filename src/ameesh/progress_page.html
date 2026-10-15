@@ -627,6 +627,10 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     var wait = lot.planned_wait;
     if (!wait) return "";
     if (wait.what === "scheduled") return "planned start " + wait.start;
+    if (wait.what === "hold") {
+      return "hold" + (wait.by ? " by " + wait.by : "")
+        + (wait.since ? " since " + new Date(wait.since * 1000).toLocaleString() : "");
+    }
     return "waiting on lots " + (wait.lots || []).map(function (id) { return "#" + id; }).join(", ");
   }
   function lotWaitLabel(lot) {
