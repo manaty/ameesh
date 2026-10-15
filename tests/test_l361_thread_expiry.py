@@ -416,11 +416,28 @@ class MediatedHostTest(TransportTest):
         self.assertEqual([c[0] for c in db.storage.threads.mock_calls], ["recount"])
         logged.assert_called_once()
         self.assertIn("1 entr", logged.call_args.args[0])
+        # #1482-N3 : la connexion tenue par l'exécuteur n'est pas fermée par l'expiration
+        db.close.assert_not_called()
         # r8/l361b: le throttle quotidien se compte sur l'horloge monotone ; sans
         # `clock` explicite le temoin dependait de la duree de vie de la machine
         # (monotonic > 86400 s -> la deuxieme passe n'etait plus retenue).
         self.assertIsNone(runner.Runner.expire_threads_once(fake, None, now=NOW + 3600,
                                                             clock=3600.0))
+
+    def test_runner_closes_the_connection_it_opened_itself(self):
+        # #1482-N3 : la connexion ouverte pour l'expiration quotidienne est
+        # fermée ; celle que l'exécuteur tient déjà ne l'est pas.
+        cfg = self.mediated_cfg()
+        self.post(entry("old", 500), entry("kept", 1))
+        db = self.remote_db()
+        from ameesh import db as db_mod
+        fake = types.SimpleNamespace(cfg=cfg, dry_run=False)
+        with mock.patch.object(db_mod, "connect", return_value=db) as connect, \
+                mock.patch.object(runner, "log_async"):
+            reports = runner.Runner.expire_threads_once(fake, None, now=NOW)
+        connect.assert_called_once()
+        db.close.assert_called_once()
+        self.assertEqual([r["dropped"] for r in reports], [1])
 
     def test_runner_says_the_missing_index_once_per_pass(self):
         cfg = self.mediated_cfg()

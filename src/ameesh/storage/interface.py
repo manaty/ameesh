@@ -158,7 +158,7 @@ from .conversations import Conversations
 from .work_dependencies import WorkDependencies
 
 import abc
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence, TypedDict
 
 
 class Domain(abc.ABC):
@@ -2048,6 +2048,20 @@ class Grants(Domain):
 # index des fils lisibles (`thread_index`)
 # --------------------------------------------------------------------------
 
+class ThreadCensus(TypedDict):
+    """Census d'un fil d'hôte médié, porté par `threads.recount` (L361b) :
+    la plus récente entrée gardée, telle que l'index la cite.
+
+    `mailbox_id` est la dernière boîte citée par l'entrée, None si elle n'en
+    cite aucune. L'ordre des champs est celui du schéma du contrat."""
+
+    entry_id: str
+    author: str
+    excerpt: str
+    ts: float
+    mailbox_id: int | None
+
+
 class Threads(Domain):
     """Index des fils (le fil lui-même vit chez son transport, hors base)."""
 
@@ -2072,7 +2086,7 @@ class Threads(Domain):
 
     @abc.abstractmethod
     def recount(self, *, project: str, lot: str, transport: str, host: str, location: str,
-                kept: int, last: dict | None, end: int) -> int:
+                kept: int, last: ThreadCensus | None, end: int) -> int:
         """L361b : verrou, recomptage et expiration de l'index en UNE
         transaction serveur, pour un fil dont le fichier vit sur l'hôte médié.
 

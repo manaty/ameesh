@@ -3152,6 +3152,33 @@
       "type": [
        "object",
        "null"
+      ],
+      "properties": {
+       "entry_id": {
+        "type": "string"
+       },
+       "author": {
+        "type": "string"
+       },
+       "excerpt": {
+        "type": "string"
+       },
+       "ts": {
+        "type": "number"
+       },
+       "mailbox_id": {
+        "type": [
+         "integer",
+         "null"
+        ]
+       }
+      },
+      "required": [
+       "entry_id",
+       "author",
+       "excerpt",
+       "ts",
+       "mailbox_id"
       ]
      },
      "required": true

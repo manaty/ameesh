@@ -71,6 +71,7 @@ from typing import Iterable, Iterator, Protocol, Sequence
 
 from . import storage
 from .config import Config
+from .storage.interface import ThreadCensus
 
 DEFAULT_PROJECT = "default"
 #: nom de fichier du fil d'un projet (un lot assaini ne commence jamais par `_`)
@@ -1210,7 +1211,9 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
                 if storage.is_remote(db):
                     # L361b : le fichier d'abord (verrou local), puis UNE
                     # opération serveur (verrou de la ligne, recomptage,
-                    # expiration) : l'index ne peut pas rester en arrière.
+                    # expiration). Un recomptage perdu est rattrapé à
+                    # l'expiration suivante, depuis le fichier : l'index ne
+                    # reste pas en arrière.
                     report = run()
                     _recount_remote(db, transport, thread, key, location, report)
                 else:
@@ -1257,8 +1260,10 @@ def _recount_remote(db, transport, thread: ThreadRef, key: dict, location: str,
                                     last=_index_row(last), end=end)
 
 
-def _index_row(entry: Entry | None) -> dict | None:
-    """La plus récente entrée gardée, telle que l'index la cite."""
+def _index_row(entry: Entry | None) -> ThreadCensus | None:
+    """La plus récente entrée gardée, telle que l'index la cite (L361b, la
+    forme déclarée au contrat : `entry_id`, `author`, `excerpt`, `ts`,
+    `mailbox_id`)."""
     if entry is None:
         return None
     ids = [i for i in entry.meta.get("ids") or () if isinstance(i, int) and not isinstance(i, bool)]
@@ -1389,16 +1394,16 @@ def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     db = None
     if not args.dry_run:
-        # L361b : un hôte médié expire par l'opération serveur (verrou,
-        # recomptage, expiration) ; c'est la connexion qui le dit. Sans elle,
-        # `expire` refuse et rien n'est touché.
+        # L361b: a mediated host expires through the server operation (lock,
+        # recount, expiry); the connection says whether it exists. Without it,
+        # `expire` refuses and nothing is touched.
         try:
             db = db_mod.connect(cfg)
         except db_mod.DbError as exc:
             message = " ".join(str(exc).split())[:200]
             if expiry_unavailable(cfg, None):
-                # L361b : sans index, un hôte médié n'expire pas ; le refus
-                # part d'ici, avant toute réécriture de fil
+                # L361b: without an index, a mediated host does not expire; the
+                # refusal starts here, before any thread rewrite
                 raise ExpiryUnavailable("%s (index unavailable: %s)" % (EXPIRY_UNAVAILABLE,
                                                                         message))
             print("thread index unavailable (%s): threads expire, the index is not updated"
