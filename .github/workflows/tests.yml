@@ -356,6 +356,13 @@ jobs:
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Cache access is closed for a job that may run on the borrowed host: the
+    # cache service scopes the run's runtime token from this declaration, and
+    # `permissions:` does not bound it (R1 Codex B3, #1256). `none` here: this
+    # job reads no cache. A write mode is forbidden on every routed job — it
+    # could otherwise publish a `carte-*` or `.venv-ci` entry that `plan` and
+    # the psycopg parts restore, poisoning required checks.
+    cache-mode: none
     timeout-minutes: 5
     continue-on-error: true
     steps:

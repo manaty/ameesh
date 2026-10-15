@@ -45,6 +45,11 @@ permissions:
 jobs:
   ui:
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # Borrowed host: the run's runtime token must not be able to save cache
+    # entries. `permissions:` does not bound that token; `cache-mode` does, in
+    # the cache service (R1 Codex B3, #1256). `read` keeps setup-node's npm
+    # restore and forbids the save.
+    cache-mode: read
     timeout-minutes: 10
     defaults:
       run:

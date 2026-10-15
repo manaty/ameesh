@@ -16,7 +16,9 @@ publishes (L159e/L159f, `ameesh-host-state/1` in
   state starts nothing (plan §5/§6);
 * it then consumes exactly one *just-in-time* configuration from the deposit
   directory (`--spool`, one file per job, written there by the ameesh side
-  outside this host: `ci-runners.sh --deposit`), unlinks it, and starts
+  outside this host: `ci-runners.sh --deposit`), validates it (base64 of a
+  JSON object, safe file names, a `.runner` that declares `ephemeral: true` —
+  the runner's own single-job setting), unlinks it, and starts
   `run.sh --jitconfig <configuration>`: GitHub removes the runner after that
   one job, so there is no registration token and no durable credential on the
   lending host (plan §1/§3);
@@ -51,6 +53,7 @@ import base64
 import binascii
 import json
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -72,6 +75,11 @@ MAX_CONFIG_BYTES = 65536
 #: the runner writes these from the JIT configuration; they are removed before
 #: and after the job, so a dead credential never stays on the lending host
 LOCAL_CONFIG_FILES = (".runner", ".credentials", ".credentials_rsaparams")
+#: the file names a JIT configuration may carry: the runner writes each of them
+#: into its root (Runner.cs, `RunJitConfig`), so a slash or a `..` there would
+#: escape that root. All-dots names are refused too (`.` and `..` match the
+#: class but are directories, not files).
+SAFE_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 class BadConfiguration(Exception):
@@ -140,15 +148,71 @@ def clean_local_config(run_dir):
             pass
 
 
+def read_bounded(fd):
+    """The bytes of an open configuration, or None past `MAX_CONFIG_BYTES`.
+
+    Read on the descriptor, never on the path: the file cannot be swapped
+    between the check and the read, and the bound is re-applied to what was
+    really read (a file grown after `fstat` is refused, not truncated into a
+    half-configuration that would still look valid)."""
+    raw = b""
+    while len(raw) <= MAX_CONFIG_BYTES:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        raw += chunk
+    if len(raw) > MAX_CONFIG_BYTES:
+        return None
+    return raw
+
+
+def validate_config(text):
+    """The decoded JIT document, or ValueError: base64 of a JSON object of
+    runner files, safe file names, and a `.runner` that declares
+    `ephemeral: true`.
+
+    The runner's one-shot discipline is `settings.Ephemeral`
+    (actions/runner v2.338.0 `Runner.cs`: the JIT blob only writes the files;
+    the single-job path reads that setting): a configuration without it would
+    leave a **persistent** runner registered on this host, so neither the
+    deposit nor this gate lets one through. The name check matters as much:
+    `run.sh --jitconfig` writes every entry into the runner root, so
+    `../../outside` would escape it."""
+    try:
+        decoded = json.loads(base64.b64decode(text, validate=True).decode("utf-8"))
+        if not isinstance(decoded, dict) or not decoded:
+            raise ValueError("not a non-empty configuration document")
+        for name, value in decoded.items():
+            if (not isinstance(name, str) or not SAFE_FILE_NAME.fullmatch(name)
+                    or set(name) <= {"."}):
+                raise ValueError("unsafe runner file name %r" % (name,))
+            if not isinstance(value, str):
+                raise ValueError("runner file %s is not base64 text" % name)
+            base64.b64decode(value, validate=True)
+        runner = decoded.get(".runner")
+        if runner is None:
+            raise ValueError("no .runner: the single-use contract cannot be read")
+        settings = json.loads(base64.b64decode(runner, validate=True).decode("utf-8"))
+        if not isinstance(settings, dict) or settings.get("ephemeral") is not True:
+            raise ValueError(".runner does not set ephemeral true: a persistent "
+                             "runner is refused")
+    except (UnicodeDecodeError, ValueError, TypeError,
+            binascii.Error, json.JSONDecodeError) as exc:
+        raise ValueError(str(exc)) from exc
+    return decoded
+
+
 def take_config(spool):
     """Consume exactly one deposited configuration: read it, unlink it, return
     its text (or None when none is deposited).
 
     The configuration is a file of the guest's own deposit directory; it is
-    read with `O_NOFOLLOW`, only if it is a regular file of bounded size (a
-    link or a device planted there is never a configuration), and it is
-    validated as base64 of a JSON object before it is unlinked — a tampered
-    entry is refused, not passed to `run.sh`.
+    read with `O_NOFOLLOW` on the descriptor, only if it is a regular file of
+    bounded size (a link or a device planted there is never a configuration),
+    and it is fully validated before it is unlinked — a tampered entry is
+    refused, not passed to `run.sh`. A consumption that fails (the entry
+    cannot be unlinked) is **refused before the start**: returning the text
+    without consuming it would run the same configuration twice.
     """
     try:
         names = sorted(name for name in os.listdir(spool) if name.endswith(".b64"))
@@ -157,35 +221,40 @@ def take_config(spool):
     for name in names:
         path = os.path.join(spool, name)
         try:
-            info = os.lstat(path)
-        except OSError:
-            continue
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_CONFIG_BYTES:
-            print("ci-runner-gate: %s is not a regular configuration file: left alone"
-                  % path, file=sys.stderr)
-            continue
-        try:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
             continue
         try:
-            raw = os.read(fd, MAX_CONFIG_BYTES)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                print("ci-runner-gate: %s is not a regular configuration file: "
+                      "left alone" % path, file=sys.stderr)
+                continue
+            if info.st_size > MAX_CONFIG_BYTES:
+                raise BadConfiguration(
+                    "%s is larger than %d bytes: not a JIT configuration"
+                    % (path, MAX_CONFIG_BYTES))
+            raw = read_bounded(fd)
         finally:
             os.close(fd)
+        if raw is None:
+            raise BadConfiguration(
+                "%s grew past %d bytes while being read: refusing it"
+                % (path, MAX_CONFIG_BYTES))
         try:
             text = "".join(raw.decode("ascii").split())
-            decoded = json.loads(base64.b64decode(text, validate=True).decode("utf-8"))
-            if not isinstance(decoded, dict) or not decoded:
-                raise ValueError("not a non-empty configuration document")
+            validate_config(text)
         except (UnicodeDecodeError, ValueError, TypeError,
                 binascii.Error, json.JSONDecodeError) as exc:
             raise BadConfiguration(
-                "%s is not a JIT configuration (%s): refusing to run it"
+                "%s is not a usable JIT configuration (%s): refusing to run it"
                 % (path, exc)) from exc
         try:
             os.unlink(path)
-        except OSError:
-            pass
+        except OSError as exc:
+            raise BadConfiguration(
+                "%s cannot be consumed (%s): refusing to run a configuration "
+                "that would stay deposited" % (path, exc)) from exc
         return text
     return None
 

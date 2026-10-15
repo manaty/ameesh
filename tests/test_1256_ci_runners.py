@@ -45,14 +45,18 @@ FLEET = "ameesh-ci"
 
 
 def jit_config(name="ameesh-nxl-ci-3-1", repo="https://github.com/manaty/ameesh",
-               files=None):
+               files=None, ephemeral=True):
     """A JIT configuration, as `POST …/generate-jitconfig` returns it: base64
     of a JSON object mapping runner file names to base64 contents
     (actions/runner v2.338.0, Runner.cs: every entry is written into the
-    runner's root before the single job)."""
+    runner's root before the single job).
+
+    `.runner` carries `ephemeral: true`: the one-shot path reads
+    `settings.Ephemeral`, the JIT blob only writes files, so a configuration
+    without it would leave a persistent runner registered (R1 Codex B1)."""
     if files is None:
         runnersettings = json.dumps(
-            {"agentName": name, "gitHubUrl": repo,
+            {"agentName": name, "gitHubUrl": repo, "ephemeral": ephemeral,
              "serverUrl": "https://pipelines.actions.githubusercontent.com/t/"})
         files = {".runner": runnersettings, ".credentials": "{}"}
     doc = {key: base64.b64encode(value.encode()).decode()
@@ -288,6 +292,64 @@ class GateWrapperTest(unittest.TestCase):
         self.assertIn("refusing to run it", out)
         self.assertNotIn("start", self.events_now())
         self.assertTrue(os.path.exists(os.path.join(self.spool, "jit-bad.b64")))
+
+    def test_a_persistent_configuration_is_refused_not_run(self):
+        # sans `ephemeral: true`, le runner resterait enregistré après le job
+        # (Runner.cs, `settings.Ephemeral`) : le portier refuse, ne consomme
+        # pas et ne démarre rien (R1 Codex B1)
+        persistent = jit_config(files={
+            ".runner": json.dumps({"agentName": "ameesh-nxl-ci-3-1",
+                                   "gitHubUrl": "https://github.com/manaty/ameesh",
+                                   "ephemeral": False}),
+            ".credentials": "{}"})
+        path = self.deposit(persistent)
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        self.assertIn("ephemeral true", proc.stdout.read())
+        self.assertNotIn("start", self.events_now())
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_configuration_that_escapes_the_runner_root_is_refused(self):
+        # `run.sh --jitconfig` écrit chaque entrée dans la racine du runner :
+        # un nom de fichier qui remonte l'arbre est refusé par le portier,
+        # comme par le dépôt (R1 Codex B2)
+        blob = jit_config(files={"../../outside": "eA==", ".runner": json.dumps(
+            {"agentName": "ameesh-nxl-ci-3-1", "ephemeral": True})})
+        path = self.deposit(blob)
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        self.assertIn("unsafe runner file name", proc.stdout.read())
+        self.assertNotIn("start", self.events_now())
+        self.assertTrue(os.path.exists(path))
+
+    def test_an_oversized_configuration_is_refused_whole(self):
+        # la borne s'applique à ce qui est lu, sur le descripteur : un fichier
+        # trop grand n'est jamais tronqué en configuration qui semblerait
+        # valide (R1 Codex B2)
+        path = self.write(os.path.join(self.spool, "jit-big.b64"),
+                          "a" * (65536 + 1), mode=0o600)
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        self.assertIn("larger than", proc.stdout.read())
+        self.assertNotIn("start", self.events_now())
+        self.assertTrue(os.path.exists(path))
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores the directory mode")
+    def test_a_configuration_that_cannot_be_consumed_starts_nothing(self):
+        # consommer d'abord : si l'unlink échoue, le portier refuse au lieu de
+        # lancer un blob qui resterait déposé et pourrait courir deux fois
+        path = self.deposit()
+        os.chmod(self.spool, 0o555)
+        self.addCleanup(os.chmod, self.spool, 0o755)
+        self.set_gate()
+        proc = self.start()
+        self.assertEqual(proc.wait(timeout=10), 78)
+        self.assertIn("cannot be consumed", proc.stdout.read())
+        self.assertNotIn("start", self.events_now())
+        self.assertTrue(os.path.exists(path))
 
     def test_a_symlinked_configuration_is_left_alone(self):
         # the spool belongs to the guest; a link planted there is never a
@@ -558,6 +620,32 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("nothing deposited", res.stderr)
 
+    def test_deposit_refuses_a_configuration_without_ephemeral(self):
+        # le dépôt refuse la même chose que le portier : une configuration qui
+        # laisserait un runner persistant enregistré sur l'hôte prêté
+        absent = jit_config(files={".runner": json.dumps(
+            {"agentName": "ameesh-nxl-ci-3-1",
+             "gitHubUrl": "https://github.com/manaty/ameesh"}), ".credentials": "{}"})
+        for blob in (jit_config(ephemeral=False), absent):
+            self.prepared(1)
+            self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+            self.deposit_file(1, blob=blob)
+            res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("ephemeral true", res.stderr)
+            self.assertEqual(self.pending(1), [])
+
+    def test_deposit_refuses_a_configuration_without_runner_settings(self):
+        # sans `.runner` il n'y a ni dépôt identifié ni contrat à usage unique
+        # lisible : plus de repli « --runner suffit » (R1 Codex B1)
+        self.prepared(1)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        self.deposit_file(1, blob=jit_config(files={".credentials": "{}"}))
+        res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no .runner", res.stderr)
+        self.assertEqual(self.pending(1), [])
+
     def test_deposit_refuses_an_unsafe_runner_file_name(self):
         # une configuration porte des noms de fichiers écrits dans la racine
         # du runner : un chemin n'y entre jamais
@@ -598,7 +686,10 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("names runner", res.stderr)
         # sans nom dans la configuration, --runner est exigé
-        self.deposit_file(1, blob=jit_config(files={".credentials": "{}"}))
+        self.deposit_file(1, blob=jit_config(files={
+            ".runner": json.dumps({"gitHubUrl": "https://github.com/manaty/ameesh",
+                                   "ephemeral": True}),
+            ".credentials": "{}"}))
         res = self.run_script("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("--runner", res.stderr)
@@ -1158,6 +1249,33 @@ class WorkflowRoutingTest(unittest.TestCase):
             for other, other_spec in (doc.get("jobs") or {}).items():
                 self.assertNotIn(job, other_spec.get("needs", []) or [],
                                  "%s/%s feeds %s" % (name, job, other))
+
+    def test_a_routed_job_can_never_write_the_actions_cache(self):
+        """Le canal du cache (R1 Codex B3) : un job prêté reçoit le jeton
+        d'exécution du run, que `permissions:` ne borne pas ; sans déclaration,
+        un déclencheur de confiance lui donne l'écriture du cache. Or `plan`
+        restaure `carte-*` et les parts psycopg `.venv-ci`, donc une entrée
+        forgée depuis l'hôte prêté atteindrait les checks requis. La parade est
+        `cache-mode`, appliqué par le service de cache : chaque job routé le
+        déclare, et jamais en écriture."""
+        for name, job, spec in self.routed():
+            mode = spec.get("cache-mode")
+            self.assertIn(mode, ("read", "none"),
+                          "%s/%s does not close cache writes (cache-mode %r)"
+                          % (name, job, mode))
+        # le témoin lit aussi les fichiers : `cache-mode` est une clé de job,
+        # pas une variable d'environnement qu'un job pourrait poser lui-même
+        with open(os.path.join(REPO, ".github", "workflows", "tests.yml"),
+                  encoding="utf-8") as fh:
+            tests_src = fh.read()
+        self.assertIn("cache-mode: none", tests_src)
+        with open(os.path.join(REPO, ".github", "workflows", "ui.yml"),
+                  encoding="utf-8") as fh:
+            ui_src = fh.read()
+        self.assertIn("cache-mode: read", ui_src)
+        for src in (tests_src, ui_src):
+            self.assertNotIn("cache-mode: write", src)
+            self.assertNotIn("cache-mode: write-only", src)
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]

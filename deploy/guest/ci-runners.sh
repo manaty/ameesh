@@ -753,10 +753,12 @@ SHIM
 deposit() {
   need_root
   [ -r "$(at "$DEPOSIT")" ] || die "$DEPOSIT is unreadable"
-  local parsed n target digest
+  local parsed n target digest raw_digest
   # validation (python3 -I: no site, no environment): strict base64 of a JSON
-  # object, safe file names, base64 values, and the repository of `.runner`
-  # when it is carried; the digest names the deposit (one file = one job)
+  # object, safe file names, base64 values, and a `.runner` that names the
+  # repository AND declares `ephemeral: true`; the digest names the deposit
+  # (one file = one job), the raw digest proves the published bytes are the
+  # validated ones
   parsed=$(python3 -I - "$(at "$DEPOSIT")" "$REPO_URL" <<'PYJIT'
 import base64, binascii, hashlib, json, re, sys
 
@@ -780,7 +782,8 @@ if not isinstance(doc, dict) or not doc:
     sys.exit("not a non-empty JSON object of runner files")
 files = {}
 for name, value in doc.items():
-    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name):
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", name)
+            or set(name) <= {"."}):
         sys.exit("unsafe runner file name %r" % (name,))
     if not isinstance(value, str):
         sys.exit("runner file %s is not base64 text" % name)
@@ -801,19 +804,29 @@ def normalize(url):
     return "%s://%s/%s" % (scheme.lower(), host.lower(), path)
 
 
-name = ""
-if ".runner" in files:
-    try:
-        settings = json.loads(files[".runner"].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        sys.exit("its .runner is not JSON: %s" % exc)
-    if normalize(settings.get("gitHubUrl")) != normalize(sys.argv[2]):
-        sys.exit("its .runner names %r, not %s" % (settings.get("gitHubUrl"), sys.argv[2]))
-    name = settings.get("agentName") or ""
-print("%s %s" % (hashlib.sha256(text.encode("ascii")).hexdigest()[:16], name))
+# `.runner` is mandatory, and so is `ephemeral: true` inside it: the JIT blob
+# only writes the runner's files (actions/runner v2.338.0 Runner.cs), the
+# single-job path reads `settings.Ephemeral`, and without it GitHub would keep
+# the runner registered — a persistent runner on a lending host, exactly what
+# option A removes (R1 Codex B1, #1256).
+if ".runner" not in files:
+    sys.exit("no .runner: the single-use contract cannot be read")
+try:
+    settings = json.loads(files[".runner"].decode("utf-8"))
+except (UnicodeDecodeError, ValueError) as exc:
+    sys.exit("its .runner is not JSON: %s" % exc)
+if not isinstance(settings, dict) or settings.get("ephemeral") is not True:
+    sys.exit("its .runner does not set ephemeral true: a persistent runner is refused")
+if normalize(settings.get("gitHubUrl")) != normalize(sys.argv[2]):
+    sys.exit("its .runner names %r, not %s" % (settings.get("gitHubUrl"), sys.argv[2]))
+name = settings.get("agentName") or ""
+print("%s %s %s" % (hashlib.sha256(text.encode("ascii")).hexdigest()[:16],
+                    hashlib.sha256(raw).hexdigest(), name))
 PYJIT
 ) || die "$DEPOSIT is not a usable single-use JIT configuration (nothing deposited)"
   digest=${parsed%% *}
+  parsed=${parsed#* }
+  raw_digest=${parsed%% *}
   name=${parsed#* }
   # the configuration names the runner; the slot it belongs to follows, so the
   # job's directory and `_work` match the registration GitHub removes
@@ -836,10 +849,28 @@ PYJIT
     die "$target is already deposited: one configuration is one job, deposit a fresh one"
   fi
   if [ "$DRY" = 1 ]; then
-    printf 'DRY runuser -u %s -- sh -c %s < %s (single-use JIT configuration %s for r%s)\n' \
-      "$GUEST" "'cat >$target'" "$(at "$DEPOSIT")" "$digest" "$n"
+    printf 'DRY runuser -u %s -- sh -c %s < %s > %s (single-use JIT configuration %s for r%s)\n' \
+      "$GUEST" "'umask 077; tmp=\$1.tmp.\$\$; cat >\"\$tmp\" && ln \"\$tmp\" \"\$1\" && rm -f \"\$tmp\"'" \
+      "$(at "$DEPOSIT")" "$(at "$target")" "$digest" "$n"
   else
-    runuser -u "$GUEST" -- sh -c 'umask 077; cat >"$1"' sh "$(at "$target")" <"$(at "$DEPOSIT")"
+    # publication exclusive et atomique : le fichier n'apparaît complet (lien
+    # vers un temporaire du même dossier) que si personne ne l'a déjà déposé ;
+    # un `cat` direct laissait un fichier partiel visible du portier et deux
+    # dépôts concurrents pouvaient s'écraser (R1 Codex B2, #1256)
+    runuser -u "$GUEST" -- sh -c '
+      umask 077
+      tmp=$1.tmp.$$
+      cat >"$tmp" || { rm -f "$tmp"; exit 1; }
+      if ln "$tmp" "$1" 2>/dev/null; then rm -f "$tmp"; else rm -f "$tmp"; exit 1; fi
+    ' sh "$(at "$target")" <"$(at "$DEPOSIT")" \
+      || die "$target is already deposited or unwritable: one configuration is one job, deposit a fresh one"
+    # les octets publiés sont ceux qui ont été validés : une source modifiée
+    # entre la lecture root et la copie invitée est refusée, jamais exécutée
+    published=$(runuser -u "$GUEST" -- sha256sum "$(at "$target")" 2>/dev/null | awk '{print $1}')
+    if [ "$published" != "$raw_digest" ]; then
+      runuser -u "$GUEST" -- rm -f "$(at "$target")" 2>/dev/null || true
+      die "$DEPOSIT changed while being deposited (published digest $published, expected $raw_digest): nothing deposited"
+    fi
   fi
   say "deposited: r$n, one job, then the runner is removed by GitHub (digest $digest)"
   say "next: --enable $n when the guard enforces, then --check"

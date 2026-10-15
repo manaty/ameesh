@@ -127,15 +127,26 @@ sudo deploy/guest/ci-runners.sh --disk-floor-mib 6144 --deposit /root/jit-ci-3-1
 
 `--deposit` reads the source as root, validates it (strict base64 of a JSON
 object; safe file names — never a path; base64 values; `.runner.gitHubUrl`
-normalized equal to `https://github.com/manaty/ameesh` when the
-configuration carries `.runner`), derives the slot from the runner name
-(`ameesh-nxl-<host>-<slot>`; `--runner N` covers a configuration that does
-not carry it), names the deposit by the sha256 of the canonical text (the
-same configuration cannot be deposited twice), and pipes the bytes to
-`/srv/ameesh-guest/ci/jit/rN/` **as the guest** (root writes nothing under
-`$ROOT`, R1 delta B4). One file = one job: GitHub removes the runner once
-the job ends, and the wrapper deletes the local configuration files the
-runner wrote from the blob.
+normalized equal to `https://github.com/manaty/ameesh`; **`.runner` mandatory,
+and `ephemeral: true` inside it**) and publishes it atomically and
+exclusively in `/srv/ameesh-guest/ci/jit/rN/` **as the guest** (a link to a
+private temporary of the same directory, so a concurrent or repeated deposit
+fails instead of overwriting, and no partial file is ever visible to the
+wrapper; root writes nothing under `$ROOT`, R1 delta B4). The digest of the
+**published** bytes is re-read and compared with the validated source: a file
+that changed between the root read and the guest copy is refused, never run.
+
+`ephemeral: true` is not decoration. The JIT blob only writes the files
+(`Runner.cs`, `RunJitConfig`); the one-shot path reads `settings.Ephemeral`,
+and a configuration without it leaves a **persistent** runner registered on
+the lending host — precisely what option A removes (R1 Codex B1, #1256). Both
+sides refuse it: the deposit, and the wrapper that consumes the configuration
+(`--spool`, `validate_config`). The slot follows the runner name in `.runner`
+(`ameesh-nxl-<host>-<slot>`, `--runner N` when the configuration carries no
+name), and the deposit is named by the sha256 of the canonical text (the same
+configuration cannot be deposited twice). One file = one job: GitHub removes
+the runner once the job ends, and the wrapper deletes the local configuration
+files the runner wrote from the blob.
 
 Consequences, accepted and bounded:
 
@@ -179,6 +190,20 @@ convenience:
   workflow files and fails if any routed job enters it, if a routed job or
   workflow holds a write permission, if anything needs a routed job, or if
   a `runs-on` names the borrowed label as a literal.
+* **The Actions cache is a channel too, and `permissions` does not close
+  it** (R1 Codex B3, confirmed by the Claude read). Every job receives the
+  run's runtime token, and with it the cache service; `plan` restores the
+  measured map (`carte-*`, most recent wins) and the psycopg parts restore
+  `.venv-ci`, so a cache entry written from the borrowed host would reach
+  the required checks — a forged map shrinks the required suite, a forged
+  venv can turn a part green. The remedy is `cache-mode`, which the **cache
+  service** enforces on the run's token (an environment variable set by the
+  job itself would prove nothing against a root-equivalent host):
+  `cache-mode: none` on `bilan` (it reads no cache) and `cache-mode: read`
+  on `ui` (setup-node keeps its npm restore, the save is denied). A routed
+  job in any write mode is a defect; the witness fails on one. **At
+  qualification, a real lent run must show the effective scope** (the cache
+  save refused, `§5`), not just the declaration.
 * Today's admissible list is therefore: **`bilan`** (tests.yml,
   `continue-on-error: true`, not in `tests.needs`, consumes the `flux-*`
   artifacts, feeds only the two-week tally of the map) and **`ui`**
@@ -305,7 +330,7 @@ check.
 | 10 | The disk is watched | own directory on the root filesystem (no volume on this VM), `disk_free_min`/`disk_paths` in the offer, `df` floor at prepare (`--disk-floor-mib`; 15 GiB default, 6 GiB qualified on ci-3, §3) | `df -Pk /srv/ameesh-guest`; `--check`; guard state |
 | 11 | The privileged tools are out of the guest's reach | `docker` shim and gate wrapper installed in `/usr/local/lib/ameesh-guest-ci` (root:root); the whole chain is checked (no symlink, root-owned, not group/other-writable) before every `--prepare` and `--remove`; every creation, publication and removal under `/srv/ameesh-guest` runs as `ameesh-guest` | `ls -ld /usr/local/lib/ameesh-guest-ci /usr/local/lib/ameesh-guest-ci/docker`; witness `tests/test_1256_ci_runners.py` (a symlinked tools path, ancestor or tool file is refused; no root mutation names a path under the guest tree; removal goes through `runuser`) |
 | 12 | The application's runner secrets stay out of the guest's read | probed as `ameesh-guest`, never as root: `/home/runner`, then every `.runner`, `.credentials`, `.credentials_rsaparams` and `_work` under it (depth 5) must fail `test -r` | `ci-runners.sh --check` (`runuser -u ameesh-guest -- test -r …`; any readable path is a KO, with the path named); witness `tests/test_1256_ci_runners.py` (unreadable tree accepted, readable `.credentials` refused); qualification §5.7 (R2 #1256 B2) |
-| 13 | A required check can never run here | the guest's label is `ameesh-lent`, distinct from the fleet's `ameesh-ci`; the two routed jobs (`bilan`, `ui`) are outside `tests` and its `needs`, hold no write permission and feed nothing the required path reads | witness `WorkflowRoutingTest` (`tests/test_1256_ci_runners.py`): the required closure is recomputed from `tests.yml`, and any routed job inside it, any write permission on a routed job, or any literal `ameesh-lent` in a `runs-on` fails the test; `--check` prints the label and the deposit count |
+| 13 | A required check can never run here | the guest's label is `ameesh-lent`, distinct from the fleet's `ameesh-ci`; the two routed jobs (`bilan`, `ui`) are outside `tests` and its `needs`, hold no write permission, **declare a non-writing `cache-mode`** and feed nothing the required path reads | witness `WorkflowRoutingTest` (`tests/test_1256_ci_runners.py`): the required closure is recomputed from `tests.yml`, and any routed job inside it, any write permission on a routed job, any routed job without `cache-mode: read`/`none`, or any literal `ameesh-lent` in a `runs-on` fails the test; `--check` prints the label and the deposit count; qualification §5.7 shows the effective cache scope (R1 #1256 B3) |
 | 14 | The borrowed job is bounded to one non-required job | the JIT configuration is consumed (unlinked) by the wrapper before `run.sh` starts, is never reused, and the runner it created is removed by GitHub after that job; the window in which an application job could steal it is one non-required job, with no reusable credential | witness `tests/test_1256_ci_runners.py` (a configuration is handed to `run.sh --jitconfig` exactly once, a second start with an empty spool starts nothing, the local files do not outlive the job); `--check` refuses leftovers |
 
 Residual limits, stated rather than hidden: the guest shares the kernel (a
@@ -374,7 +399,9 @@ runners instead of leaving them running.
    application runners' `.runner`/`.credentials`/`.credentials_rsaparams`
    and their `_work` (`ci-runners.sh --check`; a readable path is a KO, R2
    #1256 B2), the runner gone from `gh api
-   repos/manaty/ameesh/actions/runners` after the job, and the post-job disk
+   repos/manaty/ameesh/actions/runners` after the job, **the effective cache
+   scope of the lent job shown read-only or closed in the job's own log (a
+   refused save, `cache-mode`; R1 #1256 B3)**, and the post-job disk
    check of §6 (free ≥ 6 GiB, no `disk_low` episode); only then the others
    are enabled and left in service.
 
