@@ -2063,7 +2063,7 @@ def _branch_ref_escapes(text: str) -> list[str]:
 
 _RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
 _BRANCH_REF_COMPARED = re.compile(
-    r"startsWith\(github\.(?:base|head)_ref,\s*'[^']*'\)")
+    r"startsWith\(github\.(?:base|head)_ref,\s*'[^',()]*'\)")
 
 
 def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
@@ -2075,6 +2075,10 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     stays an escape. (#1468: the priority pool reads the source and target
     branches of a PR; a PR author can name a branch `integration/...` and pick
     the pool, so the comparison is a priority choice, not a gate bypass.)
+
+    The compared literal is a single argument: dev4's N, a quoted literal that
+    spans arguments of a `format()` (`'…startsWith(github.head_ref, ', …`)
+    must not absolve the interpolated reference that follows.
     """
     line = lines[k]
     col = _key_column(line)
@@ -2193,6 +2197,8 @@ class RunBodiesTest(unittest.TestCase):
         for bare in ("    runs-on: ${{ github.head_ref }}\n",
                      "    runs-on: ${{ format('{0}', github.base_ref) }}\n",
                      "    runs-on: ${{ startsWith(github.head_ref, vars.X) }}\n",
+                     "    runs-on: ${{ format('x{0}startsWith(github.head_ref, ',"
+                     " github.head_ref, ')') }}\n",
                      "    runs-on: \"${{ github.head_ref }}"
                      "\n      run: echo ok\"\n"):
             with self.subTest(bare=bare):
