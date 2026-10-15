@@ -145,6 +145,7 @@ from dataclasses import dataclass, field
 
 from . import canon as canon_mod
 from . import fil
+from . import harnesses
 from . import placement as placement_mod
 from . import receipts, registry, storage
 from . import visibility as visibility_mod
@@ -164,7 +165,11 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
                "visibility_ok", "visibility_diagnostic",
-               "placement_ok", "placement_diagnostic", "placement_ref", "projects")
+               "placement_ok", "placement_diagnostic", "placement_ref", "projects",
+               # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
+               # persistés pour le garde SQL du rôle QA. Le vocabulaire est
+               # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
+               "roles")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -186,6 +191,23 @@ class CanonUnreadable(canon_mod.CanonError):
         self.host = host
         self.diagnostic = diagnostic
         self.findings = findings
+
+
+class CanonStale(canon_mod.CanonError):
+    """Processus plus vieux que le paquet installé (L780) : rien n'est écrit.
+
+    Un exécuteur non redémarré après une livraison porte l'ancien code — dont
+    l'ancien validateur de descripteurs — alors que le paquet sur disque a
+    changé. Ses constats ne valent pas pour le paquet en place : `sync`
+    s'arrête AVANT toute écriture, `canon_state` reste celui du dernier passage
+    valide (les responsables et les placements aussi), et l'appelant demande un
+    redémarrage entre deux tours.
+    """
+
+    def __init__(self, host: str, reason: str):
+        super().__init__("outdated code, canon unchanged: %s" % reason)
+        self.host = host
+        self.reason = reason
 
 
 @dataclass
@@ -1305,7 +1327,7 @@ def _same(row: dict, values: dict) -> bool:
         if key == "budget_usd":
             old = None if old is None else float(old)
             new = None if new is None else float(new)
-        if key in ("capabilities", "projects"):
+        if key in ("capabilities", "projects", "roles"):
             old = None if old is None else list(old)
         if old != new:
             return False
@@ -1337,6 +1359,15 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     """
     if trusted_ref is None:
         trusted_ref = configured_ref(db, canon)
+    # L780 : un processus plus vieux que le paquet installé ne juge pas le
+    # canon — son validateur peut refuser un descripteur neuf légitime
+    # (`codex.json` : `modes` sans `flag`, refusé par l'ancien code). Rien
+    # n'est écrit : `canon_state`, responsables et placements restent au
+    # dernier passage valide, l'hôte se ferme (fail closed) le temps du
+    # redémarrage de l'exécuteur.
+    stale = harnesses.stale_reason()
+    if stale:
+        raise CanonStale(host, stale)
     # L42 (0031) : clé d'état et identité effective de CE canon ; seules ses
     # lignes (colonne `canon`, NULL = canon par défaut) sont lues et écrites
     key = state_key(db, canon, host)
@@ -1367,6 +1398,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     if status != CANON_OK:
         record_state(db, host, status, diagnostic, canon, key=key)
     block = canon_mod.blocking(findings)
+    #: L780 : le canon est invalide POUR CET HÔTE (erreur sans sujet, ou liée à
+    #: sa fiche Host). La réclamation est déjà fermée par `canon_state` : une
+    #: telle erreur ne doit pas détruire le dernier responsable résolu.
+    host_wide = bool(block.global_errors or block.by_host.get(host))
     actions: list[SyncAction] = []
 
     # L31 (0029) : une fiche `Placement` est une ADMISSION (hôtes nommés ou
@@ -1423,7 +1458,18 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # l'agent est (ou devient) de cet hôte : il reçoit les règles
             process_agents.add(name)
         reasons = block.reasons(name, [host])
-        responsible = canon.resolve_human(agent.responsible) if not reasons else None
+        # L780 (R14) : une erreur PROPRE à l'agent vide son responsable — sa
+        # fiche ne le confirme plus. Une erreur d'hôte ou sans sujet, elle,
+        # ferme déjà toute réclamation par `canon_state` (fail closed) et ne
+        # détruit pas le dernier responsable résolu (`keep last_good`) :
+        # l'attribution d'un lot reste ouverte (L46), et la réparation du canon
+        # rend les agents réclamables sans réécriture manuelle.
+        if block.by_agent.get(name):
+            responsible = None
+        elif host_wide:
+            responsible = row["responsible"] if row is not None else None
+        else:
+            responsible = canon.resolve_human(agent.responsible)
         verdict = placement_mod.evaluate(canon, name, host)
         # L31 (0029) : règle de visibilité, repliée dans le verdict de placement
         # (fail closed ; sans dépôt de mémoire, sans objet).
@@ -1451,6 +1497,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # stays the primary one for the readers of a single project
             "team": agent.team,
             "projects": agent.effective_projects,
+            # L244 (#420): les rôles déclarés, vocable des fiches (L242c, #414),
+            # pour que le garde SQL du verdict QA les lise au registre.
+            "roles": agent.roles,
             "provider": agent.provider,
             "credential_mode": admission.credential_mode or agent.credential_mode,
             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute
@@ -1530,8 +1579,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if unverifiable:
             # Fiche invérifiable : ni arrêté (le retrait n'est pas constaté), ni
             # réclamable (son responsable n'est plus confirmé par le canon, son
-            # placement non plus).
-            _clear_responsible(db, name, host, owner)
+            # placement non plus). L780 : seul un membre NON LU, dont la fiche
+            # n'est pas confirmée, vide le responsable ; un canon globalement
+            # invalide garde le dernier responsable résolu (keep last_good) —
+            # `canon_state` ferme déjà la réclamation.
+            if member not in loaded:
+                _clear_responsible(db, name, host, owner)
             verdict = placement_mod.Verdict(
                 name, host, False, "unverifiable placement: %s" % unverifiable,
                 row.get("placement_ref"))

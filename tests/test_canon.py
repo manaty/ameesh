@@ -18,7 +18,7 @@ from unittest import mock
 from ameesh import canon, canon_sync, config as config_mod, db as db_mod, fil, receipts, registry
 from ameesh import runner as runner_mod
 
-from .support import REPO, PgTestCase
+from .support import EMPTY_CONFIG, REPO, PgTestCase
 from .webauthn_soft import SoftWebAuthn
 
 EXAMPLE = os.path.join(REPO, "examples", "canon")
@@ -841,7 +841,13 @@ class SyncTest(_CanonDbCase):
         report = self.sync()
         self.assertEqual(self.actions(report)["orchestre"], "laissé")
         self.assertEqual(self.row("orchestre")["status"], "idle")
-        self.assertIsNone(self.row("relecteur")["responsible"])
+        # L780 : une erreur globale (ici une fiche illisible, sans sujet) ne vide
+        # plus le dernier responsable RÉSOLU (« keep last_good ») — c'est ce
+        # vidage qui, le 13/10, a fait refuser les agents de l'hôte (« has no
+        # human owner »). La réclamation reste fermée par `canon_state` (§4.1 :
+        # le canon n'est pas `ok`), donc l'assertion suivante tient toujours ;
+        # la réparation du canon rouvre l'attribution sans réécriture manuelle.
+        self.assertEqual(self.row("relecteur")["responsible"], "human:alice")
         self.assertEqual(registry.claimable(self.db, "atelier", require_responsible=True), [])
 
     def test_deplacement_vers_un_autre_hote(self):
@@ -1178,8 +1184,7 @@ class ClaimRuleTest(_TmpMixin, PgTestCase):
         self.assertFalse(overview["sans"]["responsible_ok"])
 
     def test_defaut_suit_le_canon(self):
-        absent = os.path.join(self.make_tmp(), "absent.json")
-        base = {"AMEESH_CONFIG": absent, "AGENT_MESH_CONFIG": absent}
+        base = {"AMEESH_CONFIG": EMPTY_CONFIG, "AGENT_MESH_CONFIG": EMPTY_CONFIG}
         load = lambda **kw: config_mod.load(env={**base, **kw})  # noqa: E731
         self.assertFalse(load().responsible_required)
         self.assertTrue(load(AMEESH_CANON="/x").responsible_required)

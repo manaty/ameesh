@@ -99,7 +99,9 @@ sont plus posées : le choix par retard sur le rythme les remplace.
 """
 from __future__ import annotations
 
+import math
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass, field
@@ -107,6 +109,9 @@ from typing import Callable
 
 from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
+
+#: #1469: a billing account id (`openai-manaty`), the same on every host
+BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
@@ -195,6 +200,17 @@ class Profile:
     overage: str = "auto"
     overage_cap: float = OVERAGE_CAP
     short_window_cap: float | None = None
+    #: #1075: multiplies the elapsed share of the pace cap (1.0 = nominal
+    #: pace). Configured per account in the host's `accounts` key; there is no
+    #: implicit value, neither by name nor by default folder.
+    pace_multiplier: float = 1.0
+    #: #1469: the provider billing account this profile spends from, shared by
+    #: every key, profile name, agent and host that bills it (`account_budget`);
+    #: empty = no daily account envelope applies
+    billing_account: str = ""
+    #: #1469: dollars reserved before each turn on that billing account (the
+    #: bound of one turn), settled at the real cost when the turn ends
+    reserve_usd: float = 2.0
 
     @property
     def default(self) -> bool:
@@ -237,6 +253,27 @@ class Profile:
 
 def _expand(path: str) -> str:
     return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def _pace_multiplier(harness: str, name: str, value) -> float:
+    """`pace_multiplier` d'un profil compte (#1075), validé strictement.
+
+    Absent : 1.0 (rythme nominal) — aucun défaut implicite selon le harnais,
+    le nom ou le dossier. Présent : un nombre fini strictement positif.
+    """
+    if value is None:
+        return 1.0
+    if isinstance(value, bool):
+        raise AccountError("account %s/%s: pace_multiplier must be a finite number > 0"
+                           % (harness, name))
+    try:
+        multiplier = float(value)
+    except (TypeError, ValueError):
+        raise AccountError("account %s/%s: unreadable pace_multiplier" % (harness, name))
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise AccountError("account %s/%s: pace_multiplier must be a finite number > 0"
+                           % (harness, name))
+    return multiplier
 
 
 def parse(raw) -> dict[str, list[Profile]]:
@@ -302,6 +339,18 @@ def parse(raw) -> dict[str, list[Profile]]:
                                          or not isinstance(priority, int)):
                 raise AccountError("account %s/%s: priority must be an integer"
                                    % (harness, name))
+            pace_multiplier = _pace_multiplier(harness, name, item.get("pace_multiplier"))
+            billing = str(item.get("billing_account") or "")
+            if billing and not BILLING_RE.match(billing):
+                raise AccountError("account %s/%s: invalid billing_account %r"
+                                   % (harness, name, billing))
+            try:
+                reserve = float(item.get("reserve_usd", 2.0))
+            except (TypeError, ValueError):
+                raise AccountError("account %s/%s: unreadable reserve_usd" % (harness, name))
+            if not reserve > 0 or reserve == float("inf"):
+                raise AccountError("account %s/%s: reserve_usd must be positive"
+                                   % (harness, name))
             overage = str(item.get("overage") or "auto")
             if overage not in OVERAGE_MODES:
                 raise AccountError("account %s/%s: overage must be one of %s"
@@ -335,6 +384,8 @@ def parse(raw) -> dict[str, list[Profile]]:
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
+                pace_multiplier=pace_multiplier,
+                billing_account=billing, reserve_usd=reserve,
             ))
         out[harness] = profiles
     return out
@@ -541,7 +592,9 @@ class Evaluation:
     profile: Profile
     reason: str = ""                     #: '' = sous le seuil
     gauges: list = field(default_factory=list)
-    until: float | None = None           #: remise à zéro attendue si au seuil
+    until: float | None = None           #: heure de libération si au seuil
+                                         #: (#777) : croisement du rythme ou
+                                         #: remise à zéro (#898)
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
@@ -632,14 +685,23 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
     non-critical agent): the pace cap, or the short window cap that replaces
-    it, is lowered by `RESERVE`, and never exceeds the pace cap minus
-    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered.
+    it, is lowered by `RESERVE` —
+    `max(min(PACE_CEILING, multiplier × elapsed + PACE_MARGIN) − RESERVE,
+    PACE_MARGIN)` — and the fixed caps are not lowered. #777 : tant que
+    `multiplier × elapsed ≤ RESERVE` (soit `≤ PACE_MARGIN` quand la réserve
+    vaut la marge) la réserve ne s'applique pas, le plafond de rythme y vaut
+    la marge (10 points) et non `multiplier × écoulé + marge − RESERVE` — à
+    8 % d'écoulé avec `multiplier = 2` il vaut 16 % (#1028 P3) ; l'énoncé de
+    la décision du propriétaire (« plafond = max(écoulé, marge) ») décrit ce
+    début de fenêtre. En fin de fenêtre le seuil vaut
+    `PACE_CEILING − RESERVE` (80 %), il ne suit plus `max(écoulé, marge)`
+    (#1028 N1).
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
     out = {}
     for gauge in gauges:
-        pace = (max(0.0, gauge.pace_cap(now) - cut), "pace cap")
+        pace = (gauge.held_cap(now, cut, profile.pace_multiplier), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
             if reserve:
@@ -650,6 +712,40 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
             base = pace
         out[gauge.key] = min([base, *fixed], key=lambda pair: pair[0])
     return out
+
+
+def _release(profile: Profile, depasses, hard, now: float,
+             cut: float) -> tuple[float | None, object | None]:
+    """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
+
+    Ne se rattrapent pas par l'écoulé, et attendent donc leur remise à zéro :
+    un plafond fixe (`hard`), et le plafond court du compte
+    (`short_window_cap`, abaissé de `cut` comme dans `limits`). Une fenêtre
+    tenue par le rythme seul se libère quand l'écoulé rejoint l'usage
+    (`Gauge.free_at`, #777). `(None, None)` si l'une des fenêtres qui bloquent
+    n'est pas datée : aucune heure annoncée (#373 r2).
+
+    Le plafond court se teste sur l'usage, pas sur le libellé de `limits` :
+    sous réserve, le plafond de rythme est souvent le plus bas à l'instant du
+    relevé (il porte alors le libellé « pace cap »), mais il ne rattrape
+    jamais un usage au-dessus du plafond court — voir #777 r2, un compte
+    `short_window_cap` 0,75 à 70 % d'usage avec 30 % d'écoulé.
+    """
+    dated = []
+    for gauge in depasses:
+        if not gauge.resets_at:
+            return None, None
+        short = (profile.short_window_cap is not None
+                 and gauge.window_s <= SHORT_WINDOW_S)
+        if any(gauge is held for held, _ in hard) or (
+                short and gauge.used_at(now) >= max(0.0, profile.short_window_cap - cut)):
+            free = float(gauge.resets_at)
+        else:
+            free = gauge.free_at(now, cut, profile.pace_multiplier)
+            if free is None:
+                return None, None
+        dated.append((free, gauge))
+    return max(dated, key=lambda pair: pair[0])
 
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
@@ -706,12 +802,12 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
                 profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
         if reserve and not hard:
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
-        resets = [g.resets_at for g in depasses if g.resets_at]
-        result.until = max(resets) if len(resets) == len(depasses) else None
-        if result.until is not None:
-            # #373 r2 : la pause affichée est celle de la fenêtre qui bloque
-            # le plus longtemps
-            late = max(depasses, key=lambda g: float(g.resets_at))
+        # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
+        # plus longtemps ; #777, #898 : à l'heure où elle libère vraiment —
+        # croisement du rythme, ou remise à zéro quand il ne rattrape plus.
+        result.until, late = _release(profile, depasses, hard, now,
+                                      RESERVE if reserve else 0.0)
+        if late is not None:
             result.held = (late.key, late.used)
         return result
     if profile.hourly_usd > 0 and book.db is not None:
@@ -838,7 +934,8 @@ def explain(result: Evaluation, now: float) -> str:
         return "no reading: 0% used"
     if all(g.reset_passed(now) for g in result.gauges):
         return "stale reading (window reset): 0% used"
-    cap, label = result.limits.get(gauge.key) or (gauge.pace_cap(now), "pace cap")
+    cap, label = result.limits.get(gauge.key) or (
+        gauge.pace_cap(now, result.profile.pace_multiplier), "pace cap")
     bound = ("pace %.0f%%" % (cap * 100)) if label == "pace cap" \
         else "%s %.0f%%" % (label, cap * 100)
     if not gauge.resets_at:
@@ -1162,6 +1259,9 @@ def report(cfg, db, book, *, now: float | None = None,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
+                # #1075/#1028 : le rythme du compte, pour les affichages qui
+                # lisent ses jauges hors d'`evaluate` (cost.report, progress)
+                "pace_multiplier": profile.pace_multiplier,
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
                 "overage": _overage_row(profile, result.gauges, now),
@@ -1169,7 +1269,8 @@ def report(cfg, db, book, *, now: float | None = None,
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
                     # relevé reste lisible (`last_used`)
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
-                     "cap": (result.limits.get(g.key) or (g.pace_cap(now),))[0],
+                     "cap": (result.limits.get(g.key)
+                             or (g.pace_cap(now, result.profile.pace_multiplier),))[0],
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
                      "reset_passed": g.reset_passed(now)}
                     for g in result.gauges

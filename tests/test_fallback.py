@@ -25,7 +25,7 @@ class FallbackTest(PgTestCase):
         proc = self.cli("send", "beta", "via les fichiers",
                         env=self.env_bad(AGENT_MAIL_NAME="alpha"))
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertEqual(proc.stdout.strip(), "delivered to beta")
         self.assertIn("falling back to files", proc.stderr)
         self.assertIn(UNREACHABLE.split("@")[1], proc.stderr)  # le DSN est montré
         fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
@@ -105,7 +105,7 @@ class FallbackTest(PgTestCase):
         proc = self.cli("send", "beta", "message signé", "--sign", "--key", private,
                         env=self.env_bad(AGENT_MAIL_NAME="proprietaire"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("dropped for: beta", proc.stdout)
+        self.assertIn("delivered to beta", proc.stdout)
         self.assertIn("the signature is not kept", proc.stderr)
         fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         self.assertEqual(len(fichiers), 1)
@@ -113,7 +113,7 @@ class FallbackTest(PgTestCase):
     def test_backend_pg_force_echoue_sans_repli(self):
         proc = self.cli("send", "beta", "non", env=self.env_bad(AMEESH_BACKEND="pg"))
         self.assertEqual(proc.returncode, 1)
-        self.assertNotIn("dropped for", proc.stdout)
+        self.assertNotIn("delivered to", proc.stdout)
         self.assertIn("error", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.v0state, "inbox", "beta")))
 
@@ -124,7 +124,7 @@ class FallbackTest(PgTestCase):
             proc = self.cli("send", "beta", "non", env=self.env(AMEESH_SCHEMA=schema))
             self.assertEqual(proc.returncode, 1)
             self.assertIn("migrate", proc.stderr)
-            self.assertNotIn("dropped for", proc.stdout)
+            self.assertNotIn("delivered to", proc.stdout)
         finally:
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
 
