@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import re
 from urllib.parse import quote
 
-from . import land
+from . import land, resolutions
 from .train import TrainError
 
 
@@ -44,6 +44,32 @@ class Workflow:
                 raise ValueError("full audited source blob expected")
 
 
+def audited_sources(workflows):
+    if not workflows:
+        raise TrainError("complete audited CI contract required")
+    sources = {}
+    for workflow in workflows:
+        for path, blob in workflow.sources:
+            if path in sources and sources[path] != blob:
+                raise TrainError("conflicting audited CI source contracts")
+            sources[path] = blob
+    return sources
+
+
+def verify_local(path, plan, workflows):
+    """Check commit objects before a publication can trigger push CI.
+
+    The worktree and remote default branch are not execution evidence for
+    this commit. Check the object type too: a symlink is not a workflow file.
+    """
+    for source, blob in sorted(audited_sources(workflows).items()):
+        proc = resolutions._run(path, "ls-tree", plan["head"], "--", source)
+        fields = resolutions._text(proc).strip().split()
+        if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
+                or fields[1:] != ["blob", blob, source]:
+            raise TrainError("full-suite source differs from audited CI contract: %s" % source)
+
+
 class GitHub:
     def __init__(self, slug: str, workflows: tuple[Workflow, ...], *, gh=land._gh):
         from . import radar
@@ -66,13 +92,7 @@ class GitHub:
         conditional cannot be covered by the old list of green job names.
         This is read-only and performed before dispatch and before using CI.
         """
-        sources = {}
-        for workflow in self.workflows:
-            for path, blob in workflow.sources:
-                if path in sources and sources[path] != blob:
-                    raise TrainError("conflicting audited CI source contracts")
-                sources[path] = blob
-        for path, blob in sorted(sources.items()):
+        for path, blob in sorted(audited_sources(self.workflows).items()):
             pages = self._api("contents/%s?ref=%s" % (quote(path, safe="/"), plan["head"]))
             if len(pages) != 1 or not isinstance(pages[0], dict) \
                     or pages[0].get("type") != "file" or pages[0].get("sha") != blob:

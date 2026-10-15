@@ -11,7 +11,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import land, merge_queue, radar, resolutions, train, train_git
+from ameesh import land, merge_queue, radar, resolutions, train, train_ci, train_git
 
 from .test_l160e2_land import _Land
 from .test_l160b_radar import _git
@@ -362,6 +362,21 @@ class TrainTest(unittest.TestCase):
 class TrainGitTest(_Land):
     def setUp(self):
         super().setUp()
+        path = ".github/workflows/tests.yml"
+        os.makedirs(os.path.join(self.repo, ".github/workflows"))
+        with open(os.path.join(self.repo, path), "w") as fh:
+            fh.write("audited test workflow\n")
+        script = "planner.py"
+        with open(os.path.join(self.repo, script), "w") as fh:
+            fh.write("audited executable planner\n")
+        os.chmod(os.path.join(self.repo, script), 0o755)
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "add", path, script)
+        _git(self.repo, "commit", "-qm", "test CI contract")
+        _git(self.repo, "push", "-q", "origin", "main")
+        blob = _git(self.repo, "rev-parse", "main:" + path)
+        self.workflows = (train_ci.Workflow(path, ("suite",), sources=(
+            (path, blob), (script, _git(self.repo, "rev-parse", "main:" + script)))),)
         self.clone = resolutions.Replayer(self.repo, os.path.join(self.tmp, "train.clone"))
         self.repository = train_git.Repository(self.project, self.clone)
 
@@ -376,7 +391,7 @@ class TrainGitTest(_Land):
         plan = self.plan()
         self.assertEqual(self.repository.compose("main", plan["base"], plan["members"]),
                          {k: plan[k] for k in ("head", "tree")})
-        self.repository.publish(plan, key="p:main", epoch=1, owner="one")
+        self.repository.publish(plan, key="p:main", epoch=1, owner="one", workflows=self.workflows)
         self.assertEqual(_git(self.origin, "rev-parse", "main"), plan["base"])
         self.assertEqual(_git(self.origin, "rev-parse", plan["branch"]), plan["head"])
         self.repository.promote(plan, key="p:main", epoch=1, owner="one")
@@ -385,13 +400,36 @@ class TrainGitTest(_Land):
 
     def test_moved_train_ref_and_older_epoch_never_promote(self):
         plan = self.plan()
-        self.repository.publish(plan, key="p:main", epoch=2, owner="two")
+        self.repository.publish(plan, key="p:main", epoch=2, owner="two", workflows=self.workflows)
         with self.assertRaises(land._LeaseRefused):
             self.repository.promote(plan, key="p:main", epoch=1, owner="one")
         _git(self.origin, "update-ref", "refs/heads/" + plan["branch"], plan["base"])
         with self.assertRaisesRegex(train.TrainError, "ref moved"):
             self.repository.promote(plan, key="p:main", epoch=2, owner="two")
         self.assertEqual(_git(self.origin, "rev-parse", "main"), plan["base"])
+
+    def test_stale_or_missing_ci_contract_refuses_before_any_remote_write(self):
+        plan = self.plan()
+        stale = dataclasses.replace(self.workflows[0], sources=((self.workflows[0].path, "f" * 40),))
+        for contract in ((), (stale,)):
+            with self.subTest(contract=contract), self.assertRaises(train.TrainError):
+                self.repository.publish(plan, key="p:main", epoch=1, owner="one",
+                                        workflows=contract)
+            self.assertEqual(_git(self.origin, "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/integration/", self.project.lease_ref), "")
+
+    def test_symlink_with_audited_blob_is_not_an_executable_ci_source(self):
+        plan = self.plan()
+        path, blob = self.workflows[0].sources[0]
+        _git(self.clone.path, "read-tree", plan["head"])
+        _git(self.clone.path, "update-index", "--cacheinfo", "120000", blob, path)
+        tree = _git(self.clone.path, "write-tree")
+        head = _git(self.clone.path, "commit-tree", tree, "-p", plan["head"], "-m", "symlink")
+        with self.assertRaisesRegex(train.TrainError, "full-suite source differs"):
+            self.repository.publish(dict(plan, head=head, tree=tree), key="p:main", epoch=1,
+                                    owner="one", workflows=self.workflows)
+        self.assertEqual(_git(self.origin, "for-each-ref", "--format=%(refname)",
+                              "refs/heads/integration/", self.project.lease_ref), "")
 
     def test_protected_target_refuses_before_publication(self):
         project = dataclasses.replace(self.project, protected=("main",))

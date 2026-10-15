@@ -171,7 +171,7 @@ class Engine:
             if other is None or identity(other) != identity(row):
                 raise TrainError("member withdrawn, refrozen or requeued")
         proof = self.ports.qualify(plan["members"], plan["base"], self.policy.ci_mode)
-        if proof != plan["proof"]:
+        if digest(proof) != digest(plan["proof"]):
             raise TrainError("admission evidence changed: recompose and fire again")
 
     def _ci(self, state):

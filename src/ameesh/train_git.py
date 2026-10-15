@@ -10,7 +10,7 @@ import json
 import os
 import subprocess
 
-from . import land, merge_queue, plan_git, radar, resolutions
+from . import land, merge_queue, plan_git, radar, resolutions, train_ci
 from .canon import FETCH_TIMEOUT
 from .train import TrainError, identity
 
@@ -38,19 +38,23 @@ class Repository:
         self.clone.ensure()
         return land.fresh_target(self.clone, self.project, target)
 
+    def check_members(self, target, rows):
+        branch = self._guard(target)
+        if not rows or any(r["source"] != self.source or
+                           merge_queue._remote_branch(r["target"]) != branch for r in rows):
+            raise TrainError("train members belong to another source or target")
+        tips, _ = merge_queue.fetch_fresh(self.project.repo, [r["branch"] for r in rows],
+                                         self.clone)
+        if any(tips.get(r["branch"]) != r["frozen_sha"] for r in rows):
+            raise TrainError("member moved beyond its exact freeze")
+
     def compose(self, target, base, rows, nonce=""):
         branch = self._guard(target)
         if not rows or self.target(branch) != base:
             raise TrainError("composition requires members and the exact current base")
-        if any(r["source"] != self.source or
-               merge_queue._remote_branch(r["target"]) != branch for r in rows):
-            raise TrainError("train members belong to another source or target")
-        tips, _ = merge_queue.fetch_fresh(self.project.repo, [r["branch"] for r in rows],
-                                         self.clone)
+        self.check_members(branch, rows)
         head = base
         for row in rows:
-            if tips.get(row["branch"]) != row["frozen_sha"]:
-                raise TrainError("member moved beyond its exact freeze")
             merged = land.merge(self.clone, head, row, [],
                                 generated=getattr(self.project, "generated", ()))
             if merged["state"] != "clean":
@@ -123,7 +127,11 @@ class Repository:
         rows = resolutions._text(proc).split()
         return rows[0] if rows else ""
 
-    def publish(self, plan, *, key, epoch, owner):
+    def publish(self, plan, *, key, epoch, owner, workflows):
+        # Publication itself triggers push workflows. Reject a known stale
+        # contract locally, before even updating the remote lease reference.
+        self._validate(plan)
+        train_ci.verify_local(self.clone.path, plan, workflows)
         branch, ref, url, lease_ref, mine = self._lease(plan, key, epoch, owner)
         if self._read(url, "refs/heads/" + branch) != plan["base"]:
             raise TrainError("target changed before train publication")

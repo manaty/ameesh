@@ -150,10 +150,30 @@ vivant, si une lecture fraîche prouve la cible sur le commit exact du train.
 Une cible encore sur la base ne suffit pas à prouver l'absence d'un push en
 vol : l'intention reste incertaine. Une cible divergente exige inspection.
 Le moteur ne déclare pas `landed` sans reçu réconcilié sur le plan et l'ID
-du feu exacts. Les raccords de ces validations et de la lecture distante
-restent à faire dans l'adaptateur runtime. Le raccord doit
-aussi empêcher la voie de feu direct de #1374 de contourner la réservation
-du paquet. Aucun CLI, branchement du runner ni profil actif n'est ajouté.
+du feu exacts. `train_runtime.Runtime` raccorde ces validations et la lecture
+distante aux reçus persistants. Son fournisseur d'admissions est obligatoire :
+il doit livrer les faits complets de la file, les dépendances, les preuves
+historiques et les exclusions sous bail. Le constructeur exige le même bail
+dans tous les adaptateurs et le même dépôt dans le contrat CI ; il ne fournit
+aucune politique de qualification implicite.
+
+Après réservation du feu, Runtime relit la cible distante, les générations
+de la file, les prérequis ouverts et leur ordre, les branches sources
+réellement fetchées, les preuves historiques et la CI complète courante.
+Un défaut à cet instant conserve l'intention
+incertaine et interdit le push. La reprise passe uniquement par la lecture
+fraîche de cible et `Fires.reconcile`, sous le nouveau bail. La comparaison
+des preuves dans le moteur respecte leur passage par JSON (tuples en mémoire,
+tableaux persistés) sans accepter une preuve différente.
+
+Le raccord doit encore empêcher la voie de feu direct de #1374 de contourner
+la réservation du paquet. Lecture de `979f2e2b` : `fire._lock` prend seulement
+`fire:<lot>` ; `_merge_direct` ne prend pas le bail cible de `land.lock_key`.
+Ce bail par lot ne sérialise donc pas une fusion directe avec le train.
+Mesh-design demande le 15 octobre à 04:46 à l'auteur de #1374 de coordonner
+le bail cible commun, l'ordre de prise et un témoin train/direct. Ce code
+n'est pas encore intégré à cette branche. Aucun CLI, branchement du runner
+ni profil actif n'est ajouté.
 
 Source du travail indépendant : mesh-design, message #45970 du 15 octobre
 à 04:06 et note du registre #1467 à 04:06, précisant que le hold ne concerne
@@ -169,9 +189,12 @@ Sur ameesh, `train_contracts.ameesh()` décrit le contrat vérifié sur
 psql, `plateforme macOS` et `tests`. Aucun dispatch supplémentaire. Les blobs
 de `tests.yml`, `test-plan.py`, `test-parts.py`, `ci-flow.py` et `map.py` sont
 liés à ce contrat. Leur modification exige un nouveau contrat audité ; elle
-ne peut hériter des anciens noms de jobs. Le futur adaptateur doit vérifier
-ces sources dans le clone avant publication aussi, pour ne pas lancer un
-push CI dont il sait déjà le contrat périmé.
+ne peut hériter des anciens noms de jobs. `Repository.publish` exige ce
+contrat et vérifie les blobs dans le commit local avant tout geste distant,
+y compris la prise du bail Git. Un fichier absent, modifié ou remplacé par
+un lien symbolique refuse la publication. Les planificateurs exécutables
+restent acceptés. Le push ne lance donc pas une CI dont le contrat est déjà
+connu comme périmé.
 
 Sur Nexlink, aucun push `integration/**` ne déclenche les suites. La lecture
 fichier par fichier sur `develop@ddbe5c9f073b60d218da0414688188899da3b544`
@@ -239,9 +262,9 @@ historique des retraits, ancien reçu, intention préalable, bail périmé,
 course retrait/réservation, crash entre réservation et push, push réussi
 dont la réponse est perdue, reprise sous un nouveau bail et absence de rejeu. Les
 raccords encore nécessaires avant gel sont le fournisseur exact #1465, le
-contrat Nexlink #1470, la vérification locale des sources CI avant push et
-l'adaptateur runtime (validation avant promotion, réconciliation des reçus,
-coordination avec #1374). Les revues et validations requises restent à
+contrat Nexlink #1470 et la coordination du bail cible avec #1374. Les
+validations avant promotion, la réconciliation et le contrôle local des
+sources CI sont implémentés dans les adaptateurs. Les revues requises restent à
 obtenir ; cette préparation ne vaut pas autorisation d'activer le train.
 
 Passe feu/reprise : treize scénarios SQL du feu et trois du stockage sont
@@ -250,3 +273,14 @@ moteur/Git/CI/historique et le contrat API sont verts (63 à la première
 passe, puis revalidation du moteur et ajout du refus de réconciliation sans
 reçu exact). Le diff est propre. Aucune suite complète ni CI distante n'a
 été lancée ; le lot reste `build`, non gelé.
+
+Passe adaptateur : 79 tests ciblés moteur/Git/CI/feu/stockage/contrat API
+verts sous psycopg, puis les onze témoins runtime finaux verts sous les deux
+pilotes. La passe psql couvre aussi les six témoins Git (dont refus avant
+écriture distante pour contrat périmé et lien symbolique) et les seize
+témoins feu/stockage. Les cinq sources CI du contrat ameesh correspondent
+aux objets de cette branche, planificateurs exécutables compris. Retrait,
+regel/réadmission, déplacement d'une branche source, nouveau prérequis,
+nouvelle tentative CI et réponse de push perdue sont éprouvés à travers
+Runtime et les reçus SQL réels. Les raccords externes et le runner restent
+à compléter avant gel et activation.
