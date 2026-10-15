@@ -54,10 +54,76 @@ CONFIG_NAME = "github-identities.json"
 ENV_REAL = "AMEESH_GH_REAL"
 ENV_JOURNAL = "AMEESH_GH_JOURNAL"
 ENV_ROLE = "AMEESH_GH_ROLE"
-#: un argument plus long est tronqué dans le journal (corps de PR, requêtes)
-ARG_MAX = 200
-#: jetons GitHub reconnaissables, jamais écrits dans le journal
-TOKEN_RE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")
+#: le filtre du journal, partagé par le `gh` généré (qui l'embarque) et par
+#: ce module (`sanitize_argv`). Liste blanche : ne sont consignés que la
+#: sous-commande, les noms d'options et les identifiants (numéros, SHA,
+#: branches, dépôts, chemins d'API sans requête). Toute valeur libre (corps,
+#: titre, en-tête, `-f clé=valeur`, `--body` d'un secret) devient `[valeur]`,
+#: et un jeton reconnaissable `[jeton]`, quelle que soit sa longueur : rien
+#: n'est tronqué, donc rien n'est masqué à moitié.
+SANITIZE = r"""
+_JETON = re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}")
+_IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#:@+-]{0,99}")
+#: options dont la valeur, si c'est un identifiant, est consignée
+_SURES = frozenset((
+    "--repo", "-R", "--branch", "--head", "--base", "-B", "--match-head-commit",
+    "--label", "--add-label", "--remove-label", "--workflow", "--json",
+    "--method", "-X", "--state", "--limit", "-L", "--status", "--event",
+    "--user", "--commit", "--ref", "--job", "--attempt", "--author",
+    "--assignee", "--milestone", "--hostname", "--org", "--env", "--name"))
+#: options sans valeur : l'argument suivant n'est pas leur valeur
+_BOOLS = frozenset((
+    "--auto", "--squash", "--merge", "--rebase", "--delete-branch", "-d",
+    "--admin", "--disable-auto", "--draft", "--web", "--yes", "-y", "--force",
+    "--paginate", "--silent", "--include", "-i", "--verbose", "--exit-status",
+    "--failed", "--log", "--log-failed", "--watch", "--fill", "--help", "-h"))
+
+
+def _valeur(v):
+    if _JETON.search(v):
+        return "[jeton]"
+    return v if _IDENT.fullmatch(v) else "[valeur]"
+
+
+def _positionnel(a):
+    chemin, q, _ = a.partition("?")
+    v = _valeur(chemin)
+    return v + "?[valeur]" if q and v == chemin else v
+
+
+def sanitize_argv(argv):
+    out, attente = [], None
+    for a in argv:
+        if attente is not None and not a.startswith("-"):
+            out.append(_valeur(a) if attente in _SURES else "[valeur]")
+            attente = None
+            continue
+        attente = None
+        if a == "--" or a == "-" or not a.startswith("-"):
+            out.append(a if a in ("--", "-") else _positionnel(a))
+        elif a.startswith("--"):
+            nom, egal, v = a.partition("=")
+            if not _IDENT.fullmatch(nom[2:]) or _JETON.search(nom):
+                out.append("--[option]")
+            elif egal:
+                out.append(nom + "=" + (_valeur(v) if nom in _SURES else "[valeur]"))
+            else:
+                out.append(nom)
+                attente = None if nom in _BOOLS else nom
+        else:
+            nom, reste = a[:2], a[2:]
+            if not _IDENT.fullmatch(nom[1:]):
+                out.append("-[option]")
+            elif reste:
+                out.append(nom + (_valeur(reste) if nom in _SURES else "[valeur]"))
+            else:
+                out.append(nom)
+                attente = None if nom in _BOOLS else nom
+    return out
+"""
+_ns: dict = {"re": re}
+exec(SANITIZE, _ns)  # noqa: S102 — source constante de ce module
+sanitize_argv = _ns["sanitize_argv"]
 
 #: le `gh` généré. Volontairement autonome (bibliothèque standard seule) : il
 #: tourne sous l'interpréteur de l'exécuteur, sans importer ameesh.
@@ -65,6 +131,7 @@ SHIM = r'''#!{python}
 # ameesh #1645 : journal des gestes gh. Fichier généré par l'exécuteur, ne pas
 # éditer ; il est réécrit à chaque tour.
 import json, os, re, sys, time
+{sanitize}
 real = os.environ.get("{real}", "")
 if not real or not os.access(real, os.X_OK):
     sys.stderr.write("ameesh: vrai gh introuvable ({real}=%r)\n" % real)
@@ -72,9 +139,6 @@ if not real or not os.access(real, os.X_OK):
 journal = os.environ.get("{journal}", "")
 if journal:
     try:
-        tok = re.compile(r"{token_re}")
-        args = [tok.sub("[jeton]", a if len(a) <= {arg_max} else a[:{arg_max}] + "…")
-                for a in sys.argv[1:]]
         line = json.dumps({{
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "agent": os.environ.get("AGENT_MAIL_NAME", ""),
@@ -83,7 +147,7 @@ if journal:
             "role": os.environ.get("{role}", ""),
             "host": os.environ.get("AMEESH_HOST", ""),
             "pid": os.getpid(), "ppid": os.getppid(),
-            "cwd": os.getcwd(), "argv": args}}, ensure_ascii=False)
+            "cwd": os.getcwd(), "argv": sanitize_argv(sys.argv[1:])}}, ensure_ascii=False)
         path = time.strftime(journal)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
@@ -92,7 +156,11 @@ if journal:
         finally:
             os.close(fd)
     except Exception as exc:  # le journal ne bloque jamais la commande
-        sys.stderr.write("ameesh: journal gh non écrit (%s)\n" % exc)
+        try:  # stderr peut être fermé : l'avertissement non plus
+            sys.stderr.write("ameesh: journal gh non écrit (%s)\n" % exc)
+            sys.stderr.flush()
+        except Exception:
+            pass
 os.execv(real, [real] + sys.argv[1:])
 '''
 
@@ -117,54 +185,79 @@ def load_config(config_dir: str) -> tuple[dict, str]:
     return data, ""
 
 
+#: un nom de rôle sert de nom de dossier (`gh-config/<rôle>`)
+ROLE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+
+
 def role_of(config: dict, agent: str) -> str:
-    """Le rôle de l'agent : celui qui le nomme, sinon `default_role`."""
-    roles = config.get("roles") or {}
-    for nom, role in sorted(roles.items()):
-        if isinstance(role, dict) and agent in (role.get("agents") or ()):
+    """Le rôle de l'agent : celui qui le nomme, sinon `default_role`. Un rôle
+    mal formé (nom, type) est ignoré."""
+    roles = config.get("roles")
+    if not isinstance(roles, dict):
+        return ""
+    valides = {nom: role for nom, role in roles.items()
+               if isinstance(nom, str) and ROLE_RE.fullmatch(nom)
+               and isinstance(role, dict)}
+    for nom, role in sorted(valides.items()):
+        agents = role.get("agents")
+        if isinstance(agents, list) and agent in agents:
             return nom
-    defaut = config.get("default_role") or ""
-    return defaut if defaut in roles else ""
+    defaut = config.get("default_role")
+    return defaut if isinstance(defaut, str) and defaut in valides else ""
 
 
 def _read_token(path: str) -> tuple[str, str]:
-    """(jeton, problème). Le fichier doit être privé (aucun droit groupe ou
-    autres) : un jeton lisible par d'autres comptes n'est pas utilisé."""
+    """(jeton, problème). Le fichier doit être un fichier ordinaire et privé
+    (aucun droit groupe ou autres) : un jeton lisible par d'autres comptes
+    n'est pas utilisé, un FIFO ne bloque pas le tour."""
     path = os.path.expanduser(path)
     try:
-        st = os.stat(path)
-        if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            return "", "%s : droits %o trop larges (0600 attendu)" % (
-                path, stat.S_IMODE(st.st_mode))
-        with open(path, encoding="utf-8") as fh:
-            jeton = fh.read().strip()
-    except OSError as exc:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return "", "%s : fichier ordinaire attendu" % path
+            if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                return "", "%s : droits %o trop larges (0600 attendu)" % (
+                    path, stat.S_IMODE(st.st_mode))
+            with os.fdopen(os.dup(fd), encoding="utf-8") as fh:
+                jeton = fh.read().strip()
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as exc:
         return "", "%s illisible (%s)" % (path, exc)
     if not jeton or any(c.isspace() for c in jeton):
         return "", "%s : jeton vide ou mal formé" % path
     return jeton, ""
 
 
-def resolve(config_dir: str, agent: str) -> dict:
-    """L'identité GitHub d'un agent, sans jamais rendre le jeton lui-même :
-    {role, identity: role|inherited, token_file, problem, journal}."""
+def _resolve(config_dir: str, agent: str) -> tuple[dict, str]:
+    """(résolution sans secret, jeton). Le jeton n'est lu qu'ici, une fois :
+    `identity: role` implique un jeton non vide."""
     config, probleme = load_config(config_dir)
     role = role_of(config, agent) if config else ""
     out = {"agent": agent, "role": role, "identity": "inherited",
            "token_file": "", "problem": probleme,
-           "journal": bool(config.get("journal", True))}
+           "journal": config.get("journal", True) is not False}
+    jeton = ""
     if role:
-        fichier = (config["roles"][role] or {}).get("token_file") or ""
-        out["token_file"] = fichier
-        if not fichier:
+        fichier = config["roles"][role].get("token_file")
+        if not isinstance(fichier, str) or not fichier:
             out["problem"] = "rôle %s sans token_file" % role
         else:
+            out["token_file"] = fichier
             jeton, probleme = _read_token(fichier)
             if jeton:
                 out["identity"] = "role"
             else:
                 out["problem"] = probleme
-    return out
+    return out, jeton
+
+
+def resolve(config_dir: str, agent: str) -> dict:
+    """L'identité GitHub d'un agent, sans jamais rendre le jeton lui-même :
+    {role, identity: role|inherited, token_file, problem, journal}."""
+    return _resolve(config_dir, agent)[0]
 
 
 def real_gh(path_env: str, shim_dir: str) -> str:
@@ -180,7 +273,7 @@ def write_shim(shim_dir: str, python: str | None = None) -> str:
     os.makedirs(shim_dir, mode=0o700, exist_ok=True)
     contenu = SHIM.format(python=python or sys.executable, real=ENV_REAL,
                           journal=ENV_JOURNAL, role=ENV_ROLE,
-                          token_re=TOKEN_RE.pattern, arg_max=ARG_MAX)
+                          sanitize=SANITIZE)
     cible = os.path.join(shim_dir, "gh")
     try:
         with open(cible, encoding="utf-8") as fh:
@@ -201,42 +294,53 @@ def journal_pattern(state_dir: str) -> str:
     return os.path.join(state_dir, "github", "gestes-%Y-%m.jsonl")
 
 
+def _problem(info: dict, texte: str) -> None:
+    info["problem"] = (info["problem"] + " ; " if info["problem"] else "") + texte
+
+
 def apply(env: dict, agent: str, config_dir: str, state_dir: str,
           lot: str | None = None) -> dict:
     """Pose sur `env` (celui du tour) le journal et, s'il est configuré, le
     jeton du rôle. Rend la résolution (sans jeton), pour le journal de
-    l'exécuteur. Jamais bloquant : une erreur laisse l'environnement hérité."""
-    info = resolve(config_dir, agent)
+    l'exécuteur. Jamais bloquant : chaque étape se prépare sur une copie et
+    n'est publiée qu'entière ; un échec laisse l'environnement hérité."""
+    info, jeton = _resolve(config_dir, agent)
+    nouveau = dict(env)
     if lot:
-        env["AMEESH_LOT"] = str(lot)
-    if info["identity"] == "role":
-        jeton, _ = _read_token(info["token_file"])
-        env["GH_TOKEN"] = jeton
-        env.pop("GITHUB_TOKEN", None)
-        env.pop("GH_ENTERPRISE_TOKEN", None)
-        # le hosts.yml de l'owner n'est plus lu : un dossier vide, par rôle
-        vide = os.path.join(state_dir, "github", "gh-config", info["role"])
-        os.makedirs(vide, mode=0o700, exist_ok=True)
-        env["GH_CONFIG_DIR"] = vide
-        env[ENV_ROLE] = info["role"]
-        _git_credential(env)
-    else:
-        env.pop(ENV_ROLE, None)
+        nouveau["AMEESH_LOT"] = str(lot)
+    nouveau.pop(ENV_ROLE, None)
+    if jeton:
+        identite = dict(nouveau)
+        try:
+            # le hosts.yml de l'owner n'est plus lu : un dossier vide, par rôle
+            vide = os.path.join(state_dir, "github", "gh-config", info["role"])
+            os.makedirs(vide, mode=0o700, exist_ok=True)
+        except OSError as exc:
+            info["identity"] = "inherited"
+            _problem(info, "identité du rôle non posée (%s)" % exc)
+        else:
+            identite["GH_TOKEN"] = jeton
+            identite.pop("GITHUB_TOKEN", None)
+            identite.pop("GH_ENTERPRISE_TOKEN", None)
+            identite["GH_CONFIG_DIR"] = vide
+            identite[ENV_ROLE] = info["role"]
+            _git_credential(identite)
+            nouveau = identite
     if info["journal"]:
         try:
             shim_dir = os.path.join(state_dir, "github", "bin")
-            reel = real_gh(env.get("PATH", os.defpath), shim_dir)
+            reel = real_gh(nouveau.get("PATH", os.defpath), shim_dir)
             if reel:
                 write_shim(shim_dir)
-                env[ENV_REAL] = reel
-                env[ENV_JOURNAL] = journal_pattern(state_dir)
-                env["PATH"] = shim_dir + os.pathsep + env.get("PATH", os.defpath)
+                nouveau[ENV_REAL] = reel
+                nouveau[ENV_JOURNAL] = journal_pattern(state_dir)
+                nouveau["PATH"] = shim_dir + os.pathsep + nouveau.get("PATH", os.defpath)
             else:
-                info["problem"] = (info["problem"] + " ; " if info["problem"] else "") \
-                    + "gh absent du PATH : journal sans objet"
+                _problem(info, "gh absent du PATH : journal sans objet")
         except OSError as exc:
-            info["problem"] = (info["problem"] + " ; " if info["problem"] else "") \
-                + "journal gh non installé (%s)" % exc
+            _problem(info, "journal gh non installé (%s)" % exc)
+    env.clear()
+    env.update(nouveau)
     return info
 
 
