@@ -1507,6 +1507,12 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schema     : %s" % cfg.schema)
     print("host       : %s" % cfg.host)
+    # #1466 : quel fichier cet hôte lit réellement, et ce qu'un profil écrase
+    print("config     : %s" % cfg.config_source)
+    if "accounts" in (cfg.config_shadowed or ()):
+        print("warning    : the configuration read here overrides the host `accounts` "
+              "(%s); other runners of the host may use different accounts — a stale "
+              "profile diverges silently" % cfg.config_path)
     from . import persona_memory
     from . import canon as canon_mod
     memory_note = ""
