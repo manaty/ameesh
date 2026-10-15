@@ -18,8 +18,8 @@
 #               plafond de 30 min sous saturation) ; la suite complète, en
 #               6 parts, sur push vers main, integration/** ou release/**, sur
 #               une PR de release (sans liste pilote) et à la main
-#               (workflow_dispatch, sur main, release/** ou integration/**
-#               seulement, #1635).
+#               (workflow_dispatch, sur main, release/**, integration/** ou
+#               validation/** et hors tête de PR ouverte, #1635).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
@@ -123,6 +123,10 @@ jobs:
     name: plan
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
+    # #1635 : dispatch-guard.py lit les PR ouvertes
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       # #833 : sur une poussée, le diff va du commit d'avant la poussée
       # (`github.event.before`; vide hors push) à la tête, pas seulement HEAD^1.
@@ -140,22 +144,24 @@ jobs:
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
     steps:
-      # #1635 : un lancement à la main publie le check requis `tests` sur la
-      # tête de la branche lancée ; sur une branche de lot, il satisferait le
-      # check de sa PR sans merge-ref ni passage par la PR. Il n'est admis que
-      # sur main, release/** et integration/** ; ailleurs le plan échoue et
-      # `tests` rougit sans exécuter de tests. La référence passe par
-      # l'environnement, jamais interpolée dans le script (#1237).
-      - name: lancement à la main (main, release/**, integration/** — #1635)
+      # #1635 : un lancement à la main publie le check requis `tests` sur le
+      # commit lancé (check lié au commit, pas à l'évènement) ; sur la tête
+      # d'une PR ouverte, il satisferait le check de cette PR sans merge-ref ni
+      # porte de gel. La référence est contrôlée avant tout checkout (main,
+      # release/**, integration/**, validation/**), puis
+      # scripts/dispatch-guard.py refuse un commit qui est la tête d'une PR
+      # ouverte. Un refus fait échouer `plan` : `tests` rougit sans tests. La
+      # référence passe par l'environnement, jamais interpolée (#1237).
+      - name: lancement à la main (main, release/**, integration/**, validation/** — #1635)
         if: github.event_name == 'workflow_dispatch'
         env:
           DISPATCH_REF: ${{ github.ref }}
         run: |
           case "$DISPATCH_REF" in
-            refs/heads/main|refs/heads/release/*|refs/heads/integration/*)
-              echo "workflow_dispatch on $DISPATCH_REF: admitted" ;;
+            refs/heads/main|refs/heads/release/?*|refs/heads/integration/?*|refs/heads/validation/?*)
+              echo "workflow_dispatch on $DISPATCH_REF: branch admitted" ;;
             *)
-              echo "::error::workflow_dispatch on '$DISPATCH_REF': only main, release/** and integration/** may be run by hand (#1635); a lot branch gets its CI through its pull request, nothing run"
+              echo "::error::workflow_dispatch on '$DISPATCH_REF': only main, release/**, integration/** and validation/** may be run by hand (#1635); a lot branch gets its CI through its pull request, nothing run"
               exit 1 ;;
           esac
       - uses: actions/checkout@v4
@@ -164,6 +170,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: lancement à la main sur la tête d'une PR ouverte (#1635)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/dispatch-guard.py
       # the most recent map of main (a PR reads the caches of its base branch)
       - uses: actions/cache/restore@v4
         with:
