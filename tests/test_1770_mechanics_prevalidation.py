@@ -154,6 +154,19 @@ class ReaderTest(unittest.TestCase):
                           "hosts": ["ameesh-agents-1", "ameesh-agents-2"],
                           "timeout_seconds": 3600})
 
+    def test_parts_script_is_declared_by_the_block_only(self):
+        """Le lanceur de part : optionnel au bloc, aucune valeur au lecteur."""
+        declared = mechanics.compile_document(_document(_block(
+            parts_script="tools/parts.py")))
+        self.assertEqual(declared.prevalidation.parts_script, "tools/parts.py")
+        self.assertEqual(declared.to_dict()["prevalidation"]["parts_script"],
+                         "tools/parts.py")
+        # absent, le dictionnaire compilé reste celui du bloc déclaré : la
+        # convention (`scripts/test-parts.py`) appartient au consommateur
+        default = mechanics.compile_document(_document(_block()))
+        self.assertIsNone(default.prevalidation.parts_script)
+        self.assertNotIn("parts_script", default.to_dict()["prevalidation"])
+
     def test_block_and_schema_are_consistent(self):
         with self.assertRaises(mechanics.MechanicsError) as caught:
             mechanics.compile_document(_document(_block(), schema="ameesh-mechanics/1"))
@@ -183,6 +196,10 @@ class ReaderTest(unittest.TestCase):
             "host not a label": _block(hosts="['a b']"),
             "duplicate host": _block(hosts="[h1, h1]"),
             "host not a string": _block(hosts="[1]"),
+            "absolute parts_script": _block(parts_script="/usr/bin/python3"),
+            "escaping parts_script": _block(parts_script="../runner.py"),
+            "empty parts_script": _block(parts_script='""'),
+            "null parts_script": _block(parts_script="null"),
             "timeout zero": _block(timeout_seconds="0"),
             "timeout not an int": _block(timeout_seconds="1h"),
         }

@@ -136,6 +136,35 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(report["seconds"], 42.0)
         self.assertIn("test_a", report["modules"])
 
+    def test_lanceur_de_part_du_bloc_dans_la_commande(self):
+        """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""
+        seen: list = []
+
+        def capture(argv, **kwargs):
+            seen.append(argv)
+            return _Proc(0, flux())
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(parts_script="tools/parts.py"),
+                             repo=self.tmp.name, runner=capture)
+        self.assertTrue(report["ok"], report)
+        command = " ".join(seen[0])
+        self.assertIn("tools/parts.py run --plan", command)
+        self.assertNotIn(pv.DEFAULT_PARTS_SCRIPT, command)
+
+    def test_lanceur_de_part_par_defaut_sans_cle(self):
+        """Sans clé au bloc, la convention du plan L161f s'applique."""
+        seen: list = []
+
+        def capture(argv, **kwargs):
+            seen.append(argv)
+            return _Proc(0, flux())
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name, runner=capture)
+        self.assertTrue(report["ok"], report)
+        self.assertIn(pv.DEFAULT_PARTS_SCRIPT, " ".join(seen[0]))
+
     def test_hote_hors_canon_refuse(self):
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="pc-smichea",

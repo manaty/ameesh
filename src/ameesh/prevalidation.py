@@ -39,6 +39,10 @@ CARD_SCHEMA = "ameesh-carte/1"
 FLOW_SCHEMA = "ameesh-test-event/1"
 #: schéma du rapport de prévalidation
 REPORT_SCHEMA = "ameesh-prevalidation/1"
+#: lanceur de part appliqué quand le bloc canon ne le nomme pas : la convention
+#: du plan L161f, chemin dépôt, contrat CLI `run --plan --part --driver --flow`.
+#: Un projet qui a son propre outil le déclare (`parts_script` du bloc, #1770).
+DEFAULT_PARTS_SCRIPT = "scripts/test-parts.py"
 
 #: causes de refus d'une prévalidation ; le gel n'est pas écrit, la cause est dite
 CAUSES = (
@@ -295,14 +299,19 @@ def host_allowed(host: str, *, local: str | None = None, deny: Sequence[str] = (
 
 
 def remote_script(plan_path: str, parts: Sequence[dict],
-                  python: str = "python3") -> str:
+                  python: str = "python3", parts_script: str = "") -> str:
     """Le script exécuté sur la VM : chaque part, son flux, puis la durée.
 
     Chaque part est lancée séparément, sa sortie verbeuse est écartée (seul le
     flux JSONL revient, plus le marqueur de part) ; le code de sortie est
     conservé sans interrompre les autres parts. La carte (durées) n'est pas
     embarquée : les parts portent déjà leurs modules et `test-parts.py` se
-    replie sur `tests/parts/durees.json`."""
+    replie sur `tests/parts/durees.json`.
+
+    `parts_script` vient du bloc canon (`parts_script`) : un projet qui n'a pas
+    `scripts/test-parts.py` nomme le sien ; absent, `DEFAULT_PARTS_SCRIPT`
+    s'applique."""
+    lanceur = _q(str(parts_script or DEFAULT_PARTS_SCRIPT))
     lignes = ["ec=0", "debut=$(date +%s)", "flux=$(mktemp -d)"]
     for index, part in enumerate(parts, 1):
         driver = _q(str(part.get("driver")))
@@ -310,9 +319,9 @@ def remote_script(plan_path: str, parts: Sequence[dict],
         fichier = '"$flux/part-%d.jsonl"' % index
         lignes.append('echo "%s%s:%s"' % (PART_MARK, str(part.get("driver")),
                                           part.get("part")))
-        lignes.append("%s scripts/test-parts.py run --plan %s --part %s --driver %s"
+        lignes.append("%s %s run --plan %s --part %s --driver %s"
                       " --flow %s >/dev/null 2>&1 || ec=$?"
-                      % (python, _q(plan_path), numero, driver, fichier))
+                      % (python, lanceur, _q(plan_path), numero, driver, fichier))
         lignes.append("cat %s 2>/dev/null || true" % fichier)
     lignes += ["fin=$(date +%s)", 'echo "%s$((fin-debut))"' % SECONDS_MARK,
                "rm -rf \"$flux\"", "exit $ec"]
@@ -495,9 +504,11 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
         raise PrevalidationError(chosen.causes[0], chosen.why)
     if not within:
         raise PrevalidationError("selection-unsafe", why)
-    result = run_offload(name, remote_script(plan_path, chosen.parts),
-                         timeout=int(getattr(params, "timeout_seconds", 0) or 0),
-                         cwd=cwd, env=env, runner=runner, executable=executable)
+    result = run_offload(name, remote_script(
+        plan_path, chosen.parts,
+        parts_script=getattr(params, "parts_script", None) or ""),
+        timeout=int(getattr(params, "timeout_seconds", 0) or 0),
+        cwd=cwd, env=env, runner=runner, executable=executable)
     after = ""
     if published_ref:
         after = published_head(published_ref, repo=repo or ".", remote=remote,
