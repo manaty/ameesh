@@ -335,7 +335,7 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
-ameesh work merged <id> --sha SHA [--note N] [--actor A]
+ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
@@ -365,7 +365,12 @@ ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 prerequisites between lots (L385). `work migration` reserves the next free
 migration number for the lot, per repository, **before** the file is written
 (L122); `--number` reserves an exact one, `--release` gives it back. It is
-idempotent and visible in `work show`. `work set-app` corrects a
+idempotent and visible in `work show`. `work merged --migration-landed N`
+records the number that actually landed when the landing renumbered the
+reservation (a packet takes the target's max+1, #1567); the option also
+corrects an already merged lot, so `work show` names the landed number (its
+file, and the reservation when it differs) instead of showing only the
+reservation. `work set-app` corrects a
 lot's project and `work backfill-app` fills the uniquely inferred ones, both
 with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 (`--none` detaches it),

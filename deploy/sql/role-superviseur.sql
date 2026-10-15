@@ -568,8 +568,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot, et son
-        -- dépôt (#443, 0390)
-        'migration', 'migration_repo',
+        -- dépôt (#443, 0390) ; #1567 : le numéro réellement atterri, quand la
+        -- renumérotation du paquet a changé celui de la réservation
+        'migration', 'migration_repo', 'migration_landed', 'migration_landed_repo',
         -- L157b (0054) : taille déclarée du changement
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
