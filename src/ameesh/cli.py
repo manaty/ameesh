@@ -246,6 +246,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # #506: --app may name a project nobody declares yet, on purpose
     new_project = "--new-project" in args
     args = [arg for arg in args if arg != "--new-project"]
+    # L514: a review verdict or an arbitration reaches a dsh or codex turn
+    # at its next safe point instead of waiting for the end of the turn
+    marks = [key for key in mail.MID_TURN_KEYS if "--" + key in args]
+    args = [arg for arg in args if arg not in ["--" + key for key in mail.MID_TURN_KEYS]]
     explicit_sender = "--from" in args
     estimate = None
     force = None
@@ -292,6 +296,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --urgent contradict each other: an acknowledgement does not wake",
               file=sys.stderr)
         return 2
+    if ack and marks:
+        print("--ack and --%s contradict each other: an acknowledgement does not "
+              "interrupt a turn" % marks[0], file=sys.stderr)
+        return 2
     if ack and new_lot is not None:
         print("--ack and --new-lot contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
@@ -307,7 +315,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
-              "[--urgent] "
+              "[--urgent] [--verdict|--arbitration] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
               file=sys.stderr)
         return 2
@@ -442,7 +450,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # son prochain tour sans le réveiller.
     human = _sender_is_human(bk, cfg, sender, explicit_sender)
     payload: dict = {"human": True} if human else {}
-    if ack or (not urgent and not sign and not human and dest != "all"
+    payload.update((key, True) for key in marks)
+    if ack or (not urgent and not sign and not human and not marks and dest != "all"
                and lot is None and new_lot is None and kind in ("notify", "reply")
                and mail.looks_like_ack(text)):
         payload["ack"] = True
@@ -722,6 +731,22 @@ class _Remise:
         self.reste = 1 if len(rows) >= taille else 0
         return self.msgs
 
+    def garder(self, retenir, limite: int | None = None) -> list[dict]:
+        """L514: keeps the reserved messages `retenir` accepts, at most
+        `limite`; the others are released unseen (they wait for later)."""
+        gardes = [m for m in self.msgs if retenir(m)]
+        if limite is not None:
+            gardes = gardes[:max(0, limite)]
+        rendus = [m for m in self.msgs if m not in gardes]
+        self.msgs = gardes
+        if self.pg and rendus:
+            try:
+                mail.release(self.bk.db, self.name, self.jeton,
+                             [int(m["id"]) for m in rendus if m.get("id") is not None])
+            except Exception:  # the reservation expires by itself
+                pass
+        return self.msgs
+
     def restants_apres(self) -> int:
         """#1604 : non-lus restants après cette remise, sans nouvelle requête.
 
@@ -938,6 +963,18 @@ def hook_subagent(data: dict) -> str:
     return str(agent_id).strip()
 
 
+#: L514: harnesses whose turn gets, between two tool calls, only the mail
+#: `mail.mid_turn` accepts; Claude keeps getting all of it
+MID_TURN_HARNESSES = ("deepseek", "codex")
+
+
+def mid_turn_filtered(tool: str, binding) -> bool:
+    """L514: a PostToolUse of this harness, in a turn the runner drives,
+    delivers only verdicts, arbitrations, human and urgent mail; the rest
+    keeps the L125 batching until the end of the turn."""
+    return tool in MID_TURN_HARNESSES and bool(binding.bound_to_lease)
+
+
 def cmd_hook(cfg: Config, tool: str) -> int:
     """Hook de harnais : lit le JSON sur stdin, ne fait JAMAIS échouer l'agent."""
     try:
@@ -1066,7 +1103,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             return 0
         remise = _Remise(bk, name, binding)
         try:
-            msgs = remise.prendre(borne - etat["remis"] if etat is not None else None)
+            limite = borne - etat["remis"] if etat is not None else None
+            if event == "PostToolUse" and mid_turn_filtered(tool, binding):
+                # L514: in a dsh or codex turn, only what must not wait
+                msgs = remise.garder(mail.mid_turn, limite) if remise.prendre() else []
+            else:
+                msgs = remise.prendre(limite)
             avis = ""
             if etat is not None and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
