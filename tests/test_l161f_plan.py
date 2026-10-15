@@ -1526,6 +1526,69 @@ class InheritedFoundationTest(unittest.TestCase):
         self.assertTrue(p["phase2_safe"], p["phase2_why"])
 
 
+class InheritedDataTest(unittest.TestCase):
+    """#1476 : une donnée non Python que la cible a changée depuis la carte et
+    qu'aucun test mesuré ne lit ne force plus la suite complète de la branche ;
+    changée par la branche elle-même, elle reste un doute (repli sûr)."""
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+
+    def _plan(self, base: str = "HEAD^1", card: dict | None = None) -> dict:
+        mods = parts.modules()
+        card = card or self.repo.card()
+        card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods}
+        nature = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(nature)):
+            return plan.make_plan("pull_request", card, NOW, base=base, head="HEAD",
+                                  repo=self.repo.path, base_ref="main", head_ref="lot/x")
+
+    def _ran(self, p: dict) -> list[str]:
+        return sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"])
+
+    def test_donnee_heritee_sans_lecteur_mesure_ne_force_pas_la_suite(self):
+        # la cible change `deploy/install.sh`, absent de `donnees` (aucun
+        # lecteur mesuré) ; le lot, lui, change un fichier mesuré.
+        self.repo.write("deploy/install.sh", "#!/bin/sh\necho cible\n")
+        target = self.repo.commit()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        card = self.repo.card()
+        touched = parts.modules()[0]
+        card["blocs"]["src/ameesh/code.py"]["used"]["modules"] = [touched]
+        p = self._plan(base=target, card=card)
+        self.assertTrue(p["map"]["used"])
+        self.assertTrue(p["sure"], p["unsure"])
+        self.assertTrue(p["phase2_safe"], p["phase2_why"])
+        self.assertEqual(p["selection"]["mode"], "impacted")
+        self.assertIn(touched, self._ran(p))
+
+    def test_donnee_du_lot_sans_lecteur_mesure_force_la_suite(self):
+        # le lot change lui-même une donnée que la carte ne sait pas lire :
+        # aucun test ne peut être sélectionné pour elle, le repli reste.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        self.repo.write("deploy/install.sh", "#!/bin/sh\necho lot\n")
+        self.repo.commit()
+        p = self._plan(base="HEAD^1", card=self.repo.card())
+        self.assertFalse(p["phase2_safe"])
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("read by no measured test", p["selection"]["why"])
+
+    def test_range_propre_illisible_reste_conservateur_sur_une_donnee(self):
+        # range propre illisible : la donnée héritée est jugée comme changée
+        # par la branche, donc le doute tient.
+        self.repo.write("deploy/install.sh", "#!/bin/sh\necho cible\n")
+        self.repo.commit()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        p = self._plan(base="range-illisible")
+        self.assertFalse(p["phase2_safe"])
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("read by no measured test", p["selection"]["why"])
+
+
 class PushLaneTest(unittest.TestCase):
     """nature() on a push: the whole pushed range decides (#833)."""
 
