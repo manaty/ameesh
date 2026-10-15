@@ -57,11 +57,16 @@ class _Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def fake_process(self, pid: int, *, cwd: str = "/", fds=(), maps=(), comm: str = "bash",
-                     argv0: str | None = None, unreadable: bool = False) -> None:
+                     argv0: str | None = None, state: str = "S",
+                     unreadable: bool = False) -> None:
         d = os.path.join(self.proc, str(pid))
         os.makedirs(os.path.join(d, "fd"))
         _write(os.path.join(d, "comm"), text=comm + "\n")
         _write(os.path.join(d, "cmdline"), text="%s\0--flag\0" % (argv0 or "/usr/bin/" + comm))
+        # état du processus (`Z` = zombie, #1678) : /proc/<pid>/stat, champ 3
+        _write(os.path.join(d, "stat"),
+               text="%d (%s) %s 1 %d 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 100\n"
+                    % (pid, comm, state, pid))
         os.symlink(cwd, os.path.join(d, "cwd"))
         os.symlink("/usr/bin/" + comm, os.path.join(d, "exe"))
         os.symlink("/", os.path.join(d, "root"))
@@ -172,6 +177,27 @@ class UserPathsTest(_Base):
         self.assertIn("22 btop", platform.user_paths(allow=["btop"]).doubt())
         with mock.patch.object(process, "PROC", os.path.join(self.base, "none")):
             self.assertIn("unreadable", platform.user_paths().doubt())
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_is_not_a_doubt(self):
+        """#1678 : un zombie (état Z) n'est plus qu'une entrée de table — ses
+        liens /proc illisibles ne sont pas un doute (constat #1665 :
+        « timeout <defunct> » retenait tout le ménage)."""
+        self.fake_process(30, comm="timeout", state="Z", unreadable=True)
+        scan = platform.user_paths()
+        self.assertEqual((scan.doubt(), scan.unreadable, scan.paths), ("", [], {}))
+        # l'état seul décide : le même processus vivant reste un doute
+        self.fake_process(31, comm="timeout", unreadable=True)
+        self.assertEqual(platform.user_paths().doubt(),
+                         "process(es) of the user unreadable: 31 timeout")
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_does_not_hold_the_housekeeping(self):
+        """#1665 : l'artefact inactif est retiré malgré le zombie présent."""
+        wt = self.worktree()
+        self.fake_process(32, comm="timeout", state="Z", unreadable=True)
+        out = self.go(wt)
+        self.assertEqual(len(out["entries"]), 3)
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_allowed_process_is_logged_and_does_not_block(self):
