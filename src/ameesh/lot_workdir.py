@@ -12,6 +12,16 @@ class WorkdirError(ValueError):
     """The destination cannot safely run a project session."""
 
 
+class ProjectNotDeclared(WorkdirError):
+    """Le projet du lot est hors des projets déclarés par l'agent (#811 N1)."""
+
+
+#: #811 N1 : préfixe du refus « projet déclaré dont le dossier manque » — le
+#: seul qui mérite une note sur le lot ; un projet non déclaré n'est pas un
+#: défaut du lot, il est simplement hors du périmètre de l'agent.
+MISSING_DIR_PREFIX = "Host working directory absent"
+
+
 def project(db, lot) -> str:
     if not lot or not str(lot).isdigit():
         return ""
@@ -35,8 +45,8 @@ def destination(cfg, agent, lot_project, *, canons=None) -> str | None:
     if not lot_project or lot_project == primary:
         return agent.get("cwd")
     if lot_project not in names:
-        raise WorkdirError("project %s is not declared for %s" %
-                           (lot_project, agent["name"]))
+        raise ProjectNotDeclared("project %s is not declared for %s" %
+                                 (lot_project, agent["name"]))
     canons = canon.load_configured(cfg) if canons is None else canons
     paths = set()
     for card in canons:
@@ -59,14 +69,19 @@ def destination(cfg, agent, lot_project, *, canons=None) -> str | None:
 
 
 def problem(cfg, agent, lot_project, *, canons=None) -> str | None:
-    """Reason to leave a secondary lot in the queue; None when ready."""
+    """Raison de laisser un lot secondaire dans la file ; None s'il est prêt.
+
+    Chaîne vide : le projet du lot est hors du périmètre déclaré de l'agent —
+    rien à noter sur le lot (#811 N1)."""
     names = projects.agent_projects(agent)
     if not lot_project or (names and lot_project == names[0]):
         return None
+    if lot_project not in names:      # hors périmètre : rien à noter (N1)
+        return ""
     if getattr(cfg, "host_mediated", False) and agent.get("host") == cfg.host:
         return "mediated executor has no per-project depot"
     try:
         path = destination(cfg, agent, lot_project, canons=canons)
     except (WorkdirError, canon.CanonError) as exc:
         return str(exc)
-    return None if path and os.path.isdir(path) else "Host working directory absent: %r" % path
+    return None if path and os.path.isdir(path) else "%s: %r" % (MISSING_DIR_PREFIX, path)
