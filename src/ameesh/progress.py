@@ -357,6 +357,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               now: float | None = None,
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
               messages_ts: float | None = None,
+              events_ts: float | None = None,
               planned_wait: dict | None = None,
               dependencies: list[dict] | None = None,
               agent_states: dict[str, str] | None = None,
@@ -366,7 +367,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
     package = packages.get(item.get("package_id"))
     closed_at = next((r.get("at_ts") for r in (declared or []) if r.get("kind") == "closed"),
                      None)
-    last = stagnation.last_activity(item, events, declared or [], actions, messages_ts)
+    # `events` peut ne porter que les transitions (#1647) : `events_ts` rend
+    # le dernier instant du journal, notes comprises.
+    last = stagnation.last_activity(item, events, declared or [], actions, messages_ts,
+                                    events_ts=events_ts)
     now = time.time() if now is None else float(now)
     return {
         "id": int(item["id"]),
@@ -779,8 +783,12 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     items.sort(key=lambda i: (i.get("created_ts") or 0, int(i["id"])))
     ids = [int(i["id"]) for i in items]
     events: dict = {}
-    for ev in st.lot_events(ids):
+    # #1647 : transitions seules ; le dernier instant du journal vient d'une
+    # agrégation, jamais de la lecture des notes.
+    for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
+    last_events = {int(r["work_item_id"]): r.get("last_ts")
+                   for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
         by_item.setdefault(int(row["work_item"]), []).append(row)
@@ -798,7 +806,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
-                      messages_ts=messages.get(int(item["id"])), agent_states=states,
+                      messages_ts=messages.get(int(item["id"])),
+                      events_ts=last_events.get(int(item["id"])), agent_states=states,
                       planned_wait=holds.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
