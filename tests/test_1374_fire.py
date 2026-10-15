@@ -286,6 +286,14 @@ class ReadyTest(unittest.TestCase):
         self.assertTrue(ok, why)
 
 
+class TargetKeyTest(unittest.TestCase):
+    def test_branch_aliases_share_the_target_lease(self):
+        project = types.SimpleNamespace(name="ameesh")
+        for target in ("main", "origin/main", "refs/heads/main", "refs/remotes/origin/main"):
+            with self.subTest(target=target):
+                self.assertEqual(land.lock_key(project, target), "ameesh:main")
+
+
 class ActTest(unittest.TestCase):
     """Le routage d'un passage : verdicts avant PR/file/CI, fusion au geste
     effectif, jamais d'auto-fusion laissée armée, jamais deux gestes
@@ -603,7 +611,7 @@ class FireDbTest(PgTestCase):
         """#1467 : la fusion directe prend le bail de cible du train, ou cede."""
         project = types.SimpleNamespace(name="ameesh")
         ops = storage.of(self.db).work
-        key = land.lock_key(project, "main")
+        key = land.lock_key(project, "origin/main")
         epoch = ops.land_lock(key, "train:runner", 60.0)
         self.assertIsNotNone(epoch)
         try:

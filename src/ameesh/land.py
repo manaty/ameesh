@@ -53,7 +53,7 @@ class LandError(RuntimeError):
 
 
 def lock_key(project, target: str) -> str:
-    return "%s:%s" % (project.name, target)
+    return "%s:%s" % (project.name, merge_queue._remote_branch(target))
 
 
 def _branch_of(target: str) -> str:
