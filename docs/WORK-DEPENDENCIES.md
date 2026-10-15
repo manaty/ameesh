@@ -76,7 +76,10 @@ limit; a blocker outside the displayed window still suppresses `stale_lot`
 and its reminders. Links combine with existing open commitment dependencies.
 A future planned start takes precedence in the displayed `planned_wait`; a
 pilot hold on a gate no open lot carries ([planned waits](PLANNED-WAITS.md),
-#1664) comes after it and before a declared dependency.
+#1664) comes after it, then a declared lot dependency, and last a dated
+external hold (`gate:<name>` in an open commitment,
+[PLANNED-WAITS.md](PLANNED-WAITS.md)), which ends by itself at the end of its
+due day.
 
 A dependency controls inactivity alerts and the ready intake: a lot whose
 prerequisite is not delivered is excluded from the automatic take (L165) and

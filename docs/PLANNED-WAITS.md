@@ -50,6 +50,22 @@ transition. The storage pre-selects on the same motifs as this module
 (`HOLD_NOTE_PATTERNS`, applied to the note stripped of its edge whitespace),
 so no ordinary note is fetched, and a transition note is stored stripped —
 what was authenticated is what is stored and read.
+- An **open** commitment associated with the lot names an external gate in
+  `depends_on`: `gate:<name>` (or `external:<name>`). The gate is not an
+  ameesh lot, so nothing else can release the hold; the commitment's due day
+  is what ends it (the day counts in full, as for `engagement_overdue`, and
+  the ordinary inactivity rule applies again the next day). Closing,
+  cancelling or completing the commitment releases the lot immediately.
+
+  ```sh
+  ameesh plan add "hold until the liquichain window" --lot 768 \
+      --due 2026-10-15 --depends-on gate:liquichain-window
+  ```
+
+  The hold stays visible in the plan view. `ameesh plan cancel <id>` releases
+  the lot at once; renewing it means cancelling and adding a new dated
+  commitment (a later due day pushes the hold). A hold whose date cannot be
+  read does not suppress the alert: a hold always ends.
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
@@ -72,10 +88,16 @@ or:
 {"what": "dependency", "lots": [123, 124]}
 ```
 
-or:
+or, for a pilot hold:
 
 ```json
 {"what": "hold", "by": "mesh-design", "since": 1760544000.0}
+```
+
+or, for a dated external hold:
+
+```json
+{"what": "hold", "gate": "liquichain-window", "until": "2026-10-15", "commitment": 42}
 ```
 
 `planned_wait` is null when no explicit wait applies. While it applies,
@@ -87,5 +109,8 @@ blockers outside the current project or progress window.
 
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
-by a planned date, commitment/plan dependency, direct prerequisite link or an
-explicit `hold:` note. This preserves alerts for unexplained waits.
+by a planned date, commitment/plan dependency, direct prerequisite link, an
+explicit `hold:` note or a dated external hold. This preserves alerts for
+unexplained waits. The two hold forms are complementary: each releases only
+its own hold, so lifting a pilot hold leaves a still-valid gate in force, and
+a gate that expires or is cancelled does not lift an active pilot hold.

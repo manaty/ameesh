@@ -8,9 +8,16 @@ window, human decision). The hold stops the stale reminders and the SLO
 breaches, like any other planned wait, until the lot changes state or the hold
 is explicitly lifted. Only a pilot's hold counts here (`pilot_holds`), and the
 write path authenticates that claim (`work.check_wait_note`); the runner wake
-keeps its own, older convention (`LotSessions.HOLD_PREFIX`)."""
+keeps its own, older convention (`LotSessions.HOLD_PREFIX`).
+
+A dated **external gate** (#1298) is the other form: an open commitment whose
+`depends_on` names `gate:<name>` or `external:<name>` holds its lot until the
+end of the due day. The two forms are complementary and each releases only its
+own hold: lifting a pilot hold leaves a still-valid gate in force, and a gate
+that expires or is cancelled does not lift an active pilot hold."""
 from __future__ import annotations
 
+import datetime
 import re
 import time
 
@@ -122,6 +129,25 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     return explicit_holds(events, allowed=allowed)
 
 
+#: external hold (#1298) : l'engagement nomme la porte qu'il attend — `gate:<nom>`
+#: ou `external:<nom>` — et tient le lot jusqu'à la fin de son jour d'échéance.
+_GATE = re.compile(r"^(?:gate|external):(\S+)$", re.I)
+
+
+def hold_end(due_on):
+    """End of the due day (the day counts in full), or None without a date.
+
+    A hold always ends: past this instant the ordinary inactivity rule
+    applies again, like `engagement_overdue`, which also counts the due day
+    in full and only fires the next day.
+    """
+    try:
+        day = datetime.date.fromisoformat(str(due_on)[:10])
+        return plan.day_start_ts((day + datetime.timedelta(days=1)).isoformat())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def ancestors(package_id, packages):
     """The package and its parents, cycle-safe; absent cards are not a plan."""
     seen = set()
@@ -144,6 +170,11 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
     cannot suppress an alert. Proposed/cancelled/done commitments are ignored.
     `holds` (#1664, `pilot_holds`) est un hold déclaré, prioritaire sur une
     dépendance : le lot est parqué, pas en attente d'un lot.
+
+    An open commitment whose `depends_on` names an external gate
+    (`gate:<name>` or `external:<name>`) *holds* its lot until the end of the
+    commitment's due day: the gate is not a lot, so nothing else can release
+    it, and the date is what makes the hold end by itself.
     """
     open_ids = {int(r["id"]) for r in open_items
                 if r.get("state") not in ("merged", "promoted", "closed")}
@@ -154,6 +185,7 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         for package_id in ancestors(row.get("package_id"), packages):
             package_lots.setdefault(package_id, set()).add(int(row["id"]))
     direct, by_package = {}, {}
+    gate_item, gate_package = {}, {}
     for edge in dependencies:
         if edge.get("blocking"):
             direct.setdefault(int(edge["work_item_id"]), set()).add(int(edge["blocker_id"]))
@@ -161,10 +193,15 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         if commitment.get("status") != "open":
             continue
         blockers = set()
+        gate = None
         for reference in commitment.get("depends_on") or []:
             if not isinstance(reference, str):
                 continue
             reference = reference.strip()
+            match = _GATE.fullmatch(reference)
+            if match:
+                gate = gate or match[1]
+                continue
             match = _LOT.fullmatch(reference)
             if match:
                 blockers.update({int(match[1])} & open_ids)
@@ -175,6 +212,15 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
             direct.setdefault(int(commitment["work_item_id"]), set()).update(blockers)
         elif commitment.get("package_id"):
             by_package.setdefault(commitment["package_id"], set()).update(blockers)
+        end = hold_end(commitment.get("due_on")) if gate else None
+        if end is not None and now < end:
+            held = {"gate": gate, "until": str(commitment.get("due_on"))[:10]}
+            if commitment.get("id") is not None:
+                held["commitment"] = commitment["id"]
+            if commitment.get("work_item_id") is not None:
+                gate_item.setdefault(int(commitment["work_item_id"]), held)
+            elif commitment.get("package_id"):
+                gate_package.setdefault(commitment["package_id"], held)
     waits = {}
     held = holds or {}
     for row in rows:
@@ -204,6 +250,17 @@ def resolve(rows, dates, commitments, packages, open_items, *, now, dependencies
         blockers.discard(ident)
         if blockers:
             waits[ident] = {"what": "dependency", "lots": sorted(blockers)}
+            continue
+        # #1298 x #1664 : nom distinct de `held` (le hold pilote, lu plus haut) —
+        # la porte datée ne doit pas écraser la retenue pour les lignes suivantes.
+        gate_held = gate_item.get(ident)
+        if gate_held is None:
+            for package_id in ancestors(row.get("package_id"), packages):
+                gate_held = gate_package.get(package_id)
+                if gate_held:
+                    break
+        if gate_held:
+            waits[ident] = dict(gate_held, what="hold")
     return waits
 
 

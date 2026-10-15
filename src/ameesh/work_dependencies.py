@@ -160,6 +160,8 @@ def wait_label(wait):
     if wait["what"] == "scheduled":
         return "planned start %s" % wait["start"]
     if wait["what"] == "hold":
+        if wait.get("gate") or wait.get("until"):
+            return "external hold until %s (%s)" % (wait.get("until"), wait.get("gate"))
         # #1664 : le hold déclaré, avec son auteur et sa date (le pilote juge
         # sur pièce s'il tient toujours).
         label = "hold"
