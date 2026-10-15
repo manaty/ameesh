@@ -335,6 +335,47 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _is_exit_call(node: ast.Call, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether a call is a known import-time termination: the builtins
+    `exit()`/`quit()`, `sys.exit()`/`os._exit()` (aliases of `sys`, `os` and of
+    the imported names included)."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in exit_names
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if func.attr == "exit":
+            return func.value.id in sys_names
+        if func.attr == "_exit":
+            return func.value.id in os_names
+    return False
+
+
+def _may_terminate(node: ast.AST, names: set[str], exit_names: set[str],
+                   sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether running this statement may end the import: a reachable `raise`,
+    a false `assert`, or an exit call (#1627).
+
+    Deliberately conservative — a `raise` caught by an enclosing `try` still
+    counts (a proof lost, never a false proof) — and the body of an
+    `if TYPE_CHECKING:` / `if False:` is dead, as in `_never_runs`. A function
+    or lambda body runs later, not at import, so it terminates nothing here."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return False
+    if isinstance(node, ast.Raise):
+        return True
+    if isinstance(node, ast.Assert):
+        return _never_runs(node.test, names)
+    if isinstance(node, ast.Call) and _is_exit_call(node, exit_names, sys_names, os_names):
+        return True
+    if isinstance(node, ast.If) and _never_runs(node.test, names):
+        children: list[ast.AST] = list(node.orelse)  # seul le `else` s'exécute
+    else:
+        children = list(ast.iter_child_nodes(node))
+    return any(_may_terminate(child, names, exit_names, sys_names, os_names)
+               for child in children)
+
+
 class _RuntimeImports(ast.NodeVisitor):
     """The import statements that may run, and those the module certainly runs
     when it is imported.
@@ -347,7 +388,10 @@ class _RuntimeImports(ast.NodeVisitor):
     `with` — a `with` body may never run (its `__enter__` may fail, or an
     earlier statement may raise and be suppressed), so it is no proof.
     A lazy or conditional import alone is a possible load, never a proof
-    (relecture Codex, B2 résiduel)."""
+    (relecture Codex, B2 résiduel). A reachable termination — a guarded
+    `raise`, an `except` that exits, `exit()`/`sys.exit()`/`os._exit()`, a
+    false `assert` — stops the proofs too: the imports after it may never run
+    (#1627)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
@@ -355,6 +399,12 @@ class _RuntimeImports(ast.NodeVisitor):
         self.guaranteed: list[ast.stmt] = []
         self._deferred = 0  # inside a function or lambda body: not run at import
         self._guarded = 0   # inside a condition, a loop or a try: may not run
+        # #1627 : une terminaison atteignable arrête les preuves du corps
+        # (module ou classe) : les imports suivants restent possibles seulement.
+        self._terminated = False
+        self._exit_names = {"exit", "quit"}  # builtins, `from sys import exit`
+        self._sys_names = {"sys"}            # `sys.exit`, alias compris
+        self._os_names = {"os"}              # `os._exit`, alias compris
 
     def _visit_function(self, node: ast.AST) -> None:
         self._deferred += 1
@@ -387,15 +437,43 @@ class _RuntimeImports(ast.NodeVisitor):
             return
         self._visit_guarded(node)
 
+    def _visit_body(self, body: list[ast.stmt]) -> None:
+        """The body of a module or a class runs at import, in order: a
+        reachable termination cuts the proofs that follow it (#1627)."""
+        for child in body:
+            self.visit(child)
+            if not self._deferred and not self._terminated and _may_terminate(
+                    child, self.names, self._exit_names, self._sys_names, self._os_names):
+                self._terminated = True
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._visit_body(node.body)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # décorateurs et bases ne portent aucun import : le corps seul compte
+        self._visit_body(node.body)
+
     def _record(self, node: ast.stmt) -> None:
         self.imports.append(node)
-        if not self._deferred and not self._guarded:
+        if not self._deferred and not self._guarded and not self._terminated:
             self.guaranteed.append(node)
 
     def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "sys":
+                self._sys_names.add(alias.asname or "sys")
+            elif alias.name == "os":
+                self._os_names.add(alias.asname or "os")
         self._record(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = node.module or ""
+        if module == "sys":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "exit")
+        elif module == "os":
+            self._exit_names.update(alias.asname or alias.name
+                                    for alias in node.names if alias.name == "_exit")
         self._record(node)
 
 
