@@ -165,6 +165,26 @@ def _message(ctx, db, params, body) -> dict:
     return {"agent": params["agent"], "message_id": message_id, "lot": lot}
 
 
+def _chat(ctx, db, params, body) -> dict:
+    """A message to an agent's shared conversation (L83): the server writes the
+    `human_message` entry and delivers the mail that wakes the agent. The
+    author is the human the API authenticated, never a body field; the
+    relation check of 0033 §7/§9 arrives with the OIDC tokens (L86)."""
+    from . import chat, registry, undeliverable
+    text = _text(body, "text")
+    lot = _lot_label(db, body.get("lot"))
+    sender = mail_name(ctx)
+    if registry.get(db, params["agent"]) is None:
+        raise ActionError(404, "not_found", "unknown agent")
+    try:
+        undeliverable.check_send(ctx.cfg, db, sender=sender, dest=params["agent"],
+                                 explicit=True)
+    except undeliverable.Refused as exc:
+        raise ActionError(409, "refused", str(exc)) from exc
+    return chat.post_human_message(ctx.cfg, db, human=ctx.human, sender=sender,
+                                   agent=params["agent"], text=text, lot=lot)
+
+
 def _publish(ctx, db, params, body) -> dict:
     """An entry in a project's thread, or in a lot's (the lot must belong to
     the project)."""
@@ -301,6 +321,10 @@ ACTIONS = (
            "Message to an agent: its mailbox and its thread (`agent-mail send`)", _message,
            {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False),
             "urgent": ({"type": "boolean"}, False)}),
+    Action("/agents/{agent}/chat", "chat",
+           "A message to an agent's shared conversation (L83: the server writes the entry "
+           "and wakes the agent by mail)", _chat,
+           {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False)}),
     Action("/threads/{project}", "publish", "Publish in a project's thread", _publish,
            {"text": _TEXT}),
     Action("/threads/{project}/{lot}", "publish", "Publish in a lot's thread", _publish,

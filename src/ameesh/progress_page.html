@@ -394,6 +394,27 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     if (label) b.setAttribute("aria-label", label);
     return b;
   }
+  // L83 : une entrée de la conversation partagée d'un agent (ameesh-conversation/1).
+  // Le texte passe par textContent, jamais par du HTML ; au-delà de 4 000
+  // caractères l'aperçu est coupé (le détail complet se lit avec `ameesh chat`).
+  function convEntry(entry) {
+    var kind = entry.kind || "", meta = entry.meta || {}, who = entry.author || "?";
+    var line = el("div", "conv" + (kind === "human_message" ? " conv-human" : ""));
+    if (kind === "human_message") who += " [human]";
+    else if (kind === "turn_end") who = "end of turn" + (meta.status ? " · " + meta.status : "")
+      + (typeof meta.cost_usd === "number" ? " · " + usd(meta.cost_usd) : "");
+    else if (kind === "tool") who = "· " + (meta.tool || entry.text || "tool")
+      + (meta.status ? " (" + meta.status + ")" : "");
+    else if (kind === "input") who = "← " + who;
+    else if (kind === "state") who = "· " + (entry.text || "state");
+    line.appendChild(el("div", "conv-head", hm(entry.ts) + (who ? " " + who : "")));
+    var text = entry.text || "";
+    if (kind === "state" || kind === "tool") text = "";
+    if (text.length > 4000) text = text.slice(0, 4000) + " […]";
+    if (text) line.appendChild(el("div", "conv-text", text));
+    if (entry.truncated) line.appendChild(el("div", "conv-head", "… entry truncated"));
+    return line;
+  }
 
   // -- périmètre : le projet choisi. Servie, la base filtre déjà (budget et
   //    feuille de route compris) ; statique, la page filtre ce qu'elle peut

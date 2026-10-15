@@ -194,6 +194,45 @@ CLIENT_HELP_TEXT = (
 )
 
 
+# --------------------------------------------------------------------------
+# L83 : l'écriture serveur d'un message humain dans la conversation
+# --------------------------------------------------------------------------
+
+def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
+                       text: str, lot=None, event_id: str | None = None) -> dict:
+    """Le message d'un humain dans la conversation partagée d'un agent (L83).
+
+    Le serveur écrit : l'appelant a authentifié `human` (`human:<id>`, le
+    rédacteur) et vérifié son droit de parler à `agent` (0033 §7/§9 ; L86
+    vérifie le jeton OIDC et le lien au canon, jamais ici) ; `sender` est le
+    nom de boîte nu, tel que `agent-mail send` l'écrit. Le message part
+    d'abord dans la boîte (il réveille l'agent, `payload human`), puis il est
+    reflété par une entrée `human_message` : `mail.send` écrit la copie
+    lisible (R12), l'entrée ne porte donc pas de seconde sortie. Un échec
+    après le courrier laisse le message délivré et l'erreur dite : le
+    courrier est la délivrance, l'entrée son reflet.
+
+    `event_id` est stable (`mail:<id>` par défaut) : un rejeu après la
+    délivrance ne crée pas de seconde entrée.
+    """
+    from . import conversation, fil, mail, registry
+    if not NAME_RE.match(agent or ""):
+        raise ValueError("invalid agent name: %r" % (agent,))
+    row = registry.get(db, agent)
+    work_item_id = None if lot is None else str(lot)
+    message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
+                           payload={"human": True}, work_item_id=work_item_id)
+    log = conversation.Log(db, cfg, agent=agent,
+                           project=fil.project_for(cfg, fil.agent_project(row)),
+                           lot=work_item_id)
+    entry = log.append("human_message", text, author=human,
+                       event_id=event_id or "mail:%d" % message_id, thread=False)
+    return {"agent": agent, "message_id": message_id,
+            "lot": None if lot is None else int(lot),
+            "entry": {key: entry.get(key)
+                      for key in ("seq", "kind", "author", "ts", "event_id")}}
+
+
 def _stamp(ts, *, now=None):
     """Heure locale d'une entrée ; datée si elle n'est pas d'aujourd'hui."""
     if not ts:

@@ -299,6 +299,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/projects/{project}/progress": "/api/v1/projects/demo/progress?since=2d",
             "/api/v1/agents": "/api/v1/agents",
             "/api/v1/agents/{agent}": "/api/v1/agents/a1",
+            "/api/v1/agents/{agent}/chat": "/api/v1/agents/a1/chat?limit=5",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
             "/api/v1/decisions": "/api/v1/decisions?all=1",
