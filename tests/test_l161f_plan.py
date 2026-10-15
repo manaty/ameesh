@@ -1325,6 +1325,12 @@ def _dash_column(line: str) -> int | None:
 
 def _left_open(content: str) -> bool:
     """Does a quoted scalar or a flow collection go on past this line?"""
+    # Node properties can separate the key from the opening quote/flow node.
+    # Inspect the value itself, including for keys that _run_bodies cannot read.
+    _, content = _node_properties(content.strip())
+    match = _ANY_KEY.match(content)
+    if match:
+        _, content = _node_properties(match.group("rest").strip())
     depth, quote, i = 0, None, 0
     while i < len(content):
         char, before = content[i], content[:i].rstrip()
@@ -1513,6 +1519,17 @@ class RunBodiesTest(unittest.TestCase):
         self.assertEqual([], _branch_ref_escapes(
             "env:\n  BASE_REF: ${{ github.base_ref }}\n"
             "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
+
+    def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
+        # YAML ignores indentation inside quotes, even after an anchor/tag.
+        # The apparent root env below is still text of the run scalar.
+        for key in ("run", '"run"', "run "):
+            for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
+                               "&cmd !!str"):
+                text = (f"jobs:\n  a:\n    steps:\n      - {key}: {properties} \"echo\n"
+                        "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
+                with self.subTest(key=key, properties=properties):
+                    self.assertNotEqual([], _branch_ref_escapes(text))
 
     def test_block_headers_indicators_and_comment(self):
         text = textwrap.dedent("""\
