@@ -368,3 +368,46 @@ class AccountBudgetTest(PgTestCase):
             self.assertEqual(observed, (40.0, 0.0, True))
         finally:
             old.watchdog_stop.set()
+
+    def test_capture_marqueur_atomique(self):
+        """A takeover between marker write/read cannot change the owned key."""
+        import types
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "capture")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("capture", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "capture", runner.runner_id, 3600)
+        old = AgentWorker(runner, registry.get(self.db, "capture"), lease)
+        get = registry.pending_spend_get
+        replaced = []
+        def takeover(*args):
+            replaced.append(True)
+            # Replacement starts after put committed but before the old worker's get.
+            registry.pending_spend_put(self.db, "capture", 1, "new", "m")
+            marker = get(self.db, "capture")
+            self.assertEqual(account_budget.reserve(self.db, "capture", _profile(DEEPSEEK),
+                old._spend_key(1, marker["created_ts"])), "")
+            return marker
+        try:
+            with mock.patch("ameesh.storage.postgres.registry.PendingSpend.put_get",
+                            return_value=None):
+                self.assertFalse(old._compta_marque(0, "old", "m"))
+                self.assertIsNone(old._compta_travail)
+            with mock.patch("ameesh.registry.pending_spend_get", side_effect=takeover):
+                self.assertTrue(old._compta_marque(0, "old", "m"))
+            own = old._compta_travail
+            if not replaced:
+                takeover()
+            self.assertEqual(account_budget.reserve(self.db, "capture", _profile(OPENAI),
+                old._spend_key(0, own["created_ts"])), "")
+            def record(*args, **kwargs):
+                self._spend("capture", 40., key=kwargs["key"])
+                return types.SimpleNamespace(reread_tokens=0, session=None)
+            old.lease_lost.set()
+            with mock.patch("ameesh.cost.CostBook") as book:
+                book.return_value.record.side_effect = record
+                old._compta_termine(incertain=True)
+            self.assertEqual((self._usage(OPENAI)["settled"], self._usage(DEEPSEEK)["settled"],
+                get(self.db, "capture") is not None), (40., 0., True))
+        finally:
+            old.watchdog_stop.set()

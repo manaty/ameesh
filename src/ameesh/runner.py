@@ -2537,12 +2537,12 @@ class AgentWorker(threading.Thread):
         """
         self._annonce_ram = ""  # un tour neuf n'a encore rien annoncé
         try:
-            registry.pending_spend_put(self.db, self.name, int(start), tour,
-                                       model if model is not None else "")
-            # #1469 : le marqueur de CE tour, gardé par le worker — sa clé règle
-            # sa réservation, même si un remplaçant a posé le sien depuis
-            self._compta_travail = registry.pending_spend_get(self.db, self.name)
-            return True
+            # Capture in the write itself: a replacement may write its marker
+            # as soon as ours commits, before a separate read (#1469).
+            self._compta_travail = registry.pending_spend_begin(
+                self.db, self.name, int(start), tour,
+                model if model is not None else "")
+            return self._compta_travail is not None
         except db_mod.Unavailable:
             raise  # L72 : rien lancé ; la consigne est remise au retour de la base
         except db_mod.DbError as exc:

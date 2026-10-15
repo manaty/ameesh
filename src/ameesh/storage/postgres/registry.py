@@ -939,6 +939,10 @@ class Leases(interface.Leases):
 class PendingSpend(interface.PendingSpend):
 
     def put(self, name, start_index, turn, model) -> bool:
+        return self.put_get(name, start_index, turn, model) is not None
+
+    def put_get(self, name, start_index, turn, model) -> dict | None:
+        """Return THIS marker in its write, before any replacement can change it."""
         rows = self.db.query(
             """
             INSERT INTO spend_pending (agent, start_index, turn, model, created_at)
@@ -948,11 +952,12 @@ class PendingSpend(interface.PendingSpend):
                 turn        = excluded.turn,
                 model       = excluded.model,
                 created_at  = now()
-            RETURNING agent
+            RETURNING agent, start_index, turn, model,
+                      extract(epoch from created_at)::float8 as created_ts
             """,
             (name, int(start_index), turn, model),
         )
-        return bool(rows)
+        return rows[0] if rows else None
 
     def set_model(self, name, model) -> bool:
         rows = self.db.query(
