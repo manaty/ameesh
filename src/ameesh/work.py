@@ -1163,9 +1163,40 @@ def _notify_released(db: Db, item_id: int, *, blocker_state: str,
         blocker_reason=blocker_reason, after_commit=after_commit)
 
 
+def _pr_number(pr_ref) -> "int | None":
+    """Le numéro de PR d'une référence `owner/repo#N`, ou None."""
+    text = str(pr_ref or "")
+    head, _, tail = text.rpartition("#")
+    return int(tail) if head and tail.isdigit() else None
+
+
+def _review_after_merge(db, item_id, *, sha: str = "", pr_ref=None, repo=None) -> dict:
+    """L539 : toute fusion **enregistrée** ouvre le lot de relecture du canon §2.
+
+    La file de fusion l'ouvre à l'atterrissage (`land`) ; ici passent les
+    autres voies — relevé des branches (L118), `sync-merges`, `sync-github`,
+    porte `git-merge`, `ameesh work merged` — et l'ouverture y est idempotente
+    (`review_lot.open_for_merge`). `repo` porte le dépôt où la fusion a été
+    constatée quand l'appelant le connaît (indice de classe).
+
+    Rend le constat de `review_lot.open_for_merge` (`id`, `created`, `why`),
+    jamais une exception : la fusion est un fait **déjà écrit**, rien ici ne
+    doit remonter jusqu'à l'appelant et transformer un fait acquis en échec.
+    Un `id` nul signale une relecture encore manquante — le diagnostic que
+    `catch_up` reprend."""
+    try:
+        from . import review_lot
+        return review_lot.open_for_merge(db, int(item_id), merged_sha=sha or "",
+                                         pr=_pr_number(pr_ref), repo=repo) or {}
+    except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
+        return {"id": None, "created": False,
+                "why": "lot de relecture non ouvert : %s: %s" % (
+                    type(exc).__name__, str(exc)[:160])}
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
-                 declared: bool = False, extra: str = "") -> dict:
+                 declared: bool = False, extra: str = "", repo: str | None = None) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -1187,6 +1218,16 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     le réveil ne peut être ni perdu (un échec annule la fusion, la reprise
     refait les deux) ni doublé (le verrou de graphe sérialise les fermetures,
     une seule voit la dernière attente tomber).
+
+    L539 (#1104) : une fusion enregistrée, par quelque voie que ce soit, ouvre
+    aussi le lot de relecture du canon §2 (`_review_after_merge`), y compris
+    hors file de fusion. `repo` est le dépôt où la fusion a été constatée
+    (le relevé le connaît) ; sans lui, la classe se lit sur le dossier de
+    travail de l'assigné, puis sur le dépôt du projet, et un doute n'ouvre
+    rien. Le lot de la file l'ouvre à l'atterrissage : l'ouverture est
+    idempotente. Un lot déjà fusionné (`already`) reprend lui aussi l'ouverture
+    manquante — la fusion reste acquise ; `review_lot.catch_up` reprend les
+    lots fusionnés que les relevés ne sélectionnent plus.
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -1194,8 +1235,15 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             raise WorkError("lot %s not found" % item_id)
         state = item["state"]
         if state in MERGED_STATES:
+            # L539 (#1104) : la fusion est acquise, mais sa relecture peut
+            # manquer (l'ouverture avait échoué). Ce chemin idempotent la
+            # reprend sans jamais rouvrir ni défaire la fusion (R1 #1104 P2-2).
+            review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+            detail = "already %s" % state
+            if not review.get("id"):
+                detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
-                    "detail": "already %s" % state}
+                    "detail": detail, "review_lot": review}
         if state == "closed":
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": "lot closed (%s): merge seen%s, not reopened"
@@ -1228,8 +1276,15 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         for record in threads:
             record(db.cfg, db)
         if row is not None:
+            # L539 (#1104) : la fusion est écrite ; le lot de relecture suit,
+            # sans jamais pouvoir la défaire. Un échec d'ouverture est rendu
+            # dans le constat (`review_lot`), pour être repris (`review_lot.catch_up`).
+            review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+            detail = "%s → merged" % state
+            if not review.get("id"):
+                detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "merged", "item": row,
-                    "detail": "%s → merged" % state}
+                    "detail": detail, "review_lot": review}
         if frozen_id is not None:
             freezes = [m for m in milestones(db, item_id) if m["kind"] == "frozen"]
             if not freezes or int(freezes[0]["id"]) != int(frozen_id):

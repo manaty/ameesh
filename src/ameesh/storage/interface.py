@@ -158,6 +158,7 @@ from .conversations import Conversations
 from .work_dependencies import WorkDependencies
 
 import abc
+from datetime import datetime
 from typing import Any, Callable, Protocol, Sequence
 
 
@@ -1336,6 +1337,50 @@ class WorkItems(Domain):
         """Lots, du plus récemment modifié au plus ancien."""
 
     @abc.abstractmethod
+    def items_missing_ref(self, *, states: Sequence[str], ref_prefix: str,
+                          limit: int, attempt_prefix: str = "",
+                          retry_s: float = 0, terminal_prefix: str = "",
+                          max_attempts: int = 0, since: datetime | None = None) -> list[dict]:
+        """L539 (#1104) : les lots de `states` dont **aucun** lot ne porte la
+        référence `ref_prefix + <id>` (celui qui leur correspond), du plus
+        récemment modifié au plus ancien, `limit` au plus.
+
+        La borne porte sur les lots **manquants rendus**, jamais sur un
+        balayage préalable : un lot ancien encore manquant n'est pas caché par
+        `limit` lots plus récents déjà pourvus (R2 #1104 P2-2). `states` est un
+        seul ensemble ordonné, donc un `promoted` n'est pas affamé par des
+        `merged` plus récents. Lecture pure : ni verrou ni écriture.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : excluent aussi
+        **avant** la borne les lots dont le journal porte une tentative
+        `attempt_prefix<id>` plus récente que `retry_s` secondes (voir
+        `log_review_attempt`) — sinon les mêmes candidats sans ouverture
+        affameraient les plus anciens. Le délai écoulé, ils redeviennent
+        sélectionnables (délai, pas suppression).
+
+        `since` (arbitrage pilote du 15/10 sur le P2 de la R2 #1104) : ne rend
+        que les lots dont le jalon `merged` est à `since` ou après — la borne
+        d'activation (`review_catch_up_bound`), jamais un balayage historique.
+        Un lot sans jalon `merged` lisible est exclu (jamais deviné).
+
+        `terminal_prefix`/`max_attempts` (même arbitrage) : un lot dont le
+        journal porte une marque terminale `terminal_prefix<id>` est exclu
+        **toujours** (non-light confirmé, doute épuisé) ; un lot dont le
+        journal porte `max_attempts` tentatives `attempt_prefix<id>` ou plus
+        est exclu de même (le traitement d'un doute est borné, jamais horaire
+        à perpétuité)."""
+
+    @abc.abstractmethod
+    def review_catch_up_bound(self) -> str | None:
+        """L539 (#1104) : la borne d'activation du rattrapage des relectures
+        après fusion — la ligne unique écrite par la migration 0438 au moment
+        de l'activation du lot. Commune aux exécuteurs (base partagée),
+        conservée après redémarrage ; `None` si elle manque, et le rattrapage
+        est alors fail-closed (aucun balayage historique). Rendue en ISO-8601
+        (identique quel que soit le pilote), utilisable en paramètre SQL.
+        Lecture pure : ni verrou ni écriture."""
+
+    @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
              actor: str, held: bool = False) -> dict | None:
         """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et
@@ -1371,6 +1416,15 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def note(self, item_id: int, state: str, text: str, actor: str) -> None:
         """Journalise une note et rafraîchit `updated_at`."""
+
+    @abc.abstractmethod
+    def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        Le texte commence par le marqueur `<attempt_prefix><id>` (premier mot),
+        que `items_missing_ref` reconnaît ; le journal seul est écrit,
+        `updated_at` reste intact (une tentative de fond ne réordonne pas la
+        sélection et ne rend pas le lot actif)."""
 
     @abc.abstractmethod
     def lock_deep_analysis(self, item_id: int) -> None:
