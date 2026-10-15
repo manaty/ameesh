@@ -10,9 +10,11 @@ jalon, action liée, message lié (`agent_mailbox.work_item_id`). Un lot
 (`closed`, L29) sans activité depuis un seuil (défaut 6 h ; `--stale-after`,
 `AMEESH_STALE_AFTER`).
 
-L368: a future planned start or an explicit open commitment/plan dependency
-on another open lot defers stagnation; `planned_waits` resolves those sources
-for all three views, without interpreting notes or changing activity.
+L368: a future planned start, an explicit open commitment/plan dependency on
+another open lot, or a dated external hold (`gate:<name>` in a commitment's
+`depends_on`, ended by its due day) defers stagnation; `planned_waits` resolves
+those sources for all three views, without interpreting notes or changing
+activity.
 
 **Attente** (`waiting`) : `{what, who, label}`, déduite de l'état, des jalons
 (L10, lus par `progress._jalons_de_lot`) et des actions, jamais inventée
