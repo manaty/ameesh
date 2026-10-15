@@ -44,6 +44,7 @@ import uuid
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
+from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
@@ -345,6 +346,33 @@ class AgentWorker(threading.Thread):
         #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
         self.fast_failure = False
         self.fast_failures = 0
+        #: #1268 : série d'échecs de tour **réels** (hors hôte, auth, bail,
+        #: session fille), remise à zéro par un succès ; marquée dans
+        #: `status_text` avec le **début de l'épisode** (`since`), et lue par
+        #: l'alerte `critical_turn_failures`. Relue de la ligne : elle survit
+        #: au redémarrage de l'exécuteur, y compris pendant une tentative
+        #: (`begin_turn` la préserve).
+        from . import exploitation as exploitation_mod
+        self.failure_streak = exploitation_mod.failure_streak(agent.get("status_text"))
+        self.failure_since = 0.0
+        if self.failure_streak:
+            # marqueur d'avant le champ `since` : repli sur la date de la ligne
+            self.failure_since = (exploitation_mod.failure_since(agent.get("status_text"))
+                                  or float(agent.get("status_since_ts") or 0.0))
+        #: #1270 : épisode de débit/quota fournisseur, relu de la ligne comme la
+        #: série d'échecs — la reprise cadencée et son **échéance absolue**
+        #: (`retry at`) survivent au redémarrage et ne se court-circuitent pas.
+        etat_debit = rate_limit_mod.state(agent.get("status_text"))
+        self.rate_limit = etat_debit["kind"] if etat_debit else None
+        self.rate_limit_streak = etat_debit["streak"] if etat_debit else 0
+        self.rate_limit_since = etat_debit["since"] if etat_debit else 0.0
+        self.rate_limit_retry_at = 0.0
+        if etat_debit:
+            self.rate_limit_retry_at = etat_debit.get("retry_at") or 0.0
+            if not self.rate_limit_retry_at:
+                # marqueur d'avant `retry at` : repli sur la date de la ligne
+                self.rate_limit_retry_at = (float(agent.get("status_since_ts") or 0.0)
+                                            + etat_debit["wait"])
         self.last_activity = time.monotonic()
         #: #408 : dernière lecture des lots actionnables (règle 1)
         self._lot_wake_checked = float("-inf")
@@ -910,6 +938,23 @@ class AgentWorker(threading.Thread):
             return max(0.0, min(cap, self.lease_deadline - time.time()))
         return cap
 
+    def renew_wait(self, cap: float) -> float:
+        """Attente qui laisse un renouvellement **avant** l'échéance du bail.
+
+        `wait_timeout` borne l'attente à l'échéance même : une reprise plus
+        longue que le bail (#1270, jusqu'à 600 s pour un bail de 300 s)
+        dormait jusqu'à la deadline, puis `renew()` était refusé
+        (`deadline_passed`) — le worker rendait le bail au lieu de reprendre
+        (R1 cx3 B1). On découpe donc au pas du battement de tour (`ttl/3`),
+        sans plancher : la tranche vaut `min(cap, ttl/3)` et ne dépasse jamais
+        l'échéance du bail. Chaque tranche est suivie d'un `renew()` par
+        l'appelant (boucle de reprise, boucle principale).
+        """
+        pas = (self.runner.lease_ttl / 3.0) if self.runner.lease_ttl > 0 else 3.0
+        if self.lease_deadline > 0:
+            pas = min(pas, max(0.0, self.lease_deadline - time.time()))
+        return max(0.0, min(float(cap), pas))
+
     #: réveil maximal du veilleur : il relit l'échéance au moins à ce rythme.
     WATCHDOG_TICK = 0.25
 
@@ -1012,7 +1057,7 @@ class AgentWorker(threading.Thread):
         # L125 : un courrier passif (accusé, copie, diffusion) n'ouvre pas de tour
         if mail.unread_active(self.db, self.name, limit=1):
             return True
-        return self.idle_due()
+        return self.retry_due() or self.idle_due()
 
     def request_preempt(self) -> None:
         """Un message prioritaire préempte le tour en cours (0018, R19).
@@ -3089,6 +3134,9 @@ class AgentWorker(threading.Thread):
             # l'exécuteur reprend la MÊME session (registre), une fois.
             self._reprise_attach = False
             return {"kind": "idle", "prompt": adapters.ATTACH_RESUME_PROMPT, "ids": []}
+        if self.retry_due():
+            # #1270 : échéance d'une reprise cadencée sans consigne en attente
+            return {"kind": "idle", "prompt": adapters.RETRY_PROMPT, "ids": []}
         if all(mail.passive_reason(m) for m in messages):
             # #408 : un courrier qui réveillera l'agent passe avant (fenêtre L125)
             reveil = self._lot_wake_spec()
@@ -3595,6 +3643,55 @@ class AgentWorker(threading.Thread):
             return spec, []
         return dict(spec, prompt=note + spec["prompt"]), dits
 
+    def modele_du_tour(self, harness: str, adapter, *, emprunte: bool) -> str:
+        """Le modèle passé au harnais du tour (0019) : vide si le harnais est
+        emprunté (L242b), vide aussi quand le réglage appartient positivement à
+        la famille d'un **autre** harnais (#1268 : ligne de registre héritée
+        d'une bascule, #1037 — la passer ferait un 400 côté fournisseur) ;
+        sinon le réglage de l'agent, ou le défaut livré par le descripteur
+        (DeepSeek, L60). Un identifiant de famille inconnue n'est jamais
+        refusé : on ne devine pas."""
+        model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
+        if model and cost_mod.foreign_harness_model(harness, model):
+            vu = self.__dict__.get("_foreign_model_seen")
+            if vu != model:
+                self._foreign_model_seen = model
+                log_async("[%s] model %s ignored for harness %s: it belongs to another "
+                          "harness's family (stale registry setting); the harness default "
+                          "is used" % (self.name, model, harness))
+                self._fil_note(
+                    "Model %s was ignored for harness %s: it belongs to another "
+                    "harness's family (stale registry setting, #1268). The harness "
+                    "default is used for this turn." % (model, harness),
+                    meta={"action": "modele-etranger", "modele": model, "harnais": harness})
+            model = ""
+        if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
+            # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
+            # du descripteur est passé explicitement. Le modèle du tour est
+            # alors connu (grand livre au bon tarif, jamais « inconnu ») au
+            # lieu de dépendre du profil local du harnais.
+            model = adapter.spec.defaults["model"]
+        return model
+
+    def _marqueurs_durables(self, base: str) -> str:
+        """Le statut d'un tour **en cours** garde les marqueurs durables posés
+        par les échecs précédents (#1268/#1270) : `begin_turn` ne les efface
+        plus, donc un redémarrage pendant la tentative relit la série, son
+        début d'épisode et l'échéance de reprise — sans les recalculer (une
+        échéance n'est jamais repoussée par une tentative interrompue)."""
+        texte = base
+        if self.rate_limit:
+            texte = rate_limit_mod.status_text(
+                texte, self.rate_limit, self.rate_limit_streak, self.rate_limit_since,
+                rate_limit_mod.delay(self.rate_limit_streak),
+                retry_at=self.rate_limit_retry_at or None)
+        if self.failure_streak:
+            from . import exploitation as exploitation_mod
+            texte = exploitation_mod.turn_failure_status_text(
+                texte, self.failure_streak, critical=account_turn.is_critical(self),
+                since=self.failure_since)
+        return texte
+
     def _run_turn(self, spec: dict) -> bool:
         # Travail de fond des tours précédents : en tête de consigne.
         spec, fond_dits = self._with_background_note(spec)
@@ -3626,13 +3723,7 @@ class AgentWorker(threading.Thread):
         resume = self._ouverture()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
-        model = "" if emprunte else (self.agent.get("model") or self._state_read("model"))
-        if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
-            # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
-            # du descripteur est passé explicitement. Le modèle du tour est
-            # alors connu (grand livre au bon tarif, jamais « inconnu ») au
-            # lieu de dépendre du profil local du harnais.
-            model = adapter.spec.defaults["model"]
+        model = self.modele_du_tour(harness, adapter, emprunte=emprunte)
         effort = "" if emprunte else (self._state_read("effort")
                                       or self.agent.get("effort") or "")
         # Tier (L26) : passé par le descripteur du harnais (Codex :
@@ -3677,7 +3768,8 @@ class AgentWorker(threading.Thread):
                 % (self.name, shown, session or "new", " ".join(argv)))
             return True
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                                   "%s turn (%s)" % (shown, harness)):
+                                   self._marqueurs_durables(
+                                       "%s turn (%s)" % (shown, harness))):
             log("[%s] lease lost or agent stopped before the turn" % self.name)
             return False
         lot = spec.get("lot")
@@ -4235,6 +4327,7 @@ class AgentWorker(threading.Thread):
                 "goes back in the queue and the priority message goes first.",
                 meta={"action": "interruption", "tour_s": round(duration, 1)})
             return False
+        session_fille_ecartee = False
         if not ok:
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
             # d'être effacée par end_turn. Au pire elle est rejouée.
@@ -4290,25 +4383,86 @@ class AgentWorker(threading.Thread):
                 self.last_activity = time.monotonic()
                 self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
-            if session and adapters.child_session_refused(error):
+            session_fille_ecartee = bool(session and adapters.child_session_refused(error))
+            if session_fille_ecartee:
                 # L166 : la session reprise était une session fille ; la
-                # reprendre encore échouerait de même. Pas un échec rapide :
-                # le tour suivant repart d'une session saine.
+                # reprendre encore échouerait de même. Pas un échec rapide, et
+                # pas un échec « réel » de la série #1268 (B2) : le tour suivant
+                # repart d'une session saine.
                 self.fast_failure = False
                 self._avec_reprise("child session discarded",
                                    self._ecarte_session_fille, session)
+            # #1270 : une panne passagère du fournisseur (429, 5xx, flux
+            # DeepSeek) n'est pas un échec rapide — elle attend puis reprend
+            # seule, à délais cadencés. Un quota épuisé suit la même cadence
+            # mais reste compté par L48 : cinq refus arrêtent l'agent, un
+            # plafond n'est pas repris sans fin ; la garde comptable (L226b)
+            # reste seule juge du budget. Un échec d'une autre cause
+            # efface l'épisode (hors refus de session fille, qui n'est pas une
+            # panne fournisseur et n'efface ni n'étend l'épisode).
+            genre = rate_limit_mod.classify(
+                error, self.last_final,
+                auth_failure.stderr_tail(stderr_path, start=stderr_debut))
+            if genre:
+                if genre == rate_limit_mod.RATE_LIMITED:
+                    self.fast_failure = False
+                if genre == self.rate_limit:
+                    self.rate_limit_streak += 1
+                else:
+                    self.rate_limit = genre
+                    self.rate_limit_streak = 1
+                    self.rate_limit_since = time.time()
+                # échéance absolue, écrite dans `status_text` : elle survit au
+                # redémarrage et ne se recalcule pas à chaque réveil (#1270 B1)
+                self.rate_limit_retry_at = (time.time() + rate_limit_mod.delay(
+                    self.rate_limit_streak))
+            elif not session_fille_ecartee:
+                self.rate_limit = None
+                self.rate_limit_streak = 0
+                self.rate_limit_since = 0.0
+                self.rate_limit_retry_at = 0.0
         if self._session_en_attente is not None:
             self._avec_reprise("turn session", self._enregistre_session)
         if ok and clos:
             self._turn_closed(cloture or "cap", duration)
         elif ok:
             self._note_courrier_borne(turn_id, duration)
+        # #1268 : série d'échecs de tour **réels**. Les échecs classés (hôte,
+        # authentification, bail) sont rendus plus haut ; le refus d'une
+        # session fille est écarté ici — il ne compte pas dans la série (B2)
+        # et ne l'efface pas non plus : seul un succès remet la série à zéro.
+        if ok:
+            self.failure_streak = 0
+            self.failure_since = 0.0
+            self.rate_limit, self.rate_limit_streak, self.rate_limit_since = None, 0, 0.0
+            self.rate_limit_retry_at = 0.0
+        elif not session_fille_ecartee:
+            if self.failure_streak < 1:
+                # début d'épisode : il ne bouge plus tant qu'un succès n'a pas
+                # remis la série à zéro (clé d'alerte stable, #1268 B1)
+                self.failure_since = time.time()
+            self.failure_streak += 1
+        texte_fin = ("%s in %ds%s" % (shown, int(duration), "" if ok else " (failed)")
+                     + (" (closed: %s)" % cloture.split(":")[0]
+                        if ok and clos and cloture else ""))
+        if not ok and self.rate_limit:
+            # #1270 : l'épisode de débit est écrit dans le statut — visible
+            # dans `ameesh list`/`show`, relu après un redémarrage, et lu par
+            # l'alerte #1268 (seuil de 15 min). `retry at` porte l'échéance
+            # absolue, jamais recalculée à la relecture.
+            texte_fin = rate_limit_mod.status_text(
+                texte_fin, self.rate_limit, self.rate_limit_streak,
+                self.rate_limit_since, rate_limit_mod.delay(self.rate_limit_streak),
+                retry_at=self.rate_limit_retry_at or None)
+        if not ok and self.failure_streak:
+            from . import exploitation as exploitation_mod
+            texte_fin = exploitation_mod.turn_failure_status_text(
+                texte_fin, self.failure_streak,
+                critical=account_turn.is_critical(self), since=self.failure_since)
         self._avec_reprise(
             "end of turn", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,
-            status=status,
-            status_text="%s in %ds%s" % (shown, int(duration), "" if ok else " (failed)")
-            + (" (closed: %s)" % cloture.split(":")[0] if ok and clos and cloture else ""),
+            status=status, status_text=texte_fin,
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
@@ -4403,14 +4557,92 @@ class AgentWorker(threading.Thread):
         threading.Thread(target=copy_session, daemon=True,
                          name="%s-session-backup" % self.name).start()
 
+    def retry_remaining(self) -> float:
+        """#1270 : secondes restantes avant la reprise cadencée durable, 0 sinon.
+
+        L'échéance (`retry at`) est celle écrite au tour en échec : elle est
+        relue de la ligne après un redémarrage et ne se recalcule pas. C'est
+        elle qui garde le lancement — un courrier, un reset ou le budget ne la
+        court-circuitent pas (B1 cx3)."""
+        if not self.rate_limit:
+            return 0.0
+        if self.rate_limit_retry_at:
+            return max(0.0, self.rate_limit_retry_at - time.time())
+        return rate_limit_mod.delay(self.rate_limit_streak)
+
+    def retry_due(self) -> bool:
+        """#1270 : un tour de reprise est dû — l'échéance d'un épisode de
+        débit passager est passée. Seul un tour de consigne remet sa consigne
+        en attente ; un tour de courrier, d'événements ou de reprise en échec
+        ne laisse rien (le courrier est soldé au lancement), et l'agent
+        restait `blocked` jusqu'au courrier suivant ou à la relance
+        d'inactivité — cas réels du 14/10 (Codex, tour « événements ») et du
+        15/10 (DeepSeek, tour « messages »). Un quota épuisé n'est pas repris
+        ainsi : il n'est pas repris sans fin."""
+        return (self.rate_limit == rate_limit_mod.RATE_LIMITED
+                and self.retry_remaining() <= 0)
+
+    def _attendre_reprise(self, duree: float) -> None:
+        """Attend l'échéance de reprise sans se laisser court-circuiter.
+
+        Les réveils (courrier, reset, budget) sont consommés sans lancer de
+        tour ; le bail est renouvelé **avant son échéance**, par tranches de
+        `renew_wait` (B1 cx3 : dormir jusqu'à la deadline faisait refuser le
+        renouvellement au réveil), et l'arrêt, le drainage ou la fermeture de
+        la porte d'hôte interrompent l'attente."""
+        fin = time.monotonic() + max(0.0, float(duree))
+        while not self.stopping.is_set() and not self.runner.stop.is_set():
+            if self.runner.draining.is_set() or self.runner.gate_holds():
+                return
+            reste = fin - time.monotonic()
+            if reste <= 0:
+                return
+            self.wake.wait(timeout=self.renew_wait(reste))
+            self.wake.clear()
+            if not self.renew():
+                return
+
+    def _attendre_apres_echec(self, duree: float) -> None:
+        """Attend `duree` après un échec, bail renouvelé, **sans troncature**.
+
+        Quand la durée tient sous le pas de renouvellement (`renew_wait`),
+        un seul `wake.wait` suffit — écourté par un réveil (courrier) comme
+        avant. Au-delà (#1270 : une reprise cadencée peut dépasser le bail de
+        300 s), l'attente se découpe et le bail est renouvelé entre les
+        tranches : dormir jusqu'à l'échéance faisait refuser `renew()` au
+        réveil et le worker rendait le bail (R1 cx3 B1)."""
+        fin = time.monotonic() + max(0.0, float(duree))
+        while not self.stopping.is_set() and not self.runner.stop.is_set():
+            reste = fin - time.monotonic()
+            if reste <= 0:
+                return
+            tranche = self.renew_wait(reste)
+            reveil = self.wake.wait(timeout=tranche)
+            self.wake.clear()
+            if reveil or tranche >= reste:
+                return
+            if not self.renew():
+                return
+
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec
-        rapide consécutif, bornée par `failure_backoff_max` (L48)."""
+        consécutif, bornée par `failure_backoff_max` (L48).
+
+        #1268 : la série d'échecs **réels** compte aussi (pas seulement les
+        échecs rapides) — un harnais qui échoue lentement ne doit pas être
+        relancé toutes les 5 s sans fin.
+
+        #1270 : pour un épisode de débit/quota, c'est le temps **restant**
+        jusqu'à l'échéance durable (`retry at`) — jamais un délai repoussé par
+        un réveil ; L48 n'arrête jamais un débit passager, un quota si."""
+        if self.rate_limit:
+            return self.retry_remaining()
         base = self.runner.failure_backoff
-        if self.fast_failures <= 1:
+        n = max(self.fast_failures, self.failure_streak)
+        if n <= 1:
             return base
         return min(self.runner.failure_backoff_max,
-                   base * (2 ** (self.fast_failures - 1)))
+                   base * (2 ** (n - 1)))
 
     def _sync_memory(self) -> None:
         """Transport the persona session's memory changes at turn end, in the background."""
@@ -4497,6 +4729,14 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            # #1270 B1 : pas de tentative avant l'échéance de reprise durable ;
+            # un réveil déjà posé ne fait pas repartir le tour plus tôt.
+            if self.retry_remaining() > 0:
+                if time.monotonic() >= deadline:
+                    return False
+                self.wake.wait(timeout=min(0.25, max(0.02, deadline - time.monotonic())))
+                self.wake.clear()
+                continue
             self.apply_restart_if_requested()
             self.maybe_rotate()
             spec = self.rotate_for_lot(self.pick())
@@ -4547,6 +4787,15 @@ class AgentWorker(threading.Thread):
                         break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
+                    # #1270 B1 : l'échéance de reprise durable garde le
+                    # lancement du tour ; un courrier, un reset ou le budget
+                    # ne la court-circuitent pas — l'attente consomme les
+                    # réveils et renouvelle le bail. Aucune consigne n'est
+                    # consommée avant l'échéance (`pick` est après).
+                    attente_reprise = self.retry_remaining()
+                    if attente_reprise > 0:
+                        self._attendre_reprise(attente_reprise)
+                        continue
                     spec = self.rotate_for_lot(self.pick())
                     if spec is not None and self._moved_before_turn(spec):
                         break
@@ -4588,8 +4837,12 @@ class AgentWorker(threading.Thread):
                 # Un message non remis ou un harnais en échec ne doit pas
                 # produire une boucle serrée : on laisse retomber, de plus en
                 # plus longtemps tant que les échecs rapides se suivent (L48).
-                self.wake.wait(timeout=self.failure_wait())
-                self.wake.clear()
+                # L'attente est honorée en entier mais découpée au pas du
+                # battement (`_attendre_apres_echec`) : le worker renouvelle son
+                # bail au lieu de dormir jusqu'à l'échéance, sinon `renew()`
+                # refusait au réveil (B1 cx3) — #1270 : la reprise cadencée peut
+                # dépasser le bail.
+                self._attendre_apres_echec(self.failure_wait())
         finally:
             self._mark_power_stop()
             self.release_lease()
