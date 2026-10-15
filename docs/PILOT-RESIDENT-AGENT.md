@@ -40,6 +40,11 @@ are what the pilot is expected to exercise.
 | Liveness and silence | answered probes; `resident silent: no answer to the liveness probe` and `silent between turns` lines; sleeps, wakes, resident restarts | host journal |
 | Lease | the resident group dies with the lease (stop, epoch change, host withdrawal), checked once on purpose | host journal, `turn_resources` |
 
+The liveness probe of the table above is a second `initialize` on the control
+channel, sent outside a turn and bounded (`probe(timeout)`). The Claude CLI
+answers `success` to it without a model call, so a probe that brings back no
+answer is a silent resident, not a refusal.
+
 The study's own warning is kept: the token cost follows the size of the
 session, not the mode. A cost difference between two windows is not read as an
 effect of the resident mode unless traffic and session size are comparable —
