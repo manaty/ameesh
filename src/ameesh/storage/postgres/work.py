@@ -521,21 +521,6 @@ class WorkItems(interface.WorkItems):
             (assignee, today, int(item_id or 0)))
         return int(rows[0]["id"]) if rows else None
 
-    def _pending(self, assignee, item_id) -> int | None:
-        """#540 (porté de #555), dans la transaction ouverte et sous le verrou
-        de l'agent : son plus ancien lot ouvert non démarré **qui l'occupe**
-        (L165b : ni en attente d'un autre, ni prévu pour plus tard) autre que
-        `item_id`, ou None."""
-        import datetime as _dt
-        self.db.query(PENDING_LOCK, (assignee,))
-        rows = self.db.query(
-            "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
-            "   AND state NOT IN %s AND state NOT IN %s"
-            "   AND (planned_start IS NULL OR planned_start <= %%s::date)"
-            "   AND id <> %%s ORDER BY id LIMIT 1" % (_CLOSED, _WAITING_ON_OTHERS),
-            (assignee, _dt.date.today().isoformat(), int(item_id or 0)))
-        return int(rows[0]["id"]) if rows else None
-
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
         """`assign` dans la transaction ouverte ; `state` : celui exigé.
 
