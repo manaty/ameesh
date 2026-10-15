@@ -663,3 +663,11 @@ Tranché le 13/10 :
 7. **Portes** — les deux portes locales suffisent-elles pour le pilote, ou
    faut-il des portes par chemin (`scripts/__tests__/*.test.mjs`) dès le
    premier jour ?
+8. **Acceptation du jour pilote (Nexlink) — 15/10 13:19Z** — l'orchestrateur
+   Nexlink accepte le jour pilote sur la base du présent dossier
+   (`@3c921745` : profil `radar-nexlink.json`, unité unique `orchestrateur`,
+   `land: "pr"` sur `develop`). Planification une fois le build 1.11.1 déployé
+   en staging, avec pré-vol re-qualifié et feu `mesh-design` distinct ;
+   l'orchestrateur est prévenu la veille du créneau, les paquets Nexlink
+   restent sur le chemin actuel jusque-là. (source : courrier orchestrateur
+   15/10 13:18:59Z, #58691)
