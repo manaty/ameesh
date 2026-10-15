@@ -180,6 +180,26 @@ def read_plan(path: str) -> dict:
     return data
 
 
+def planned_modules(plan: dict) -> tuple[str, ...]:
+    """Les modules que les parts du plan exécuteront, sans doublon.
+
+    Le plan L161f (`scripts/test-plan.py`) porte les listes dans
+    `parts.<pilote>[].modules` ; `selection.modules` n'est qu'un **compte**
+    (`selected`, `impacted`, `contract` aussi). La sélection se lit donc dans
+    ses parts : lire le compte comme une liste faisait échouer la commande sur
+    un vrai plan (`TypeError`), défaut trouvé par la preuve réelle (#1770)."""
+    modules: list[str] = []
+    seen: set[str] = set()
+    for _driver, listed in sorted((plan.get("parts") or {}).items()):
+        for part in listed or ():
+            for name in (part.get("modules") if isinstance(part, dict) else None) or ():
+                text = str(name)
+                if text not in seen:
+                    seen.add(text)
+                    modules.append(text)
+    return tuple(modules)
+
+
 def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> Selection:
     """La sélection d'un plan pour la tête `head`, ou les causes du refus.
 
@@ -201,7 +221,7 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
         causes.append("card-missing" if _missing(problem) else "card-stale")
         why.append(problem)
     sel = plan.get("selection") if isinstance(plan.get("selection"), dict) else {}
-    modules = tuple(str(m) for m in (sel.get("modules") or ()))
+    modules = planned_modules(plan)
     mode = str(sel.get("mode") or "")
     if mode == "full":
         causes.append("selection-full")
@@ -237,16 +257,12 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
                           "of": part.get("of"), "label": part.get("label") or "",
                           "modules": tuple(str(m) for m in listed_modules),
                           "estimate_s": part.get("estimate_s")})
-    seen: set = set()
-    for part in parts:
-        seen.update(part["modules"])
-    if modules and not set(modules) <= seen:
+    announced = sel.get("selected")
+    if isinstance(announced, int) and not isinstance(announced, bool) \
+            and announced != len(modules):
         causes.append("selection-unsafe")
-        why.append("modules sélectionnés hors des parts: %s"
-                   % ", ".join(sorted(set(modules) - seen)[:3]))
-    if modules and not parts:
-        causes.append("selection-unsafe")
-        why.append("aucune part exécutable")
+        why.append("plan incohérent: %d module(s) annoncés, %d dans les parts"
+                   % (announced, len(modules)))
     unique: list[str] = []
     for cause in causes:
         if cause not in unique:
@@ -421,7 +437,7 @@ def meets_canon(plan: dict, params) -> tuple[bool, str]:
                 if isinstance(entry, (list, tuple)) and entry
                 and str(entry[0]) in declared}
     expected |= contract
-    chosen = {str(m) for m in ((plan.get("selection") or {}).get("modules") or ())}
+    chosen = set(planned_modules(plan))
     missing = sorted(expected - chosen)
     extra = sorted(chosen - expected)
     if missing:
