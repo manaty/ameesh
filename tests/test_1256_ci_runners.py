@@ -646,26 +646,32 @@ class CiRunnersTest(unittest.TestCase):
 
     @unittest.skipIf(os.geteuid() == 0, "the real-deposit seam is a non-root run")
     def test_a_real_deposit_refuses_a_source_that_changed(self):
-        """La source est relue pour la copie invitée : un tube qui rend A à la
-        validation puis B à la copie est refusé AVANT publication. Vérifier
-        l'empreinte après le lien laissait consommer B puis échouait (R2 cx2
-        B2, #1256)."""
-        valid = jit_config()
-        other = jit_config(repo="https://github.com/other/repo")
-        fifo = os.path.join(self.host, "root/fifo.b64")
-        os.makedirs(os.path.dirname(fifo), exist_ok=True)
-        os.mkfifo(fifo)
-        writer = subprocess.Popen(
-            ["sh", "-c", 'printf %s "$1" > "$3"; sleep 1; printf %s "$2" > "$3"',
-             "sh", valid, other, fifo])
-        self.addCleanup(writer.wait)
+        """Le shim remplace A par B après validation, avant la copie invitée,
+        sans dépendre d'un délai. Aucun lien ne doit être tenté : le seul
+        spool final vide ne détectait pas publier-puis-retirer (B2, #1256)."""
+        self.deposit_file(1)
+        self.write("root/other.b64", jit_config(repo="https://github.com/other/repo"))
+        self.write("bin/runuser", "#!/bin/sh\n"
+                   "[ \"$1\" = -u ] && shift 2\n"
+                   "[ \"$1\" = -- ] && shift\n"
+                   # The shell has opened stdin already: overwrite the same
+                   # inode before the guest command reads from that descriptor.
+                   'cat "$CI_RUNNERS_TEST_HOST/root/other.b64" '
+                   '> "$CI_RUNNERS_TEST_HOST/root/jit-r1.b64"\n'
+                   'exec "$@"\n', mode=0o755)
+        real_ln = shutil.which("ln")
+        self.assertIsNotNone(real_ln)
+        self.write("bin/ln", "#!/bin/sh\n"
+                   ': > "$CI_RUNNERS_TEST_HOST/link-attempted"\n'
+                   'exec "$CI_RUNNERS_TEST_LN" "$@"\n', mode=0o755)
         self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
-        res = self.real_run("--deposit", "/root/fifo.b64", "--host", "ci-3")
+        res = self.real_run("--deposit", "/root/jit-r1.b64", "--host", "ci-3",
+                            CI_RUNNERS_TEST_LN=real_ln)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("changed while being deposited", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.host, "link-attempted")))
         spool = os.path.join(self.host, "srv/ameesh-guest/ci/jit/r1")
         self.assertEqual(sorted(os.listdir(spool)), [".keep"])
-        writer.wait(timeout=10)
 
     def test_deposit_prints_one_configuration_and_never_its_bytes(self):
         blob = jit_config()
