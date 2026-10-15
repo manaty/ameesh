@@ -54,6 +54,10 @@
   ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
         the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
         docs/api/openapi-v1.json);
+  ameesh github gestes [--since 24h] [--agent A] [--match 'run cancel'] [--json]
+        | identity <agent> [--json]
+        the gh commands run by agents, journaled per turn (who cancelled,
+        merged, labelled), and the GitHub identity an agent resolves to (#1645);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -243,6 +247,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "activity":
         from . import activity
         return activity.main(rest)
+    if command == "github":
+        # #1645 : journal des gestes gh des agents, identité GitHub par rôle
+        from . import github_identity
+        return github_identity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)

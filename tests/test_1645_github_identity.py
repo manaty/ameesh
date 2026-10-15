@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#1645 — journal des gestes gh d'un tour et identité GitHub par rôle.
+
+Sans base : `github_identity` ne lit que des fichiers (configuration, jeton,
+journal) et l'environnement du tour.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import pathlib
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+from ameesh import github_identity as gi  # noqa: E402
+
+#: un faux `gh` : écrit ses arguments sur la sortie et sort en 3
+FAUX_GH = """#!/bin/sh
+printf '%s\\n' "$*"
+printf 'GH_TOKEN=%s\\n' "${GH_TOKEN:-}"
+exit 3
+"""
+JETON = "ghp_" + "A" * 36
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.racine = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.racine, True)
+        self.config = self.racine / "config"
+        self.state = self.racine / "state"
+        self.config.mkdir()
+        self.state.mkdir()
+        self.bin = self.racine / "vraibin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(FAUX_GH)
+        gh.chmod(0o755)
+
+    def ecrire_config(self, data: dict) -> None:
+        (self.config / gi.CONFIG_NAME).write_text(json.dumps(data))
+
+    def jeton(self, nom: str, mode: int = 0o600, contenu: str = JETON) -> str:
+        chemin = self.racine / nom
+        chemin.write_text(contenu + "\n")
+        chemin.chmod(mode)
+        return str(chemin)
+
+    def env_tour(self, agent: str = "dev-x", lot: str | None = "1645") -> tuple[dict, dict]:
+        env = {"PATH": str(self.bin) + os.pathsep + "/usr/bin:/bin",
+               "GITHUB_TOKEN": "hérité", "AGENT_MAIL_NAME": agent,
+               "AMEESH_TURN_ID": "tour-1", "AMEESH_HOST": "hote"}
+        info = gi.apply(env, agent, str(self.config), str(self.state), lot)
+        return env, info
+
+
+class ResolutionTest(Base):
+    def test_sans_configuration_identite_heritee_et_journal_actif(self):
+        info = gi.resolve(str(self.config), "dev-x")
+        self.assertEqual(info["identity"], "inherited")
+        self.assertEqual(info["role"], "")
+        self.assertTrue(info["journal"])
+        self.assertEqual(info["problem"], "")
+
+    def test_role_nomme_prime_sur_le_role_par_defaut(self):
+        self.ecrire_config({"default_role": "agent", "roles": {
+            "agent": {"token_file": self.jeton("agent.token")},
+            "pilote": {"token_file": self.jeton("pilote.token"),
+                       "agents": ["mesh-design"]}}})
+        self.assertEqual(gi.resolve(str(self.config), "mesh-design")["role"], "pilote")
+        self.assertEqual(gi.resolve(str(self.config), "dev-x")["role"], "agent")
+        self.assertEqual(gi.resolve(str(self.config), "dev-x")["identity"], "role")
+
+    def test_jeton_lisible_par_d_autres_comptes_refuse(self):
+        self.ecrire_config({"default_role": "agent", "roles": {
+            "agent": {"token_file": self.jeton("agent.token", 0o644)}}})
+        info = gi.resolve(str(self.config), "dev-x")
+        self.assertEqual(info["identity"], "inherited")
+        self.assertIn("0600", info["problem"])
+
+    def test_configuration_illisible_garde_l_identite_heritee(self):
+        (self.config / gi.CONFIG_NAME).write_text("{pas du json")
+        info = gi.resolve(str(self.config), "dev-x")
+        self.assertEqual(info["identity"], "inherited")
+        self.assertIn("illisible", info["problem"])
+
+    def test_la_resolution_ne_rend_jamais_le_jeton(self):
+        self.ecrire_config({"default_role": "agent", "roles": {
+            "agent": {"token_file": self.jeton("agent.token")}}})
+        self.assertNotIn(JETON, json.dumps(gi.resolve(str(self.config), "dev-x")))
+
+
+class ApplicationTest(Base):
+    def test_sans_role_l_environnement_d_identite_est_inchange(self):
+        env, info = self.env_tour()
+        self.assertEqual(env["GITHUB_TOKEN"], "hérité")
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("GH_CONFIG_DIR", env)
+        self.assertNotIn("GIT_CONFIG_COUNT", env)
+
+    def test_role_configure_pose_son_jeton_et_isole_gh_et_git(self):
+        self.ecrire_config({"default_role": "agent", "roles": {
+            "agent": {"token_file": self.jeton("agent.token")}}})
+        env = {"PATH": str(self.bin), "GITHUB_TOKEN": "hérité",
+               "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.x",
+               "GIT_CONFIG_VALUE_0": "1"}
+        gi.apply(env, "dev-x", str(self.config), str(self.state))
+        self.assertEqual(env["GH_TOKEN"], JETON)
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertEqual(env[gi.ENV_ROLE], "agent")
+        self.assertTrue(os.path.isdir(env["GH_CONFIG_DIR"]))
+        self.assertEqual(os.listdir(env["GH_CONFIG_DIR"]), [])
+        # la clé existante est gardée ; la liste des assistants est vidée
+        # pour github.com, puis l'assistant du rôle est ajouté
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "core.x")
+        self.assertEqual(env["GIT_CONFIG_VALUE_1"], "")
+        self.assertIn("GH_TOKEN", env["GIT_CONFIG_VALUE_2"])
+        self.assertEqual(env["GIT_CONFIG_KEY_2"], "credential.https://github.com.helper")
+
+    def test_assistant_git_rend_le_jeton_du_role(self):
+        self.ecrire_config({"default_role": "agent", "roles": {
+            "agent": {"token_file": self.jeton("agent.token")}}})
+        env, _ = self.env_tour()
+        env["HOME"] = str(self.racine)  # aucune configuration git globale
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        sortie = subprocess.run(
+            ["git", "credential", "fill"], input="protocol=https\nhost=github.com\n\n",
+            env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(sortie.returncode, 0, sortie.stderr)
+        self.assertIn("password=%s" % JETON, sortie.stdout)
+        self.assertIn("username=x-access-token", sortie.stdout)
+
+    def test_journal_desactive_par_la_configuration(self):
+        self.ecrire_config({"journal": False})
+        env, _ = self.env_tour()
+        self.assertEqual(env["PATH"].split(os.pathsep)[0], str(self.bin))
+        self.assertNotIn(gi.ENV_JOURNAL, env)
+
+    def test_sans_gh_sur_le_path_le_journal_est_sans_objet(self):
+        env = {"PATH": str(self.racine / "vide")}
+        info = gi.apply(env, "dev-x", str(self.config), str(self.state))
+        self.assertEqual(env["PATH"], str(self.racine / "vide"))
+        self.assertIn("gh absent", info["problem"])
+
+    def test_le_vrai_gh_exclut_le_dossier_genere(self):
+        env, _ = self.env_tour()
+        dossier = env["PATH"].split(os.pathsep)[0]
+        # un second tour hérite d'un PATH qui contient déjà le gh généré
+        self.assertEqual(gi.real_gh(env["PATH"], dossier), str(self.bin / "gh"))
+
+
+class JournalTest(Base):
+    def lancer(self, env: dict, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["gh", *args], env=env, capture_output=True,
+                              text=True, timeout=30)
+
+    def test_le_geste_est_consigne_et_la_commande_inchangee(self):
+        env, _ = self.env_tour(agent="dev-x", lot="1645")
+        long = "x" * (gi.ARG_MAX + 50)
+        sortie = self.lancer(env, "run", "cancel", "38709406320", "--body", JETON, long)
+        # le vrai gh a tourné avec ses arguments intacts, code de sortie gardé
+        self.assertEqual(sortie.returncode, 3)
+        self.assertIn("run cancel 38709406320 --body %s %s" % (JETON, long), sortie.stdout)
+        gestes = gi.read_journal(str(self.state))
+        self.assertEqual(len(gestes), 1)
+        geste = gestes[0]
+        self.assertEqual((geste["agent"], geste["lot"], geste["turn"], geste["host"]),
+                         ("dev-x", "1645", "tour-1", "hote"))
+        self.assertEqual(geste["argv"][:3], ["run", "cancel", "38709406320"])
+        self.assertNotIn(JETON, json.dumps(geste))  # jamais de jeton au journal
+        self.assertEqual(geste["argv"][4], "[jeton]")
+        self.assertEqual(len(geste["argv"][5]), gi.ARG_MAX + 1)  # tronqué, « … »
+        fichier = next((self.state / "github").glob("gestes-*.jsonl"))
+        self.assertEqual(stat.S_IMODE(fichier.stat().st_mode), 0o600)
+
+    def test_le_role_est_consigne_et_le_jeton_transmis(self):
+        self.ecrire_config({"default_role": "agent", "roles": {
+            "agent": {"token_file": self.jeton("agent.token")}}})
+        env, _ = self.env_tour()
+        sortie = self.lancer(env, "pr", "merge", "12")
+        self.assertIn("GH_TOKEN=%s" % JETON, sortie.stdout)
+        self.assertEqual(gi.read_journal(str(self.state))[0]["role"], "agent")
+
+    def test_un_journal_inscriptible_ne_bloque_jamais_la_commande(self):
+        env, _ = self.env_tour()
+        bloque = self.racine / "fichier"
+        bloque.write_text("")
+        env[gi.ENV_JOURNAL] = str(bloque / "sous" / "gestes.jsonl")
+        sortie = self.lancer(env, "pr", "view", "1")
+        self.assertEqual(sortie.returncode, 3)
+        self.assertIn("pr view 1", sortie.stdout)
+        self.assertIn("journal gh non écrit", sortie.stderr)
+
+    def test_lecture_filtree_par_agent_motif_et_periode(self):
+        dossier = self.state / "github"
+        dossier.mkdir()
+        maintenant = datetime.datetime(2026, 10, 15, 12, 0, tzinfo=datetime.timezone.utc)
+        lignes = [
+            {"ts": "2026-10-15T11:50:00+0000", "agent": "a", "argv": ["run", "cancel", "9"]},
+            {"ts": "2026-10-15T11:55:00+0000", "agent": "b", "argv": ["pr", "merge", "3"]},
+            {"ts": "2026-10-14T08:00:00+0000", "agent": "a", "argv": ["run", "cancel", "8"]},
+        ]
+        (dossier / "gestes-2026-10.jsonl").write_text(
+            "".join(json.dumps(l) + "\n" for l in lignes) + "{ligne coupée\n")
+        lire = lambda **k: gi.read_journal(str(self.state), now=maintenant, **k)  # noqa: E731
+        self.assertEqual(len(lire()), 3)
+        self.assertEqual([g["argv"][2] for g in lire(match="run cancel")], ["8", "9"])
+        self.assertEqual([g["argv"][2] for g in lire(since=datetime.timedelta(hours=1))],
+                         ["9", "3"])
+        self.assertEqual([g["agent"] for g in lire(agent="b")], ["b"])
+
+
+class ExecuteurTest(Base):
+    """Le câblage : une session `attach` reçoit le journal comme un tour."""
+
+    def test_session_attachee_journalisee(self):
+        from unittest import mock
+        from ameesh import runner
+        from ameesh.config import Config
+        cfg = Config(state_dir=str(self.state), config_dir=str(self.config))
+        with mock.patch.dict(os.environ, {"PATH": str(self.bin) + os.pathsep + "/usr/bin:/bin"}):
+            env = runner._attach_env(cfg, "dev-x", "attach:u@h", 3)
+        self.assertEqual(env[gi.ENV_REAL], str(self.bin / "gh"))
+        self.assertTrue(env["PATH"].startswith(str(self.state / "github" / "bin")))
+        self.assertEqual(env["AGENT_MAIL_NAME"], "dev-x")
+
+
+if __name__ == "__main__":
+    unittest.main()
