@@ -29,8 +29,10 @@ one is running); `steer(text)` serves an input at the safe point of the
 running turn (outside a turn, it is `send`); `interrupt()` ends the running
 turn without killing the process; `probe(timeout)` checks, bounded, that the
 harness answers — a control round-trip (`initialize` again for Claude,
-`thread/read` for Codex, `session/list` for ACP), where any answer, a refusal
-too, proves it alive; `close()` stops the process group. A turn steered one or
+`thread/read` for Codex, `session/list` for ACP). The Claude CLI answers
+`success` to the second `initialize` (observed, no model call), so any answer
+proves it alive, a refusal from another harness too; only silence is a failure.
+`close()` stops the process group. A turn steered one or
 more times stays **one** logical turn: its `TurnResult` lists every input it
 served, whatever the protocol does underneath (a second `result` for Claude, a
 second `turn/start` for Codex when the steer lost the race against the end of
@@ -105,7 +107,9 @@ class ResidentBusy(ResidentError):
 
 class RequestRefused(ResidentError):
     """The harness answered a control request, but refused it: it is alive
-    (`probe`), which is not the same as silence."""
+    (`probe`), which is not the same as silence. The Claude CLI answers
+    `success` to the probe's `initialize`; counting a refusal as an answer
+    covers another harness, or a protocol that changes."""
 
 
 def log(message: str) -> None:
@@ -906,9 +910,10 @@ class ClaudeStreamJson(ResidentDriver):
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
         """Does the harness answer? The `initialize` handshake of `start()`,
         sent again outside a turn and bounded by `timeout`: it carries no turn
-        and no state the driver depends on. Any answer — a refusal too — proves
-        the control channel and its reader alive; only silence, or a process
-        gone meanwhile, is a failure (L76 T3, #285)."""
+        and no state the driver depends on. The CLI answers `success` to it
+        (observed, no model call): any answer proves the control channel and
+        its reader alive — a refusal from another harness too — and only
+        silence, or a process gone meanwhile, is a failure (L76 T3, #285)."""
         if not self.alive:
             return False
         try:

@@ -586,8 +586,9 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertFalse(driver.probe(0.5))         # …but does not answer any more
 
     def test_a_refused_probe_still_proves_the_harness_alive(self):
-        # T3 (#285): an answer, a refusal too, is a proof of life; only
-        # silence (or a process gone) is a failure
+        # T3 (#285): an answer proves life, even a refusal — a defensive case:
+        # the Claude CLI answers `success` to the probe; only silence (or a
+        # process gone) is a failure
         driver = self.driver()
         driver.start()
         with mock.patch.object(resident.ClaudeStreamJson, "_control",
