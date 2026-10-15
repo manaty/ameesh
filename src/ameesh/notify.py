@@ -1730,7 +1730,8 @@ def desktop_probe(cfg, env: dict | None = None) -> tuple[bool, str]:
             backend, ou)
     if problem:
         return False, "KO — %s" % problem
-    results = send_test(ncfg, human, cfg.host, sender=Sender(env=env), kinds=("desktop",))
+    results = send_test(ncfg, human, cfg.host,
+                        sender=Sender(env=env, timeout=ncfg.timeout), kinds=("desktop",))
     errors = [detail for _name, detail in results if detail]
     if errors:
         return False, "%s (%s) — test to %s failed: %s" % (backend, ou, human, errors[0])
