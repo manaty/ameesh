@@ -1707,8 +1707,8 @@ class WatcherTest(PgTestCase):
                          if a["type"] == "ci_queue_saturated"],
                         "la file en attente doit alerter avant le relevé partiel")
         # 11 exécutions `in_progress` sous un plafond de 12 appels : la
-        # onzième est refusée (une liste par état vivant + les jobs jusqu'au
-        # plafond) ; un relevé partiel publié effacerait l'alerte à tort.
+        # limite est atteinte avant la fin (une liste par état vivant + les jobs
+        # jusqu'au plafond) ; publier ce relevé effacerait l'alerte à tort.
         self.api.live = [run_view(910 + i, "%040d" % i, "main") for i in range(11)]
         for i in range(11):
             self.api.live[i].update({"status": "in_progress", "created_at": iso(horloge.t)})

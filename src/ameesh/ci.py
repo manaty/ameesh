@@ -31,9 +31,9 @@ chaque passage un relevé (`Watcher.tick`) :
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
    reste, car l'agent a pu agir ; les exécutions non démarrées (`queued`,
-   `pending`) du **même groupe de concurrence** — même PR, même dépôt source,
-   même workflow — dont l'essai est prouvé antérieur à celui de la tête
-   courante sont annulées : jamais sur `main`, sur `release/…`, sur la tête
+   `pending`) de la même PR, du même dépôt source et du même workflow
+   (périmètre prudent du veilleur), dont l'essai est prouvé antérieur à celui
+   de la tête courante sont annulées : jamais sur `main`, sur `release/…`, sur la tête
    courante, ni sur un essai plus récent (un rerun garde son `id` et augmente
    `run_attempt` ; sans date d'essai, rien n'est annulé) (#1161) ; une
    exécution de PR restée `pending` plus de cinq minutes est signalée à
@@ -125,7 +125,7 @@ EXCERPT_LINES = 40
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
 #: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
-#: coûte un appel par exécution non conclue (en plus des deux listes et de
+#: coûte un appel par exécution non conclue (en plus des listes par état et de
 #: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
 #: jamais à chaque passage. La fenêtre est écrite dans la base avant le premier
 #: appel HTTP (`ci_guard_scan`) : deux `notify --once` concurrents, ou deux
@@ -241,11 +241,13 @@ def pr_identity(run: dict) -> tuple[str, tuple[int, ...]] | None:
 
 
 def run_group(run: dict) -> tuple | None:
-    """La clé du groupe de concurrence d'une exécution : (dépôt source,
-    numéro(s) de PR, fichier de workflow). GitHub évalue `concurrency.group`
-    dans le fichier de workflow : deux exécutions ne partagent un groupe que si
-    la PR, son dépôt source et le workflow sont les mêmes. `None` sans cette
-    preuve — le relevé n'annule alors rien (#1161)."""
+    """Le périmètre prudent d'annulation : (dépôt source, PR, workflow).
+
+    Les groupes GitHub peuvent être partagés entre workflows d'un dépôt.
+    Exiger le même workflow est une garde volontaire du veilleur, qui ne
+    reconstitue pas l'expression `concurrency.group`. `None` sans preuve :
+    le relevé n'annule alors rien (#1161).
+    """
     identity = pr_identity(run)
     if identity is None:
         return None
@@ -799,8 +801,8 @@ class Watcher:
         Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
         la fenêtre de 600 s est écrite dans la base avant le premier appel
         (`ci_guard_scan`, atomique par dépôt), chaque exécution non conclue est
-        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 63 appels
-        (2 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
+        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 66 appels
+        (5 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
         relue : un run resté `queued` peut porter un job déjà `in_progress`
         quand un autre attend (mesure fondatrice #828), donc aucun instantané de
         jobs ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3,
@@ -1006,9 +1008,9 @@ class Watcher:
 
     def _unblock(self, db, repo: str, live: dict[int, dict], lots: list[dict]) -> list[dict]:
         """Les exécutions de PR qui attendent leur groupe de concurrence
-        (#1161). Un groupe — même PR, même dépôt source, même workflow — est
-        retenu par les exécutions non démarrées d'un essai antérieur : le
-        relevé les annule, jamais `main`, `release/…`, jamais la tête courante,
+        (#1161). Dans son périmètre prudent (même PR, même dépôt source,
+        même workflow), le relevé annule les exécutions non démarrées d'un
+        essai antérieur, jamais `main`, `release/…`, jamais la tête courante,
         jamais un essai dont l'antériorité n'est pas prouvée (un rerun reste,
         #901). La tête courante restée `pending` au-delà de PENDING_ALERT est
         signalée à l'assigné du lot."""
