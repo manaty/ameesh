@@ -420,8 +420,10 @@ class RoutageTest(_Base):
         le premier lot venu ; ce lot ouvre SA session, sur le brief minimal."""
         worker = self._worker("w7")
         try:
-            a = work.add(self.db, title="A", assignee="w7")["id"]
-            work.add(self.db, title="B", assignee="w7")
+            # #540 : le second lot non démarré irait à la file d'équipe sans
+            # forçage motivé — le témoin « deux lots actifs » ne serait plus bâti.
+            a = work.add(self.db, title="A", assignee="w7", force=_FORCE)["id"]
+            work.add(self.db, title="B", assignee="w7", force=_FORCE)
             registry.set_pending_prompt(self.db, "w7", "veille : rien de neuf")
             with self._env("sess-veille"):
                 spec = worker.rotate_for_lot(worker.pick())
