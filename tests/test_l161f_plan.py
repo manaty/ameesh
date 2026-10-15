@@ -1666,13 +1666,22 @@ class LotBranchTest(unittest.TestCase):
         self.assertIn(f"candidates: `{self.mods[0]}`", text)
 
     def test_parts_shrink_to_the_estimate(self):
+        # #1343 (composition paquet 11h) : population simulée explicite. Le
+        # témoin portait sur `self.mods` (les modules réellement découverts,
+        # 235 à sa mesure) : passé 300 s d'estimation, chaque module de plus
+        # changeait le nombre de parts attendu. La population est ici fixée
+        # (235 modules), et `test_count` neutralisé pour que rien ne dépende
+        # des fichiers du dépôt.
+        population = [f"test_simule_{i:03d}.py" for i in range(235)]
+
         def card(seconds):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
-                                for m in self.mods}}
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
-        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
+                                for m in population}}
+        with mock.patch.object(plan.parts, "test_count", lambda module, tests=None: 1):
+            self.assertEqual(plan.lot_part_count("psycopg", population[:10], card(1.0)), 1)
+            # 235 modules × 2 s = 470 s -> deux parts
+            self.assertEqual(plan.lot_part_count("psycopg", population, card(2.0)), 2)
+            self.assertGreaterEqual(plan.lot_part_count("psycopg", population, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
         # un lot très large (60 s par module) reste dans PARTS : quatre parts
@@ -2404,10 +2413,17 @@ class WorkflowTest(unittest.TestCase):
         # d'intégration du paquet ne déclenche plus ce workflow — une tête de
         # paquet n'a qu'une suite, celle de sa PR ; le portier paquet.yml
         # appelle la suite (workflow_call) quand aucune PR ouverte ne couvre
-        # la tête exacte.
-        self.assertIn('branches: [main, "release/**"]', self.text)
-        self.assertNotIn('"integration/**"]', self.text)
-        self.assertIn("\n  pull_request:\n", self.text)
+        # la tête exacte. #1343 : la cible de PR garde integration/** (une PR
+        # de paquet doit pouvoir demander son ci-full) ; seule la poussée
+        # integration/** est hors du déclencheur direct.
+        push_start = self.text.index("\n  push:\n") + len("\n  push:\n")
+        push = self.text[push_start:self.text.index("\n", push_start)]
+        self.assertIn('branches: [main, "release/**"]', push)
+        self.assertNotIn("integration", push)
+        pull_start = self.text.index("\n  pull_request:\n") + len("\n  pull_request:\n")
+        pull = self.text[pull_start:self.text.index("\n  workflow_call:\n")]
+        self.assertIn('branches: [main, "release/**", "integration/**"]', pull)
+        self.assertIn("types: [labeled]", pull)
         self.assertIn("\n  workflow_call:\n", self.text)
         self.assertIn("L1211", self.text)
         self.assertIn("tests/parts/toujours.txt", self.text)
