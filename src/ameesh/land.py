@@ -620,7 +620,19 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local" and resolutions._run(
             replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
             base).returncode == 0:
-        # #194 r4: another executor (an earlier epoch) already pushed it
+        # #194 r4: another executor (an earlier epoch) already pushed it.
+        # #1776: ancestry alone does not prove the content is still in the
+        # tree — a composition reverted on the target leaves the freeze an
+        # ancestor without its content. Judge the content, as the branch
+        # sweep does (plan_git.probe), and eject with a way forward rather
+        # than record a delivery that is no longer there.
+        found = plan_git.probe(replayer.path, row["frozen_sha"], base)
+        if not found["merged"]:
+            return landing.eject(
+                "the frozen content is no longer in %s: %s"
+                % (row["target"], found["detail"]),
+                "Rebase the branch on %s, freeze again at constant content, then "
+                "ameesh work queue add %d." % (row["target"], lot))
         return landing.landed({"sha": base, "state": "already", "files": []}, base)
     refused = landing.required_ci()
     if refused is not None:

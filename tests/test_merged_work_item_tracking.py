@@ -1151,6 +1151,42 @@ class ContentDeliveryTest(_Base):
         _git(self.repo, "commit", "-q", "-am", "suite sur le meme fichier")
         self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
 
+    def gel_vide(self, branch, message="composition"):
+        """Une branche dont le gel est un commit vide (`--allow-empty`) : son
+        diff propre ne porte rien, le contenu du lot est dans ses ancêtres
+        (#1776). Le gel est fusionné en `--no-ff` sur la cible, publiée."""
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit(branch.replace("/", "-"))
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "gel vide")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", message, branch)
+        self.publish_develop()
+        return sha
+
+    def test_1776_gel_vide_reverte_ne_ferme_pas(self):
+        sha = self.gel_vide("agent/1776")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        self.retirer()
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertFalse(found["merged"])
+        self.assertIn("revert", found["detail"])
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+
+    def test_1776_gel_vide_conserve_reste_fusionne(self):
+        # le contenu du lot est toujours là, l'arbre a évolué : pas de retrait
+        sha = self.gel_vide("agent/1776")
+        with open(os.path.join(self.repo, "agent-1776"), "a") as fh:
+            fh.write("suite\n")
+        _git(self.repo, "commit", "-q", "-am", "suite sur le meme fichier")
+        self.publish_develop()
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertTrue(found["merged"])
+        self.assertEqual(found["how"], "ancestor")
+
 
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""

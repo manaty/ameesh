@@ -136,6 +136,30 @@ def _applies(repo: str, tree: str, patch: bytes, *, reverse: bool = False) -> bo
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def _introducing_merge(repo: str, sha: str, head: str) -> tuple[str, str] | None:
+    """Le commit de fusion qui a fait entrer `sha` dans `head` : son premier
+    parent (l'arbre d'avant) et lui-même.
+
+    Un gel vide (`commit --allow-empty`) ne porte aucun diff propre : la
+    preuve de contenu du lot est le delta de la fusion qui l'a introduit dans
+    la cible (#1776). None quand l'entrée n'est pas une fusion (avance
+    rapide), quand `sha` n'est pas ancêtre de `head`, ou quand git ne peut
+    pas la lire — un doute ne conclut jamais au retrait."""
+    if _git(repo, "merge-base", "--is-ancestor", sha, head).returncode != 0:
+        return None
+    out = _out(repo, "rev-list", "--first-parent", "--ancestry-path",
+               "%s..%s" % (sha, head))
+    if not out:
+        return None
+    # rev-list rend du plus récent au plus ancien : le plus ancien descendant
+    # de `sha` sur la chaîne des premiers parents est là où le lot est entré.
+    entry = out.split()[-1]
+    parents = (_out(repo, "rev-list", "--parents", "-n", "1", entry) or "").split()
+    if len(parents) < 3:
+        return None
+    return parents[1], entry
+
+
 def _content_gone(repo: str, sha: str, head: str) -> str | None:
     """`sha` est ancêtre de `head`, mais son contenu n'y est plus : la raison,
     sinon None.
@@ -144,15 +168,27 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
     défait son diff : l'ascendance seule ne prouve alors plus rien (constat
     qa-01, #498 / 043e14d8e). Le contenu est jugé là quand le diff du gel se
     défait sur l'arbre de la cible, et retiré quand il s'y réapplique
-    proprement. Arbres évolués (les deux échouent) : seuls les fichiers
-    ajoutés par le lot et disparus, ou supprimés et revenus, prouvent le
-    retrait — un doute ne conclut jamais au retrait."""
+    proprement. Un gel vide ne porte aucun diff : sa preuve est le delta de
+    la fusion qui l'a introduit (#1776). Arbres évolués (les deux échouent) :
+    seuls les fichiers ajoutés par le lot et disparus, ou supprimés et
+    revenus, prouvent le retrait — un doute ne conclut jamais au retrait."""
     parent = _out(repo, "rev-parse", "--verify", "--quiet", sha + "^1")
     if parent is None:
         return None
-    diff = _git(repo, "diff", "--no-color", "--binary", parent, sha)
-    if diff.returncode != 0 or not diff.stdout.strip():
+    proof, proof_parent = sha, parent
+    diff = _git(repo, "diff", "--no-color", "--binary", proof_parent, proof)
+    if diff.returncode != 0:
         return None
+    if not diff.stdout.strip():
+        # gel vide : la preuve de contenu est le delta de la fusion qui l'a
+        # fait entrer dans la cible
+        entry = _introducing_merge(repo, sha, head)
+        if entry is None:
+            return None
+        proof_parent, proof = entry
+        diff = _git(repo, "diff", "--no-color", "--binary", proof_parent, proof)
+        if diff.returncode != 0 or not diff.stdout.strip():
+            return None
     forward = _applies(repo, head, diff.stdout)
     reverse = _applies(repo, head, diff.stdout, reverse=True)
     if forward and not reverse:
@@ -161,7 +197,7 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
         return None
     # les deux échouent (arbres évolués) : seuls les chemins ajoutés disparus
     # ou supprimés revenus prouvent le retrait
-    status = _out(repo, "diff", "--name-status", "-z", parent, sha)
+    status = _out(repo, "diff", "--name-status", "-z", proof_parent, proof)
     fields = iter((status or "").split("\0"))
     for kind in fields:
         path = next(fields, "")
