@@ -97,6 +97,24 @@ class NumerosDuDepotTest(unittest.TestCase):
             self.assertEqual(sorted(mine), [375, 376])
             self.assertEqual(migrations.origin_repo(repo), "manaty/nexlink")
 
+    def test_une_branche_du_paquet_s_ignore_explicitement(self):
+        """#1603 : la branche d'intégration d'un paquet en composition s'ignore
+        sur demande, en plus de celle du lot (réf locale et distante)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink", NEXLINK.directory,
+                          ["375_a.sql"], {"integration/paquet-5": ["453_demo.sql"]})
+            self.assertIn(453, migrations.repo_numbers(repo, NEXLINK))
+            skipped = migrations.repo_numbers(repo, NEXLINK,
+                                              also_skip=("integration/paquet-5",))
+            self.assertEqual(sorted(skipped), [375])
+            _git(repo, "update-ref", "refs/remotes/origin/integration/paquet-5",
+                 "refs/heads/integration/paquet-5")
+            _git(repo, "update-ref", "-d", "refs/heads/integration/paquet-5")
+            self.assertIn(453, migrations.repo_numbers(repo, NEXLINK))
+            skipped = migrations.repo_numbers(repo, NEXLINK,
+                                              also_skip=("integration/paquet-5",))
+            self.assertEqual(sorted(skipped), [375])
+
     def test_le_paquet_ameesh_ne_compte_que_pour_ameesh(self):
         with tempfile.TemporaryDirectory() as tmp:
             package = os.path.join(tmp, "paquet")
@@ -174,6 +192,32 @@ class ReservationTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("migration: %04d reserved in manaty/ameesh" % (self.floor + 1),
                       proc.stdout)
+
+    def test_numero_porte_par_la_branche_du_paquet_ignore(self):
+        """#1603 : à la composition, la branche d'intégration porte déjà les
+        fichiers renumérotés ; `--skip-branch` la retire du scan, sans
+        exempter de l'unicité entre lots."""
+        _git(self.nexlink, "checkout", "-qb", "integration/paquet-5")
+        _commit(self.nexlink, NEXLINK.directory, "453_demo.sql", "455_autre.sql")
+        _git(self.nexlink, "checkout", "-q", "develop")
+        lot = self._lot("nx", "manaty/nexlink")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 453)
+        self.assertIn("already in manaty/nexlink", str(ctx.exception))
+        got = self._nx(lot, 453, skip_branches=("integration/paquet-5",))
+        self.assertEqual(got["migration"], 453)
+        # la même option par la CLI
+        proc = self.mesh("work", "migration", str(self._lot("nx2", "manaty/nexlink", 2)["id"]),
+                         "--number", "455", "--repo", self.nexlink,
+                         "--skip-branch", "integration/paquet-5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("migration 455 reserved in manaty/nexlink", proc.stdout)
+        # l'option ne dispense pas de l'unicité (dépôt, numéro) entre lots
+        other = self._lot("nx3", "manaty/nexlink", 3)
+        holder = self._nx(other, 454)
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 454, skip_branches=("integration/paquet-5",))
+        self.assertIn("lot #%d" % holder["id"], str(ctx.exception))
 
     def test_lot_nexlink_dossier_et_numerotation_de_nexlink(self):
         lot = self._lot("nx", "manaty/nexlink", 169)
@@ -422,6 +466,55 @@ class ReservationTest(PgTestCase):
         self.assertIn("migration 9200 reserved in manaty/ameesh", proc.stdout)
         proc = self.mesh("work", "migration", str(a["id"]), "--release")
         self.assertIn("no migration reserved", proc.stdout)
+
+
+class CorrectionIssueRefTest(PgTestCase):
+    """#1603 : `work issue-ref` corrige la référence qui décide du dépôt de la
+    réservation (`lot_repository`), réservé aux correcteurs et journalisé."""
+
+    def _lot(self):
+        return work.add(self.db, title="mauvais dépôt", issue_ref="manaty/nexlink#1567",
+                        actor="mesh-design")
+
+    def test_correcteur_corrige_et_journalise_puis_idempotent(self):
+        lot = self._lot()
+        proc = self.mesh("work", "issue-ref", str(lot["id"]), "manaty/ameesh#1603",
+                         "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], "manaty/ameesh#1603")
+        events = work.events(self.db, lot["id"])
+        self.assertEqual(events[0]["actor"], "human:owner")
+        self.assertIn("manaty/nexlink#1567", events[0]["note"])
+        self.assertIn("manaty/ameesh#1603", events[0]["note"])
+        proc = self.mesh("work", "issue-ref", str(lot["id"]), "manaty/ameesh#1603",
+                         "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.events(self.db, lot["id"]), events)
+
+    def test_none_efface_et_format_refuse(self):
+        lot = self._lot()
+        proc = self.mesh("work", "issue-ref", str(lot["id"]), "pas-une-ref",
+                         "--actor", "human:owner")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("owner/repo#N", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], "manaty/nexlink#1567")
+        proc = self.mesh("work", "issue-ref", str(lot["id"]), "--none",
+                         "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["issue_ref"])
+        proc = self.mesh("work", "issue-ref", str(lot["id"]), "manaty/ameesh#1", "--none",
+                         "--actor", "human:owner")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--none", proc.stderr)
+
+    def test_agent_lie_ne_corrige_pas_a_la_place_d_un_humain(self):
+        lot = self._lot()
+        env = self.env(AGENT_MAIL_NAME="dev1", AMEESH_ALERT_ORCHESTRATORS="orch")
+        proc = self.mesh("work", "issue-ref", str(lot["id"]), "manaty/ameesh#1",
+                         "--actor", "human:owner", env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("correction refused", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], "manaty/nexlink#1567")
 
 
 def _drivers():

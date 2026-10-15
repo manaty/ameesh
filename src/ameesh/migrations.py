@@ -195,12 +195,14 @@ def toplevel(path: str) -> str:
 
 
 def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = None,
-                 package: str = MIGRATIONS_DIR) -> dict[int, list[str]]:
+                 also_skip: tuple[str, ...] = (), package: str = MIGRATIONS_DIR) -> dict[int, list[str]]:
     """Numéro → endroits où il existe dans le dépôt : l'arbre de travail et
     TOUTES les branches locales et distantes du clone (une PR ouverte compte,
     même sans réservation) ; pour ameesh, le paquet installé aussi. Les refs
-    de la branche `skip_branch` (celle du lot) ne comptent pas, ni l'arbre de
-    travail s'il est sur elle. Rien n'est récupéré (pas de fetch)."""
+    de la branche `skip_branch` (celle du lot) et de `also_skip` (les branches
+    à ignorer explicitement, p. ex. la branche d'intégration d'un paquet en
+    composition, #1603) ne comptent pas, ni l'arbre de travail s'il est sur
+    l'une d'elles. Rien n'est récupéré (pas de fetch)."""
     found: dict[int, list[str]] = {}
 
     def add(names, where):
@@ -212,7 +214,8 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
 
     if layout.repo == AMEESH_REPO and os.path.isdir(package):
         add(os.listdir(package), "package")
-    skip = {"refs/heads/" + skip_branch} if skip_branch else set()
+    names = {name for name in (skip_branch, *also_skip) if name}
+    skip = {"refs/heads/" + name for name in names}
     head = _git(checkout, "symbolic-ref", "-q", "HEAD").strip()
     directory = os.path.join(checkout, layout.directory)
     if os.path.isdir(directory) and head not in skip:
@@ -220,8 +223,8 @@ def repo_numbers(checkout: str, layout: Layout, *, skip_branch: str | None = Non
     refs = _git(checkout, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
     for ref in refs.split():
         if ref.endswith("/HEAD") or ref in skip or (
-                skip_branch and ref.startswith("refs/remotes/")
-                and ref.split("/", 3)[-1] == skip_branch):
+                names and ref.startswith("refs/remotes/")
+                and ref.split("/", 3)[-1] in names):
             continue
         add(_git(checkout, "ls-tree", "--name-only", ref, layout.directory + "/").split(),
             ref.split("/", 2)[-1])

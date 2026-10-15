@@ -641,7 +641,15 @@ restée 4 h fusionnée sans être déployée :
    déclenche un réessai ; une autre erreur qui le nomme remonte. La commande est
    idempotente ; `--number N` réserve un numéro précis (refusé s'il existe
    déjà dans le dépôt, hors la branche du lot, ou s'il est réservé ailleurs),
-   `--release` libère. La réservation se lit dans `ameesh work show <lot>`
+   `--release` libère. `--skip-branch BRANCHE` (répétable, #1603) ajoute une
+   branche au scan ignoré, en plus de celle du lot : à la composition d'un
+   paquet, la branche d'intégration porte déjà les fichiers renumérotés et
+   ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
+   numéro retenu par un autre lot reste refusé). Un lot dont l'`issue_ref`
+   désigne un autre dépôt se corrige avant de réserver :
+   `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
+   réservé aux correcteurs comme `work set-app` et journalisé. La réservation
+   se lit dans `ameesh work show <lot>`
    (ligne `migration`) et au journal du lot ; la description de la PR
    l'annonce.
    En confiant un lot qui touche au schéma, l'orchestrateur réserve le
