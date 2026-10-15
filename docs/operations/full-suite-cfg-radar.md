@@ -10,6 +10,11 @@ le code d'avant refuse la clé inconnue `full_suite` (`radar.parse_settings`
 lève « `radar.projects.<p>`: unknown key(s) full_suite »), et la configuration
 de l'hôte deviendrait illisible pour l'exécuteur.
 
+**État au 2026-10-15 :** #756 est **fusionné** (`main` `313d73458`, paquet 19:55
+fusionné à 19:37Z) ; le **déploiement** du build qui le porte reste à faire
+(le build installé ici, `ameesh 1.11.1`, ne connaît pas encore `full_suite`).
+Tant que ce déploiement n'a pas eu lieu : **ne rien appliquer sur les hôtes**.
+
 Objet : la porte de release L756 lit `radar.projects.<projet>.full_suite` sur
 l'hôte ; aucune déclaration n'existe aujourd'hui, donc toute release qui exige
 la suite complète est refusée au déploiement ([#916](https://github.com/manaty/ameesh/issues/916),
@@ -31,8 +36,9 @@ constat N1 de la R2 #633).
   par conception ne bloque pas ; `cancelled`, `neutral` ou illisible ne
   certifie rien (fail-closed — une part annulée au plafond ne vaut pas vert,
   #940).
-* `tolerate` nomme les jobs tolérés (`continue-on-error`) : ils ne certifient
-  ni ne bloquent.
+* `tolerate` nomme les jobs tolérés (`continue-on-error`) : leur conclusion ne
+  certifie ni ne bloque ; un job toléré **non terminé** laisse en revanche le
+  rapport en `pending` (pas de vert tant qu'il n'est pas terminé).
 * Une entrée réduite au chemin exige **tous** les jobs : à éviter dès qu'un job
   est conditionnel.
 
@@ -115,6 +121,17 @@ cible, et être **fetché** avant un contrôle (la porte ne fetche pas).
 
 ### 3.1 pc-smichea
 
+**Quel fichier ?** La déclaration doit être dans le fichier **réellement lu par
+le processus qui exécute la porte** (land/`release check`) : `AMEESH_CONFIG`
+s'il est posé par l'unité, sinon `~/.config/ameesh/config.json`. Sur pc-smichea
+les exécuteurs chargent des profils par `AMEESH_CONFIG` (drop-ins
+`~/.config/systemd/user/ameesh-runner-agent@*.service.d/*.conf`, profils
+`~/.config/ameesh/runner-profiles/*.json`) : relever d'abord
+`systemctl --user show <unité> -p Environment -p DropInPaths`, puis déclarer
+dans ce profil — dans les deux si plusieurs acteurs peuvent lancer la porte.
+Le §5 (sauvegarde, fusion, validation) se fait sur ce même fichier, et le §5.3
+se lance avec le même `AMEESH_CONFIG`.
+
 La clé `radar` existe probablement déjà (c'est l'hôte désigné du radar de
 conflits) : **ajouter** `github` et `full_suite` aux projets existants, sans
 écraser `migrations`, `target`, `land`, `gates` ni `merge_method`.
@@ -149,7 +166,11 @@ conflits) : **ajouter** `github` et `full_suite` aux projets existants, sans
 ### 3.2 ameesh-agents-1 et ameesh-agents-2
 
 Même bloc, avec `"repo": "~/work/ameesh-release"` et
-`"repo": "~/work/nexlink-release"`.
+`"repo": "~/work/nexlink-release"`. Sur ces VM, aucune unité d'exécuteur ne
+pose `AMEESH_CONFIG` (relevé du 2026-10-15 sur `ameesh-agents-1` :
+`systemctl --user show 'ameesh-runner-agent@*' -p Environment -p DropInPaths`,
+aucun drop-in ne le déclare) : le fichier lu est
+`~/.config/ameesh/config.json`.
 
 **Effet de bord** : la clé `radar` désigne l'hôte pour le **radar de conflits**
 (L160b). La déclarer sur une VM y lance un passage après chaque relevé de
@@ -183,22 +204,24 @@ contrôles de release (pc-smichea), et n'ajouter une VM que si un
 
 ## 5. Runbook (après #756 seulement)
 
-1. **Sauvegarde** de la configuration de l'hôte :
+1. **Sauvegarde** du fichier retenu en §3.1 :
 
    ```bash
-   cp -a ~/.config/ameesh/config.json ~/.config/ameesh/config.json.bak-$(date +%F-%H%M)
+   F=~/.config/ameesh/config.json   # pc-smichea : le profil AMEESH_CONFIG de l'unité
+   cp -a "$F" "$F.bak-$(date +%F-%H%M)"
    ```
 
-2. **Fusion** du bloc §3 dans `~/.config/ameesh/config.json` (éditer, ne pas
-   écraser le reste). JSON sans commentaire ni virgule finale.
+2. **Fusion** du bloc §3 dans ce fichier (éditer, ne pas écraser le reste).
+   JSON sans commentaire ni virgule finale.
 
 3. **Validation du schéma** (lecture seule, aucun effet) :
 
    ```bash
-   python3 - <<'PY'
-   import json, os
+   F=~/.config/ameesh/config.json   # même fichier qu'en §5.1
+   python3 - "$F" <<'PY'
+   import json, os, sys
    from ameesh import radar
-   raw = json.load(open(os.path.expanduser("~/.config/ameesh/config.json")))
+   raw = json.load(open(os.path.expanduser(sys.argv[1])))
    s = radar.parse_settings(raw.get("radar") or {})
    for name, p in sorted(s.projects.items()):
        print(name, p.repo, p.github, len(p.full_suite))
@@ -209,12 +232,13 @@ contrôles de release (pc-smichea), et n'ajouter une VM que si un
    avant l'exécuteur.
 
 4. **Rechargement** : l'exécuteur lit la configuration à son démarrage.
-   Redémarrer l'unité concernée de l'hôte
+   Redémarrer l'unité dont le profil a été modifié en §3.1
    (`systemctl --user restart ameesh-runner-agent@<agent>.service`), ou
    attendre son prochain redémarrage. `ameesh release check` lit le fichier
    directement : pas de redémarrage nécessaire pour lui.
 
-5. **Contrôle à blanc** (lecture seule, aucune publication) :
+5. **Contrôle à blanc** (lecture seule, aucune publication) — sur pc-smichea,
+   lancer avec l'environnement de l'unité (`AMEESH_CONFIG=… python3 …`) :
 
    ```bash
    python3 - <<'PY'
@@ -267,5 +291,14 @@ dépôt, aucun geste GitHub.
   `psql 5/6` et l'agrégat `tests`, sans job requis manquant) ; nexlink
   `38366848457`, `38444083884`, `38406858502`, `38372147722`, `38385460349`
   (dispatch verts, jobs conditionnels sautés acceptés).
+* **Re-vérification du 2026-10-15, sur le code FUSIONNÉ de #756** (`main`
+  `313d73458`, paquet 19:55 fusionné à 19:37Z ; worktree jetable, aucun geste
+  de production) : les six blocs §2/§3 passent `radar.parse_settings` de
+  `origin/main` ; `tests.yml` porte toujours `plan`, `psycopg *`, `psql *`,
+  `plateforme macOS`, `tests` et le job toléré `bilan des impactés` ;
+  `radar.settings_of` et `radar.full_suite_ci` sont présents. **Rien n'est
+  encore appliqué** : le build installé (`ameesh 1.11.1`) ne connaît pas
+  `full_suite` (`'full_suite' in radar.PROJECT_KEYS` → `False`) — la porte
+  restante est le déploiement du build qui porte #756.
 * **Aucune écriture** : pas de configuration modifiée, pas de run CI créé,
   pas de PR ouverte.
