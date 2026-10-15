@@ -51,7 +51,7 @@ class PyYamlCiTest(unittest.TestCase):
         # (sinon un venv restauré sans PyYAML serait déclaré valide).
         deps = _etape(TESTS, "      - id: deps")
         self.assertIn(PYYAML, deps)
-        self.assertIn("import psycopg, cryptography, psutil, yaml", deps)
+        self.assertIn("import psycopg, cryptography, psutil, coverage, yaml", deps)
 
     def test_part_psql_installe_pyyaml(self):
         # le job psql n'a pas de venv : il installe PyYAML avant la part.

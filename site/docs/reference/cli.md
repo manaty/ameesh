@@ -335,8 +335,8 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
-ameesh work merged <id> --sha SHA [--note N] [--actor A]
-ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
@@ -368,7 +368,12 @@ ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 prerequisites between lots (L385). `work migration` reserves the next free
 migration number for the lot, per repository, **before** the file is written
 (L122); `--number` reserves an exact one, `--release` gives it back. It is
-idempotent and visible in `work show`. `work set-app` corrects a
+idempotent and visible in `work show`. `work merged --migration-landed N`
+records the number that actually landed when the landing renumbered the
+reservation (a packet takes the target's max+1, #1567); the option also
+corrects an already merged lot, so `work show` names the landed number (its
+file, and the reservation when it differs) instead of showing only the
+reservation. `work set-app` corrects a
 lot's project and `work backfill-app` fills the uniquely inferred ones, both
 with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 (`--none` detaches it),
@@ -441,6 +446,14 @@ deadline: if the delegate has not worked on it by then, the lot goes back to
 the delegator (`--actor`, else the current assignee). The runner processes
 deadlines at every pass; `expire-delegations` does it by hand. See
 [Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
+
+`--claim` assigns only a lot that has **no assignee**: a lot already taken is
+refused (exit 1) naming its holder, and the write is conditional on the
+assignee still being empty, so two concurrent claims produce a single
+assignment and the other is refused without changing hands (#1026). The
+`stale_lot` (unassigned lot) and `idle_capacity` (lots without an agent)
+briefs carry that command; a deliberate reassignment of a lot already held
+stays `work assign` without `--claim`.
 
 **Branch of a lot (L118).** `--branch` records the lot's branch, `--target`
 its target (default: `git config ameesh.target` in the repository, else

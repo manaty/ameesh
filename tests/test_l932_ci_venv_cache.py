@@ -47,7 +47,7 @@ class VenvCacheTest(unittest.TestCase):
         self.assertIsNotNone(m, "pas « dépendances » introuvable")
         body = m.group(1)
         self.assertNotIn("cache-hit", body)
-        self.assertIn("import psycopg, cryptography, psutil, yaml", body)
+        self.assertIn("import psycopg, cryptography, psutil, coverage, yaml", body)
         self.assertIn("rm -rf .venv-ci", body)
         self.assertIn("python -m venv .venv-ci", body)
 
