@@ -371,7 +371,12 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
     `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
     a confié des lots (délégation ou `work assign`) dans les 30 derniers
-    jours, sauf avec `history=False` (#740). Seulement des agents du registre."""
+    jours, sauf avec `history=False` (#740). Seulement des agents du registre.
+
+    Modèle de rôle (autorité : correction, plan, analyse) : il inclut
+    l'historique. Pour les **destinataires d'alerte**, l'historique ne confère
+    pas le rôle : `alert_orchestrators` (#1114), qui exclut les assigneurs
+    récents non déclarés."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -391,6 +396,22 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
     from .chat import is_chat_agent
     chats = {row["name"] for row in listing if is_chat_agent(row)}
     return sorted(n for n in found if n in names and n not in chats)
+
+
+def alert_orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
+    """Les orchestrateurs qui peuvent recevoir une alerte : déclarés
+    (`--orchestrators`, `AMEESH_ALERT_ORCHESTRATORS`) ou rôle `orchestrateur`
+    d'une fiche Agent du canon. L'historique des lots confiés (30 jours) ne
+    confère pas ce rôle (#1114) : un agent qui a seulement assigné récemment
+    n'est pas un destinataire, et ne peut donc pas entrer dans la boucle
+    « recevoir l'alerte pousse à assigner, ce qui entretient la liste ».
+
+    Le repli « sans équipe » d'`alert_briefs._of_teams` ne s'applique plus
+    qu'aux agents présents ici : un hub sans équipe (bureau) est donc admis
+    seulement par déclaration explicite — rôle au canon ou
+    `AMEESH_ALERT_ORCHESTRATORS` —, jamais par le seul historique."""
+    return orchestrators(cfg, db, listing, declared=declared, canons=canons,
+                         history=False)
 
 
 def orchestrator_held(listing: list, now: float, orchestras: list, *,
@@ -847,8 +868,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
                          pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held,
                          multipliers=pace_multipliers(cfg))
-    orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
-                               canons=canons)
+    orchestras = alert_orchestrators(cfg, db, listing, declared=orchestrators_declared,
+                                     canons=canons)
     for alert in out:
         # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
         alert["orchestrators"] = list(orchestras)

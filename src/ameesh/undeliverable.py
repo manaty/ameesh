@@ -126,14 +126,15 @@ def declared_orchestrators() -> tuple:
 
 
 def known_orchestrators(cfg, db, rows: list, *, declared=None, canons=None) -> list[str]:
-    """Les orchestrateurs connus (`sous_utilisation.orchestrators` : déclarés,
-    rôle `orchestrateur` au canon, ou agents qui ont confié des lots) parmi
-    `rows` (lignes du registre)."""
+    """Les orchestrateurs destinataires d'alerte
+    (`sous_utilisation.alert_orchestrators` : déclarés ou rôle
+    `orchestrateur` au canon) parmi `rows` (lignes du registre). L'historique
+    des lots confiés ne confère pas ce rôle (#1114)."""
     from . import sous_utilisation as su
     if declared is None:
         declared = declared_orchestrators()
     try:
-        return su.orchestrators(cfg, db, rows, declared=declared, canons=canons)
+        return su.alert_orchestrators(cfg, db, rows, declared=declared, canons=canons)
     except db_mod.SchemaMissing:
         raise
     except Exception:  # un canon illisible ne fait pas tomber l'envoi ni l'alerte
@@ -142,8 +143,9 @@ def known_orchestrators(cfg, db, rows: list, *, declared=None, canons=None) -> l
 
 def team_orchestrators(rows: list, known: list[str], teams, *, exclude=()) -> list[str]:
     """Parmi les orchestrateurs `known`, ceux qui servent l'une des `teams` :
-    même équipe, ou sans équipe (ils servent tout le monde) ; `teams` vide :
-    tous. Jamais un agent arrêté (il ne lit pas son courrier), ni `exclude`."""
+    même équipe, ou sans équipe (un hub explicitement déclaré, #1114) ;
+    `teams` vide : tous. Jamais un agent arrêté (il ne lit pas son courrier),
+    ni `exclude`."""
     by_name = {row["name"]: row for row in rows}
     wanted = {team for team in teams or () if team}
     out = []
