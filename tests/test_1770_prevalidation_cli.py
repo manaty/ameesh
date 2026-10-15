@@ -10,10 +10,12 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
+from unittest import mock
 
+from ameesh import db as db_mod
 from ameesh import mesh_cli, prevalidation as pv
 
 A = "a" * 40
@@ -237,6 +239,52 @@ class CommandTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["causes"], ["block-missing"])
         self.assertEqual(payload["schema"], pv.REPORT_SCHEMA)
+
+
+class PersistenceTest(unittest.TestCase):
+    """Le rapport s'imprime avant l'écriture : un run réel ne se perd jamais.
+
+    La table 0450 est livrée avec le lot : avant son déploiement, l'écriture
+    échoue en `SchemaMissing` et l'avertissement nomme `ameesh migrate` ; le
+    sort du run, lui, ne change pas."""
+
+    def _args(self):
+        return SimpleNamespace(lot=1770, sha=A, plan="plan.json", host="vm1",
+                               base="", repo="", canon_repo="", canon_commit="c" * 40,
+                               project="ameesh", published_ref="", remote="origin",
+                               json=True)
+
+    def _green(self) -> dict:
+        return {"schema": pv.REPORT_SCHEMA, "lot": 1770, "sha": A, "base": "",
+                "ok": True, "outcome": "green", "causes": [], "host": "vm1",
+                "modules": ["test_a"], "seconds": 42.0}
+
+    def test_rapport_imprime_malgre_la_table_absente(self):
+        out, err = StringIO(), StringIO()
+        missing = db_mod.SchemaMissing(
+            'relation "prevalidation_reports" does not exist')
+        with mock.patch.object(pv, "load_parameters",
+                               return_value=(None, params())), \
+                mock.patch.object(pv, "validate", return_value=self._green()), \
+                mock.patch.object(pv, "record", side_effect=missing), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = pv.run(None, object(), self._args())
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out.getvalue())["ok"])
+        self.assertIn("non persisté", err.getvalue())
+        self.assertIn("migrate", err.getvalue())
+
+    def test_rapport_persiste_sans_avertissement(self):
+        out, err = StringIO(), StringIO()
+        with mock.patch.object(pv, "load_parameters",
+                               return_value=(None, params())), \
+                mock.patch.object(pv, "validate", return_value=self._green()), \
+                mock.patch.object(pv, "record") as recorded, \
+                redirect_stdout(out), redirect_stderr(err):
+            code = pv.run(None, object(), self._args())
+        self.assertEqual(code, 0)
+        recorded.assert_called_once()
+        self.assertEqual(err.getvalue(), "")
 
 
 if __name__ == "__main__":
