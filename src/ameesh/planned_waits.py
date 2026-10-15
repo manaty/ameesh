@@ -24,9 +24,9 @@ def hold_end(due_on):
     """
     try:
         day = datetime.date.fromisoformat(str(due_on)[:10])
-    except (TypeError, ValueError):
+        return plan.day_start_ts((day + datetime.timedelta(days=1)).isoformat())
+    except (TypeError, ValueError, OverflowError):
         return None
-    return plan.day_start_ts((day + datetime.timedelta(days=1)).isoformat())
 
 
 def ancestors(package_id, packages):

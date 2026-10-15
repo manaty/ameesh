@@ -93,6 +93,17 @@ class UnitTest(unittest.TestCase):
         rows = [{"id": 4, "state": "build", "package_id": "other"}]
         self.assertEqual(self.resolve(commitments=[commitment], rows=rows), {})
 
+    def test_unrepresentable_hold_end_does_not_break_other_waits(self):
+        rows = [{"id": 1, "state": "build"}, {"id": 2, "state": "build"}]
+        commitments = [
+            {"status": "open", "work_item_id": 1, "due_on": "9999-12-31",
+             "depends_on": ["gate:out-of-range"]},
+            {"status": "open", "work_item_id": 2, "due_on": "2026-10-13",
+             "depends_on": ["gate:valid"]},
+        ]
+        self.assertEqual(self.resolve(rows=rows, commitments=commitments),
+                         {2: {"what": "hold", "gate": "valid", "until": "2026-10-13"}})
+
     def test_malformed_finished_or_undated_gate_does_not_suppress(self):
         base = {"id": 7, "status": "open", "work_item_id": 1, "due_on": "2026-10-13"}
         for reference in ("gate:", "gate", "external", "gate liquichain", "hold:liquichain",
