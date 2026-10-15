@@ -83,9 +83,13 @@ class Test1617ReviewDesignationPg(PgTestCase):
 
     def run_apply(self, port, *, candidates, authors=None, unknown=(),
                   policy=RULES, paths=("src/ameesh/db.py",), notify="pilot",
-                  risk="sensitive"):
+                  risk="sensitive", freeze_sha=None):
+        if freeze_sha is None:
+            # l'appelant collecte ses entrées sur le dernier gel qu'il voit
+            freeze_sha = (pg.PgPort(self.db).latest_freeze(self.lot) or {}).get("sha", "")
         return rd.apply(dict(self.item, state="build"), policy=policy, paths=list(paths),
-                        port=port, authors=authors or [{"name": "author", "family": "deepseek"}],
+                        port=port, freeze_sha=freeze_sha,
+                        authors=authors or [{"name": "author", "family": "deepseek"}],
                         candidates=candidates, risk=risk, base="c" * 40,
                         policy_ref="canon@deadbeef", notify=notify,
                         unknown_authors=unknown)
@@ -323,6 +327,7 @@ class Test1617FrozenHook(PgTestCase):
         return rd.apply(
             dict(self.item, state="build"), policy=RULES,
             paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
+            freeze_sha=milestone["sha"],  # les entrées valent pour CE gel
             authors=[{"name": "author", "family": "deepseek"}],
             candidates=[rd.Candidate("r1", "claude"), rd.Candidate("r2", "codex")],
             risk="sensitive", base="c" * 40, policy_ref="canon@deadbeef",

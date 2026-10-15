@@ -70,7 +70,10 @@ ceux de ce gel : si le `Port` refuse un gel devenu périmé (`StaleFreeze`, rien
 n'est écrit), `apply` lève `FreezeMoved` et ne désigne **pas** la nouvelle tête
 avec les entrées de l'ancienne (un SHA de courrier changé ne suffit pas) —
 l'appelant recollecte les entrées du nouveau gel, puis rejoue (B1, revue Codex
-cx2). Un même gel rejoué rend la désignation enregistrée sans second courrier ;
+cx2). L'appelant nomme ce gel (`freeze_sha`, le SHA du jalon sur lequel il a
+collecté) : un gel arrivé **avant** l'appel, entre la collecte et la lecture,
+est refusé de même par `FreezeMoved`, avant toute sélection (R Claude dev2).
+Un même gel rejoué rend la désignation enregistrée sans second courrier ;
 un gel nouveau est un autre objet, donc une nouvelle désignation — l'ancienne
 ne compte plus. Aucun retour à une ancienne tête n'est possible : le gel est
 relu sous verrou, et un SHA qui n'est pas un identifiant de commit est refusé.
