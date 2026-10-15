@@ -114,7 +114,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #194 r6: a PR merged into a wrong base, or not checked
                  "land_uncertain", "db_connections_high",
                  # #513 : la dépense comptée s'écarte des soldes (barème faux)
-                 "budget_drift")
+                 "budget_drift",
+                 # #532: a local PgBouncer pool queues its mesh clients
+                 "pgbouncer_pool_waiting")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -139,6 +141,7 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
+    "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -210,11 +213,15 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
                 "owner_key_registered",
-                "land_uncertain", "db_connections_high")
+                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
 QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
+#: types qu'un passage observe depuis la configuration de l'hôte seule, sans
+#: la base du mesh : la console du pool PgBouncer local (#532). Une panne de
+#: base ne les résout jamais, et ne les cache pas non plus.
+LOCAL_TYPES = ("pgbouncer_pool_waiting",)
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -798,7 +805,12 @@ class DrySender:
 
 class Router:
     """Le destinataire humain d'une alerte (une instance par passage : les
-    lectures — registre, lots, paquets, canon — sont faites au plus une fois)."""
+    lectures — registre, lots, paquets, canon — sont faites au plus une fois).
+
+    `db` peut être None pour un passage sans la base (`Notifier.run_local_pass`,
+    #532) : le registre et les lots ne sont alors pas lisibles, et la route se
+    limite au champ `responsible` de l'alerte, à la fiche d'hôte du canon et au
+    destinataire par défaut."""
 
     def __init__(self, cfg: Config, db, ncfg: NotifyConfig):
         self.cfg, self.db, self.ncfg = cfg, db, ncfg
@@ -808,8 +820,8 @@ class Router:
 
     def agents(self) -> dict:
         if self._agents is None:
-            self._agents = {row["name"]: row
-                            for row in storage.of(self.db).operations.listing()}
+            self._agents = {} if self.db is None else {
+                row["name"]: row for row in storage.of(self.db).operations.listing()}
         return self._agents
 
     def agent_responsible(self, name) -> str | None:
@@ -818,7 +830,7 @@ class Router:
         return (self.agents().get(name) or {}).get("responsible")
 
     def lot_responsible(self, lot) -> str | None:
-        if lot is None:
+        if lot is None or self.db is None:
             return None
         try:
             item = storage.of(self.db).work.get(int(lot))
@@ -1111,6 +1123,70 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    def run_local_pass(self, now: float | None = None) -> list:
+        """Un passage sans la base du mesh : la console du pool local (#532).
+
+        Le notifieur atteint la base à travers ce même pool : quand
+        `max_client_conn` refuse tout le monde, sa connexion ordinaire échoue
+        alors que la console, elle, répond encore. Ce passage lit donc la
+        console depuis `cfg` seule, puis lève, retente et résout les alertes de
+        `LOCAL_TYPES` — sans connexion ni lecture préalable de la base. Les
+        autres livraisons en cours sont laissées telles quelles : une alerte
+        non observée n'est jamais résolue. Une console illisible est
+        journalisée et ne change rien."""
+        now = float(self.clock() if now is None else now)
+        records: list = []
+        self._records = records
+        from . import pgbouncer_local
+        try:
+            current = pgbouncer_local.probe(self.cfg)
+        except db_mod.Unavailable as exc:
+            self.log("local pool console unreadable (%s): active local alerts kept"
+                     % exc)
+            return records
+        router = Router(self.cfg, None, self.ncfg)
+        wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
+        active = self.state["active"]
+        for key, alert in wanted.items():
+            entry = active.get(key)
+            if entry is None:
+                entry = active[key] = {
+                    "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                    "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
+                    "channels": {}}
+                self._raise(entry, router, now)
+            elif entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
+                # un responsable (ou une route) a pu apparaître depuis
+                self._raise(entry, router, now)
+            else:
+                self._retry(entry, "raised", now)
+        self._local_resolutions(wanted, now)
+        return records
+
+    def _local_resolutions(self, wanted: dict, now: float) -> None:
+        """Résout les alertes locales que la console ne montre plus, et retente
+        les résolutions en vol. Les autres types ne sont jamais touchés : la
+        base peut simplement être non observée."""
+        for key in list(self.state["active"]):
+            if key in wanted:
+                continue
+            entry = self.state["active"][key]
+            if entry["alert"].get("type") not in LOCAL_TYPES:
+                continue
+            del self.state["active"][key]
+            if entry["alert"].get("type") not in self.ncfg.types:
+                self.log("[%s] removed from notify.types: forgotten without resolution"
+                         % entry["alert"].get("type"))
+                continue
+            self._resolved(key, entry, now)
+        for key in list(self.state["resolved"]):
+            entry = self.state["resolved"][key]
+            if entry["alert"].get("type") not in LOCAL_TYPES:
+                continue
+            self._retry(entry, "resolved", now)
+            if not self._pending(entry):
+                del self.state["resolved"][key]
 
     def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
         """Adopt persisted per-lot deliveries before checking for resolutions.
@@ -1782,6 +1858,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     db = None
     try:
         while True:
+            # #532 : la console du pool local se lit depuis `cfg` seule, avant
+            # la base — c'est ce qui fait survivre l'alerte au refus qu'elle
+            # signale, puisque la base passe par ce même pool.
+            notifier.run_local_pass()
+            if not args.dry_run:
+                save_state(path, notifier.state)
             try:
                 if db is None:
                     db = db_mod.connect(cfg)
