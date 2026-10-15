@@ -273,11 +273,97 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(json.loads(blob)["lots"][0]["title"], _snap()["lots"][0]["title"])
 
 
+class CiSuiteTest(unittest.TestCase):
+    """#1476 : durée médiane de la suite complète par dépôt (veilleur CI) :
+    médiane et p80, part couverte par le pool prioritaire de #1468, verdict
+    face à la cible de 15 min portée par la vue."""
+
+    @staticmethod
+    def _run(repo, branch, base, duration, ts, run_id=1, event="push"):
+        return {"repo": repo, "run_id": run_id, "branch": branch, "base": base,
+                "event": event, "duration_s": duration, "concluded_ts": ts}
+
+    def test_mediane_et_pool_prioritaire(self):
+        rows = [
+            self._run("manaty/ameesh", "integration/1204", "main", 720.0, 10, 1),
+            self._run("manaty/ameesh", "lot/1476", "integration/1204", 1080.0, 20, 2,
+                      event="pull_request"),
+            self._run("manaty/ameesh", "main", "main", 1800.0, 30, 3),
+            self._run("manaty/ameesh", "release/1.11.0", "main", 540.0, 40, 4),
+            self._run("manaty/nexlink", "main", "main", 3600.0, 50, 5),
+        ]
+        out = progress.build_ci_suite(rows)
+        self.assertEqual(out["schema"], progress.CI_SUITE_SCHEMA)
+        self.assertEqual(out["target_s"], progress.CI_SUITE_TARGET_S)
+        self.assertEqual(out["window_days"], progress.CI_SUITE_WINDOW_D)
+        self.assertEqual([r["repo"] for r in out["repos"]],
+                         ["manaty/ameesh", "manaty/nexlink"])
+        ameesh = out["repos"][0]
+        self.assertEqual(ameesh["runs"], 4)
+        self.assertEqual(ameesh["median_s"], 900.0)      # (720 + 1080) / 2
+        self.assertEqual(ameesh["p80_s"], 1368.0)        # interpolation sur 4 points
+        self.assertEqual(ameesh["priority_runs"], 3)     # source, cible, release
+        self.assertEqual(ameesh["priority_median_s"], 720.0)
+        self.assertEqual(ameesh["last_s"], 540.0)
+        self.assertEqual(ameesh["last_concluded_ts"], 40)
+        nexlink = out["repos"][1]
+        self.assertEqual(nexlink["priority_runs"], 0)
+        self.assertIsNone(nexlink["priority_median_s"])
+
+    def test_sans_duree_ni_ligne(self):
+        self.assertEqual(progress.build_ci_suite([])["repos"], [])
+        rows = [self._run("r", "main", "main", None, 10, 1),
+                self._run("r", "main", "main", 600.0, 5, 2)]
+        repo = progress.build_ci_suite(rows)["repos"][0]
+        self.assertEqual(repo["runs"], 1)                 # une durée inconnue ne compte pas
+        self.assertEqual(repo["median_s"], 600.0)
+        self.assertIsNone(repo["last_s"])                 # la dernière conclue n'a pas de durée
+        self.assertEqual(repo["last_concluded_ts"], 10)
+
+    def test_lignes_et_verdict(self):
+        rows = [
+            self._run("r/prioritaire", "integration/1", "main", 600.0, 1, 1),
+            self._run("r/prioritaire", "main", "main", 2400.0, 2, 2),
+            self._run("r/cible", "integration/1", "main", 600.0, 3, 3),
+            self._run("r/cible", "integration/1", "main", 720.0, 4, 4),
+            self._run("r/lente", "main", "main", 2400.0, 5, 5),
+            self._run("r/lente", "main", "main", 3000.0, 6, 6),
+        ]
+        lines = progress._ci_suite_lines(progress.build_ci_suite(rows), 60)
+        text = "\n".join(lines)
+        for line in text.splitlines():
+            self.assertLessEqual(len(line), 60, line)
+        plat = " ".join(text.split())          # le repli ne cache pas un verdict
+        self.assertIn("target ≤ 15 min", plat)
+        self.assertIn("r/cible: median 11 min", plat)
+        self.assertIn("target met", plat)
+        self.assertIn("r/prioritaire: median 25 min", plat)
+        self.assertIn("target met on the priority pool only", plat)
+        self.assertIn("r/lente: median 45 min", plat)
+        self.assertIn("target not met", plat)
+        vide = {"window_days": 7, "target_s": 900,
+                "repos": [{"repo": "r/vide", "runs": 0}]}
+        self.assertIn("r/vide: no concluded full suite",
+                      " ".join(" ".join(progress._ci_suite_lines(vide, 60)).split()))
+
+    def test_le_pool_prioritaire_suit_la_source_et_la_cible(self):
+        # #1468 : integration/** et release/** en source comme en cible ; main
+        # (poussée qui suit la fusion d'un paquet) ne l'est pas.
+        for branch, base, attendu in (("integration/1", "main", True),
+                                      ("lot/x", "integration/1", True),
+                                      ("release/1.11.0", "main", True),
+                                      ("lot/x", "release/1.11.0", True),
+                                      ("main", "main", False),
+                                      ("lot/x", "main", False)):
+            self.assertEqual(progress._ci_priority({"branch": branch, "base": base}),
+                             attendu, (branch, base))
+
+
 class ProgressPgTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("TRUNCATE action_events, action_attempts, actions, turn_costs, "
-                        "spend_pending RESTART IDENTITY CASCADE")
+                        "spend_pending, ci_runs RESTART IDENTITY CASCADE")
 
     def _book(self):
         return cost.CostBook(state_dir=self.state, codex_sessions=os.path.join(self.tmp, "codex"),
@@ -464,13 +550,65 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["déduit"]["state"], "review")
         self.assertIsNotNone(lots["déduit"]["milestones"]["frozen"])
 
+    def test_ci_suite_du_veilleur(self):
+        """#1476 : la vue ne compte que les suites complètes CONCLUES (main,
+        release/**, integration/** et PR dont la source ou la cible l'est) ;
+        annulée, remplacée, en cours et hors fenêtre sont écartées ; la borne
+        de lecture est par dépôt."""
+        def run(run_id, branch, base, status, *, repo="manaty/ameesh", minutes=10,
+                age_s=0, event="push"):
+            self.db.execute(
+                "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+                " status, url, first_seen_at, concluded_at)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, 'u',"
+                " to_timestamp(extract(epoch from now()) - %s),"
+                " CASE WHEN %s = 'running' THEN NULL"
+                "      ELSE to_timestamp(extract(epoch from now()) - %s) END)",
+                (repo, run_id, "0" * 40, branch, event, base, status,
+                 float(minutes * 60 + age_s), status, float(age_s)))
+        run(1, "main", "main", "success", minutes=10)
+        run(2, "release/1.11.0", "main", "failure", minutes=12)
+        run(3, "integration/1204", "main", "success", minutes=14)
+        run(4, "lot/1476", "integration/1204", "success", minutes=16, event="pull_request")
+        run(5, "lot/999", "main", "success", minutes=18, event="pull_request")  # impactés
+        run(6, "main", "main", "cancelled", minutes=5)
+        run(7, "main", "main", "superseded", minutes=5)
+        run(8, "release/1.11.0", "main", "running", minutes=5)
+        run(9, "main", "main", "success", minutes=10, age_s=8 * 86400)
+        run(10, "main", "main", "success", minutes=10, repo="manaty/nexlink")
+        run(11, "main", "main", "success", minutes=11, repo="manaty/nexlink")
+
+        st = storage.of(self.db).progress
+        # l'instant de référence vient de la base : aucune horloge locale
+        depuis = self.db.query("SELECT extract(epoch from now())::float8 AS epoch")[0]["epoch"] \
+            - 7 * 86400
+        rows = st.ci_suite(since_ts=depuis, limit=100)
+        self.assertEqual([r["run_id"] for r in rows], [11, 10, 4, 3, 2, 1])
+        attendu = {1: 600.0, 2: 720.0, 3: 840.0, 4: 960.0, 10: 600.0, 11: 660.0}
+        for row in rows:
+            self.assertAlmostEqual(row["duration_s"], attendu[row["run_id"]], delta=2)
+        # la borne est par dépôt : le dépôt actif ne chasse pas l'autre
+        self.assertEqual([r["run_id"] for r in st.ci_suite(since_ts=depuis, limit=1)],
+                         [11, 4])
+
+        snap = progress.snapshot(self.db, self.cfg, book=self._book())
+        self.assertEqual([r["repo"] for r in snap["ci_suite"]["repos"]],
+                         ["manaty/ameesh", "manaty/nexlink"])
+        ameesh = snap["ci_suite"]["repos"][0]
+        self.assertEqual(ameesh["runs"], 4)
+        self.assertEqual(ameesh["median_s"], 780.0)          # (720 + 840) / 2
+        self.assertEqual(ameesh["priority_runs"], 3)         # release/**, integration/**, cible
+        self.assertEqual(ameesh["priority_median_s"], 840.0)
+
     def test_vide(self):
         snap = progress.snapshot(self.db, self.cfg, book=self._book())
         self.assertEqual((snap["lots"], snap["agents"], snap["actions"]), ([], [], []))
         self.assertEqual(snap["budget"]["spend"]["24h"]["total_usd"], 0.0)
+        self.assertEqual(snap["ci_suite"]["repos"], [])
         st = storage.of(self.db).progress
         self.assertEqual(st.lot_events([]), [])
         self.assertEqual(st.costs(since_ts=0, agents=[]), [])
+        self.assertEqual(st.ci_suite(since_ts=0, limit=10), [])
 
     def test_cli(self):
         item = work.add(self.db, title="lot cli", app="demo")
