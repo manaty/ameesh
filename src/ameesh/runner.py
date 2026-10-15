@@ -1404,6 +1404,10 @@ class AgentWorker(threading.Thread):
         l'authentification) et tourne sous le compte de la session ; sinon la
         rotation attend : la bascule du prochain tour (`continuity`) résume
         sous l'ancien compte s'il le peut encore, ou ouvre un brief déterministe."""
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            # L87b: the summary turn would be refused; wait without consuming a
+            # forced rotation or noting a cancellation on every pass.
+            return False
         if not self.budget_ok() or not self.auth_ready():
             return False
         if self.turn_harness() != account_turn.session_harness(self):
