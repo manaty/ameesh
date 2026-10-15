@@ -85,7 +85,11 @@ if grep -qx "ko=sante:$hote" "$state/scenario" 2>/dev/null; then
   echo "courrier $hote : KO (echec injecte)" >&2
   exit 1
 fi
-echo "courrier $hote : ok"
+if grep -qx "sans_sonde=sante:$hote" "$state/scenario" 2>/dev/null; then
+  echo "courrier $hote : sans-sonde (aucune persona menee (bail vivant) sur cet hote)"
+  exit 0
+fi
+echo "courrier $hote : sonde remise a persona-$hote en 2.0s (message 7)"
 '''
 
 VENV_AMEESH = r'''#!/usr/bin/env bash
@@ -317,7 +321,7 @@ class StagingTest(unittest.TestCase):
         ])
         self.assertIn('venv-ameesh doctor --harness', self.calls())
         for host in ('ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1', 'pc-smichea'):
-            self.assertIn('courrier %s : ok' % host, p.stdout)
+            self.assertIn('courrier %s : sonde remise' % host, p.stdout)
         traces = self.traces()
         self.assertEqual(traces[-1]['etape'], 'sequence')
         self.assertEqual(traces[-1]['verdict'], 'ok')
@@ -327,6 +331,23 @@ class StagingTest(unittest.TestCase):
                                 and t['verdict'] == 'ok' for t in traces), traces)
         self.assertEqual((self.home / '.local/state/ameesh/mise-a-jour').stat().st_mode & 0o777, 0o700)
         self.assertEqual(list(self.script_dir.glob('staging-*.env')), [])
+
+    def test_sante_trace_names_the_real_delivery(self):
+        """#1214 : le detail de la trace nomme la remise reelle, pas « sante ok »."""
+        p = self.run_staging('--hotes', 'ameesh-agents-1')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        details = [t['detail'] for t in self.traces()
+                   if t['hote'] == 'ameesh-agents-1' and t['etape'] == 'sante']
+        self.assertTrue(any('sonde remise a ' in (d or '') for d in details), details)
+
+    def test_sante_trace_names_sans_sonde_without_a_driven_persona(self):
+        """#1214 : un hote sans persona menee trace « sans-sonde », jamais une remise."""
+        (self.state / 'scenario').write_text('sans_sonde=sante:ameesh-agents-1\n')
+        p = self.run_staging('--hotes', 'ameesh-agents-1')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        details = [t['detail'] for t in self.traces()
+                   if t['hote'] == 'ameesh-agents-1' and t['etape'] == 'sante']
+        self.assertTrue(any('sans-sonde' in (d or '') for d in details), details)
 
     def test_failure_stops_sequence_and_rolls_back_host(self):
         (self.state / 'scenario').write_text('ko=manaty-mesh-1:controler\n')
@@ -656,6 +677,18 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertEqual(self.mod.choose(rows, 'auto', now)[0]['name'], 'a')
         self.assertEqual(self.mod.choose(rows, 'jamais', now), (None, 'sonde desactivee'))
         self.assertEqual(self.mod.choose([], 'auto', now)[0], None)
+
+    def test_detail_names_delivery_or_sans_sonde(self):
+        """#1214 : le detail de trace nomme la remise reelle ou son absence."""
+        remise = self.mod.detail('h', {'destinataire': 'p', 'delai_s': 2.3, 'message': 7}, None)
+        self.assertIn('sonde remise a p en 2.3s', remise)
+        sans = self.mod.detail('h', None, 'aucune persona menee (bail vivant) sur cet hote')
+        self.assertIn('sans-sonde', sans)
+        self.assertIn('aucune persona menee', sans)
+        ko = self.mod.detail('h', {'destinataire': 'p', 'delai_s': None, 'tour': 'x',
+                                   'message': 7}, None, 300)
+        self.assertIn('sonde KO a p', ko)
+        self.assertIn('attente 300', ko)
 
     def test_dead_letters_include_stopped_personas(self):
         """N1 : une boite morte d'une persona arretee de l'hote est rapportee."""

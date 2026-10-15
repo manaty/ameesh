@@ -165,6 +165,25 @@ def probe(db, row: dict, sha: str, attente: float) -> dict:
     return out
 
 
+def detail(hote: str, resultat: dict | None, pourquoi: str | None,
+           attente: float | None = None) -> str:
+    """Le verdict porte dans la trace JSONL de staging.sh (#1214).
+
+    « sonde remise a <nom> en <n>s » nomme une remise reelle, « sans-sonde
+    (<pourquoi>) » dit l'absence de sonde, et un KO nomme l'echec : une
+    sequence saine ne peut plus se lire comme une preuve de remise.
+    """
+    if resultat is None:
+        return "courrier %s : sans-sonde (%s)" % (hote, pourquoi or "aucune persona menee")
+    if resultat.get("delai_s") is None:
+        borne = "" if attente is None else ", attente %ss" % attente
+        return ("courrier %s : sonde KO a %s, %s (message %s%s)"
+                % (hote, resultat["destinataire"], resultat["tour"],
+                   resultat["message"], borne))
+    return ("courrier %s : sonde remise a %s en %ss (message %s)"
+            % (hote, resultat["destinataire"], resultat["delai_s"], resultat["message"]))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="sante du courrier d'un hote (#1155)")
     parser.add_argument("--hote", required=True)
@@ -200,16 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("courrier %s : %d persona(s), souffrance %s, boites mortes %s"
               % (args.hote, len(rows), souffrance or "aucune", mortes or "aucune"))
-        if resultat is None:
-            print("courrier %s : sonde non passee (%s)" % (args.hote, pourquoi))
-        elif resultat["delai_s"] is None:
-            print("courrier %s : KO sonde a %s, %s (message %s, attente %ss)"
-                  % (args.hote, resultat["destinataire"], resultat["tour"],
-                     resultat["message"], args.attente))
-        else:
-            print("courrier %s : sonde remise et accusee par %s en %ss (message %s)"
-                  % (args.hote, resultat["destinataire"], resultat["delai_s"],
-                     resultat["message"]))
+        print(detail(args.hote, resultat, pourquoi, args.attente))
     return 1 if verdict == "ko" else 0
 
 

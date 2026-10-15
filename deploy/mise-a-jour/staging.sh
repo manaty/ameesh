@@ -44,7 +44,9 @@
 #
 # Traces : une ligne JSON par evenement (date, hote, etape, verdict, sha,
 # precedent, detail) dans ~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl ;
-# `precedent` nomme la version que « retour » reinstalle reellement.
+# `precedent` nomme la version que « retour » reinstalle reellement. Le detail de
+# l'etape sante porte le verdict de sonde (« sonde remise a <nom> en <n>s » ou
+# « sans-sonde (...) »), jamais un simple « sante ok » (#1214).
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -255,8 +257,12 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
     serveur) ssh_lire "${CIBLE[$nom]}" "cat /opt/ameesh/precedent" 2>/dev/null ;;
   esac || true
 }
+#: detail de la derniere sonde, porte dans la trace JSONL (#1214) : « sonde
+#: remise … » distingue une remise reelle de « sans-sonde (aucune persona
+#: menee) », pour qu'une sequence saine ne se lise pas comme une remise.
+DETAIL_SANTE=""
 sante_hote() {  # nom [jamais]
-  local nom=$1 sans=${2:-} cible_sonde var
+  local nom=$1 sans=${2:-} cible_sonde var ligne
   var=$(var_sonde_de "$nom")
   cible_sonde=${!var:-}
   if [ "$(mode_de "$nom")" = poste ]; then
@@ -265,14 +271,17 @@ sante_hote() {  # nom [jamais]
   fi
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
-    "$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde "${cible_sonde:-auto}" \
-      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" \
-      || return 1
+    ligne=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde "${cible_sonde:-auto}" \
+      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA") \
+      || { printf '%s\n' "$ligne"; DETAIL_SANTE="sonde en echec"; return 1; }
   else
     etape "courrier de $nom (lecture seule, sonde desactivee)"
-    "$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde jamais \
-      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" || return 1
+    ligne=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde jamais \
+      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA") \
+      || { printf '%s\n' "$ligne"; DETAIL_SANTE="sonde en echec"; return 1; }
   fi
+  printf '%s\n' "$ligne"
+  DETAIL_SANTE=$ligne
 }
 notifier() {  # sujet corps
   local sujet=$1 corps=$2
@@ -377,7 +386,7 @@ for nom in "${HOTES[@]}"; do
   trace "$nom" controler ok
   etape "$nom : sante"
   sante_hote "$nom" || echec_hote "$nom" sante "sante en echec"
-  trace "$nom" sante ok
+  trace "$nom" sante ok "$DETAIL_SANTE"
 done
 
 etape "sequence staging terminee : ${HOTES[*]} sur $SHA_TRAVE"
