@@ -1,0 +1,63 @@
+{
+  "schema": "ameesh-train-ci-source-scope-draft/1",
+  "status": "unqualified",
+  "groups": {
+    "script_launchers_and_helpers": [
+      "scripts/**",
+      "infra/lib/**",
+      "infra/compute-build/win-nsis/**",
+      "website/scripts/**",
+      "desktop/scripts/**",
+      "desktop/host/scripts/**",
+      "mobile/scripts/**",
+      "mobile/plugins/**",
+      "shared/*/scripts/**",
+      "shared/routing/vectors/**"
+    ],
+    "node_package_execution": [
+      "backend/package*.json",
+      "website/package*.json",
+      "desktop/package*.json",
+      "mobile/package*.json",
+      "shared/*/package*.json",
+      "backend/tsconfig*.json",
+      "website/tsconfig*.json",
+      "desktop/tsconfig*.json",
+      "mobile/tsconfig*.json",
+      "shared/*/tsconfig*.json",
+      "backend/jest.config.cjs",
+      "backend/test/jest-boot.cjs",
+      "backend/test/jest-e2e.cjs",
+      "backend/.dependency-cruiser.js",
+      "backend/eslint*.mjs",
+      "website/vitest.config.mts",
+      "website/__tests__/setup.ts",
+      "website/playwright.remote-mock.config.ts",
+      "desktop/jest.config.js",
+      "mobile/jest.config.js",
+      "mobile/metro.config.js",
+      "mobile/app.config.ts",
+      "mobile/__mocks__/**",
+      "shared/*/jest.config.*"
+    ],
+    "rust_workspace_execution": [
+      "desktop/host/Cargo.toml",
+      "desktop/host/Cargo.lock",
+      "desktop/host/deny.toml",
+      "desktop/host/rust-toolchain.toml",
+      "desktop/host/.cargo/**",
+      "desktop/host/crates/*/Cargo.toml",
+      "desktop/host/vendor/**"
+    ]
+  },
+  "scope_questions": [
+    "scripts/deploy-workflow-shell.test.mjs belongs to deploy-api.yml and is excluded by scripts-suite.mjs; that deployment workflow is outside the twenty candidate code workflows",
+    "mobile live performance tests and general website staging e2e tests are outside the standard workflow baseline",
+    "hosted desktop matrices and the compute device bridge depend on external variables and authorization"
+  ],
+  "external_inputs": [
+    "GitHub actions and reusable remote workflows at the refs declared in each workflow",
+    "CI_HOSTED_DESKTOP, NEXLINK_CI_RUNNER_SHARE, bridge inputs and runner capabilities",
+    "unlocked npm install in shared/compute and shared/page-host, dynamic Python cryptography dependency and downloaded toolchains"
+  ]
+}

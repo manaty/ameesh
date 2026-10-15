@@ -530,3 +530,29 @@ aucun feu réel n'est donné. Les huit scénarios de port #1616 sont également
 verts avec les deux pilotes sur `488681e0dbb00f53a39f8244819b3faf362b74c1`.
 Restent le canon mécanique qualifié, le contrat complet Nexlink et le point
 d'appel du runner, puis les revues requises, avant gel et activation.
+
+## État après le canon du 15 octobre à 15:05
+
+Le courrier canon #58116, « Processus de lot », ajoute au §11 bis les
+allègements décidés par l'owner vers 14:45 : un avis d'une autre famille hors
+droits SQL, secrets, paiement et prod réelle ; aucun feu nominatif lorsque les
+verdicts sont acquis. Le feu pilote et les comptes de revue décrits plus haut
+correspondent à la préparation antérieure. Leur adaptation attend le contrat
+du fournisseur de mécanique compilée ; aucune nouvelle valeur de processus
+n'est fixée dans le consommateur. La demande de source qualifiée a été
+transmise au pilote, avec copie au fournisseur #1616.
+
+Le service runner préparatoire est présent depuis `308d7e84`, après le canon
+et le balayage des branches, avec une connexion ScopedDb fraîche par passage.
+Son port événementiel attend la qualification du raccord producteur demandée
+par le pilote le 15 octobre à 14:12 ; il ne fournit aucune autorité de fusion.
+L'incident #1656 doit être gardé dans la voie de fusion PR existante, au
+dernier geste, sous la réservation cible commune : un réveil du service
+inactif ne pourrait pas bloquer une fusion directe déjà armée sur GitHub.
+
+La carte Nexlink est complétée par
+[`reviews/1467-nexlink-contract/README.md`](../../../reviews/1467-nexlink-contract/README.md)
+et son inventaire reproductible de scripts/configurations. L'exclusion du
+témoin `deploy-workflow-shell` et les frontières perf mobile/e2e website sont
+signalées à #1470 pour qualification projet. Ce travail reste préparatoire,
+sans CI distante ni activation.
