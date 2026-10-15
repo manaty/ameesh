@@ -116,6 +116,30 @@ def resolve_lot(db, ref: str) -> dict | None:
     return rows[0] if rows else None
 
 
+def _branch_owner(db, branch: str, exclude: int | None = None):
+    """#1646 : le lot qui porte DÉJÀ cette branche, sinon None.
+
+    Une branche citée par un courrier peut être celle du parent d'un lot
+    empilé : la poser sur ce lot le ferait clore à la fusion du parent, sans
+    son propre contenu. Un lot terminal compte aussi : sa branche a déjà
+    atterri, la reposer fermerait le nouveau lot aussitôt."""
+    sql = "SELECT id, state, title FROM work_items WHERE branch = %s"
+    params: tuple = (branch,)
+    if exclude is not None:
+        sql += " AND id != %s"
+        params += (int(exclude),)
+    rows = db.query(sql + " ORDER BY id LIMIT 1", params)
+    return rows[0] if rows else None
+
+
+def _cited_branch_warning(owner: dict, branch: str, lot_id: int, recipient: str) -> str:
+    return ("branch %s already belongs to lot #%d (%s): not set on lot #%d — a branch "
+            "closes its own lot; to ride it anyway, set it explicitly: ameesh work "
+            "assign %d %s --branch %s"
+            % (branch, int(owner["id"]), owner.get("state") or "?",
+               int(lot_id), int(lot_id), recipient, branch))
+
+
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
@@ -125,8 +149,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
-    posée sur le lot qui n'en a pas. Lève AssignmentError si l'attribution
-    gardée refuse (rien n'est alors déposé).
+    posée sur le lot qui n'en a pas, sauf si elle est déjà celle d'un autre
+    lot (#1646 : un avertissement dit alors quoi faire). Lève AssignmentError
+    si l'attribution gardée refuse (rien n'est alors déposé).
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -179,10 +204,15 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             # #506: read before the lot exists (it makes its project known)
             introduced = (work_projects.introduction(cfg, db, project, sender)
                           if new_project and app is not None else "")
+            owner = _branch_owner(db, branch) if branch else None
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
-                                source="mail", app=project, cfg=cfg, branch=branch,
+                                source="mail", app=project, cfg=cfg,
+                                branch=None if owner else branch,
                                 estimate=minutes, note=introduced, parent_lot=parent_lot)
             out.update(created=True, assigned=True, branch=item.get("branch"))
+            if owner is not None:
+                out["warnings"].append(_cited_branch_warning(
+                    owner, branch, int(item["id"]), recipient))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
         elif lot is not None:
@@ -225,9 +255,14 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                             out["warnings"].append(done["check"]["warning"])
                 if branch and not item.get("branch") \
                         and (item.get("assignee") or "") == recipient:
-                    item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
-                                               source="cited by the mail")
-                    out["branch"] = item.get("branch")
+                    owner = _branch_owner(db, branch, exclude=int(item["id"]))
+                    if owner is not None:
+                        out["warnings"].append(_cited_branch_warning(
+                            owner, branch, int(item["id"]), recipient))
+                    else:
+                        item = work_mod.set_branch(db, int(item["id"]), branch, actor=sender,
+                                                   source="cited by the mail")
+                        out["branch"] = item.get("branch")
     except work_mod.WorkError as exc:
         raise AssignmentError(str(exc)) from exc
     if item is not None:
