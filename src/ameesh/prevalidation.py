@@ -20,14 +20,17 @@ avoir sa fin verte, chaque module attendu doit avoir été exécuté, et les
 modules du rapport sont ceux réellement vus — jamais ceux du plan.
 
 Le geste lie la tête prouvée à ce qui part sur la VM : `--repo` (ou le cwd)
-désigne l'arbre unique dont les contrats sont lus, dont l'état est vérifié
-(HEAD = `--sha`, aucune modification suivie), qui est photographié par
-l'offload et qui doit transporter le plan (`--plan`, chemin relatif refusé
-hors de l'arbre ou ignoré par git). La tête est relue après le run, en local
-et, si `--published-ref` est nommée, au distant : un mouvement pendant la
-validation invalide le rapport. Le rapport porte lot, SHA complet, base,
-commit de carte, modules exécutés, hôte, résultat et durée ; il n'est pas un
-verdict et ne remplace aucune relecture (#1617, #1756).
+désigne l'arbre unique dont les contrats sont lus et dont la tête est vérifiée
+(HEAD = `--sha`) ; le contenu envoyé n'est pas une photographie de l'arbre de
+travail mais l'arbre **construit** du SHA candidat plus le plan relu, figé par
+son identité et passé à l'offload (`--snapshot`) : ni fichier non suivi, ni
+flag `assume-unchanged`/`skip-worktree`, ni modification locale ne peut s'y
+glisser. Le plan est un chemin relatif, refusé hors de l'arbre ou ignoré par
+git. La tête est relue après le run, en local et, si `--published-ref` est
+nommée, au distant : un mouvement pendant la validation invalide le rapport.
+Le rapport porte lot, SHA complet, base, commit de carte, identité de l'arbre
+envoyé, modules exécutés, hôte, résultat et durée ; il n'est pas un verdict et
+ne remplace aucune relecture (#1617, #1756).
 """
 from __future__ import annotations
 
@@ -40,6 +43,8 @@ import sys
 import time
 from dataclasses import dataclass
 from typing import Sequence
+
+from . import offload
 
 #: schéma du plan lu (`scripts/test-plan.py`, L161f)
 PLAN_SCHEMA = "ameesh-test-plan/1"
@@ -126,6 +131,11 @@ def part_label(part: dict) -> str:
     return "%s:%s" % (part.get("driver"), part.get("part"))
 
 
+def _fin_label(part: str, fins_par_part: dict) -> str:
+    """Une part sans fin verte, avec le statut observé (diagnostic du refus)."""
+    return "%s (%s)" % (part, fins_par_part.get(part) or "sans fin")
+
+
 @dataclass(frozen=True)
 class Selection:
     """La sélection à exécuter, ou les causes de son refus (`ok` faux).
@@ -154,13 +164,15 @@ class Selection:
         `run` : `{"outcome", "exit", "seconds"}` ; `flow` : le flux lu
         (`modules`, `tests`, `fins_par_part`). `head_after` : la tête relue
         après le run (locale et/ou publiée) ; si elle diffère du SHA validé, le
-        rapport est invalidé (`head-moved`). `tree` : l'état vérifié de l'arbre
-        envoyé (tête observée, propreté), recopié dans le rapport.
+        rapport est invalidé (`head-moved`). `tree` : ce qui a été vérifié et ce
+        qui est parti (tête observée, identité du snapshot envoyé, chemin du
+        plan), recopié dans le rapport.
 
         La preuve est **exhaustive** : chaque part attendue doit avoir sa fin
-        verte, chaque module attendu doit avoir été exécuté, et les modules du
-        rapport sont ceux réellement vus — jamais ceux du plan (une preuve ne
-        s'invente pas)."""
+        verte — seul `succes` est vert ; `echec` est rouge, tout autre statut
+        (interrompu, inconnu, vide) est incomplet —, chaque module attendu doit
+        avoir été exécuté, et les modules du rapport sont ceux réellement vus —
+        jamais ceux du plan (une preuve ne s'invente pas)."""
         flow = flow or {}
         causes = list(self.causes)
         if head_after and not _same_commit(head_after, self.head):
@@ -168,11 +180,12 @@ class Selection:
         executed = tuple(sorted(str(m) for m in (flow.get("modules") or ())))
         fins_par_part = flow.get("fins_par_part") or {}
         planned_parts = tuple(sorted(part_label(p) for p in self.parts))
-        # une part rouge et une part sans fin ne disent pas la même chose :
-        # la première a tourné et échoué, la seconde n'a pas rendu son verdict
+        # une part rouge et une part sans fin verte ne disent pas la même chose :
+        # la première a tourné et échoué, la seconde n'a pas rendu son verdict.
+        # Un statut inconnu n'est jamais vert (#1770, P1 cx1).
         red = [p for p in planned_parts if fins_par_part.get(p) == "echec"]
         unfinished = [p for p in planned_parts
-                      if p not in fins_par_part or fins_par_part.get(p) == "interrompu"]
+                      if fins_par_part.get(p) not in ("succes", "echec")]
         missing_modules = [m for m in self.modules if m not in set(executed)]
         detail: list[str] = []
         outcome = run.get("outcome") or ""
@@ -186,7 +199,9 @@ class Selection:
             elif unfinished:
                 outcome = "run-incomplete"
                 causes.append("run-incomplete")
-                detail.append("parts sans fin verte: %s" % ", ".join(unfinished[:4]))
+                detail.append("parts sans fin verte: %s"
+                              % ", ".join(_fin_label(p, fins_par_part)
+                                          for p in unfinished[:4]))
             elif missing_modules:
                 outcome = "run-incomplete"
                 causes.append("run-incomplete")
@@ -218,16 +233,33 @@ class Selection:
         return report
 
 
-def read_plan(path: str) -> dict:
-    """Le plan écrit par `scripts/test-plan.py plan --out` (jamais deviné)."""
+def plan_text(path: str) -> str:
+    """Le contenu du plan, lu une fois : c'est ce texte qui est prouvé.
+
+    Le même texte est parsé et embarqué dans l'arbre envoyé (`--snapshot`) :
+    un plan modifié entre la lecture et le run ne peut donc pas faire exécuter
+    autre chose que ce qui a été validé."""
     try:
         with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError) as exc:
+            return fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("plan illisible (%s): %s" % (path, exc)) from None
+
+
+def parse_plan(text: str, path: str = "") -> dict:
+    """Le plan L161f depuis son texte (jamais deviné, jamais relu du disque)."""
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError("plan illisible (%s): %s" % (path or "contenu", exc)) from None
     if not isinstance(data, dict):
-        raise ValueError("plan %s : objet attendu" % path)
+        raise ValueError("plan %s : objet attendu" % (path or "contenu"))
     return data
+
+
+def read_plan(path: str) -> dict:
+    """Le plan écrit par `scripts/test-plan.py plan --out` (jamais deviné)."""
+    return parse_plan(plan_text(path), path)
 
 
 def planned_modules(plan: dict) -> tuple[str, ...]:
@@ -386,30 +418,37 @@ def resolved_head(root: str, *, runner=subprocess.run) -> str:
     return (getattr(proc, "stdout", "") or "").strip()
 
 
-def snapshot_state(root: str, head: str, *,
-                   runner=subprocess.run) -> tuple[bool, str, str]:
-    """L'arbre envoyé à l'offload est-il exactement la tête `head`, propre ?
+def head_state(root: str, head: str, *,
+               runner=subprocess.run) -> tuple[bool, str, str]:
+    """La tête de `root` est-elle le `head` annoncé ?
 
-    Rend `(ok, cause, tête observée)`. L'offload photographie l'arbre de
-    travail (suivi et non suivi, ignorés exclus) : sans cette garde, le rapport
-    certifierait un SHA que l'arbre envoyé ne porte pas. Toute modification
-    suivie (index ou travail) refuse : la preuve porterait du code non
-    commité."""
+    Rend `(ok, cause, tête observée)`. L'arbre de travail n'a plus à être
+    propre : ce n'est pas lui qui part (voir `pinned_snapshot`), seule la tête
+    est vérifiée avant et après le run."""
     got = resolved_head(root, runner=runner)
     if not got:
         return False, "dépôt illisible (git rev-parse HEAD dans %s)" % root, ""
     if not _same_commit(got, head):
         return False, ("arbre à %s, tête annoncée %s"
                        % (got[:12], (head or "—")[:12])), got
-    proc = runner(["git", "-C", root, "status", "--porcelain", "--untracked-files=no"],
-                  capture_output=True, text=True)
-    if getattr(proc, "returncode", 1):
-        return False, "état du dépôt illisible (git status)", got
-    dirty = (getattr(proc, "stdout", "") or "").strip()
-    if dirty:
-        return False, ("arbre modifié depuis %s: %s"
-                       % (got[:12], dirty.splitlines()[0])), got
     return True, "", got
+
+
+def pinned_snapshot(root: str, head: str, plan_rel: str, plan: str) -> str:
+    """L'identité exacte de ce qui part sur la VM : `head` + le plan relu.
+
+    `offload.snapshot()` photographie l'arbre de travail — fichiers non suivis
+    compris, et flags `assume-unchanged`/`skip-worktree` remis puis relus
+    (`offload.py`) — donc `git status` ne prouve pas ce qui part. Le geste ne
+    photographie plus : il **construit** l'arbre voulu (arbre du SHA candidat
+    plus le plan tel qu'il vient d'être lu), le fige par son identité et la
+    passe à l'offload (`--snapshot`) : le contenu exécuté ne dépend plus de
+    l'état local, et le rapport peut nommer l'identité envoyée."""
+    try:
+        return offload.snapshot_with(root, head, {plan_rel: plan})
+    except offload.OffloadError as exc:
+        raise PrevalidationError("head-moved",
+                                 "arbre du SHA + plan non constructible: %s" % exc) from None
 
 
 def remote_plan_path(plan_path: str, root: str, *, runner=subprocess.run) -> str:
@@ -438,11 +477,16 @@ def _q(value: str) -> str:
 
 
 def offload_argv(host: str, command: str, *, timeout: int | None = None,
-                 executable: str = "ameesh") -> list[str]:
-    """L'appel d'offload, toujours `--fallback none` : pas de repli local."""
+                 snapshot: str = "", executable: str = "ameesh") -> list[str]:
+    """L'appel d'offload, toujours `--fallback none` : pas de repli local.
+
+    `--snapshot` fige le contenu envoyé (arbre construit du SHA + plan) ; sans
+    lui, l'offload photographierait l'arbre de travail."""
     argv = [executable, "offload", "run", "--host", host, "--fallback", "none"]
     if timeout:
         argv += ["--timeout", str(int(timeout))]
+    if snapshot:
+        argv += ["--snapshot", str(snapshot)]
     return argv + ["--", "bash", "-lc", command]
 
 
@@ -509,14 +553,15 @@ def parse_seconds(text: str) -> float | None:
 
 
 def run_offload(host: str, command: str, *, timeout: int | None = None,
-                cwd: str | None = None, env: dict | None = None,
+                snapshot: str = "", cwd: str | None = None, env: dict | None = None,
                 runner=subprocess.run, executable: str = "ameesh") -> dict:
     """Exécute la sélection sur la VM et rend `{outcome, exit, seconds, host, flow}`.
 
     Aucun repli : un transport perdu n'est jamais rejoué ici (la suite peut
     tourner encore sur la VM). La durée distante est lue dans la sortie, la
     durée murale sert de repli."""
-    argv = offload_argv(host, command, timeout=timeout, executable=executable)
+    argv = offload_argv(host, command, timeout=timeout, snapshot=snapshot,
+                        executable=executable)
     started = time.time()
     proc = runner(argv, cwd=cwd, env=env, capture_output=True, text=True)
     output = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
@@ -621,7 +666,7 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
              remote: str = "origin", local: str | None = None,
              cwd: str | None = None, env: dict | None = None,
              runner=subprocess.run, git_runner=subprocess.run,
-             executable: str = "ameesh") -> dict:
+             snapshotter=None, executable: str = "ameesh") -> dict:
     """Le geste complet : contrôles du canon, exécution distante, rapport.
 
     Refuse avant tout run un hôte hors du canon, un contrat déclaré introuvable
@@ -635,32 +680,34 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
     allowed, why = host_allowed(name, local=local)
     if not allowed:
         raise PrevalidationError("no-vm", why)
-    # un seul arbre pour tout le geste : contrats lus, état vérifié, snapshot
-    # envoyé, plan embarqué. `--repo` désigne cet arbre ; sans lui, le cwd.
+    # un seul arbre pour tout le geste : contrats lus, tête vérifiée, plan
+    # embarqué. `--repo` désigne cet arbre ; sans lui, le cwd.
     root = os.path.abspath(cwd or repo or os.getcwd())
     for path in getattr(params, "contracts", ()) or ():
         full = os.path.join(root, str(path))
         if not os.path.isfile(full):
             raise PrevalidationError("selection-unsafe",
                                      "contrat déclaré introuvable: %s" % path)
-    plan = read_plan(plan_path)
+    text = plan_text(plan_path)
+    plan = parse_plan(text, plan_path)
     within, why = meets_canon(plan, params, root)
     chosen = selection(plan, head=head, base=base, plan_path=plan_path)
     if not chosen.ok:
         raise PrevalidationError(chosen.causes[0], chosen.why)
     if not within:
         raise PrevalidationError("selection-unsafe", why)
-    # ce que l'offload envoie, c'est l'arbre de travail : il doit porter la tête
-    # exacte, sans modification suivie, et le plan doit y être transporté
-    ok_tree, why_tree, tree_head = snapshot_state(root, head, runner=git_runner)
-    if not ok_tree:
-        raise PrevalidationError("head-moved", why_tree)
+    # la tête annoncée est celle de l'arbre ; ce qui part sur la VM n'est pas
+    # l'arbre de travail mais l'arbre construit du SHA + le plan relu, figé ici
+    ok_head, why_head, tree_head = head_state(root, head, runner=git_runner)
+    if not ok_head:
+        raise PrevalidationError("head-moved", why_head)
     remote_plan = remote_plan_path(plan_path, root, runner=git_runner)
+    pinned = (snapshotter or pinned_snapshot)(root, head, remote_plan, text)
     result = run_offload(name, remote_script(
         remote_plan, chosen.parts,
         parts_script=getattr(params, "parts_script", None) or ""),
         timeout=int(getattr(params, "timeout_seconds", 0) or 0),
-        cwd=root, env=env, runner=runner, executable=executable)
+        snapshot=pinned, cwd=root, env=env, runner=runner, executable=executable)
     # la tête est relue APRÈS le run : l'arbre local d'abord (a-t-il bougé
     # pendant l'exécution ?), la référence publiée ensuite si elle est nommée.
     # Une relecture impossible ne vaut pas « inchangée » : elle invalide.
@@ -671,9 +718,10 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
                                      runner=git_runner)
         if not _same_commit(remote_head, head):
             after = remote_head
-    # le rapport dit ce qui a été vérifié : l'arbre local toujours, la
-    # référence publiée seulement quand l'opérateur l'a nommée
-    tree = {"head": tree_head, "clean": True}
+    # le rapport dit ce qui a été vérifié et ce qui est parti : l'arbre local
+    # (tête observée), l'identité exacte du snapshot envoyé et le plan qu'il
+    # porte ; la référence publiée seulement quand l'opérateur l'a nommée
+    tree = {"head": tree_head, "snapshot": pinned, "plan": remote_plan}
     if published_ref:
         tree["published_ref"] = published_ref
     return chosen.proof(lot=lot, host=name, run=result, flow=result.get("flow"),
@@ -708,7 +756,7 @@ def add_parsers(work_sub, func) -> None:
     parser.add_argument("--host", required=True, help="VM agents (jamais le poste local)")
     parser.add_argument("--base", default="")
     parser.add_argument("--repo", default="",
-                        help="arbre du lot : contrats, état vérifié, snapshot envoyé")
+                        help="arbre du lot : contrats, tête vérifiée, plan embarqué")
     parser.add_argument("--canon-repo", default="")
     parser.add_argument("--canon-commit", default="", help="commit exact du canon relu")
     parser.add_argument("--project", default="ameesh")
