@@ -396,3 +396,170 @@ def run_offload(host: str, command: str, *, timeout: int | None = None,
     if result["seconds"] is None:
         result["seconds"] = round(time.time() - started, 1)
     return result
+
+
+# --------------------------------------------------------------------------
+# la sélection doit rester dans ce que le canon déclare (#1770)
+# --------------------------------------------------------------------------
+
+def meets_canon(plan: dict, params) -> tuple[bool, str]:
+    """La sélection du plan tient-elle exactement dans le canon ?
+
+    Le canon déclare les classes retenues ; le plan porte la classe de chaque
+    module (`classes`) et la liste des contrats. La sélection doit être
+    exactement `classes déclarées ∪ contrats` : un module en trop serait un
+    élargissement, un module manquant un contrat perdu. Sans classes lisibles,
+    rien ne se prouve : refus."""
+    classes = plan.get("classes") if isinstance(plan, dict) else None
+    if not isinstance(classes, dict) or not classes:
+        return False, "plan sans classes : la sélection ne se prouve pas"
+    declared = tuple(getattr(params, "classes", ()) or ())
+    if not declared:
+        return False, "canon sans classes déclarées"
+    contract = {str(m) for m in (plan.get("contract") or ())}
+    expected = {str(m) for m, entry in classes.items()
+                if isinstance(entry, (list, tuple)) and entry
+                and str(entry[0]) in declared}
+    expected |= contract
+    chosen = {str(m) for m in ((plan.get("selection") or {}).get("modules") or ())}
+    missing = sorted(expected - chosen)
+    extra = sorted(chosen - expected)
+    if missing:
+        return False, "modules attendus absents de la sélection: %s" % ", ".join(missing[:3])
+    if extra:
+        return False, "modules hors des classes déclarées: %s" % ", ".join(extra[:3])
+    return True, ""
+
+
+def published_head(ref: str, *, repo: str = ".", remote: str = "origin",
+                   runner=subprocess.run) -> str:
+    """La tête d'une référence **publiée** : ce que porte le distant.
+
+    Un ref local ne prouve pas la publication ; une lecture impossible refuse
+    (`head-moved`) plutôt que de valider un résultat sur une tête incertaine."""
+    proc = runner(["git", "-C", repo, "ls-remote", remote, ref],
+                  capture_output=True, text=True)
+    if getattr(proc, "returncode", 1) != 0:
+        raise PrevalidationError("head-moved", "tête publiée illisible: %s" % ref)
+    for ligne in (getattr(proc, "stdout", "") or "").splitlines():
+        champs = ligne.split()
+        if len(champs) == 2 and champs[1] in (ref, "refs/heads/" + ref):
+            return champs[0]
+    raise PrevalidationError("head-moved", "référence publiée introuvable: %s" % ref)
+
+
+def validate(*, lot: int, plan_path: str, head: str, host: str, params,
+             base: str = "", repo: str = "", published_ref: str = "",
+             remote: str = "origin", local: str | None = None,
+             cwd: str | None = None, env: dict | None = None,
+             runner=subprocess.run, git_runner=subprocess.run,
+             executable: str = "ameesh") -> dict:
+    """Le geste complet : contrôles du canon, exécution distante, rapport.
+
+    Refuse avant tout run un hôte hors du canon, un contrat déclaré introuvable
+    ou une sélection élargie ; aucun repli local, aucune écriture de jalon. Le
+    rapport rendu n'est pas un verdict (#1617, #1756)."""
+    if not isinstance(lot, int) or lot <= 0:
+        raise PrevalidationError("selection-unsafe", "lot invalide: %r" % (lot,))
+    name = (host or "").strip()
+    if name not in tuple(getattr(params, "hosts", ()) or ()):
+        raise PrevalidationError("no-vm", "hôte %r hors des hôtes déclarés au canon" % name)
+    allowed, why = host_allowed(name, local=local)
+    if not allowed:
+        raise PrevalidationError("no-vm", why)
+    for path in getattr(params, "contracts", ()) or ():
+        full = os.path.join(repo, str(path)) if repo else str(path)
+        if not os.path.isfile(full):
+            raise PrevalidationError("selection-unsafe",
+                                     "contrat déclaré introuvable: %s" % path)
+    plan = read_plan(plan_path)
+    within, why = meets_canon(plan, params)
+    chosen = selection(plan, head=head, base=base, plan_path=plan_path)
+    if not chosen.ok:
+        raise PrevalidationError(chosen.causes[0], chosen.why)
+    if not within:
+        raise PrevalidationError("selection-unsafe", why)
+    result = run_offload(name, remote_script(plan_path, chosen.parts),
+                         timeout=int(getattr(params, "timeout_seconds", 0) or 0),
+                         cwd=cwd, env=env, runner=runner, executable=executable)
+    after = ""
+    if published_ref:
+        after = published_head(published_ref, repo=repo or ".", remote=remote,
+                               runner=git_runner)
+    return chosen.proof(lot=lot, host=name, run=result, flow=result.get("flow"),
+                        head_after=after)
+
+
+# --------------------------------------------------------------------------
+# la commande explicite : refus nommé, aucun jalon, accroche automatique inactive
+# --------------------------------------------------------------------------
+
+#: sous-commandes `ameesh work …` portées par ce module
+COMMANDS = ("prevalidate",)
+
+
+def add_parsers(work_sub, func) -> None:
+    """`ameesh work prevalidate` : prévalidation explicite d'une tête candidate."""
+    parser = work_sub.add_parser(
+        "prevalidate", help="#1770 : exécuter la sélection du canon sur une VM avant un gel")
+    parser.add_argument("lot", type=int)
+    parser.add_argument("--sha", required=True, help="tête candidate exacte")
+    parser.add_argument("--plan", required=True, help="plan L161f (scripts/test-plan.py)")
+    parser.add_argument("--host", required=True, help="VM agents (jamais le poste local)")
+    parser.add_argument("--base", default="")
+    parser.add_argument("--repo", default="", help="dépôt du lot (contrats, tête publiée)")
+    parser.add_argument("--canon-repo", default="")
+    parser.add_argument("--canon-commit", default="", help="commit exact du canon relu")
+    parser.add_argument("--project", default="ameesh")
+    parser.add_argument("--published-ref", default="",
+                        help="référence relue au distant après le run (invalide si elle bouge)")
+    parser.add_argument("--remote", default="origin")
+    parser.add_argument("--json", action="store_true")
+    parser.set_defaults(func=func)
+
+
+def run(cfg, db, args) -> int:
+    """La commande explicite refuse un canon sans bloc, cause `block-missing`.
+
+    Elle n'écrit ni jalon ni verdict : l'accroche automatique du gel reste
+    inactive tant que la règle n'est pas adoptée."""
+    from . import mechanics  # refus nommé si le lecteur manque (load_parameters)
+    try:
+        params = None
+        if args.canon_commit:
+            _, params = load_parameters(args.canon_repo or args.repo or ".",
+                                        args.canon_commit, args.project)
+        if params is None:
+            raise PrevalidationError("block-missing",
+                                     "aucun canon relu fourni (--canon-commit)")
+        report = validate(lot=args.lot, plan_path=args.plan, head=args.sha,
+                          host=args.host, params=params, base=args.base,
+                          repo=args.repo or "", published_ref=args.published_ref,
+                          remote=args.remote)
+    except PrevalidationError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": REPORT_SCHEMA, "lot": args.lot,
+                              "outcome": "refused", "ok": False,
+                              "causes": [exc.cause], "why": exc.why}, sort_keys=True))
+        else:
+            print("prévalidation refusée : %s%s"
+                  % (exc.cause, (" — " + exc.why) if exc.why else ""))
+        return 1
+    except (ValueError, mechanics.MechanicsError) as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": REPORT_SCHEMA, "lot": args.lot,
+                              "outcome": "refused", "ok": False,
+                              "causes": ["selection-unsafe"], "why": str(exc)},
+                             sort_keys=True))
+        else:
+            print("prévalidation refusée : %s" % exc)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(report, sort_keys=True))
+    elif report["ok"]:
+        print("prévalidation verte : lot %s, %s, %s module(s), %s s sur %s"
+              % (report["lot"], report["sha"][:12], len(report["modules"]),
+                 report["seconds"], report["host"]))
+    else:
+        print("prévalidation refusée : %s" % ", ".join(report["causes"]))
+    return 0 if report["ok"] else 1

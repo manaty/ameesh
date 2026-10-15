@@ -52,6 +52,32 @@ exact et rend `(document, bloc)` ; sans bloc, il lève
 (`src/ameesh/prevalidation.py`) ne reçoivent leurs paramètres que du bloc : ni
 classe, ni hôte, ni délai codés en dur.
 
+## Commande explicite
+
+```
+ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
+        [--base <sha>] [--repo <dépôt>] --canon-commit <sha> [--canon-repo <dépôt>]
+        [--project <nom>] [--published-ref <ref>] [--json]
+```
+
+- sans canon relu (`--canon-commit` absent ou bloc absent) : refus
+  `block-missing`, aucune exécution ;
+- contrôles avant tout run : hôte déclaré au canon (sinon `no-vm`), contrats
+  déclarés présents dans le dépôt, sélection exactement `classes du canon ∪
+  contrats` (tout module en trop est un élargissement, tout module manquant un
+  contrat perdu) ;
+- délai du run : `timeout_seconds` du canon ; exécution par
+  `ameesh offload run --fallback none` uniquement ;
+- après le run, si `--published-ref` est donnée, la référence est relue **au
+  distant** (`git ls-remote`) : une tête qui a bougé invalide le rapport
+  (`head-moved`) ;
+- le rapport `ameesh-prevalidation/1` est imprimé (`--json`) ; code de sortie 0
+  si vert, 1 sinon. **Aucun jalon, aucun verdict, aucune écriture** : l'accroche
+  automatique du gel n'existe pas encore.
+
+Tant que le bloc canon n'est pas publié, la commande refuse donc toujours :
+c'est l'effet voulu de l'ordre de mise en service.
+
 ## Raccords
 
 - #1616 (lecteur) : extension additive, tête gelée non élargie ; ce delta est

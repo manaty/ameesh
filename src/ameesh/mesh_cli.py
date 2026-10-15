@@ -1303,10 +1303,12 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
 
 
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
-    from . import plan, plan_cli, stagnation  # plan de travail (L29)
+    from . import plan, plan_cli, prevalidation, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
         _work_actor(cfg, db, args)
+        if args.work_command in prevalidation.COMMANDS:   # #1770 prévalidation au gel
+            return prevalidation.run(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
@@ -2553,6 +2555,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
+    from . import prevalidation
+    prevalidation.add_parsers(work_sub, cmd_work)  # #1770 prévalidation au gel
     from . import backlog
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
     from . import unrecorded
