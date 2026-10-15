@@ -47,7 +47,7 @@ from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
-from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
+from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import load as load_config
 
@@ -728,6 +728,7 @@ class AgentWorker(threading.Thread):
         retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         # L76 : rien ne survit au bail, pas même un processus résident inactif
         self._close_resident("lease released")
+        self._release_session_lock()
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         # L113 : le travail part au serveur sous le bail, puis le dossier est
         # effacé (même bail perdu : rien ne doit rester sur l'appareil)
@@ -3230,6 +3231,8 @@ class AgentWorker(threading.Thread):
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
+        if self._attach_pending():
+            return None
         spec = self._pick()
         if spec is not None:
             # #408 : le réveil sur un lot actionnable porte déjà son lot
@@ -3642,7 +3645,49 @@ class AgentWorker(threading.Thread):
             "remaining": reste,
         }
 
+    def _release_session_lock(self) -> None:
+        lock = getattr(self, "_session_lock", None)
+        if lock is not None:
+            self._session_lock = None
+            lock.close()
+
+    def _attach_pending(self) -> bool:
+        from .platform import session_lock
+        if not session_lock.requested(self.state_dir):
+            return False
+        if not getattr(self, "_session_turn_depth", 0):
+            self._close_resident("attach requested")
+            self._release_session_lock()
+        return True
+
     def run_turn(self, spec: dict) -> bool:
+        """Exclude attach for the whole turn and life of its resident."""
+        from .platform import session_lock
+        if self._attach_pending():
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        if getattr(self, "_session_lock", None) is None:
+            self._session_lock = session_lock.try_lock(self.state_dir, "session-use")
+            if self._session_lock is None:
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+                return False
+        if self._attach_pending():
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
+        try:
+            return self._run_guarded_turn(spec)
+        finally:
+            self._session_turn_depth -= 1
+            if not self._session_turn_depth:
+                try:
+                    if session_lock.requested(self.state_dir):
+                        self._close_resident("attach requested after turn")
+                finally:
+                    if self.resident is None:
+                        self._release_session_lock()
+
+    def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
         réservation sous un jeton (registre verrouillé, bail contrôlé), consigne
         rendue sur les messages réservés, remise soldée juste après le lancement
@@ -3943,6 +3988,8 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 if self.resident is rp:
                     self.resident = None
+            if not getattr(self, "_session_turn_depth", 0):
+                self._release_session_lock()
         with self.runner.launch_lock:
             self.runner.harness_pids.discard(rp.pgid)
         if rp.resource_open:
@@ -8155,7 +8202,28 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
-               ttl: float | None = None) -> int:
+               ttl: float | None = None, max_seconds: float | None = None) -> int:
+    from contextlib import ExitStack
+    from . import attach as attach_mod
+    from .platform import session_lock
+    if not NAME_RE.match(name or ""):
+        print("invalid agent name: %r" % name, file=sys.stderr)
+        return 1
+    max_seconds = attach_mod.DEFAULT_MAX if max_seconds is None else max_seconds
+    attach_mod.Deadline(max_seconds)  # validate before taking a lock or lease
+    with ExitStack() as locks:
+        request = session_lock.try_lock(cfg.agent_dir(name), "attach-request")
+        if request is None:
+            print("agent %s already has an attach request/session: close it first" % name,
+                  file=sys.stderr)
+            return 3
+        locks.enter_context(request)
+        return _run_attach(cfg, db, name, wait=wait, ttl=ttl,
+                           max_seconds=max_seconds, locks=locks)
+
+
+def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
+                ttl: float | None, max_seconds: float, locks) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
 
     Le bail est pris même s'il est déjà détenu par un exécuteur **sans tour en
@@ -8165,6 +8233,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     renouvelé tant que la session vit, le harnais est arrêté si le bail est
     perdu, et le bail est rendu à la sortie.
     """
+    from . import attach as attach_mod
+    from .platform import session_lock
     agent = registry.get(db, name)
     if agent is None:
         print("unknown agent: %s" % name, file=sys.stderr)
@@ -8196,7 +8266,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     owner = attach_owner(cfg.host)
     ttl = max(5.0, ttl or cfg.lease_ttl)
     registry.reap(db, cfg.host)
+    handoff_end = time.monotonic() + attach_mod.HANDOFF_TIMEOUT
+    session_guard = None
     while True:
+        current = registry.get(db, name) or {}
+        if ((current.get("lease_owner") or "").startswith("attach:")
+                and float(current.get("lease_expires_ts") or 0) > time.time()):
+            print("agent %s already has an attached session: close it first" % name,
+                  file=sys.stderr)
+            return 3
         if registry.turn_in_progress(db, name):
             if not wait:
                 print("a turn is in progress for %s (rerun with --wait to wait)"
@@ -8205,6 +8283,23 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             print("turn in progress for %s: waiting…" % name, file=sys.stderr, flush=True)
             time.sleep(2.0)
             continue
+        if session_guard is None:
+            session_guard = session_lock.try_lock(cfg.agent_dir(name), "session-use")
+            if session_guard is None:
+                if time.monotonic() >= handoff_end:
+                    print("agent %s: resident did not hand back its session; attach refused"
+                          % name, file=sys.stderr)
+                    return 3
+                time.sleep(0.1)
+                continue
+            locks.enter_context(session_guard)
+        # No runner can start a turn while this guard is held. Refresh the
+        # session after --wait, before taking a lease that needs cleanup.
+        finished = registry.get(db, name) or {}
+        if ((finished.get("harness") or "") == (agent.get("harness") or "")
+                and agent_incarnation(finished) == agent_incarnation(agent)):
+            agent = dict(agent, session_id=finished.get("session_id"),
+                         pending_prompt=finished.get("pending_prompt"))
         lease = registry.attach_claim(db, name, owner, ttl)
         if lease:
             break
@@ -8242,6 +8337,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     stop = threading.Event()
     perdu = threading.Event()
     etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
+    limit = attach_mod.Deadline(max_seconds)
+    expired = threading.Event()
 
     def battement() -> None:
         interval = max(3.0, ttl / 3.0)
@@ -8269,6 +8366,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         bornée par l'échéance, comme le veilleur d'`AgentWorker`.
         """
         while not stop.is_set():
+            if limit.expired():
+                expired.set()
+                perdu.set()
+                log_async("[%s] attach: maximum duration reached; returning to runner" % name)
+                return
+            remaining = limit.notice()
+            if remaining is not None:
+                log_async("[%s] attach ends in %.0fs; close the session to return to the runner"
+                          % (name, remaining))
             if etat["deadline"] <= 0:
                 stop.wait(0.5)
                 continue
@@ -8284,12 +8390,35 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     proc: subprocess.Popen | None = None
     code = 0
     holds: list = []
+    def check_inputs() -> None:
+        prompt_since = time.time() if agent.get("pending_prompt") else None
+        alerted_since = None
+        while not stop.is_set():
+            try:
+                queued = registry.get(db, name) or {}
+                if not queued.get("pending_prompt"):
+                    prompt_since = None
+                elif prompt_since is None:
+                    prompt_since = time.time()
+                since = attach_mod.waiting_since(db, name, queued, prompt_since)
+                if since is None:
+                    alerted_since = None
+                elif time.time() - since >= attach_mod.INPUT_DELAY and since != alerted_since:
+                    log_async("[%s] attach: inputs waiting for more than 10 min; "
+                              "close the session to return to the runner" % name)
+                    alerted_since = since
+            except db_mod.DbError as exc:
+                log_async("[%s] attach: cannot check waiting inputs (%s)" % (name, exc))
+            stop.wait(attach_mod.INPUT_CHECK)
+
+    inputs = threading.Thread(target=check_inputs, daemon=True, name="%s-attach-inputs" % name)
     try:
         # codex verdict #182 (P2): everything after taking the lease is under the
         # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
         # slow `claude --help`) still releases the lease
         thread.start()
         veille.start()
+        inputs.start()
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
@@ -8303,6 +8432,10 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
             return 1  # le `finally` rend le bail
+        if limit.expired():
+            return 124
+        if perdu.is_set():
+            return 1
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
         proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
@@ -8315,6 +8448,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                 break
             time.sleep(0.2)
         code = proc.wait()
+        if expired.is_set():
+            code = 124
     except KeyboardInterrupt:
         if proc is not None:
             stop_group_now(proc, "interrupted (attach)", name=name)
@@ -8325,7 +8460,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         stop.set()
         for hold in holds:          # L219: the session is over
             hold.release()
-        for worker in (thread, veille):
+        for worker in (thread, veille, inputs):
             if worker.ident is not None:    # started (L223)
                 worker.join(timeout=5)
         try:
@@ -8337,14 +8472,17 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
 
 
 def attach_main(argv: list[str] | None = None) -> int:
+    from . import attach as attach_mod
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
         prog="ameesh attach",
-        description="Open an interactive session on an agent's lease (C9).")
+        description="Put the resident to sleep for bounded native access, then return its lease (L82).")
     parser.add_argument("agent")
     parser.add_argument("--wait", action="store_true",
                         help="wait for a turn in progress to end before taking the lease")
     parser.add_argument("--ttl", type=float, default=None, help="lease duration in seconds")
+    parser.add_argument("--max", type=attach_mod.duration, default=attach_mod.DEFAULT_MAX,
+                        help="maximum interactive duration (default: 2h; e.g. 30m, 4h)")
     parsed = parser.parse_args(argv)
     cfg = load_config()
     adapters.configure(cfg)  # L106 : `harness_bins` de l'hôte
@@ -8360,7 +8498,8 @@ def attach_main(argv: list[str] | None = None) -> int:
         except db_mod.SchemaMissing as exc:
             print("ameesh attach: %s" % exc, file=sys.stderr)
             return 1
-        code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl)
+        code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl,
+                          max_seconds=parsed.max)
         return code
     finally:
         try:
