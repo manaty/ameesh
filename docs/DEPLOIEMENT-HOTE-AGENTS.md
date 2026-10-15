@@ -134,7 +134,7 @@ VM, dont la présence est prouvée avant l’envoi ; sans base lisible, ou si
 l’exclusion vide le paquet, il est autonome — une cible déjà fusionnée dans
 `origin/main` passe donc, comme le retour vers un ancêtre absent de la VM.
 
-Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
+La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `étape`, `verdict`,
 `sha`, `precedent`, `detail`) dans
 `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`. Le `detail` de
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
