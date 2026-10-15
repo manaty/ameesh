@@ -210,8 +210,9 @@ def _agent(ctx: Context, db, params, query) -> dict:
 
 def _chat(ctx: Context, db, params, query) -> dict:
     """An agent's shared conversation, ascending from `after` (L83): the same
-    `ameesh-conversation/1` history `ameesh chat` reads. Team mode filters it
-    by the 0033 §9 relations; local mode is the machine's owner (L86)."""
+    `ameesh-conversation/1` history `ameesh chat` reads. No relation filter
+    yet: the API's token is the machine owner's; filtering by the 0033 §9
+    relations arrives with the OIDC tokens of team mode (L86)."""
     from . import conversation, registry
     if registry.get(db, params["agent"]) is None:
         raise ApiError(404, "not_found", "unknown agent")

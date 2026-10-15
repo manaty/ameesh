@@ -210,7 +210,9 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
     reflété par une entrée `human_message` : `mail.send` écrit la copie
     lisible (R12), l'entrée ne porte donc pas de seconde sortie. Un échec
     après le courrier laisse le message délivré et l'erreur dite : le
-    courrier est la délivrance, l'entrée son reflet.
+    courrier est la délivrance, l'entrée son reflet. L'entrée est rangée dans
+    le projet de la copie R12 : celui du lot quand un lot est posé
+    (`fil.lot_project`, la règle de `mail.send`), sinon celui de l'agent.
 
     `event_id` est stable (`mail:<id>` par défaut) : un rejeu après la
     délivrance ne crée pas de seconde entrée.
@@ -223,7 +225,8 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
     message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
                            payload={"human": True}, work_item_id=work_item_id)
     log = conversation.Log(db, cfg, agent=agent,
-                           project=fil.project_for(cfg, fil.agent_project(row)),
+                           project=fil.project_for(cfg, fil.lot_project(db, work_item_id),
+                                                   fil.agent_project(row)),
                            lot=work_item_id)
     entry = log.append("human_message", text, author=human,
                        event_id=event_id or "mail:%d" % message_id, thread=False)

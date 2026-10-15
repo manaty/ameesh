@@ -110,6 +110,21 @@ class PostHumanMessageTest(unittest.TestCase):
                                          "author": "human:owner", "ts": 5.0,
                                          "event_id": "mail:7"}})
 
+    def test_with_a_lot_the_entry_goes_to_the_lot_project(self):
+        # #1673 (N3): the R12 copy of `mail.send` goes to the lot's project;
+        # the entry follows it, not the agent's project
+        row = {"name": "a1", "team": "demo", "canon_governed": True}
+        with mock.patch.object(registry, "get", return_value=row), \
+                mock.patch.object(mail, "send", return_value=7), \
+                mock.patch.object(fil, "lot_project", return_value="nexlink") as lot_project, \
+                mock.patch.object(conversation, "Log", self._Log):
+            out = chat.post_human_message(self.cfg, object(), human="human:owner",
+                                          sender="owner", agent="a1", text="salut", lot=42)
+        self.assertEqual(lot_project.call_args.args[1], "42")
+        log = self._Log.instances[0]
+        self.assertEqual((log.kwargs["project"], log.kwargs["lot"]), ("nexlink", "42"))
+        self.assertEqual(out["lot"], 42)
+
     def test_an_invalid_agent_is_refused_before_the_mail(self):
         with mock.patch.object(mail, "send") as send:
             with self.assertRaises(ValueError):

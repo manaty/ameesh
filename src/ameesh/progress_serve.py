@@ -241,8 +241,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _refuse(self) -> None:
         path = urllib.parse.urlsplit(self.path).path
         allow = "GET, HEAD, POST" if path == CHAT and self.write_chat is not None else "GET, HEAD"
-        self._error(405, "read-only: GET and HEAD only, plus POST %s" % CHAT,
-                    (("Allow", allow),))
+        if allow.endswith("POST"):
+            message = "conversation: GET, HEAD and POST only"
+        elif self.write_chat is not None:
+            message = "read-only: GET and HEAD only (POST: %s alone)" % CHAT
+        else:
+            message = "read-only: GET and HEAD only"
+        self._error(405, message, (("Allow", allow),))
 
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = \
         lambda self: self._refuse()
@@ -256,6 +261,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "by ameesh progress --serve", (("WWW-Authenticate", "Bearer"),))
 
     def _json_body(self) -> dict:
+        from . import serve
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
             raise ServeError(415, "Content-Type: application/json is required")
@@ -268,8 +274,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if length > MAX_CHAT_BODY:
             raise ServeError(413, "body too large (max %d bytes)" % MAX_CHAT_BODY)
         try:
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
+            # the parser of L87 (`serve._body`): no duplicate key, no NaN
+            body = json.loads(self.rfile.read(length).decode("utf-8"),
+                              parse_constant=serve._no_constant,
+                              object_pairs_hook=serve._no_duplicates)
+        except (UnicodeDecodeError, ValueError, RecursionError):
             raise ServeError(400, "invalid JSON body")
         if not isinstance(body, dict):
             raise ServeError(400, "a JSON object is required")
@@ -307,6 +316,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 db_mod.SchemaMissing) as exc:
             self._error(503, "conversation unavailable: %s" % exc)
             return
+        except Exception as exc:  # noqa: BLE001 — an answer, never a trace
+            # `serve.act` keeps the key reserved: the message may be delivered
+            self.log_message("conversation input: internal error (%s)", type(exc).__name__)
+            self._error(500, "internal error: the message may have been delivered; "
+                             "check the conversation before sending it again")
+            return
         extra = (("Idempotent-Replayed", "true"),) if replayed else ()
         self._send(status, json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8"),
                    "application/json; charset=utf-8", extra)
@@ -340,6 +355,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
                     db_mod.SchemaMissing) as exc:
                 self._error(503, "conversation unavailable: %s" % exc)
+                return
+            except Exception as exc:  # noqa: BLE001 — an answer, never a trace
+                self.log_message("conversation: internal error (%s)", type(exc).__name__)
+                self._error(500, "internal error")
                 return
             data = json.dumps(page, ensure_ascii=False, sort_keys=True)
             self._send(200, data.encode("utf-8"), "application/json; charset=utf-8")

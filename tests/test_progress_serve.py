@@ -459,6 +459,84 @@ class ConversationPgTest(PgTestCase):
         self.assertEqual(self.db.query("select 1 from agent_mailbox"), [])
 
 
+class ConversationGuardTest(unittest.TestCase):
+    """#1673 : sans base, la saisie de la fiche suit le parseur de L87 et
+    répond toujours, même sur une erreur imprévue de l'écriture."""
+
+    def setUp(self):
+        self.calls = []
+        self.fail_with = None
+
+        def read(query):
+            if self.fail_with is not None:
+                raise self.fail_with
+            return {"entries": []}
+
+        def write(key, body):
+            self.calls.append(body)
+            if self.fail_with is not None:
+                raise self.fail_with
+            return 200, {"ok": True}, False
+        snapshots = progress_serve.Snapshots(lambda project: _projects_snap(project))
+        self.server = progress_serve.make_server(snapshots, port=0, chat=(read, write))
+        self.port = self.server.server_address[1]
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+
+        def stop():
+            self.server.shutdown()
+            self.server.server_close()
+            thread.join(5)
+        self.addCleanup(stop)
+
+    def request(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Host": "127.0.0.1:%d" % self.port,
+                   "Authorization": "Bearer %s" % self.server.token,
+                   "Content-Type": "application/json", "Idempotency-Key": "web-0000000001"}
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            return resp, resp.read().decode("utf-8")
+        finally:
+            conn.close()
+
+    def test_cle_dupliquee_refusee_comme_l87(self):
+        resp, _ = self.request("POST", progress_serve.CHAT,
+                               b'{"agent": "a1", "text": "x", "text": "y"}')
+        self.assertEqual(resp.status, 400)
+        resp, _ = self.request("POST", progress_serve.CHAT,
+                               b'{"agent": "a1", "text": NaN}')
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(self.calls, [])
+
+    def test_erreur_imprevue_de_l_ecriture_repond_500(self):
+        self.fail_with = KeyError("secret-detail")
+        with mock.patch("sys.stderr"):
+            resp, body = self.request("POST", progress_serve.CHAT,
+                                      b'{"agent": "a1", "text": "x"}')
+        self.assertEqual(resp.status, 500)
+        self.assertIn("may have been delivered", body)
+        self.assertNotIn("secret-detail", body)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_erreur_imprevue_de_la_lecture_repond_500(self):
+        self.fail_with = KeyError("secret-detail")
+        with mock.patch("sys.stderr"):
+            resp, body = self.request("GET", progress_serve.CHAT + "?agent=a1")
+        self.assertEqual(resp.status, 500)
+        self.assertNotIn("secret-detail", body)
+
+    def test_405_dit_ce_que_dit_allow(self):
+        resp, body = self.request("PUT", progress_serve.CHAT, b"{}")
+        self.assertEqual((resp.status, resp.getheader("Allow")), (405, "GET, HEAD, POST"))
+        self.assertIn("GET, HEAD and POST", body)
+        resp, body = self.request("POST", progress_serve.API, b"{}")
+        self.assertEqual((resp.status, resp.getheader("Allow")), (405, "GET, HEAD"))
+        self.assertIn("GET and HEAD only", body)
+        self.assertNotIn("POST %s" % progress_serve.API, body)
+
+
 class ConfigTest(unittest.TestCase):
     def test_lecture_seule_au_demarrage(self):
         cfg = config_mod.Config(statement_timeout_ms=0)
