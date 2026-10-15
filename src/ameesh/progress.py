@@ -1190,8 +1190,10 @@ def main(argv: list[str] | None = None) -> int:
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db, defer=True)
-            # L160f (#497) : un lecteur GitHub par exécution (cache mémoire)
-            reader = None if args.no_versions else versions_mod.Reader()
+            # L160f (#497) : un lecteur GitHub par exécution (cache mémoire),
+            # adossé au cache partagé de l'hôte (#848) entre exécutions
+            reader = None if args.no_versions else versions_mod.Reader(
+                cache_dir=cfg.state_dir)
             # L61 : lectures regroupées (db.batched) — deux allers-retours
             snap = db_mod.batched(db, lambda db: snapshot(
                 db, cfg, since=args.since, project=args.project, stale_after=threshold,

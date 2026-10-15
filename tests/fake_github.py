@@ -23,10 +23,39 @@ Seule l'expression `--jq '.[] | @json'` est comprise (un objet par ligne).
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 
 WRITE_METHODS = ("POST", "PATCH", "DELETE", "PUT")
+
+#: en-têtes de quota du faux `gh api -i` (#848) ; reset lointain et fixe
+QUOTA_HEAD = ("X-RateLimit-Limit: 5000", "X-RateLimit-Remaining: 4999",
+              "X-RateLimit-Used: 1", "X-RateLimit-Reset: 4102444800")
+
+
+def _with_headers(argv: list, code: int, out: str, err: str) -> tuple[int, str, str]:
+    """Enveloppe une réponse du faux `gh` comme `gh api -i` (#848).
+
+    L'ETag est le condensé du corps ; un `If-None-Match` qui le reprend rend
+    un 304 sans corps (code 1, comme `gh`), ce qui laisse le cache partagé
+    revalider sans consommer de quota."""
+    etag = '"%s"' % hashlib.sha1(out.encode("utf-8")).hexdigest()[:16]
+    sent = None
+    if "-H" in argv:
+        index = argv.index("-H")
+        if index + 1 < len(argv):
+            name, _, value = argv[index + 1].partition(":")
+            if name.strip().lower() == "if-none-match":
+                sent = value.strip()
+    if code == 0 and sent is not None and sent == etag:
+        return 1, "HTTP/2.0 304 Not Modified\r\n" + "\r\n".join(QUOTA_HEAD) + "\r\n\r\n", ""
+    if code != 0:
+        status = 404 if "404" in err else 502
+        head = ["HTTP/2.0 %d Error" % status, *QUOTA_HEAD]
+        return code, "\r\n".join(head) + "\r\n\r\n", err
+    head = ["HTTP/2.0 200 OK", *QUOTA_HEAD, "ETag: %s" % etag]
+    return 0, "\r\n".join(head) + "\r\n\r\n" + out, ""
 
 
 def _repo(state: dict, name: str) -> dict:
@@ -216,7 +245,10 @@ class FakeGh:
         if self.fail is not None and self.fail(list(argv)):
             self.state.setdefault("calls", []).append(list(argv))
             return 1, "", "gh: Server Error (HTTP 502)"
-        return handle(self.state, list(argv), stdin)
+        code, out, err = handle(self.state, list(argv), stdin)
+        if "-i" in argv:
+            return _with_headers(list(argv), code, out, err)
+        return code, out, err
 
     # -- observation -------------------------------------------------------
     def calls(self) -> list:

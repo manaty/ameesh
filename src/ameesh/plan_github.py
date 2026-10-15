@@ -63,12 +63,15 @@ réimporté comme état — au plus signalé comme **proposition**.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import functools
 import hashlib
 import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -172,6 +175,49 @@ def _lines(gh, argv: list[str]) -> list[dict]:
     return rows
 
 
+#: première ligne d'une réponse `gh api -i`
+_HTTP_STATUS_RE = re.compile(r"^HTTP/\S+\s+([1-9][0-9]{2})\b")
+
+
+def _split_http(text: str) -> tuple[str, str]:
+    """(en-têtes, corps) d'une sortie `gh api -i`, quel que soit le saut de ligne."""
+    for sep in ("\r\n\r\n", "\n\n"):
+        if sep in text:
+            head, _, body = text.partition(sep)
+            return head, body
+    return text, ""
+
+
+def _http_headers(head: str) -> dict:
+    """Les en-têtes d'une sortie `gh api -i`, sans la ligne d'état."""
+    headers: dict = {}
+    for line in head.splitlines()[1:]:
+        name, sep, value = line.partition(":")
+        if sep and name.strip():
+            headers[name.strip()] = value.strip()
+    return headers
+
+
+def gh_api_response(gh, path: str, *, etag: str | None = None) -> tuple[int, dict, str]:
+    """`gh api -i` : (code HTTP, en-têtes, corps), `If-None-Match` pour revalider.
+
+    Un 304 n'a pas de corps et `gh` sort en code 1 : les en-têtes restent
+    lisibles, donc la revalidation conditionnelle marche aussi par `gh`
+    (repli local, #848). Lève `GithubError` si la sortie ne porte pas de
+    ligne d'état (gh absent, panne de transport)."""
+    argv = ["api", str(path), "-i"]
+    if etag:
+        argv += ["-H", "If-None-Match: %s" % etag]
+    _code, out, err = gh.run(argv)
+    head, body = _split_http(out)
+    lines = head.splitlines()
+    match = _HTTP_STATUS_RE.match(lines[0]) if lines else None
+    if match is None:
+        raise GithubError("gh api %s: %s"
+                          % (path, " ".join((err or out or "—").split())[:300]))
+    return int(match.group(1)), _http_headers(head), body
+
+
 # --------------------------------------------------------------------------
 # lectures GitHub par jeton (L160f) : le client d'ameesh, sans sous-processus
 # --------------------------------------------------------------------------
@@ -193,67 +239,424 @@ def token_of(env=None) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------
+# cache partagé des lectures et quota GitHub (#848)
+# --------------------------------------------------------------------------
+
+#: sous-dossier de l'état de l'hôte qui porte le cache et le quota partagés
+READS_DIR = "github"
+#: durée de vie par défaut d'une lecture gardée (secondes) : une lecture
+#: identique n'est pas repayée à chaque passage
+READS_TTL = 60.0
+#: durée de vie minimale d'une lecture gardée (secondes)
+READS_MIN_TTL = 5.0
+#: entrées de cache gardées au plus (les plus anciennes retirées)
+READS_MAX = 2000
+#: magasins avant un élagage du cache
+READS_PRUNE_EVERY = 128
+#: en-têtes de quota lus sur chaque réponse GitHub
+QUOTA_HEADERS = {"limit": "X-RateLimit-Limit", "remaining": "X-RateLimit-Remaining",
+                 "used": "X-RateLimit-Used", "reset": "X-RateLimit-Reset"}
+#: attente imposée après un 403/429 de quota sans `X-RateLimit-Reset` (secondes)
+RATE_LIMIT_WAIT = 60.0
+
+
+class GithubRateLimited(GithubError):
+    """Quota GitHub épuisé (#848) : ne rien redemander avant `reset` (epoch).
+
+    Levée sans requête quand le quota observé est à zéro, ou après un 403/429
+    de quota ; `reset` vient de `X-RateLimit-Reset` (ou `Retry-After`). Un
+    appelant qui a une valeur en cache la sert : la panne ne perd pas de
+    preuve, elle attend le reset."""
+
+    def __init__(self, path: str, reset: float | None = None):
+        when = time.strftime("%H:%M:%SZ", time.gmtime(reset)) if reset else "unknown"
+        super().__init__("GitHub %s: rate limit exhausted (reset at %s)" % (path, when))
+        self.reset = reset
+
+
+@dataclass
+class ReadEntry:
+    """Une lecture gardée : valeur JSON, ETag de revalidation, instant de lecture."""
+
+    value: object
+    etag: str | None
+    read_ts: float
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _atomic_write(path: str, data: dict) -> None:
+    """Écrit `data` en JSON (0600), remplacement atomique dans son dossier."""
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+class SharedReads:
+    """Cache disque et quota GitHub partagés par les processus d'un hôte (#848).
+
+    L'incident : le jeton GitHub partagé (core 5000/h) a été épuisé à 09:41Z
+    par des lectures CI répétées ; chaque processus (notify, progress,
+    versions) relisait GitHub sans partager ni revalider, et un 403 se
+    répétait à chaque passage. Ici :
+
+    * une lecture gardée (`ttl` secondes) est servie du disque, sans requête ;
+    * une lecture périmée est revalidée par `If-None-Match` : un 304 ne
+      consomme pas de quota (L161 §3) ;
+    * le quota observé (`X-RateLimit-*`, `Retry-After`) vit sur disque : à
+      zéro, les lectures servent le cache et les autres échouent aussitôt
+      (`GithubRateLimited`), sans boucle agressive ;
+    * des compteurs (requêtes, 304, cache servi) rendent l'économie mesurable
+      (`ameesh ci status`).
+
+    Le cache ne garde que des réponses JSON de l'API, jamais le jeton ;
+    racine 0700, fichiers 0600, écriture atomique. Une panne du cache
+    (disque plein, droits) ne fait jamais échouer une lecture : elle la
+    laisse simplement repayée."""
+
+    def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
+                 max_entries: int = READS_MAX):
+        self.root = os.path.join(str(state_dir), READS_DIR)
+        self.clock = clock
+        self.ttl = float(ttl)
+        self.max_entries = int(max_entries)
+        self._reads_dir = os.path.join(self.root, "reads")
+        self._quota_path = os.path.join(self.root, "quota.json")
+        self._lock_path = os.path.join(self.root, ".lock")
+        self._stores = 0
+        for directory in (self.root, self._reads_dir):
+            with contextlib.suppress(OSError):
+                os.makedirs(directory, mode=0o700, exist_ok=True)
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """Verrou de fichier partagé, pour les compteurs et le quota."""
+        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    # -- entrées du cache ---------------------------------------------------
+    def _entry_path(self, path: str) -> str:
+        digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:40]
+        return os.path.join(self._reads_dir, digest + ".json")
+
+    def cached(self, path: str) -> ReadEntry | None:
+        """L'entrée gardée de ce chemin, même périmée, sinon None."""
+        try:
+            with open(self._entry_path(path), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict) or data.get("path") != path:
+            return None
+        return ReadEntry(data.get("value"), data.get("etag"),
+                         float(data.get("read_ts") or 0.0))
+
+    def fresh(self, entry: ReadEntry | None, *, now=None, ttl=None) -> bool:
+        """Vrai si l'entrée est dans sa durée de vie (`ttl` par défaut)."""
+        if entry is None:
+            return False
+        ttl = self.ttl if ttl is None else float(ttl)
+        now = float(self.clock() if now is None else now)
+        return ttl > 0 and now - entry.read_ts < ttl
+
+    def store(self, path: str, value, *, etag: str | None = None,
+              read_ts=None) -> None:
+        now = float(self.clock() if read_ts is None else read_ts)
+        try:
+            _atomic_write(self._entry_path(path),
+                          {"path": path, "value": value, "etag": etag or None,
+                           "read_ts": now})
+        except (OSError, ValueError, TypeError):
+            return                 # le cache est une économie, jamais une panne
+        self._stores += 1
+        if self._stores % READS_PRUNE_EVERY == 0:
+            self.prune()
+
+    def touch(self, path: str, *, read_ts=None) -> None:
+        """Rafraîchit l'instant d'une entrée revalidée (304, sans quota)."""
+        entry = self.cached(path)
+        if entry is not None:
+            self.store(path, entry.value, etag=entry.etag, read_ts=read_ts)
+
+    def prune(self) -> int:
+        """Retire les entrées les plus anciennes au-delà de `max_entries`."""
+        try:
+            names = [os.path.join(self._reads_dir, name)
+                     for name in os.listdir(self._reads_dir) if name.endswith(".json")]
+        except OSError:
+            return 0
+        if len(names) <= self.max_entries:
+            return 0
+
+        def mtime(path: str) -> float:
+            try:
+                return os.stat(path).st_mtime
+            except OSError:
+                return 0.0
+
+        names.sort(key=mtime)
+        removed = 0
+        for old in names[:len(names) - self.max_entries]:
+            with contextlib.suppress(OSError):
+                os.unlink(old)
+                removed += 1
+        return removed
+
+    # -- quota et compteurs -------------------------------------------------
+    def _load(self) -> dict:
+        try:
+            with open(self._quota_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def quota(self) -> dict:
+        quota = self._load().get("quota")
+        return dict(quota) if isinstance(quota, dict) else {}
+
+    def counters(self) -> dict:
+        counters = self._load().get("counters")
+        return dict(counters) if isinstance(counters, dict) else {}
+
+    def count(self, name: str, n: int = 1) -> None:
+        """Un compteur partagé (hits, stale, refused…) ; jamais bloquant."""
+        try:
+            with self._locked():
+                data = self._load()
+                counters = data.setdefault("counters", {})
+                counters[name] = int(counters.get(name) or 0) + int(n)
+                counters["updated"] = float(self.clock())
+                _atomic_write(self._quota_path, data)
+        except (OSError, ValueError):
+            return
+
+    def note(self, headers, *, status: int, now=None) -> float | None:
+        """Enregistre le quota lu dans les en-têtes, compte la requête.
+
+        Rend l'instant (epoch) jusqu'auquel le quota est épuisé, sinon None."""
+        now = float(self.clock() if now is None else now)
+        values = {key: _int_or_none(headers.get(header)) if headers is not None else None
+                  for key, header in QUOTA_HEADERS.items()}
+        retry = _int_or_none(headers.get("Retry-After")) if headers is not None else None
+        try:
+            with self._locked():
+                data = self._load()
+                quota = data.setdefault("quota", {})
+                counters = data.setdefault("counters", {})
+                counters["requests"] = int(counters.get("requests") or 0) + 1
+                if status == 304:
+                    counters["not_modified"] = int(counters.get("not_modified") or 0) + 1
+                for key, value in values.items():
+                    if value is not None:
+                        quota[key] = value
+                blocked = float(quota.get("blocked_until") or 0.0)
+                remaining, reset = values.get("remaining"), values.get("reset")
+                exhausted = status in (403, 429) and (remaining == 0 or retry is not None)
+                if remaining == 0 and (reset or 0) > now:
+                    exhausted = True
+                if retry:
+                    blocked = max(blocked, now + float(retry))
+                elif exhausted:
+                    blocked = max(blocked, float(reset or (now + RATE_LIMIT_WAIT)))
+                quota["blocked_until"] = blocked if blocked > now else 0.0
+                quota["checked"] = now
+                _atomic_write(self._quota_path, data)
+                return quota["blocked_until"] or None
+        except (OSError, ValueError):
+            return None
+
+    def blocked(self, now=None) -> float | None:
+        """L'instant (epoch) jusqu'auquel le quota est épuisé, sinon None."""
+        now = float(self.clock() if now is None else now)
+        until = float(self.quota().get("blocked_until") or 0.0)
+        return until if until > now else None
+
+
 class Api:
     """Les lectures GitHub par HTTPS, avec le jeton de l'hôte (lecture seule).
 
-    `get(chemin) -> JSON` ; toute panne (réseau, refus, réponse illisible)
-    lève `GithubError`, jamais autre chose."""
+    `get(chemin, ttl=…) -> JSON` ; toute panne (réseau, refus, réponse
+    illisible) lève `GithubError`, jamais autre chose. Avec un cache partagé
+    (`cache_dir` ou `reads`) : les lectures gardées sont servies du disque,
+    les autres revalidées par `If-None-Match`, et le quota épuisé fait
+    répondre le cache ou lever `GithubRateLimited` sans requête."""
 
-    def __init__(self, token=None, *, env=None, base=None, timeout=60.0):
+    def __init__(self, token=None, *, env=None, base=None, timeout=60.0,
+                 cache_dir=None, reads: "SharedReads | None" = None,
+                 ttl: float = READS_TTL, clock=time.time, opener=None):
         env = os.environ if env is None else env
         self.token = str(token if token is not None else token_of(env)).strip()
         self.base = str(base or env.get("GITHUB_API_URL") or API_BASE).rstrip("/")
         self.timeout = float(timeout)
+        self.ttl = float(ttl)
+        self.clock = clock
+        self.reads = reads if reads is not None else (
+            SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None)
+        self._open = opener or urllib.request.urlopen
 
-    def get(self, path: str):
+    def _request_headers(self, path: str, entry: ReadEntry | None) -> dict:
+        headers = {"Authorization": "Bearer %s" % self.token,
+                   "Accept": "application/vnd.github+json",
+                   "X-GitHub-Api-Version": "2022-11-28",
+                   "User-Agent": "ameesh"}
+        if entry is not None and entry.etag:
+            headers["If-None-Match"] = entry.etag
+        return headers
+
+    def get(self, path: str, *, ttl=None):
+        ttl = self.ttl if ttl is None else float(ttl)
+        now = float(self.clock())
+        entry = self.reads.cached(path) if self.reads is not None else None
+        if self.reads is not None and self.reads.fresh(entry, now=now, ttl=ttl):
+            self.reads.count("hits")
+            return entry.value
+        if self.reads is not None:
+            until = self.reads.blocked(now)
+            if until:
+                if entry is not None:
+                    self.reads.count("stale")
+                    return entry.value
+                self.reads.count("refused")
+                raise GithubRateLimited(path, until)
         url = "%s/%s" % (self.base, str(path).lstrip("/"))
-        request = urllib.request.Request(url, method="GET", headers={
-            "Authorization": "Bearer %s" % self.token,
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "ameesh"})
+        request = urllib.request.Request(url, method="GET",
+                                         headers=self._request_headers(path, entry))
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._open(request, timeout=self.timeout) as response:
                 body = response.read().decode("utf-8", "replace")
+                headers = getattr(response, "headers", None)
         except urllib.error.HTTPError as exc:
+            headers = getattr(exc, "headers", None)
+            if exc.code == 304 and entry is not None:
+                if self.reads is not None:
+                    self.reads.touch(path, read_ts=now)
+                    self.reads.note(headers, status=304, now=now)
+                return entry.value
+            until = self.reads.note(headers, status=exc.code, now=now) \
+                if self.reads is not None else None
+            if until:
+                if entry is not None:
+                    self.reads.count("stale")
+                    return entry.value
+                self.reads.count("refused")
+                raise GithubRateLimited(path, until) from exc
             raise GithubError("GitHub %s: HTTP %d" % (path, exc.code)) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise GithubError("GitHub %s: %s"
                               % (path, " ".join(str(exc).split())[:200])) from exc
         try:
-            return json.loads(body) if body.strip() else None
+            value = json.loads(body) if body.strip() else None
         except ValueError as exc:
             raise GithubError("GitHub %s: unreadable response" % (path,)) from exc
+        if self.reads is not None:
+            etag = headers.get("ETag") if headers is not None else None
+            self.reads.note(headers, status=200, now=now)
+            self.reads.store(path, value, etag=etag, read_ts=now)
+        return value
 
 
 class GhApi:
     """`gh api` derrière l'interface d'`Api` : le repli LOCAL, quand l'hôte
-    n'a pas de jeton (un poste de travail, jamais le serveur)."""
+    n'a pas de jeton (un poste de travail, jamais le serveur). Le cache
+    partagé (#848) sert aussi ce repli, revalidation comprise : `gh api -i`
+    rend les en-têtes, donc l'ETag et les en-têtes de quota se lisent comme
+    avec le jeton (nos hôtes d'agents n'ont pas de `GH_TOKEN` : `gh` y lit
+    sa session dans `~/.config/gh/hosts.yml`)."""
 
-    def __init__(self, gh):
+    def __init__(self, gh, *, reads: "SharedReads | None" = None,
+                 ttl: float = READS_TTL, clock=time.time):
         self.gh = gh
+        self.reads = reads
+        self.ttl = float(ttl)
+        self.clock = clock
 
-    def get(self, path: str):
-        return _json(self.gh, ["api", path])
+    def get(self, path: str, *, ttl=None):
+        ttl = self.ttl if ttl is None else float(ttl)
+        now = float(self.clock())
+        if self.reads is None:
+            return _json(self.gh, ["api", path])
+        entry = self.reads.cached(path)
+        if self.reads.fresh(entry, now=now, ttl=ttl):
+            self.reads.count("hits")
+            return entry.value
+        until = self.reads.blocked(now)
+        if until:
+            if entry is not None:
+                self.reads.count("stale")
+                return entry.value
+            self.reads.count("refused")
+            raise GithubRateLimited(path, until)
+        status, headers, body = gh_api_response(
+            self.gh, path, etag=entry.etag if entry is not None else None)
+        if status == 304 and entry is not None:
+            self.reads.touch(path, read_ts=now)
+            self.reads.note(headers, status=304, now=now)
+            return entry.value
+        until = self.reads.note(headers, status=status, now=now)
+        if until and status in (403, 429):
+            if entry is not None:
+                self.reads.count("stale")
+                return entry.value
+            self.reads.count("refused")
+            raise GithubRateLimited(path, until)
+        if status >= 400:
+            raise GithubError("GitHub %s: HTTP %d" % (path, status))
+        try:
+            value = json.loads(body) if body.strip() else None
+        except ValueError as exc:
+            raise GithubError("gh api %s: unreadable response" % path) from exc
+        self.reads.store(path, value, etag=headers.get("ETag"), read_ts=now)
+        return value
 
 
 def client(*, env=None, gh: str | None = None, timeout: float = 60.0,
-           allow_gh: bool = True):
+           allow_gh: bool = True, cache_dir=None, ttl: float = READS_TTL,
+           clock=time.time):
     """Le client de lecture GitHub : le jeton s'il est là, sinon `gh`.
 
     `allow_gh=False` (le serveur) : sans jeton, rend None — `gh` n'est pas
-    appelé et l'appelant dit le manque."""
+    appelé et l'appelant dit le manque. `cache_dir` (l'état de l'hôte) active
+    le cache et le quota partagés (#848) ; sans lui, rien n'est gardé."""
     env = os.environ if env is None else env
+    reads = SharedReads(cache_dir, clock=clock, ttl=ttl) if cache_dir else None
     if token_of(env):
-        return Api(env=env, timeout=timeout)
+        return Api(env=env, timeout=timeout, reads=reads, ttl=ttl, clock=clock)
     if not allow_gh:
         return None
-    return GhApi(Gh(gh, env=env, timeout=timeout))
+    return GhApi(Gh(gh, env=env, timeout=timeout), reads=reads, ttl=ttl, clock=clock)
 
 
 def client_name(env=None) -> str:
     """Ce que `client` utiliserait : `api` (jeton) ou `gh` (repli local)."""
     return "api" if token_of(env) else "gh"
+
+
+def quota_stats(state_dir) -> dict:
+    """Le quota et les compteurs partagés de l'hôte (#848), pour les vues.
+
+    Rend `{"quota": {...}, "counters": {...}}`, vide sans cache encore écrit."""
+    reads = SharedReads(state_dir)
+    return {"quota": reads.quota(), "counters": reads.counters()}
 
 
 # --------------------------------------------------------------------------
@@ -872,7 +1275,7 @@ TITLE_MAX = 256
 BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
-SETTINGS_KEYS = ("projects", "host", "interval", "exclude_terms")
+SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms")
 #: forme longue d'un projet : `repo`, et les workflows suivis par le veilleur
 #: de CI (#1110, `ci.Watcher`)
 PROJECT_KEYS = ("repo", "workflows")
@@ -880,6 +1283,11 @@ PROJECT_KEYS = ("repo", "workflows")
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
 MIN_INTERVAL = 60.0
+#: durée de vie (secondes) des lectures CI dans le cache partagé (#848) :
+#: 60 s = un passage de `ameesh notify` sur deux est servi du cache, les
+#: autres revalident (un 304 ne consomme pas de quota)
+DEFAULT_CI_TTL = READS_TTL
+MIN_CI_TTL = READS_MIN_TTL
 #: cache de la visibilité d'un dépôt (secondes) ; un dépôt illisible vaut
 #: « public » (un doute ne publie pas le corps) et n'est gardé qu'une minute
 VISIBILITY_TTL = 3600.0
@@ -926,6 +1334,8 @@ class Settings:
     host: str | None = None
     #: secondes entre deux tours complets d'un projet
     interval: float = DEFAULT_INTERVAL
+    #: secondes de garde d'une lecture CI partagée (#848)
+    ci_ttl: float = DEFAULT_CI_TTL
     #: termes que l'organisation ne publie jamais (noms de clients…), sans casse
     exclude_terms: tuple = ()
     #: {dépôt: (fichiers de workflow, …)} — les workflows que le veilleur de CI
@@ -1010,12 +1420,17 @@ def parse_settings(raw) -> Settings:
             or interval < MIN_INTERVAL:
         raise SettingsError("`github.interval`: a number of seconds, at least %d"
                             % MIN_INTERVAL)
+    ci_ttl = raw.get("ci_ttl", DEFAULT_CI_TTL)
+    if isinstance(ci_ttl, bool) or not isinstance(ci_ttl, (int, float)) \
+            or ci_ttl < MIN_CI_TTL:
+        raise SettingsError("`github.ci_ttl`: a number of seconds, at least %d"
+                            % MIN_CI_TTL)
     terms = raw.get("exclude_terms")
     terms = [] if terms is None else terms
     if not isinstance(terms, list) or not all(isinstance(t, str) and t.strip() for t in terms):
         raise SettingsError("`github.exclude_terms`: list of non-empty terms expected")
     return Settings(projects=projects, host=(host or "").strip() or None,
-                    interval=float(interval),
+                    interval=float(interval), ci_ttl=float(ci_ttl),
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
                     workflows=workflows)
 

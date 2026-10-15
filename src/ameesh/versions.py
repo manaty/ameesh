@@ -296,11 +296,14 @@ class Reader:
     chemin) : un cache servi n'est jamais dit frais. Un échec est gardé
     `fail_ttl` secondes ; si le chemin avait déjà été lu, sa valeur
     précédente reste servie, marquée périmée (`stale(chemin)`), jamais une
-    page vide à cause d'une panne passagère."""
+    page vide à cause d'une panne passagère. `cache_dir` (l'état de l'hôte)
+    adosse le lecteur au cache partagé (#848) : deux exécutions successives
+    ne repayent pas la même lecture, et un quota épuisé ne fait pas boucler."""
 
     def __init__(self, api=None, *, ttl: float = CACHE_S, clock=time.monotonic,
                  wall=time.time, timeout: float = READ_TIMEOUT,
-                 allow_gh: bool = True, fail_ttl: float = FAIL_S):
+                 allow_gh: bool = True, fail_ttl: float = FAIL_S,
+                 cache_dir=None):
         self._api = api
         self._ttl = float(ttl)
         self._clock = clock
@@ -308,6 +311,7 @@ class Reader:
         self._timeout = float(timeout)
         self._allow_gh = bool(allow_gh)
         self._fail_ttl = float(fail_ttl)
+        self._cache_dir = cache_dir
         self._cache: dict = {}
         self._stamps: dict = {}
         self._failures: dict = {}
@@ -334,7 +338,8 @@ class Reader:
 
     def _call(self, path: str):
         if self._api is None:
-            client = plan_github.client(timeout=self._timeout, allow_gh=self._allow_gh)
+            client = plan_github.client(timeout=self._timeout, allow_gh=self._allow_gh,
+                                        cache_dir=self._cache_dir)
             if client is None:
                 raise plan_github.GithubError(
                     "no GitHub token (%s) and no local gh"
