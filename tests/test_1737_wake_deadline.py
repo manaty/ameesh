@@ -20,7 +20,7 @@ from . import support  # isolate the host's configuration and environment
 
 
 class DeadlineTest(unittest.TestCase):
-    def install(self, args, *, connect_delay=90):
+    def install(self, args, *, connect_delay=90, sub_state="waiting"):
         """Run the CLI and its real arm path; systemctl and the database are fake."""
         self.clock = datetime.datetime(2026, 10, 15, 23, 45,
                                        tzinfo=datetime.timezone.utc).timestamp()
@@ -36,7 +36,7 @@ class DeadlineTest(unittest.TestCase):
             if argv[2:4] == ["show", "-p"]:
                 value = {"Environment": "AGENT_MAIL_NAME=deadline-agent",
                          "ExecStart": "env AGENT_MAIL_NAME=deadline-agent /a watch fire",
-                         "ActiveState": "active"}[argv[4]]
+                         "ActiveState": "active", "SubState": sub_state}[argv[4]]
             return subprocess.CompletedProcess(argv, 0, value, "")
 
         directory = tempfile.TemporaryDirectory(prefix="ameesh-1737-")
@@ -88,6 +88,11 @@ class DeadlineTest(unittest.TestCase):
     def test_deadline_passed_during_connection_is_refused_without_installing(self):
         self.assertEqual(self.install(["--in", "30m"], connect_delay=1801), 1)
         self.assertEqual(self.calls, [])
+        self.assertEqual(os.listdir(self.directory), [])
+
+    def test_deadline_passed_before_timer_start_is_refused_and_disarmed(self):
+        # systemd leaves a past OnCalendar= timer active/elapsed: it never fires.
+        self.assertEqual(self.install(["--in", "30m"], sub_state="elapsed"), 1)
         self.assertEqual(os.listdir(self.directory), [])
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "needs the systemd calendar parser")

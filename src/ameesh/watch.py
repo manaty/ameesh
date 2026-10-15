@@ -637,6 +637,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
                                   wake_name(agent, slug, "service"))
         state = _systemctl_show(run, "ActiveState",
                                 wake_name(agent, slug, "timer")).strip()
+        sub = _systemctl_show(run, "SubState", wake_name(agent, slug, "timer")).strip()
     except WatchError as exc:
         _disarm(directory, agent, slug, run)
         raise WatchError("wake %s of %s not armed: witness unreadable (%s)"
@@ -657,6 +658,12 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
             "(read back: %r); an environment file may override Environment=, and "
             "a wake without identity loses its message at the deadline (#1020)"
             % (slug, agent, wanted, (applied or "").strip()))
+    if sub == "elapsed":
+        # #1737: an OnCalendar= deadline passed before `start` leaves the
+        # timer active/elapsed; it never fires and the wake would be lost.
+        _disarm(directory, agent, slug, run)
+        raise WatchError("wake %s of %s not armed: its deadline passed before the "
+                         "timer started; choose a later --at" % (slug, agent))
     if state != "active":
         _disarm(directory, agent, slug, run)
         raise WatchError("wake %s of %s not armed: its timer is %r after start"
