@@ -484,10 +484,14 @@ class Watcher:
 
     def bases(self, repo: str) -> tuple:
         """Les branches de base d'un dépôt (#1483) : celles que déclare
-        `github.projects.<projet>.base`, sinon `BASE_BRANCHES`."""
+        `github.projects.<projet>.base`, en tête (la première est la référence
+        d'un push hors PR), puis `BASE_BRANCHES` — `main` reste une base même
+        quand le dépôt déclare `develop` : traitée en branche de lot, chaque
+        tête de main y remplacerait la précédente et retirerait son verdict,
+        comme `ci_main_red` la lit déjà."""
         settings = self.settings()
         declared = settings.bases_for(repo) if settings else None
-        return tuple(declared) if declared else BASE_BRANCHES
+        return tuple(dict.fromkeys(tuple(declared or ()) + BASE_BRANCHES))
 
     def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
         """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si

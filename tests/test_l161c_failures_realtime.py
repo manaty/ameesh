@@ -1145,7 +1145,8 @@ class WatcherTest(PgTestCase):
         api = FauxApi()
         api.workflows = ["backend-suite.yml"]
         watcher = ci.Watcher(cfg, api=api)
-        self.assertEqual(watcher.bases(repo), ("develop",))
+        # main reste une base : jamais une branche de lot (R1 dev4)
+        self.assertEqual(watcher.bases(repo), ("develop", "main"))
         st = storage.of(self.db)
         # deux têtes de develop : la première n'est pas remplacée (base)
         api.live = [run_view(1200, "b1" * 20, "develop", workflow="backend-suite.yml")]
@@ -1153,6 +1154,13 @@ class WatcherTest(PgTestCase):
         api.live = [run_view(1201, "b2" * 20, "develop", workflow="backend-suite.yml")]
         watcher.tick(self.db)
         self.assertEqual((st.ci.run(repo, 1200)["status"], st.ci.run(repo, 1201)["status"]),
+                         ("running", "running"))
+        # ni deux têtes de main (release de Nexlink)
+        api.live = [run_view(1204, "c1" * 20, "main", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        api.live = [run_view(1205, "c2" * 20, "main", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        self.assertEqual((st.ci.run(repo, 1204)["status"], st.ci.run(repo, 1205)["status"]),
                          ("running", "running"))
         # un push hors PR sur une branche de lot prend develop pour base
         run = run_view(1203, "b3" * 20, "lot/1-un", workflow="backend-suite.yml")
