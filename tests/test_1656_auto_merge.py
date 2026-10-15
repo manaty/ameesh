@@ -7,6 +7,7 @@ fusionner elle-même ; si le désarmement échoue, rien n'est poussé et le lot
 est éjecté (fail closed)."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 
@@ -198,3 +199,19 @@ class AutoMergeDirectTest(MergePrBase):
             self.merge(gh)
         self.assertIn("auto-merge", str(caught.exception))
         self.assertEqual(self.tip(), self.base)      # rien n'a été poussé
+
+
+class AutoMergeEarlyEjectTest(PrLandTest):
+    def test_an_ejection_before_the_push_still_disarms(self):
+        """Relecture dev1 : un lot éjecté avant la poussée (porte, conflit, CI)
+        ne laisse pas l'auto-merge armé pour la prochaine tête de l'auteur."""
+        self.project = dataclasses.replace(self.project, gates=("echo boom; exit 3",))
+        gh = AutoGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        gh.auto = True
+        out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("gate", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(gh.disarm_calls, 1)
+        self.assertFalse(gh.auto)

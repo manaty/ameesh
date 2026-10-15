@@ -634,6 +634,26 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if not landing.write(state="landing", note="merge queue of %s: landing (%s)"
                          % (row["target"], project.land), actor=work.SYSTEM_SENDER):
         return landing.busy("lease on %s lost before landing" % landing.key)
+    if project.land == "pr":
+        status = pr_status(slug, row["branch"], gh=gh) if slug else None
+        if status is None:
+            return landing.eject("no open PR for %s" % row["branch"],
+                                 "Open the PR, then ameesh work queue add %d." % lot)
+        # #1656: never leave an active auto-merge on a PR the queue manages. It
+        # would merge whatever head it finds — a rewritten one included, even
+        # under `[skip ci]` — with no new fire, freeze or parts proof (GitHub
+        # checks `--match-head-commit` only when the auto-merge is armed). ameesh
+        # merges itself, on the exact frozen head; disarm first, fail closed —
+        # before any ejection below (conflict, gate, CI), which would otherwise
+        # leave it armed for the head the author pushes next.
+        if status.get("auto"):
+            error = pr_disable_auto(slug, status["number"], gh=gh)
+            if error is not None:
+                return landing.eject(
+                    "PR #%s: auto-merge armed and not disarmed (%s)" % (status["number"], error),
+                    "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
+                    "queue add %d: an armed auto-merge merges a head the queue has not "
+                    "qualified (#1656)." % (status["number"], lot))
     base = fresh_target(replayer, project, row["target"])
     if project.land == "local" and resolutions._run(
             replayer.path, "merge-base", "--is-ancestor", row["frozen_sha"],
@@ -693,23 +713,6 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             return {"lot": lot, "result": "retry", "error": resolutions._err(proc)}
         return landing.landed(merged, base)
     # land: pr — the merge commit goes to the lot branch, its CI decides
-    status = pr_status(slug, row["branch"], gh=gh) if slug else None
-    if status is None:
-        return landing.eject("no open PR for %s" % row["branch"],
-                             "Open the PR, then ameesh work queue add %d." % lot)
-    # #1656: never leave an active auto-merge on a PR the queue manages. It
-    # would merge whatever head it finds — a rewritten one included, even
-    # under `[skip ci]` — with no new fire, freeze or parts proof (GitHub
-    # checks `--match-head-commit` only when the auto-merge is armed). ameesh
-    # merges itself, on the exact frozen head; disarm first, fail closed.
-    if status.get("auto"):
-        error = pr_disable_auto(slug, status["number"], gh=gh)
-        if error is not None:
-            return landing.eject(
-                "PR #%s: auto-merge armed and not disarmed (%s)" % (status["number"], error),
-                "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
-                "queue add %d: an armed auto-merge merges a head the queue has not "
-                "qualified (#1656)." % (status["number"], lot))
     if status.get("base") != branch:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
