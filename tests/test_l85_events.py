@@ -156,6 +156,28 @@ class EventLogPgTest(PgTestCase):
     def last(self):
         return storage.of(self.db).events.bounds()["last"]
 
+    def delivered(self, store, position, expected, limit=100, timeout=10.0):
+        """`readable()` until `expected` (objects, in order) is delivered.
+
+        `pg_current_snapshot()`'s xmin is cluster-wide: on the shared bench,
+        another agent's suite holding an xid below our events defers them —
+        correct behaviour, announced as "xmin", never a skip. Wait (bounded)
+        for that foreign transaction to end; past the bound, keep only what
+        holds under it: a delivered prefix, in order, and the announced wait.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            rows, waiting = store.readable(position, limit)
+            got = [r["object"] for r in rows]
+            if waiting is None:
+                self.assertEqual(got, expected)          # no skip, no loss
+                return rows
+            self.assertEqual(waiting, "xmin")
+            self.assertEqual(got, expected[:len(got)])   # a prefix, in order
+            if time.monotonic() >= deadline:
+                return rows
+            time.sleep(0.1)
+
     def test_lot_events_carry_the_project(self):
         start = self.last()
         lot = work.add(self.db, title="lot", app="demo")
@@ -369,13 +391,17 @@ class EventLogPgTest(PgTestCase):
             a = storage.of(tx_a).events.record("alert.raised", "alert:a", None, {})
             b = events.record(self.db, "alert.raised", "alert:b")
             self.assertGreater(b, a)
-            self.assertEqual(store.readable(position, 100), ([], "xmin"))   # held back by A
-        rows, waiting = store.readable(position, 100)
-        self.assertEqual([r["object"] for r in rows], ["alert:a", "alert:b"])
-        self.assertFalse(waiting)
-        self.assertFalse(store.readable((int(rows[-1]["tx"]), int(rows[-1]["id"])), 100)[1])
+            rows, waiting = store.readable(position, 100)   # held back by A
+            # A holds its own event back; a foreign transaction of the shared
+            # bench (xmin) can only shorten that prefix, never skip 11 for 12.
+            self.assertNotIn("alert:b", [r["object"] for r in rows])
+            self.assertEqual(waiting, "xmin")
+        self.delivered(store, position, ["alert:a", "alert:b"])
+        b_tx = int(self.db.query("select tx::text as tx from ameesh_events where id = %s",
+                                 (b,))[0]["tx"])
+        after = (b_tx, b)
+        self.assertFalse(store.readable(after, 100)[1])
         # a rolled-back transaction leaves nothing to wait for
-        after = (int(rows[-1]["tx"]), int(rows[-1]["id"]))
         try:
             with other.transaction() as tx_c:
                 storage.of(tx_c).events.record("alert.raised", "alert:c", None, {})
@@ -383,7 +409,7 @@ class EventLogPgTest(PgTestCase):
         except KeyError:
             pass
         events.record(self.db, "alert.raised", "alert:d")
-        self.assertEqual([r["object"] for r in store.readable(after, 100)[0]], ["alert:d"])
+        self.delivered(store, after, ["alert:d"])
 
     def test_readable_and_waiting_share_one_snapshot(self):
         """Codex P2 r2: A holds B back, then ends WITHOUT writing an event
@@ -399,8 +425,7 @@ class EventLogPgTest(PgTestCase):
             with mock.patch.object(self.db, "query", wraps=self.db.query) as query:
                 self.assertEqual(store.readable(position, 100), ([], "xmin"))
             self.assertEqual(query.call_count, 1)
-        rows, waiting = store.readable(position, 100)        # A over, no event of its own
-        self.assertEqual(([r["object"] for r in rows], waiting), (["alert:b"], None))
+        self.delivered(store, position, ["alert:b"])         # A over, no event of its own
 
     def test_a_limited_read_orders_the_position_as_a_number(self):
         """R2 auditeur P1: the CTE selects `tx::text as tx`, and a bare
