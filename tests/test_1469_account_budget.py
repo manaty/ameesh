@@ -331,3 +331,40 @@ class AccountBudgetTest(PgTestCase):
             self.assertEqual([r["billing_account"] for r in rows], [OPENAI])
         finally:
             worker.watchdog_stop.set()
+
+    def test_ancien_worker_ne_regle_pas_le_marqueur_du_remplacant(self):
+        """B2 runner (cx1) : la clé de règlement reste celle du lancement."""
+        import types
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", "takeover")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("takeover", "claude", cwd=cwd)
+        lease = registry.claim(self.db, "takeover", runner.runner_id, 3600)
+        old = AgentWorker(runner, registry.get(self.db, "takeover"), lease)
+        try:
+            self.assertTrue(old._compta_marque(0, "old", "m"))
+            marker = registry.pending_spend_get(self.db, "takeover")
+            old_key = old._spend_key(0, marker["created_ts"])
+            self.assertEqual(account_budget.reserve(
+                self.db, "takeover", _profile(OPENAI), old_key), "")
+            # the replacement repaired the old marker, then launched its turn
+            self.assertTrue(registry.pending_spend_put(self.db, "takeover", 1, "new", "m"))
+            marker = registry.pending_spend_get(self.db, "takeover")
+            new_key = old._spend_key(1, marker["created_ts"])
+            self.assertEqual(account_budget.reserve(
+                self.db, "takeover", _profile(DEEPSEEK), new_key), "")
+
+            def record(*args, **kwargs):
+                self._spend("takeover", 40.0, key=kwargs["key"])
+                return types.SimpleNamespace(reread_tokens=0, session=None)
+            # the old worker ends late, after the lease was taken over
+            old.lease_lost.set()
+            with mock.patch("ameesh.cost.CostBook") as book:
+                book.return_value.record.side_effect = record
+                old._compta_termine(incertain=True)
+            observed = (self._usage(OPENAI)["settled"],
+                        self._usage(DEEPSEEK)["settled"],
+                        registry.pending_spend_get(self.db, "takeover") is not None)
+            self.assertEqual(observed, (40.0, 0.0, True))
+        finally:
+            old.watchdog_stop.set()

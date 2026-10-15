@@ -436,6 +436,8 @@ class AgentWorker(threading.Thread):
         #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
+        #: #1469 : le marqueur comptable du tour lancé par CE worker
+        self._compta_travail: dict | None = None
         self._account_override = None
         #: L242b (3) : harnais emprunté par un agent critique au seuil sur le
         #: sien, `(harnais, compte ou None)`, et harnais imposé au tour de
@@ -2537,6 +2539,9 @@ class AgentWorker(threading.Thread):
         try:
             registry.pending_spend_put(self.db, self.name, int(start), tour,
                                        model if model is not None else "")
+            # #1469 : le marqueur de CE tour, gardé par le worker — sa clé règle
+            # sa réservation, même si un remplaçant a posé le sien depuis
+            self._compta_travail = registry.pending_spend_get(self.db, self.name)
             return True
         except db_mod.Unavailable:
             raise  # L72 : rien lancé ; la consigne est remise au retour de la base
@@ -2598,7 +2603,8 @@ class AgentWorker(threading.Thread):
             # fournisseur est comptée au relais, pas sur l'appareil (L111).
             if not self.runner.mediated:
                 account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
-            registry.pending_spend_clear(self.db, self.name)
+            registry.pending_spend_clear(self.db, self.name, cree)
+            self._compta_travail = None
             self._annonce_ram = ""
             self._compta_en_echec = False
             return True
@@ -2685,6 +2691,13 @@ class AgentWorker(threading.Thread):
         # L72 : le tour a eu lieu ; sa ligne de grand livre attend la base
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
+        propre = getattr(self, "_compta_travail", None)
+        if propre and (not travail or travail.get("created_ts") != propre.get("created_ts")):
+            # #1469 : le marqueur en base n'est plus celui de ce tour (reprise
+            # par un remplaçant, ou déjà réparé) : on règle CE tour par sa propre
+            # clé (la ligne est dédoublonnée par `spend_key`), sans toucher au
+            # marqueur d'un autre
+            travail = dict(propre, model=self._annonce_ram or propre.get("model"))
         if travail:
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
@@ -3870,12 +3883,14 @@ class AgentWorker(threading.Thread):
         # marqueur est retiré. Un résumé de bascule peut imposer l'ancien
         # compte : réserver celui appliqué au harnais (`compte`).
         if account_budget.billing_of(compte):
-            marqueur = registry.pending_spend_get(self.db, self.name) or {}
+            marqueur = self._compta_travail or {}
             refus = account_budget.reserve(
                 self.db, self.name, compte,
                 self._spend_key(events_start, marqueur.get("created_ts")))
             if refus:
-                registry.pending_spend_clear(self.db, self.name)  # rien n'est parti
+                registry.pending_spend_clear(self.db, self.name,
+                                             marqueur.get("created_ts"))  # rien n'est parti
+                self._compta_travail = None
                 self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
                 return False
 

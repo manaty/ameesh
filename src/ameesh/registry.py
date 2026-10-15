@@ -358,8 +358,20 @@ def pending_spend_get(db: Db, name: str) -> dict | None:
     }
 
 
-def pending_spend_clear(db: Db, name: str) -> bool:
-    return storage.of(db).pending_spend.clear(name)
+def pending_spend_clear(db: Db, name: str, created_ts: float | None = None) -> bool:
+    """Efface le marqueur ; avec `created_ts` (#1469), seulement s'il est encore
+    celui de ce tour — un worker en retard n'efface pas celui de son remplaçant."""
+    api = storage.of(db).pending_spend
+    if created_ts is None:
+        return api.clear(name)
+    if hasattr(api, "clear_if"):
+        return api.clear_if(name, created_ts)
+    # backend médié : pas d'opération conditionnelle, le bail est fencé au serveur
+    row = api.get(name)
+    if row is None or row.get("created_ts") is None \
+            or abs(float(row["created_ts"]) - float(created_ts)) >= 0.0000005:
+        return False
+    return api.clear(name)
 
 
 def cwd_used(db: Db, cwd: str, exclude: str) -> bool:

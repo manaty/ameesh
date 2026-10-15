@@ -976,3 +976,12 @@ class PendingSpend(interface.PendingSpend):
         rows = self.db.query("DELETE FROM spend_pending WHERE agent = %s RETURNING agent",
                              (name,))
         return bool(rows)
+
+    def clear_if(self, name, created_ts) -> bool:
+        """#1469 : efface le marqueur seulement s'il est encore celui de ce tour
+        (même `created_ts`) — jamais celui d'un remplaçant, en une instruction."""
+        rows = self.db.query(
+            "DELETE FROM spend_pending WHERE agent = %s"
+            " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
+            " RETURNING agent", (name, float(created_ts)))
+        return bool(rows)
