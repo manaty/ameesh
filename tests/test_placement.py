@@ -396,6 +396,20 @@ class ProfilEvalueTest(_PlacementDbCase):
                                       "credential_mode=NULL")
         self.assertIs(row["confondus"], False)
 
+    def test_wake_status_nomme_les_deux_profils_diverges(self):
+        """#1219 : le refus d'admission dit QUEL profil a divergé (les deux)."""
+        self.sync()
+        registry.upsert(self.db, "orchestre", harness="codex", host="atelier")
+        ok, why, note = registry.wake_status(self.db, None, "orchestre")
+        self.assertFalse(ok)
+        self.assertIn("not admitted on its host atelier", why)
+        self.assertIn("profile diverged since the placement was evaluated", why)
+        self.assertIn("harness='claude'", why)      # le profil évalué
+        self.assertIn("harness='codex'", why)       # le profil courant
+        self.assertNotIn("next canon sync", why)    # la cause n'est plus masquée
+        self.assertEqual(note, "")
+        self.assertEqual(registry.wake_status(self.db, None, "relecteur")[:2], (True, ""))
+
     def test_sonde_harnais_change_parent_et_enfant(self):
         """La sonde : hôte qui n'admet que claude, sync, spawn, puis inscription
         en codex sur le même hôte — ni le parent ni l'enfant ne restent réclamables."""
