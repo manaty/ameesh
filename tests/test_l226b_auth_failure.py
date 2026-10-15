@@ -287,6 +287,15 @@ class ClaudeJournalOverageTest(Sandbox, unittest.TestCase):
             self.assertTrue(accounts.in_overage(gauges, self.now))
             gauges.clear()              # the caller's copy, not the cached one
 
+    def test_no_reading_is_an_empty_gauges(self):
+        # N1 impl-04: without any reading the result has the same type as a
+        # reading, so a direct `.overage` read meets None, not a bare list.
+        self.agent("a", "claude")
+        gauges = self.book().claude_gauges(account="secondaire", primary="primaire")
+        self.assertIsInstance(gauges, cost.Gauges)
+        self.assertEqual([], gauges)
+        self.assertIsNone(gauges.overage)
+
 
 class _AuthBase(_Base):
     def setUp(self) -> None:

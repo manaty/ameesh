@@ -804,7 +804,9 @@ class CostBook:
                 best = found
         # A caller must not mutate the cached list seen by another CostBook;
         # the copy keeps the reading's overage flags (L226b, #1649).
-        return Gauges(best[1], best[2]) if best else []
+        # No reading: an empty Gauges (overage None), the same type as a
+        # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
+        return Gauges(best[1], best[2]) if best else Gauges()
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
