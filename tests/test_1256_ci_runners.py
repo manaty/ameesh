@@ -21,9 +21,7 @@ import textwrap
 import time
 import unittest
 
-import yaml
-
-from ameesh import capacity_guard
+from ameesh import canon, capacity_guard
 
 from .support import REPO
 
@@ -42,6 +40,14 @@ TOOLS_REL = TOOLS.lstrip("/")
 # second (option A of the R2 B1 arbitration)
 LENT = "ameesh-lent"
 FLEET = "ameesh-ci"
+
+
+def structure_text(value):
+    """Une structure chargée, rendue en texte. Les témoins ci-dessous n'y
+    cherchent que des sous-chaînes ; les parts de la CI n'installent pas
+    PyYAML (canon retombe sur son lecteur minimal), et `json` suffit à
+    aplatir la structure de façon déterministe."""
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
 def jit_config(name="ameesh-nxl-ci-3-1", repo="https://github.com/manaty/ameesh",
@@ -1227,7 +1233,7 @@ class CiRunnersTest(unittest.TestCase):
         block = next(block for block in blocks if "policy:" in block)
         body = "\n".join(line for line in textwrap.dedent(block).splitlines()
                          if line.strip() != "---")
-        lend = yaml.safe_load(body)["policy"]["lend"]
+        lend = canon.load_yaml(body)["policy"]["lend"]
         offer, problems, unknown = capacity_guard.parse_lend(lend)
         self.assertEqual(problems, [])
         # `restart_after_seconds` est la clé propre au garde (L159e4), lue par
@@ -1265,7 +1271,7 @@ class WorkflowRoutingTest(unittest.TestCase):
         for name in sorted(os.listdir(root)):
             if name.endswith((".yml", ".yaml")):
                 with open(os.path.join(root, name), encoding="utf-8") as fh:
-                    out[name] = yaml.safe_load(fh) or {}
+                    out[name] = canon.load_yaml(fh.read()) or {}
         return out
 
     def needs_closure(self, jobs, job):
@@ -1363,7 +1369,7 @@ class WorkflowRoutingTest(unittest.TestCase):
         jobs = self.workflows()["tests.yml"]["jobs"]
         plan = jobs["plan"]
         self.assertIn("plan_sha256", plan.get("outputs") or {})
-        self.assertIn("sha256sum", yaml.safe_dump(plan))
+        self.assertIn("sha256sum", structure_text(plan))
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         consumers = []
         for job in sorted(closure):
@@ -1374,7 +1380,7 @@ class WorkflowRoutingTest(unittest.TestCase):
             if not downloads:
                 continue
             consumers.append(job)
-            body = " ".join(yaml.safe_dump(steps).split())
+            body = " ".join(structure_text(steps).split())
             self.assertIn("plan.outputs.plan_sha256", body,
                           "%s downloads the plan artifact without checking its digest" % job)
             self.assertIn("sha256sum -c", body)
