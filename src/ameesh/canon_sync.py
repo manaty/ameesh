@@ -138,6 +138,7 @@ from dataclasses import dataclass, field
 from . import canon as canon_mod
 from . import fil
 from . import harnesses
+from . import mechanics
 from . import placement as placement_mod
 from . import receipts, registry, storage
 from . import visibility as visibility_mod
@@ -311,6 +312,8 @@ class SyncReport:
     packages: "PackageSync | None" = None
     #: #538 : règles de travail (fiches Process) poussées aux agents de l'hôte
     processes: "ProcessSync | None" = None
+    #: #1616 : paramètres mécaniques compilés du canon appliqué (constat)
+    mechanics: "MechanicsSync | None" = None
 
     @property
     def errors(self) -> list[Finding]:
@@ -335,7 +338,9 @@ class SyncReport:
                                    if self.authenticators is not None else None),
                 "packages": self.packages.to_dict() if self.packages is not None else None,
                 "processes": (self.processes.to_dict()
-                              if self.processes is not None else None)}
+                              if self.processes is not None else None),
+                "mechanics": (self.mechanics.to_dict()
+                              if self.mechanics is not None else None)}
 
 
 # --------------------------------------------------------------------------
@@ -1449,6 +1454,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     _inherit_placements(db, host, canon)
     packages = sync_packages(db, canon, findings, ident=ident)
     findings.extend(packages.findings)
+    # #1616 : compilation des paramètres mécaniques du canon appliqué. Un
+    # document absent ou mal formé est un CONSTAT, jamais une fermeture du
+    # canon : les consommateurs raccordés, eux, refusent (lecteur strict).
+    machine = sync_mechanics(canon)
     processes = ProcessSync()
     if status == CANON_OK:
         # #538 : les règles de travail modifiées partent aux agents de cet hôte
@@ -1470,7 +1479,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
                       diagnostic=diagnostic, authenticators=authenticators,
-                      packages=packages, processes=processes)
+                      packages=packages, processes=processes, mechanics=machine)
 
 
 # --------------------------------------------------------------------------
@@ -1563,6 +1572,74 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
         st.packages.retire(gone)
         done.retired = sorted(gone)
         done.relinked = st.work.refresh_package_parents()
+    return done
+
+
+# --------------------------------------------------------------------------
+# paramètres mécaniques (#1616)
+# --------------------------------------------------------------------------
+
+@dataclass
+class MechanicsSync:
+    """#1616 : le bloc mécanique (`processus/mecanique.yaml`) compilé au commit
+    appliqué. Constat : un document absent ou invalide ne ferme pas le canon
+    (les consommateurs raccordés refusent, eux, par [`mechanics.load`])."""
+
+    #: `ok` (compilé), `absent` (pas de document au commit), `invalid`
+    #: (schéma ou règle refusés), `untrusted` (pas de commit exact)
+    status: str = "absent"
+    schema: str = ""
+    timezone: str = ""
+    cutoffs: list[str] = field(default_factory=list)
+    max_in_build: int = 0
+    ci: dict = field(default_factory=dict)
+    reviews: dict = field(default_factory=dict)
+    projects: list[str] = field(default_factory=list)
+    error: str = ""
+
+    def to_dict(self) -> dict:
+        out = {"status": self.status, "schema": self.schema,
+               "timezone": self.timezone, "cutoffs": list(self.cutoffs),
+               "max_in_build": self.max_in_build, "ci": dict(self.ci),
+               "reviews": dict(self.reviews), "projects": list(self.projects)}
+        if self.error:
+            out["error"] = _clip(self.error)
+        return out
+
+
+def sync_mechanics(canon: Canon) -> MechanicsSync:
+    """Compile `processus/mecanique.yaml` au commit exact du canon appliqué."""
+    done = MechanicsSync()
+    if not canon.sources:
+        done.status = "untrusted"
+        done.error = "no canon source"
+        return done
+    source = canon.sources[0]
+    if source.mode != "git" or not source.commit:
+        done.status = "untrusted"
+        done.error = "no exact canon commit applied"
+        return done
+    try:
+        document = mechanics.load_global(source.repo, source.commit)
+    except mechanics.MechanicsAbsent as exc:
+        done.status = "absent"
+        done.error = str(exc)
+        return done
+    except mechanics.MechanicsError as exc:
+        done.status = "invalid"
+        done.error = str(exc)
+        return done
+    done.status = "ok"
+    done.schema = document.schema
+    done.timezone = document.timezone
+    done.cutoffs = list(document.cutoffs)
+    done.max_in_build = document.max_in_build
+    done.ci = {"packet": document.ci_packet,
+               "incident_label": document.ci_incident_label}
+    done.reviews = {"families": list(document.families),
+                    "exclude_author_family": document.exclude_author_family,
+                    "distinct_families": document.distinct_families}
+    done.projects = sorted(item.name for item in document.overrides)
     return done
 
 
