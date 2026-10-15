@@ -36,12 +36,13 @@ No ameesh code cancels a run, dispatches a workflow, labels a PR or arms auto-me
 
 The executor writes a generated `gh` into `<state>/github/bin/` and puts it first on the turn's `PATH` (turns and `ameesh attach`). Before running the real `gh` with `execv`, it appends one JSON line to `<state>/github/gestes-YYYY-MM.jsonl` (mode 0600). The line carries the time, agent, turn id, lot, role, host, pid, cwd and arguments. Exit code, signals and stdin/stdout are those of the real `gh`.
 
-* Recognisable tokens (`ghp_…`, `github_pat_…`) are replaced by `[jeton]`, and each argument is cut at 200 characters.
+* Only a safe projection of the arguments is written (allowlist): the subcommand, option names, and identifiers (numbers, SHAs, branches, repos, API paths without their query string). Every free value — body, title, header, `-f key=value`, a secret's `--body`, the value of an unknown option — becomes `[valeur]`; a recognisable token (`ghp_…`, `github_pat_…`, even glued to other characters) becomes `[jeton]`. Nothing is truncated, so nothing is half-masked. The journal answers "who did what to which object", never "with which content".
+* Only the values of a fixed list of options (`--repo`, `--head`, `--match-head-commit`, `--label`, `--json`, `-X`…) are kept, and only when they look like identifiers.
 * A write failure prints a warning and never blocks the command.
 * `ameesh github gestes --match 'run cancel' --since 24h` answers "who cancelled this run". `--agent` and `--json` filter and format the output.
 * It is turned off with `"journal": false` in `github-identities.json`.
 
-This is **attribution, not enforcement**. An agent that calls the real `gh` by its absolute path, or the API through `curl`, is not journaled. Enforcement comes from the permissions of separate identities (§3).
+This is **attribution, not enforcement**. An agent that calls the real `gh` by its absolute path, or the API through `curl`, is not journaled. Enforcement comes from the permissions of separate identities (§3). That holds only if an agent cannot read another role's token: on a host where all agents share one Unix user, mode 0600 does not separate them, and every agent can read every `token_file`. Real separation needs tokens that agents never see (a GitHub App minter that hands out short-lived installation tokens per turn), or separate Unix users or hosts. Until then, per-role identities limit what a role's token can do, not which agent uses it.
 
 ### 2. An identity per role, inert until configured
 
