@@ -628,7 +628,8 @@ class StreamPgTest(ServerMixin, PgTestCase):
         self.assertIsNotNone(parsed, frame["id"])
         self.assertEqual(parsed[1], cluster)
         self.assertGreaterEqual(parsed[0], at_least)
-        self.assertLessEqual(parsed[0], storage.of(self.db).events.bounds()["top"])
+        bounds = storage.of(self.db).events.bounds()
+        self.assertLessEqual(parsed[0], max(bounds["top"], bounds["pruned"]))
 
     def test_live_events_then_resume(self):
         self.serve()
@@ -772,6 +773,19 @@ class StreamPgTest(ServerMixin, PgTestCase):
         resp = self.open_stream({"Last-Event-ID": events.format_position(pruned, cluster)})
         got = self.read_messages(resp, 1, kind="alert.raised")
         self.assertEqual(json.loads(got[0]["data"])["object"], "alert:kept")
+
+    def test_reset_after_pruning_the_whole_log_has_a_stable_cursor(self):
+        self.db.execute("TRUNCATE ameesh_events, ameesh_events_pruned")
+        self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
+                        " VALUES ('alert.resolved', 'alert:gone',"
+                        " now() - interval '400 days')")
+        events.prune(self.db, days=365)
+        bounds = storage.of(self.db).events.bounds()
+        self.serve()
+        resp = self.open_stream({"Last-Event-ID": events.format_position(
+            (0, 0), bounds["cluster"])})
+        reset = self.read_messages(resp, 1, kind="reset")[0]
+        self.assertGreaterEqual(events.parse_position(reset["id"])[0], bounds["pruned"])
 
     def test_a_prune_during_the_stream_resets_the_open_reader(self):
         """#928/F6: the watermark was checked at connection only. A stream

@@ -991,26 +991,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             bounds = self.read(lambda db: storage.of(db).events.bounds())
+            # An empty retained log still has a logical position: resetting
+            # below its watermark would reset again on every resume/wakeup.
+            head = max(bounds["head"], bounds["pruned"])
             # None: the cluster's identity is refused to this role, so no
             # resume can be trusted
             self._cluster = cluster = bounds["cluster"] or events.UNKNOWN_CLUSTER
             reset = None
             if resume is None:
-                position = bounds["head"]
+                position = head
             elif resume[1] != cluster or cluster == events.UNKNOWN_CLUSTER:
                 # `tx` orders within one cluster and timeline only: a logical
                 # restore or a point-in-time recovery starts again lower,
                 # below a position of the old one
-                position, reset = bounds["head"], "another cluster or timeline"
-            elif resume[0] > bounds["top"]:
+                position, reset = head, "another cluster or timeline"
+            elif resume[0] > max(bounds["top"], bounds["pruned"]):
                 # a position this base never gave: rebuilt, or another mesh
-                position, reset = bounds["head"], "unknown position"
+                position, reset = head, "unknown position"
             else:
                 position = resume[0]
                 # below the retention's watermark (the greatest position it
                 # deleted), events after this one may be gone
                 if position < bounds["pruned"]:
-                    reset = "events lost (retention)"
+                    position, reset = head, "events lost (retention)"
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -1078,7 +1081,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # same frame as a resume below the watermark: the
                         # client reloads, then follows from the new head
                         bounds = self.read(lambda db: storage.of(db).events.bounds())
-                        position = bounds["head"]
+                        position = max(bounds["head"], bounds["pruned"])
                         self._write("id: %s\nevent: reset\ndata: %s\n\n" % (
                             events.format_position(position, self._cluster),
                             json.dumps({"reason": "events lost (retention)",
