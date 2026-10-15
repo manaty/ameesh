@@ -543,7 +543,11 @@ class PosteMigrerTest(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, timeout=60)
 
     def test_dispatcher_forwards_the_ref(self):
-        """B1 : migrer REF doit migrer REF, pas HEAD du depot."""
+        """B1 : migrer REF doit migrer REF, pas HEAD du depot.
+
+        #1695 : seul temoin du dispatcher migrer REF (l'ancien doublon
+        francise test_1245_poste_migrer_ref.py est supprime) ; il verifie en
+        plus le CONTENU de l'instantane, pas seulement le chemin."""
         p = self.run_poste('migrer', self.premier)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         lignes = self.log.read_text().splitlines()
@@ -551,6 +555,19 @@ class PosteMigrerTest(unittest.TestCase):
         self.assertTrue(any('migrate --additive-only' in l for l in lignes), lignes)
         self.assertTrue(any(('src-%s' % self.premier[:7]) in l for l in lignes), lignes)
         self.assertFalse(any(('src-%s' % self.tete[:7]) in l for l in lignes), lignes)
+        instantane = self.partage / ('src-%s' % self.premier[:7])
+        self.assertEqual((instantane / 'marque').read_text(), 'base\n',
+                         "instantane pris sur HEAD alors que REF etait demande")
+        self.assertFalse((self.partage / ('src-%s' % self.tete[:7])).exists())
+
+    def test_migrer_without_ref_takes_head(self):
+        """Sans REF, migrer prend HEAD (apport propre de l'ancien #1245)."""
+        p = self.run_poste('migrer')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        lignes = self.log.read_text().splitlines()
+        self.assertTrue(any(('src-%s' % self.tete[:7]) in l for l in lignes), lignes)
+        self.assertFalse(any(('src-%s' % self.premier[:7]) in l for l in lignes), lignes)
+        self.assertTrue((self.partage / ('src-%s' % self.tete[:7]) / 'marque').is_file())
 
     def test_additive_guard_forced_on_a_reprise(self):
         """B2 : sur une cible deja installee, --additif-seulement garde le refus."""
