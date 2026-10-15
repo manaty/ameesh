@@ -1551,8 +1551,10 @@ def report(cfg, db, book, *, now: float | None = None,
         active = store.active(cfg.host, harness) if store else None
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
+        evaluations = {}
         for profile in items:
             result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+            evaluations[profile.name] = result
             hold = holds.get(profile.name) or {}
             rows.append({
                 "harness": harness,
@@ -1595,7 +1597,7 @@ def report(cfg, db, book, *, now: float | None = None,
                 "_limits": result.limits,
                 "_ceilings": result.ceilings,
             })
-        _forecast(rows[len(rows) - len(items):], items, now)
+        _forecast(rows[len(rows) - len(items):], items, now, evaluations)
     return rows
 
 
@@ -1611,7 +1613,8 @@ def _overage_row(profile: Profile, gauges, now: float) -> dict:
             "in_use": in_overage(gauges, now)}
 
 
-def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
+def _forecast(rows: list[dict], items: list[Profile], now: float,
+              evaluations: dict) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
@@ -1620,15 +1623,12 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
     #1561 : un relevé périmé n'annonce ni perte ni échéance — la capacité
     inutilisée qu'il décrit (30 % d'une fenêtre de 7 j encore ouverte) n'est
     qu'une borne inférieure, et l'annonce « 70 % perdus à la remise à zéro »
-    était fausse. Le compte porte `stale` pour les affichages."""
-    evaluations = {}
+    était fausse. Le compte porte `stale` pour les affichages.
+
+    #1580 : les `Evaluation` réellement calculées par `report` sont reprises
+    telles quelles — reconstruire ici des évaluations sans plafonds changeait
+    les rapports de rythme (plafonds fixes, plafond court, `pace_multiplier`)."""
     for row, profile in zip(rows, items):
-        # #1176 : les plafonds effectifs et les plafonds retenus sont ceux du
-        # rapport — `why` explique le choix avec le même plafond que `choose`.
-        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"],
-                            limits=row.get("_limits") or {},
-                            ceilings=row.get("_ceilings") or {})
-        evaluations[profile.name] = result
         stale = bool(row["_gauges"]) and stale_reading(row["_gauges"], now)
         row["stale"] = stale
         row["losses"] = [] if stale else [
