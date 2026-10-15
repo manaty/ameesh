@@ -873,9 +873,9 @@ BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
 SETTINGS_KEYS = ("projects", "host", "interval", "exclude_terms")
-#: forme longue d'un projet : `repo`, et les workflows suivis par le veilleur
-#: de CI (#1110, `ci.Watcher`)
-PROJECT_KEYS = ("repo", "workflows")
+#: forme longue d'un projet : `repo`, les workflows suivis par le veilleur de
+#: CI (#1110, `ci.Watcher`) et la ou les branches de base du dépôt (#1483)
+PROJECT_KEYS = ("repo", "workflows", "base")
 #: suffixes admis pour un fichier de workflow (`.github/workflows/…`)
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
@@ -931,6 +931,10 @@ class Settings:
     #: {dépôt: (fichiers de workflow, …)} — les workflows que le veilleur de CI
     #: suit dans ce dépôt (#1110) ; sans entrée, il découvre ceux du dépôt
     workflows: dict = field(default_factory=dict)
+    #: {dépôt: (branches de base, …)} — les branches sur lesquelles une
+    #: exécution n'est jamais remplacée et dont le rouge sert de référence
+    #: (#1483 : Nexlink a `develop` pour base) ; sans entrée, `ci.BASE_BRANCHES`
+    bases: dict = field(default_factory=dict)
 
     def project_name(self, project: str | None) -> str | None:
         """Le nom configuré d'un projet (sans casse), ou None."""
@@ -951,6 +955,25 @@ class Settings:
         return next((tuple(files) for name, files in self.workflows.items()
                      if name.casefold() == key), None)
 
+    def bases_for(self, repo: str | None) -> tuple | None:
+        """Les branches de base déclarées d'un dépôt, ou None (défaut du
+        veilleur : `ci.BASE_BRANCHES`)."""
+        key = (repo or "").strip().casefold()
+        if not key:
+            return None
+        return next((tuple(branches) for name, branches in self.bases.items()
+                     if name.casefold() == key), None)
+
+    def all_bases(self) -> tuple:
+        """Toutes les branches de base déclarées, sans doublon, dans l'ordre
+        de déclaration : la lecture des alertes (`ci.main_red`) couvre ainsi
+        les bases de tous les dépôts (le défaut `main` reste à la charge de
+        l'appelant)."""
+        out: list[str] = []
+        for branches in self.bases.values():
+            out.extend(branches)
+        return tuple(dict.fromkeys(out))
+
 
 def parse_settings(raw) -> Settings:
     """Valide la clé `github` (SettingsError : message actionnable)."""
@@ -968,6 +991,7 @@ def parse_settings(raw) -> Settings:
         raise SettingsError("`github.projects`: object {\"project\": \"owner/repo\"} expected")
     projects: dict = {}
     workflows: dict = {}
+    bases: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`github.projects.%s`" % name
@@ -976,32 +1000,51 @@ def parse_settings(raw) -> Settings:
         if any(other.casefold() == name.casefold() for other in projects):
             raise SettingsError("%s: project declared twice (case-insensitive)" % where)
         files = None
+        declared_bases = None
         if isinstance(value, dict):
             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
             if extra:
                 raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
             files = value.get("workflows")
+            declared_bases = value.get("base")
             value = value.get("repo")
         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
             raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
         projects[name] = value.strip()
         if files is not None:
-            where = "%s.workflows" % where
+            where_files = "%s.workflows" % where
             if not isinstance(files, list) or not files:
-                raise SettingsError("%s: non-empty list of workflow file names expected" % where)
+                raise SettingsError("%s: non-empty list of workflow file names expected"
+                                    % where_files)
             names = []
             for item in files:
                 if not isinstance(item, str) or not item.strip():
-                    raise SettingsError("%s: workflow file name expected, not %r" % (where, item))
+                    raise SettingsError("%s: workflow file name expected, not %r"
+                                        % (where_files, item))
                 filename = item.strip().rsplit("/", 1)[-1]
                 if not filename.endswith(WORKFLOW_SUFFIXES):
                     raise SettingsError("%s: %r is not a workflow file name (…%s)"
-                                        % (where, item, "/".join(WORKFLOW_SUFFIXES)))
+                                        % (where_files, item, "/".join(WORKFLOW_SUFFIXES)))
                 if filename not in names:
                     names.append(filename)
             key = projects[name]
             workflows[key] = tuple(dict.fromkeys(workflows.get(key, ()) + tuple(names)))
+        if declared_bases is not None:
+            where = "%s.base" % where
+            items = [declared_bases] if isinstance(declared_bases, str) else declared_bases
+            if not isinstance(items, list) or not items:
+                raise SettingsError("%s: branch name or non-empty list expected "
+                                    "(\"develop\" or [\"main\", \"develop\"])" % where)
+            names = []
+            for item in items:
+                if not isinstance(item, str) or not item.strip() or item.strip() != item \
+                        or any(ch.isspace() for ch in item):
+                    raise SettingsError("%s: branch name expected, not %r" % (where, item))
+                if item not in names:
+                    names.append(item)
+            key = projects[name]
+            bases[key] = tuple(dict.fromkeys(bases.get(key, ()) + tuple(names)))
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
         raise SettingsError("`github.host`: host name expected")
@@ -1017,7 +1060,7 @@ def parse_settings(raw) -> Settings:
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval),
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
-                    workflows=workflows)
+                    workflows=workflows, bases=bases)
 
 
 def settings_of(cfg) -> Settings:
