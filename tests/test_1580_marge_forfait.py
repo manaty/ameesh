@@ -17,6 +17,8 @@ import io
 import json
 import os
 import time
+import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import accounts, cost, mesh_cli, rebalance
@@ -185,3 +187,65 @@ class MargeForfaitTest(_Base):
         self.assertEqual(rc, 0)
         charge = json.loads(buf.getvalue())
         self.assertEqual(charge["proposal"]["movable"], 0)   # dernière famille gardée
+
+
+class GardesMargeTest(unittest.TestCase):
+    """Contre-exemples de relecture : aucun accès aux comptes ou à la base."""
+
+    def test_un_compte_retenu_ou_un_releve_perime_ne_promet_rien(self):
+        now = 1_000_000.0
+        profile = accounts.Profile("codex", "test", hourly_usd=1)
+        fresh = cost.Gauge("codex", "long", 0.03, now + 6 * JOUR, 7 * JOUR)
+        old = dataclasses.replace(fresh)
+        object.__setattr__(old, "read_at", now - 8 * JOUR)
+        cases = {
+            "courant": [fresh],
+            "rythme court": [cost.Gauge("codex", "court", .2, now + 18000, 18000), fresh],
+            "courte echue longue ouverte": [cost.Gauge("codex", "court", .2, now - 1, 18000), fresh],
+            "toutes echues": [dataclasses.replace(fresh, resets_at=now - 1)],
+            "age connu depasse": [old],
+            "plafond horaire": [fresh],
+        }
+        for label, gauges in cases.items():
+            with self.subTest(label=label):
+                book = mock.Mock(db=object())
+                book.codex_gauges.return_value = gauges
+                book.spent.return_value = 2 if label == "plafond horaire" else 0
+                with mock.patch.object(accounts, "check", return_value=[]):
+                    offer = rebalance._offer([profile], ["cx"], now, book)
+                if label == "courant":
+                    self.assertEqual(offer.capacity, 2)
+                    self.assertAlmostEqual(offer.free, 1 / 7 - .03)
+                else:
+                    self.assertEqual((offer.free, offer.capacity, offer.accounts), (0, 0, ()))
+
+    def test_une_cle_api_ne_fournit_pas_de_marge_de_forfait(self):
+        profile = accounts.Profile("codex", "api", kind="api_key_env")
+        with mock.patch.object(accounts, "evaluate") as evaluate:
+            offer = rebalance._offer([profile], [], 1_000_000, mock.Mock())
+        evaluate.assert_not_called()
+        self.assertEqual(offer.capacity, 0)
+
+    def test_les_critiques_de_roles_et_declaration_restant_dans_leur_famille(self):
+        from ameesh import auditor, registry, sous_utilisation
+        cfg = SimpleNamespace(accounts={}, critical_agents=("config-critical",), host="test")
+        fleet = {name: "deepseek" for name in
+                 ("auditeur", "designer", "pilot", "config-critical", "explicit", "dev")}
+        with (mock.patch.object(cost, "paid_harnesses_of", return_value=("deepseek",)),
+              mock.patch.object(auditor, "load_all", return_value=[]),
+              mock.patch.object(sous_utilisation, "declared_orchestrators", return_value={"pilot"}),
+              mock.patch.object(sous_utilisation, "role_orchestrators", return_value={"designer"}),
+              mock.patch.object(auditor, "owned_card", return_value=object()),
+              mock.patch.object(registry, "get", return_value={"name": "designer"})):
+            prop = rebalance.proposal(cfg, object(), object(), now=1_000_000,
+                                      fleet=fleet, critical=("explicit",))
+        self.assertEqual((prop.candidates, prop.kept_for_review), (1, 0))
+
+    def test_un_bail_ne_rend_pas_un_agent_arrete_ou_externe_deplacable(self):
+        from ameesh import registry
+        rows = [dict(name=name, harness="deepseek", lease_owner="r", lease_expires_ts=200,
+                     status=status, mode=mode) for name, status, mode in
+                (("live", "idle", "execute"), ("stopped", "stopped", "execute"),
+                 ("external", "idle", "externe"))]
+        with mock.patch.object(registry, "overview", return_value=rows):
+            self.assertEqual(rebalance.live_fleet(object(), 100), {"live": "deepseek"})
