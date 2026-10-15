@@ -413,6 +413,21 @@ class CiRunnersTest(unittest.TestCase):
         # the tools the preconditions look for, without this machine's
         for name in ("podman", "psql", "git"):
             self.write("bin/%s" % name, "#!/bin/sh\nexit 0\n", mode=0o755)
+        # a real (non-dry) run pointed at this host substitutes this shim for
+        # `runuser`: the guest commands run as the test user (TEST_SELF), so
+        # the deposit's publication path is exercised without root (R2 cx2
+        # #1256)
+        self.write("bin/runuser",
+                   "#!/bin/sh\n"
+                   "[ \"$1\" = -u ] && shift 2\n"
+                   "[ \"$1\" = -- ] && shift\n"
+                   "exec \"$@\"\n", mode=0o755)
+
+    def real_run(self, *args, **env_extra):
+        """A real run (no `--dry-run`) against the test host: non-root, the
+        `runuser` shim on PATH; refuses to touch anything else (R2 cx2 #1256)."""
+        return subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                              env=self.script_env(**env_extra))
 
     def write(self, path, content, mode=None):
         full = os.path.join(self.host, path)
@@ -608,6 +623,49 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotIn("--labels " + FLEET, src)   # jamais le label de la flotte
         self.assertNotIn("--unattended", src)
         self.assertIn("LABEL=" + LENT, src)
+
+    @unittest.skipIf(os.geteuid() == 0, "the real-deposit seam is a non-root run")
+    def test_a_real_deposit_publishes_the_validated_bytes(self):
+        """Vrai dépôt (pas de `--dry-run`) : le fichier publié est un lien vers
+        le temporaire vérifié, aux octets validés, propriété de l'invité, et
+        aucun temporaire ne survit (R2 cx2 B2, #1256)."""
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        source = self.deposit_file(1)
+        res = self.real_run("--deposit", "/root/jit-r1.b64", "--host", "ci-3")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(source, "rb") as fh:
+            raw = fh.read()
+        digest = hashlib.sha256(b"".join(raw.split())).hexdigest()[:16]
+        spool = os.path.join(self.host, "srv/ameesh-guest/ci/jit/r1")
+        target = os.path.join(spool, "jit-%s.b64" % digest)
+        self.assertTrue(os.path.isfile(target), os.listdir(spool))
+        with open(target, "rb") as fh:
+            self.assertEqual(fh.read(), raw)
+        self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(os.listdir(spool)), [".keep", os.path.basename(target)])
+
+    @unittest.skipIf(os.geteuid() == 0, "the real-deposit seam is a non-root run")
+    def test_a_real_deposit_refuses_a_source_that_changed(self):
+        """La source est relue pour la copie invitée : un tube qui rend A à la
+        validation puis B à la copie est refusé AVANT publication. Vérifier
+        l'empreinte après le lien laissait consommer B puis échouait (R2 cx2
+        B2, #1256)."""
+        valid = jit_config()
+        other = jit_config(repo="https://github.com/other/repo")
+        fifo = os.path.join(self.host, "root/fifo.b64")
+        os.makedirs(os.path.dirname(fifo), exist_ok=True)
+        os.mkfifo(fifo)
+        writer = subprocess.Popen(
+            ["sh", "-c", 'printf %s "$1" > "$3"; sleep 1; printf %s "$2" > "$3"',
+             "sh", valid, other, fifo])
+        self.addCleanup(writer.wait)
+        self.write("srv/ameesh-guest/ci/jit/r1/.keep", "")
+        res = self.real_run("--deposit", "/root/fifo.b64", "--host", "ci-3")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("changed while being deposited", res.stderr)
+        spool = os.path.join(self.host, "srv/ameesh-guest/ci/jit/r1")
+        self.assertEqual(sorted(os.listdir(spool)), [".keep"])
+        writer.wait(timeout=10)
 
     def test_deposit_prints_one_configuration_and_never_its_bytes(self):
         blob = jit_config()
@@ -1288,6 +1346,33 @@ class WorkflowRoutingTest(unittest.TestCase):
         for src in (tests_src, ui_src):
             self.assertNotIn("cache-mode: write", src)
             self.assertNotIn("cache-mode: write-only", src)
+
+    def test_the_required_path_verifies_the_plan_artifact(self):
+        """Le jeton d'exécution sert aussi l'API d'artefacts du run : un job
+        routé (`bilan`) tourne après `plan` et peut remplacer l'artefact
+        `plan` avant un « re-run failed jobs » des parts (R1 dev4 B4, #1256).
+        Le job `plan` publie donc l'empreinte du fichier qu'il dépose en
+        sortie de job — que nul autre job ne peut réécrire — et chaque
+        consommateur requis la vérifie avant d'exécuter."""
+        jobs = self.workflows()["tests.yml"]["jobs"]
+        plan = jobs["plan"]
+        self.assertIn("plan_sha256", plan.get("outputs") or {})
+        self.assertIn("sha256sum", yaml.safe_dump(plan))
+        closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
+        consumers = []
+        for job in sorted(closure):
+            steps = jobs[job].get("steps") or []
+            downloads = [s for s in steps
+                         if str(s.get("uses", "")).startswith("actions/download-artifact")
+                         and (s.get("with") or {}).get("name") == "plan"]
+            if not downloads:
+                continue
+            consumers.append(job)
+            body = " ".join(yaml.safe_dump(steps).split())
+            self.assertIn("plan.outputs.plan_sha256", body,
+                          "%s downloads the plan artifact without checking its digest" % job)
+            self.assertIn("sha256sum -c", body)
+        self.assertEqual(set(consumers), {"psycopg", "psql"})
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]

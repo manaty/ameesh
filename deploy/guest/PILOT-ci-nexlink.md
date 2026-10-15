@@ -129,12 +129,14 @@ sudo deploy/guest/ci-runners.sh --disk-floor-mib 6144 --deposit /root/jit-ci-3-1
 object; safe file names — never a path; base64 values; `.runner.gitHubUrl`
 normalized equal to `https://github.com/manaty/ameesh`; **`.runner` mandatory,
 and `ephemeral: true` inside it**) and publishes it atomically and
-exclusively in `/srv/ameesh-guest/ci/jit/rN/` **as the guest** (a link to a
-private temporary of the same directory, so a concurrent or repeated deposit
-fails instead of overwriting, and no partial file is ever visible to the
-wrapper; root writes nothing under `$ROOT`, R1 delta B4). The digest of the
-**published** bytes is re-read and compared with the validated source: a file
-that changed between the root read and the guest copy is refused, never run.
+exclusively in `/srv/ameesh-guest/ci/jit/rN/` **as the guest** (root writes
+nothing under `$ROOT`, R1 delta B4). The guest copy goes to a private
+temporary of the same directory; its digest is compared with the validated
+source **before** the exclusive link publishes it (the link fails if the
+target already exists, so a concurrent or repeated deposit is refused, and no
+partial file is ever visible to the wrapper). A source that changed between
+the root read and the guest copy is therefore refused **before** anything is
+published, never consumed then rejected (R1/R2 Codex B2, #1256).
 
 `ephemeral: true` is not decoration. The JIT blob only writes the files
 (`Runner.cs`, `RunJitConfig`); the one-shot path reads `settings.Ephemeral`,
@@ -204,6 +206,21 @@ convenience:
   job in any write mode is a defect; the witness fails on one. **At
   qualification, a real lent run must show the effective scope** (the cache
   save refused, `§5`), not just the declaration.
+* **The run's artifacts are a second channel of the same token** (R1 Claude
+  B4, #1256). `bilan` runs after `plan`, `psycopg` and `psql`, and the
+  runtime token serves the artifact API too: a rooted application job could
+  delete the `plan` artifact and publish a forged one, then a *re-run of
+  failed jobs* of the parts would execute the forged plan — a green without
+  tests. The remedy does not depend on the artifact service refusing
+  deletion: the `plan` job publishes **the sha256 of the file it uploads as
+  a job output** (`plan_sha256`), which no other job can rewrite, and
+  `psycopg` and `psql` compare it (`sha256sum -c`) before their part runs —
+  a mismatch fails the required job. The witness
+  (`test_the_required_path_verifies_the_plan_artifact`) recomputes the
+  required closure and fails if a required consumer downloads `plan`
+  without that check. Qualification must also record whether the runtime
+  token may delete an artifact at all (`§5.7`); if it may not, this is
+  defence in depth rather than the only barrier.
 * Today's admissible list is therefore: **`bilan`** (tests.yml,
   `continue-on-error: true`, not in `tests.needs`, consumes the `flux-*`
   artifacts, feeds only the two-week tally of the map) and **`ui`**
@@ -401,7 +418,9 @@ runners instead of leaving them running.
    #1256 B2), the runner gone from `gh api
    repos/manaty/ameesh/actions/runners` after the job, **the effective cache
    scope of the lent job shown read-only or closed in the job's own log (a
-   refused save, `cache-mode`; R1 #1256 B3)**, and the post-job disk
+   refused save, `cache-mode`; R1 #1256 B3)**, **the plan artifact digest
+   verified by the required parts and whether the runtime token may delete
+   an artifact (R1 #1256 B4)**, and the post-job disk
    check of §6 (free ≥ 6 GiB, no `disk_low` episode); only then the others
    are enabled and left in service.
 

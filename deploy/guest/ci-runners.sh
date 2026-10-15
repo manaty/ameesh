@@ -218,8 +218,20 @@ esac
 # The tests' dry runs see a host of their own (CI_RUNNERS_TEST_HOST=DIR): its
 # /etc, /srv and /run are read under DIR, and systemd is asked nothing. A real
 # run reads only the host. Same seam as install-pilot.sh's PILOT_TEST_HOST.
+#
+# A NON-ROOT process pointed at CI_RUNNERS_TEST_HOST (TEST_SELF) reads that
+# host for real, without `--dry-run`: `runuser` is then a shim on PATH, so the
+# publication path of `--deposit` is exercised for real (temporary file,
+# digest, exclusive link) without root and without touching the machine (R2
+# cx2 #1256). In a real root run the seam is inert: it needs both the
+# variable and a non-root euid.
 HOSTDIR=
-if [ "$DRY" = 1 ] && [ -n "${CI_RUNNERS_TEST_HOST:-}" ]; then
+TEST_SELF=0
+if [ -n "${CI_RUNNERS_TEST_HOST:-}" ] && [ "$(id -u)" != 0 ]; then
+  TEST_SELF=1
+  HOSTDIR=$CI_RUNNERS_TEST_HOST
+  STATE=${CI_RUNNERS_TEST_STATE:-$HOSTDIR/etc/ameesh/ci-runners.state}
+elif [ "$DRY" = 1 ] && [ -n "${CI_RUNNERS_TEST_HOST:-}" ]; then
   HOSTDIR=$CI_RUNNERS_TEST_HOST
   STATE=${CI_RUNNERS_TEST_STATE:-$HOSTDIR/etc/ameesh/ci-runners.state}
 fi
@@ -248,10 +260,10 @@ if [ "$FLOOR_SET" = 0 ] && [ -f "$STATE" ]; then
 fi
 host_says() { [ -z "$HOSTDIR" ] && "$@" || true; }
 run() {
-  if [ "$DRY" = 1 ]; then printf 'DRY %s\n' "$*"; else "$@"; fi
+  if [ "$DRY" = 1 ] || [ "$TEST_SELF" = 1 ]; then printf 'DRY %s\n' "$*"; else "$@"; fi
 }
 safe_run() { # run, but a failure is reported, never fatal (check mode)
-  if [ "$DRY" = 1 ]; then printf 'DRY %s\n' "$*"; else "$@" || ko "$*"; fi
+  if [ "$DRY" = 1 ] || [ "$TEST_SELF" = 1 ]; then printf 'DRY %s\n' "$*"; else "$@" || ko "$*"; fi
 }
 put() { # put PATH MODE OWNER  (content on stdin)
   local path mode owner
@@ -496,7 +508,7 @@ wait_runner_stops() { # N : 0 child disparu, 2 porte rouverte (child légitime),
 }
 slice_state() { host_says systemctl show ameesh-guest.slice --property="$1" --value 2>/dev/null || true; }
 
-need_root() { [ "$DRY" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo)"; }
+need_root() { [ "$DRY" = 1 ] || [ "$TEST_SELF" = 1 ] || [ "$(id -u)" = 0 ] || die "run as root (sudo)"; }
 
 # the guard (L159g) is what stops the guest runners when the application needs
 # the host. #1256 R1 : sans lui, ou s'il ne couvre pas nos unités, rien ne les
@@ -850,27 +862,31 @@ PYJIT
   fi
   if [ "$DRY" = 1 ]; then
     printf 'DRY runuser -u %s -- sh -c %s < %s > %s (single-use JIT configuration %s for r%s)\n' \
-      "$GUEST" "'umask 077; tmp=\$1.tmp.\$\$; cat >\"\$tmp\" && ln \"\$tmp\" \"\$1\" && rm -f \"\$tmp\"'" \
+      "$GUEST" "'umask 077; tmp=\$1.tmp.\$\$; cat >tmp; empreinte(tmp)=\$2 ou exit 3; ln tmp \$1 (exclusif)'" \
       "$(at "$DEPOSIT")" "$(at "$target")" "$digest" "$n"
   else
-    # publication exclusive et atomique : le fichier n'apparaît complet (lien
-    # vers un temporaire du même dossier) que si personne ne l'a déjà déposé ;
-    # un `cat` direct laissait un fichier partiel visible du portier et deux
-    # dépôts concurrents pouvaient s'écraser (R1 Codex B2, #1256)
+    # publication exclusive et atomique, et seulement d'octets vérifiés : le
+    # temporaire reçoit la copie, son empreinte est comparée AVANT le lien, et
+    # le lien (qui échoue si la cible existe) publie ce même inode — un
+    # `cat` direct laissait un fichier partiel visible du portier, et vérifier
+    # après le lien laissait consommer une source remplacée entre la lecture
+    # root et la copie invitée (R1/R2 Codex B2, #1256)
+    rc=0
     runuser -u "$GUEST" -- sh -c '
       umask 077
       tmp=$1.tmp.$$
-      cat >"$tmp" || { rm -f "$tmp"; exit 1; }
-      if ln "$tmp" "$1" 2>/dev/null; then rm -f "$tmp"; else rm -f "$tmp"; exit 1; fi
-    ' sh "$(at "$target")" <"$(at "$DEPOSIT")" \
-      || die "$target is already deposited or unwritable: one configuration is one job, deposit a fresh one"
-    # les octets publiés sont ceux qui ont été validés : une source modifiée
-    # entre la lecture root et la copie invitée est refusée, jamais exécutée
-    published=$(runuser -u "$GUEST" -- sha256sum "$(at "$target")" 2>/dev/null | awk '{print $1}')
-    if [ "$published" != "$raw_digest" ]; then
-      runuser -u "$GUEST" -- rm -f "$(at "$target")" 2>/dev/null || true
-      die "$DEPOSIT changed while being deposited (published digest $published, expected $raw_digest): nothing deposited"
-    fi
+      trap '"'"'rm -f "$tmp"'"'"' EXIT INT TERM
+      cat >"$tmp" || exit 2
+      got=$(sha256sum -- "$tmp" | cut -d" " -f1)
+      [ "$got" = "$2" ] || exit 3
+      ln "$tmp" "$1" 2>/dev/null || exit 1
+    ' sh "$(at "$target")" "$raw_digest" <"$(at "$DEPOSIT")" || rc=$?
+    case "$rc" in
+      0) ;;
+      3) die "$DEPOSIT changed while being deposited (the copy does not match the validated source): nothing deposited" ;;
+      2) die "$(at "$target") could not be written as $GUEST: nothing deposited" ;;
+      *) die "$target is already deposited or unwritable: one configuration is one job, deposit a fresh one" ;;
+    esac
   fi
   say "deposited: r$n, one job, then the runner is removed by GitHub (digest $digest)"
   say "next: --enable $n when the guard enforces, then --check"
