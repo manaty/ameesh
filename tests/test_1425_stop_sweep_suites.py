@@ -88,8 +88,11 @@ class CmdStopReleasesLotsTest(_Base):
         (la transaction relit le registre)."""
         self.agent("dev1")
         lot = self.lot("A", assignee="dev1")
+        # Un lot orphelin porte exactement le nom absent que la CLI arrête.
+        self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s",
+                        ("dev1-absent", lot["id"]))
         runner_mod.cmd_stop(self.cfg, self.db, ["dev1-absent"])
-        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1-absent")
 
 
 class SweepHandsPromotedTest(_Base):
