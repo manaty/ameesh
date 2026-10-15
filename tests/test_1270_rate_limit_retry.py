@@ -132,6 +132,47 @@ class ClassifyTest(unittest.TestCase):
                 self.assertEqual(rate_limit.classify(stderr_tail=texte),
                                  rate_limit.RATE_LIMITED)
 
+    def test_pannes_passageres_deepseek(self):
+        # Complément bureau du 15/10 03:06 : la reprise bornée #1270 couvre
+        # aussi les pannes passagères du fournisseur DeepSeek — flux SSE
+        # malformé, service surchargé, passerelle 5xx. Formes réelles relevées
+        # dans les `stderr.log` des exécuteurs :
+        # « dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type
+        # mismatch » et « Service is too busy. We advise users to temporarily
+        # switch to alternative LLM API service providers. ».
+        for texte in ("dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type mismatch",
+                      "MALFORMED_RESPONSE",
+                      "DeepSeek Messages SSE event type mismatch",
+                      "SSE error: stream closed unexpectedly",
+                      "Service is too busy. We advise users to temporarily switch to "
+                      "alternative LLM API service providers.",
+                      "HTTP 502 Bad Gateway",
+                      "status: 503",
+                      "Error code: 504",
+                      "502 Bad Gateway",
+                      "503 Service Unavailable",
+                      "504 Gateway Timeout",
+                      "500 Internal Server Error"):
+            with self.subTest(texte=texte):
+                self.assertEqual(rate_limit.classify(stderr_tail=texte),
+                                 rate_limit.RATE_LIMITED)
+                self.assertEqual(rate_limit.classify(error=texte),
+                                 rate_limit.RATE_LIMITED)
+
+    def test_un_5xx_de_trace_ne_classe_pas(self):
+        # même exigence d'ancrage que le 429 : un numéro de ligne « 5xx » ou un
+        # mot libre ne sont pas des signatures de passerelle.
+        for texte in ("Traceback (most recent call last):\n"
+                      "  File \"runner.py\", line 502, in run\n"
+                      "ValueError: boom",
+                      "File \"/srv/app/api/client.py\", line 503",
+                      "voir la ligne 504 du journal",
+                      "le flux a été malformed puis réessayé"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(result=texte))
+                self.assertIsNone(rate_limit.classify(stderr_tail=texte))
+
 
 class DelaiTest(unittest.TestCase):
     def test_cadence_1_2_5_10_min_puis_palier(self):

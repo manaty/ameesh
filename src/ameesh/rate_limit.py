@@ -78,6 +78,23 @@ TRANSIENT_PATTERNS = (
     re.compile(r"\boverloaded\b[^\n]{0,40}\b(?:try again|retry)", re.I),
     re.compile(r"\bretry[- ]after\b", re.I),
     re.compile(r"\btemporarily unavailable\b", re.I),
+    # #1270 x DeepSeek (complément bureau du 15/10 03:06) : les pannes
+    # passagères du fournisseur DeepSeek suivent la même reprise cadencée que
+    # le 429 — flux SSE malformé, service surchargé, passerelle 5xx. Formes
+    # réelles relevées dans les `stderr.log` des exécuteurs :
+    # ``dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type mismatch``
+    # et ``Service is too busy. We advise users to temporarily switch…``.
+    # Signatures fournisseur positives uniquement (lues dans `error` et
+    # `stderr_tail`), jamais un mot libre du modèle.
+    re.compile(r"\bMALFORMED_RESPONSE\b"),
+    re.compile(r"DeepSeek Messages SSE event type mismatch", re.I),
+    re.compile(r"\bSSE\b[^\n]{0,40}\b(?:error|mismatch|failed|closed|reset)\b", re.I),
+    re.compile(r"\bservice is too busy\b", re.I),
+    # un « 5xx » doit nommer un statut HTTP explicite, comme le 429 ci-dessus
+    re.compile(r"\b(?:https?(?:/\d(?:\.\d)?)?|status(?:[_ ]?code)?|error code|api error)"
+               r"\b\s*[:=]?\s*5\d\d\b", re.I),
+    re.compile(r"\b(?:internal server error|bad gateway|service unavailable|"
+               r"gateway time-?out)\b", re.I),
 )
 
 #: genres rendus par `classify`
