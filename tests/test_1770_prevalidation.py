@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import unittest
 
+import ameesh.prevalidation  # noqa: F401  (preuve du chargement du fichier, plan L161f #1339)
 from ameesh import prevalidation as pv
 
 A = "a" * 40
