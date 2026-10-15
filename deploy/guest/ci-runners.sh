@@ -76,7 +76,10 @@
 #   CI_RUNNERS_TEST_ACTIVE (active units), CI_RUNNERS_TEST_CHILD (live runner
 #   processes, stopped by the /run/ci-runners-test-child-gone-<N> marker),
 #   CI_RUNNERS_TEST_STOP_DELAY, CI_RUNNERS_TEST_GUEST_READS (logical paths the
-#   guest can read on the test host; the real probe runs `runuser`)
+#   guest can read on the test host; the real probe runs `runuser`),
+#   CI_RUNNERS_TEST_GUEST_TRAVERSES (logical directories the guest can
+#   traverse: `test -x`), CI_RUNNERS_TEST_APP_DIRS (logical WorkingDirectory
+#   values of the application's `actions.runner.*` units)
 #
 # Safety, by construction:
 #   * every systemd unit this script writes matches `ameesh-guest-ci@*`; it
@@ -128,6 +131,9 @@ LABEL=ameesh-lent
 VERSION=2.338.0
 # the digest published for actions/runner v2.338.0 linux-x64 (the fleet's)
 SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
+# bound of the archive root reads (~110 MiB in 2.338.0): a guest-owned cache
+# that claims more than this is not the runner tarball (R2 N1, #1416)
+MAX_ARCHIVE_BYTES=536870912
 URL_BASE=https://github.com/actions/runner/releases/download
 HOST=$(hostname -s)
 COUNT=2
@@ -343,7 +349,37 @@ stage_cleanup() { # the root-private archive snapshot never outlives the run
   if [ -n "$STAGE_DIR" ]; then rm -rf "$STAGE_DIR"; fi
 }
 snapshot() { # SRC DST : the archive bytes, read by root into its private file
-  cat -- "$1" >"$2"
+  # Le cache vit sous $ROOT, que l'invité possède : entre le contrôle de lien
+  # et un `cat`, il peut le remplacer par un lien (lecture root d'un fichier
+  # arbitraire) ou par /dev/zero (remplissage de /var/tmp). La copie ouvre
+  # donc elle-même la source en O_NOFOLLOW, n'accepte qu'un fichier régulier
+  # et borne ce qu'elle lit (R2 N1, #1416).
+  python3 -I - "$1" "$2" "$MAX_ARCHIVE_BYTES" <<'PYSNAP'
+import os, stat, sys
+src, dst, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+except OSError as exc:
+    sys.exit("cannot open %s without following a link: %s" % (src, exc))
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        sys.exit("%s is not a regular file: refusing to read it as the archive" % src)
+    if info.st_size > limit:
+        sys.exit("%s is larger than %d bytes: not the runner archive" % (src, limit))
+    total = 0
+    with open(dst, "wb") as out:
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                sys.exit("%s grew past %d bytes while being read" % (src, limit))
+            out.write(chunk)
+finally:
+    os.close(fd)
+PYSNAP
 }
 trap stage_cleanup EXIT
 restore_howto() {
@@ -381,31 +417,77 @@ app_units() { # the application's own runner units: read, never written
     | awk '{print $1}' | sort || true
 }
 app_count() { app_units | grep -c . || true; }
-# R2 #1256 B2 : l'isolation dans l'autre sens. Un job de l'application est
-# root-equivalent sur cette VM (les jobs de la flotte lancent Docker) : il ne
-# doit donc pas pouvoir lire les secrets du runner ameesh, ni son arbre de
-# travail. Le test tourne en tant qu'invité (`runuser`), jamais en root.
-guest_reads() { # PATH logique : 0 si ameesh-guest peut le lire
+# R2 #1256 B2 : la sonde tourne en tant qu'invité (`runuser`), jamais en root.
+# Elle prouve que l'invité ne peut pas lire l'arbre ni les secrets du runner
+# de l'application : sinon un job ameesh se ferait passer pour un runner
+# Nexlink. La direction inverse (un job de l'application, root-équivalent via
+# Docker, qui lirait les secrets ameesh) est le constat B1 : elle n'est pas
+# prouvée par cette sonde (R2 N4, #1416).
+guest_reads() { # PATH logique : 0 si ameesh-guest peut le lire, ou le traverser
   if [ -n "$HOSTDIR" ]; then
     case ",${CI_RUNNERS_TEST_GUEST_READS:-}," in
       *",$1,"*) return 0 ;;
-      *) return 1 ;;
     esac
+    case ",${CI_RUNNERS_TEST_GUEST_TRAVERSES:-}," in
+      *",$1,"*) return 0 ;;
+    esac
+    # un dry-run ne lance aucun `runuser` réel (même pointé sur un hôte de
+    # test en non-root) : le seam décide seul. Un run réel non-root (TEST_SELF)
+    # exécute la sonde à travers le shim `runuser` du banc (les droits de
+    # l'utilisateur de test tiennent lieu de ceux de l'invité).
+    { [ "$TEST_SELF" = 1 ] && [ "$DRY" = 0 ]; } || return 1
   fi
-  runuser -u "$GUEST" -- test -r "$(at "$1")" 2>/dev/null
+  # Un dossier en 0711 n'est pas lisible (`test -r` échoue) mais reste
+  # traversable : les chemins prévisibles sous lui sont atteignables, ce que
+  # `test -r` seul ne voit pas (R2 N5, #1416). Pour un dossier, l'un ou
+  # l'autre des droits est donc un KO ; pour un fichier, la lecture seule.
+  runuser -u "$GUEST" -- sh -c '
+    if [ -d "$1" ]; then
+      [ -x "$1" ] || [ -r "$1" ]
+    else
+      [ -r "$1" ]
+    fi' sh "$(at "$1")" 2>/dev/null
+}
+app_work_dirs() { # les arbres de travail des unités `actions.runner.*`
+  # Un runner peut être installé ailleurs que sous /home/runner : le
+  # WorkingDirectory de son unité dit où (R2 N6, #1416). Lu, jamais écrit.
+  if [ -n "$HOSTDIR" ]; then
+    local d
+    for d in ${CI_RUNNERS_TEST_APP_DIRS:-}; do printf '%s\n' "$d"; done
+    return 0
+  fi
+  local unit
+  while IFS= read -r unit; do
+    [ -n "$unit" ] || continue
+    systemctl show -p WorkingDirectory --value "$unit" 2>/dev/null
+  done < <(app_units)
 }
 app_isolation_paths() { # les chemins logiques de l'application à sonder
-  local root=/home/runner mapped; mapped=$(at "$root")
-  [ -e "$mapped" ] || return 0
-  printf '%s\n' "$root"
-  [ -d "$mapped" ] || return 0
-  local p
-  while IFS= read -r p; do
-    printf '%s\n' "$root${p#"$mapped"}"
-  done < <(find "$mapped" -maxdepth 5 \
-             \( -name .runner -o -name .credentials \
-                -o -name .credentials_rsaparams -o -name _work \) \
-             -print 2>/dev/null)
+  # La racine historique est gardée (les runners y vivent le plus souvent),
+  # les WorkingDirectory déclarés s'y ajoutent : un runner déplacé n'échappe
+  # plus à la sonde (R2 N6, #1416).
+  local -a roots=(/home/runner)
+  local d root mapped p
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "${d#/}" in "$d") continue ;; esac   # un chemin absolu seulement
+    case " ${roots[*]} " in
+      *" $d "*) ;;
+      *) roots+=("$d") ;;
+    esac
+  done < <(app_work_dirs)
+  for root in "${roots[@]}"; do
+    mapped=$(at "$root")
+    [ -e "$mapped" ] || continue
+    printf '%s\n' "$root"
+    [ -d "$mapped" ] || continue
+    while IFS= read -r p; do
+      printf '%s\n' "$root${p#"$mapped"}"
+    done < <(find "$mapped" -maxdepth 5 \
+               \( -name .runner -o -name .credentials \
+                  -o -name .credentials_rsaparams -o -name _work \) \
+               -print 2>/dev/null)
+  done
 }
 guest_busy() { # N : a job of runner N is running
   [ -n "${CI_RUNNERS_TEST_BUSY:-}" ] && return 0
@@ -973,6 +1055,10 @@ check() {
   say "shim: $SHIM"
   [ -x "$(at "$SHIM")" ] || ko "$SHIM is missing or not executable"
   say "runners (single-use JIT, label $LABEL, never the fleet's ameesh-ci)"
+  # Le préfixe est le marqueur d'une coupure d'infra : un job arrêté par le
+  # garde apparaît en échec sous un runner nommé ainsi, ce n'est pas un rouge
+  # de test (R2 N3, #1416 ; plan §4).
+  say "runner prefix: $RUNNER_PREFIX-<slot> (a job the guard stops is an infra cut, not a test red)"
   local n active_runners=0
   for n in $(seq 1 "$COUNT"); do
     local dir=$ROOT/ci/r$n
@@ -1012,11 +1098,11 @@ check() {
   local probe probes
   probes=$(app_isolation_paths)
   if [ -z "$probes" ]; then
-    echo "note: no application runner tree at /home/runner: nothing to probe"
+    echo "note: no application runner tree to probe (no readable WorkingDirectory, /home/runner absent)"
   else
     while IFS= read -r probe; do
       if guest_reads "$probe"; then
-        ko "$GUEST can read $probe: an application job could impersonate the ameesh runner (R2 B2)"
+        ko "$GUEST can read $probe: an ameesh job could impersonate an application runner (R2 B2)"
       else
         ok "$GUEST cannot read $probe"
       fi
