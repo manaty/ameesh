@@ -1,23 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1580 (point 2) — la marge des forfaits et les agents facturés au token.
+"""#1580 (point 2) — forfait margin and usage-billed agents.
 
-Demande du propriétaire (2026-10-15 10:25) : « qui répartit les agents entre
-comptes pour optimiser les coûts ? ». Le choix par tour (0034, #1580 point 1)
-consomme d'abord ce qui sera perdu à la remise à zéro, mais rien ne dit
-combien d'agents facturés au token (DeepSeek) pourraient passer sur un forfait
-(Codex, Claude) qui a de la marge.
+Owner request (2026-10-15 10:25): "who distributes agents between accounts to
+optimize costs?". The per-turn choice (0034, #1580 point 1) first consumes
+what will be lost at reset, but nothing says how many usage-billed agents
+(DeepSeek) could move to a forfait (Codex, Claude) that has margin.
 
-`proposal()` lit les jauges des comptes au forfait sous le seuil des
-**non-critiques** (la réserve `RESERVE` reste aux agents critiques, L242b),
-estime la part de fenêtre longue qu'un agent consomme (observée sur le
-harnais, plancher `DEFAULT_AGENT_SHARE`), et rend le nombre d'agents
-déplaçables — jamais plus que la marge mesurée ne porte. Une famille n'est
-jamais vidée : au moins un agent actif y reste, pour qu'une relecture d'une
-autre famille demeure possible (canon §2).
+`proposal()` reads the forfait accounts' gauges below the **non-critical**
+threshold (the `RESERVE` stays with critical agents, L242b), estimates the
+share of the long window an agent consumes (observed on the harness, floor
+`DEFAULT_AGENT_SHARE`), and returns the number of movable agents — never more
+than the measured margin carries. A family is never emptied: at least one
+active agent stays in it, so that a review of another family remains possible
+(canon §2).
 
-**Aucune bascule n'est faite ici** : c'est une proposition affichée
-(`ameesh accounts list`), l'humain ou le pilote décide. La garde de budget
-par tour reste seule juge de l'exécution.
+**No switch is made here**: this is a displayed proposal
+(`ameesh accounts list`), the human or the pilot decides. The per-turn budget
+guard remains the sole judge of execution.
 """
 from __future__ import annotations
 
@@ -27,40 +26,40 @@ from dataclasses import dataclass
 from . import accounts
 from . import cost as cost_mod
 
-#: Part de la fenêtre longue qu'un agent consomme **au minimum** : repli quand
-#: aucune observation n'est disponible, plancher de l'observation sinon. Cinq
-#: points d'une semaine : une proposition prudente (moins d'agents annoncés).
+#: Share of the long window an agent consumes **at minimum**: fallback when
+#: no observation is available, floor of the observation otherwise. Five
+#: points of a week: a prudent proposal (fewer agents announced).
 DEFAULT_AGENT_SHARE = 0.05
-#: Une fenêtre plus courte qu'un jour se remet à zéro trop souvent pour porter
-#: une bascule durable : la capacité se lit sur la fenêtre longue (L74).
+#: A window shorter than a day resets too often to carry a durable switch:
+#: capacity is read on the long window (L74).
 LONG_WINDOW_S = 86400.0
 
 
 @dataclass(frozen=True)
 class Offer:
-    """Ce qu'un harnais au forfait peut porter, sur sa fenêtre longue."""
+    """What a forfait harness can carry, on its long window."""
 
     harness: str
-    free: float                      #: part disponible sous le seuil non-critique
-    unit: float                      #: part consommée par un agent (observée/plancher)
-    capacity: int                    #: agents que `free` porte (floor(free / unit))
-    accounts: tuple = ()             #: comptes qui ont une marge mesurée
+    free: float                      #: share available below the non-critical threshold
+    unit: float                      #: share consumed by one agent (observed/floor)
+    capacity: int                    #: agents that `free` carries (floor(free / unit))
+    accounts: tuple = ()             #: accounts with a measured margin
 
 
 @dataclass(frozen=True)
 class Proposal:
-    """La proposition affichée : combien d'agents facturés au token déplacer."""
+    """The displayed proposal: how many usage-billed agents to move."""
 
     movable: int = 0
-    #: répartition `(harnais, nombre)` — un harnais au forfait à la fois
+    #: distribution `(harness, count)` — one forfait harness at a time
     moves: tuple = ()
     offers: tuple = ()
-    candidates: int = 0              #: agents facturés au token, hors critiques
-    kept_for_review: int = 0         #: familles qu'on ne vide pas (relecture croisée)
-    reason: str = ""                 #: pourquoi aucune proposition n'est faite
+    candidates: int = 0              #: usage-billed agents, excluding critical ones
+    kept_for_review: int = 0         #: families not emptied (cross-review)
+    reason: str = ""                 #: why no proposal is made
 
     def text(self) -> str:
-        """La ligne d'affichage (`ameesh accounts list`)."""
+        """The display line (`ameesh accounts list`)."""
         if self.reason:
             return "forfait margin: %s" % self.reason
         if not self.movable:
@@ -86,17 +85,17 @@ class Proposal:
 
 
 def live_fleet(db, now: float, host: str | None = None) -> dict:
-    """`{agent: harnais}` des agents **sous bail** à `now` (R3, L37).
+    """`{agent: harness}` of the agents **under lease** at `now` (R3, L37).
 
-    Un agent arrêté, expiré ou `externe` n'est pas une bascule : le bail seul
-    autorise à tourner. `host` restreint à un hôte (les comptes déclarés sont
-    ceux d'un hôte). Base illisible : `{}` — aucune proposition plutôt qu'un
-    compte faux.
+    A stopped, expired or `externe` agent is not a move: the lease alone
+    authorizes it to run. `host` restricts to one host (the declared accounts
+    are those of one host). Unreadable database: `{}` — no proposal rather
+    than a wrong count.
     """
-    from . import registry  # import local : garde le module d'affichage léger
+    from . import registry  # local import: keeps the display module light
     try:
         rows = registry.overview(db)
-    except Exception:  # noqa: BLE001 - lecture facultative, jamais fatale à l'affichage
+    except Exception:  # noqa: BLE001 - optional read, never fatal to the display
         return {}
     fleet = {}
     for row in rows:
@@ -117,22 +116,22 @@ def live_fleet(db, now: float, host: str | None = None) -> dict:
 
 
 def _offer(items: list, agents: list, now: float, book) -> Offer:
-    """La marge d'un harnais au forfait : ses comptes, leur fenêtre longue."""
+    """The margin of a forfait harness: its accounts, their long window."""
     free = 0.0
     used = 0.0
     measured = []
     for profile in items:
         if profile.kind == "api_key_env":
-            continue  # une clé API ne constitue pas une capacité de forfait
-        # seuil des non-critiques : la réserve reste aux agents critiques (L242b)
-        # #1580 (tranche 3) : `model=''` — la marge se lit sur les fenêtres
-        # générales ; un seau propre à un modèle (Fable) ne l'annule pas pour
-        # les agents d'un autre modèle. La capacité par modèle reste à faire.
+            continue  # an API key is not a forfait capacity
+        # non-critical threshold: the reserve stays with critical agents (L242b)
+        # #1580 (slice 3): `model=''` — the margin is read on the general
+        # windows; a model-specific bucket (Fable) does not cancel it for
+        # the agents of another model. Per-model capacity remains to be done.
         result = accounts.evaluate(book, profile, items, now, record=False,
                                    reserve=True, model="")
-        # Une fenêtre échue ne mesure pas la suivante, et une courte échue
-        # invalide la longue encore ouverte (#1561). L'affichage ne promet
-        # rien sans une marge courante, même si la garde autorise un essai.
+        # An expired window does not measure the next one, and an expired short
+        # one invalidates the long one still open (#1561). The display promises
+        # nothing without a current margin, even if the guard allows a try.
         if any(g.reset_passed(now) for g in result.gauges):
             continue
         stamps = [stamp for g in result.gauges
@@ -141,12 +140,12 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
             continue
         long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
         if not long:
-            continue  # aucune fenêtre longue mesurée : rien à porter
-        # #1789/N5 : l'unité observée somme l'usage de TOUS les comptes
-        # mesurables du harnais, y compris celui que la garde écarte (saturé,
-        # plafond fixe) : ses agents comptent dans `agents`, sa consommation
-        # doit compter aussi — sinon l'unité est sous-estimée et la capacité
-        # annoncée trop grande.
+            continue  # no long window measured: nothing to carry
+        # #1789/N5: the observed unit sums the usage of ALL the harness's
+        # measurable accounts, including the one the guard sets aside
+        # (saturated, fixed cap): its agents count in `agents`, so its
+        # consumption must count too — otherwise the unit is underestimated
+        # and the announced capacity too large.
         used += sum(g.used_at(now) for g in long)
         if not result.ok or result.hard:
             continue
@@ -154,8 +153,8 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
         measured.append(profile.name)
     unit = DEFAULT_AGENT_SHARE
     if agents:
-        # l'observation ne fait que relever le coût d'un agent (jamais l'abaisser
-        # sous le plancher) : une proposition prudente
+        # the observation only raises the cost of one agent (never lowers it
+        # below the floor): a prudent proposal
         unit = max(DEFAULT_AGENT_SHARE, min(1.0, used / len(agents)))
     harness = items[0].harness if items else ""
     return Offer(harness=harness, free=free, unit=unit,
@@ -165,11 +164,11 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
 
 def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = None,
              critical=()) -> Proposal:
-    """La proposition de bascule, sans aucun geste : lecture seule.
+    """The switch proposal, without any action: read-only.
 
-    `fleet` : `{agent: harnais}` à considérer (défaut : les agents sous bail,
-    `live_fleet`). `critical` : noms à ne jamais déplacer (défaut :
-    `cfg.critical_agents`) — leur réserve est en plus gardée dans la marge.
+    `fleet`: `{agent: harness}` to consider (default: the agents under lease,
+    `live_fleet`). `critical`: names never to move (default:
+    `cfg.critical_agents`) — their reserve is additionally kept in the margin.
     """
     now = time.time() if now is None else now
     try:
@@ -179,8 +178,8 @@ def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = No
     try:
         billed = set(cost_mod.paid_harnesses_of(getattr(cfg, "host", None)))
     except cost_mod.CostError as exc:
-        # fail-closed (0019 §2) : sans descripteurs, on ne devine pas qui est
-        # facturé au token
+        # fail-closed (0019 §2): without descriptors, we do not guess who is
+        # usage-billed
         return Proposal(reason="usage-billed harnesses unknown: %s" % exc)
     if fleet is None:
         fleet = live_fleet(db, now, getattr(cfg, "host", None))
@@ -190,18 +189,18 @@ def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = No
                         if harness in billed and name not in kept_names)
     if not candidates:
         return Proposal(reason="no usage-billed agent to move")
-    # Même définition des critiques que l'exécuteur (L242b), y compris les
-    # rôles au canon propriétaire et les orchestrateurs déclarés.
+    # Same definition of criticals as the executor (L242b), including the
+    # roles in the owner canon and the declared orchestrators.
     from . import auditor, sous_utilisation
     try:
         canons = auditor.load_all(cfg)
         declared_critical = sous_utilisation.declared_orchestrators()
         candidates = [name for name in candidates if not auditor.is_critical(
             cfg, db, name, canons, declared=declared_critical)]
-    except Exception:  # noqa: BLE001 - rôles illisibles : aucune proposition
+    except Exception:  # noqa: BLE001 - unreadable roles: no proposal
         return Proposal(reason="critical agent roles unknown")
-    # ne jamais vider une famille : la relecture croisée (canon §2) suppose au
-    # moins deux familles représentées après la bascule
+    # never empty a family: cross-review (canon §2) assumes at least two
+    # families represented after the switch
     kept = 0
     for family in set(agents.values()):
         members = [name for name, harness in agents.items() if harness == family]

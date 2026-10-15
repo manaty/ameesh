@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#1580 point 2 — « marge de forfait disponible : N agents déplaçables ».
+"""#1580 point 2 — "forfait margin available: N movable agents".
 
-La proposition lit les jauges des comptes au forfait **sous le seuil des
-non-critiques** (`RESERVE` gardée pour les agents critiques, L242b), estime la
-part de fenêtre longue qu'un agent consomme (observée, plancher
-`DEFAULT_AGENT_SHARE`), ne vide jamais une famille de relecture et n'annonce
-jamais plus d'agents que la marge mesurée n'en porte. Aucune bascule n'est
-faite : c'est un affichage (`ameesh accounts list`).
+The proposal reads the forfait accounts' gauges **below the non-critical
+threshold** (`RESERVE` kept for critical agents, L242b), estimates the share
+of the long window an agent consumes (observed, floor `DEFAULT_AGENT_SHARE`),
+never empties a review family and never announces more agents than the
+measured margin carries. No switch is made: this is a display
+(`ameesh accounts list`).
 """
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ JOUR = 86400.0
 
 
 def _deux_fenetres(home: str, court: tuple, long: tuple) -> None:
-    """Un journal Codex avec la fenêtre de 5 h (`primary`) et celle de 7 jours
-    (`secondary`) : `(pourcentage utilisé, resets_at)` pour chacune."""
+    """A Codex log with the 5 h window (`primary`) and the 7-day one
+    (`secondary`): `(used percentage, resets_at)` for each."""
     dossier = os.path.join(home, "sessions", "2026", "10", "15")
     os.makedirs(dossier, exist_ok=True)
     with open(os.path.join(dossier, "rollout-1580.jsonl"), "w", encoding="utf-8") as fh:
@@ -44,14 +44,14 @@ def _deux_fenetres(home: str, court: tuple, long: tuple) -> None:
                               "resets_at": long[1]}}}}) + "\n")
 
 
-#: 3 % de la semaine, 6 jours avant la remise à zéro : le seuil non-critique
-#: vaut max(écoulé + 10 − 10, 10) = 1/7 ≈ 14,3 %, la marge ≈ 11,3 points par
-#: compte, l'agent Codex observé en consomme 6 (0,06), donc 3 agents portés.
+#: 3% of the week, 6 days before reset: the non-critical threshold is
+#: max(elapsed + 10 − 10, 10) = 1/7 ≈ 14.3%, the margin ≈ 11.3 points per
+#: account, the observed Codex agent consumes 6 (0.06), so 3 agents carried.
 MARGE_3_POURCENT = (3, 6 * JOUR)
 
 
 class MargeForfaitTest(_Base):
-    """La marge des forfaits, les candidats et les gardes de la proposition."""
+    """Forfait margin, candidates and the proposal's guards."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -81,15 +81,15 @@ class MargeForfaitTest(_Base):
             "now() + interval '1 hour')",
             (name, harness, self.cfg.host))
 
-    # -- la marge et les candidats ----------------------------------------
+    # -- the margin and the candidates ------------------------------------
 
-    def test_la_marge_du_forfait_donne_des_agents_deplacables(self):
+    def test_forfait_margin_gives_movable_agents(self):
         cfg, _ = self._codex_a_3_pourcent()
         prop = self._marge(cfg, {"dev1": "deepseek", "dev2": "deepseek",
                                  "dev3": "deepseek", "cx1": "codex"})
         self.assertEqual(prop.candidates, 3)
-        self.assertEqual(prop.kept_for_review, 1)      # la famille DeepSeek survit
-        self.assertEqual(prop.movable, 2)              # 3 portés, 1 gardé
+        self.assertEqual(prop.kept_for_review, 1)      # the DeepSeek family survives
+        self.assertEqual(prop.movable, 2)              # 3 carried, 1 kept
         self.assertEqual(prop.moves, (("codex", 2),))
         self.assertEqual(prop.offers[0].harness, "codex")
         self.assertEqual(prop.offers[0].accounts, ("primaire", "secondaire"))
@@ -97,18 +97,18 @@ class MargeForfaitTest(_Base):
                       prop.text())
         self.assertEqual(prop.as_dict()["moves"], [{"harness": "codex", "agents": 2}])
 
-    def test_un_agent_critique_ne_se_deplace_pas(self):
+    def test_a_critical_agent_does_not_move(self):
         cfg, _ = self._codex_a_3_pourcent()
         prop = self._marge(cfg, {"dev1": "deepseek", "dev2": "deepseek",
                                  "dev3": "deepseek", "cx1": "codex"},
                            critical=("dev1", "dev2"))
         self.assertEqual(prop.candidates, 1)
-        self.assertEqual(prop.kept_for_review, 0)      # dev1/dev2 restent chez DeepSeek
+        self.assertEqual(prop.kept_for_review, 0)      # dev1/dev2 stay with DeepSeek
         self.assertEqual(prop.movable, 1)
 
-    def test_la_derniere_famille_de_relecture_est_gardee(self):
-        """Déplacer le dernier agent DeepSeek ne laisserait qu'une famille : la
-        relecture croisée (canon §2) exige d'en garder au moins deux."""
+    def test_the_last_review_family_is_kept(self):
+        """Moving the last DeepSeek agent would leave only one family:
+        cross-review (canon §2) requires keeping at least two."""
         cfg, _ = self._codex_a_3_pourcent()
         prop = self._marge(cfg, {"dev1": "deepseek"})
         self.assertEqual(prop.candidates, 1)
@@ -116,17 +116,17 @@ class MargeForfaitTest(_Base):
         self.assertEqual(prop.movable, 0)
         self.assertIn("forfait margin: no movable agent", prop.text())
 
-    def test_la_reserve_des_critiques_reste_hors_de_la_marge(self):
+    def test_the_critical_reserve_stays_out_of_the_margin(self):
         cfg, _ = self._codex_a_3_pourcent()
         prop = self._marge(cfg, {"dev1": "deepseek", "cx1": "codex"})
-        # 1/7 d'écoulé + 10 points − 10 points de réserve − 3 % utilisés
+        # 1/7 elapsed + 10 points − 10 points of reserve − 3% used
         self.assertAlmostEqual(prop.offers[0].free, 2 * (1 / 7 - 0.03), places=6)
         with mock.patch.object(accounts, "RESERVE", 0.0):
             sans = self._marge(cfg, {"dev1": "deepseek", "cx1": "codex"})
         self.assertAlmostEqual(sans.offers[0].free, 2 * (1 / 7 + 0.10 - 0.03), places=6)
         self.assertGreater(sans.offers[0].free, prop.offers[0].free)
 
-    def test_aucun_depassement_la_marge_porte_les_agents_annonces(self):
+    def test_no_overage_the_margin_carries_the_announced_agents(self):
         cfg, _ = self._codex_a_3_pourcent()
         prop = self._marge(cfg, {"dev1": "deepseek", "dev2": "deepseek",
                                  "dev3": "deepseek", "cx1": "codex"})
@@ -135,8 +135,8 @@ class MargeForfaitTest(_Base):
         self.assertLessEqual(prop.movable, sum(o.capacity for o in prop.offers))
         self.assertLessEqual(prop.movable, prop.candidates - prop.kept_for_review)
 
-    def test_sans_fenetre_longue_mesuree_aucune_promesse(self):
-        """Fenêtre courte seule et relevé absent : rien ne se promet."""
+    def test_without_a_measured_long_window_no_promise(self):
+        """Short window alone and no reading: nothing is promised."""
         comptes = {"codex": self._codex_comptes()}
         _codex_rollout(comptes["codex"][0]["path"], 0, self.now + 300 * 60)
         prop = self._marge(self._cfg(comptes), {"dev1": "deepseek", "cx1": "codex"})
@@ -144,7 +144,7 @@ class MargeForfaitTest(_Base):
         self.assertEqual(prop.movable, 0)
         self.assertIn("no movable agent", prop.text())
 
-    def test_aucun_agent_facture_au_token_rien_a_deplacer(self):
+    def test_no_usage_billed_agent_nothing_to_move(self):
         cfg, _ = self._codex_a_3_pourcent()
         prop = self._marge(cfg, {"cx1": "codex", "cx2": "codex"})
         self.assertEqual(prop.movable, 0)
@@ -152,9 +152,9 @@ class MargeForfaitTest(_Base):
         self.assertIn("forfait margin: no usage-billed agent to move",
                       self._marge(cfg, {}).text())
 
-    # -- le vivier et l'affichage -----------------------------------------
+    # -- the pool and the display -----------------------------------------
 
-    def test_seuls_les_agents_sous_bail_sont_deplacables(self):
+    def test_only_agents_under_lease_are_movable(self):
         self._agent_sous_bail("m1580-live", "deepseek")
         self.db.execute(
             "INSERT INTO agent_registry(name, harness, host) VALUES "
@@ -163,7 +163,7 @@ class MargeForfaitTest(_Base):
         self.assertEqual(fleet.get("m1580-live"), "deepseek")
         self.assertNotIn("m1580-mort", fleet)
 
-    def test_accounts_list_affiche_la_proposition(self):
+    def test_accounts_list_displays_the_proposal(self):
         cfg, _ = self._codex_a_3_pourcent()
         for name in ("m1580-a", "m1580-b"):
             self._agent_sous_bail(name, "deepseek")
@@ -176,7 +176,7 @@ class MargeForfaitTest(_Base):
         self.assertIn("forfait margin available: 1 movable agent(s) (codex 1)",
                       buf.getvalue())
 
-    def test_le_json_des_comptes_porte_la_proposition(self):
+    def test_the_accounts_json_carries_the_proposal(self):
         cfg, _ = self._codex_a_3_pourcent()
         self._agent_sous_bail("m1580-a", "deepseek")
         self._agent_sous_bail("m1580-cx", "codex")
@@ -186,13 +186,13 @@ class MargeForfaitTest(_Base):
             rc = mesh_cli.cmd_accounts(cfg, args)
         self.assertEqual(rc, 0)
         charge = json.loads(buf.getvalue())
-        self.assertEqual(charge["proposal"]["movable"], 0)   # dernière famille gardée
+        self.assertEqual(charge["proposal"]["movable"], 0)   # last family kept
 
 
 class GardesMargeTest(unittest.TestCase):
-    """Contre-exemples de relecture : aucun accès aux comptes ou à la base."""
+    """Review counter-examples: no access to accounts or the database."""
 
-    def test_un_compte_retenu_ou_un_releve_perime_ne_promet_rien(self):
+    def test_a_held_account_or_a_stale_reading_promises_nothing(self):
         now = 1_000_000.0
         profile = accounts.Profile("codex", "test", hourly_usd=1)
         fresh = cost.Gauge("codex", "long", 0.03, now + 6 * JOUR, 7 * JOUR)
@@ -219,17 +219,17 @@ class GardesMargeTest(unittest.TestCase):
                 else:
                     self.assertEqual((offer.free, offer.capacity, offer.accounts), (0, 0, ()))
 
-    def test_une_cle_api_ne_fournit_pas_de_marge_de_forfait(self):
+    def test_an_api_key_provides_no_forfait_margin(self):
         profile = accounts.Profile("codex", "api", kind="api_key_env")
         with mock.patch.object(accounts, "evaluate") as evaluate:
             offer = rebalance._offer([profile], [], 1_000_000, mock.Mock())
         evaluate.assert_not_called()
         self.assertEqual(offer.capacity, 0)
 
-    def test_l_usage_d_un_compte_ecarte_compte_dans_l_unite(self):
-        """#1789/N5 : un compte que la garde écarte (fenêtre courte au seuil)
-        garde ses agents ; son usage de la fenêtre longue entre donc dans
-        l'unité observée — sinon la capacité annoncée est trop grande."""
+    def test_the_usage_of_a_set_aside_account_counts_in_the_unit(self):
+        """#1789/N5: an account the guard sets aside (short window at the
+        threshold) keeps its agents; its long-window usage therefore enters
+        the observed unit — otherwise the announced capacity is too large."""
         now = 1_000_000.0
         sature = accounts.Profile("codex", "sature", path="/tmp/sature", hourly_usd=1)
         libre = accounts.Profile("codex", "libre", path="/tmp/libre", hourly_usd=1)
@@ -244,14 +244,14 @@ class GardesMargeTest(unittest.TestCase):
             next(name for name in gauges if name in kw["sessions"])]
         with mock.patch.object(accounts, "check", return_value=[]):
             offer = rebalance._offer([sature, libre], ["a", "b"], now, book)
-        # 0,95 + 0,03 sur deux agents : l'unité vaut 0,49 (et non le plancher
-        # de 5 %, qui annoncerait 2 agents portés au lieu d'aucun)
+        # 0.95 + 0.03 over two agents: the unit is 0.49 (and not the 5%
+        # floor, which would announce 2 agents carried instead of none)
         self.assertAlmostEqual(offer.unit, 0.49)
         self.assertEqual(offer.accounts, ("libre",))
         self.assertAlmostEqual(offer.free, 1 / 7 - 0.03)
         self.assertEqual(offer.capacity, int((1 / 7 - 0.03) / 0.49))
 
-    def test_les_critiques_de_roles_et_declaration_restant_dans_leur_famille(self):
+    def test_role_and_declaration_criticals_stay_in_their_family(self):
         from ameesh import auditor, registry, sous_utilisation
         cfg = SimpleNamespace(accounts={}, critical_agents=("config-critical",), host="test")
         fleet = {name: "deepseek" for name in
@@ -266,7 +266,7 @@ class GardesMargeTest(unittest.TestCase):
                                       fleet=fleet, critical=("explicit",))
         self.assertEqual((prop.candidates, prop.kept_for_review), (1, 0))
 
-    def test_un_bail_ne_rend_pas_un_agent_arrete_ou_externe_deplacable(self):
+    def test_a_lease_does_not_make_a_stopped_or_external_agent_movable(self):
         from ameesh import registry
         rows = [dict(name=name, harness="deepseek", lease_owner="r", lease_expires_ts=200,
                      status=status, mode=mode) for name, status, mode in
