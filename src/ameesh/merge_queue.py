@@ -290,7 +290,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
             raise QueueError("PR #%s is a draft: a light lot merges only from a "
                              "non-draft PR" % status.get("number"))
     if needs_commit_ci:
-        _required_ci(project, tip, commit_ci)
+        _required_ci(project, tip, commit_ci, branch=row["branch"])
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"), "class": klass.get("class"),
             "class_why": klass.get("why") or ""}
@@ -343,12 +343,12 @@ def _class_worse(candidate: dict, best: dict) -> bool:
     return bool(best.get("doubt")) and not candidate.get("doubt")
 
 
-def _required_ci(project, sha: str, commit_ci=None) -> None:
+def _required_ci(project, sha: str, commit_ci=None, *, branch: str | None = None) -> None:
     """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
     `sha` itself; QueueError otherwise (no run, running, red, unreadable)."""
     from . import plan_github, radar
     try:
-        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
         raise QueueError("project %s requires CI on the frozen commit (ci_required), "
                          "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
@@ -361,6 +361,10 @@ def _required_ci(project, sha: str, commit_ci=None) -> None:
     if runs["failed"]:
         raise QueueError("the CI on the frozen commit %s is red (%s)"
                          % (sha[:12], ", ".join(runs["failed"])))
+    if runs.get("missing"):
+        raise QueueError("the frozen commit %s carries no successful %s status: its "
+                         "required validation has not concluded (required_statuses)"
+                         % (sha[:12], " / ".join("%s*" % p for p in runs["missing"])))
     if not runs.get("green"):
         raise QueueError("the CI on the frozen commit %s is not green" % sha[:12])
 

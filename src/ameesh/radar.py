@@ -70,7 +70,7 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref", "generated", "ci_required", "protected")
+                "lease_ref", "generated", "ci_required", "protected", "required_statuses")
 #: #194 r6: where the lease of a target lives on the remote (local mode)
 LEASE_REF_DEFAULT = "refs/ameesh/land/"
 #: #194 r8: the only namespaces a lease ref may live in — never a branch that
@@ -141,6 +141,10 @@ class Project:
     path_gates: tuple = ()
     ci_required: bool = False
     protected: tuple = ()
+    #: #1748 (a): `((branch glob, context prefix), …)` — a PR head (or frozen
+    #: commit) of a matching branch is green only with at least one commit
+    #: status of that prefix in `success` (Nexlink: `integration/**` → `lot/`)
+    required_statuses: tuple = ()
 
 
 @dataclass
@@ -247,6 +251,12 @@ def parse_settings(raw) -> Settings:
         if not isinstance(protected, (list, tuple)) or not all(
                 isinstance(p, str) and p.strip() for p in protected):
             raise SettingsError("%s.protected: a list of target globs expected" % where)
+        required = value.get("required_statuses") or {}
+        if not isinstance(required, dict) or not all(
+                isinstance(g, str) and g.strip() and isinstance(p, str) and p.strip()
+                for g, p in required.items()):
+            raise SettingsError("%s.required_statuses: {\"branch glob\": \"context prefix\"} "
+                                "expected" % where)
         gates = always
         if land != "off" and not (gates or by_path):
             raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
@@ -276,7 +286,9 @@ def parse_settings(raw) -> Settings:
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
                                  ci_required=ci_required,
-                                 protected=tuple(p.strip() for p in protected))
+                                 protected=tuple(p.strip() for p in protected),
+                                 required_statuses=tuple((g.strip(), p.strip())
+                                                         for g, p in required.items()))
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -857,10 +869,38 @@ def github_slug(project: Project) -> str | None:
     return match.group(1) if match else None
 
 
-def ci_green(rollup) -> bool:
+def required_statuses(project, branch: str | None) -> tuple:
+    """#1748 (a): the commit status prefixes `branch` must carry in `success`
+    (`required_statuses` of the project). An unknown branch gets every
+    declared prefix: a doubt never lowers the gate."""
+    import fnmatch
+    declared = getattr(project, "required_statuses", ()) or ()
+    if branch is None:
+        return tuple(sorted({prefix for _, prefix in declared}))
+    name = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
+    return tuple(sorted({prefix for glob, prefix in declared
+                         if fnmatch.fnmatchcase(name, glob)}))
+
+
+def _status_success(contexts, required) -> list:
+    """The prefixes of `required` that no `success` context of `contexts`
+    (`(context, state)` pairs) carries."""
+    won = [c for c, state in contexts if (state or "").upper() == "SUCCESS"]
+    return [p for p in required if not any((c or "").startswith(p) for c in won)]
+
+
+def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
-    terminés sans échec."""
+    terminés sans échec. #1748 (a) : chaque préfixe de `required`
+    (`required_statuses`) doit en outre être porté par un statut de commit
+    (`StatusContext`, jamais un check run, dont le nom est libre) en
+    `success` — des checks `skipped` ou `success` seuls ne suffisent plus."""
     if not rollup:
+        return False
+    statuses = [(c.get("context"), c.get("state")) for c in rollup
+                if c.get("__typename") == "StatusContext"
+                or "state" in c and "conclusion" not in c]
+    if _status_success(statuses, required):
         return False
     for check in rollup:
         if check.get("__typename") == "StatusContext" or "state" in check \
@@ -900,7 +940,8 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
             return None
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
                 "head": rows[0].get("headRefOid"),
-                "green": ci_green(rows[0].get("statusCheckRollup")),
+                "green": ci_green(rows[0].get("statusCheckRollup"),
+                                  required_statuses(project, branch)),
                 "draft": bool(rows[0].get("isDraft"))}
     return status
 
@@ -909,7 +950,7 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
 CI_PASSING = ("success", "skipped", "neutral")
 
 
-def commit_ci(project: Project, sha: str, gh=None) -> dict:
+def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
     (Actions, external app checks and commit statuses), the latest activity
     of each workflow database ID: `{runs,
@@ -1014,8 +1055,11 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
         elif status.get("state") != "success":
             failed.append(status["context"])
     count = len(latest) + len(external) + len(statuses["statuses"])
-    return {"runs": count, "green": bool(count) and not pending and not failed,
-            "pending": sorted(pending), "failed": sorted(failed)}
+    # #1748 (a): the declared prefixes of `branch` need a `success` status
+    missing = _status_success([(s["context"], s.get("state")) for s in statuses["statuses"]],
+                              required_statuses(project, branch))
+    return {"runs": count, "green": bool(count) and not pending and not failed and not missing,
+            "pending": sorted(pending), "failed": sorted(failed), "missing": missing}
 
 
 def gates_for(project, files) -> tuple:

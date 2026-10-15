@@ -247,7 +247,7 @@ def _json(proc, what: str, kind):
     return data
 
 
-def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
+def pr_status(slug: str, branch: str, gh=_gh, *, project=None) -> dict | None:
     """The open PR of `branch`: `{number, head, base, ci: green|red|pending}`."""
     from . import radar
     proc = gh(["pr", "list", "--repo", slug, "--head", branch, "--state", "open", "--json",
@@ -258,9 +258,13 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
     if not rows:
         return None
     rollup = rows[0].get("statusCheckRollup") or []
+    required = radar.required_statuses(project, branch)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
-    ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
+    # #1748 (a): all green but a required status not yet published: the
+    # package validation is still to come, never a green
+    ci = "green" if radar.ci_green(rollup, required) else "pending" \
+        if pending or not rollup or radar.ci_green(rollup) else "red"
     return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
             "base": rows[0].get("baseRefName"), "ci": ci}
 
@@ -464,7 +468,8 @@ class _Landing:
     def required_ci(self):
         if getattr(self.project, "ci_required", False):
             try:
-                merge_queue._required_ci(self.project, self.row["frozen_sha"])
+                merge_queue._required_ci(self.project, self.row["frozen_sha"],
+                                         branch=self.row.get("branch"))
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "
                                   "ameesh work queue add %d." % self.lot)
@@ -675,7 +680,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             return {"lot": lot, "result": "retry", "error": resolutions._err(proc)}
         return landing.landed(merged, base)
     # land: pr — the merge commit goes to the lot branch, its CI decides
-    status = pr_status(slug, row["branch"], gh=gh) if slug else None
+    status = pr_status(slug, row["branch"], gh=gh, project=project) if slug else None
     if status is None:
         return landing.eject("no open PR for %s" % row["branch"],
                              "Open the PR, then ameesh work queue add %d." % lot)
@@ -754,7 +759,7 @@ def pr_view(slug: str, number, gh=_gh) -> dict:
 def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     branch = _branch_of(row["target"])
-    status = pr_status(slug, row["branch"], gh=gh) if slug else None
+    status = pr_status(slug, row["branch"], gh=gh, project=project) if slug else None
     if status is None and slug and row.get("landing_sha"):
         # #194 r8: merged since (a merge call that timed out, or between two
         # passes): checked like any merge of ameesh's, never ejected

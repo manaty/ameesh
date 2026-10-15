@@ -195,7 +195,7 @@ def _branch_name(target: str) -> str:
     return text
 
 
-def _pr_guards(view: dict, pr: int, head: str, target: str) -> None:
+def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> None:
     """Les gardes portées par la vue de la PR, rejouées avant toute écriture."""
     state = (view.get("state") or "").upper()
     if state != "OPEN":
@@ -215,7 +215,8 @@ def _pr_guards(view: dict, pr: int, head: str, target: str) -> None:
             "PR #%d is not mergeable now (mergeStateStatus %s): the direct path never "
             "weakens what the API checks — required checks, reviews or the base state "
             "must be settled first" % (pr, merge_state or "?"))
-    if not radar.ci_green(view.get("statusCheckRollup") or []):
+    required = radar.required_statuses(project, (view.get("headRefName") or "").strip() or None)
+    if not radar.ci_green(view.get("statusCheckRollup") or [], required):
         raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
                            % (pr, head[:12]))
 
@@ -244,7 +245,8 @@ def _admission(db, cfg, lot: int, repo: str, project, owner: str, view: dict) ->
             return None
         return {"number": view.get("number"), "url": view.get("url") or "",
                 "head": (view.get("headRefOid") or "").lower(),
-                "green": radar.ci_green(view.get("statusCheckRollup") or []),
+                "green": radar.ci_green(view.get("statusCheckRollup") or [],
+                                        radar.required_statuses(project, branch)),
                 "draft": bool(view.get("isDraft"))}
 
     clone = resolutions.Replayer(repo, owner)
@@ -537,7 +539,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                             owner=owner)
         if project is None:
             project = _project_of(cfg, repo)
-        _pr_guards(view, pr, head, target)
+        _pr_guards(view, pr, head, target, project)
         ready = _admission(db, cfg, lot, repo, project, owner, view)
         if not _same(ready.get("frozen_sha"), head):
             raise MergePrError("lot #%d is admitted on %s, not on the freeze %s: refreeze and "
@@ -622,7 +624,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # de la file et les deux refs distantes sont relues ; toute mutation
         # depuis la construction du commit de fusion arrête sans écrire.
         fresh = pr_view(slug, pr, gh=gh)
-        _pr_guards(fresh, pr, head, target)
+        _pr_guards(fresh, pr, head, target, project)
         ready = _admission(db, cfg, lot, repo, project, owner, fresh)
         if not _same(ready.get("frozen_sha"), head) \
                 or _branch_name(ready.get("target")) != _branch_name(target):
