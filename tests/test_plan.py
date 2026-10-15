@@ -961,6 +961,16 @@ class ContentMergeTest(_PlanDb):
         report = plan_git.sync_merges(self.db, self.repo, target="main", **kwargs)
         return {r["work_item"]: r for r in report["results"]}
 
+    def dependent(self, blocker_id: int, assignee: str = "dev-a") -> dict:
+        """Un dépendant assigné du lot : une fermeture refusée ne lui doit
+        aucun courrier (B1, R1 #1319)."""
+        from ameesh import work_dependencies
+        waiting = work.add(self.db, title="dépendant")
+        self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s",
+                        (assignee, waiting["id"]))
+        work_dependencies.add(self.db, waiting["id"], blocker_id, actor="test")
+        return waiting
+
     def test_nom_change_mais_gel_ancetre_de_la_cible(self):
         # gelé sur « revue-garde-acces », fusionné depuis « GARDE-ACCES » (commit de fusion)
         git(self.repo, "checkout", "-q", "-b", "revue-garde-acces")
@@ -980,6 +990,26 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual((ms["sha"], ms["actor"]), (sha, "git:main"))
         # idempotent
         self.assertEqual(self.run_sync(), {})
+
+    def test_le_releve_qui_ferme_le_bloqueur_reveille_le_dependant(self):
+        """L385 suite : la fermeture par contenu dépose le courrier du dépendant
+        — le relevé réel (`sync_merges`) est le chemin, pas seulement le CLI."""
+        from ameesh import mail, work_dependencies
+        git(self.repo, "checkout", "-q", "-b", "lot/bloqueur")
+        sha = self.commit("src/bloqueur.py", "b = 1\n", "bloqueur")
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", "fusion bloqueur", "lot/bloqueur")
+        blocker = self.frozen("bloqueur", sha)
+        waiting = work.add(self.db, title="dépendant")
+        self.db.execute("UPDATE work_items SET assignee = 'dev-a' WHERE id = %s",
+                        (waiting["id"],))
+        work_dependencies.add(self.db, waiting["id"], blocker["id"], actor="test")
+        self.assertEqual(self.run_sync()[blocker["id"]]["result"], "merged")
+        [row] = mail.unread(self.db, "dev-a")
+        self.assertEqual((row["kind"], row["recipient"]), ("event", "dev-a"))
+        self.assertIn("lot #%d is merged" % blocker["id"], row["body"])
+        self.assertEqual(mail.message_payload(row)["dependency"]["dependent"],
+                         waiting["id"])
 
     def test_rebase_cherry_pick_et_squash_par_patch_id(self):
         git(self.repo, "checkout", "-q", "-b", "lot/a")
@@ -1065,16 +1095,23 @@ class ContentMergeTest(_PlanDb):
 
     def test_nouveau_gel_concurrent_empeche_la_fermeture(self):
         """La fermeture est conditionnée au gel examiné (P2-1, course)."""
+        from ameesh import mail
         git(self.repo, "checkout", "-q", "-b", "lot/y")
         sha = self.commit("src/y.py", "y=1\n", "y")
         git(self.repo, "checkout", "-q", "main")
         git(self.repo, "merge", "-q", "--ff-only", "lot/y")
         item = self.frozen("y", sha)
+        self.dependent(item["id"])
         examined = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "frozen"][0]
         work.milestone(self.db, item["id"], "frozen", sha="d" * 40, actor="ouvrier")
         done = work.close_merged(self.db, item["id"], sha=sha, frozen_id=int(examined["id"]))
         self.assertEqual(done["result"], "refrozen")
+        # B1 (R1 #1319) : le refus ne doit laisser AUCUNE trace committée —
+        # ni état, ni jalon, ni courrier — même sous la transaction englobante.
         self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+        self.assertEqual([m["kind"] for m in work.milestones(self.db, item["id"])
+                          if m["kind"] == "merged"], [])
+        self.assertEqual(mail.unread(self.db, "dev-a"), [])
 
     def _wait_lock(self, needle: str) -> None:
         """Attend qu'une autre connexion soit RÉELLEMENT bloquée sur un verrou."""
@@ -1097,6 +1134,7 @@ class ContentMergeTest(_PlanDb):
         git(self.repo, "checkout", "-q", "main")
         git(self.repo, "merge", "-q", "--ff-only", "lot/course")
         item = self.frozen("course", sha)
+        self.dependent(item["id"])
         examined = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "frozen"][0]
         blocker, closer = db_mod.connect(self.cfg), db_mod.connect(self.cfg)
         result, errors = [], []
@@ -1114,16 +1152,19 @@ class ContentMergeTest(_PlanDb):
                 tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                          (item["id"],))
                 thread.start()
-                self._wait_lock("SET state = 'merged'")
+                self._wait_lock("FOR UPDATE")
                 tx.query("INSERT INTO work_item_milestones (work_item_id, kind, sha)"
                          " VALUES (%s, 'frozen', %s) RETURNING id", (item["id"], "d" * 40))
             thread.join(10)
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(result[0]["result"], "refrozen", result)
+            # B1 (R1 #1319) : refus = rien de committé (état, jalon, courrier).
+            from ameesh import mail
             self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
             self.assertEqual([m["kind"] for m in work.milestones(self.db, item["id"])
                               if m["kind"] == "merged"], [])
+            self.assertEqual(mail.unread(self.db, "dev-a"), [])
         finally:
             thread.join(10)
             blocker.close()
