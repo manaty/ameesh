@@ -88,7 +88,7 @@ def git_runner_for(head: str = A, ls_remote: str = "", ignored: bool = False):
             return _Proc(0 if ignored else 1, "")
         if "ls-remote" in argv:
             return _Proc(0, ls_remote)
-        if "show" in argv:
+        if "cat-file" in argv:
             return _Proc(1, "")
         return _Proc(0, "")
     return run
@@ -504,6 +504,18 @@ class CommitContentTest(unittest.TestCase):
         with self.assertRaises(pv.PrevalidationError) as caught:
             self._validate(plan_canon(head=self.head), contracts=("untracked.txt",))
         self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.transport.assert_not_called()
+
+    def test_contrat_repertoire_au_sha_refuse(self):
+        os.makedirs(os.path.join(self.repo, "dir"))
+        self._write("dir/test_x.txt", "test_cluster\n")
+        self._git("add", "dir")
+        self._git("commit", "-qm", "dir")
+        self.head = self._git("rev-parse", "HEAD")
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            self._validate(plan_canon(head=self.head), contracts=("dir",))
+        self.assertEqual(caught.exception.cause, "selection-unsafe")
+        self.assertIn("illisible", caught.exception.why)
         self.transport.assert_not_called()
 
     def test_plan_ne_remplace_pas_un_fichier_du_sha_meme_retire_de_l_index(self):

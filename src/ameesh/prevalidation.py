@@ -598,7 +598,9 @@ def contract_modules(paths, repo: str = "", *, head: str = "",
     for path in paths or ():
         full = os.path.join(repo, str(path)) if repo else str(path)
         if head:
-            proc = runner(["git", "-C", repo or ".", "show", "%s:%s" % (head, path)],
+            # `cat-file blob` : contenu brut d'un fichier, un répertoire refuse
+            # (`show` listerait l'arbre et en ferait des modules)
+            proc = runner(["git", "-C", repo or ".", "cat-file", "blob", "%s:%s" % (head, path)],
                           capture_output=True, text=True)
             if getattr(proc, "returncode", 1):
                 return (), "contrat déclaré illisible au SHA candidat: %s" % path
