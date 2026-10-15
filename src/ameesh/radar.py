@@ -875,9 +875,14 @@ def required_statuses(project, branch: str | None) -> tuple:
     declared prefix: a doubt never lowers the gate."""
     import fnmatch
     declared = getattr(project, "required_statuses", ()) or ()
-    if branch is None:
+    name = (branch or "").strip()
+    # Match the same branch aliases that merge_queue.fetch_fresh resolves.
+    for ref_prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(ref_prefix):
+            name = name[len(ref_prefix):]
+            break
+    if not name:
         return tuple(sorted({prefix for _, prefix in declared}))
-    name = branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else branch
     return tuple(sorted({prefix for glob, prefix in declared
                          if fnmatch.fnmatchcase(name, glob)}))
 

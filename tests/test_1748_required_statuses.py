@@ -58,6 +58,11 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(radar.required_statuses(None, None), ())
         self.assertEqual(radar.required_statuses(radar.Project("p", "/r"), None), ())
 
+    def test_empty_unknown_branch_keeps_required_prefixes(self):
+        for branch in ("", " ", "refs/heads/", "refs/remotes/origin/", "origin/"):
+            with self.subTest(branch=branch):
+                self.assertEqual(radar.required_statuses(PROJECT, branch), ("lot/",))
+
 
 class RollupTest(unittest.TestCase):
     required = ("lot/",)
@@ -100,6 +105,21 @@ class PrStatusTest(unittest.TestCase):
 
 
 class CommitCiTest(unittest.TestCase):
+    def test_remote_branch_aliases_cannot_bypass_queue_validation(self):
+        for prefix in ("origin/", "refs/remotes/origin/", "refs/heads/"):
+            with self.subTest(prefix=prefix):
+                branch = prefix + "integration/paquet-9"
+                gh = _Gh([_run("Package suites awaiting main")])
+                reader = lambda sha: radar.commit_ci(PROJECT, sha, gh=gh, branch=branch)
+                with self.assertRaisesRegex(merge_queue.QueueError, "no successful lot/"):
+                    merge_queue._required_ci(PROJECT, SHA, reader, branch=branch)
+                gh.statuses = [{"context": "lot/docs-gate", "state": "success"}]
+                merge_queue._required_ci(PROJECT, SHA, reader, branch=branch)
+                for state in ("pending", "failure"):
+                    gh.statuses[0]["state"] = state
+                    with self.assertRaises(merge_queue.QueueError):
+                        merge_queue._required_ci(PROJECT, SHA, reader, branch=branch)
+
     def test_runs_alone_do_not_certify_a_package(self):
         gh = _Gh([_run("Package suites awaiting main"), _run("x", conclusion="skipped")])
         out = radar.commit_ci(PROJECT, SHA, gh=gh, branch="integration/paquet-9")

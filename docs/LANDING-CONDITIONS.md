@@ -81,7 +81,9 @@ one classic commit status with that prefix is `success`; the other checks
 still apply. Only a commit status counts (a check run's name is free text),
 and an unknown branch gets every declared prefix. It applies wherever the PR
 rollup or the frozen commit is read: queue admission, landing, and
-`ameesh work merge-pr`. A head whose checks are all green but whose required
+`ameesh work merge-pr`. Bare branch names and their `origin/`, `refs/heads/`
+and `refs/remotes/origin/` aliases receive the same requirements.
+A head whose checks are all green but whose required
 status is not yet published reads `pending`, never green. Nexlink declares
 `{"integration/**": "lot/"}`: a package is validated by its `lot/<suite>`
 statuses, so a package bootstrapper that ends with `success` and `skipped`
