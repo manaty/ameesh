@@ -1017,6 +1017,38 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual(plan._imported_files(nested, "tests/test_a.py", known,
                                               guaranteed=True), {"src/ameesh/db.py"})
 
+    def test_exit_expressions_stop_proofs_before_class_body_and_after_assert(self):
+        # #1474 : les bases et décorateurs s'évaluent avant le corps de classe ;
+        # une sortie dans un assert s'exécute aussi, même sans assert faux.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import sys\nclass C(sys.exit(1)):\n    import ameesh.db\n",
+            "@exit()\nclass C:\n    import ameesh.db\n",
+            "import os as o\nclass C(metaclass=o._exit(1)):\n    import ameesh.db\n",
+            "from sys import exit as bye\nassert bye(1)\nimport ameesh.db\n",
+            "import os\nassert os._exit(1)\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+
+    def test_exit_expressions_keep_prior_dead_and_deferred_proofs(self):
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "import ameesh.db\nclass C(exit()):\n    pass\n",
+            "if False:\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def factory():\n    class C(exit()):\n        pass\nimport ameesh.db\n",
+            "def unused():\n    assert quit()\nimport ameesh.db\n",
+            "class C:\n    import ameesh.db\n    quit()\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
     def test_reassigned_exit_symbols_stay_conservative(self):
         # #1474 : un symbole de terminaison réaffecté (`sys = ...`, puis un
         # `bye = ...` sur un nom importé de sys/os) n'est pas suivi — la

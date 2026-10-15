@@ -462,10 +462,8 @@ class _RuntimeImports(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         self.generic_visit(node)
-        func = node.func
-        if (not self._deferred and not self._guarded
-                and isinstance(func, ast.Attribute) and func.attr == "exit"
-                and isinstance(func.value, ast.Name) and func.value.id == "sys"):
+        if not self._deferred and _is_exit_call(
+                node, self._exit_names, self._sys_names, self._os_names):
             self._terminated = True
 
     def visit_If(self, node: ast.If) -> None:
@@ -489,7 +487,11 @@ class _RuntimeImports(ast.NodeVisitor):
         self._visit_body(node.body)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        # décorateurs et bases ne portent aucun import : le corps seul compte
+        # Ces expressions s'évaluent avant le corps : une sortie y interdit
+        # aussi de certifier les imports du corps, pas seulement ceux d'après.
+        for expression in (*node.decorator_list, *node.bases,
+                           *(keyword.value for keyword in node.keywords)):
+            self.visit(expression)
         self._visit_body(node.body)
 
     def _record(self, node: ast.stmt) -> None:
