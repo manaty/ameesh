@@ -262,7 +262,11 @@ class LotIllisibleTest(_Base):
         self.age(1.5 * HEURE)                           # lot sain, en retard
         sain = work.add(self.db, title="un autre lot SLO", assignee="dev1")
         self.age(1.5 * HEURE, lot=sain)
-        malsain = work.add(self.db, title="lot illisible", assignee="dev1")
+        # #540 : dev1 a déjà un lot non démarré, un second irait à la file
+        # d'équipe (sans assigné) ; le lot illisible a donc son propre agent,
+        # pour vérifier que le signal va bien à l'assigné.
+        registry.upsert(self.db, "dev3", harness="claude", host=self.cfg.host)
+        malsain = work.add(self.db, title="lot illisible", assignee="dev3")
         self.age(1.5 * HEURE, lot=malsain)
 
         with mock.patch.object(progress, "_work_item_milestones",
@@ -274,7 +278,7 @@ class LotIllisibleTest(_Base):
         signaux = [a for a in alerts if a["type"] == "slo_unreadable"]
         self.assertEqual(sains, {self.lot["id"], sain["id"]})
         self.assertEqual([a["lot"] for a in signaux], [malsain["id"]])
-        self.assertEqual(signaux[0]["agent"], "dev1")
+        self.assertEqual(signaux[0]["agent"], "dev3")
         self.assertIn("ValueError", signaux[0]["detail"])
         self.assertIn("pas-un-instant", signaux[0]["detail"])
         # un type d'alerte non enregistré ferait tomber le tri d'`alerts()`
