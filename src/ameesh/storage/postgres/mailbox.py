@@ -22,7 +22,7 @@ PROJECT_SQL = (
     " FROM agent_registry r WHERE r.name = %s")
 
 MAIL_COLUMNS = """
-    id, sender, recipient, body, kind, payload, status, host, work_item_id,
+    id, sender, recipient, body, kind, payload, status, host,
     signature, signature_key, signed_payload, nonce,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from delivered_at)::float8 as delivered_ts,

@@ -321,9 +321,7 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def clear_session(self, name: str, owner: str, epoch: int) -> bool:
-        """Oublie la session, fencé par un bail valide ; l'oubli est durable
-        (`session_reset_at` posé dans la même écriture), pour qu'un fichier
-        local non retiré ne ressuscite pas la session (#794)."""
+        """Oublie la session, fencé par un bail valide."""
 
     @abc.abstractmethod
     def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
@@ -861,8 +859,7 @@ class Mailbox(Domain):
 
     @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
-        """Messages non remis, du plus ancien au plus récent, avec leur lot
-        (`work_item_id`, #794 : le brief d'un lot ne montre que son fil)."""
+        """Messages non remis, du plus ancien au plus récent."""
 
     @abc.abstractmethod
     def unread_active(self, recipient: str, limit: int) -> list[dict]:
@@ -3106,11 +3103,7 @@ class LotSessions(Domain):
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
-        sont plus assignés à leur agent ; rend les lignes supprimées. Ne touche
-        pas au registre : la session ACTIVE d'un lot fini est fermée par
-        l'agent qui la détient, à son tour suivant, sous son bail (#794,
-        revue Claude B1 : ce balayage n'a pas le bail et peut tomber en plein
-        tour)."""
+        sont plus assignés à leur agent ; rend les lignes supprimées."""
 
 
 # --------------------------------------------------------------------------
