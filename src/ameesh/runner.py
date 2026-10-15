@@ -4064,6 +4064,20 @@ class AgentWorker(threading.Thread):
             self._workdir_missing(force_status=True)
             return False
 
+        # #896 : l'identité du tour vient du bail (#834), jamais du dépôt. Un
+        # `user.name` laissé dans le `.git/config` partagé signerait les
+        # commits lancés hors harnais depuis ce dossier (incident du
+        # 13/10/2026) : on le signale, sans bloquer le tour ni corriger la
+        # configuration à la place de son auteur.
+        partagee = identity.repo_config_identity(cwd)
+        if partagee and partagee.get("user.name", "") not in ("", self.name):
+            log("[%s] shared git identity in %s (%s): the turn signs %s <%s>; "
+                "remove user.* from the shared .git/config"
+                % (self.name, cwd,
+                   ", ".join("%s=%s" % (cle, val)
+                             for cle, val in sorted(partagee.items())),
+                   self.name, "%s@%s" % (self.name, identity.GIT_EMAIL_DOMAIN)))
+
         env = os.environ.copy()
         env.update(adapter.env())
         # Decision 0029 disables native account memory for managed sessions.
