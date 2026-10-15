@@ -529,8 +529,8 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     y rendre une frontière fausse, et le delta d'une branche contiendrait
     alors les migrations de la cible (#1333).
 
-    `reservations` : `branches -> liste`, appelé quand les entrées portent
-    encore `added` (les migrations ajoutées par un lot) ; seul son résultat
+    `reservations` : `branches -> liste`, appelé sur les cibles certifiées
+    quand les entrées portent encore `added` (les migrations ajoutées par un lot) ; seul son résultat
     entre au rapport, `added` ne sort jamais dans le journal (#1335)."""
     cache = cache if cache is not None else Cache()
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
@@ -658,7 +658,8 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     if migrations and shallow:
         report["migration_probe"] = "suspended: shallow repository (history is incomplete)"
     if reservations is not None:
-        report["unreserved_migrations"] = reservations(branches)
+        report["unreserved_migrations"] = reservations(
+            [b for b in branches if b.get("target_certified", True)])
     return report
 
 
