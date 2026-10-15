@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, cost, db as db_mod, registry
+from ameesh import adapters, cost, db as db_mod, registry, work
 from ameesh.adapters import adapter_for
 from ameesh.runner import AgentWorker, Runner
 
@@ -316,6 +316,33 @@ class BudgetGateTest(PgTestCase):
         self.assertFalse(worker3.budget_ok())
         self.assertIsNotNone(registry.pending_spend_get(self.db, "budget"))
 
+    def test_marqueur_porte_le_lot_et_la_reparation_le_garde(self):
+        """#796 : le lot et l'identifiant du tour partent avec le marqueur
+        comptable, et la ligne écrite par la réparation d'un autre worker —
+        après une panne — garde l'attribution, l'instant de début et le lien
+        vers les ressources du tour."""
+        runner, worker = self._worker(plafond=10.0, harness="deepseek")
+        lot = int(work.add(self.db, title="attribué")["id"])
+        self.assertTrue(worker._compta_marque(0, "tour", "", work_item_id=str(lot),
+                                              turn_id="tour-796"))
+        marqueur = registry.pending_spend_get(self.db, "budget")
+        self.assertEqual(int(marqueur["work_item_id"]), lot)
+        self.assertEqual(marqueur["turn_id"], "tour-796")
+        # un autre worker répare (même bail, autre session)
+        worker2 = AgentWorker(runner, registry.get(self.db, "budget"), {
+            "lease_epoch": worker.epoch,
+            "lease_expires_ts": time.time() + 3600,
+        })
+        worker2._compta_termine()
+        ligne = self.db.query(
+            "select work_item_id, turn_id,"
+            " extract(epoch from started_at)::float8 as start_ts"
+            " from turn_costs where agent = 'budget' order by id desc limit 1")[0]
+        self.assertEqual((ligne["work_item_id"], ligne["turn_id"]), (lot, "tour-796"))
+        self.assertAlmostEqual(ligne["start_ts"], marqueur["created_ts"], places=3)
+        self.assertIsNone(registry.pending_spend_get(self.db, "budget"))
+        worker.watchdog_stop.set()
+
     def test_marqueur_non_pose_refuse_le_tour(self):
         """Verdict L13 B5 : si la trace comptable ne peut pas être posée en
         base, le tour ne démarre pas (aucune dépense à l'aveugle)."""
@@ -323,7 +350,7 @@ class BudgetGateTest(PgTestCase):
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
         try:
             with mock.patch.dict(os.environ, env, clear=False), \
-                    mock.patch("ameesh.registry.pending_spend_put",
+                    mock.patch("ameesh.registry.pending_spend_begin",
                                side_effect=db_mod.DbError("base indisponible")):
                 self.assertFalse(worker.run_turn(
                     {"kind": "prompt", "prompt": "tour", "ids": []}))
@@ -379,6 +406,11 @@ class AnnouncedModelTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
+        # #513 : ces tours passent à l'heure réelle ; le prix creux est testé
+        # par test_l513_deepseek_offpeak, ici on facture toujours la pointe
+        periods = mock.patch.dict(cost.PRICE_PERIODS, clear=True)
+        periods.start()
+        self.addCleanup(periods.stop)
         self.name = "annonce"
         self.db.execute("DELETE FROM turn_costs")
         self.db.execute("DELETE FROM spend_pending WHERE agent = %s", (self.name,))

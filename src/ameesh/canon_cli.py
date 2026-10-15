@@ -53,6 +53,14 @@ confiance configurée d'un canon qui n'est pas le canon par défaut est la `ref`
 de SON entrée `canons` (AMEESH_CANONS n'en donne pas : amorçage par
 `canon sync --canon <id> --bootstrap-ref BRANCHE`). `--bootstrap-ref` ne sert
 qu'aux canons dont le registre n'est pas encore amorcé.
+
+L814 : le journal des authentificateurs est unique par canon, tous hôtes
+confondus. Avant de juger, `canon sync` (et la passe de l'exécuteur) rattrape
+le clone de l'hôte : quand un dernier commit appliqué est inconnu du dépôt,
+les dépôts du canon sont fetchés et le canon relu ; le checkout du clone
+canonique est ensuite avancé à la révision lue (fast-forward seulement). Un
+checkout qui ne peut pas la contenir (clone divergé, modifications locales)
+fait refuser l'écriture des authentificateurs — registre inchangé.
 """
 from __future__ import annotations
 

@@ -82,8 +82,8 @@ class RepartitionTest(_Base):
         self.assertEqual(choice.profile.name, "secondaire")
         self.assertEqual(choice.switched["from"], "primaire")
         self.assertEqual(choice.why,
-                         "no reading: 0% used, furthest behind its pace; "
-                         "ahead of: tertiaire no reading: 0% used, primaire "
+                         "no reading: unverified, tried first (L117); "
+                         "ahead of: tertiaire no reading: unverified, primaire "
                          "codex-10080min 35% used (pace 55%)")
         # la bascule en base porte la même raison
         self.assertEqual(self.db.query("SELECT reason FROM account_switches")[0]["reason"],
@@ -92,8 +92,8 @@ class RepartitionTest(_Base):
         cfg = mock.Mock(host=self.cfg.host, accounts={"codex": self.declared})
         rows = accounts.report(cfg, self.db, self._book(), now=now, record=False)
         self.assertEqual([r["account"] for r in rows if r["next"]], ["secondaire"])
-        self.assertIn("↳ next choice for a new session: no reading: 0% "
-                      "used, furthest behind its pace; ahead of: tertiaire",
+        self.assertIn("↳ next choice for a new session: no reading: unverified, "
+                      "tried first (L117); ahead of: tertiaire",
                       accounts.format_rows(rows))
 
     def test_spread_over_successive_new_sessions(self):
@@ -216,8 +216,8 @@ class RangSansBaseTest(unittest.TestCase):
         self.assertEqual([p.name for p in accounts.rank(items, evaluations, now)],
                          ["secondaire", "tertiaire", "primaire"])
         self.assertEqual(accounts.reason_of(accounts.rank(items, evaluations, now), evaluations, now),
-                         "no reading: 0% used, furthest behind its pace; "
-                         "ahead of: tertiaire no reading: 0% used, primaire seven_day "
+                         "no reading: unverified, tried first (L117); "
+                         "ahead of: tertiaire no reading: unverified, primaire seven_day "
                          "35% used (pace 55%)")
 
     def test_expired_reading_counts_as_zero(self):

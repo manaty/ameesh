@@ -358,6 +358,62 @@ class ReservationTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             self._am(a)
 
+    def test_la_fusion_libere_la_reservation(self):
+        """#956 : le lot fusionné ne tient plus son numéro ; le suivant peut le
+        reprendre (le fichier, lui, le protège toujours)."""
+        a, b = self._lot("a"), self._lot("b", n=2)
+        number = self._am(a, 9101)["migration"]
+        got = work.merged(self.db, a["id"], sha="deadbeef", actor="dev1")
+        self.assertEqual(got["result"], "merged")
+        self.assertIsNone(got["item"]["migration"])
+        item = work.get(self.db, a["id"])
+        self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
+        self.assertIn("migration 9101 released (fusion, #956)",
+                      [e["note"] for e in work.events(self.db, a["id"])])
+        self.assertEqual(self._am(b, number)["migration"], number)
+
+    def test_le_passage_terminal_par_move_libere_la_reservation(self):
+        """#956 : le chemin `work move` vers merged (et promoted) libère aussi."""
+        a = self._lot("move", n=3)
+        number = self._am(a, 9102)["migration"]
+        for state in ("build", "qa", "merged"):
+            work.move(self.db, a["id"], state, actor="dev1")
+        self.assertIsNone(work.get(self.db, a["id"])["migration"])
+        self.assertEqual(self._am(self._lot("suivant", n=4), number)["migration"], number)
+
+    def test_la_cloture_libere_la_reservation(self):
+        a = self._lot("ferme", n=5)
+        number = self._am(a, 9103)["migration"]
+        work.close(self.db, a["id"], abandoned=True, actor="dev1")
+        item = work.get(self.db, a["id"])
+        self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
+        self.assertEqual(self._am(self._lot("apres", n=6), number)["migration"], number)
+
+    def test_reservation_heritee_d_un_lot_terminal(self):
+        """#956 : une réservation posée avant le correctif sur un lot terminal
+        (cas #850) ne bloque plus : la réservation suivante la libère dans sa
+        transaction, avec sa ligne de journal."""
+        old = self._lot("ancien", "manaty/nexlink", 169)
+        work.close(self.db, old["id"], abandoned=True, actor="dev1")
+        # état d'avant le correctif : le lot terminal garde son numéro
+        self.db.execute("UPDATE work_items SET migration = 9401 WHERE id = %d" % old["id"])
+        self.assertEqual(work.get(self.db, old["id"])["migration_repo"], "manaty/nexlink")
+        self.assertIsNone(pg_work.WorkItems(self.db).migration_holder(9401, "manaty/nexlink"))
+        new = self._lot("nouveau", "manaty/nexlink", 170)
+        self.assertEqual(self._nx(new, 9401)["migration"], 9401)
+        self.assertIsNone(work.get(self.db, old["id"])["migration"])
+        notes = " ".join(e["note"] for e in work.events(self.db, old["id"]))
+        self.assertIn("migration 9401 released (lot %d closed, #956)" % old["id"], notes)
+
+    def test_liberer_la_reservation_d_un_lot_terminal(self):
+        """#956 : `--release` marche encore sur un lot déjà terminal (héritage)."""
+        old = self._lot("tardif", n=7)
+        self._am(old, 9104)
+        work.close(self.db, old["id"], abandoned=True, actor="dev1")
+        self.db.execute("UPDATE work_items SET migration = 9104 WHERE id = %d" % old["id"])
+        released = work.reserve_migration(self.db, old["id"], release=True, actor="dev1")
+        self.assertIsNone(released["migration"])
+
     def test_cli(self):
         a = self._lot()
         proc = self.mesh("work", "migration", str(a["id"]), "--number", "9200",

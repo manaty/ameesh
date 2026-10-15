@@ -127,7 +127,8 @@ class DemandeTest(_Base):
         self.db.execute("UPDATE agent_registry SET responsible = NULL WHERE name = 'orch'")
         self.db.execute("UPDATE agent_registry SET responsible = %s WHERE name = 'dev1'",
                         ("human:carol",))
-        troisieme = work.add(self.db, title="troisième", assignee="dev1")
+        troisieme = work.add(self.db, title="troisième", assignee="dev1",
+                             force="test: second lot of dev1 not started (#540)")
         self.assertEqual(self.ask(lot=str(troisieme["id"]))["owner"], "human:carol")
         # 4. personne : tout humain du mesh
         self.db.execute("UPDATE agent_registry SET responsible = NULL")
