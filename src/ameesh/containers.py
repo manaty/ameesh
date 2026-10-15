@@ -133,10 +133,17 @@ class Runtime:
         self._labels[turn_id] = [c["id"] for c in out]
         return out
 
-    def list_all(self) -> list[dict] | None:
+    def list_all(self, stopped: bool = False) -> list[dict] | None:
         """Tous les conteneurs EN COURS (L73, lecture seule) : `id`, `name`,
-        `image`, `created`, `labels` ; None si le moteur ne répond pas."""
-        argv = self._argv("ps", "--no-trunc", "--format", "{{json .}}")
+        `image`, `created`, `status`, `labels` ; None si le moteur ne répond
+        pas.
+
+        `stopped=True` (#1411) : aussi ceux qui ne tournent plus (`ps -a`) —
+        un conteneur étiqueté sorti ou jamais démarré ne consomme plus de
+        processus, mais retient sa couche et ses volumes anonymes ; sans `-a`
+        il restait invisible du ménage comme de la mesure."""
+        argv = self._argv("ps", "--no-trunc", *(["-a"] if stopped else []),
+                          "--format", "{{json .}}")
         try:
             proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
         except (OSError, subprocess.SubprocessError):

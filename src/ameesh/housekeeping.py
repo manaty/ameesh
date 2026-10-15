@@ -2780,13 +2780,22 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     s'ils portent `ameesh.lot`, une fois le lot fini ; les autres sont
     seulement signalés, avec la commande proposée.
 
+    #1411 : le relevé couvre aussi les conteneurs ARRÊTÉS (`ps -a`) — un
+    conteneur étiqueté sorti ou jamais démarré ne consomme plus de
+    processus, mais retient sa couche et ses volumes anonymes, et restait
+    invisible du ménage comme de la mesure. Une base de test d'un lot ENCORE
+    OUVERT reste gardée jusqu'à la fin du lot (L73) : une photographie de
+    l'état des tours ne prouve pas l'absence d'usage d'un hôte entier, et
+    rien ne l'exclut d'un démarrage de tour qui suivrait le constat (R1
+    #1411). On ne détruit donc pas sur cette photographie.
+
     Un conteneur étiqueté par un tour INCONNU de cette base, ou d'un autre
     hôte, n'est pas supprimé (signalé). Rend `{entries, plan, ameesh,
     others}` ; `ameesh`/`others` à None si le moteur ne répond pas."""
     out: dict = {"entries": [], "plan": [], "ameesh": None, "others": None}
     if runtime is None:
         return out
-    rows = runtime.list_all()
+    rows = runtime.list_all(stopped=True)
     if rows is None:
         return out
     binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")

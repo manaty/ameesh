@@ -316,12 +316,17 @@ class WorktreeEtatTest(_Tmp):
 class _FauxMoteur:
     binary = "/usr/bin/docker"
 
-    def __init__(self, rows):
+    def __init__(self, rows, running=None):
         self.rows = rows
+        #: ids considérés EN COURS (`ps` sans `-a`) ; None : tous le sont
+        self.running = running
         self.removed: list[str] = []
 
-    def list_all(self):
-        return [dict(r) for r in self.rows if r["id"] not in self.removed]
+    def list_all(self, stopped=False):
+        out = [dict(r) for r in self.rows if r["id"] not in self.removed]
+        if not stopped and self.running is not None:
+            out = [r for r in out if r["id"] in self.running]
+        return out
 
     def remove(self, ident):
         self.removed.append(ident)
@@ -641,6 +646,56 @@ class MenageDbTest(PgTestCase):
         seul = menage.reap_containers(moteur, self.db, "pc", only_turn="encours")
         self.assertEqual(seul["entries"], [])
         self.assertIsNone(seul["others"])
+
+    def test_conteneurs_arretes_visibles_et_base_de_lot_gardee(self):
+        """#1411 : `ps -a` rend visibles les conteneurs arrêtés (récoltés ou
+        signalés) ; une base de lot ENCORE OUVERT reste gardée jusqu'à sa fin.
+        Repli borné après la R1 : pas de destruction sur la photographie des
+        tours, faute d'exclusion commune avec le démarrage d'un tour."""
+        turns = storage.of(self.db).turn_resources
+        for tid in ("fini", "encours"):
+            turns.open_turn(tid, "a1", "pc", pgid=None, label=None)
+        turns.close_turn("fini", orphan=True)
+        ouvert, ferme = self._lot("ouvert"), self._lot("ferme")
+        work.close(self.db, ferme, abandoned=True)
+
+        def c(ident, status="Up", **labels):
+            return {"id": ident, "name": "c-" + ident, "image": "postgres",
+                    "status": status, "labels": labels}
+
+        moteur = _FauxMoteur([
+            # arrêté, tour fini, sans lot : récolté (invisible avant #1411)
+            c("8", status="Exited (137) 2 days ago",
+              **{"ameesh.turn": "fini", "ameesh.agent": "a1"}),
+            # arrêté, base d'un lot OUVERT : gardé jusqu'à la fin du lot
+            c("9", status="Created", **{"ameesh.turn": "fini", "ameesh.agent": "a1",
+                                        "ameesh.lot": str(ouvert)}),
+            # arrêté, hors tour : signalé, jamais supprimé
+            c("10", status="Exited (0) 3 h ago"),
+            # en cours, lot ouvert et tour vivant : attend
+            c("11", status="Up", **{"ameesh.turn": "encours", "ameesh.agent": "a1",
+                                    "ameesh.lot": str(ouvert)}),
+            # en cours, tour fini et lot fermé : récolté
+            c("12", status="Up", **{"ameesh.turn": "fini", "ameesh.agent": "a1",
+                                    "ameesh.lot": str(ferme)}),
+        ], running={"11", "12"})
+        essai = menage.reap_containers(moteur, self.db, "pc", dry_run=True)
+        self.assertEqual(moteur.removed, [])
+        self.assertEqual({p["path"] for p in essai["plan"] if p["action"] == "suppression"},
+                         {"c-8", "c-12"})
+        self.assertEqual({o["path"]: o["action"] for o in essai["ameesh"]},
+                         {"c-8": "suppression", "c-9": "attend",
+                          "c-11": "attend", "c-12": "suppression"})
+        # la base du lot ouvert attend sa fin, quoi qu'en dise la photographie
+        self.assertEqual("lot #%s intake" % ouvert,
+                         [o["detail"] for o in essai["ameesh"]
+                          if o["path"] == "c-9"][0])
+        # le conteneur arrêté hors tour est vu et signalé, avec sa commande
+        self.assertEqual([o["command"] for o in essai["others"]], ["docker rm -f c-10"])
+        self.assertEqual(essai["others"][0]["status"], "Exited (0) 3 h ago")
+        # réalisation : le tour fini sans lot et la base du lot fermé partent
+        menage.reap_containers(moteur, self.db, "pc")
+        self.assertEqual(sorted(moteur.removed), ["12", "8"])
 
     def _lecture(self, used: float) -> None:
         storage.of(self.db).hosts.record({
