@@ -2397,6 +2397,22 @@ class WorkflowTest(unittest.TestCase):
             self.assertNotIn("github.head_ref", body)
         self.assertEqual([], _branch_ref_escapes(self.text))
 
+    def test_fs_class_lane_follows_the_plan_release_output(self):
+        # #748 / #1247 R2 : le job « autre système de fichiers » ne rejoue la
+        # suite que pour une release (source ou cible `release/**`) ou à la
+        # main ; son `if:` lit l'output `release` du plan — posé par un step
+        # qui reçoit les branches par `env:` — et n'interpole aucun nom de
+        # branche dans une condition.
+        self.assertIn("release: ${{ steps.release.outputs.release }}", self.text)
+        fs_class = self.text[self.text.index("\n  fs-class:\n"):
+                             self.text.index("\n  platform-macos:\n")]
+        self.assertIn("needs.plan.outputs.release == 'true'", fs_class)
+        condition = fs_class.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("github.head_ref", condition)
+        self.assertNotIn("github.base_ref", condition)
+        self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', self.text)
+        self.assertIn('case "$HEAD_REF" in release/*) release=true ;; esac', self.text)
+
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
         # décide), main et release/** portent la suite complète ; le check
