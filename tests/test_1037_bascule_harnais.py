@@ -26,7 +26,7 @@ import dataclasses
 import os
 import unittest
 
-from ameesh import registry, reprise
+from ameesh import persona_sessions as ps, registry, reprise
 from ameesh.backend import PgBackend
 
 from .support import PgTestCase
