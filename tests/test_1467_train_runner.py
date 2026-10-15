@@ -27,6 +27,10 @@ class FixtureMechanics(train_policy.Versioned):
     exclude_author_family = distinct_families = True
     cutoff = staticmethod(train.cutoff)
 
+    def next_cutoff(self, now):
+        # Explicit fixture calendar; real provider/DST tested by the port probe.
+        return now + 1234
+
     @property
     def review_policy(self):
         return self.policy
@@ -165,6 +169,20 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(self.git(self.host, "rev-parse", "HEAD"), self.base)
         self.assertIsNone(passage.epoch)
         self.assertEqual(self.notices, [])
+
+    def test_scheduled_passage_uses_compiled_calendar_with_real_sql_and_reservation(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.next_cutoff = mock.Mock(return_value=self.now + 1234)
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage()
+        result, deadline = passage.scheduled_step(self.db, self.now)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual(deadline, self.now + 1234)
+        self.mechanics.load.assert_called_once()
+        rules.next_cutoff.assert_called_once_with(self.now)
+        self.assertEqual(self.passage(owner="competing").step(self.db, self.now)["result"], "busy")
+        self.assertEqual(self.ops.train_read(self.key)["plan"]["head"], result["plan"]["head"])
 
     def test_competing_runner_cannot_touch_the_reserved_train_or_share_its_clone(self):
         first, second = self.passage(), self.passage(owner="runner-b")

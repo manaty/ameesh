@@ -41,6 +41,18 @@ def stamp(hour):
 
 
 class RealMechanicsTest(TrainRunnerTest):
+    def test_real_next_cutoff_and_engine_use_the_changed_canon(self):
+        self.queued_at_ten()
+        commit = self.revise(MECHANICS.replace('"11:00"', '"12:00"'))
+        passage = self.passage(policy_commit=commit)
+        result, deadline = passage.scheduled_step(self.db, stamp("11"))
+        self.assertEqual(result["result"], "idle", result)
+        self.assertEqual(deadline, stamp("12"))
+        self.assertEqual(self.api_calls, [])
+        result, deadline = passage.scheduled_step(self.db, stamp("12"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual(deadline, stamp("23"))
+
     def write(self, name, content):
         super().write(name, content)
         if name == "federation.yaml":
@@ -109,6 +121,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--supplier", required=True)
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--test", action="append", help="Run only the named consumer witness")
     args = parser.parse_args()
     resolved = subprocess.check_output(["git", "-C", args.supplier, "rev-parse", "--verify",
                                         args.commit + "^{commit}"], text=True).strip()
@@ -128,6 +141,10 @@ if __name__ == "__main__":
         names += ["test_new_clone_reads_real_history_then_lands_exact_ci_head_across_connections",
                   "test_competing_runner_cannot_touch_the_reserved_train_or_share_its_clone",
                   "test_missing_provenance_cannot_publish_or_be_replaced_by_current_registry"]
+        if args.test:
+            if not set(args.test) <= set(names):
+                parser.error("unknown consumer witness")
+            names = args.test
         result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(
             RealMechanicsTest(name) for name in names))
         sys.exit(not result.wasSuccessful())

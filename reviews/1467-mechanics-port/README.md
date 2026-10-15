@@ -32,3 +32,10 @@ canon de production et ne constitue pas une activation du train.
 
 Requalification du 15 octobre après corrections Codex/Claude du fournisseur :
 les huit scénarios restent verts sur cette nouvelle tête avec psycopg et psql.
+
+Le témoin ajouté pour le service runner change uniquement le canon de 11 h
+à 12 h : `scheduled_step` attend 12 h puis compose à 12 h, avec la prochaine
+échéance à 23 h fournie par le même objet compilé. Exécution ciblée : ajouter
+`--test test_real_next_cutoff_and_engine_use_the_changed_canon` aux commandes
+ci-dessus. Les neuf témoins de `tests.test_1467_train_service` couvrent le
+cycle de vie et le port d'événement, sans fournisseur ni API réels.

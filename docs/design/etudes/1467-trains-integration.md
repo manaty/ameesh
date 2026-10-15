@@ -265,7 +265,28 @@ fermée ne peut être réutilisée au passage suivant. Le clone privé est disti
 pour chaque source, cible et propriétaire, et séparé du clone du radar. La
 qualification récupère d'abord les branches exactes dans ce clone : un dépôt
 ne connaissant que la cible peut ainsi lire l'historique des lots. Aucun
-profil ni point d'appel du runner actif n'est installé par ce module.
+profil actif n'est installé par ce module.
+
+Le point d'appel préparatoire dans `Runner.run` démarre un service distinct
+après `start_branch_sweep_poll`, sans dépendre de ses 300 secondes. Les
+passages doivent être fournis explicitement au constructeur ; la liste vide
+par défaut laisse le service inactif. Les modes once, dry-run et médié le
+refusent. Chaque passage crée puis ferme un `ScopedDb` ; les ports runtime
+restent locaux à cet appel et seule l'époque de réservation reste dans le
+passage. Le service appartient à l'arrêt du runner et son fil est ajouté aux
+fils vérifiés avant la sortie sûre.
+
+Le démarrage reprend l'intention persistante. Ensuite le même objet compilé
+qui sert au moteur fournit `next_cutoff` pour la prochaine échéance, sans
+date ni cadence de balayage locale. Un événement explicite appelle
+`train_service.event(kind=..., project=..., target=...)` (types `ci-terminal`,
+`verdict`, `fire`), avec projet et cible exacts ; les autres types et cibles
+sont ignorés. Les événements sont regroupés sans perdre celui reçu pendant
+un passage. Ce signal n'apporte aucune autorité : les preuves sont relues
+par `Passage` sur une connexion fraîche. Aucun minuteur ne sonde
+la CI ou les avis ; une erreur attend un nouvel événement. Le raccord des
+notifications et la sélection du canon qualifié demeurent nécessaires avant
+activation : le point d'appel seul ne les déclare pas fournis.
 
 Raccord #1616 (contrat impl07 du 15 octobre à 12:43, corrigé à
 `ddf1091d3a47c89ca8dcc1c445221af37d828b35`) : le constructeur exige aussi

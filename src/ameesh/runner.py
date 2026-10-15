@@ -4606,6 +4606,7 @@ class Runner:
         wait: float = 0.0,
         dry_run: bool = False,
         max_turns: int | None = None,
+        train_passages=(),
     ):
         from .host_gate import gate_choice
         try:
@@ -4621,6 +4622,9 @@ class Runner:
         self.wait = wait
         self.dry_run = dry_run
         self.max_turns = max_turns
+        # #1467: explicit qualified passages only; no live policy selected here.
+        self.train_passages = tuple(train_passages)
+        self.train_service = None
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
@@ -5433,6 +5437,9 @@ class Runner:
     def shutdown(self) -> None:
         self.stop.set()
         self.wake_all.set()
+        train_service = getattr(self, "train_service", None)
+        if train_service is not None:
+            train_service.shutdown()
         if self.listener:
             self.listener.close()
         with self.lock:
@@ -5464,6 +5471,8 @@ class Runner:
         if self.listener_thread is not None:
             self.listener_thread.join(timeout=2.0)
         self.stopped_threads = list(workers)
+        if train_service is not None and train_service.thread is not None:
+            self.stopped_threads.append(train_service.thread)
         if getattr(self, "host_gate", None) is not None:
             self.host_gate.tick()  # dernier acquittement : plus aucun bail
             self.host_gate.stop()
@@ -6073,6 +6082,18 @@ class Runner:
             if message != getattr(self, "_radar_error", None):
                 log_async(message)
             self._radar_error = message
+
+    def start_train_service(self) -> None:
+        """#1467: separate from branch sweep, never inside a worker turn."""
+        if (self.once or self.dry_run or getattr(self, "mediated", False)
+                or self.stop.is_set() or getattr(self, "train_service", None) is not None):
+            return
+        passages = tuple(p for p in getattr(self, "train_passages", ()) if p.policy.enabled)
+        if not passages:
+            return
+        from .train_runner import Service
+        self.train_service = Service(self.cfg, passages, stop=self.stop, report=log_async)
+        self.train_service.start()
 
     def start_branch_sweep_poll(self) -> None:
         """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,
@@ -6813,6 +6834,7 @@ class Runner:
         self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
+        self.start_train_service()
         if self.once:
             try:
                 self.sweep()
