@@ -291,6 +291,23 @@ class CourrierBorneTest(_Base):
         self.assertLessEqual(float(etat.get("humain") or 0), time.time())
 
 
+    def test_l_instant_humain_survit_aux_hooks_suivants_meme_sans_borne(self):
+        for borne in (5, 0):
+            with self.subTest(borne=borne):
+                _runner, worker = self._worker("orch-humain-suite-%d" % borne)
+                mail.send(self.db, "proprio", worker.name, "fais le point",
+                          payload={"human": True})
+                self._hook(worker, "tour-1", borne=borne)
+                instant = cli.tour_lu(worker.cfg, worker.name).get("humain")
+                self.assertTrue(instant)
+                mail.send(self.db, "pair", worker.name, "suite d'agent")
+                self._hook(worker, "tour-1", borne=borne)
+                self.assertEqual(cli.tour_lu(worker.cfg, worker.name).get("humain"),
+                                 instant)
+                worker._humain_observe()
+                self.assertTrue(worker._humain_recent())
+
+
 class ReglagesTest(_Base):
     def test_ameesh_set_des_plafonds_du_tour(self):
         self._worker("orch-set")

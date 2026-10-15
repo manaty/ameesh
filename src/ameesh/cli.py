@@ -782,14 +782,18 @@ def tour_lu(cfg: Config, name: str) -> dict:
 def tour_lit(cfg: Config, name: str, turn: str) -> dict:
     """Compteur du tour `turn` ; un autre tour (ou rien de lisible) : zéro."""
     etat = tour_lu(cfg, name)
-    if etat.get("turn") == turn:
-        return {"turn": turn, "remis": int(etat.get("remis") or 0),
-                "attente": int(etat.get("attente") or 0),
-                "signale": bool(etat.get("signale")),
-                # borne atteinte pendant un travail du tour (dit une fois)
-                "differe": bool(etat.get("differe")),
-                "travail": [str(t) for t in etat.get("travail") or []],
-                "travail_ts": float(etat.get("travail_ts") or 0.0)}
+    try:
+        if etat.get("turn") == turn:
+            return {"turn": turn, "remis": int(etat.get("remis") or 0),
+                    "attente": int(etat.get("attente") or 0),
+                    "humain": float(etat.get("humain") or 0.0),
+                    "signale": bool(etat.get("signale")),
+                    # borne atteinte pendant un travail du tour (dit une fois)
+                    "differe": bool(etat.get("differe")),
+                    "travail": [str(t) for t in etat.get("travail") or []],
+                    "travail_ts": float(etat.get("travail_ts") or 0.0)}
+    except (ValueError, TypeError):
+        pass
     return {"turn": turn, "remis": 0, "attente": 0, "signale": False, "differe": False,
             "travail": [], "travail_ts": 0.0}
 
@@ -1028,8 +1032,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         from . import resident_runner
         tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
-        etat = tour_lit(cfg, name, tour) if borne else None
-        if etat is not None and etat["remis"] >= borne:
+        etat = tour_lit(cfg, name, tour) if (tour and binding.bound_to_lease) else None
+        if etat is not None and borne and etat["remis"] >= borne:
             if event == "Stop":
                 return 0
             attente = _attente(bk, name, [])
@@ -1049,9 +1053,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             return 0
         remise = _Remise(bk, name, binding)
         try:
-            msgs = remise.prendre(borne - etat["remis"] if etat is not None else None)
+            msgs = remise.prendre(borne - etat["remis"] if etat is not None and borne else None)
             avis = ""
-            if etat is not None and msgs and etat["remis"] + len(msgs) >= borne:
+            if etat is not None and borne and msgs and etat["remis"] + len(msgs) >= borne:
                 attente = _attente(bk, name, msgs)
                 etat["attente"] = attente
                 if attente:
