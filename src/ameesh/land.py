@@ -313,6 +313,18 @@ def pr_merged(slug: str, branch: str, sha: str, gh=_gh) -> dict | None:
     return None
 
 
+def _merged_after_disarm(slug: str, branch: str, sha: str, gh) -> tuple[dict | None, str]:
+    """#1718: `pr_merged` read after a failed disarm, and what to add to the
+    ejection when it cannot be read. Its LandError must not reach the
+    retry path of `land`: the entry would go back to `queued` (or stay
+    `landing`) silently, auto-merge still armed — the ejection that asks
+    to disarm by hand is kept, fail closed."""
+    try:
+        return pr_merged(slug, branch, sha, gh=gh), ""
+    except LandError as exc:
+        return None, "; merged PRs unreadable (%s)" % str(exc)[:200]
+
+
 # --------------------------------------------------------------------------
 # one landing
 # --------------------------------------------------------------------------
@@ -671,12 +683,13 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
                 # the disarm — the disarm then fails on an already merged PR.
                 # A merge at the frozen head into its target is constated;
                 # anything else keeps the fail-closed ejection.
-                found = pr_merged(slug, row["branch"], row["frozen_sha"], gh=gh)
+                found, unread = _merged_after_disarm(slug, row["branch"], row["frozen_sha"], gh)
                 if found is not None:
                     return _after_merge(landing, found["number"], found["base"], None,
                                         sha=row["frozen_sha"])
                 return landing.eject(
-                    "PR #%s: auto-merge armed and not disarmed (%s)" % (status["number"], error),
+                    "PR #%s: auto-merge armed and not disarmed (%s)%s"
+                    % (status["number"], error, unread),
                     "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
                     "queue add %d: an armed auto-merge merges a head the queue has not "
                     "qualified (#1656)." % (status["number"], lot))
@@ -842,12 +855,12 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
             # #1682: the auto-merge may have fired between the read and the
             # disarm (the disarm then fails on a merged PR): a merge at the
             # landing head is constated, like the "merged since" path above.
-            merged = pr_merged(slug, row["branch"], row["landing_sha"], gh=gh)
+            merged, unread = _merged_after_disarm(slug, row["branch"], row["landing_sha"], gh)
             if merged is not None:
                 return _after_merge(landing, merged["number"], merged["base"], None)
             return landing.eject(
-                "PR #%s: auto-merge armed and not disarmed (%s) — it could merge a head "
-                "the queue has not qualified" % (status["number"], error),
+                "PR #%s: auto-merge armed and not disarmed (%s)%s — it could merge a head "
+                "the queue has not qualified" % (status["number"], error, unread),
                 "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
                 "queue add %d; ameesh merges itself on the exact frozen head (#1656)."
                 % (status["number"], lot))
