@@ -75,20 +75,28 @@ def runner_for(returncode: int = 0, stdout: str = ""):
     return run
 
 
-def git_runner_for(head: str = A, porcelain: str = "", ls_remote: str = "",
-                   ignored: bool = False):
-    """Un `git` simulé : rev-parse, status, check-ignore et ls-remote."""
+def git_runner_for(head: str = A, ls_remote: str = "", ignored: bool = False):
+    """Un `git` simulé : rev-parse, check-ignore et ls-remote.
+
+    Le contenu envoyé n'est plus lu par `status` : il est **construit** par
+    `snapshot_with` (vrai git), injecté ici par `snapshot_for()`."""
     def run(argv, **kwargs):
         if "rev-parse" in argv:
             return _Proc(0, (head + "\n") if head else "")
-        if "status" in argv:
-            return _Proc(0, porcelain)
         if "check-ignore" in argv:
             return _Proc(0 if ignored else 1, "")
         if "ls-remote" in argv:
             return _Proc(0, ls_remote)
         return _Proc(0, "")
     return run
+
+
+def snapshot_for(snap: str = C):
+    """Le snapshot construit (SHA + plan) simulé : le vrai passe par git."""
+    def build(root, head, plan_rel, plan):
+        assert head and plan_rel and plan
+        return snap
+    return build
 
 
 class MeetsCanonTest(unittest.TestCase):
@@ -195,14 +203,16 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(0, flux()),
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["causes"], [])
         self.assertEqual(report["host"], "vm1")
         self.assertEqual(report["seconds"], 42.0)
         self.assertIn("test_a", report["modules"])
-        # l'arbre vérifié est recopié dans le rapport
-        self.assertEqual(report["tree"], {"head": A, "clean": True})
+        # l'arbre vérifié et l'identité envoyée sont recopiés dans le rapport
+        self.assertEqual(report["tree"],
+                         {"head": A, "snapshot": C, "plan": "plan.json"})
 
     def test_lanceur_de_part_du_bloc_dans_la_commande(self):
         """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""
@@ -215,6 +225,7 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(parts_script="tools/parts.py"),
                              repo=self.tmp.name, runner=capture,
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         command = " ".join(seen[0])
@@ -231,6 +242,7 @@ class ValidateTest(unittest.TestCase):
 
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name, runner=capture,
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         self.assertIn(pv.DEFAULT_PARTS_SCRIPT, " ".join(seen[0]))
@@ -245,6 +257,7 @@ class ValidateTest(unittest.TestCase):
 
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name, runner=capture,
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for())
         self.assertTrue(report["ok"], report)
         argv, kwargs = seen[0]
@@ -257,7 +270,9 @@ class ValidateTest(unittest.TestCase):
         with self.assertRaises(pv.PrevalidationError) as caught:
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="pc-smichea",
                         params=params(), repo=self.tmp.name,
-                        runner=runner_for(0, flux()), git_runner=git_runner_for())
+                        runner=runner_for(0, flux()),
+                        snapshotter=snapshot_for(),
+                        git_runner=git_runner_for())
         self.assertEqual(caught.exception.cause, "no-vm")
 
     def test_contrat_declare_introuvable_refuse(self):
@@ -265,6 +280,7 @@ class ValidateTest(unittest.TestCase):
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                         params=params(contracts=("tests/parts/toujours.txt",)),
                         repo=self.tmp.name, runner=runner_for(0, flux()),
+                        snapshotter=snapshot_for(),
                         git_runner=git_runner_for())
         self.assertEqual(caught.exception.cause, "selection-unsafe")
 
@@ -274,19 +290,30 @@ class ValidateTest(unittest.TestCase):
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
+                        snapshotter=snapshot_for(),
                         git_runner=git_runner_for(head=B))
         self.assertEqual(caught.exception.cause, "head-moved")
         self.assertIn("arbre à", caught.exception.why)
 
-    def test_arbre_modifie_refuse(self):
-        """Une modification suivie partirait sur la VM : refus."""
-        with self.assertRaises(pv.PrevalidationError) as caught:
-            pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
-                        params=params(), repo=self.tmp.name,
-                        runner=runner_for(0, flux()),
-                        git_runner=git_runner_for(porcelain=" M src/ameesh/x.py\n"))
-        self.assertEqual(caught.exception.cause, "head-moved")
-        self.assertIn("modifié", caught.exception.why)
+    def test_arbre_de_travail_sale_ne_part_pas(self):
+        """Un arbre local sale n'entre pas dans la preuve : le contenu envoyé
+        est construit (SHA + plan), pas photographié (P1 cx1 : non suivis,
+        `assume-unchanged` et `skip-worktree` échappaient à `git status`)."""
+        seen: list = []
+
+        def capture(argv, **kwargs):
+            seen.append(argv)
+            return _Proc(0, flux())
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name,
+                             runner=capture,
+                             snapshotter=snapshot_for(),
+                             git_runner=git_runner_for())
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["tree"]["snapshot"], C)
+        self.assertIn("--snapshot", " ".join(seen[0]))
+        self.assertIn(C, " ".join(seen[0]))
 
     def test_plan_ignore_par_git_refuse(self):
         """Un plan ignoré n'est pas transporté : refus avant le run."""
@@ -294,6 +321,7 @@ class ValidateTest(unittest.TestCase):
             pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                         params=params(), repo=self.tmp.name,
                         runner=runner_for(0, flux()),
+                        snapshotter=snapshot_for(),
                         git_runner=git_runner_for(ignored=True))
         self.assertEqual(caught.exception.cause, "selection-unsafe")
         self.assertIn("ignoré", caught.exception.why)
@@ -308,6 +336,7 @@ class ValidateTest(unittest.TestCase):
                 pv.validate(lot=1770, plan_path=ailleurs, head=A, host="vm1",
                             params=params(), repo=self.tmp.name,
                             runner=runner_for(0, flux()),
+                            snapshotter=snapshot_for(),
                             git_runner=git_runner_for())
         self.assertEqual(caught.exception.cause, "selection-unsafe")
         self.assertIn("hors de l'arbre", caught.exception.why)
@@ -324,7 +353,9 @@ class ValidateTest(unittest.TestCase):
 
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
-                             runner=runner_for(0, flux()), git_runner=git)
+                             runner=runner_for(0, flux()),
+                             snapshotter=snapshot_for(),
+                             git_runner=git)
         self.assertFalse(report["ok"])
         self.assertIn("head-moved", report["causes"])
 
@@ -332,6 +363,7 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(1, flux("echec")),
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for())
         self.assertFalse(report["ok"])
         self.assertIn("run-red", report["causes"])
@@ -344,6 +376,7 @@ class ValidateTest(unittest.TestCase):
         report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
                              params=params(), repo=self.tmp.name,
                              runner=runner_for(0, sans_fin + "\n" + pv.SECONDS_MARK + "9\n"),
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for())
         self.assertFalse(report["ok"])
         self.assertIn("run-incomplete", report["causes"])
@@ -353,6 +386,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              published_ref="lot/x",
                              runner=runner_for(0, flux()),
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for(
                                  ls_remote="%s\trefs/heads/lot/x\n" % C))
         self.assertFalse(report["ok"])
@@ -363,6 +397,7 @@ class ValidateTest(unittest.TestCase):
                              params=params(), repo=self.tmp.name,
                              published_ref="lot/x",
                              runner=runner_for(0, flux()),
+                             snapshotter=snapshot_for(),
                              git_runner=git_runner_for(
                                  ls_remote="%s\trefs/heads/lot/x\n" % A))
         self.assertTrue(report["ok"], report)
