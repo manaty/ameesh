@@ -119,6 +119,7 @@ def resolve_lot(db, ref: str) -> dict | None:
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
                  estimate=None, app: str | None = None, new_project: bool = False,
+                 force: str | None = None,
                  parent_lot: int | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
@@ -131,6 +132,11 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
     déposé), un avertissement pour un humain.
+
+    #540 : un lot que le destinataire ne peut recevoir (il a déjà un lot non
+    démarré) va dans la file d'équipe et le message n'est pas déposé
+    (AssignmentError) ; sauf `force`, la raison d'un `--force` motivé.
+
     #1193: `parent_lot` is the explicit parent of the suite lot created by
     `new_lot` — the blocking edge is written together with the creation
     (refused without `new_lot`)."""
@@ -181,7 +187,10 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                           if new_project and app is not None else "")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg, branch=branch,
-                                estimate=minutes, note=introduced, parent_lot=parent_lot)
+                                estimate=minutes, note=introduced, force=force,
+                                parent_lot=parent_lot)
+            if item.get("queue_warning"):
+                raise AssignmentError(_queued(item))
             out.update(created=True, assigned=True, branch=item.get("branch"))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
@@ -218,8 +227,10 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                                recipient))
                     else:
                         done = work_mod.assign(db, int(item["id"]), recipient, actor=sender,
-                                               cfg=cfg)
+                                               cfg=cfg, force=force)
                         item = done["item"]
+                        if done.get("queue_warning"):
+                            raise AssignmentError(_queued(dict(item, **done)))
                         out["assigned"] = True
                         if done["check"].get("warning"):
                             out["warnings"].append(done["check"]["warning"])
@@ -238,6 +249,14 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             "nor in alerts — link it (--lot <id|ref>) or create it "
             "(--new-lot \"title\")" % recipient)
     return out
+
+
+def _queued(item: dict) -> str:
+    """#540 : le lot est allé dans la file d'équipe, pas au destinataire ; le
+    message n'est pas déposé (il confierait un lot que L165 peut donner à un
+    autre)."""
+    return ("%s; resend without --lot, or once the recipient has started that lot"
+            % item["queue_warning"])
 
 
 def _is_chat(db, name: str) -> bool:

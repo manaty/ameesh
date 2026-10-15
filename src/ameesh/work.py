@@ -175,6 +175,39 @@ def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> 
     raise WorkError(refus % text)
 
 
+def forcer(cfg, db, explicit: str | None = None) -> str:
+    """#540 : l'auteur d'un `--force "<raison>"`, écrit au journal du lot ;
+    WorkError si la session ne peut pas le prouver. Une session qui porte une
+    identité d'agent force en son nom, jamais au nom d'un autre (`--actor` ou
+    `--from` différent : refus) ; une identité refusée ne retombe pas sur le
+    terminal humain. Une session sans identité (un humain à son terminal)
+    dit qui force, et seulement par une identité humaine explicite
+    (`--actor human:<id>`) : sans liaison, un nom d'agent est refusé (revue
+    r2, B/P2) — sinon n'importe quelle session signerait un forçage au nom
+    d'un agent."""
+    from . import identity
+
+    text = (explicit or "").strip()
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("--force refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("--force refused: this session belongs to %s, it does not "
+                            "force on behalf of %s" % (binding.name, text))
+        return binding.name
+    if not text:
+        raise WorkError("--force: say who forces (--actor human:<id>)")
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "--force refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); an agent forces from its "
+        "own bound session, a human terminal says --actor human:<id>" % text)
+
+
 def pin_authority(cfg, db, actor: str | None = None) -> str | None:
     """#740: who may protect a date from the schedule (`work plan`, `work
     schedule --pin`): the actor `corrector` accepts on a declared role (a
@@ -209,6 +242,7 @@ def add(
     estimate_source: str | None = None,
     size: str | None = None,
     note: str = "",
+    force: str | None = None,
     parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
@@ -232,11 +266,42 @@ def add(
     marque d'idempotence du lot de relecture au journal de ce lot, dans la
     même transaction que la création (`{lot}` y vaut l'identifiant créé).
 
+    #540 : un agent qui a déjà un lot non démarré ne reçoit pas celui-ci : il
+    va dans la file d'équipe (`queued_behind`, `queue_warning`). `force` : la
+    raison d'un forçage (`--force "<raison>"`), écrite au journal avec son
+    auteur ; vide, aucun forçage. L'exemption du lot d'une demande de
+    décision n'est pas un paramètre : `_decision_lot`, interne, réservé à
+    `decisions.ask`.
+
     #1193: `parent_lot` is the explicit parent of a suite lot. The blocking
     edge is written **in the same transaction** as the creation (parent still
     open), traced in the journal if the parent is already finished; an unknown
     parent is refused before any creation. No number is ever guessed from the
     title or the body."""
+    return _create(db, title=title, type=type, source=source, app=app, body=body,
+                   issue_ref=issue_ref, workstream=workstream, assignee=assignee,
+                   budget_usd=budget_usd, actor=actor, package=package, externe=externe,
+                   cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
+                   estimate=estimate, estimate_source=estimate_source, size=size,
+                   note=note, force=force, parent_lot=parent_lot,
+                   mark_item_id=mark_item_id, mark_note=mark_note, team_queue=True)
+
+
+def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
+    """#540 : le lot de la question de `requester` (`decisions.ask`), à son
+    nom même s'il a déjà un lot non démarré : il attend la réponse, ce lot
+    ne va jamais dans la file d'équipe. Seul appelant : `decisions.ask`."""
+    return _create(db, title=title, assignee=requester, actor=requester,
+                   source="decision", app=app, cfg=cfg, team_queue=False)
+
+
+def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
+            body="", issue_ref=None, workstream=None, assignee=None, budget_usd=None,
+            actor="", package=None, externe=False, cfg=None, branch=None,
+            branch_target=None, priority=None, estimate=None, estimate_source=None,
+            size=None, note="", force=None, parent_lot=None, mark_item_id=None,
+            mark_note="", team_queue: bool) -> dict:
+    """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -252,6 +317,7 @@ def add(
         raise WorkError("title required")
     if priority is not None and priority not in PRIORITIES:
         raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
+    queued = None
     if parent_lot is not None:
         try:
             parent_lot = int(parent_lot)
@@ -263,24 +329,31 @@ def add(
             raise WorkError("parent lot #%d not found" % parent_lot)
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
-        assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
+        check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+        assignee = check["assignee"]
+        queued = check if team_queue else None
     elif externe:
         raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
+    created = ("created" + (" (plan: %s)" % package if package else "")
+               + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+               + ("; %s" % note if note else ""))
     item = storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
-        + ("; estimate: %s" % span(minutes * 60) if minutes else "")
-        + ("; %s" % note if note else ""),
+        budget_usd=budget_usd, note=created,
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
         if minutes else None, change_size=size or None,
+        queued_note=queued and _queued_note(queued, created),
+        forced_note=queued and _forced_note(queued, created, force, actor),
         mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
+    if item.get("queued_behind") is not None:
+        item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
@@ -603,7 +676,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
-           cfg=None, branch: str | None = None, branch_target: str | None = None) -> dict:
+           cfg=None, branch: str | None = None, branch_target: str | None = None,
+           force: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -631,13 +705,79 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # L40 (0030) : la réassignation efface la délégation en cours
         "; delegation from %s cancelled" % item["delegated_by"]
         if item.get("delegated_by") and item.get("due_ts") else "")
+    queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
+                          % (check["assignee"], previous or "nobody"))
     row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
-                                     actor=actor)
+                                     actor=actor, queued_note=queued,
+                                     forced_note=queued and _forced_note(check, note, force,
+                                                                         actor))
     if row is None:
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    behind = row.get("queued_behind")
     if branch:
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
-    return {"item": row, "check": check, "previous": previous}
+    out = {"item": row, "check": check, "previous": previous}
+    if behind is not None:
+        row["queued_behind"] = behind
+        out["queue_warning"] = queue_warning(db, row, check["assignee"])
+    return out
+
+
+def takes_rule(check: dict) -> bool:
+    """#540 : l'assigné normalisé par `check_assignee` est soumis à la règle
+    « au plus un lot non démarré » (ni humain ni agent externe)."""
+    return not (check["externe"] or check["assignee"].startswith(HUMAN_PREFIX))
+
+
+def _queued_note(check: dict, head: str) -> str | None:
+    """#540 : la note du journal d'un lot mis dans la file d'équipe faute de
+    place chez l'agent (`{lot}` : son lot déjà en attente) ; None pour un
+    humain ou un agent externe, hors de la règle."""
+    if not takes_rule(check):
+        return None
+    return "%s; team queue (#540): %s already has lot #{lot} not started" % (
+        _braces(head), check["assignee"])
+
+
+def _forced_note(check: dict, head: str, reason: str | None, actor: str) -> str | None:
+    """#540 (canon §4, « sauf --force motivé ») : la note d'une attribution
+    forcée malgré un lot non démarré ; None sans raison (pas de forçage)."""
+    reason = " ".join(str(reason or "").split())
+    if not reason or _queued_note(check, head) is None:
+        return None
+    return ("%s; team queue (#540) forced by %s: %s already has lot #{lot} not started; "
+            "reason: %s" % (_braces(head), _braces(actor or "?"), check["assignee"],
+                            _braces(reason)))
+
+
+def _braces(text: str) -> str:
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def lot_team(db: Db, item: dict) -> str | None:
+    """L'équipe du lot comme la lit la prise L165 : la sienne, sinon celle de
+    sa fiche ou de la fiche parente, sinon son application."""
+    st = storage.of(db)
+    for value in (item.get("team"),
+                  *((st.packages.get(p) or {}).get("team")
+                    for p in (item.get("package_id"), item.get("package_parent")) if p),
+                  item.get("app")):
+        if (value or "").strip():
+            return value.strip()
+    return None
+
+
+def queue_warning(db: Db, item: dict, agent: str) -> str:
+    """#540 : ce qu'on dit à qui attribue un lot mis dans la file d'équipe."""
+    team = lot_team(db, item)
+    later = "ameesh work assign once %s starts #%s" % (agent, item["queued_behind"])
+    return ("lot #%s put in the team queue: %s already has lot #%s not started (at most one "
+            "per agent, #540); %s" % (
+                item["id"], agent, item["queued_behind"],
+                "it is %s: it waits for the orchestrator (%s)" % (item["state"], later)
+                if item.get("state") != "intake" else
+                "an idle agent of team %s will take it (L165)" % team if team else
+                "it has no team: it waits for the orchestrator (%s)" % later))
 
 
 # --------------------------------------------------------------------------

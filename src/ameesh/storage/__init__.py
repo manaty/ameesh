@@ -35,12 +35,12 @@ la documentation de `storage.interface`.
 """
 from __future__ import annotations
 
-from .interface import MailboxRefused, ReservationContention, Storage
+from .interface import MailboxRefused, PendingLot, ReservationContention, Storage
 from .postgres import PostgresStorage
 from .remote.client import RemoteDb
 
-__all__ = ["MailboxRefused", "ReservationContention", "Storage", "PostgresStorage", "of",
-           "is_remote"]
+__all__ = ["MailboxRefused", "PendingLot", "ReservationContention", "Storage",
+           "PostgresStorage", "of", "is_remote"]
 
 
 def of(db) -> Storage:

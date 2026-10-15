@@ -1015,6 +1015,15 @@ class Nonces(Domain):
 # lots (`work_items`, `work_item_events`)
 # --------------------------------------------------------------------------
 
+class PendingLot(RuntimeError):
+    """#540 : `assign(…, take=True)` refusé : l'agent a déjà le lot non
+    démarré `lot` (lu sous son verrou) ; rien n'est écrit."""
+
+    def __init__(self, lot: int):
+        super().__init__("lot #%d not started" % lot)
+        self.lot = lot
+
+
 class ReservationContention(RuntimeError):
     """L122, #478 : le budget de réessais d'une réservation automatique est
     épuisé — le prochain numéro libre n'a pas pu être réservé à temps sous la
@@ -1048,6 +1057,7 @@ class WorkItems(Domain):
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
             estimate_source: str | None = None, change_size: str | None = None,
+            queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
             parent_lot: int | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
@@ -1055,7 +1065,14 @@ class WorkItems(Domain):
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
         si `estimate_minutes`, L157 ; avec la taille déclarée du changement
         si `change_size`, L157b) et sa première ligne de journal ; rend le
-        lot.
+        lot. #540 : avec `queued_note`, un `assignee` qui a déjà un lot
+        ouvert qui l'occupe (L165b : non démarré, ni en attente d'un autre,
+        ni prévu après aujourd'hui) ne le reçoit pas : le lot va
+        dans la file d'équipe (sans assigné), journalisé par `queued_note`
+        (`{lot}` : le lot déjà en attente), rendu avec `queued_behind`.
+        Avec `forced_note` aussi (`--force` motivé) : l'agent le reçoit quand
+        même, journalisé par `forced_note`, rendu avec `forced_behind`.
+        Contrôle et écriture sous le verrou de transaction de l'agent.
 
         `mark_note`, si non vide, est écrit au journal de `mark_item_id` dans
         la **même** transaction (L539 : la marque d'idempotence du lot de
@@ -1068,7 +1085,11 @@ class WorkItems(Domain):
         `parent_lot` (#1193): the explicit parent of a suite lot, linked in the
         **same** transaction — a blocking edge if the parent is still open, a
         journal trace if it is already finished, everything rolled back if it
-        is unknown."""
+        is unknown.
+
+        L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
+        les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
+        identifiant croissant), le verrou d'agent ensuite."""
 
     @abc.abstractmethod
     def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
@@ -1284,10 +1305,16 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
-               actor: str) -> dict | None:
+               actor: str, queued_note: str | None = None,
+               forced_note: str | None = None, take: bool = False) -> dict | None:
         """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
-        L40 : efface la délégation en cours (issue `annulee`)."""
+        L40 : efface la délégation en cours (issue `annulee`). #540 : avec
+        `queued_note`, un lot non démarré ne va pas à un `assignee` qui a déjà
+        un autre lot ouvert qui l'occupe (L165b, comme `add`) : il passe dans
+        la file d'équipe (sans assigné) (`forced_note` de même). `take=True`
+        (la prise automatique, `backlog.auto_take`) : même contrôle sous le
+        même verrou, mais le lot reste où il est et `PendingLot` est levée."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,

@@ -517,10 +517,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     check = work.check_assignee(db, row["name"], cfg=cfg)
                 except work.WorkError:
                     break                   # agent non réveillable : au suivant
-                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                      note="%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                    check["assignee"]),
-                                      actor=SENDER)
+                try:
+                    # #540 : sous le verrou de l'agent, pas de second lot
+                    # non démarré (il en a reçu un depuis sa sélection)
+                    done = st.work.assign(int(item["id"]), check["assignee"], current=None,
+                                          note="%s par %s, au repos" % (LOT_TAKE_NOTE,
+                                                                        check["assignee"]),
+                                          actor=SENDER, take=work.takes_rule(check))
+                except storage.PendingLot:
+                    break                   # le lot reste à l'agent suivant
                 lots.remove(item)
                 if done is None:
                     continue                # pris entre-temps : lot suivant
@@ -572,8 +577,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             note = "%s par %s (valeur %s) : %s" % (
                 AUTO_TAKE_NOTE, check["assignee"], item.get("value_score"),
                 item.get("expected_value") or "")
-            done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                  note=note, actor=SENDER)
+            try:
+                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
+                                      note=note, actor=SENDER, take=work.takes_rule(check))
+            except storage.PendingLot:
+                break                       # #540 : l'élément reste au suivant
             queue.remove(item)
             if done is None:
                 continue                    # pris entre-temps : élément suivant
