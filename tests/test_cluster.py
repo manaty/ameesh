@@ -37,7 +37,13 @@ SIGNATURES = {
                 "replace_receipt", "replace_nonce"},
     "action_attempts": {"receipt", "nonce"},
     "standing_approvals": {"receipt", "nonce", "challenge"},
-    "agent_registry": {"public_key"},
+    "agent_registry": {"public_key",
+                       # L87b (0441) : geste opérateur (motif, acteur,
+                       # mandant, horodatage) — choix fermé, ouvrable plus
+                       # tard comme état s'il est jugé utile à la supervision.
+                       "operator_paused", "operator_pause_reason",
+                       "operator_pause_by", "operator_pause_for",
+                       "operator_pause_at"},
     "agent_mesh_overview": {"public_key"},
     "key_holders": {"public_key"},     # #330
     "mesh_keys": {"public_key"},
@@ -48,6 +54,14 @@ SIGNATURES = {
     "executor_assertion_jti": {"jti"},
     "executors": {"public_key", "device_attestation"},
     "exec_idempotency": {"response"},
+    # L87 (0440) : clés d'idempotence de l'API et réponses rejouables — même
+    # nature que `exec_idempotency` ; tout est fermé tant que la classification
+    # d'état n'est pas tranchée.
+    "api_idempotency": {"human", "key", "fingerprint", "status", "response",
+                        "created_at", "done_at"},
+    # L87b (0441) : journal des transitions de la pause opérateur.
+    "operator_pause_events": {"id", "agent", "paused", "reason", "actor",
+                              "principal", "created_at"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }
