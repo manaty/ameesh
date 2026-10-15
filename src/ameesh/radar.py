@@ -445,8 +445,13 @@ def _lines(proc) -> list[str]:
 
 def trial_merge(repo: str, objects: str, scratch: str, a: str, b: str) -> list[str] | None:
     """Fusion d'essai de deux commits : la liste des fichiers en conflit (vide :
-    fusion propre), None si git n'a pas su la calculer."""
-    proc = _scratch_git(repo, objects, scratch, "merge-tree", "--write-tree", "-z",
+    fusion propre), None si git n'a pas su la calculer.
+
+    #1517 : les attributs de fusion (`.gitattributes`, `merge=union` des
+    listes centrales) sont lus dans l'arbre de `a`, comme une vraie fusion
+    sur cette cible, et non dans ce que la copie locale a d'extrait."""
+    proc = _scratch_git(repo, objects, scratch, "-c", "attr.tree=%s" % a,
+                        "merge-tree", "--write-tree", "-z",
                         "--name-only", "--no-messages", a, b)
     if proc.returncode not in (0, 1):
         return None
