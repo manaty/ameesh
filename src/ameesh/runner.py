@@ -185,6 +185,8 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
 LIVE_REVIEW_START_SLACK_S = 300.0
+#: L85 : rétention du journal d'événements, au plus une fois par heure
+EVENTS_PRUNE_EVERY_S = 3600.0
 
 #: #804 : cadence de la prise automatique déclenchée par l'exécuteur pour ses
 #: propres agents au repos (secondes ; 0 coupe la prise de l'exécuteur). Le
@@ -5421,6 +5423,9 @@ class Runner:
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
+        #: L85 : dernière rétention du journal d'événements (monotone), son erreur
+        self._events_pruned_at: float | None = None
+        self._events_prune_error: str | None = None
         #: L159f : porte d'hôte — None sans porte (hôte classique : rien ne
         #: change). Celle de la configuration dès maintenant ; celle d'un hôte
         #: prêteur (fiche Host avec `policy.lend`) au premier `canon sync`,
@@ -5762,10 +5767,44 @@ class Runner:
                 take.get("agent"), (take.get("item") or {}).get("id"), take.get("kind")))
         return taken
 
+    def prune_events_once(self, now: float | None = None) -> int | None:
+        """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
+        fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
+        `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run
+        ni en exécuteur médié (le journal est au serveur du mesh). Une erreur
+        (base, réglage) est journalisée une fois, jamais fatale à la passe."""
+        from . import events as events_mod
+
+        now = time.monotonic() if now is None else now
+        if self.dry_run or getattr(self, "mediated", False) or (
+                self._events_pruned_at is not None
+                and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
+            return None
+        self._events_pruned_at = now
+        try:
+            gone = events_mod.prune(self.db, max_batches=events_mod.PRUNE_MAX_BATCHES,
+                                    max_s=events_mod.PRUNE_MAX_S)
+            # rien supprimé alors qu'il reste des événements expirés : la
+            # rétention est bloquée (jamais un 0 silencieux)
+            left = 0 if gone else events_mod.expired(self.db)
+            if left:
+                raise ValueError("%d expired event(s) left, none deleted" % left)
+        except (db_mod.DbError, ValueError) as exc:
+            message = "event log retention not applied (%s)" % exc
+            if message != self._events_prune_error:
+                log_async(message)
+            self._events_prune_error = message
+            return None
+        self._events_prune_error = None
+        if gone:
+            log_async("event log: %d event(s) past retention deleted" % gone)
+        return gone
+
     def sweep(self) -> None:
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
+        self.prune_events_once()   # L85 : après la moisson des baux, bornée
         finished = []
         with self.lock:
             for name, worker in list(self.workers.items()):
