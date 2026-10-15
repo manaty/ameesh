@@ -229,7 +229,7 @@ def wake_env_name(agent: str, slug: str) -> str:
 
 
 def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
-               directory: str = "") -> dict[str, str]:
+               directory: str = "", *, deadline: float | None = None) -> dict[str, str]:
     """The service and the timer of the one-shot wake `<slug>` of `agent`.
 
     A wake runs outside a turn, where the runner's `AGENT_MAIL_NAME` is
@@ -240,6 +240,10 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
     if a host file names another agent. `Restart=on-failure` keeps a wake
     whose firing failed (database down): it retries until it is sent.
     """
+    if deadline is None:
+        deadline = time.time() + delay_s
+    calendar = datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc) \
+        .strftime("%Y-%m-%d %H:%M:%S.%f UTC")
     service = (
         "[Unit]\n"
         "Description=ameesh one-shot wake of %(agent)s (%(slug)s)\n"
@@ -263,9 +267,11 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
         "[Unit]\n"
         "Description=ameesh one-shot wake of %(agent)s (%(slug)s), in %(delay)ds\n"
         "[Timer]\n"
-        "OnActiveSec=%(delay)d\n"
+        # #1737: a daemon-reload can rebase OnActiveSec. Keep the original
+        # wall-clock deadline instead, including for wakes requested with --in.
+        "OnCalendar=%(calendar)s\n"
         "AccuracySec=1s\n"
-        % {"agent": agent, "slug": slug, "delay": int(delay_s)})
+        % {"agent": agent, "slug": slug, "delay": int(delay_s), "calendar": calendar})
     return {wake_name(agent, slug, "service"): service,
             wake_name(agent, slug, "timer"): timer}
 
@@ -273,7 +279,15 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
 def parse_wake_delay(text: str | None, at: str | None, *, now: float | None = None) -> int:
     """The delay of a wake, from `--in 45m` or `--at 2026-10-13T20:00:00Z`
     (absolute, timezone required: the deadline of a wake is not read twice)."""
+    reference = time.time() if now is None else now
+    return int(round(parse_wake_deadline(text, at, now=reference) - reference))
+
+
+def parse_wake_deadline(text: str | None, at: str | None, *,
+                        now: float | None = None) -> float:
+    """Resolve either CLI form once, before connecting to the database."""
     from . import stagnation
+    reference = time.time() if now is None else now
     if bool(text) == bool(at):
         raise WatchError("give exactly one of --in DURATION or --at TIME")
     if text:
@@ -288,12 +302,10 @@ def parse_wake_delay(text: str | None, at: str | None, *, now: float | None = No
             raise WatchError("--at: unreadable time %r (%s)" % (at, exc)) from exc
         if when.tzinfo is None:
             raise WatchError("--at: %r has no timezone (use 2026-10-13T20:00:00Z)" % at)
-        reference = datetime.datetime.now(datetime.timezone.utc) \
-            if now is None else datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
-        delay = (when - reference).total_seconds()
+        delay = when.timestamp() - reference
     if delay < MIN_WAKE_S:
         raise WatchError("a wake fires at least %d s from now, got %gs" % (MIN_WAKE_S, delay))
-    return int(round(delay))
+    return reference + delay
 
 
 def _ameesh_binary() -> str:
@@ -569,7 +581,7 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
 
 def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
         run: Callable = subprocess.run, env: dict | None = None,
-        actor: str | None = None) -> str:
+        actor: str | None = None, deadline: float | None = None) -> str:
     """Arms (or re-arms) the one-shot wake `<slug>` of `agent` on this host.
 
     The unit declares the identity and applies it with `env` on its exec line
@@ -591,15 +603,22 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
     if not host:
         raise WatchError("this host has no name (host of the configuration)")
     actor = actor or authorize(cfg, db, agent)
+    armed_ts = time.time()
+    if deadline is None:
+        deadline = armed_ts + delay_s
+    if deadline <= armed_ts:
+        raise WatchError("wake deadline elapsed before arming: choose a future --at")
     directory = unit_dir(env)
     os.makedirs(directory, exist_ok=True)
     source = os.environ if env is None else env
     path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
-    files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory)
+    files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory,
+                       deadline=deadline)
     files[wake_env_name(agent, slug)] = pinned_env(dict(source), host)
     files[wake_name(agent, slug, "wake.json")] = json.dumps(
         {"agent": agent, "slug": slug, "message": message, "host": host,
-         "armed_ts": time.time()}, ensure_ascii=False, sort_keys=True) + "\n"
+         "armed_ts": armed_ts, "deadline_ts": deadline},
+        ensure_ascii=False, sort_keys=True) + "\n"
     _systemctl_quiet(run, "stop", wake_name(agent, slug, "timer"))
     for name, text in files.items():
         tmp = os.path.join(directory, "." + name + ".tmp")
@@ -768,7 +787,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_mod.load()
     try:
         every = parse_every(args.every) if args.command == "enable" else None
-        delay = parse_wake_delay(args.in_, args.at) if args.command == "at" else None
+        now = time.time()
+        deadline = parse_wake_deadline(args.in_, args.at, now=now) \
+            if args.command == "at" else None
+        delay = int(round(deadline - now)) if deadline is not None else None
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db)
@@ -783,7 +805,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "send":
                 print(send(cfg, db, args.agent))
             elif args.command == "at":
-                print(arm(cfg, db, args.agent, args.wake, delay, args.message))
+                print(arm(cfg, db, args.agent, args.wake, delay, args.message,
+                          deadline=deadline))
             elif args.command == "cancel":
                 print(disarm(cfg, db, args.agent, args.wake))
             elif args.command == "fire":
