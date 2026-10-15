@@ -2709,10 +2709,12 @@ def cmd_cost(cfg: Config, args) -> int:
             print("accounts: invalid configuration: %s" % exc, file=sys.stderr)
             comptes = []
         actifs = {}
+        rythmes = {}
         for ligne in comptes:
             if ligne["active"]:
                 actifs[ligne["harness"]] = (ligne["account"], ligne["_gauges"])
-        rows = book.report(accounts=actifs)
+                rythmes[ligne["harness"]] = ligne.get("pace_multiplier", 1.0)
+        rows = book.report(accounts=actifs, multipliers=rythmes)
         for ligne in comptes:
             ligne.pop("_gauges", None)
         if comptes:
@@ -2764,7 +2766,9 @@ def _cost_report_reads(cfg: Config, db) -> None:
         comptes = []
     actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
               for ligne in comptes if ligne["active"]}
-    book.report(accounts=actifs)
+    rythmes = {ligne["harness"]: ligne.get("pace_multiplier", 1.0)
+               for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs, multipliers=rythmes)
     _real_spend_24h(db)
 
 
