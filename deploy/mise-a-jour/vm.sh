@@ -85,7 +85,10 @@ exiger_migrations() {  # $1 : commit, $2 : ce qu'on s'apprête à faire
 }
 # Commandes sur la VM d'agents : utilisateur ameesh et son bus systemd,
 # la base reste celle de la configuration du compte de l’unité.
-ssh_agents() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$AGENTS_SSH" "$@"; }
+# -n : le client consomme son entrée standard même quand la commande distante
+# ne la lit pas. Sans lui, la boucle `while read` de controler_agents lui livre
+# la liste des agents et n'en contrôle qu'un seul (#1455).
+ssh_agents() { ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$AGENTS_SSH" "$@"; }
 utilisateur_agents() {
   local commande; printf -v commande '%q ' "$@"
   ssh_agents "set -euo pipefail
