@@ -49,7 +49,9 @@ class RelectureConfigTest(unittest.TestCase):
             return config_mod.load(env={"AMEESH_CONFIG": self.profil})
 
     def _runner(self) -> Runner:
-        cfg = self._cfg()
+        # comme `main()` : les options de ligne de commande sont appliquées à
+        # la configuration avant la construction de l'exécuteur
+        cfg = replace(self._cfg(), poll=1.0)
         with mock.patch.dict(os.environ, {"HOME": self.home,
                                           "AMEESH_CONFIG": self.profil}):
             return Runner(cfg, None, cfg_overrides={"poll": 1.0})
@@ -84,6 +86,36 @@ class RelectureConfigTest(unittest.TestCase):
                                           "AMEESH_CONFIG": self.profil}):
             self.assertTrue(runner.reload_config())
         self.assertEqual(list(runner.cfg.accounts), ["claude"])
+
+    def test_les_champs_figes_ne_suivent_pas_la_relecture(self):
+        """R1 cx2/dev2 : recharger toute la `Config` appliquait le schéma, la
+        base, le dossier d'état et le bail aux workers actifs, alors que la
+        connexion et les baux sont ceux du démarrage. Seuls les champs de
+        `RELOADABLE_FIELDS` suivent le fichier ; les autres restent figés."""
+        runner = self._runner()
+        avant = (runner.cfg.dsn, runner.cfg.schema, runner.cfg.state_dir,
+                 runner.cfg.lease_ttl, runner.cfg.poll,
+                 runner.cfg.budget_check_interval)
+        self._write(self.host, {
+            "budget_usd_per_hour": 250,
+            "accounts": {"deepseek": [{"name": "cle-a"}]},
+            "dsn": "postgresql://autre/base", "schema": "autre",
+            "state_dir": os.path.join(self.tmp, "autre-etat"),
+            "lease_ttl": 700, "poll": 99, "budget_check_interval": 5,
+        })
+        with mock.patch.dict(os.environ, {"HOME": self.home,
+                                          "AMEESH_CONFIG": self.profil}):
+            # le fichier a bien été lu et portait ces valeurs…
+            lu = config_mod.load(env={"AMEESH_CONFIG": self.profil})
+            self.assertEqual((lu.schema, lu.lease_ttl), ("autre", 700.0))
+            self.assertTrue(runner.reload_config())
+        # …mais l'exécuteur en cours garde ce qui a décidé sa connexion et ses
+        # baux ; le champ rechargeable, lui, suit
+        self.assertEqual(runner.cfg.budget_usd_per_hour, 250.0)
+        self.assertEqual(
+            (runner.cfg.dsn, runner.cfg.schema, runner.cfg.state_dir,
+             runner.cfg.lease_ttl, runner.cfg.poll,
+             runner.cfg.budget_check_interval), avant)
 
     def test_un_fichier_casse_ne_remplace_rien(self):
         runner = self._runner()
@@ -146,12 +178,18 @@ class RelectureConfigTest(unittest.TestCase):
         self.assertTrue(faux.wake.is_set())
         self.assertEqual(faux.state_dir, runner.cfg.agent_dir("agent-1"))
 
-    def test_apply_config_du_worker_reprend_le_dossier_d_etat(self):
+    def test_le_worker_prend_la_config_au_tour_suivant(self):
+        """R1 cx2 : la configuration relue n'entre pas au milieu d'un tour ;
+        le worker la prend à sa frontière de tour."""
         cfg = self._cfg()
-        worker = SimpleNamespace(name="agent-2", cfg=None, state_dir="")
+        worker = SimpleNamespace(name="agent-2", cfg="celle-du-tour",
+                                 _cfg_pending=None)
         AgentWorker.apply_config(worker, cfg)
+        self.assertEqual(worker.cfg, "celle-du-tour")     # rien au milieu du tour
+        AgentWorker._apply_pending_config(worker)
         self.assertIs(worker.cfg, cfg)
-        self.assertEqual(worker.state_dir, cfg.agent_dir("agent-2"))
+        AgentWorker._apply_pending_config(worker)          # idempotent
+        self.assertIs(worker.cfg, cfg)
 
 
 if __name__ == "__main__":

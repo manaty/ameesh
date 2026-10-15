@@ -12,8 +12,10 @@ Désormais un profil est une **superposition** : les clés qu'il ne déclare pas
 viennent de `config.json`. Ses propres clés l'emportent (une isolation voulue
 se déclare), et l'écart est retenu (`config_shadowed`, `config_source`) pour
 rester visible. `"inherit": false` rend un profil autonome ; `"inherit":
-"<chemin>"` nomme une autre base. Hors du dossier de l'hôte, un fichier reste
-autonome : le banc de tests ne lit jamais la configuration du poste.
+"<chemin>"` nomme une autre base ; `"inherit": true` force l'héritage. Hors du
+dossier des profils (`runner-profiles/`), un fichier reste autonome : le banc
+de tests, et la configuration d'une autre base rangée à côté de `config.json`,
+ne lisent jamais la configuration du poste.
 """
 from __future__ import annotations
 
@@ -101,6 +103,27 @@ class ConfigProfilTest(unittest.TestCase):
         self.assertEqual(cfg.host, "ailleurs")
         self.assertEqual(cfg.config_base, "")
         self.assertEqual(cfg.config_shadowed, ())
+
+    def test_un_fichier_a_cote_de_config_json_reste_autonome(self):
+        """Revue Claude #1466 : `config-ancienne-base.json`, la configuration
+        d'une AUTRE base rangée à côté de `config.json`, n'emprunte pas les clés
+        de l'hôte (ni comptes, ni `github`, ni `critical_agents`)."""
+        ancienne = self._write(os.path.join(self.cfgdir, "config-ancienne-base.json"),
+                               {"host": "ancienne"})
+        cfg = self.load(AMEESH_CONFIG=ancienne)
+        self.assertEqual(cfg.accounts, {})
+        self.assertEqual(cfg.host, "ancienne")
+        self.assertEqual(cfg.config_base, "")
+        self.assertEqual(cfg.config_source, ancienne)
+
+    def test_inherit_vrai_force_l_heritage_hors_du_dossier_des_profils(self):
+        """`"inherit": true` reste l'échappatoire explicite d'un fichier rangé
+        ailleurs sous le dossier de l'hôte."""
+        ancienne = self._write(os.path.join(self.cfgdir, "config-ancienne-base.json"),
+                               {"inherit": True, "host": "ancienne"})
+        cfg = self.load(AMEESH_CONFIG=ancienne)
+        self.assertEqual(cfg.accounts, {"deepseek": [{"name": "cle-a", "hourly_usd": 100}]})
+        self.assertEqual(cfg.config_base, self.host)
 
     def test_une_base_explicite_se_nomme(self):
         ailleurs = self._write(os.path.join(self.tmp, "ailleurs.json"),

@@ -344,6 +344,10 @@ class AgentWorker(threading.Thread):
         self.runner = runner
         self.db = runner.db
         self.cfg = runner.cfg
+        #: #1466 : configuration relue, prise au début du tour suivant (jamais
+        #: au milieu d'un tour, où schéma, dossier d'état et comptes doivent
+        #: rester cohérents du début à la fin)
+        self._cfg_pending: Config | None = None
         self.name = agent["name"]
         self.epoch = int(lease["lease_epoch"])
         self.agent = agent
@@ -540,12 +544,20 @@ class AgentWorker(threading.Thread):
         self._resume_load()
 
     def apply_config(self, cfg: Config) -> None:
-        """Le fichier de configuration a été relu (#1466) : ce worker suit la
-        nouvelle configuration. Tout ce qu'il lit à chaque tour (comptes,
-        plafonds, rôles critiques) passe par `self.cfg` ; seul `state_dir`
-        était recopié au démarrage."""
+        """Le fichier de configuration a été relu (#1466) : ce worker prendra la
+        nouvelle configuration au début de son prochain tour. Rien n'est changé
+        au milieu d'un tour : le schéma, la base et le dossier d'état d'un tour
+        en cours restent ceux avec lesquels il a démarré (R1 cx2)."""
+        self._cfg_pending = cfg
+
+    def _apply_pending_config(self) -> None:
+        """Frontière de tour (#1466) : la configuration relue entre en vigueur
+        ici, avant tout ce qui la lit (comptes, plafonds, rôles critiques)."""
+        cfg = self._cfg_pending
+        if cfg is None:
+            return
+        self._cfg_pending = None
         self.cfg = cfg
-        self.state_dir = cfg.agent_dir(self.name)
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -3510,6 +3522,7 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
+        self._apply_pending_config()  # #1466 : frontière de tour
         self.fast_failure = False
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
@@ -5205,6 +5218,24 @@ class AgentWorker(threading.Thread):
             self.release_lease()
 
 
+#: #1466 : les seuls champs qu'une relecture à chaud reprend du fichier. Liste
+#: explicite, et non « tout sauf » : un champ nouveau reste figé tant qu'on ne
+#: l'ajoute pas ici. Sont rechargeables ce qui décide une pause budget et la
+#: lecture des comptes ; le reste (hôte, bail, dsn, schéma, dossier d'état,
+#: cadences, porte d'hôte) a décidé des baux et des connexions en cours : le
+#: changer sous un tour actif romprait ce qui tourne (R1 cx2 et dev2 sur #1466 :
+#: schéma et `state_dir` appliqués aux workers sans reconnexion).
+RELOADABLE_FIELDS = frozenset({
+    # provenance de la lecture (journal de l'exécuteur, `ameesh doctor`)
+    "config_path", "config_base", "config_shadowed",
+    # comptes, plafonds et rôles : la décision de pause budget
+    "accounts", "budget_usd_per_hour", "budget_usd_per_day", "budget_explicit",
+    "critical_agents", "noncritical_hourly_share", "critical_fallback_harnesses",
+    # binaires de harnais de l'hôte (L106), lus au lancement de chaque tour
+    "harness_bins",
+})
+
+
 class Runner:
     def __init__(
         self,
@@ -5224,8 +5255,10 @@ class Runner:
         except ValueError as exc:
             raise SystemExit("agent-runner: %s" % exc) from exc
         self.cfg = cfg
-        #: #1466 : options de ligne de commande (hôte, bail, sondage, réveil)
-        #: réappliquées à chaque relecture du fichier de configuration
+        #: #1466 : options de ligne de commande (hôte, bail, sondage, réveil),
+        #: décidées au démarrage. Elles ne se relisent pas — comme tous les
+        #: champs hors `RELOADABLE_FIELDS` — et sont gardées ici pour la trace
+        #: (l'hôte et le bail ont décidé les baux en cours).
         self._cfg_overrides = dict(cfg_overrides or {})
         #: #1466 : empreinte des fichiers lus au dernier chargement
         self._config_stamp = self.config_stamp()
@@ -5866,11 +5899,13 @@ class Runner:
         Un exécuteur gardait la configuration de son démarrage : un compte
         retiré, un plafond relevé ou un profil corrigé restaient sans effet
         jusqu'au redémarrage, et des agents restaient en pause sur un plafond
-        périmé. Tout ce que la décision de pause lit à chaque tour (comptes,
-        plafonds, rôles critiques, part non critique, harnais de repli,
-        binaires de harnais) suit désormais le fichier. Les cadences et délais
-        figés au démarrage (bail, sondage, intervalles, porte d'hôte) gardent
-        leur valeur jusqu'au redémarrage.
+        périmé. Seuls les champs de `RELOADABLE_FIELDS` — ceux qui décident une
+        pause budget — suivent le fichier. Tout le reste (identité de l'hôte,
+        bail, dsn, schéma, dossier d'état, cadences, porte d'hôte) a décidé des
+        baux et des connexions en cours : le changer sous un tour actif
+        romprait ce qui tourne, il reste figé jusqu'au redémarrage (R1 cx2 et
+        dev2 sur #1466 : schéma et `state_dir` appliqués aux workers sans
+        reconnexion, `refresh_host_limits` relisant `cfg.lease_ttl`).
 
         Un fichier cassé ou disparu ne remplace rien : la dernière
         configuration valide reste en vigueur, et le refus est journalisé une
@@ -5888,31 +5923,27 @@ class Runner:
             log_async("config reload refused: %s missing" % ", ".join(disparus))
             return False
         try:
-            fresh = load_config()
+            lu = load_config()
         except SystemExit as exc:
             log_async("config reload refused: %s" % exc)
             return False
-        if fresh.config_path != self.cfg.config_path:
+        if lu.config_path != self.cfg.config_path:
             log_async("config reload refused: now reads %s, started on %s"
-                      % (fresh.config_path or "defaults", self.cfg.config_path))
+                      % (lu.config_path or "defaults", self.cfg.config_path))
             return False
-        # l'identité de l'exécuteur (hôte, bail), son stockage (base, schéma,
-        # serveur médié, dossier d'état : la connexion et les sessions ouvertes
-        # au démarrage) et les options de ligne de commande ne se rechargent
-        # pas : elles ont décidé les baux et les tours en cours
-        gelés = {name: getattr(self.cfg, name) for name in (
-            "host", "runner_id", "dsn", "schema", "driver", "backend",
-            "exec_url", "state_dir")}
-        gelés.update(self._cfg_overrides)
-        fresh = dataclasses.replace(fresh, **gelés)
+        # liste explicite : ce qui n'y est pas garde la valeur du démarrage, y
+        # compris un champ nouveau (le défaut sûr est de ne pas le relire) ;
+        # l'identité de l'exécuteur, son stockage (base, schéma, serveur médié,
+        # dossier d'état) et les options de ligne de commande ont décidé les
+        # baux et les tours en cours
+        fresh = dataclasses.replace(
+            self.cfg, **{nom: getattr(lu, nom) for nom in RELOADABLE_FIELDS})
         if fresh == self.cfg:
             return False
         avant = self.cfg
         self.cfg = fresh
-        # les scalaires que `budget_limits` et la cadence de pause avaient
-        # recopiés au démarrage
+        # le scalaire que `budget_limits` avait recopié au démarrage
         self.budget_usd_per_hour = max(0.0, fresh.budget_usd_per_hour)
-        self.budget_check_interval = max(1.0, fresh.budget_check_interval)
         adapters.configure(fresh)  # L106 : `harness_bins` de l'hôte
         with self.lock:
             workers = list(self.workers.values())
