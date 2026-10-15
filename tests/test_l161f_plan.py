@@ -1958,7 +1958,9 @@ class WorkflowTest(unittest.TestCase):
         # plan en produisait une, l'agrégat requis rougit au lieu de verdir
         # sans tests.
         job = self.text[self.text.index("\n  tests:\n"):]
-        self.assertIn('if [ "$CI_EVENT" = "pull_request" ]; then', job)
+        # #940 : l'agrégat n'admet que les expressions de son contrat et garde
+        # `github.event_name` dans le script (pas d'`env:` intercalé).
+        self.assertIn('if [ "${{ github.event_name }}" = pull_request ]; then', job)
         self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
         self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
 
