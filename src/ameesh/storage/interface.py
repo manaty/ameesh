@@ -3281,6 +3281,26 @@ class Handoffs(Domain):
     def unfence(self, operation: str, expected: str, state: str) -> dict | None: ...
 
 
+class PrevalidationReports(Domain):
+    """Rapports de prévalidation au gel (#1770, 0450) : une ligne par (lot, tête).
+
+    Le rapport `ameesh-prevalidation/1` est une preuve, pas un verdict : il ne
+    remplace ni la désignation au gel (#1617) ni le gel dérivé (#1756)."""
+
+    @abc.abstractmethod
+    def record(self, report: dict) -> None:
+        """Écrit le rapport de sa clé (lot, tête), après le run distant ;
+        réécrire la même clé remplace le rapport courant."""
+
+    @abc.abstractmethod
+    def report(self, work_item_id: int, head_sha: str) -> dict | None:
+        """Le rapport enregistré pour cette tête exacte, ou None."""
+
+    @abc.abstractmethod
+    def latest(self, work_item_id: int) -> dict | None:
+        """Le rapport le plus récent du lot (toute tête), ou None."""
+
+
 # --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
@@ -3336,3 +3356,4 @@ class Storage(abc.ABC):
     ci: CiResults
     conversations: Conversations
     handoffs: Handoffs
+    prevalidation: PrevalidationReports

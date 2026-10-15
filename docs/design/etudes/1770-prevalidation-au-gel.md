@@ -72,8 +72,24 @@ ameesh work prevalidate <lot> --sha <tête> --plan <plan.json> --host <vm>
   distant** (`git ls-remote`) : une tête qui a bougé invalide le rapport
   (`head-moved`) ;
 - le rapport `ameesh-prevalidation/1` est imprimé (`--json`) ; code de sortie 0
-  si vert, 1 sinon. **Aucun jalon, aucun verdict, aucune écriture** : l'accroche
-  automatique du gel n'existe pas encore.
+  si vert, 1 sinon. **Aucun jalon, aucun verdict** : l'accroche automatique du
+  gel n'existe pas encore.
+
+## Rapport persisté (0450)
+
+Le rapport est enregistré dans `prevalidation_reports` (migration 0450), clé
+`(work_item_id, head_sha)` : une tête candidate a un seul rapport courant,
+réécrire la même clé remplace le précédent. `outcome`, `ok` et `causes` sont
+recopiés du rapport complet pour la lecture courte de l'accroche ; `report`
+garde le rapport entier (modules, parts, tests, hôte, durée).
+
+L'écriture a lieu **après** le run distant, en une instruction hors de toute
+transaction : aucun verrou de base n'est tenu pendant que la VM exécute la
+sélection. Un refus avant run (`block-missing`, `no-vm`,
+`selection-unsafe`) n'écrit rien ; un run rouge ou incomplet est un résultat et
+s'enregistre (`ok` faux). Le rapport n'est pas un verdict : il ne remplace ni
+#1617 (désignation au gel) ni #1756 (gel dérivé), et son écriture n'active
+aucune règle.
 
 Tant que le bloc canon n'est pas publié, la commande refuse donc toujours :
 c'est l'effet voulu de l'ordre de mise en service.

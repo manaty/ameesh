@@ -490,6 +490,16 @@ def validate(*, lot: int, plan_path: str, head: str, host: str, params,
                         head_after=after)
 
 
+def record(conn, report: dict) -> None:
+    """Persiste le rapport APRÈS le run distant (0450), hors de toute transaction.
+
+    Rien n'est écrit avant l'exécution : aucun verrou de base n'est tenu pendant
+    que la VM exécute la sélection. Le rapport n'est pas un verdict (#1617,
+    #1756) ; cette écriture n'active aucune règle."""
+    from . import storage
+    storage.of(conn).prevalidation.record(report)
+
+
 # --------------------------------------------------------------------------
 # la commande explicite : refus nommé, aucun jalon, accroche automatique inactive
 # --------------------------------------------------------------------------
@@ -554,6 +564,7 @@ def run(cfg, db, args) -> int:
         else:
             print("prévalidation refusée : %s" % exc)
         return 1
+    record(db, report)  # le rapport s'écrit après le run, hors transaction
     if getattr(args, "json", False):
         print(json.dumps(report, sort_keys=True))
     elif report["ok"]:
