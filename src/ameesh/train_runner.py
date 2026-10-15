@@ -84,6 +84,10 @@ class Passage:
             raise train.TrainError("compiled mechanics belongs to another commit or project")
         if rules.ci_packet != "full":
             raise train.TrainError("train requires full packet CI in the compiled canon")
+        if not getattr(rules, "packet_cutoffs", None) \
+                or not callable(getattr(rules, "last_packet", None)) \
+                or not callable(getattr(rules, "next_packet", None)):
+            raise train.TrainError("explicit compiled packet calendar required; no release fallback")
         # Missing fields never resurrect the old named-fire requirement.
         # Unsupported process changes require an explicit adapter first.
         try:
@@ -124,9 +128,10 @@ class Passage:
         if not self.policy.enabled:
             return {"result": "off"}, None
         runtime = self.runtime(db)
-        deadline = runtime.policy.schedule.next_cutoff(now)
-        if not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline <= now:
-            raise train.TrainError("compiled canon must provide a future cutoff")
+        deadline = runtime.policy.schedule.next_packet(now)
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
+                or not math.isfinite(deadline) or deadline <= now:
+            raise train.TrainError("compiled canon must provide a future packet cutoff")
         return self._step(runtime, now), deadline
 
     def _step(self, runtime, now):

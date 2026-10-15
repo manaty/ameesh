@@ -35,8 +35,17 @@ dernier commit vert), puis tague et déploie en staging. Cette sélection
 ne demande aucune composition supplémentaire au train. Le calendrier des
 paquets et celui des releases doivent être distingués par le contrat
 mécanique. `home#94` ne contient pas encore `processus/mecanique.yaml` :
-le port horaire est demandé à l'auteur de #1616, sans remplacer sa source
-par un intervalle local. L'ancien calendrier autonome de 11 h/23 h reste
+le port horaire est confié à impl07 dans #1757 après son P1 #1749, sans
+remplacer sa source par un intervalle local. Mesh-design le qualifie le
+15 octobre à 20:04 : `packets.cutoffs` fournit `packet_cutoffs`, `packets_on`,
+`last_packet(now)` (borne incluse) et `next_packet(now)` (strictement future).
+Le consommateur exige ces ports, sans repli sur `cutoff`/`next_cutoff` des
+releases. Son calendrier reste celui du même objet compilé que les avis et
+l'autorité de fusion. L'absence de créneaux ou de méthode refuse avant
+réservation ; les bornes temporelles sont vérifiées avant composition.
+Après une CI longue, le passage reprend le dernier créneau fourni à
+l'instant courant, sans rafale pour rattraper les créneaux manqués.
+L'ancien calendrier autonome de 11 h/23 h reste
 uniquement un banc de préparation ; aucun profil actif ne le sélectionne.
 
 L'intention est conservée en base, dans `integration_trains` (migration
@@ -320,7 +329,7 @@ passage. Le service appartient à l'arrêt du runner et son fil est ajouté aux
 fils vérifiés avant la sortie sûre.
 
 Le démarrage reprend l'intention persistante. Ensuite le même objet compilé
-qui sert au moteur fournit `next_cutoff` pour la prochaine échéance, sans
+qui sert au moteur fournit `next_packet` pour la prochaine échéance, sans
 date ni cadence de balayage locale. Un événement explicite appelle
 `train_service.event(kind=..., project=..., target=...)` (types `ci-terminal`,
 `verdict`, `fire`), avec projet et cible exacts ; les autres types et cibles
@@ -336,7 +345,7 @@ Raccord #1616 (contrat impl07 du 15 octobre à 12:43, corrigé à
 le fournisseur explicite `mechanics`, et appelle
 `mechanics.load(policy_path, policy_commit, project.name)` à chaque passage.
 Il refuse le mode par intervalle et toute CI canon autre que `full`.
-Le même objet compilé fournit `Policy.schedule.cutoff`,
+Le même objet compilé fournit `Policy.schedule.last_packet`,
 `train_policy.Compiled.reviews_for` et les familles/règles d'indépendance de
 `train_history.Recorded`. Le lecteur autonome `Versioned` reste disponible
 pour les appels de préparation ; le passage ne s'y replie jamais. Une règle

@@ -54,7 +54,11 @@ class Policy:
             raise ValueError("positive train limits expected")
 
     def cutoff(self, now):
-        return self.schedule.cutoff(now) if self.schedule is not None else cutoff(now)
+        at = self.schedule.last_packet(now) if self.schedule is not None else cutoff(now)
+        if isinstance(at, bool) or not isinstance(at, (int, float)) \
+                or not math.isfinite(at) or at > now:
+            raise TrainError("compiled canon must provide a packet cutoff at or before now")
+        return at
 
 
 def digest(value) -> str:

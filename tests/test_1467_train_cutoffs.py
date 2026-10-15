@@ -27,8 +27,31 @@ class CutoffTest(unittest.TestCase):
         return train.Engine(self.ports, source="github.com/o/r", target="main",
                             policy=train.Policy(enabled=True, **policy))
 
+    def test_compiled_packet_cutoff_cannot_be_unknown_nonfinite_or_future(self):
+        now = stamp("2026-10-15T12:00:00")
+        for at in (None, True, float("nan"), float("inf"), now + 1):
+            with self.subTest(at=at), self.assertRaises(train.TrainError):
+                train.Policy(schedule=types.SimpleNamespace(last_packet=lambda _: at)).cutoff(now)
+
+    def test_long_ci_resumes_latest_hour_without_a_catchup_burst(self):
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1)], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        self.assertEqual(engine.step(stamp("2026-10-15T14:00:00"))["result"], "ci")
+        self.assertEqual(len(self.ports.probes), 1)
+        self.ports.ci_by_head[first["head"]] = "green"
+        self.assertEqual(engine.step(stamp("2026-10-15T14:00:01"))["result"], "landed")
+        self.ports.rows = [admitted(2, "2026-10-15T12:00:00")]
+        second = engine.step(stamp("2026-10-15T14:00:02"))["plan"]
+        self.ports.ci_by_head[second["head"]] = "green"
+        self.assertEqual(engine.step(stamp("2026-10-15T14:00:03"))["result"], "landed")
+        self.ports.rows = [admitted(3, "2026-10-15T13:00:00")]
+        self.assertEqual(engine.step(stamp("2026-10-15T14:00:04"))["result"], "idle")
+        self.assertEqual(engine.step(stamp("2026-10-15T15:00:00"))["result"], "ci")
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 3)
+
     def test_withdrawn_packet_drains_its_ci_before_next_hour_can_compose(self):
-        schedule = types.SimpleNamespace(cutoff=lambda now: now - now % 3600)
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
         engine = self.engine([admitted(1)], schedule=schedule)
         first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
         self.ports.rows = [admitted(2, "2026-10-15T11:01:00")]

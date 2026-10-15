@@ -32,16 +32,17 @@ class TrainServiceTest(unittest.TestCase):
         passage = train_runner.Passage.__new__(train_runner.Passage)
         passage.policy = train.Policy(enabled=True)
         runtime = mock.Mock()
-        runtime.policy.schedule.next_cutoff.return_value = 1234
+        runtime.policy.schedule.next_packet.return_value = 1234
         passage.runtime = mock.Mock(return_value=runtime)
         passage._step = mock.Mock(return_value={"result": "ci"})
         db = object()
         self.assertEqual(passage.scheduled_step(db, 100), ({"result": "ci"}, 1234))
         passage.runtime.assert_called_once_with(db)
-        runtime.policy.schedule.next_cutoff.assert_called_once_with(100)
+        runtime.policy.schedule.next_packet.assert_called_once_with(100)
+        runtime.policy.schedule.next_cutoff.assert_not_called()
         passage._step.assert_called_once_with(runtime, 100)
-        for deadline in (100, 99, float("nan"), float("inf")):
-            runtime.policy.schedule.next_cutoff.return_value = deadline
+        for deadline in (True, 100, 99, float("nan"), float("inf")):
+            runtime.policy.schedule.next_packet.return_value = deadline
             with self.assertRaises(train.TrainError):
                 passage.scheduled_step(db, 100)
         self.assertEqual(passage._step.call_count, 1)

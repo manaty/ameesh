@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Cross-branch #1467/#1616 probe; SQL/Git real, CI/provenance fixtures.
+"""Cross-branch #1467/#1616/#1757 probe; Git/SQL real, CI/provenance fixtures.
 
 PYTHONPATH=src ameesh heavy -- .venv/bin/python reviews/1467-mechanics-port/probe.py \
-    --supplier . --commit 53cf2e01c90fbc07233f865a68c4d44fab5c096c
+    --supplier . --commit <exact-1757-supplier-commit>
 
 Only the supplier's exact mechanics.py object is loaded. No branch merge,
 canon checkout, production connection, runner installation or remote API.
@@ -24,6 +24,8 @@ from tests.test_1467_train_runner import TrainRunnerTest
 MECHANICS = """schema: ameesh-mechanics/1
 timezone: Europe/Paris
 cutoffs: ["11:00", "23:00"]
+packets:
+  cutoffs: ["11:00", "23:00"]
 build:
   max_in_build: 2
 ci:
@@ -51,12 +53,16 @@ def stamp(hour):
 class RealMechanicsTest(TrainRunnerTest):
     def hourly_canon(self):
         hours = json.dumps(["%02d:00" % hour for hour in range(24)])
-        return self.revise(MECHANICS.replace('["11:00", "23:00"]', hours)
+        return self.revise(MECHANICS.replace('  cutoffs: ["11:00", "23:00"]',
+                                            '  cutoffs: ' + hours)
                            .replace("named_fire: true", "named_fire: false"))
 
     def test_real_hourly_calendar_keeps_pending_packet_across_restart(self):
         commit = self.hourly_canon()
         passage = self.passage(policy_commit=commit)
+        rules = passage.runtime(self.db).policy.schedule
+        self.assertEqual(rules.cutoff(stamp("12")), stamp("11"))
+        self.assertEqual(rules.last_packet(stamp("12")), stamp("12"))
         first, deadline = passage.scheduled_step(self.db, stamp("12"))
         self.assertEqual(first["result"], "ci", first)
         self.assertEqual(deadline, stamp("13"))
@@ -130,9 +136,18 @@ class RealMechanicsTest(TrainRunnerTest):
         self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
         self.assertEqual(self.api_calls, [])
 
+    def test_absent_packet_calendar_never_uses_release_cutoffs(self):
+        document = MECHANICS.replace('packets:\n  cutoffs: ["11:00", "23:00"]\n', "")
+        commit = self.revise(document)
+        with self.assertRaisesRegex(train.TrainError, "explicit compiled packet calendar"):
+            self.passage(policy_commit=commit).step(self.db, self.now)
+        self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
+        self.assertEqual(self.api_calls, [])
+
     def test_real_next_cutoff_and_engine_use_the_changed_canon(self):
         self.queued_at_ten()
-        commit = self.revise(MECHANICS.replace('"11:00"', '"12:00"'))
+        commit = self.revise(MECHANICS.replace('  cutoffs: ["11:00", "23:00"]',
+                                              '  cutoffs: ["12:00", "23:00"]'))
         passage = self.passage(policy_commit=commit)
         result, deadline = passage.scheduled_step(self.db, stamp("11"))
         self.assertEqual(result["result"], "idle", result)
@@ -162,7 +177,8 @@ class RealMechanicsTest(TrainRunnerTest):
         self.queued_at_ten()
         before = self.passage(policy=train.Policy(enabled=True)).runtime(self.db)
         self.assertEqual(before.policy.cutoff(stamp("11")), stamp("11"))
-        commit = self.revise(MECHANICS.replace('"11:00"', '"12:00"'))
+        commit = self.revise(MECHANICS.replace('  cutoffs: ["11:00", "23:00"]',
+                                              '  cutoffs: ["12:00", "23:00"]'))
         passage = self.passage(policy=train.Policy(enabled=True), policy_commit=commit)
         self.assertEqual(passage.step(self.db, stamp("11"))["result"], "idle")
         self.assertEqual(self.api_calls, [])

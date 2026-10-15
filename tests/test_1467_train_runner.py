@@ -31,11 +31,19 @@ class FixtureMechanics(train_policy.Versioned):
     merge_post_merge_red = "forward_or_revert"
     families = ("codex", "claude", "deepseek")
     exclude_author_family = distinct_families = True
-    cutoff = staticmethod(train.cutoff)
+    # Independent packet calendar fixture; the release methods must never
+    # schedule a train. #1757's real supplier is exercised by the port probe.
+    packet_cutoffs = ("11:00", "23:00")
+    last_packet = staticmethod(train.cutoff)
 
-    def next_cutoff(self, now):
+    def next_packet(self, now):
         # Explicit fixture calendar; real provider/DST tested by the port probe.
         return now + 1234
+
+    def cutoff(self, now):
+        raise AssertionError("release calendar must not schedule a packet")
+
+    next_cutoff = cutoff
 
     @property
     def review_policy(self):
@@ -178,7 +186,7 @@ class TrainRunnerTest(PgTestCase):
 
     def test_scheduled_passage_uses_compiled_calendar_with_real_sql_and_reservation(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
-        rules.next_cutoff = mock.Mock(return_value=self.now + 1234)
+        rules.next_packet = mock.Mock(return_value=self.now + 1234)
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
         passage = self.passage()
@@ -186,9 +194,21 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(result["result"], "ci", result)
         self.assertEqual(deadline, self.now + 1234)
         self.mechanics.load.assert_called_once()
-        rules.next_cutoff.assert_called_once_with(self.now)
+        rules.next_packet.assert_called_once_with(self.now)
         self.assertEqual(self.passage(owner="competing").step(self.db, self.now)["result"], "busy")
         self.assertEqual(self.ops.train_read(self.key)["plan"]["head"], result["plan"]["head"])
+
+    def test_release_calendar_cannot_replace_absent_packet_calendar(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        for fields in (dict(packet_cutoffs=None), dict(packet_cutoffs=()),
+                       dict(last_packet=None), dict(next_packet=None)):
+            with self.subTest(fields=fields), mock.patch.multiple(rules, **fields):
+                with self.assertRaisesRegex(train.TrainError, "explicit compiled packet calendar"):
+                    self.passage().step(self.db, self.now)
+        self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
+        self.assertEqual(self.api_calls, [])
 
     def test_competing_runner_cannot_touch_the_reserved_train_or_share_its_clone(self):
         first, second = self.passage(), self.passage(owner="runner-b")
@@ -226,7 +246,7 @@ class TrainRunnerTest(PgTestCase):
         # The calendar is a trusted compiled port. Choosing times relative
         # to the actual queue timestamp keeps this independent of wall time.
         queued = self.ops.queue(None)[0]["queued_ts"]
-        rules.cutoff = lambda now: queued - 1 if now < queued + 100 else queued + 100
+        rules.last_packet = lambda now: queued - 1 if now < queued + 100 else queued + 100
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
         passage = self.passage(policy=train.Policy(enabled=True))
