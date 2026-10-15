@@ -382,7 +382,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L225 (0059) : raison d'un tour facturé au repli prudent
         'price_fallback',
         -- L225 (0059) : écritures de cache Claude du tour
-        'cache_write_tokens'
+        'cache_write_tokens',
+        -- #1469 (0443) : compte de facturation qui porte la dépense
+        'billing_account'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
@@ -460,6 +462,15 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('budget_events', ARRAY[
         'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
+    ]),
+    -- #1469 (0443) : enveloppe par compte de facturation et réservations des
+    -- tours, de l'ÉTAT comptable (montants, jour, clé), aucun contenu
+    ('account_budgets', ARRAY[
+        'billing_account', 'usd_per_day', 'tz', 'set_by', 'updated_at'
+    ]),
+    ('account_reservations', ARRAY[
+        'id', 'billing_account', 'agent', 'usd', 'period', 'state', 'spend_key',
+        'created_at', 'closed_at', 'closed_by'
     ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[

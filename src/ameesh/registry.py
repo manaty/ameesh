@@ -333,6 +333,20 @@ def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = No
     return storage.of(db).pending_spend.put(name, start_index, turn, model)
 
 
+def pending_spend_begin(db: Db, name: str, start_index: int, turn: str | None = None,
+                        model: str | None = None) -> dict | None:
+    """Write and capture one marker atomically on PostgreSQL (#1469).
+
+    The mediated backend keeps its fenced write; its operations are separate.
+    """
+    api = storage.of(db).pending_spend
+    if hasattr(api, "put_get"):
+        return _pending_spend_row(api.put_get(name, start_index, turn, model))
+    if not api.put(name, start_index, turn, model):
+        return None
+    return pending_spend_get(db, name)
+
+
 def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
     """Remplace le modèle du marqueur par celui **annoncé par le flux** (L13 B4).
 
@@ -346,7 +360,10 @@ def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
 
 def pending_spend_get(db: Db, name: str) -> dict | None:
     """Le marqueur comptable en attente, ou None (aucun travail suspendu)."""
-    row = storage.of(db).pending_spend.get(name)
+    return _pending_spend_row(storage.of(db).pending_spend.get(name))
+
+
+def _pending_spend_row(row: dict | None) -> dict | None:
     if row is None:
         return None
     return {
@@ -358,8 +375,20 @@ def pending_spend_get(db: Db, name: str) -> dict | None:
     }
 
 
-def pending_spend_clear(db: Db, name: str) -> bool:
-    return storage.of(db).pending_spend.clear(name)
+def pending_spend_clear(db: Db, name: str, created_ts: float | None = None) -> bool:
+    """Efface le marqueur ; avec `created_ts` (#1469), seulement s'il est encore
+    celui de ce tour — un worker en retard n'efface pas celui de son remplaçant."""
+    api = storage.of(db).pending_spend
+    if created_ts is None:
+        return api.clear(name)
+    if hasattr(api, "clear_if"):
+        return api.clear_if(name, created_ts)
+    # backend médié : pas d'opération conditionnelle, le bail est fencé au serveur
+    row = api.get(name)
+    if row is None or row.get("created_ts") is None \
+            or abs(float(row["created_ts"]) - float(created_ts)) >= 0.0000005:
+        return False
+    return api.clear(name)
 
 
 def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
