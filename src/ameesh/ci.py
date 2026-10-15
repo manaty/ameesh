@@ -384,6 +384,107 @@ def gh_api(gh=None, *, cache_dir=None, ttl=None, clock=None):
     return client.get
 
 
+#: les marqueurs canon d'un message de fusion (`plan_git.WORK_TRAILER_RE`,
+#: `ameesh-work: <id>`). Le commit composé du train #1467 en porte **un par
+#: membre** : le message entier ne désigne donc pas un lot unique.
+def _message_lots(message: str) -> list:
+    from . import plan_git
+    out = []
+    for match in plan_git.WORK_TRAILER_RE.finditer(message or ""):
+        try:
+            out.append(int(match.group(1)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _files_of(entry: dict) -> list:
+    return [str(f.get("filename")) for f in (entry.get("files") or ()) if f.get("filename")]
+
+
+def _author_of(entry: dict) -> str:
+    author = entry.get("author") or {}
+    if author.get("login"):
+        return str(author["login"])
+    return str(((entry.get("commit") or {}).get("author") or {}).get("name") or "")
+
+
+def _summary_of(entry: dict) -> str:
+    message = ((entry.get("commit") or {}).get("message") or "").splitlines()
+    return " ".join(message[0].split())[:160] if message else ""
+
+
+def landed_commits(repo: str, head_sha: str, api=None, *, max_lots: int = 12) -> list:
+    """#1681 : les commits de l'atterrissage qui a produit `head_sha`.
+
+    Rend `[{sha, lot, author, summary, files}]`, la forme attendue par
+    `incident.attribute` : le premier parent de la tête ouvre la comparaison
+    (`repos/<repo>/compare/<parent>...<head>`, le même client `gh api` que le
+    veilleur), et chaque commit porteur du marqueur canon `ameesh-work: <id>`
+    nomme un lot.
+
+    Trois cas, du plus précis au plus prudent :
+
+    * un seul lot — un candidat, avec les fichiers de la comparaison entière ;
+    * un paquet dont chaque lot porte **son** commit de fusion (un marqueur par
+      commit) — un candidat par lot, fichiers de son commit (lus au détail) ;
+    * un paquet composé (**plusieurs marqueurs dans un même message**, le
+      commit final multiparent du train #1467) — les lots sont nommés, mais
+      aucun fichier ne leur est attribué : l'agrégat ne se découpe pas sans la
+      preuve du manifeste (`plan.proof.members[]`), et l'agrégat donnerait à
+      chaque lot les changements des autres. Un candidat sans fichier ne fonde
+      aucune accusation (`incident.attribute`).
+
+    Sans marqueur, un candidat sans lot est rendu : il porte les fichiers, mais
+    ne peut pas fonder une accusation.
+    """
+    if not repo or not head_sha:
+        return []
+    api = api or gh_api()
+    head = api("repos/%s/commits/%s" % (repo, head_sha)) or {}
+    parents = [str(p.get("sha") or "") for p in (head.get("parents") or ()) if p.get("sha")]
+    if not parents:
+        return []
+    compare = api("repos/%s/compare/%s...%s" % (repo, parents[0], head_sha)) or {}
+    commits = list(compare.get("commits") or ())
+    by_lot: dict = {}
+    composed: list = []
+    for entry in commits:
+        lots = _message_lots((entry.get("commit") or {}).get("message") or "")
+        if len(lots) > 1:
+            composed.append((entry, lots))
+        elif lots:
+            by_lot.setdefault(lots[0], []).append(entry)
+    if composed:
+        out = []
+        for entry, lots in composed:
+            for lot in lots[:max_lots]:
+                out.append(dict(sha=str(entry.get("sha") or head_sha), lot=lot,
+                                author=_author_of(entry), summary=_summary_of(entry), files=[]))
+                max_lots -= 1
+                if max_lots <= 0:
+                    return out
+        return out
+    if not by_lot:
+        if not commits:
+            return []
+        last = commits[-1]
+        return [dict(sha=str(last.get("sha") or head_sha), lot=None, author=_author_of(last),
+                     summary=_summary_of(last), files=_files_of(compare))]
+    if len(by_lot) == 1:
+        lot, entries = next(iter(by_lot.items()))
+        last = entries[-1]
+        return [dict(sha=str(last.get("sha") or head_sha), lot=lot, author=_author_of(last),
+                     summary=_summary_of(last), files=_files_of(compare))]
+    out = []
+    for lot, entries in list(by_lot.items())[:max_lots]:
+        last = entries[-1]
+        detail = api("repos/%s/commits/%s" % (repo, last.get("sha"))) or {}
+        out.append(dict(sha=str(last.get("sha") or ""), lot=lot, author=_author_of(last),
+                        summary=_summary_of(last), files=_files_of(detail)))
+    return out
+
+
 def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
     """#845 : le relevé d'une exécution — jobs `queued` (compte et plus
     vieux) et runners qui tiennent un job `in_progress` (`{nom: job}`).
