@@ -349,6 +349,20 @@ class ClientIsolationTest(unittest.TestCase):
         self.assertEqual(api.get("repos/o/r")["visibility"], "private")
         self.assertEqual(len(gh.calls()), 1)
 
+    def test_entree_illisible_repayee(self):
+        """Une date illisible dans une entrée ne fait pas échouer la lecture."""
+        api = self.api()
+        api.get("repos/o/r")
+        path = api.reads._entry_path("repos/o/r", api.scope)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        data["read_ts"] = "abc"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        self.assertIsNone(api.reads.cached("repos/o/r", scope=api.scope))
+        self.assertEqual(api.get("repos/o/r"), {"id": 1})
+        self.assertEqual(len(self.gh.calls), 2)
+
     def test_ressource_du_chemin(self):
         self.assertEqual(plan_github.resource_of("repos/o/r"), "core")
         self.assertEqual(plan_github.resource_of("/search/issues?q=x"), "search")

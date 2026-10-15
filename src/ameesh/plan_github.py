@@ -442,9 +442,12 @@ class SharedReads:
         if not isinstance(data, dict) or data.get("path") != path \
                 or str(data.get("scope") or "") != scope:
             return None
+        try:
+            read_ts = float(data.get("read_ts") or 0.0)
+        except (TypeError, ValueError):
+            return None                # entrée illisible : repayée, jamais une panne
         resource = data.get("resource")
-        return ReadEntry(data.get("value"), data.get("etag"),
-                         float(data.get("read_ts") or 0.0),
+        return ReadEntry(data.get("value"), data.get("etag"), read_ts,
                          str(resource) if resource else None)
 
     def fresh(self, entry: ReadEntry | None, *, now=None, ttl=None) -> bool:
