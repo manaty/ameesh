@@ -511,8 +511,23 @@ def _session_dsh(home: str, session: str) -> None:
     os.makedirs(os.path.join(home, "sessions", "-work", "session-" + session))
 
 
+def _dossier_dsh(home: str, ident: str) -> None:
+    """Le dossier tel que dsh le nomme pour un id REÇU, sans préfixe ajouté."""
+    os.makedirs(os.path.join(home, "sessions", "-work", ident))
+
+
 class DeepSeekTest(_Verifie):
     SESSION = "dsh-0a1b2c3d"
+    #: L'id RÉEL du flux dsh porte déjà le préfixe `session-` (#724, #786).
+    REEL = "session-b126155c-0d1e-4f2a-9b3c-5d6e7f809a1b"
+
+    def _reprises(self) -> list[str | None]:
+        out = []
+        for tour in self.turns():
+            argv = tour["argv"]
+            out.append(argv[argv.index("--session-id") + 1]
+                       if "--session-id" in argv else None)
+        return out
 
     def test_session_dsh_connue_reprise(self):
         home = os.path.join(self.tmp, "dsh-home")
@@ -521,6 +536,30 @@ class DeepSeekTest(_Verifie):
         self._avec_session(worker, self.SESSION)
         self.assertTrue(self._tour(worker, DSH_HOME=home))
         self.assertEqual(self._reprise("--session-id"), self.SESSION)
+
+    def test_session_dsh_reelle_connue_reprise(self):
+        """#786 : le dossier d'un id réel est retrouvé tel quel ; construit en
+        `session-session-…`, il manquait et le tour repartait à vide."""
+        home = os.path.join(self.tmp, "dsh-reel")
+        _dossier_dsh(home, self.REEL)
+        _runner, worker = self._worker("ds-reel", harness="deepseek")
+        self._avec_session(worker, self.REEL)
+        self.assertTrue(self._tour(worker, DSH_HOME=home))
+        self.assertEqual(self._reprise("--session-id"), self.REEL)
+
+    def test_le_tour_du_flux_reprend_l_id_reel(self):
+        """#786 de bout en bout : l'id annoncé par le flux entre au registre,
+        puis le tour suivant le reprend (dossier écrit par dsh pendant le
+        tour) ; sans #724, le 2e tour perd la session et repart à vide."""
+        home = os.path.join(self.tmp, "dsh-flux")
+        _runner, worker = self._worker("ds-flux", harness="deepseek")
+        with mock.patch.dict(os.environ, {"AMEESH_TEST_DSH_SESSION": self.REEL}):
+            self.assertTrue(self._tour(worker, DSH_HOME=home))
+            self.assertEqual(registry.get(self.db, "ds-flux")["session_id"], self.REEL)
+            _dossier_dsh(home, self.REEL)
+            worker.agent = registry.get(self.db, "ds-flux")
+            self.assertTrue(self._tour(worker, DSH_HOME=home))
+        self.assertEqual(self._reprises(), [None, self.REEL])
 
     def test_session_dsh_inconnue_jamais_reprise(self):
         home = os.path.join(self.tmp, "dsh-home-2")

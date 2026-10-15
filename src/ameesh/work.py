@@ -4,8 +4,9 @@ tickets existant (spec §5 point 4).
 
     intake → build → qa → merged → promoted
 
-plus `blocked` et `waiting_human`, et l'état terminal `closed` (abandonné ou
-remplacé par un autre lot : `close`, L29). La boucle `qa → build` est bornée à deux
+plus `blocked` et `waiting_human`, et l'état terminal `closed` (abandonné,
+remplacé par un autre lot, ou livré hors cible : `close`, L29 et #988). La
+boucle `qa → build` est bornée à deux
 allers-retours (comme dans le design d'origine) : au-delà, il faut bloquer le
 lot ou attendre une décision humaine, sinon la boucle coûte des tokens sans fin.
 
@@ -45,8 +46,9 @@ STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_hum
 TERMINAL = ("promoted", "closed")
 #: déjà fusionnés : une fusion constatée n'y change rien
 MERGED_STATES = ("merged", "promoted")
-#: raisons d'une fermeture explicite (`ameesh work close`)
-CLOSE_REASONS = ("abandoned", "superseded")
+#: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
+#: remplacé par un autre lot, ou livré hors cible avec sa tête relue (#988)
+CLOSE_REASONS = ("abandoned", "superseded", "delivered")
 MAX_QA_LOOPS = 2
 FORWARD = {
     "intake": ("build",),
@@ -70,9 +72,10 @@ TRANSITIONS = {
 }
 WAITING = {"blocked", "waiting_human"}
 #: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
-#: vers). Un `promoted` à tort revient en `merged` ; ensuite, les transitions
-#: habituelles (merged → blocked → …) s'appliquent.
-CORRECTIONS = {("promoted", "merged")}
+#: vers). Un `promoted` à tort revient en `merged` ; un `merged` à tort (une
+#: PR d'étape fermée trop tôt, #759) revient en `build` ; ensuite, les
+#: transitions habituelles (merged → blocked → …) s'appliquent.
+CORRECTIONS = {("promoted", "merged"), ("merged", "build")}
 #: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
 CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 #: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
@@ -93,8 +96,11 @@ WAITING_WITHOUT_QUESTION = (
     "request — ameesh decide ask --lot %(id)s --question \"…\" --option a=\"…\" (the "
     "lot moves to waiting_human by itself); a decision written in a mail never counts")
 
-#: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité)
-ITEM_COLUMNS = _pg.ITEM_COLUMNS
+#: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité).
+#: Depuis #705 c'est une fonction : la colonne `reviewer` n'existe qu'après la
+#: migration 0421, et la prod peut être en 0373.
+def item_columns(db) -> str:
+    return _pg.item_columns(db)
 
 
 class WorkError(RuntimeError):
@@ -126,9 +132,11 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
                            "\"%s\"; pass --actor <agent|human:id>" % UNKNOWN_ACTOR)
 
 
-def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> str:
+def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
+              history: bool = True) -> str:
     """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
-    si la correction lui est refusée.
+    si la correction lui est refusée. `what` (#705) nomme le geste dans les
+    messages : la désignation du relecteur demande les mêmes autorités.
 
     Réservée aux humains et aux orchestrateurs ou agents de conception. Une
     session qui porte une identité d'agent (`identity.resolve_binding`) corrige
@@ -147,21 +155,26 @@ def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> 
     # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
     if not binding.ok and (binding.name or binding.source != "none"
                            or os.environ.get("AGENT_MAIL_NAME")):
-        raise WorkError("correction refused: invalid session identity (%s)"
-                        % (binding.reason or "unbound identity"))
-    refus = ("correction refused: %s is neither a human, an orchestrator nor a design agent "
+        raise WorkError("%s refused: invalid session identity (%s)"
+                        % (what, binding.reason or "unbound identity"))
+    refus = ("%s refused: %%s is neither a human, an orchestrator nor a design agent "
              "(orchestrator or design role on its Agent card in the canon, "
-             "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner")
+             "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner" % what)
     if binding.name:
         if text and text != binding.name:
-            raise WorkError("correction refused: this session belongs to %s, it does not "
-                            "correct on behalf of %s" % (binding.name, text))
+            raise WorkError("%s refused: this session belongs to %s, it does not "
+                            "act on behalf of %s" % (what, binding.name, text))
         if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES,
                                        history=history):
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
-        raise WorkError("correction: say who corrects (--actor human:<id>)")
+        # le libellé historique de la correction reste (la CLI `hosts` le
+        # traduit en « hold: say who holds », #254) ; `what` nomme les autres
+        # gestes (#705, « designation »)
+        if what == "correction":
+            raise WorkError("correction: say who corrects (--actor human:<id>)")
+        raise WorkError("%s: say who does it (--actor human:<id>)" % what)
     if text.startswith(HUMAN_PREFIX):
         return text
     human = known_human(db, text, cfg)
@@ -172,6 +185,39 @@ def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> 
                                             history=history):
         return text
     raise WorkError(refus % text)
+
+
+def forcer(cfg, db, explicit: str | None = None) -> str:
+    """#540 : l'auteur d'un `--force "<raison>"`, écrit au journal du lot ;
+    WorkError si la session ne peut pas le prouver. Une session qui porte une
+    identité d'agent force en son nom, jamais au nom d'un autre (`--actor` ou
+    `--from` différent : refus) ; une identité refusée ne retombe pas sur le
+    terminal humain. Une session sans identité (un humain à son terminal)
+    dit qui force, et seulement par une identité humaine explicite
+    (`--actor human:<id>`) : sans liaison, un nom d'agent est refusé (revue
+    r2, B/P2) — sinon n'importe quelle session signerait un forçage au nom
+    d'un agent."""
+    from . import identity
+
+    text = (explicit or "").strip()
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("--force refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("--force refused: this session belongs to %s, it does not "
+                            "force on behalf of %s" % (binding.name, text))
+        return binding.name
+    if not text:
+        raise WorkError("--force: say who forces (--actor human:<id>)")
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "--force refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); an agent forces from its "
+        "own bound session, a human terminal says --actor human:<id>" % text)
 
 
 def pin_authority(cfg, db, actor: str | None = None) -> str | None:
@@ -208,6 +254,7 @@ def add(
     estimate_source: str | None = None,
     size: str | None = None,
     note: str = "",
+    force: str | None = None,
     parent_lot: int | None = None,
     mark_item_id: int | None = None,
     mark_note: str = "",
@@ -231,11 +278,48 @@ def add(
     marque d'idempotence du lot de relecture au journal de ce lot, dans la
     même transaction que la création (`{lot}` y vaut l'identifiant créé).
 
+    #540 : un agent qui a déjà un lot non démarré ne reçoit pas celui-ci : il
+    va dans la file d'équipe (`queued_behind`, `queue_warning`). `force` : la
+    raison d'un forçage (`--force "<raison>"`), écrite au journal avec son
+    auteur ; vide, aucun forçage. L'exemption du lot d'une demande de
+    décision n'est pas un paramètre : `_decision_lot`, interne, réservé à
+    `decisions.ask`.
+
     #1193: `parent_lot` is the explicit parent of a suite lot. The blocking
     edge is written **in the same transaction** as the creation (parent still
     open), traced in the journal if the parent is already finished; an unknown
     parent is refused before any creation. No number is ever guessed from the
-    title or the body."""
+    title or the body.
+
+    Canon §2 (15/10/2026): the returned item carries `route_hint` when the
+    title or the source looks like a non-blocking follow-up (N, P2, P3) — the
+    route to the backlog, to be shown by the caller. Nothing is ever refused:
+    a human request, a blocking defect and the review-after-merge lot pass
+    unchanged."""
+    return _create(db, title=title, type=type, source=source, app=app, body=body,
+                   issue_ref=issue_ref, workstream=workstream, assignee=assignee,
+                   budget_usd=budget_usd, actor=actor, package=package, externe=externe,
+                   cfg=cfg, branch=branch, branch_target=branch_target, priority=priority,
+                   estimate=estimate, estimate_source=estimate_source, size=size,
+                   note=note, force=force, parent_lot=parent_lot,
+                   mark_item_id=mark_item_id, mark_note=mark_note, team_queue=True)
+
+
+def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
+    """#540 : le lot de la question de `requester` (`decisions.ask`), à son
+    nom même s'il a déjà un lot non démarré : il attend la réponse, ce lot
+    ne va jamais dans la file d'équipe. Seul appelant : `decisions.ask`."""
+    return _create(db, title=title, assignee=requester, actor=requester,
+                   source="decision", app=app, cfg=cfg, team_queue=False)
+
+
+def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
+            body="", issue_ref=None, workstream=None, assignee=None, budget_usd=None,
+            actor="", package=None, externe=False, cfg=None, branch=None,
+            branch_target=None, priority=None, estimate=None, estimate_source=None,
+            size=None, note="", force=None, parent_lot=None, mark_item_id=None,
+            mark_note="", team_queue: bool) -> dict:
+    """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
@@ -251,6 +335,7 @@ def add(
         raise WorkError("title required")
     if priority is not None and priority not in PRIORITIES:
         raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
+    queued = None
     if parent_lot is not None:
         try:
             parent_lot = int(parent_lot)
@@ -262,30 +347,45 @@ def add(
             raise WorkError("parent lot #%d not found" % parent_lot)
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
-        assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
+        check = check_assignee(db, assignee, externe=externe, cfg=cfg)
+        assignee = check["assignee"]
+        queued = check if team_queue else None
     elif externe:
         raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
+    created = ("created" + (" (plan: %s)" % package if package else "")
+               + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+               + ("; %s" % note if note else ""))
     item = storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
-        + ("; estimate: %s" % span(minutes * 60) if minutes else "")
-        + ("; %s" % note if note else ""),
+        budget_usd=budget_usd, note=created,
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
         if minutes else None, change_size=size or None,
+        queued_note=queued and _queued_note(queued, created),
+        forced_note=queued and _forced_note(queued, created, force, actor),
         mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
+    if item.get("queued_behind") is not None:
+        item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
     # l'auditeur pour une analyse profonde, tout de suite
     from . import deep_analysis
     analysis = deep_analysis.on_lot_created(db, item, actor=actor, cfg=cfg)
     if analysis is not None:
         item["deep_analysis"] = analysis
+    # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne crée pas de
+    # lot, elle va au backlog. L'avertissement est rendu par la création
+    # elle-même (tous les points d'entrée l'obtiennent) ; rien n'est refusé.
+    from . import backlog
+    hint = backlog.followup_hint(title=item.get("title") or title, source=source,
+                                 issue_ref=issue_ref or "", app=app or "")
+    if hint:
+        item["route_hint"] = hint
     return item
 
 
@@ -374,13 +474,15 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     refusé s'il existe déjà dans le dépôt ou s'il est réservé par un autre lot
     (index unique (dépôt, numéro) : la base tranche, même entre deux
     réservations simultanées). Un lot qui a déjà sa réservation la garde
-    (idempotent). `release` la libère. Rend le lot, avec `migration_file`."""
+    (idempotent). `release` la libère, y compris sur un lot déjà terminal
+    (#956 : un lot fusionné gardait sa réservation et bloquait le numéro).
+    Rend le lot, avec `migration_file`."""
     from . import migrations
 
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
-    if item["state"] in ("merged", "promoted", "closed"):
+    if item["state"] in ("merged", "promoted", "closed") and not release:
         raise WorkError("lot %s already %s: no reservation" % (item_id, item["state"]))
     current = item.get("migration")
     if release:
@@ -533,6 +635,77 @@ _ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> �
                   "an external session with a human owner, add --externe")
 
 
+def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
+    """#705 : le relecteur désigné d'une revue est un nom joignable.
+
+    Un agent du registre, ou un humain (`human:…`, ou un nom nu qui en désigne
+    un, normalisé comme pour l'assignation). Un nom inconnu est refusé : la
+    revue attendrait quelqu'un que ni le courrier ni l'alerte ne peuvent
+    joindre — le défaut que ce lot corrige. Un agent arrêté reste accepté : il
+    porte l'attente et sera relancé à sa reprise.
+    """
+    from . import registry
+
+    name = (reviewer or "").strip()
+    if not name:
+        raise WorkError("empty reviewer")
+    if name.startswith(HUMAN_PREFIX):
+        return name
+    if registry.get(db, name) is not None:
+        return name
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    human = known_human(db, name, cfg)
+    if human:
+        return human
+    raise WorkError("reviewer refused: %s is not in the registry (unknown agent): "
+                    "the review would wait for nobody; register it "
+                    "(agent-runner register …), or name a human (human:<id>)" % name)
+
+
+def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str:
+    """#705 : le relecteur désigné est joignable et relit un AUTRE lot.
+
+    L'assigné du lot ne peut pas être son relecteur : le verdict attendu vient
+    d'ailleurs, sinon la désignation ne corrige rien."""
+    name = check_reviewer(db, reviewer, cfg=cfg)
+    assignee = (item.get("assignee") or "").strip()
+    if assignee and name == assignee:
+        raise WorkError("reviewer refused: %s holds lot #%s — a reviewer reviews "
+                        "another agent's work" % (name, item.get("id")))
+    return name
+
+
+def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
+                       actor: str | None = None) -> dict:
+    """#705 : désigne (ou change) le relecteur d'un lot **déjà en `qa`**.
+
+    Geste de pilote : mêmes autorités que la correction (`corrector`) — un
+    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
+    joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
+    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+    who = corrector(cfg, db, actor, what="designation")
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] != "qa":
+        raise WorkError(
+            "lot %s is %s, not qa: designate the reviewer on the entry to the "
+            "review (ameesh work move %s qa --reviewer <agent>), or with "
+            "ameesh work reviewer %s <agent> once it is in qa"
+            % (item_id, item["state"], item_id, item_id))
+    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
+    row = storage.of(db).work.designate_reviewer(item_id, name, actor=who)
+    if row is None:
+        # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
+        # et elle, le lot a pu quitter qa ou recevoir `name` comme assigné.
+        latest = get(db, item_id)
+        if latest is not None and latest["state"] == "qa":
+            raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
+                            "reviews another agent's work" % (name, item_id))
+        raise WorkError("lot %s left qa in the meantime: retry" % item_id)
+    return row
+
+
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
     """L37 (0030, règle 2) : un lot ne va qu'à un agent qu'ameesh sait réveiller.
 
@@ -549,6 +722,12 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     `human:<id>`, avec un avertissement — `assignee` rendu est alors le nom
     normalisé, à enregistrer. Un canon momentanément invalide ne bloque pas
     l'attribution (avertissement seulement). Les refus disent quoi faire.
+
+    #1021 : un agent réveillable mais en tenue budget/rythme (`account_turn.
+    turn_hold`, la garde de l'exécuteur) est refusé de même : son exécuteur ne
+    lui donnerait pas de tour, le lot dormirait. C'est le point de passage
+    unique des attributions (`work assign`, `work add --assignee`, courrier
+    `--lot`/`--new-lot`, `delegate`, `backlog.auto_take`, `handoff`).
     """
     from . import registry
 
@@ -591,6 +770,21 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
             hint = (" — fix its registration or admission (agent-runner register "
                     "…, canon sync), or assign to a human (human:<id>)")
         raise WorkError("assignment refused: %s%s" % (why, hint))
+    # #1021 : réveillable ne suffit pas — un agent en tenue budget/rythme ou
+    # en échec d'authentification ne sera pas réveillé par son exécuteur et le
+    # lot dormirait (#885/#886/#967, confiés à des agents Codex en pause
+    # budget). Un agent arrêté garde son avertissement : l'arrêt est un geste
+    # humain, réversible, pas une tenue.
+    if row.get("status") not in ("stopped", "dead"):
+        from . import account_turn
+
+        hold = account_turn.turn_hold(cfg, db, name, row)
+        if hold:
+            raise WorkError(
+                "assignment refused: %s is held — %s; its runner will not start a "
+                "turn before the hold lifts: wait for the release, assign another "
+                "agent, or leave the lot unassigned (the team queue takes it)"
+                % (name, hold))
     warnings = []
     if row.get("status") == "stopped":
         warnings.append("%s is stopped (%s): the lot will wait for it to resume"
@@ -602,14 +796,17 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
-           cfg=None, branch: str | None = None, branch_target: str | None = None) -> dict:
+           cfg=None, branch: str | None = None, branch_target: str | None = None,
+           force: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
 
     L118 : `branch` (et `branch_target`) posent aussi la branche du lot ; avec
     une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
-    la branche est posée)."""
+    la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
+    du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
+    pas son propre travail."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -630,13 +827,79 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         # L40 (0030) : la réassignation efface la délégation en cours
         "; delegation from %s cancelled" % item["delegated_by"]
         if item.get("delegated_by") and item.get("due_ts") else "")
+    queued = _queued_note(check, "not assigned to %s (before: %s, now: nobody)"
+                          % (check["assignee"], previous or "nobody"))
     row = storage.of(db).work.assign(item_id, check["assignee"], current=previous, note=note,
-                                     actor=actor)
+                                     actor=actor, queued_note=queued,
+                                     forced_note=queued and _forced_note(check, note, force,
+                                                                         actor))
     if row is None:
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
+    behind = row.get("queued_behind")
     if branch:
         row = set_branch(db, item_id, branch, branch_target, actor=actor)
-    return {"item": row, "check": check, "previous": previous}
+    out = {"item": row, "check": check, "previous": previous}
+    if behind is not None:
+        row["queued_behind"] = behind
+        out["queue_warning"] = queue_warning(db, row, check["assignee"])
+    return out
+
+
+def takes_rule(check: dict) -> bool:
+    """#540 : l'assigné normalisé par `check_assignee` est soumis à la règle
+    « au plus un lot non démarré » (ni humain ni agent externe)."""
+    return not (check["externe"] or check["assignee"].startswith(HUMAN_PREFIX))
+
+
+def _queued_note(check: dict, head: str) -> str | None:
+    """#540 : la note du journal d'un lot mis dans la file d'équipe faute de
+    place chez l'agent (`{lot}` : son lot déjà en attente) ; None pour un
+    humain ou un agent externe, hors de la règle."""
+    if not takes_rule(check):
+        return None
+    return "%s; team queue (#540): %s already has lot #{lot} not started" % (
+        _braces(head), check["assignee"])
+
+
+def _forced_note(check: dict, head: str, reason: str | None, actor: str) -> str | None:
+    """#540 (canon §4, « sauf --force motivé ») : la note d'une attribution
+    forcée malgré un lot non démarré ; None sans raison (pas de forçage)."""
+    reason = " ".join(str(reason or "").split())
+    if not reason or _queued_note(check, head) is None:
+        return None
+    return ("%s; team queue (#540) forced by %s: %s already has lot #{lot} not started; "
+            "reason: %s" % (_braces(head), _braces(actor or "?"), check["assignee"],
+                            _braces(reason)))
+
+
+def _braces(text: str) -> str:
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def lot_team(db: Db, item: dict) -> str | None:
+    """L'équipe du lot comme la lit la prise L165 : la sienne, sinon celle de
+    sa fiche ou de la fiche parente, sinon son application."""
+    st = storage.of(db)
+    for value in (item.get("team"),
+                  *((st.packages.get(p) or {}).get("team")
+                    for p in (item.get("package_id"), item.get("package_parent")) if p),
+                  item.get("app")):
+        if (value or "").strip():
+            return value.strip()
+    return None
+
+
+def queue_warning(db: Db, item: dict, agent: str) -> str:
+    """#540 : ce qu'on dit à qui attribue un lot mis dans la file d'équipe."""
+    team = lot_team(db, item)
+    later = "ameesh work assign once %s starts #%s" % (agent, item["queued_behind"])
+    return ("lot #%s put in the team queue: %s already has lot #%s not started (at most one "
+            "per agent, #540); %s" % (
+                item["id"], agent, item["queued_behind"],
+                "it is %s: it waits for the orchestrator (%s)" % (item["state"], later)
+                if item.get("state") != "intake" else
+                "an idle agent of team %s will take it (L165)" % team if team else
+                "it has no team: it waits for the orchestrator (%s)" % later))
 
 
 # --------------------------------------------------------------------------
@@ -687,7 +950,8 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
     l'attribution gardée (`check_assignee`, mêmes refus que `work assign`) et
     doit être un AGENT : une échéance se mesure en tours. Une nouvelle
     délégation remplace la précédente (et son échéance). Un événement
-    (`kind=event`, lié au lot) réveille le délégué.
+    (`kind=event`, lié au lot) réveille le délégué. #705 : déléguer le lot à
+    son relecteur désigné retire la désignation (le journal le dit).
 
     Rend `{item, delegation, replaced, check, previous, message_id, warning}`.
     """
@@ -882,6 +1146,23 @@ def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
     return row
 
 
+def _notify_released(db: Db, item_id: int, *, blocker_state: str,
+                     blocker_reason: str = "", after_commit: list | None = None) -> list[dict]:
+    """L385 suite : la fermeture d'un lot réveille les agents des lots qui le
+    déclarent en prérequis explicite.
+
+    Appelé DANS la transaction de fermeture, après l'écriture de la transition
+    et sous le verrou de graphe : le courrier est committé avec la fermeture.
+    Il n'y a donc pas de fenêtre « fermeture commise, réveil non écrit » ; un
+    échec d'écriture annule la fermeture entière et la reprise refait les deux
+    (voir `work_dependencies.notify_released`). Le fil lisible est écrit après
+    le commit, par la liste `after_commit` que l'appelant exécute."""
+    from . import work_dependencies
+    return work_dependencies.notify_released(
+        db, int(item_id), blocker_state=blocker_state,
+        blocker_reason=blocker_reason, after_commit=after_commit)
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "") -> dict:
@@ -899,6 +1180,13 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     La note du journal et du jalon dit comment la fusion est connue :
     « fusion constatée par <source> », ou « fusion déclarée par … »
     (`declared`, `ameesh work merged`), suivie de `extra`.
+
+    Dans la MÊME transaction que la transition, les agents des lots qui
+    déclarent ce lot en prérequis explicite et dont c'était la dernière attente
+    reçoivent un courrier durable (L385 suite) :
+    le réveil ne peut être ni perdu (un échec annule la fusion, la reprise
+    refait les deux) ni doublé (le verrou de graphe sérialise les fermetures,
+    une seule voit la dernière attente tomber).
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -916,10 +1204,17 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             "declared" if declared else "seen",
             " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
             " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
+        threads: list = []
         try:
-            row = storage.of(db).work.close_merged(
-                item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-                frozen_id=frozen_id)
+            from . import work_dependencies
+            with db.transaction() as tx:
+                work_dependencies.lock(tx)
+                row = storage.of(tx).work.close_merged(
+                    item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
+                    frozen_id=frozen_id)
+                if row is not None:
+                    _notify_released(tx, item_id, blocker_state="merged",
+                                     after_commit=threads)
         except DbError as exc:
             # A refused module requirement is a per-lot result, allowing a
             # merge sweep to continue with other projects. Other DB errors
@@ -928,6 +1223,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 raise
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": str(exc)}
+        # le fil externe après le commit seulement : un envoi annulé n'y
+        # laisse rien
+        for record in threads:
+            record(db.cfg, db)
         if row is not None:
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": "%s → merged" % state}
@@ -960,17 +1259,45 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -
         if item["state"] != "closed":
             raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
-                        % (item_id, "abandoned" if item.get("close_reason") == "abandoned"
-                           else "superseded by #%s" % item.get("superseded_by"), item_id))
+                        % (item_id, close_label(item), item_id))
     return done
 
 
+def close_label(item: dict) -> str:
+    """Le libellé d'une fermeture (`closed`), pour les messages : abandonné,
+    remplacé par #N, ou livré hors cible (#988)."""
+    reason = item.get("close_reason")
+    if reason == "superseded":
+        return "superseded by #%s" % item.get("superseded_by")
+    return {"delivered": "delivered outside the target"}.get(reason, reason or "closed")
+
+
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
-          note: str = "", actor: str = "") -> dict:
-    """Ferme un lot qui ne sera pas fusionné : abandonné, ou remplacé par un
-    autre lot. Jalon `closed` ; rien ne reste ouvert par oubli."""
-    if bool(abandoned) == (superseded_by is not None):
-        raise WorkError("pass --abandoned OR --superseded-by <id>")
+          delivered: bool = False, sha: str = "", note: str = "", actor: str = "") -> dict:
+    """Ferme un lot qui ne sera pas fusionné : abandonné, remplacé par un autre
+    lot, ou **livré hors cible** (#988 : un rapport, une note, un livrable dont
+    la tête relue reste sur sa branche, sans fusion dans la cible).
+
+    Les trois portes sont exclusives. `--delivered` exige `--sha <tête relue>`
+    (7 à 64 caractères hexadécimaux) : le jalon `delivered` porte ce SHA et
+    compte comme livraison dans `estimates`. Un jalon `closed` est écrit dans
+    tous les cas ; rien ne reste ouvert par oubli.
+
+    Dans la MÊME transaction, les agents des lots qui déclarent ce lot en
+    prérequis explicite et dont c'était la dernière attente reçoivent un
+    courrier durable (L385 suite) : l'abandon libère
+    l'attente sans prouver la livraison, le dépendant doit réévaluer son
+    prérequis. Un échec du courrier annule la fermeture (reprise) ; le verrou
+    de graphe empêche deux fermetures de se doubler."""
+    if sum((bool(abandoned), superseded_by is not None, bool(delivered))) != 1:
+        raise WorkError("pass one of --abandoned, --superseded-by <id>, "
+                        "--delivered --sha <reviewed head>")
+    head = (sha or "").strip().lower()
+    if delivered and not _SHA_RE.match(head):
+        raise WorkError("--delivered: the reviewed head (--sha, 7 to 64 hex characters), "
+                        "not %r" % (sha,))
+    if not delivered and head:
+        raise WorkError("--sha only makes sense with --delivered")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -982,13 +1309,27 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     state = item["state"]
     if state in MERGED_STATES or state == "closed":
         raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
-    reason = "abandoned" if abandoned else "superseded"
-    text = ("abandoned" if abandoned else "superseded by #%s" % superseded_by) + (
-        " — %s" % note.strip() if note and note.strip() else "")
-    row = storage.of(db).work.close(
-        item_id, current=state, reason=reason,
-        superseded_by=int(superseded_by) if superseded_by is not None else None,
-        actor=actor, note=text)
+    if abandoned:
+        reason, base = "abandoned", "abandoned"
+    elif superseded_by is not None:
+        reason, base = "superseded", "superseded by #%s" % superseded_by
+    else:
+        reason, base = "delivered", "delivered (head %s)" % head[:12]
+    text = base + (" — %s" % note.strip() if note and note.strip() else "")
+    from . import work_dependencies
+    threads: list = []
+    with db.transaction() as tx:
+        work_dependencies.lock(tx)
+        row = storage.of(tx).work.close(
+            item_id, current=state, reason=reason,
+            superseded_by=int(superseded_by) if superseded_by is not None else None,
+            sha=head, actor=actor, note=text)
+        if row is not None:
+            _notify_released(tx, item_id, blocker_state="closed", blocker_reason=reason,
+                             after_commit=threads)
+    # le fil externe après le commit seulement : un envoi annulé n'y laisse rien
+    for record in threads:
+        record(db.cfg, db)
     if row is None:
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
@@ -1006,24 +1347,49 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
-         correct: str | None = None) -> dict:
+         correct: str | None = None, reviewer: str | None = None) -> dict:
     """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
 
     `correct` (la raison) : correction d'un état posé par erreur, hors machine
     à états, limitée à `CORRECTIONS` (un `promoted` à tort revient en
-    `merged`) ; le journal la dit (« correction : promoted → merged — raison »).
-    L'appelant a vérifié qui corrige (`corrector`)."""
+    `merged` ; un `merged` à tort, PR d'étape fusionnée trop tôt, revient en
+    `build`) ; le journal la dit (« correction : promoted → merged — raison »).
+    L'appelant a vérifié qui corrige (`corrector`).
+
+    `reviewer` (#705) : le relecteur désigné, seulement en entrant en `qa` —
+    il doit être joignable et différent de l'assigné (`check_reviewer_choice`),
+    et seul un humain ou un orchestrateur le désigne (`corrector`). La
+    désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
+    `stale_lot` le nomment avant tout verdict."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
-                        "--superseded-by <id>")
+                        "--superseded-by <id> | --delivered --sha <reviewed head>")
+    reviewer = (reviewer or "").strip() or None
+    if reviewer is not None:
+        if state != "qa":
+            raise WorkError(
+                "--reviewer: a reviewer is designated for a review: "
+                "ameesh work move %s qa --reviewer %s" % (item_id, reviewer))
+        if correct is not None:
+            raise WorkError("--reviewer: a correction does not designate a reviewer")
+        if not _pg.has_reviewer(db):
+            # #705 r2 (N1) : sans la colonne (migration 0421), refuser AVANT
+            # d'écrire : sinon le lot entrait en qa sans relecteur, à moitié.
+            raise WorkError(
+                "--reviewer: work_items.reviewer is missing (migration 0421): "
+                "run \"ameesh migrate\", then move the lot to qa with its reviewer")
+        actor = corrector(getattr(db, "cfg", None), db, actor, what="designation")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     current = item["state"]
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
+    if reviewer is not None:
+        reviewer = check_reviewer_choice(db, item, reviewer,
+                                         cfg=getattr(db, "cfg", None))
     if correct is not None:
         reason = (correct or "").strip()
         if not reason:
@@ -1057,14 +1423,31 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (MAX_QA_LOOPS, item_id))
 
     held = state == "waiting_human"
+    text = note or ("%s → %s" % (current, state))
+    if reviewer:
+        text = "%s — reviewer %s" % (text, reviewer)
     row = storage.of(db).work.move(
         item_id, state, current=current, loops=1 if returning_loop else 0,
-        note=note or ("%s → %s" % (current, state)), actor=actor, held=held)
+        note=text, actor=actor, held=held)
     if row is None:
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
             raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
+    if reviewer:
+        # #705 : la désignation est un geste distinct (journalisé), fait dans la
+        # même foulée que l'entrée en qa ; le lot y est, l'écriture passe.
+        designated = storage.of(db).work.designate_reviewer(item_id, reviewer, actor=actor)
+        if designated is None:
+            # #705 r2 (N2) : entre le move (écrit) et la désignation, le lot a
+            # quitté qa ou l'assigné est devenu le relecteur — ne pas afficher
+            # un relecteur jamais posé ; le move, lui, tient.
+            raise WorkError(
+                "lot %s moved to %s but reviewer %s was not designated (the lot left "
+                "qa, or %s now holds it): the move is written; check the lot "
+                "(ameesh work show %s) and designate the reviewer once it is in qa"
+                % (item_id, state, reviewer, reviewer, item_id))
+        row["reviewer"] = reviewer      # le CLI et les appelants le lisent
     return row
 
 
@@ -1083,14 +1466,17 @@ def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
 
 
 #: les jalons d'un lot : `requested` et `merged` sont automatiques (0013),
-#: `frozen` et `verdict` se déclarent par la CLI.
-MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed")
+#: `closed` et `delivered` le sont aussi (fermeture, #988), `frozen` et
+#: `verdict` se déclarent par la CLI.
+MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed", "delivered")
 MANUAL_KINDS = ("frozen", "verdict")
 VERDICTS = ("ok", "blocked")
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
-#: colonne de durée) — l'ordre est celui de la frise lue à l'envers.
+#: colonne de durée) — l'ordre est celui de la frise lue à l'envers. `delivered`
+#: (#988) est la fin d'un lot livré hors cible : il remplace la fusion.
 MILESTONES = (
+    ("delivered", "delivered_ts", None),
     ("merge", "merged_ts", "review_to_merge_s"),
     ("review", "reviewed_ts", "freeze_to_review_s"),
     ("freeze", "frozen_ts", "request_to_freeze_s"),
@@ -1124,9 +1510,10 @@ def milestone(
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
     `frozen` (la branche est gelée pour la revue) et `verdict` (`ok` ou
-    `blocked`, avec le `sha` relu) sont les deux seuls : `requested` et `merged`
-    sont écrits automatiquement depuis les transitions (0013), les déclarer à la
-    main serait un mensonge sur la frise.
+    `blocked`, avec le `sha` relu) sont les deux seuls : `requested`, `merged`,
+    `closed` et `delivered` sont écrits automatiquement (transitions et
+    fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
+    frise.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))

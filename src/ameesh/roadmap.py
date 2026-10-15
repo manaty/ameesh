@@ -385,6 +385,8 @@ def real_milestones(item: dict, events: list[dict], actions: list[dict],
     started = next((e.get("created_ts") for e in events if dev.en_cours(e.get("state"))), None)
     out = {key: jalons.get(dev.jalon(key)) for key in ("demandee", "soumise", "verdict",
                                                        "livree")}
+    # #988 : un lot livré hors cible porte `delivered`, pas `merged`
+    out["livree"] = out["livree"] or jalons.get("delivered")
     out["debut"] = started
     out["verdict_kind"] = jalons.get("verdict_kind")
     return {k: (round(float(v), 3) if isinstance(v, (int, float)) and k != "verdict_kind"
@@ -412,8 +414,8 @@ def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
                commitments: list[dict], shown_state: str | None,
                now: float | None = None) -> dict:
     state = item.get("state")
-    delivered = dev.livree(state)
-    abandoned = dev.abandonnee(state)
+    delivered = dev.livree(state, item.get("close_reason"))
+    abandoned = dev.abandonnee(state, item.get("close_reason"))
     planned = {k: item.get("planned_" + k) for k in DATE_KEYS}
     done_day = _day_of(real.get("livree")) if delivered else None
     target_key = "delivery" if planned["delivery"] else ("end" if planned["end"] else None)

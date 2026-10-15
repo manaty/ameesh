@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# ameesh-job-launcher (L159b2): root-owned entry point of an offloaded job,
+# installed by deploy/guest/install.sh and admitted to the guest user by a
+# sudoers rule, as the job's own user:
+#
+#   ameesh-guest ALL=(ameesh-job) NOPASSWD: /usr/local/lib/ameesh-guest/ameesh-job-launcher
+#
+# The work is in ameesh-job-launcher.py. `-I` isolates the interpreter so
+# neither the client's work tree nor its environment can inject a module.
+set -eu
+PY=/usr/bin/python3
+[ -x "$PY" ] || PY=/usr/local/bin/python3
+exec "$PY" -I /usr/local/lib/ameesh-guest/ameesh-job-launcher.py "$@"
