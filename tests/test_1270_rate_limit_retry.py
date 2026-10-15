@@ -302,6 +302,37 @@ class RepriseTest(_Base):
                 finally:
                     worker.watchdog_stop.set()
 
+    def test_quota_dans_un_result_marque_is_error(self):
+        # #1397 (NO-GO dev1) : Claude ne dit un quota que dans le `result`
+        # marqué `is_error` — ce texte est un canal du CLI, donc classé quota,
+        # et le tour n'est pas un échec rapide (L48 désarmé).
+        _, worker = self._worker("rlq", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(
+                worker, AMEESH_TEST_RESULT="You've hit your usage limit",
+                AMEESH_TEST_IS_ERROR="1", AMEESH_TEST_EXIT="1"))
+            ligne = registry.get(self.db, "rlq")
+            etat = rate_limit.state(ligne["status_text"])
+            self.assertEqual(etat["kind"], rate_limit.QUOTA)
+            self.assertFalse(worker.fast_failure)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_result_libre_non_marque_ne_classe_pas_un_quota(self):
+        # #1397 : sans `is_error`, le même texte libre ne conclut rien — le
+        # tour reste un échec rapide ordinaire (L48 armé).
+        _, worker = self._worker("rlq2", "claude", {})
+        try:
+            self.assertIsNotNone(self._tour(
+                worker, AMEESH_TEST_RESULT="not near the usage limit",
+                AMEESH_TEST_EXIT="1"))
+            self.assertIsNone(worker.rate_limit)
+            self.assertTrue(worker.fast_failure)
+            self.assertIsNone(rate_limit.state(
+                registry.get(self.db, "rlq2")["status_text"]))
+        finally:
+            worker.watchdog_stop.set()
+
     def test_un_succes_efface_l_episode(self):
         _, worker = self._worker("rl2", "claude", {})
         try:
