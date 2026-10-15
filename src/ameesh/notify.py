@@ -7,6 +7,7 @@
                 [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
                 [--handoff-max-per-hour N] [--handoff-idle S]
+                [--wip-max-returns N] [--wip-apply]
         follows the operations alerts (`ameesh alerts --follow`, same
         thresholds, same dedupe keys) and sends each raised alert and each
         resolution to the responsible human, on their channels.
@@ -21,6 +22,10 @@
         Claude agent paused on budget go to a free DeepSeek agent of the
         same project (`ameesh.handoff.budget_handoff`);
         `--handoff-max-per-hour 0` turns it off.
+        §4 (owner 14/10/2026): each pass can also return the surplus lots of
+        an agent above the WIP cap (`ameesh.wip.sweep`); the pass is off by
+        default (`--wip-max-returns 0`) and, without `--wip-apply`, it only
+        reports (nothing is returned).
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
         (`ameesh.plan_github.Projector`) and polls the running CI: each
@@ -1023,13 +1028,17 @@ class Notifier:
 
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
-                 take: dict | None = None, handoff: dict | None = None):
+                 take: dict | None = None, handoff: dict | None = None,
+                 wip: dict | None = None):
         self.cfg, self.ncfg = cfg, ncfg
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
         #: L233b : réglages de la reprise sur pause budget
         #: (`handoff.budget_handoff`) ; None la coupe
         self.handoff = handoff
+        #: §4 : réglages du balayage de la limite d'en-cours (`wip.sweep`) ;
+        #: None le coupe (défaut : aucun balayage du mesh actif à ce stade)
+        self.wip = wip
         self.state = state if state is not None else empty_state()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
@@ -1119,6 +1128,8 @@ class Notifier:
             self._budget_handoff(db, now)
         if self.take:
             self._auto_take(db, current, now)
+        if self.wip:
+            self._wip_sweep(db, now)
         self._github_issues(db, now)
         self._ci_failures(db)
         for human in list(self.state["rate"]):
@@ -1284,6 +1295,28 @@ class Notifier:
                      "source": "lot de l'équipe" if take.get("kind") == "lot"
                      else "file d'amélioration"}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
+
+    # -- §4 (owner 14/10/2026) : limite d'en-cours -----------------------------
+    def _wip_sweep(self, db, now: float) -> None:
+        """Rend à la file le surplus des agents au-dessus du plafond (§4).
+        Sans `--wip-apply` — et sous le `--dry-run` global — le passage ne rend
+        rien : il ne fait que relever (`a_blanc`)."""
+        from . import wip as wip_mod
+        dry = bool(self.dry_run or not self.wip.get("apply"))
+        try:
+            returned = wip_mod.sweep(self.cfg, db, dry_run=dry,
+                                     limit=int(self.wip.get("limit") or 0))
+        except db_mod.DbError:
+            raise
+        except Exception as exc:     # le balayage ne fait jamais tomber les alertes
+            self.log("WIP sweep failed: %s" % _clean(exc, 200))
+            return
+        for row in returned:
+            item = row["item"]
+            entry = {"alert": {"type": "wip_return", "agent": row["agent"],
+                               "lot": int(item["id"]), "title": item.get("title")},
+                     "human": None, "source": "limite d'en-cours (§4)"}
+            self._record("wip_return", entry, "a_blanc" if dry else "rendu", {})
 
     def _budget_handoff(self, db, now: float) -> None:
         from . import handoff
@@ -1679,14 +1712,15 @@ _DELIVERY_LABELS = {"a_blanc": "dry run", "envoyee": "sent", "echec": "failed",
                     "sans_destinataire": "no recipient", "sans_canal": "no channel",
                     "resumee": "summarized", "abandonnee": "abandoned",
                     "sans_envoi": "not sent", "prise": "taken", "nouvelle": "new",
-                    "envoi": "sending"}
+                    "rendu": "returned", "envoi": "sending"}
 
 
 def _format(record: dict) -> str:
     who = record.get("human") or "—"
     what = "[%s] %s" % (record.get("type"), _subject(record))
     event = {"raised": "raised", "resolved": "resolved", "summary": "summary",
-             "auto_take": "auto-take", "budget_handoff": "budget handoff"}.get(
+             "auto_take": "auto-take", "budget_handoff": "budget handoff",
+             "wip_return": "WIP return"}.get(
         record["event"], record["event"])
     channels = ", ".join("%s %s" % (k, v) for k, v in sorted(record["channels"].items()))
     delivery = record["delivery"]
@@ -1778,6 +1812,16 @@ def build_parser() -> argparse.ArgumentParser:
                                                         handoff.DEFAULT_IDLE_S),
                         help="a DeepSeek agent takes a handed lot once idle for S seconds "
                              "(default 300)")
+    # §4 (owner 14/10/2026) : balayage de la limite d'en-cours, coupé par
+    # défaut — l'activation du balayage mutant vient après les portes et le
+    # déploiement ; sans --wip-apply, le passage ne fait que relever.
+    parser.add_argument("--wip-max-returns", type=int,
+                        default=int(exploitation._env_float("AMEESH_WIP_MAX_RETURNS", 0)),
+                        help="WIP sweep (§4): at most N surplus lots returned per pass "
+                             "(default 0: off); without --wip-apply, dry run only")
+    parser.add_argument("--wip-apply", action="store_true",
+                        help="WIP sweep: actually return the lots to the team queue "
+                             "(never with --dry-run)")
     return parser
 
 
@@ -1788,6 +1832,13 @@ def handoff_settings(args) -> dict | None:
         return None
     return {"max_per_hour": most,
             "idle_s": max(0.0, float(getattr(args, "handoff_idle", 0) or 0))}
+
+
+def wip_settings(args) -> dict | None:
+    """§4 : réglages du balayage de la limite d'en-cours lus des options ; None
+    si le balayage est coupé (le défaut). Voir `wip.notify_settings`."""
+    from . import wip as wip_mod
+    return wip_mod.notify_settings(args)
 
 
 def take_settings(args) -> dict | None:
@@ -1857,7 +1908,8 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             print(_format(record), flush=True)
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
-                        take=take_settings(args), handoff=handoff_settings(args))
+                        take=take_settings(args), handoff=handoff_settings(args),
+                        wip=wip_settings(args))
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
