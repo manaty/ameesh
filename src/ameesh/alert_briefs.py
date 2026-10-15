@@ -72,11 +72,13 @@ def _of_teams(orchestras, by_name: dict, teams: set) -> list:
 
 def _of_project(orchestras, by_name: dict, project, teams: set) -> list:
     """#705 : les orchestrateurs du PROJET du lot (`team` ou `workstream`),
-    à défaut ceux de l'équipe de l'assigné (routage d'origine), à défaut tous."""
+    à défaut ceux de l'équipe de l'assigné (routage d'origine), à défaut tous.
+    L243 : l'agent est membre de chacun de ses projets (`_projects`)."""
     project = (project or "").strip()
     if project:
         matched = [o for o in orchestras
-                   if project in (_team(by_name, o), _workstream(by_name.get(o) or {}))]
+                   if project in _projects(by_name, o)
+                   or project == _workstream(by_name.get(o) or {})]
         if matched:
             return matched
     return _of_teams(orchestras, by_name, teams)
