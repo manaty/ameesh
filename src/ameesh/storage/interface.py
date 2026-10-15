@@ -713,6 +713,13 @@ class Credentials(Domain):
 # boîte aux lettres (`agent_mailbox`)
 # --------------------------------------------------------------------------
 
+class MailboxRefused(RuntimeError):
+    """L976 : le renvoi d'une boîte morte est refusé par l'état du registre,
+    relu SOUS VERROU dans la transaction qui copie — un destinataire relancé
+    entre la lecture et l'écriture, un successeur arrêté ou un nom absent.
+    L'appelant (`ameesh.undeliverable`) la rend en `Refused` lisible."""
+
+
 class Mailbox(Domain):
     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
 
@@ -815,7 +822,39 @@ class Mailbox(Domain):
         message, auteur du renvoi ; la signature, qui couvre le destinataire,
         ne suit pas) ; l'original passe remis, renvoi noté (`meta.forwarded`).
         Rend une ligne par message renvoyé : `original_id`, `new_id`,
-        `sender`, `kind`, `work_item_id`, `created_ts`."""
+        `sender`, `kind`, `work_item_id`, `created_ts`.
+
+        L976 : la décision est prise DANS cette transaction, sous le verrou
+        advisory par nom (`registry.NAME_LOCK_*`, partagé avec tous les chemins
+        de création d'une ligne du registre) puis sous les lignes du registre
+        de `old` et `new` (`FOR UPDATE`, par ordre de nom), leur statut relu
+        après l'attente éventuelle : `old` relancé, `new` absent ou arrêté
+        lèvent `MailboxRefused`. Une relance, un arrêt ou une INSCRIPTION
+        concurrente de `old` (nom absent : aucune ligne à verrouiller) ne peut
+        plus se glisser entre la lecture et la copie (relectures codex3, B1
+        puis B1 résiduel)."""
+
+    @abc.abstractmethod
+    def expire_dead_letters(self, recipient: str, note: dict, before_ts: float,
+                            dry_run: bool = False) -> list[dict]:
+        """L976 : expire le courrier en souffrance de `recipient` — non remis,
+        reçu avant `before_ts`, sans réservation active, hors demande de
+        décision (L124) — à condition qu'il soit TOUJOURS une boîte morte
+        (absent du registre ou arrêté) : marqué remis, `note` dans
+        `meta.expired`. Un destinataire relancé entre la lecture et l'écriture
+        garde son courrier. Rend une ligne par message expiré : `id`, `sender`,
+        `kind`, `created_ts` ; `dry_run` : ceux qui le seraient, rien n'est
+        écrit.
+
+        L976 : le statut est relu SOUS LE VERROU — verrou advisory par nom
+        (`registry.NAME_LOCK_*`, partagé avec tous les chemins de création)
+        pris dans une instruction à part AVANT la décision, puis verrou de la
+        ligne du registre (`FOR SHARE`) quand elle existe — donc après
+        l'attente éventuelle sur une relance en cours : le courrier d'un vivant
+        n'est jamais expiré. L'inscription concurrente d'un nom ABSENT (aucune
+        ligne à verrouiller) prend le même verrou advisory : elle attend, ou sa
+        ligne est vue par la lecture suivante (relectures codex3, B1 puis B1
+        résiduel). `dry_run` : lecture seule, sans verrou."""
 
     @abc.abstractmethod
     def human_messages(self, *, since_ts: float, humans: Sequence[str],
