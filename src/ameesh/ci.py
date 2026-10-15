@@ -456,6 +456,7 @@ class Watcher:
         """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
         l'API ne répond pas. Le résultat est gardé : une découverte par heure,
         une nouvelle tentative après un échec."""
+        from . import plan_github
         now = float(self.clock())
         cached = self._workflows_cache.get(repo)
         if cached is not None and now - cached[0] < cached[1]:
@@ -471,6 +472,10 @@ class Watcher:
                 if name and name not in files:
                     files.append(name)
             found = tuple(sorted(files))
+        except plan_github.GithubRateLimited:
+            # N5 #848 : le quota épuisé n'est pas une panne de découverte ; il
+            # remonte au passage, qui s'arrête et le journalise comme tel.
+            raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
             ttl = DISCOVERY_RETRY
             self.log("CI %s: workflow discovery failed (%s)"
@@ -637,8 +642,13 @@ class Watcher:
         Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
         journalisée et n'empêche ni les échecs, ni les verdicts.
         """
+        from . import plan_github
         try:
             self._guard_state(db, repo)
+        except plan_github.GithubRateLimited:
+            # N5 #848 : un quota épuisé arrête le passage (tick le rattrape),
+            # il n'est pas journalisé comme un échec de la garde.
+            raise
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
             self.log("CI %s: guard failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
 
@@ -1086,6 +1096,7 @@ def quota_line(state_dir, *, now=None) -> str | None:
 
 
 def cmd_ci(cfg, args) -> int:
+    from . import plan_github
     from .db import open_db
     db = open_db(cfg)
     try:
@@ -1093,6 +1104,9 @@ def cmd_ci(cfg, args) -> int:
     except CiError as exc:
         print("ameesh ci: %s" % exc)
         return 1
+    # N2 #848 : la vue JSON dit les lectures GitHub partagées de l'hôte, comme
+    # la vue texte (`quota_line`) ; sans état, la projection est vide.
+    report["github_reads"] = plan_github.quota_stats(getattr(cfg, "state_dir", None))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=1))
         return 0
