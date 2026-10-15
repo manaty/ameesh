@@ -979,6 +979,13 @@ class WorkItems(interface.WorkItems):
         # relevé du registre et le geste rendrait les lots d'un agent qui
         # travaille de nouveau. Verrou de la ligne du registre d'abord (ordre
         # stable agent -> lots).
+        # #1425 (N6) : cet ordre est un invariant global. Les seules
+        # transactions qui verrouillent les DEUX tables le prennent dans ce
+        # sens — ici et `handoff` (`agent_registry ... FOR SHARE` puis
+        # `work_items`), plus `handoffs.drain` (registre puis lecture des
+        # lots) ; aucun chemin ne verrouille `work_items` puis
+        # `agent_registry`. Le tenir ainsi évite le cycle de verrous que
+        # PostgreSQL devrait sinon détecter et abandonner.
         if stopped_with:
             rows = self.db.query(
                 "SELECT status, stop_reason FROM agent_registry"
@@ -1031,7 +1038,10 @@ class WorkItems(interface.WorkItems):
                     continue
                 self._cancel_delegation(row["id"], actor)
                 self._event(int(row["id"]), "promoted", measure_reason, actor)
-                out.append(updated[0])
+                # #1425 : la même clé que le chemin `dry_run` — sans elle, les
+                # appelants (`cmd_stop`, la passe du runner) journalisaient un
+                # lot remis à l'auditeur comme « retourné à la file d'équipe ».
+                out.append(dict(updated[0], assigned_to=measure_actor))
         return out
 
     def open_by_ref(self, ref) -> list[dict]:

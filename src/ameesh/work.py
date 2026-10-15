@@ -507,14 +507,15 @@ def release_lots(db: Db, agent: str, *, reason: str, actor: str = "",
         stopped_with=stopped_with)
 
 
-def measurement_actor(db: Db, cfg=None, *, listing=None) -> str:
+def measurement_actor(db: Db, cfg=None, *, listing=None, canons=None) -> str:
     """#753 : l'acteur de la mesure post-déploiement d'un lot promu —
     l'auditeur du registre (l'agent `auditeur`, ou celui dont la fiche Agent
     du canon porte le rôle). Un auditeur arrêté ou mort n'est pas un acteur :
     on ne réassigne pas un lot à un agent arrêté, ce serait le mal que ce lot
     corrige. Chaîne vide s'il n'y a aucun auditeur vivant, ou plusieurs sans
     choix évident : les lots promus restent alors en place. Jamais
-    d'exception."""
+    d'exception. `canons` : canons déjà chargés (le balayage de l'exécuteur
+    espace cette lecture, #1425 N5) ; `None` les lit ici."""
     from . import alert_briefs, registry
 
     try:
@@ -527,7 +528,8 @@ def measurement_actor(db: Db, cfg=None, *, listing=None) -> str:
               and (row.get("status") or "") not in ("stopped", "dead")}
     if alert_briefs.AUDITOR_NAME in living:   # le nom suffit : pas de canon
         return alert_briefs.AUDITOR_NAME
-    names = [name for name in alert_briefs.auditors(listing, configured_canons(cfg))
+    names = [name for name in alert_briefs.auditors(
+                 listing, configured_canons(cfg) if canons is None else canons)
              if name in living]
     return names[0] if len(names) == 1 else ""
 

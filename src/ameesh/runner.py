@@ -174,6 +174,10 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
 LIVE_REVIEW_START_SLACK_S = 300.0
+#: #1425 (N5) : `measurement_actor` relit les canons ; le balayage des arrêts
+#: délibérés tourne à chaque passe — on espace cette lecture d'une fenêtre,
+#: l'auditeur nommé (`auditeur`) restant résolu sans canon.
+MEASURE_CANONS_TTL_S = 300.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -5058,9 +5062,11 @@ class Runner:
         return done
 
     def release_stopped_lots_once(self) -> list[dict]:
-        """#753 : un agent arrêté ne garde pas ses lots. À chaque passe, les
-        lots ouverts d'un agent `stopped` retournent à la file d'équipe, et ses
-        lots promus dont la mesure reste à refaire vont à l'auditeur.
+        """#753 : un agent arrêté ne garde pas ses lots. À chaque passe qui
+        atteint la reprise — après les gardes secteur/drainage/code périmé
+        (#1425, N2) —, les lots ouverts d'un agent `stopped` retournent à la
+        file d'équipe, et ses lots promus dont la mesure reste à refaire vont à
+        l'auditeur.
 
         Seuls les arrêts DÉLIBÉRÉS (`stop_reason` dans
         `work.RELEASABLE_STOP_REASONS`) dessaisissent : un arrêt automatique et
@@ -5084,19 +5090,29 @@ class Runner:
             self._stopped_lots_error = message
             return []
         self._stopped_lots_error = None
-        measure_actor = work_mod.measurement_actor(self.db, self.cfg, listing=agents)
+        # #1425 (N5) : ne payer la résolution de l'auditeur (lecture des canons)
+        # que s'il y a un arrêt délibéré à dessaisir ; le balayage tourne à
+        # chaque passe.
+        stopped = [a for a in agents if a.get("status") == "stopped"
+                   and a.get("stop_reason") in work_mod.RELEASABLE_STOP_REASONS]
+        if not stopped:
+            return []
+        cache = getattr(self, "_measure_canons_cache", None)
+        now = time.time()
+        if cache is None or cache[0] <= now:
+            cache = (now + MEASURE_CANONS_TTL_S,
+                     work_mod.configured_canons(getattr(self, "cfg", None)))
+            self._measure_canons_cache = cache
+        measure_actor = work_mod.measurement_actor(
+            self.db, self.cfg, listing=agents, canons=cache[1])
         measure_reason = ("promoted lot whose measurement is still to be redone: "
                           "handed to %s (#753)" % measure_actor) if measure_actor else ""
         out: list[dict] = []
-        for agent in agents:
-            if agent.get("status") != "stopped":
-                continue
-            # B1 (R2 Claude) : un arrêt automatique et réversible — `erreur` de
-            # `stop_after_failures`, `retire_du_canon` que `canon.revive`
-            # annule, bail expiré — ne dessaisit pas : l'agent relancé retrouve
-            # ses lots. Seul un arrêt délibéré (manuel) les rend.
-            if agent.get("stop_reason") not in work_mod.RELEASABLE_STOP_REASONS:
-                continue
+        # B1 (R2 Claude) : un arrêt automatique et réversible — `erreur` de
+        # `stop_after_failures`, `retire_du_canon` que `canon.revive` annule,
+        # bail expiré — ne dessaisit pas : l'agent relancé retrouve ses lots.
+        # Seul un arrêt délibéré (manuel) les rend.
+        for agent in stopped:
             try:
                 done = work_mod.release_lots(
                     self.db, agent["name"],
@@ -5126,7 +5142,6 @@ class Runner:
 
     def sweep(self) -> None:
         self.expire_delegations_once()
-        self.release_stopped_lots_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
         finished = []
@@ -5161,6 +5176,12 @@ class Runner:
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
             return  # host gate closed: registry diagnosis without taking a lease
+        # #1425 (N2) : le dessaisissement des arrêts délibérés vient APRÈS les
+        # gardes (secteur, drainage, code périmé, porte) : sous l'une d'elles
+        # l'exécuteur n'agit pas sur la file, et un runner périmé ne dessaisit
+        # pas avec une logique ancienne. Il précède la reprise des agents : la
+        # file est à jour avant les nouvelles prises.
+        self.release_stopped_lots_once()
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
