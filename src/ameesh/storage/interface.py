@@ -692,14 +692,16 @@ class Events(Domain):
         most `limit` (a listing for humans: ids are not in commit order)."""
 
     @abc.abstractmethod
-    def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None]:
+    def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None, tuple]:
         """The reader's order: (the events after `position` = (tx, id) whose
         transaction is over for good (`tx` below the snapshot's xmin), by
         (tx, id), at most `limit`, each row also carrying `tx`; why events
         after `position` wait, None if none does: "xmin" for an older open
-        transaction, "restore" for rows of another cluster above the counter).
-        Both from ONE snapshot. Such a transaction can no longer add an event
-        before the last one read."""
+        transaction, "restore" for rows of another cluster above the counter;
+        the retention's watermark `(tx, id)`, `(0, 0)` when it never deleted).
+        All from ONE snapshot. Such a transaction can no longer add an event
+        before the last one read; a `position` below the watermark returned
+        with it may have lost events (reset)."""
 
     @abc.abstractmethod
     def bounds(self) -> dict:
@@ -707,19 +709,19 @@ class Events(Domain):
         empty); `head`: the position (tx, id) of the last readable event,
         `top`: of the last event written, `oldest`: of the first one kept
         ((0, 0) when none); `pruned`: the greatest position the retention
-        deleted ((0, 0) when none); `cluster`: the identity of the cluster
-        and timeline, outside which a position means nothing (None when its
-        functions are refused)."""
+        deleted ((0, 0) when none); `cluster`: the identity of the journal
+        (cluster, timeline and the log's own random identifier), outside which
+        a position means nothing (None when its functions are refused)."""
 
     @abc.abstractmethod
-    def count_before(self, before_ts: float) -> int:
-        """The number of events older than `before_ts`."""
+    def count_before(self, days: int) -> int:
+        """The number of events older than `days`, on the database's clock."""
 
     @abc.abstractmethod
-    def prune(self, before_ts: float, limit: int, timeout_s: float | None = None) -> int:
-        """Deletes at most `limit` events older than `before_ts` (the oldest
-        first) and raises the watermark `bounds()["pruned"]` in the same
-        statement; the number deleted.
+    def prune(self, days: int, limit: int, timeout_s: float | None = None) -> int:
+        """Deletes at most `limit` events older than `days` (the oldest first,
+        on the database's clock) and raises the watermark
+        `bounds()["pruned"]` in the same statement; the number deleted.
         `timeout_s`: lock and statement timeout of the deletion (DbError past
         it). The table refuses an event younger than 30 days."""
 
