@@ -6091,6 +6091,9 @@ class Runner:
         passages = tuple(p for p in getattr(self, "train_passages", ()) if p.policy.enabled)
         if not passages:
             return
+        if any(getattr(p, "reservation", None) is None for p in passages):
+            log_async("train service requires an explicit qualified packet reservation and deadline")
+            return
         from .train_runner import Service
         self.train_service = Service(self.cfg, passages, stop=self.stop, report=log_async)
         self.train_service.start()

@@ -129,9 +129,55 @@ class TrainServiceTest(unittest.TestCase):
         service.shutdown()
         self.assertFalse(service.thread.is_alive())
 
+    def test_maintenance_has_its_own_fresh_connection_and_never_runs_passage(self):
+        passage = mock.Mock()
+        passage.maintain.return_value = 300
+        service = self.service(passage)
+        first, second = mock.Mock(), mock.Mock()
+        with mock.patch("ameesh.scoped_db.ScopedDb", side_effect=[first, second]):
+            self.assertEqual(service.maintain_once(0, 100), 300)
+            passage.maintain.side_effect = RuntimeError("lost epoch")
+            self.assertIsNone(service.maintain_once(0, 200))
+        first.close.assert_called_once_with()
+        second.close.assert_called_once_with()
+        passage.scheduled_step.assert_not_called()
+        service.report.assert_called_once()
+
+    def test_renewal_timer_does_not_become_a_ci_poll(self):
+        passage = types.SimpleNamespace(maintenance_at=200)
+        service = self.service(passage, clock=lambda: 100)
+        service.pending.clear()
+        service.deadlines[0] = 9876
+        service.maintenance[0] = 100
+
+        def wait(timeout):
+            self.assertEqual(timeout, 200)
+            service.stop.set()
+
+        with mock.patch.object(service, "pass_once", side_effect=AssertionError("CI poll")), \
+             mock.patch.object(service, "maintain_once", return_value=300) as renew, \
+             mock.patch.object(service.condition, "wait", side_effect=wait):
+            service.run()
+        renew.assert_called_once_with(0, 100)
+
+    def test_event_and_due_maintenance_share_one_passage_instead_of_double_renewal(self):
+        passage = types.SimpleNamespace(maintenance_at=300)
+        service = self.service(passage, clock=lambda: 100)
+        service.maintenance[0] = 100
+
+        def run(index, now):
+            service.stop.set()
+            return 9876
+
+        with mock.patch.object(service, "pass_once", side_effect=run) as run_pass, \
+             mock.patch.object(service, "maintain_once", side_effect=AssertionError("duplicate")):
+            service.run()
+        run_pass.assert_called_once_with(0, 100)
+        self.assertEqual(service.maintenance, {0: 300})
+
     def test_runner_guards_and_single_start(self):
         runner = Runner.__new__(Runner)
-        passage = types.SimpleNamespace(policy=train.Policy(enabled=True))
+        passage = types.SimpleNamespace(policy=train.Policy(enabled=True), reservation=object())
         runner.train_passages, runner.train_service = [passage], None
         runner.cfg, runner.stop = object(), threading.Event()
         runner.once = runner.dry_run = runner.mediated = False
@@ -143,6 +189,8 @@ class TrainServiceTest(unittest.TestCase):
             runner.train_passages = []
             runner.start_train_service()
             runner.train_passages = [types.SimpleNamespace(policy=train.Policy())]
+            runner.start_train_service()
+            runner.train_passages = [types.SimpleNamespace(policy=train.Policy(enabled=True))]
             runner.start_train_service()
             service.assert_not_called()
             runner.train_passages = [passage]

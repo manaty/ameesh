@@ -99,6 +99,8 @@ class Runtime:
     def publish(self, plan, epoch):
         self._current(plan)
         self._held(epoch)
+        if hasattr(self.ledger, "before_publish"):
+            self.ledger.before_publish(plan, epoch)
         self.repository.publish(plan, key=self.ledger.key, epoch=epoch,
                                 owner=self.ledger.owner, workflows=self.ci_adapter.workflows)
 

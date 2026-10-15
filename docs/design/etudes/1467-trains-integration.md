@@ -584,3 +584,21 @@ locale et la recette e2e staging de la baseline de code. Ces frontières
 figurent dans `qualified_boundaries`, sans extension de #1470 ni deuxième
 CI. La liste complète des vingt workflows et les portées des plateformes
 optionnelles restent à qualifier avant un contrat exécutable.
+
+Le raccord de maintien #1680 est préparé dans `train_reservation` et
+`Passage`/`Service` : ticket persistant avant publication, reprise au même
+epoch sans réacquisition d'un bail expiré, renouvellement SQL sur connexion
+fraîche et réveil distinct sans consultation CI. Le runner refuse l'assemblage
+d'un passage sans port de réservation. Le callback d'échéance absolue est
+obligatoire et ne possède aucune durée par défaut. Le moteur autonome conserve
+ses ports de préparation antérieurs ; il n'est pas l'assemblage du service.
+Le contrat et les scénarios interbranches figurent dans
+[`reviews/1467-reservation-port/README.md`](../../../reviews/1467-reservation-port/README.md).
+
+Sources : mesh-design, courrier du 15 octobre à 18:14, autorise ce port injecté
+sans suspendre les préparations indépendantes ; impl07, courrier du même jour
+à 18:18, confirme l'absence de limite adoptée et de champ compilé dans le canon
+`579c64dc` ou la mécanique `430e65921`. Sa proposition de deux heures reste à
+décider par l'owner ; elle ne configure pas ce consommateur. La sélection du
+fournisseur et du champ qualifié, le protocole de transition des anciennes
+clés et les autres raccords d'activation demeurent externes à cette préparation.

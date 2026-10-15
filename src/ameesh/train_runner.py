@@ -12,7 +12,7 @@ import os
 import math
 import threading
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 from . import (merge_queue, radar, resolutions, train, train_admissions,
                train_ci, train_fire, train_git, train_history, train_policy,
@@ -21,7 +21,8 @@ from . import (merge_queue, radar, resolutions, train, train_admissions,
 
 class Passage:
     def __init__(self, cfg, project, *, owner, policy, policy_path,
-                 policy_commit, workflows, provider, mechanics, notify, impact=None):
+                 policy_commit, workflows, provider, mechanics, notify, impact=None,
+                 reservation=None):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
@@ -31,7 +32,20 @@ class Passage:
         self.workflows, self.provider, self.notify = workflows, provider, notify
         self.mechanics = mechanics
         self.impact = impact
+        self.reservation = reservation
+        self.maintenance_at = None
         self.epoch = None
+
+    def reservation_ledger(self, db):
+        if self.reservation is None:
+            raise train.TrainError("explicit qualified packet reservation required")
+        return self.reservation.bind(db, self.project,
+            merge_queue._remote_branch(self.project.target), self.owner,
+            train.digest([asdict(workflow) for workflow in self.workflows]))
+
+    def maintain(self, db, now):
+        self.maintenance_at = self.reservation_ledger(db).maintain(now)
+        return self.maintenance_at
 
     def repository_path(self):
         target = merge_queue._remote_branch(self.project.target)
@@ -89,7 +103,8 @@ class Passage:
         directory = self.repository_path()
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         repository = train_git.Repository(self.project, clone)
-        ledger = train_store.Ledger(db, self.project, target, self.owner)
+        ledger = (self.reservation_ledger(db) if self.reservation is not None else
+                  train_store.Ledger(db, self.project, target, self.owner))
         authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)
         history = train_history.Recorded(db, clone.path, provider=self.provider, review_rules=rules)
         admissions = train_admissions.Admissions(db, self.project, history, policy=requirement)
@@ -122,6 +137,8 @@ class Passage:
             return engine.step(now)
         finally:
             self.epoch = engine.epoch
+            self.maintenance_at = (runtime.ledger.next_maintenance()
+                if self.reservation is not None and self.epoch is not None else None)
 
 
 class Service:
@@ -137,6 +154,7 @@ class Service:
         self.condition = threading.Condition()
         self.pending = set(range(len(self.passages)))
         self.deadlines = {}
+        self.maintenance = {}
         self.thread = None
 
     def wake(self):
@@ -176,6 +194,19 @@ class Service:
         finally:
             db.close()
 
+    def maintain_once(self, index, now):
+        from .scoped_db import ScopedDb
+        if self.stop.is_set():
+            return None
+        db = ScopedDb(self.cfg)
+        try:
+            return self.passages[index].maintain(db, now)
+        except Exception as exc:
+            self.report("train reservation maintenance failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        finally:
+            db.close()
+
     def run(self):
         while not self.stop.is_set():
             with self.condition:
@@ -183,11 +214,21 @@ class Service:
                     return
                 now = self.clock()
                 ready = self.pending | {i for i, at in self.deadlines.items() if at <= now}
-                if not ready:
-                    delay = min(self.deadlines.values()) - now if self.deadlines else None
+                renew = {i for i, at in self.maintenance.items() if at <= now} - ready
+                if not ready and not renew:
+                    times = list(self.deadlines.values()) + list(self.maintenance.values())
+                    delay = min(times) - now if times else None
                     self.condition.wait(timeout=delay)
                     continue
                 self.pending.difference_update(ready)
+            for index in sorted(renew):
+                if self.stop.is_set():
+                    return
+                deadline = self.maintain_once(index, self.clock())
+                with self.condition:
+                    self.maintenance.pop(index, None)
+                    if deadline is not None:
+                        self.maintenance[index] = deadline
             for index in sorted(ready):
                 if self.stop.is_set():
                     return
@@ -196,6 +237,10 @@ class Service:
                     self.deadlines.pop(index, None)
                     if deadline is not None:
                         self.deadlines[index] = deadline
+                    self.maintenance.pop(index, None)
+                    at = getattr(self.passages[index], "maintenance_at", None)
+                    if isinstance(at, (int, float)) and math.isfinite(at):
+                        self.maintenance[index] = at
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True, name="integration-trains")
