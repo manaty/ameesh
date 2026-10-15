@@ -286,10 +286,11 @@ def _decisions(ctx: Context, db, params, query) -> dict:
 
 
 def _alerts(ctx: Context, db, params, query) -> dict:
-    from . import exploitation
+    from . import alert_ack, exploitation
     thresholds = exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
-    return {"schema": "ameesh-alerts/1", "alerts": db_mod.batched(
-        db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))}
+    current = db_mod.batched(db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))
+    return {"schema": "ameesh-alerts/1", "alerts": alert_ack.annotate(
+        ctx.cfg, db, current, human=serve_actions.principal(ctx))}
 
 
 def _hosts(ctx: Context, db, params, query) -> dict:
@@ -493,7 +494,9 @@ SCHEMAS = {
     "ameesh-decisions/1": _obj("ameesh-decisions/1", ["requests", "prose", "approvals"],
                                requests=_LIST, prose=_LIST, approvals=_LIST),
     "ameesh-alerts/1": _obj("ameesh-alerts/1", ["alerts"], alerts={
-        "type": "array", "items": _obj("ameesh-alert/1", ["type"], type=_STR)}),
+        "type": "array", "items": _obj("ameesh-alert/1", ["type", "key", "acknowledged"],
+            type=_STR, key={"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            acknowledged={"type": "boolean"}, acknowledgement={"type": ["object", "null"]})}),
     "ameesh-hosts/1": _obj("ameesh-hosts/1", ["hosts"], hosts={
         "type": "array", "items": _HOST}),
     "ameesh-host/1": _HOST,

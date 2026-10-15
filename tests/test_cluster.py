@@ -54,6 +54,11 @@ SIGNATURES = {
     # 15/10 : conservation des droits actuels, aucun GRANT modifié).
     "api_idempotency": {"human", "key", "fingerprint", "status", "response",
                         "created_at", "done_at"},
+    # L87c (0444): native-operator acknowledgement audit. Preserve the
+    # migration's closed rights; this classification adds no GRANT.
+    "alert_acknowledgements": {"id", "alert_key", "severity", "observation_host",
+                               "actor", "principal", "acknowledged_at", "confirmed_at",
+                               "invalidated_at", "invalidation_reason"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }

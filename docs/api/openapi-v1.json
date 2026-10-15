@@ -89,6 +89,19 @@
           "alerts": {
             "items": {
               "properties": {
+                "acknowledged": {
+                  "type": "boolean"
+                },
+                "acknowledgement": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "key": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
                 "schema": {
                   "const": "ameesh-alert/1",
                   "type": "string"
@@ -99,7 +112,9 @@
               },
               "required": [
                 "schema",
-                "type"
+                "type",
+                "key",
+                "acknowledged"
               ],
               "type": "object"
             },
@@ -1748,6 +1763,147 @@
           }
         },
         "summary": "Current alerts (`ameesh alerts --json`)"
+      }
+    },
+    "/api/v1/alerts/{key}/ack": {
+      "post": {
+        "operationId": "post_alerts_key_ack",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "one key per action; a retry with the same key and the same request reads the first response back",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "pattern": "^[A-Za-z0-9_-]{8,128}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {},
+                "required": [],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-action-1"
+                }
+              }
+            },
+            "description": "Acknowledge an alert as its human recipient; the alert remains visible"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not allowed"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "refused, or the key's first request still running"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body too large"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "body not JSON"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "key already used for another request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Acknowledge an alert as its human recipient; the alert remains visible"
       }
     },
     "/api/v1/budget": {
