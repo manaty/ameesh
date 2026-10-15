@@ -23,6 +23,22 @@ def _charge_config():
     return load_config()
 
 
+def _nom_statusline(cfg, fastmail, data: dict) -> str:
+    """Le nom d'agent du JSON, sans base : celui que le chemin complet écrira.
+
+    Environnement (session menée par l'exécuteur), sinon la liaison déjà notée
+    par un hook (`claude` : la barre d'état est celle de Claude Code), sinon
+    l'alias du dossier — le même repli que `cmd_statusline`. #1628 : ce nom
+    entre dans la clé du cache, pour que deux sessions d'un même dossier ne
+    partagent pas la même ligne.
+    """
+    nom = fastmail.identite(cfg, "claude", data)
+    if nom:
+        return nom
+    from . import identity  # léger : configuration seulement
+    return identity.legacy_name(fastmail.statusline_cwd(data), cfg)
+
+
 def _rapide_statusline(cfg, fastmail, rest: list) -> int | None:
     if rest:
         return None
@@ -33,7 +49,7 @@ def _rapide_statusline(cfg, fastmail, rest: list) -> int | None:
         return None
     if not isinstance(data, dict):
         return None
-    cle = fastmail.statusline_key(data)
+    cle = fastmail.statusline_key(data, _nom_statusline(cfg, fastmail, data))
     out = fastmail.read_statusline(cfg, cle)
     if out is None:
         sys.stdin = io.StringIO(raw)  # la commande complète relira l'entrée
