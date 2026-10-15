@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Sequence
@@ -561,6 +562,7 @@ def run(cfg, db, args) -> int:
     Elle n'écrit ni jalon ni verdict : l'accroche automatique du gel reste
     inactive tant que la règle n'est pas adoptée."""
     from . import mechanics  # refus nommé si le lecteur manque (load_parameters)
+    from .db import SchemaMissing, explain as db_explain
     try:
         params = None
         if args.canon_commit:
@@ -591,7 +593,6 @@ def run(cfg, db, args) -> int:
         else:
             print("prévalidation refusée : %s" % exc)
         return 1
-    record(db, report)  # le rapport s'écrit après le run, hors transaction
     if getattr(args, "json", False):
         print(json.dumps(report, sort_keys=True))
     elif report["ok"]:
@@ -600,4 +601,13 @@ def run(cfg, db, args) -> int:
                  report["seconds"], report["host"]))
     else:
         print("prévalidation refusée : %s" % ", ".join(report["causes"]))
+    # Le rapport s'imprime AVANT l'écriture : un run réel ne se perd jamais
+    # parce que la table (0450, livrée avec le lot) n'est pas encore migrée.
+    # L'avertissement nomme la cause et `ameesh migrate` ; le sort du run, lui,
+    # reste celui du run.
+    try:
+        record(db, report)  # après le run, hors de toute transaction
+    except SchemaMissing as exc:
+        print("prévalidation : rapport non persisté — %s" % db_explain(exc),
+              file=sys.stderr)
     return 0 if report["ok"] else 1
