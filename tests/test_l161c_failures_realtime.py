@@ -1413,6 +1413,18 @@ class WatcherTest(PgTestCase):
         self.assertEqual(watcher.tick(self.db), [])
         self.assertEqual(len(self.mails("dev-a")), 1)
 
+    def test_echec_sans_destinataire_journalise_une_seule_fois(self):
+        """#1573 R2 : une exécution sans lot (main) n'envoie aucun message ;
+        ses échecs déjà inscrits ne sont pas rejournalisés à chaque passe."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "73" * 20
+        self.api.live = [run_view(1032, sha, "main")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_c.T.test_3", execution=1032)])]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("tests"), o["to"]) for o in out],
+                         [("failures", ["tests.test_c.T.test_3"], None)])
+        self.assertEqual(watcher.tick(self.db), [])
+
     def test_reference_stricte_par_workflow(self):
         """#1110 P2-2 : une ligne sans workflow (écrite avant 0433 par un
         ancien processus) ne sert pas de référence à une autre suite : l'échec

@@ -899,7 +899,7 @@ class Watcher:
         # celles qu'aucun message n'a portées restent à signaler (#1573 N2)
         recorded = {(f["part"], f["test"]): f
                     for f in st.ci.failures(repo, int(run_id))}
-        new = []
+        new, fresh = [], set()
         for ev in events:
             source = event_attempt(ev)
             failure = {"part": str(ev.get("part") or ""), "test": ev["test"],
@@ -915,14 +915,19 @@ class Watcher:
                 seen = recorded.get((failure["part"], failure["test"]))
                 if added or (seen is not None and not seen.get("message_id")):
                     new.append(failure)
+                if added:
+                    fresh.add((failure["part"], failure["test"]))
         own = [f for f in new if not f["inherited"]]
         if not own:
             return []
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)
         if not to:
+            # sans destinataire, aucun message ne portera jamais ces lignes :
+            # seules les nouvelles sont journalisées, pas toutes à chaque passe
+            own = [f for f in own if (f["part"], f["test"]) in fresh]
             return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
-                     "tests": [f["test"] for f in own], "to": None}]
+                     "tests": [f["test"] for f in own], "to": None}] if own else []
         # premier message de l'exécution (un passif sans base compte aussi)
         first = not row.get("urgent_message_id") and not any(
             f.get("message_id") for f in recorded.values())
