@@ -2,6 +2,8 @@
 """Repository identity, read-only radar and atomic legacy reservation import."""
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -101,27 +103,112 @@ class ReservationImportTest(PgTestCase):
             self.run_import(apply=True)
         self.assertEqual(work.get(self.db, self.a)["migration"], 327)
 
-    def test_concurrent_collision_rolls_back_the_entire_import(self):
+    def test_stale_collision_rolls_back_the_entire_import(self):
+        # Inject a stale holder observation: the repository lock serializes
+        # even legacy SQL writers through trigger 0419. The second reservation
+        # must still roll back the first if an unexpected unique collision occurs.
         other = self.lot("Concurrent holder", 3)
         conn = db_mod.connect(self.cfg)
         self.addCleanup(conn.close)
-        original = WorkItems.reserve_migration
-        raced = []
-
-        def race(registry, item_id, *args, **kwargs):
-            if item_id == self.b and not raced:
-                raced.append(True)
-                original(WorkItems(conn), other, self.slug, 324, 0,
-                         actor="other", note="concurrent %(number)s")
-            return original(registry, item_id, *args, **kwargs)
-
-        with mock.patch.object(WorkItems, "reserve_migration", new=race):
+        with conn.transaction() as tx:
+            tx.execute("UPDATE work_items SET migration = 324, migration_repo = %s"
+                       " WHERE id = %s", (self.slug, other))
+        with mock.patch.object(WorkItems, "migration_holder", return_value=None):
             with self.assertRaises(db_mod.DbError):
                 self.run_import(apply=True)
-        self.assertTrue(raced)
         self.assertIsNone(work.get(self.db, self.a)["migration"])
         self.assertIsNone(work.get(self.db, self.b)["migration"])
         self.assertEqual(work.get(self.db, other)["migration"], 324)
+
+    def test_import_locks_repository_before_mapped_lots(self):
+        conn = self.connect()
+        self.addCleanup(conn.close)
+        errors, pids = [], []
+
+        def run_import():
+            try:
+                with conn.transaction() as tx:
+                    pids.append(tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"])
+                    reservations.import_reservations(
+                        tx, self.rows, self.mapping, repo=self.slug, actor="orch", apply=True)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_import)
+        try:
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL lock_timeout = '5s'")
+                storage.of(tx).migration_reservations.lock_target("github.com/" + self.slug, "main")
+                thread.start()
+                deadline = time.monotonic() + 5
+                while not pids or not tx.query(
+                        "SELECT 1 FROM pg_locks WHERE pid = %s AND locktype = 'advisory'"
+                        " AND NOT granted", (pids[0],)):
+                    self.assertFalse(errors, errors)
+                    self.assertLess(time.monotonic(), deadline, "import never waited for repository lock")
+                    time.sleep(0.01)
+                storage.of(tx).work.reserve_migration(
+                    self.a, self.slug, 323, 0, actor="orch", note="reserved %(number)s")
+        finally:
+            thread.join(timeout=10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual([work.get(self.db, lot)["migration"] for lot in (self.a, self.b)], [323, 324])
+
+    def test_concurrent_reservation_waits_for_the_import_repository_lock(self):
+        # #711: pendant la transaction d'import, un second écrivain coopérant
+        # attend le verrou consultatif du dépôt (observé non accordé dans
+        # pg_locks) au lieu de courir vers l'index unique ; une fois l'import
+        # commité, il prend le numéro suivant sans collision.
+        other = self.lot("Waiting holder", 3)
+        original = WorkItems.reserve_migration
+        results, errors, backend, threads, hooked = [], [], [], [], []
+
+        def wait_writer():
+            conn = db_mod.connect(self.cfg)
+            try:
+                # Le pid est relevé dans la transaction persistante qui va
+                # attendre : le pilote psql ouvre une session par transaction.
+                with conn.transaction() as tx:
+                    backend.append(tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"])
+                    results.append(original(storage.of(tx).work, other, self.slug, None, 0,
+                                            actor="other", note="waiting %(number)s")["migration"])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        def race(registry, item_id, *args, **kwargs):
+            if item_id == self.b and not hooked:
+                hooked.append(True)
+                thread = threading.Thread(target=wait_writer)
+                threads.append(thread)
+                thread.start()
+                deadline = time.monotonic() + 5
+                while not backend and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(backend, "second writer never connected")
+                waited = False
+                while time.monotonic() < deadline:
+                    waited = bool(self.db.query(
+                        "SELECT 1 FROM pg_locks WHERE pid = %s AND locktype = 'advisory'"
+                        " AND NOT granted", (backend[0],)))
+                    if waited:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(waited, "second writer never waited for the repository lock")
+            return original(registry, item_id, *args, **kwargs)
+
+        with mock.patch.object(WorkItems, "reserve_migration", new=race):
+            self.run_import(apply=True)
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [325])
+        self.assertEqual(work.get(self.db, self.a)["migration"], 323)
+        self.assertEqual(work.get(self.db, self.b)["migration"], 324)
+        self.assertEqual(work.get(self.db, other)["migration"], 325)
 
     def test_probe_checks_owner_and_repository_and_reports_new_files_only(self):
         self.run_import(apply=True)
