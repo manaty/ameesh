@@ -485,6 +485,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('ameesh_events_pruned', ARRAY[
         'one', 'tx', 'id', 'at'
     ]),
+    -- #928 (0448): the journal's random identity, in every position; it names
+    -- a log, it carries no content and no secret
+    ('ameesh_events_journal', ARRAY[
+        'one', 'journal'
+    ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[
         'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'

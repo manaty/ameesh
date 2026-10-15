@@ -1040,11 +1040,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _drain(self, position: tuple) -> tuple:
         """Sends the readable events after `position`: (new position, whether
-        anything was written, whether events wait for an open transaction)."""
-        wrote = False
+        anything was written, whether events wait for an open transaction,
+        whether the retention's watermark passed the position — events after
+        it may be gone, the client must reset)."""
+        wrote, lost = False, False
         while True:
-            rows, waiting = self.read(
+            rows, waiting, pruned = self.read(
                 lambda db: storage.of(db).events.readable(position, EVENTS_BATCH))
+            if position < pruned:
+                # #928/F6: the retention deleted events after this cursor
+                # while the stream was open; the rows below would silently
+                # skip them, so the caller resets. One statement, one
+                # snapshot: watermark and rows agree.
+                lost = True
             for row in rows:
                 row["tx"] = int(row["tx"])
             out = "".join(event_message(row, self._cluster) for row in rows
@@ -1055,7 +1063,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if rows:
                 position = (rows[-1]["tx"], int(rows[-1]["id"]))
             if len(rows) < EVENTS_BATCH:
-                return position, wrote, waiting
+                return position, wrote, waiting, lost
 
     def _follow(self, position: tuple) -> None:
         hub = self.hub
@@ -1065,7 +1073,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         while not hub.stopped and time.monotonic() - start < STREAM_MAX_S:
             if pending or waiting:
                 try:
-                    position, wrote, waiting = self._drain(position)
+                    position, wrote, waiting, lost = self._drain(position)
+                    if lost:
+                        # same frame as a resume below the watermark: the
+                        # client reloads, then follows from the new head
+                        bounds = self.read(lambda db: storage.of(db).events.bounds())
+                        position = bounds["head"]
+                        self._write("id: %s\nevent: reset\ndata: %s\n\n" % (
+                            events.format_position(position, self._cluster),
+                            json.dumps({"reason": "events lost (retention)",
+                                        "first": bounds["first"],
+                                        "last": bounds["last"]})))
+                        wrote = True
                 except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
                     log.warning("event stream: database unavailable: %s", type(exc).__name__)
                     self._write("event: error\ndata: %s\n\n" % json.dumps(
