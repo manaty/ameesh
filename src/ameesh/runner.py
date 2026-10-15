@@ -5868,7 +5868,12 @@ class Runner:
         fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
         `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run
         ni en exécuteur médié (le journal est au serveur du mesh). Une erreur
-        (base, réglage) est journalisée une fois, jamais fatale à la passe."""
+        (base, réglage) est journalisée une fois, jamais fatale à la passe.
+
+        #928/F6 : l'élagage passe par sa PROPRE connexion. Sa transaction
+        (jusqu'à `PRUNE_MAX_S`, avec verrous et délais) tiendrait sinon le
+        verrou de transaction de la connexion partagée de l'exécuteur, sur
+        lequel les renouvellements de bail attendent."""
         from . import events as events_mod
 
         now = time.monotonic() if now is None else now
@@ -5877,12 +5882,23 @@ class Runner:
                 and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
             return None
         self._events_pruned_at = now
+        db, own = self.db, None
+        if getattr(self, "cfg", None) is not None:
+            try:
+                own = db_mod.open_db(self.cfg)
+            except db_mod.DbError as exc:
+                message = "event log retention not applied (%s)" % exc
+                if message != self._events_prune_error:
+                    log_async(message)
+                self._events_prune_error = message
+                return None
+            db = own
         try:
-            gone = events_mod.prune(self.db, max_batches=events_mod.PRUNE_MAX_BATCHES,
+            gone = events_mod.prune(db, max_batches=events_mod.PRUNE_MAX_BATCHES,
                                     max_s=events_mod.PRUNE_MAX_S)
             # rien supprimé alors qu'il reste des événements expirés : la
             # rétention est bloquée (jamais un 0 silencieux)
-            left = 0 if gone else events_mod.expired(self.db)
+            left = 0 if gone else events_mod.expired(db)
             if left:
                 raise ValueError("%d expired event(s) left, none deleted" % left)
         except (db_mod.DbError, ValueError) as exc:
@@ -5891,6 +5907,9 @@ class Runner:
                 log_async(message)
             self._events_prune_error = message
             return None
+        finally:
+            if own is not None:
+                own.close()
         self._events_prune_error = None
         if gone:
             log_async("event log: %d event(s) past retention deleted" % gone)
