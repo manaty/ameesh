@@ -383,7 +383,7 @@ class _Landing:
     once, at the end (`land_head`)."""
 
     def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
-                 cfg=None, clone=None):
+                 cfg=None, clone=None, replayer=None, parts=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
@@ -391,6 +391,10 @@ class _Landing:
         self.release = False
         self.projects = projects
         self.cfg, self.clone = cfg, clone
+        #: L1651 : le clone radar (pour relire la source de sélection versionnée
+        #: de la cible) et les parts dues déjà requalifiées par l'appelant
+        #: (§12 : le manifeste de paquet remplace la CI individuelle)
+        self.replayer, self.parts = replayer, parts
         self.entry = tuple(row.get(k) for k in
                            ("generation", "target", "frozen_id", "frozen_sha"))
 
@@ -464,7 +468,16 @@ class _Landing:
     def required_ci(self):
         if getattr(self.project, "ci_required", False):
             try:
-                merge_queue._required_ci(self.project, self.row["frozen_sha"])
+                parts = self.parts
+                if parts is None and getattr(self.project, "ci_parts", None):
+                    # L1651 (#1650) : la preuve de complétude est refaite ici,
+                    # sur la cible de cette entrée de file, avec la source de
+                    # sélection versionnée relue maintenant (le contrat peut
+                    # avoir bougé depuis l'admission).
+                    parts = merge_queue._parts_reader(
+                        self.project, self.project.repo, self.row.get("target") or "",
+                        self.row["frozen_sha"], self.replayer)
+                merge_queue._required_ci(self.project, self.row["frozen_sha"], parts=parts)
             except merge_queue.QueueError as exc:
                 return self.eject(str(exc), "Restore green CI on the frozen commit, then "
                                   "ameesh work queue add %d." % self.lot)
@@ -513,9 +526,14 @@ class _Landing:
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
-              gh=_gh) -> dict:
+              gh=_gh, parts=None) -> dict:
     """Lands (or follows the landing of) `row`, the head of its queue.
-    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`."""
+    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`.
+
+    L1651 (#1650) : `parts` porte la requalification d'un lot dont la CI
+    individuelle est remplacée par celle d'un paquet (§12, #1467) — les
+    contextes dus que l'appelant atteste, ou `()` ; None : la porte du projet
+    (`ci_parts`) s'applique telle quelle."""
     from . import radar, resolutions
     locks = locks if locks is not None else {}
     lot = int(row["work_item_id"])
@@ -539,7 +557,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
-                       cfg=cfg, clone=getattr(replayer, "path", None))
+                       cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
+                       parts=parts)
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         try:
