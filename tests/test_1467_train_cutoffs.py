@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Canon §11 bis: a single packet per Paris cutoff during build/beta."""
+"""Canon §11 bis: one packet per compiled epoch, including Paris DST."""
 from datetime import datetime
 import types
 import unittest
@@ -49,6 +49,54 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(engine.step(stamp("2026-10-15T14:00:04"))["result"], "idle")
         self.assertEqual(engine.step(stamp("2026-10-15T15:00:00"))["result"], "ci")
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 3)
+
+    def test_repeated_paris_hour_starts_distinct_packets_across_restart(self):
+        # Explicit supplier epochs: this checks the consumer, not how #1757
+        # computes the calendar. Both instants are 02:00 in Europe/Paris.
+        first = datetime.fromisoformat("2026-10-25T02:00:00+02:00").timestamp()
+        second = datetime.fromisoformat("2026-10-25T02:00:00+01:00").timestamp()
+        schedule = types.SimpleNamespace(last_packet=lambda now:
+            first if now < second else second)
+        engine = self.engine([dict(row(1), queued_ts=first - 1)], schedule=schedule)
+        earlier = engine.step(first + 5)["plan"]
+        self.ports.ci_by_head[earlier["head"]] = "green"
+        self.assertEqual(engine.step(first + 10)["result"], "landed")
+        self.ports.rows = [dict(row(2), queued_ts=first + 15)]
+        resumed = train.Engine(self.ports, source=engine.source, target=engine.target,
+                               policy=engine.policy)
+        self.assertEqual(resumed.step(second - 1)["result"], "idle")
+        result = resumed.step(second + 5)
+        self.assertEqual(result["result"], "ci", result)
+        later = result["plan"]
+        self.assertEqual([r["work_item_id"] for r in later["members"]], [2])
+        self.assertNotEqual(earlier["branch"], later["branch"])
+        self.assertNotEqual(earlier["id"], later["id"])
+        self.ports.ci_by_head[later["head"]] = "green"
+        self.assertEqual(resumed.step(second + 10)["result"], "landed")
+        self.ports.rows = [dict(row(3), queued_ts=second + 15)]
+        self.assertEqual(resumed.step(second + 1800)["result"], "idle")
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
+
+    def test_pending_packet_survives_spring_gap_without_another_dispatch(self):
+        first = datetime.fromisoformat("2026-03-29T01:00:00+01:00").timestamp()
+        second = datetime.fromisoformat("2026-03-29T03:00:00+02:00").timestamp()
+        schedule = types.SimpleNamespace(last_packet=lambda now:
+            first if now < second else second)
+        engine = self.engine([dict(row(1), queued_ts=first - 1)], schedule=schedule)
+        original = engine.step(first + 5)["plan"]
+        late = dict(row(2), queued_ts=first + 15)
+        self.ports.rows.append(late)
+        result = engine.step(second + 5)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual(result["plan"], original)
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+        self.ports.ci_by_head[original["head"]] = "green"
+        self.assertEqual(engine.step(second + 10)["result"], "landed")
+        self.ports.rows = [late]
+        result = engine.step(second + 15)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 2)
 
     def test_withdrawn_packet_drains_its_ci_before_next_hour_can_compose(self):
         schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)

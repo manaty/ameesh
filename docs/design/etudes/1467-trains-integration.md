@@ -45,6 +45,14 @@ l'autorité de fusion. L'absence de créneaux ou de méthode refuse avant
 réservation ; les bornes temporelles sont vérifiées avant composition.
 Après une CI longue, le passage reprend le dernier créneau fourni à
 l'instant courant, sans rafale pour rattraper les créneaux manqués.
+Le moteur compare les créneaux par epoch : les deux occurrences de 02 h
+au passage à l'heure d'hiver peuvent donc produire deux paquets distincts,
+y compris après reprise entre les deux. Au passage à l'heure d'été, une CI
+en cours conserve son manifeste jusqu'à sa conclusion ; la prochaine
+composition prend le dernier créneau réel fourni. Ces comportements sont
+éprouvés avec des epochs explicites dans le banc du consommateur ; le calcul
+du calendrier et son raccord Git/SQL restent à qualifier sur le fournisseur
+exact #1757.
 L'ancien calendrier autonome de 11 h/23 h reste
 uniquement un banc de préparation ; aucun profil actif ne le sélectionne.
 
