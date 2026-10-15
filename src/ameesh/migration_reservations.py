@@ -141,6 +141,9 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
     if numbers - set(mapped):
         raise work.WorkError("apply needs an explicit lot mapping for every active reservation")
     with db.transaction() as tx:
+        # Match named and legacy writers: repository before any lot row.
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                   "current_schema() || ':migration-repo:' || %s, 0))", ("github.com/" + slug,))
         for lot in sorted(mapped.values()):
             tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE", (lot,))
         result = preview(tx)
