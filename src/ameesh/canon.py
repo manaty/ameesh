@@ -2547,6 +2547,24 @@ class _Loader:
             deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
             superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
 
+    def _roles(self, fiche: Fiche, where: dict, subject: dict) -> list[str] | None:
+        """L244 (#420) : les rôles déclarés d'une fiche Agent/Persona.
+
+        Lus sous `roles` (liste ou chaîne), ou `role` au singulier ; normalisés
+        en minuscules, sans blanc ni doublon : le garde SQL du verdict QA les
+        compare tels quels au registre. `roles: [QA]` vaut `['qa']`."""
+        roles = self._list(fiche, "roles", where, "agent-roles-invalid", **subject)
+        if roles is None:
+            roles = self._list(fiche, "role", where, "agent-roles-invalid", **subject)
+        if roles is None:
+            return None
+        out: list[str] = []
+        for role in roles:
+            name = role.strip().lower()
+            if name and name not in out:
+                out.append(name)
+        return out
+
     def _build_agent(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": fiche.title}
         budget = fiche.data.get("budget_usd_per_day")
@@ -2616,7 +2634,7 @@ class _Loader:
             memory_repository=memory_repository,
             fiche=fiche,
             harnesses=harnesses,
-            roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
+            roles=self._roles(fiche, where, subject),
             projects=projects,
         ))
 
