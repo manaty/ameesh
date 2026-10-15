@@ -7,7 +7,12 @@ au fait, l'absence qui rend `unknown`, la divergence refusée, l'ajout seul.
 """
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import review_provenance as prov, storage, work
 
@@ -133,6 +138,89 @@ class PgProvenanceTest(PgTestCase):
         self.assertEqual(again["sha"], SHA1)
         recu = prov.receipt_for_commit(self.db, SHA1)
         self.assertEqual(recu["commit"], SHA1)
+
+    def test_a_divergent_commit_row_is_refused_not_unknown(self):
+        # une ligne existe pour le sujet, mais enregistre un AUTRE commit :
+        # ce n'est pas une origine absente (None), c'est une preuve corrompue
+        self._receipt("commit:" + SHA1, SHA1_FULL)
+        with self.assertRaises(prov.ProvenanceError):
+            prov.receipt_for_commit(self.db, SHA1)
+
+    def test_milestone_declared_in_a_turn_carries_its_proof(self):
+        """Le jalon et sa preuve naissent dans la même transaction (0445)."""
+        storage.of(self.db).agents.upsert_unleased(
+            "mty-amh-impl-07", chantier=None, harness="deepseek", host="h",
+            cwd="/tmp", session_id="s-1")
+        turn = "t" * 32
+        env = {"AGENT_MAIL_NAME": "mty-amh-impl-07", "AMEESH_TURN_ID": turn,
+               "AMEESH_HARNESS": "deepseek"}
+        # le sha déclaré est une abréviation ; le dépôt sous la main la résout
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(prov, "resolve_commit", return_value=SHA1):
+            mark = work.milestone(self.db, int(self.lot["id"]), "frozen",
+                                  sha=SHA1[:12], actor="mty-amh-impl-07")
+        self.assertEqual(mark["sha"], SHA1[:12], "le fait garde le sha déclaré")
+        recu = prov.receipt_for_milestone(self.db, mark["id"])
+        self.assertEqual(recu["commit"], SHA1, "la preuve porte le commit complet")
+        self.assertEqual(recu["session"], "s-1")
+        self.assertEqual(recu["turn"], turn)
+        self.assertEqual(recu["harness"], "deepseek")
+        self.assertEqual(recu["milestone"], {
+            "id": mark["id"], "actor": mark["actor"], "at_ts": mark["at_ts"],
+            "sha": mark["sha"], "verdict": mark["verdict"]})
+
+    def test_milestone_outside_a_turn_stays_unknown(self):
+        """Hors tour managé, le jalon s'écrit, l'origine reste inconnue."""
+        with mock.patch.dict(os.environ, {"AMEESH_TURN_ID": "", "AMEESH_HARNESS": ""},
+                             clear=False):
+            mark = work.milestone(self.db, int(self.lot["id"]), "verdict",
+                                  sha=SHA1, actor="mty-amh-impl-07", verdict="ok")
+        self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))
+
+    def test_record_commit_is_exact_and_never_rewritten(self):
+        ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                 "harness": "deepseek"}
+        row = prov.record_commit(self.db, SHA1, identity=ident,
+                                 work_item_id=int(self.lot["id"]))
+        self.assertTrue(row["recorded"])
+        self.assertEqual(prov.receipt_for_commit(self.db, SHA1)["session"], "s-1")
+        # rejouer la MÊME identité ne réécrit rien et ne lève pas
+        again = prov.record_commit(self.db, SHA1, identity=ident)
+        self.assertFalse(again["recorded"])
+        # une autre identité pour le même commit est refusée
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, SHA1, identity=dict(ident, actor="autre"))
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, "pas-un-sha", identity=ident)
+
+
+class HookInstallTest(unittest.TestCase):
+    """Le hook post-commit : posé une fois, jamais à la place d'un étranger."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-1465-hook-")
+        subprocess.run(["git", "init", "-q", self.tmp], check=True,
+                       capture_output=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_install_is_idempotent_and_keeps_a_foreign_hook(self):
+        out = prov.install_hook(self.tmp)
+        self.assertTrue(out["installed"], out)
+        self.assertEqual(out["path"], os.path.join(self.tmp, ".git", "hooks", "post-commit"))
+        with open(out["path"], encoding="utf-8") as fh:
+            self.assertIn("ameesh #1465", fh.read())
+        self.assertTrue(os.access(out["path"], os.X_OK))
+        self.assertTrue(prov.install_hook(self.tmp)["installed"])
+        foreign = "#!/bin/sh\necho autre\n"
+        with open(out["path"], "w", encoding="utf-8") as fh:
+            fh.write(foreign)
+        refused = prov.install_hook(self.tmp)
+        self.assertFalse(refused["installed"])
+        self.assertIn("foreign", refused["reason"])
+        with open(out["path"], encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), foreign)
 
 
 if __name__ == "__main__":

@@ -1352,8 +1352,14 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
-                      verdict: str | None, note: str) -> dict:
-        """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend."""
+                      verdict: str | None, note: str,
+                      proof: dict | None = None) -> dict:
+        """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
+
+        `proof` (#1465) : l'identité exacte du tour qui déclare (`actor`,
+        `session`, `turn`, `harness`, `sha` complet), écrite DANS LA MÊME
+        TRANSACTION que le jalon sous le sujet `milestone:<id>`. Absent, le
+        jalon s'écrit sans preuve : l'origine reste inconnue, jamais devinée."""
 
     @abc.abstractmethod
     def delays(self, limit: int, *, ids: Sequence[int] | None = None) -> list[dict]:

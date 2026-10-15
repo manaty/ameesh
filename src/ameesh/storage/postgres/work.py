@@ -618,9 +618,13 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note) -> dict:
+    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note, proof=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
-        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot."""
+        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
+
+        #1465 : quand `proof` porte un sha complet, sa ligne de provenance est
+        écrite dans la MÊME transaction — le fait et sa preuve naissent
+        ensemble, ou pas du tout."""
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
@@ -633,7 +637,16 @@ class WorkItems(interface.WorkItems):
                 """,
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
-            return rows[0]
+            mark = rows[0]
+            if proof and proof.get("sha"):
+                tx.execute(
+                    "INSERT INTO provenance_receipts"
+                    "       (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    ("milestone:%d" % int(mark["id"]), proof["sha"], proof["actor"],
+                     proof["session"], proof["turn"], proof["harness"], int(item_id)))
+            return mark
 
     def delays(self, limit, *, ids=None) -> list[dict]:
         if ids is not None:

@@ -25,6 +25,9 @@
         decision answers, chat) not attached to any work item (L130);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
+  ameesh provenance record --commit SHA | install | show
+        #1465 : preuve exacte d'origine (acteur, session, tour, harnais) d'un
+        commit ou d'un jalon — le hook post-commit l'écrit à chaque commit ;
   ameesh accounts list | use <harness> <account> | auto [harness]
         multiple accounts per provider: active, gauges, override (L30);
   ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
@@ -288,6 +291,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "provenance":
+        # #1465 : preuve exacte d'origine d'un commit ou d'un jalon
+        from . import review_provenance
+        return review_provenance.main(rest)
     if command == "decide":
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions

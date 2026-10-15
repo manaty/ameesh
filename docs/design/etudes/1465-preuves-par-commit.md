@@ -75,11 +75,14 @@ Règles de refus :
 
 ## 4. État et suite
 
-Livré dans ce point réversible : migration 0445, contrat de stockage, fournisseur
-et ses témoins (`tests/test_1465_provenance.py`).
+Livré dans les points réversibles de `lot/1465-preuves-par-commit` : migration
+0445, contrat de stockage, fournisseur (`receipt_for_commit`,
+`receipt_for_milestone`), écriture (`ameesh provenance record --commit`,
+`ameesh provenance install`, jalon gel/verdict et sa preuve dans la même
+transaction que `work_item_milestones`) et témoins
+(`tests/test_1465_provenance.py`).
 
-Reste avant gel : la commande `ameesh provenance record`, l'installation du hook
-`post-commit` (par le runner, au démarrage de session), le branchement de la
-déclaration de jalon sur la preuve, et la relecture croisée avec #1467.
-L'historique **antérieur** à la migration restera `unknown` : c'est le prix
-d'une preuve honnête, et le train #1467 devra qualifier des commits enregistrés.
+Reste avant gel : poser le hook au démarrage de session (runner), faire relire
+les deux familles requises (SQL sensible, canon §2). L'historique **antérieur**
+à la migration restera `unknown` : c'est le prix d'une preuve honnête, et le
+train #1467 devra qualifier des commits enregistrés.

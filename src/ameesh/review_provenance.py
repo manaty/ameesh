@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 
 from . import storage
 
@@ -90,8 +91,13 @@ def receipt_for_commit(db, sha) -> dict | None:
     ne l'a pas."""
     subject = subject_of_commit(sha)
     row = storage.of(db).provenance.get(subject)
-    if row is None or row["sha"] != subject[len("commit:"):]:
+    if row is None:
         return None
+    if row["sha"] != subject[len("commit:"):]:
+        # Une ligne existe pour ce sujet mais enregistre un AUTRE commit :
+        # ce n'est pas une absence (unknown), c'est une preuve corrompue.
+        raise ProvenanceError(
+            "%s: proof records commit %s, not the subject" % (subject, row["sha"]))
     return _receipt(row, commit=row["sha"], milestone=None)
 
 
@@ -165,3 +171,192 @@ def live_session(db, actor: str, *, harness: str = "") -> str:
                 "harness %r does not match the live session of %s (%r)"
                 % (harness, actor, live))
     return session
+
+
+def resolve_commit(value, *, cwd: str | None = None) -> str | None:
+    """Le commit complet qu'une abréviation désigne, dans le dépôt sous la main.
+
+    Rend None quand `git` ne résout pas — jamais une supposition : la preuve
+    exige le commit complet, et une abréviation ambiguë ou inconnue laisse
+    l'origine inconnue."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        run = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", text + "^{commit}"],
+            capture_output=True, text=True, cwd=cwd or os.getcwd(), timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = (run.stdout or "").strip().lower()
+    if run.returncode != 0 or not FULL_SHA.fullmatch(sha):
+        return None
+    return sha
+
+
+def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
+                           cwd: str | None = None) -> dict | None:
+    """L'identité exacte du tour courant, ou None si le fait n'y est pas déclaré.
+
+    None couvre trois cas, tous « origine inconnue » : pas de tour managé
+    (`AMEESH_TURN_ID` absent), pas de session vivante au registre pour l'acteur,
+    ou un `sha` déclaré que le dépôt ne résout pas. Un jalon hors tour s'écrit
+    donc sans preuve — jamais avec une preuve devinée."""
+    try:
+        ident = capture(actor=actor)
+        ident["session"] = live_session(db, ident["actor"], harness=ident["harness"])
+    except ProvenanceError:
+        return None
+    declared = str(sha or "").strip()
+    if declared:
+        full = resolve_commit(declared, cwd=cwd)
+        if full is None:
+            return None
+        ident["sha"] = full
+    else:
+        ident["sha"] = ""
+    return ident
+
+
+def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None) -> dict:
+    """Écrit la preuve exacte d'un commit, ou refuse une divergence.
+
+    C'est le point d'écriture du hook `post-commit` : l'identité vient du tour
+    courant (jamais de l'appelant), le commit doit être complet ou résoluble.
+    Une preuve déjà écrite pour ce commit n'est pas réécrite : une identité
+    différente est une erreur."""
+    full = full_sha(sha) if FULL_SHA.fullmatch(str(sha or "").strip().lower()) \
+        else resolve_commit(sha)
+    if full is None:
+        raise ProvenanceError("commit %r does not resolve to a full commit" % (sha,))
+    subject = subject_of_commit(full)
+    row = storage.of(db).provenance.add(
+        subject, full, identity["actor"], identity["session"], identity["turn"],
+        identity["harness"], work_item_id=work_item_id)
+    if not row["recorded"]:
+        same = (row["actor"] == identity["actor"] and row["session"] == identity["session"]
+                and row["turn"] == identity["turn"] and row["harness"] == identity["harness"])
+        if not same:
+            raise ProvenanceError(
+                "%s: already recorded for %s/%s, not %s/%s"
+                % (subject, row["actor"], row["turn"], identity["actor"], identity["turn"]))
+    return row
+
+
+#: le hook posé par `ameesh provenance install` — il ne bloque JAMAIS un
+#: commit : sans tour managé, sans base ou sans ameesh, il sort 0.
+HOOK = """#!/bin/sh
+# ameesh #1465 — preuve d'origine du commit, dans le tour qui l'a cree.
+# Ne bloque jamais un commit : hors tour manage ou sans base, sort 0.
+[ "${AMEESH_TURN_ID:-}" ] || exit 0
+command -v ameesh >/dev/null 2>&1 || exit 0
+ameesh provenance record --commit HEAD --quiet >/dev/null 2>&1 || exit 0
+exit 0
+"""
+
+
+def install_hook(repo: str) -> dict:
+    """Pose le hook `post-commit` dans le dépôt `repo` (hooks partagés).
+
+    Idempotent : un hook absent ou déjà le nôtre est (ré)écrit ; un hook
+    ÉTRANGER n'est jamais écrasé — on le signale, l'agent décide. Rend
+    `{"path", "installed", "reason"}`."""
+    common = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                            capture_output=True, text=True, cwd=repo, timeout=20)
+    git_dir = (common.stdout or "").strip()
+    if common.returncode != 0 or not git_dir:
+        return {"path": "", "installed": False,
+                "reason": "not a git repository: %s" % (repo,)}
+    if not os.path.isabs(git_dir):
+        git_dir = os.path.join(repo, git_dir)
+    path = os.path.join(git_dir, "hooks", "post-commit")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            current = fh.read()
+        if current != HOOK and "ameesh #1465" not in current:
+            return {"path": path, "installed": False,
+                    "reason": "a foreign post-commit hook is already installed"}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(HOOK)
+    os.chmod(path, 0o755)
+    return {"path": path, "installed": True, "reason": "installed"}
+
+
+def _connect():
+    from . import config as config_mod, db as db_mod
+    cfg = config_mod.load()
+    db = db_mod.connect(cfg)
+    db_mod.require_schema(db)
+    return db
+
+
+def build_parser():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="ameesh provenance",
+        description="#1465 : preuves exactes d'origine d'un commit et d'un jalon.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    rec = sub.add_parser("record", help="record the exact origin of a commit")
+    rec.add_argument("--commit", required=True, help="commit id (HEAD accepted)")
+    rec.add_argument("--lot", type=int, default=None, help="attach to a work item")
+    rec.add_argument("--quiet", action="store_true")
+    rec.add_argument("--json", action="store_true")
+    inst = sub.add_parser("install", help="install the post-commit hook")
+    inst.add_argument("--repo", default=".", help="repository (default: cwd)")
+    inst.add_argument("--json", action="store_true")
+    show = sub.add_parser("show", help="read the receipt, or nothing if unknown")
+    show.add_argument("--commit", default="")
+    show.add_argument("--milestone", type=int, default=None)
+    show.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    import json
+    import sys
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    if args.command == "install":
+        out = install_hook(args.repo)
+        if args.json:
+            print(json.dumps(out))
+        elif out["installed"]:
+            print("post-commit hook installed: %s" % out["path"])
+        else:
+            print("post-commit hook NOT installed: %s" % out["reason"], file=sys.stderr)
+        return 0 if out["installed"] else 1
+    db = _connect()
+    try:
+        if args.command == "record":
+            identity = capture()
+            identity["session"] = live_session(db, identity["actor"],
+                                               harness=identity["harness"])
+            row = record_commit(db, args.commit, identity=identity,
+                                work_item_id=args.lot)
+            if args.json:
+                print(json.dumps(row, default=str))
+            elif not args.quiet:
+                print("provenance recorded: %s by %s (turn %s)"
+                      % (row["subject"], row["actor"], row["turn"][:8]))
+            return 0
+        if args.commit:
+            recu = receipt_for_commit(db, args.commit)
+        elif args.milestone is not None:
+            recu = receipt_for_milestone(db, args.milestone)
+        else:
+            print("error: --commit or --milestone is required", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(recu, default=str))
+        elif recu is None:
+            print("unknown origin (no exact receipt)")
+        else:
+            print("%s: %s in %s, turn %s, %s"
+                  % (recu["subject"], recu["actor"], recu["session"],
+                     recu["turn"][:8], recu["record"]))
+        return 0 if recu is not None else 3
+    except ProvenanceError as exc:
+        print("provenance refused: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        db.close()
