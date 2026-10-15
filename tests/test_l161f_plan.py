@@ -2216,9 +2216,43 @@ def _branch_ref_escapes(text: str) -> list[str]:
     return escapes
 
 
-_RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
+_RUNNER_SELECTION = re.compile(
+    r"^runs-on:[ \t]*(?:"
+    r"\$\{\{.*\}\}"                       # valeur nue
+    r"|\"\$\{\{.*\}\}\""                  # valeur a guillemets doubles
+    r"|'\$\{\{.*\}\}'"                    # valeur a guillemets simples
+    r")[ \t]*(?:#.*)?$")
 _BRANCH_REF_COMPARED = re.compile(
-    r"startsWith\(github\.(?:base|head)_ref,\s*'[^',()]*'\)")
+    r"startsWith\(\s*github\.(?:base|head)_ref\s*,\s*'(?:[^',()]|'')*'\)")
+
+
+def _job_level(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a direct key of a job mapping, under `jobs:`?
+
+    #1563: the `runs-on:` exemption is job-level only. A `runs-on:` nested in
+    a step mapping, a strategy or any other level is not the label GitHub
+    reads for a job; it stays text and the witness keeps refusing an
+    interpolation there (fail closed).
+    """
+    col, ancestors = _key_column(lines[k]), []
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if dash is not None and dash < col:
+            return False                     # un item de sequence sur le chemin
+        if key < col:
+            if not _BARE_KEY.match(line[key:]):
+                return False
+            ancestors.append(j)
+            col = key
+            if len(ancestors) == 2:
+                break
+    if len(ancestors) != 2:
+        return False
+    _job, jobs = ancestors
+    return _key_column(lines[jobs]) == 0 and lines[jobs].startswith("jobs:")
 
 
 def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
@@ -2234,6 +2268,15 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     The compared literal is a single argument: dev4's N, a quoted literal that
     spans arguments of a `format()` (`'…startsWith(github.head_ref, ', …`)
     must not absolve the interpolated reference that follows.
+
+    #1563: the `runs-on:` exemption is bound to the job level (`_job_level`)
+    and reads the YAML spellings GitHub reads for the value: bare or quoted
+    (`"${{ … }}"`, `'${{ … }}'`), spaces after `startsWith(` and around the
+    literal, and `''` for an apostrophe inside a compared literal. Two forms
+    stay documented fail-closed limits: a `${{` opened on one line and closed
+    on another (`_left_open` refuses the unclosed flow), and a single-quoted
+    value whose compared literal uses the `''` escape, which the witness does
+    not decode.
     """
     line = lines[k]
     col = _key_column(line)
@@ -2242,6 +2285,8 @@ def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
     if _BRANCH_REF_ENV.match(line[col:]) and _under_env(lines, k, structural):
         return True
     if _RUNNER_SELECTION.match(line[col:]) is None:
+        return False
+    if not _job_level(lines, k, structural):
         return False
     return not _BRANCH_REF.search(_BRANCH_REF_COMPARED.sub("", line[col:]))
 
@@ -2358,6 +2403,40 @@ class RunBodiesTest(unittest.TestCase):
                      "\n      run: echo ok\"\n"):
             with self.subTest(bare=bare):
                 self.assertNotEqual([], _branch_ref_escapes("jobs:\n  a:\n" + bare))
+
+    def test_runner_selection_is_job_level_and_reads_yaml_spellings(self):
+        # #1563: l'exemption suit les formes YAML que GitHub lit pour un vrai
+        # `runs-on:` de job, et rien d'autre.
+        compared = "startsWith(github.head_ref, 'refs/heads/integration/')"
+        for name, line in {
+            "nue": "    runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared,
+            "guillemets doubles": (
+                "    runs-on: \"${{ %s && 'pool' || 'ci' }}\"\n" % compared),
+            "espace apres startsWith(": (
+                "    runs-on: ${{ startsWith( github.head_ref, "
+                "'refs/heads/integration/') && 'pool' || 'ci' }}\n"),
+            "apostrophe doublee": (
+                "    runs-on: ${{ startsWith(github.head_ref, "
+                "'refs/heads/it''s/') && 'pool' || 'ci' }}\n"),
+        }.items():
+            with self.subTest(forme=name):
+                self.assertEqual([], _branch_ref_escapes("jobs:\n  a:\n" + line))
+        # La meme ligne nichee dans un mapping d'etape ou une matrice n'est pas
+        # le `runs-on:` d'un job : elle reste une evasion (echec ferme).
+        for name, text in {
+            "mapping d'etape": ("jobs:\n  a:\n    steps:\n      - name: s\n"
+                                "        runs-on: ${{ %s && 'pool' || 'ci' }}\n"
+                                % compared),
+            "matrice": ("jobs:\n  a:\n    strategy:\n      matrix:\n"
+                        "        runs-on: ${{ %s && 'pool' || 'ci' }}\n" % compared),
+        }.items():
+            with self.subTest(hors_job=name):
+                self.assertNotEqual([], _branch_ref_escapes(text))
+        # Une expression `${{` ouverte sur une ligne et fermee sur une autre
+        # reste refusee : limite d'echec ferme documentee sur _branch_ref_allowed.
+        self.assertNotEqual([], _branch_ref_escapes(
+            "jobs:\n  a:\n    runs-on: ${{\n"
+            "      startsWith(github.head_ref, 'refs/heads/integration/') }}\n"))
 
     def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
         # YAML ignores indentation inside quotes, even after an anchor/tag.
