@@ -73,6 +73,17 @@ class BriefsTest(unittest.TestCase):
         briefs = alert_briefs.briefs(alert, self.listing, auditor_names=["auditeur"])
         self.assertIn("ameesh work assign", briefs["orch"])
         self.assertIn("Action : répartir", briefs["auditeur"])
+        # #1608 : bloqué -> l'auditeur ne reçoit pas l'ordre d'assigner ;
+        # démarrable -> il le reçoit
+        bloque = dict(alert, lots=[12], startable_lots=[],
+                      blocked_lots={"12": {"what": "dependency", "lots": [7]}})
+        auditeur = alert_briefs.briefs(bloque, self.listing, auditor_names=["auditeur"])["auditeur"]
+        self.assertIn("Action : répartir", auditeur)
+        self.assertNotIn("Lots are waiting", auditeur)
+        demarrable = dict(alert, lots=[12], startable_lots=[12])
+        auditeur = alert_briefs.briefs(demarrable, self.listing,
+                                       auditor_names=["auditeur"])["auditeur"]
+        self.assertIn("Lots are waiting", auditeur)
         self.assertEqual(alert_briefs.briefs({"type": "long_turn"}, self.listing), {})
 
     def test_orchestrateur_et_auditeur(self):

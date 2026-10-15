@@ -9,7 +9,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, mail, notify, registry, storage, sous_utilisation, work
+from ameesh import (exploitation, mail, notify, registry, storage, sous_utilisation,
+                    work, work_dependencies)
 
 from .support import PgTestCase
 
@@ -215,6 +216,56 @@ class IdleCapacityTest(_Base):
         work.assign(self.db, lot["id"], "claude1")
         self.assertEqual(self.alertes(), [])
         self.assertEqual(self.alertes(idle_capacity_s=0), [])
+
+    def test_lot_bloque_n_est_pas_propose_au_dispatch(self):
+        """#1608 : un lot sans assigné qui attend une dépendance n'est pas
+        proposé ; le brief nomme le bloqueur et ne propose que le démarrable."""
+        self.agent("claude1")
+        self.agent("claude2")
+        self.agent("orch")
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")      # hors des lots à confier
+        attente = work.add(self.db, title="à prendre")
+        work_dependencies.add(self.db, attente["id"], bloqueur["id"], actor="test")
+        libre = work.add(self.db, title="libre")
+        alerte = _types(self.alertes(), "idle_capacity")[0]
+        self.assertEqual(sorted(alerte["lots"]), sorted([attente["id"], libre["id"]]))
+        self.assertEqual(alerte["startable_lots"], [libre["id"]])
+        self.assertEqual(alerte["blocked_lots"][str(attente["id"])],
+                         {"what": "dependency", "lots": [bloqueur["id"]]})
+        self.assertIn("#%d waits on #%d" % (attente["id"], bloqueur["id"]), alerte["detail"])
+        self.assertIn("1 startable now: #%d" % libre["id"], alerte["detail"])
+
+        briefs = sous_utilisation.orchestrator_briefs(
+            {**alerte, "orchestrators": ["orch"]}, self.listing(),
+            {attente["id"]: "à prendre", libre["id"]: "libre"})
+        texte = briefs["orch"]
+        self.assertIn('Open lots without an agent: #%d "libre"' % libre["id"], texte)
+        self.assertNotIn('#%d "à prendre"' % attente["id"], texte)
+        self.assertIn("Waiting for a prerequisite: #%d waits on #%d"
+                      % (attente["id"], bloqueur["id"]), texte)
+        self.assertIn("Give them work tied to a lot", texte)
+
+    def test_aucun_lot_demarrable_le_dit(self):
+        """#1608 : sans lot démarrable, le brief le dit et écarte le dispatch."""
+        self.agent("claude1")
+        self.agent("claude2")
+        self.agent("orch")
+        bloqueur = work.add(self.db, title="bloqueur")
+        work.assign(self.db, bloqueur["id"], "claude2")
+        attente = work.add(self.db, title="à prendre")
+        work_dependencies.add(self.db, attente["id"], bloqueur["id"], actor="test")
+        alerte = _types(self.alertes(), "idle_capacity")[0]
+        self.assertEqual(alerte["lots"], [attente["id"]])
+        self.assertEqual(alerte["startable_lots"], [])
+        briefs = sous_utilisation.orchestrator_briefs(
+            {**alerte, "orchestrators": ["orch"]}, self.listing(),
+            {attente["id"]: "à prendre"})
+        texte = briefs["orch"]
+        self.assertIn("No startable open lot without an agent: #%d waits on #%d"
+                      % (attente["id"], bloqueur["id"]), texte)
+        self.assertIn("Do not assign a lot that waits", texte)
+        self.assertNotIn("Give them work tied to a lot", texte)
 
     def test_forfait_au_repos_pendant_que_le_token_travaille(self):
         self.agent("claude1")
