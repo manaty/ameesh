@@ -23,8 +23,9 @@ repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
 pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
 plan de repli le demande par `pilot_list` ; une PR de release garde la suite
 complète, scripts/test-plan.py). La liste
-est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
-refusée.
+est additive (L160a) : on écrit un nom par ligne, en ordre alphabétique et
+sans doublon ; la lecture range et dédoublonne ce qu'une fusion `union`
+(.gitattributes) produit, et refuse toujours un nom inconnu.
 
 `run` exécute la part dans ce processus (`unittest`, verbeux) et mesure la
 durée de chaque module ; `durations` fusionne ces mesures dans la table.
