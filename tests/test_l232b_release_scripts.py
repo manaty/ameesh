@@ -20,7 +20,8 @@ args = sys.argv[1:]
 with open(os.environ["RELEASE_CALLS"], "a") as out:
     out.write(json.dumps({"release": Path(__file__).with_name("release").read_text(),
                           "args": args}) + "\\n")
-if args[0] == "migrate" and "--additive-only" in args and Path(__file__).with_name("nonadditive").exists():
+# Like cli.cmd_migrate, a dry-run reports nonadditivity without refusing.
+if args[0] == "migrate" and "--dry-run" not in args and "--additive-only" in args and Path(__file__).with_name("nonadditive").exists():
     sys.exit(3)
 '''
 
@@ -126,7 +127,10 @@ class MigrationPinningTest(unittest.TestCase):
         (self.share / "src-current").symlink_to("src-" + c[:7])
         done = self.run_script("migrer", c, MIGRER_APRES="1")
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        self.assertEqual(self.calls(), [{"release": "C", "args": ["migrate", "--dry-run", "--additive-only"]}])
+        self.assertEqual(self.calls(), [
+            {"release": "C", "args": ["migrate", "--dry-run", "--additive-only"]},
+            {"release": "C", "args": ["migrate", "--additive-only"]},
+        ])
 
     def test_failed_backup_start_is_propagated(self):
         done = self.run_script("sauvegarder", BACKUP_START_STATUS="42")
