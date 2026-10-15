@@ -281,14 +281,24 @@ L'ajout est compatible : la version passe à `1.2.0` et une sixième ligne de
   `location`, `kept` (entrées gardées), `last` (la plus récente, ou `null`)
   et `end` (fin logique du fil). Rend le `counted_until` retenu. Un
   `counted_until` au-delà de `end` (recomptage plus récent) n'est pas
-  repris ; à `end` égal le census est repris : à fin logique constante,
-  seule une expiration change le fil. `threads.lock`, `threads.expired` et
+  repris ; à `end` égal le census n'est repris que s'il ne rallonge pas la
+  ligne (`kept <= entries`) : à fin logique constante, seule une expiration
+  change le fil (elle le raccourcit), donc un census plus long a été lu
+  avant elle et est périmé (L361c). `threads.lock`, `threads.expired` et
   `threads.indexed` restent refusés : un verrou ne tient pas d'une requête
   distante à l'autre.
 - **Indexation.** Sur un exécuteur médié, l'entrée qui vient d'être écrite
-  reste indexée par `threads.index` (l'opération d'avant L361, chaque
-  entrée comptée) ; l'expiration et l'indexation sont deux requêtes
-  distinctes.
+  est indexée par le même census absolu que l'expiration (L361c, #877) :
+  l'appareil calcule le census du fichier après l'écriture et le porte par
+  `threads.recount` — un `+1` local ne peut donc plus compter deux fois une
+  entrée déjà reprise par une expiration, ni être effacé par un census plus
+  court arrivé après. La trace dans la boîte (`agent_mailbox.meta`) reste une
+  écriture `threads.index` (`count` faux, portée B, auteur membre du fil) :
+  elle marque la boîte et rafraîchit `location`, jamais `entries` ni
+  `last_*` — une entrée expirée entre-temps ne peut pas revenir par sa trace.
+  Deux requêtes pour une entrée qui porte un message, une seule sinon. Le
+  contrat ne change pas (`threads.recount` et `threads.index` existent tous
+  deux en 1.2.0) ; seule la répartition des écritures change.
 - **Sans connexion, rien n'expire** : `fil expire` refuse et ne touche à
   aucun fichier ; `--dry-run` liste ce qui expirerait.
 

@@ -963,14 +963,44 @@ def _link(path: str) -> str:
     return target if target.startswith("/") else ""
 
 
+def _zombie(pid: int) -> bool:
+    """Le processus `pid` est-il un zombie (état `Z` de /proc/<pid>/stat) ?
+
+    Un zombie n'est plus qu'une entrée de table : il ne détient aucun fichier,
+    et ses liens `/proc` sont illisibles sans qu'il y ait un doute à avoir
+    (#1678, constat #1665 : un « timeout <defunct> » retenait tout le ménage
+    des worktrees). Un stat illisible (disparu, autre utilisateur) : False —
+    le doute ordinaire s'applique.
+
+    Le meneur d'un groupe dont un autre fil vit encore se lit aussi `Z` : il
+    n'est zombie que si tous ses fils (`/proc/<pid>/task`) le sont."""
+    try:
+        if _stat_fields(pid)[0] != "Z":
+            return False
+        tasks = os.listdir(os.path.join(PROC, str(int(pid)), "task"))
+        for tid in tasks:
+            path = os.path.join(PROC, str(int(pid)), "task", tid, "stat")
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    data = fh.read()
+            except FileNotFoundError:
+                continue   # fil disparu entre-temps
+            if data[data.rindex(")") + 2:].split()[0] != "Z":
+                return False
+        return bool(tasks)
+    except (OSError, IndexError, ValueError):
+        return False
+
+
 def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     """Where the processes of `uid` (default: this user) are, from `/proc`.
 
-    A process gone meanwhile is ignored. One that cannot be read (not
-    dumpable: setuid, file capabilities) is a doubt, unless its name (`comm`)
-    AND the base name of its `argv[0]` are both in `allow` or the service
-    manager: its `exe` link is unreadable too, its command line is not.
-    Without `/proc` (other OS), `available` is false."""
+    A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
+    it holds nothing anymore. One that cannot be read (not dumpable: setuid,
+    file capabilities) is a doubt, unless its name (`comm`) AND the base name
+    of its `argv[0]` are both in `allow` or the service manager: its `exe` link
+    is unreadable too, its command line is not. Without `/proc` (other OS),
+    `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
@@ -986,6 +1016,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
             if os.lstat(base).st_uid != uid:
                 continue
         except OSError:
+            continue
+        if _zombie(int(pid)):
+            # plus un détenteur : ignoré comme un processus disparu (#1678)
             continue
         name = _read_text(os.path.join(base, "comm")).strip() or "?"
         who = "%s %s" % (pid, name)

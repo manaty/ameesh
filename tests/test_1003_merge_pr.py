@@ -103,7 +103,11 @@ class _Base(unittest.TestCase):
         self.lot_target = "main"
         self.lot_marks = []
         self.ready_marks()
+        # These Git/PR fixtures simulate storage. #1680's real shared-lease
+        # exclusion and fencing are exercised by test_1680_packet_reservation.
+        self.writer = mock.Mock()
         for patch in (
+                mock.patch("ameesh.packet_reservation.WriterLease", return_value=self.writer),
                 mock.patch.object(work, "get", side_effect=self._lot_row),
                 mock.patch.object(work, "milestones",
                                   side_effect=lambda db, n, *a, **kw: list(self.lot_marks))):
@@ -161,6 +165,23 @@ class _Base(unittest.TestCase):
 
 
 class GuardTest(_Base):
+    def test_reserved_packet_target_prevents_merge_construction(self):
+        from ameesh.packet_reservation import ReservationError
+        self.writer.acquire.side_effect = ReservationError("target reserved")
+        with mock.patch.object(merge_pr, "_fetch") as fetch:
+            with self.assertRaisesRegex(merge_pr.MergePrError, "reserved"):
+                self.merge(self.gh())
+        fetch.assert_not_called()
+        self.assertEqual(self.tip(), self.base)
+
+    def test_lost_target_lease_prevents_the_remote_push(self):
+        from ameesh.packet_reservation import ReservationError
+        self.writer.refresh.side_effect = ReservationError("reservation lost before push")
+        with self.assertRaisesRegex(merge_pr.MergePrError, "lost before push"):
+            self.merge(self.gh())
+        self.assertEqual(self.tip(), self.base)
+        self.writer.release.assert_called_once()
+
     def test_dry_run_builds_the_merge_commit_without_pushing(self):
         gh = self.gh()
         out = self.merge(gh, dry_run=True)
@@ -420,6 +441,15 @@ class MergeTest(_Base):
         with self.assertRaisesRegex(merge_pr.MergePrError, "targets release/1"):
             self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
 
+    def test_a_target_written_refs_remotes_origin_names_the_same_branch(self):
+        # #1253 (cx3): `refs/remotes/origin/main` must name `main`, like
+        # `origin/main` does (merge_queue's normalization); the guard used to
+        # refuse it and declare nothing.
+        self.lot_target = "refs/remotes/origin/main"
+        _git(self.origin, "update-ref", "refs/heads/main", self.head)
+        out = self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+        self.assertEqual(out["state"], "already", out)
+
     def test_an_already_merged_view_that_does_not_name_the_head_is_refused(self):
         with self.assertRaisesRegex(merge_pr.MergePrError, "head is"):
             self.merge(self.gh(state="MERGED", headRefOid="a" * 40,
@@ -581,6 +611,22 @@ class RunTest(unittest.TestCase):
         code, text = self.run_with(out, args=self.args(lot=1003, json=False))
         self.assertEqual(code, 0)
         self.assertIn("WARNING lot not declared", text)
+
+    def test_an_unknown_actor_declares_nothing(self):
+        # N2 (#1253): the merged milestone is never attributed to
+        # UNKNOWN_ACTOR — the merge is a fact that is kept, the declaration is
+        # skipped and the warning names the fix.
+        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
+               "tip": "d" * 40}
+        for actor in ("", work.UNKNOWN_ACTOR):
+            with self.subTest(actor=actor):
+                with mock.patch.object(merge_pr.work, "merged") as recorded:
+                    code, text = self.run_with(out, args=self.args(actor=actor, json=False))
+                self.assertEqual(code, 0)
+                recorded.assert_not_called()
+                self.assertIn("WARNING lot not declared", text)
+                self.assertIn("unknown actor", text)
 
     def test_an_already_merged_pr_is_declared_on_its_lot(self):
         out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,

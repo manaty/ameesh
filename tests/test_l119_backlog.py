@@ -124,10 +124,22 @@ class PriseTest(_Base):
             return sous_utilisation.idle_capacity(
                 self.db, listing, self.now, [], idle_s=30, paid=("deepseek",), **kw)
 
-        self.assertEqual(alertes(), [])
-        self.assertEqual(alertes(lots=storage.of(self.db).operations.open_lots_activity(500)), [])
+        # #1608 : l'alerte ne se tait plus devant un lot de projet bloqué — elle
+        # le garde dans `lots`, le classe dans `blocked_lots` et écarte le
+        # dispatch ; la prise automatique (0037) garde, elle, le filtre `db=db`
+        # de #1021 (test suivant).
+        self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
+        self.assertEqual(alertes()[0]["lots"], [lot["id"]])
+        self.assertEqual(alertes()[0]["startable_lots"], [])
+        self.assertEqual(alertes()[0]["blocked_lots"][str(lot["id"])]["what"], "dependency")
+        self.assertNotIn("ameesh work assign", alertes()[0]["detail"])
+        self.assertEqual(
+            [a["type"] for a in alertes(
+                lots=storage.of(self.db).operations.open_lots_activity(500))],
+            ["idle_capacity"])
         work.close(self.db, amont["id"], abandoned=True)
         self.assertEqual([a["type"] for a in alertes()], ["idle_capacity"])
+        self.assertEqual(alertes()[0]["startable_lots"], [lot["id"]])
         self.assertIn("#%d" % lot["id"], alertes()[0]["detail"])
 
     def test_dependance_ouverte_laisse_prendre_l_amelioration_prete(self):

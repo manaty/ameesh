@@ -965,15 +965,24 @@ def main_red(db) -> list[dict]:
     l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
     est déjà relevé (#846 : un main rouge ne reste pas silencieux derrière ses
     jobs agrégateurs, qui peuvent attendre un runner des heures).
+    Une exécution en cours plus ancienne que la dernière conclue de son
+    workflow est écartée : une exécution supprimée ou introuvable (l'API rend
+    `{}`) n'est jamais conclue, et son job rouge garderait l'alerte, qui bloque
+    les déploiements, sans fin (#1453).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
-    out = []
+    out, newest = [], {}
     for row in st.ci.latest_concluded(BASE_BRANCHES):
+        key = (row["repo"], row["branch"], row.get("workflow"))
+        newest[key] = max(newest.get(key, 0), int(row["run_id"]))
         if row.get("status") != "failure":
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
     for row in st.ci.running_on(BASE_BRANCHES):
+        if int(row["run_id"]) < newest.get(
+                (row["repo"], row["branch"], row.get("workflow")), 0):
+            continue
         # hérités exclus : un échec déjà rouge à la dernière exécution conclue
         # de la base est déjà porté par l'alerte de celle-ci, de même clé
         own = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))

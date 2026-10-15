@@ -319,4 +319,4 @@ conditional on the assignee and the state; a note goes on the lot and an
   host.
 
 When the pause ends, nothing comes back on its own: the note says so, and
-the orchestrator decides. The codex review stays required.
+the orchestrator decides. A review by another family stays required.
