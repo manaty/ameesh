@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import db as db_mod, migrations, work
+from ameesh import db as db_mod, migrations, storage, work
 from ameesh.db import DbError
 from ameesh.storage.postgres import work as pg_work
 
@@ -752,6 +752,149 @@ class RetryReservationTest(PgTestCase):
         self.assertNotIsInstance(got, DbError)
         self.assertEqual(attempts, [0.0])
         self.assertEqual(clock.slept, [])
+
+
+class NumeroAtterriTest(PgTestCase):
+    """#1567 : le numéro **atterri** est enregistré et nommé par `work show`,
+    pas seulement la réservation — un paquet renumérote au max+1 de la cible
+    (#1240 réservait 457, atterri 452)."""
+
+    def setUp(self):
+        super().setUp()
+        self.nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                              NEXLINK.directory, ["375_a.sql", "376_b.sql"])
+        self.ameesh = _depot(os.path.join(self.tmp, "ameesh"), "manaty/ameesh",
+                             AMEESH.directory, ["0005_e.sql"])
+
+    def _lot(self, repo="manaty/nexlink", n=1):
+        return work.add(self.db, title="lot", issue_ref="%s#%d" % (repo, n),
+                        actor="mesh-design")
+
+    def _nx(self, lot, number=None, **kw):
+        return work.reserve_migration(self.db, lot["id"], number, repo=self.nexlink, **kw)
+
+    def test_la_fusion_nomme_le_numero_atterri(self):
+        lot = self._lot()
+        self.assertEqual(self._nx(lot)["migration"], 377)
+        done = work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1",
+                           migration_landed=452)
+        self.assertEqual(done["result"], "merged")
+        item = work.get(self.db, lot["id"])
+        # la réservation reste la sienne ; le numéro atterri est un fait à part
+        self.assertEqual((item["migration"], item["migration_repo"]),
+                         (377, "manaty/nexlink"))
+        self.assertEqual((item["migration_landed"], item["migration_landed_repo"]),
+                         (452, "manaty/nexlink"))
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("migration 452 landed (reserved 377)" in n for n in notes), notes)
+        self.assertEqual(
+            work.migration_line(item),
+            "452 landed in manaty/nexlink (L122) — file"
+            " supabase/migrations/452_<name>.sql (reserved 377)")
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("migration: 452 landed in manaty/nexlink (L122) — file"
+                      " supabase/migrations/452_<name>.sql (reserved 377)", proc.stdout)
+        self.assertNotIn("file supabase/migrations/377", proc.stdout)
+        proc = self.mesh("work", "show", str(lot["id"]), "--json")
+        self.assertIn('"migration_landed": 452', proc.stdout)
+        self.assertIn('"migration_landed_repo": "manaty/nexlink"', proc.stdout)
+
+    def test_sans_enregistrement_la_vue_ne_donne_pas_la_reservation_pour_atterrie(self):
+        lot = self._lot()
+        self._nx(lot)
+        work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1")
+        item = work.get(self.db, lot["id"])
+        self.assertIsNone(item["migration_landed"])
+        self.assertEqual(work.migration_line(item),
+                         "377 reserved in manaty/nexlink (L122)"
+                         " — landed number not recorded")
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertIn("migration: 377 reserved in manaty/nexlink (L122)"
+                      " — landed number not recorded", proc.stdout)
+        self.assertNotIn("377 landed", proc.stdout)
+        self.assertNotIn("supabase/migrations/377", proc.stdout)
+
+    def test_rattrapage_et_correction_d_un_lot_deja_fusionne(self):
+        lot = self._lot()
+        self._nx(lot)
+        sha = "b" * 40
+        work.merged(self.db, lot["id"], sha=sha, actor="dev1")
+        done = work.merged(self.db, lot["id"], sha=sha, actor="dev2", migration_landed=452)
+        self.assertEqual(done["result"], "landed")
+        self.assertIn("landed migration 452 recorded (manaty/nexlink)", done["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 452)
+        # idempotent : le même numéro ne réécrit rien
+        again = work.merged(self.db, lot["id"], sha=sha, actor="dev2", migration_landed=452)
+        self.assertEqual(again["result"], "already")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertEqual(sum("landed migration" in n for n in notes), 1, notes)
+        # correction : l'ancien numéro est rendu, le nouveau est tenu
+        fixed = work.merged(self.db, lot["id"], sha=sha, actor="dev2", migration_landed=453)
+        self.assertEqual(fixed["result"], "landed")
+        self.assertIn("landed migration 452 → 453 corrected (manaty/nexlink)",
+                      fixed["detail"])
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["migration_landed"], 453)
+        registry = storage.of(self.db).work
+        self.assertIsNone(registry.migration_landed_holder(452, "manaty/nexlink"))
+        self.assertEqual(registry.migration_landed_holder(453, "manaty/nexlink")["id"],
+                         lot["id"])
+        proc = self.mesh("work", "merged", str(lot["id"]), "--sha", sha,
+                         "--migration-landed", "454")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lot #%d already merged:" % lot["id"], proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["migration_landed"], 454)
+
+    def test_deux_lots_ne_nomment_pas_le_meme_numero_atterri(self):
+        first = self._lot(n=1)
+        self._nx(first)
+        work.merged(self.db, first["id"], sha="c" * 40, actor="dev1", migration_landed=452)
+        second = self._lot(n=2)
+        self._nx(second)
+        with self.assertRaises(work.WorkError) as ctx:
+            work.merged(self.db, second["id"], sha="d" * 40, actor="dev2",
+                        migration_landed=452)
+        self.assertIn("lot #%d" % first["id"], str(ctx.exception))
+        self.assertIn("manaty/nexlink", str(ctx.exception))
+        # la déclaration refusée n'a rien fermé ni écrit
+        item = work.get(self.db, second["id"])
+        self.assertEqual((item["state"], item["migration_landed"]), ("intake", None))
+        done = work.merged(self.db, second["id"], sha="d" * 40, actor="dev2",
+                           migration_landed=453)
+        self.assertEqual(done["result"], "merged")
+
+    def test_numero_hors_bornes_et_lot_ferme(self):
+        lot = self._lot()
+        self._nx(lot)
+        for number in (0, 10000):
+            with self.assertRaises(work.WorkError) as ctx:
+                work.merged(self.db, lot["id"], sha="e" * 40, actor="dev1",
+                            migration_landed=number)
+            self.assertIn("outside 0001-9999", str(ctx.exception))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+        work.close(self.db, lot["id"], abandoned=True, actor="dev1")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.merged(self.db, lot["id"], sha="e" * 40, actor="dev1",
+                        migration_landed=452)
+        self.assertIn("not reopened", str(ctx.exception))
+
+    def test_le_numero_atterri_survit_a_la_liberation_de_la_reservation(self):
+        """#956 (qa) libère `migration`/`migration_repo` à l'état terminal : le
+        numéro atterri, lui, ne doit pas disparaître avec la réservation."""
+        lot = self._lot()
+        self._nx(lot)
+        work.merged(self.db, lot["id"], sha="f" * 40, actor="dev1", migration_landed=452)
+        self.db.execute("UPDATE work_items SET migration = NULL, migration_repo = NULL"
+                        " WHERE id = %d" % lot["id"])
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
+        self.assertEqual(
+            work.migration_line(item),
+            "452 landed in manaty/nexlink (L122) — file"
+            " supabase/migrations/452_<name>.sql")
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertIn("migration: 452 landed in manaty/nexlink (L122)", proc.stdout)
 
 
 if __name__ == "__main__":
