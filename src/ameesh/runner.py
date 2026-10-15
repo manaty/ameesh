@@ -466,6 +466,10 @@ class AgentWorker(threading.Thread):
         #: résumé, worker relancé) : repli sur le grand livre
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
+        #: L81 (étude §6.3) : instant monotone du dernier message humain en
+        #: attente — un entretien de session résidente ne le précède pas de
+        #: moins de `resident_runner.QUIET_S`, sauf dépassement dur
+        self._dernier_humain = 0.0
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -1461,6 +1465,11 @@ class AgentWorker(threading.Thread):
         ni annulée à chaque passage (2026-10-10 : 62 rotations annulées en une
         soirée), et la ligne de fin de l'épisode de pression la cite.
         """
+        # L81 (étude §6) : l'entretien d'une session résidente se décide entre
+        # deux tours, sur la mesure enregistrée au dernier tour.
+        entretien = self._resident_maintenance()
+        if entretien and self._resident_maintain(entretien):
+            return True
         if self.proc is None and (self.rotation_forcee or self.context_rotation_due()
                                   or self.rotation_due()):
             if self._held_by_pressure(self.runner.host_pressure()):
@@ -1480,6 +1489,58 @@ class AgentWorker(threading.Thread):
             return False
         return self._rotate("turns=%d, tokens=%.0f, last turn=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
+
+    def _resident_maintenance(self) -> str:
+        """L81 : ce que la session résidente demande entre deux tours
+        (`resident_runner.maintenance`), '' si elle peut continuer."""
+        from . import resident_runner
+        with self.lock:
+            rp = self.resident
+        if rp is None:
+            return ""
+        return rp.maintenance_due(
+            cap=self.context_max_tokens(),
+            reread_max=resident_runner.reread_max(
+                self._state_read(resident_runner.REREAD_MAX_SETTING)))
+
+    def _humain_recent(self, quiet: float | None = None) -> bool:
+        """L81 (étude §6.3) : un message humain en attente depuis moins de
+        `quiet` secondes interdit un entretien non urgent (le seuil de relu
+        cumulé, la compaction) ; le dépassement dur, lui, passe outre."""
+        from . import resident_runner
+        delai = resident_runner.QUIET_S if quiet is None else quiet
+        return bool(self._dernier_humain) and \
+            time.monotonic() - self._dernier_humain < delai
+
+    def _resident_maintain(self, decision: str) -> bool:
+        """L81 (étude §6.2/§6.3) : exécute la décision d'entretien d'une
+        session résidente — la rotation (quand calme pour le seuil de relu
+        cumulé, sans attendre pour le plafond dur). Rend True si la session a
+        été tournée : le processus est alors fermé et le prochain tour en
+        ouvre un neuf sur le résumé (étude §6.3). La compaction native (T3)
+        viendra ici, quand calme."""
+        from . import resident_runner
+        with self.lock:
+            rp = self.resident
+        if rp is None:
+            return False
+        if decision == resident_runner.ROTATE:
+            raison = ("context cap: %d tokens reread in the last turn (cap %d)"
+                      % (rp.last_reread, self.context_max_tokens()))
+        elif decision == resident_runner.ALERT:
+            if self._humain_recent():
+                return False
+            raison = ("resident session re-read: %d tokens (threshold %.0f)"
+                      % (rp.session_reread, resident_runner.reread_max(
+                          self._state_read(resident_runner.REREAD_MAX_SETTING))))
+        else:
+            return False
+        if not self._rotation_allowed():
+            return False
+        if not self._rotate(raison):
+            return False
+        self._close_resident("rotated: %s" % raison)
+        return True
 
     def _rotation_allowed(self) -> bool:
         """L226b : le tour de résumé d'une rotation est un appel de modèle. Il
@@ -1579,7 +1640,26 @@ class AgentWorker(threading.Thread):
             "`session-history.jsonl`; the new session starts from the summary below.\n\n%s"
             % (raison, ancienne or "new", resume),
             meta={"action": "rotation", "session": ancienne or "", "raison": raison})
+        # L81 (étude §6.3) : la rotation est annoncée dans la conversation.
+        self._conversation_state(
+            "Session rotated (%s): the old id (%s) is kept in "
+            "`session-history.jsonl`; the new session starts from the summary."
+            % (raison, ancienne or "new"),
+            session=ancienne, meta={"action": "rotation", "raison": raison})
         return True
+
+    def _conversation_state(self, text: str, *, session: str | None = None,
+                            meta: dict | None = None) -> None:
+        """L78/L81 : une ligne d'état dans la conversation de l'agent (visible
+        en `ameesh chat`), sans jamais casser le geste qu'elle raconte."""
+        try:
+            from . import conversation, fil as fil_mod
+            log = conversation.Log(
+                self.db, self.cfg, agent=self.name,
+                project=fil_mod.project_for(self.cfg, fil_mod.agent_project(self.agent)))
+            log.append("state", text, session=session, meta=meta)
+        except Exception as exc:  # noqa: BLE001
+            log_async("[%s] conversation state not recorded (%s)" % (self.name, exc))
 
     # -- rotation au changement de lot (0025, L26) ---------------------------
     def turn_lot(self, spec: dict) -> str | None:
@@ -3322,6 +3402,10 @@ class AgentWorker(threading.Thread):
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
         mail_due = bool(others) and self._mail_due(others)
+        if others and any(self._from_human(m) for m in others):
+            # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
+            # d'une session résidente lui laisse la place (fenêtre de calme).
+            self._dernier_humain = time.monotonic()
         if not mail_due and not (events and self._events_due(events)):
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:

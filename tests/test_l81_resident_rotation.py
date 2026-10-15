@@ -1,16 +1,25 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L81 (#289) — resident rotation: continuous measurement and thresholds.
 
-No Postgres, no harness: the measurement is read from `TurnResult.usage`
-(study §6.1) and the decision is a pure function (study §6.2). The rotation
-and the native compaction themselves come next.
+The measurement is read from `TurnResult.usage` (study §6.1) and the decision
+is a pure function (study §6.2); the rotation itself runs on the L76 fake
+harness (Claude Code stream-json) with Postgres, like `test_l76`.
 """
 from __future__ import annotations
 
+import json
+import os
+import sys
+import time
 import types
 import unittest
+from unittest import mock
 
-from ameesh import resident_runner
+from ameesh import adapters, conversation, harnesses, registry, resident_runner
+from ameesh.runner import AgentWorker, Runner
+
+from .support import PgTestCase
+from .test_l75_resident import claude_doc
 
 
 def _result(**usage):
@@ -47,16 +56,28 @@ class MaintenanceTest(unittest.TestCase):
             context=1_000, window=200_000, reread=15_000_000,
             session_reread=15_000_000, cap=15_000_000), resident_runner.ROTATE)
 
-    def test_rotation_on_the_session_cumulative_reread(self):
+    def test_alert_on_the_session_cumulative_reread(self):
         self.assertEqual(resident_runner.maintenance(
             context=1_000, window=200_000, reread=1_000,
             session_reread=50_000_000, reread_max=50_000_000),
-            resident_runner.ROTATE)
+            resident_runner.ALERT)
 
     def test_rotation_wins_over_compaction(self):
         self.assertEqual(resident_runner.maintenance(
             context=190_000, window=200_000, reread=15_000_000,
             session_reread=15_000_000, cap=15_000_000), resident_runner.ROTATE)
+
+    def test_hard_ceiling_wins_over_the_cumulative_alert(self):
+        self.assertEqual(resident_runner.maintenance(
+            context=190_000, window=200_000, reread=15_000_000,
+            session_reread=50_000_000, cap=15_000_000, reread_max=50_000_000),
+            resident_runner.ROTATE)
+
+    def test_the_alert_wins_over_compaction(self):
+        self.assertEqual(resident_runner.maintenance(
+            context=190_000, window=200_000, reread=1_000,
+            session_reread=50_000_000, reread_max=50_000_000),
+            resident_runner.ALERT)
 
     def test_compaction_at_half_the_window(self):
         self.assertEqual(resident_runner.maintenance(
@@ -126,7 +147,107 @@ class ResidentMeasurementTest(unittest.TestCase):
         rp.record_turn(_result(input_tokens=31_000_000, context_tokens=1_000,
                                context_window=200_000))
         self.assertEqual(rp.maintenance_due(reread_max=50_000_000),
-                         resident_runner.ROTATE)
+                         resident_runner.ALERT)
+
+
+class ResidentRotationTest(PgTestCase):
+    """The rotation itself: measured between two turns, when quiet."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute("TRUNCATE turn_costs, spend_pending, turn_resources CASCADE")
+        self.log = os.path.join(self.tmp, "resident-trace.jsonl")
+        path = os.path.join(self.tmp, "fake-claude.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(claude_doc(), fh)
+        self.adapter = adapters.HarnessAdapter(harnesses.load(path, source="test"),
+                                               sys.executable)
+        for patch in (mock.patch.dict(os.environ, {"FAKE_RESIDENT_LOG": self.log}),
+                      mock.patch.object(resident_runner, "binary_version",
+                                        return_value="2.1.286")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def _worker(self, name: str = "res81", **local):
+        runner = Runner(self.cfg, self.db, once=False)
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(name, "claude", cwd=cwd)
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        self.addCleanup(worker._close_resident, "end of test")
+        worker._adapter = lambda: self.adapter
+        self._set(worker, resident="on", **local)
+        return runner, worker
+
+    @staticmethod
+    def _set(worker, **values) -> None:
+        os.makedirs(worker.state_dir, exist_ok=True)
+        for key, value in values.items():
+            with open(os.path.join(worker.state_dir, key), "w", encoding="utf-8") as fh:
+                fh.write(str(value))
+
+    def _turn(self, worker, prompt: str) -> bool:
+        return worker.run_turn({"kind": "prompt", "prompt": prompt, "ids": []})
+
+    def _starts(self) -> list[list[str]]:
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding="utf-8") as fh:
+            return [json.loads(l)["argv"] for l in fh if l.strip() and '"argv"' in l]
+
+    def _prompts(self) -> list[str]:
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding="utf-8") as fh:
+            return [json.loads(l)["user"] for l in fh if l.strip() and '"user"' in l]
+
+    def _states(self, name: str = "res81") -> list[str]:
+        page = conversation.history(self.db, name, limit=100)
+        return [e["text"] for e in page["entries"] if e["kind"] == "state"]
+
+    def test_cumulative_reread_rotates_between_two_turns(self):
+        _runner, worker = self._worker(resident_reread_max="100")
+        self.assertTrue(self._turn(worker, "premier"))
+        rp = worker.resident
+        self.assertIsNotNone(rp)
+        # the fake harness answers each turn with usage 10+200+30
+        self.assertEqual(rp.session_reread, 240)
+        self.assertEqual(worker._resident_maintenance(), resident_runner.ALERT)
+        self.assertTrue(worker.maybe_rotate())
+        self.assertIsNone(worker.resident)          # the process was closed
+        self.assertIsNone(worker.current_session())  # the session was forgotten
+        self.assertTrue(worker.resume_summary)
+        self.assertTrue(any("Session rotated" in t for t in self._states()))
+        # the next turn opens a new session, from the resume summary
+        self.assertTrue(self._turn(worker, "deux"))
+        argv = self._starts()[-1]
+        self.assertNotIn("--resume", argv)
+        self.assertIn("Session resumed after rotation", self._prompts()[-1])
+
+    def test_hard_ceiling_rotates_even_right_after_a_human_message(self):
+        _runner, worker = self._worker(resident_reread_max="0")
+        self.assertTrue(self._turn(worker, "premier"))
+        worker._dernier_humain = time.monotonic()
+        self.assertFalse(worker.maybe_rotate())      # nothing due yet
+        self.assertIsNotNone(worker.resident)
+        with mock.patch.object(worker, "context_max_tokens", return_value=100):
+            self.assertEqual(worker._resident_maintenance(), resident_runner.ROTATE)
+            self.assertTrue(worker.maybe_rotate())
+        self.assertIsNone(worker.resident)
+
+    def test_a_recent_human_message_holds_the_soft_rotation(self):
+        _runner, worker = self._worker(resident_reread_max="100")
+        self.assertTrue(self._turn(worker, "premier"))
+        worker._dernier_humain = time.monotonic()
+        self.assertFalse(worker.maybe_rotate())
+        self.assertIsNotNone(worker.resident)        # the resident is kept
+        self.assertIsNotNone(worker.current_session())
+        worker._dernier_humain = time.monotonic() - resident_runner.QUIET_S - 1
+        self.assertTrue(worker.maybe_rotate())
+        self.assertIsNone(worker.resident)
 
 
 if __name__ == "__main__":

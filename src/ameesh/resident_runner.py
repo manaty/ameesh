@@ -58,8 +58,14 @@ REREAD_MAX_SETTING = "resident_reread_max"
 DEFAULT_REREAD_MAX = 50_000_000
 #: study §6.2: native compaction when the context reaches half the window
 COMPACT_SHARE = 0.5
+#: study §6.3: never during a turn, and not within 2 minutes after a human
+#: message — except for a hard overrun
+QUIET_S = 120.0
 #: what a finished resident turn asks for (L81, study §6.2)
 COMPACT = "compact"
+#: the session's cumulative re-read passed its threshold (study §6.2): this
+#: rotation waits for a quiet moment, unlike the hard L60 ceiling
+ALERT = "reread-alert"
 ROTATE = "rotate"
 
 ON = ("on", "1", "true", "yes")
@@ -126,15 +132,18 @@ def turn_reread(usage: dict | None) -> int:
 def maintenance(*, context: int | None, window: int | None, reread: int,
                 session_reread: int, cap: float = 0, reread_max: float = 0,
                 share: float = COMPACT_SHARE) -> str:
-    """What a finished resident session asks for (L81, study §6.2): `ROTATE`
-    when a hard bound is reached — the per-agent L60 ceiling on the turn's
-    re-read, or the session's cumulative re-read — `COMPACT` when the context
-    fills `share` of its window, else ''. Rotation wins: it is the hard
-    bound, and a compaction could not bring the session back under it."""
+    """What a finished resident session asks for (L81, study §6.2).
+
+    `ROTATE`: the per-agent L60 ceiling is reached on the turn's re-read — a
+    hard bound, acted on at the first passage between turns. `ALERT`: the
+    session's cumulative re-read passed `reread_max` (the study's alert
+    threshold) — acted on when quiet. `COMPACT`: the context fills `share` of
+    its window — acted on when quiet too. Rotation wins over compaction: a
+    compaction would not bring the session back under a hard bound."""
     if cap and reread >= cap:
         return ROTATE
     if reread_max and session_reread >= reread_max:
-        return ROTATE
+        return ALERT
     if context and window and share > 0 and context >= share * window:
         return COMPACT
     return ""
