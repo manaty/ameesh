@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import (exploitation, mail, notify, registry, storage, sous_utilisation,
+from ameesh import (exploitation, mail, notify, plan, registry, roadmap, storage, sous_utilisation,
                     work, work_dependencies)
 
 from .support import PgTestCase
@@ -258,6 +258,7 @@ class IdleCapacityTest(_Base):
         alerte = _types(self.alertes(), "idle_capacity")[0]
         self.assertEqual(alerte["lots"], [attente["id"]])
         self.assertEqual(alerte["startable_lots"], [])
+        self.assertNotIn("ameesh work assign", alerte["detail"])
         briefs = sous_utilisation.orchestrator_briefs(
             {**alerte, "orchestrators": ["orch"]}, self.listing(),
             {attente["id"]: "à prendre"})
@@ -266,6 +267,30 @@ class IdleCapacityTest(_Base):
                       % (attente["id"], bloqueur["id"]), texte)
         self.assertIn("Do not assign a lot that waits", texte)
         self.assertNotIn("Give them work tied to a lot", texte)
+
+    def test_bloqueur_de_feuille_de_route_hors_liste_affichee(self):
+        """La liste bornée des candidats ne borne pas la vérité des dépendances."""
+        self.agent("claude1")
+        attente = work.add(self.db, title="à prendre")
+        bloqueur = work.add(self.db, title="hors de la liste affichée")
+        roadmap.add_commitment(self.db, "release", due="2999-01-01", lot=attente["id"],
+                               depends_on=["#%d" % bloqueur["id"]])
+        alerte = sous_utilisation.idle_capacity(
+            self.db, self.listing(), self.now, [], lots=[attente])[0]
+        self.assertEqual(alerte["startable_lots"], [])
+        self.assertEqual(alerte["blocked_lots"][str(attente["id"])]["lots"], [bloqueur["id"]])
+        self.assertNotIn("ameesh work assign", alerte["detail"])
+
+    def test_demarrage_planifie_suit_l_instant_evalue(self):
+        self.agent("claude1")
+        attente = work.add(self.db, title="planifié")
+        storage.of(self.db).roadmap.plan_item(
+            attente["id"], {"start": "2999-01-01"}, source="test", actor="test")
+        debut = plan.day_start_ts("2999-01-01")
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - 1):
+            alerte = sous_utilisation.idle_capacity(
+                self.db, self.listing(), debut, [], lots=[attente])[0]
+        self.assertEqual(alerte["startable_lots"], [attente["id"]])
 
     def test_forfait_au_repos_pendant_que_le_token_travaille(self):
         self.agent("claude1")
