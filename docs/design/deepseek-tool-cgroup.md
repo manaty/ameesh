@@ -89,14 +89,23 @@ shared. No temporary shared-environment mutation or after-the-fact repair is
 used. Ordinary child Node **processes** still lose the guard: that accepted
 residual is separate from same-process worker threads.
 
-A missing, changed or unreviewed provider, unavailable source or unsupported
-Node module-hook API logs a warning and exits 127 before provider execution.
-During normal startup this precedes any stdout/session, so the headless runner
-classifies it as `host_not_ready`,
-preserves the instruction and emits its existing operational alert. Review a
-provider upgrade and its regression results before changing the pin. There is
-no silent fallback to an unreviewed native scope path. A resident driver reports
-startup failure; its eventual runner integration must retain host-error handling.
+Unavailable protection no longer stops the turn (#1460). A missing dsh package
+or provider, a changed or unreviewed provider (such as `dsh-subprocess-local`
+0.2.0-rc.2 under `/opt/node/lib/node_modules` on the VMs), unavailable source,
+an unexpected module format or export, or an unsupported Node module-hook API
+logs `[ameesh] WARNING: DeepSeek cgroup protection unavailable, running dsh
+without it: …` on stderr, and dsh runs as installed. At startup no hook is
+installed and the preload removes its own option from `NODE_OPTIONS`; a
+profile-local provider failing verification later is loaded unmodified. Its
+tools may then run in native `dsh-subprocess-*` scopes outside the runner
+cgroup: the warning is the only signal, the turn is not `host_not_ready`.
+Misuse of the guard still exits 127 before provider execution (provider
+preloaded or cached, guard not first or loaded with `--import`, asynchronous
+loaders and VM-module flags, a provider in a worker, `SHARE_ENV` with ambient
+preloads), classified `host_not_ready` by the headless runner. Review a
+provider upgrade and its regression results before changing the pin. A
+resident driver reports startup failure; its eventual runner integration must
+retain host-error handling.
 
 ## Cleanup limit and follow-up
 
@@ -149,9 +158,10 @@ DSH_TEST_SUBPROCESS_LOCAL=/path/to/node_modules/@deepseek-ai/dsh-subprocess-loca
 It proves the native-scope baseline, inherited cgroups for ordinary children,
 `setsid` and Node grandchildren, PTY placement, and normal termination. It also
 uses **dsh's actual profile loader**, accepts a reviewed profile-local provider,
-and refuses version/source/export drift with the CLI provider unchanged.
-Standard CI runs the module-local binding, actual-source/exports rejection,
-incompatible-provider and read-only-check tests without this optional dependency.
+and runs version/source/export drift unguarded with the warning (no 127), with
+the CLI provider unchanged. Standard CI runs the module-local binding,
+actual-source/exports verification, incompatible-provider (warning, dsh still
+runs) and read-only-check tests without this optional dependency.
 Real-provider regressions also reproduce refusal of a previously cached reviewed
 provider and declared require/import preloads, and thread-local refusal with
 default/empty `execArgv`, `SHARE_ENV`, eval, nested and retained-constructor
@@ -183,8 +193,9 @@ Choosing a sibling slice alone cannot enforce the caller service's `MemoryMax`.
 
 **Current workaround:** A narrowly targeted Node preload refuses the native
 capability probe, selecting the provider's existing PGID fallback. It pins the
-provider module and fails loudly on upgrades. This is temporary and loses
-exhaustive escaped-descendant cleanup at the tool-range level.
+provider module; an unreviewed upgrade runs without it, after a warning. This
+is temporary and loses exhaustive escaped-descendant cleanup at the tool-range
+level.
 
 **Requested resolution:** Document and expose an option to disable native
 scope creation under an external supervisor, with ordinary/PTY and `setsid`
