@@ -22,6 +22,11 @@ class Budgets(interface.Budgets):
 
     def put(self, scope, window_s, usd, *, actor, lower_only=False, ceiling=None) -> tuple:
         with self.db.transaction() as tx:
+            # A first cap has no row to lock. Serialize its creation too,
+            # before reading the value used by lower_only and the journal.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':budget_limits:' || %s || ':' || %s, 0))",
+                     (scope, str(int(window_s))))
             rows = tx.query(
                 "select usd::float8 as usd from budget_limits"
                 " where scope = %s and window_s = %s for update", (scope, int(window_s)))

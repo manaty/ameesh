@@ -10,6 +10,8 @@ trace, and the replay of a key.
 from __future__ import annotations
 
 import ast
+import concurrent.futures
+import threading
 import dataclasses
 import http.client
 import json
@@ -161,6 +163,13 @@ class NoReceiptTest(unittest.TestCase):
                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
         self.assertIn("create_request", called)
 
+    def test_non_scalar_budget_window_is_a_bad_request(self):
+        for value in ([], {}):
+            with self.subTest(window=value):
+                with self.assertRaises(serve_actions.ActionError) as exc:
+                    serve_actions._lower_cap(None, None, {}, {"window": value, "usd": 1})
+                self.assertEqual(exc.exception.status, 400)
+
     def test_no_path_approves_or_receives(self):
         for action in serve.ACTIONS:
             path = action.path.lower()
@@ -306,6 +315,42 @@ class ActionsPgTest(PostMixin, PgTestCase):
         limits = {(r["scope"], r["window_s"]): r["usd"]
                   for r in storage.of(self.db).budgets.limits()}
         self.assertEqual(limits[("a1", 3600)], 5.0)
+
+    def test_concurrent_first_caps_cannot_raise_the_first_lowering(self):
+        ready, release = threading.Event(), threading.Event()
+        first, second = self.connect(), self.connect()
+        pid = []
+
+        def lower_first():
+            with first.transaction() as tx:
+                pid.append(int(tx.query("select pg_backend_pid() as pid")[0]["pid"]))
+                storage.of(tx).budgets.put("a1", 3600, 5, actor="human:first",
+                                           lower_only=True, ceiling=10)
+                ready.set()
+                self.assertTrue(release.wait(30))
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                low = pool.submit(lower_first)
+                try:
+                    self.assertTrue(ready.wait(30))
+                    high = pool.submit(storage.of(second).budgets.put, "a1", 3600, 9,
+                                       actor="human:second", lower_only=True, ceiling=10)
+                    self.wait_for(lambda: self.db.query(
+                        "select pid from pg_stat_activity"
+                        " where %s = any(pg_blocking_pids(pid))", (pid[0],)), timeout=30)
+                finally:
+                    release.set()
+                low.result(timeout=30)
+                with self.assertRaises(ValueError):
+                    high.result(timeout=30)
+            self.assertEqual(storage.of(self.db).budgets.limits()[0]["usd"], 5)
+            events = storage.of(self.db).budgets.events(10, scope="a1")
+            self.assertEqual([(e["old_usd"], e["new_usd"]) for e in events], [(None, 5)])
+        finally:
+            release.set()
+            first.close()
+            second.close()
 
     def test_approval_request_of_an_unknown_action(self):
         status, _h, out = self.post("/api/v1/actions/act_%s/approval-request" % ("0" * 26),
