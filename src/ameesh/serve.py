@@ -87,10 +87,15 @@ SOCKET_TIMEOUT = 15.0
 RATE_PER_MINUTE = 600
 #: lots listed at most (`?limit=`)
 MAX_LOTS = 500
+#: conversation page of an agent card (L83): default and hard bound
+CHAT_PAGE = 100
+MAX_CHAT = 500
 LANGUAGES = ("fr", "en")
 #: an agent, host or project name; a lot id; a thread entry id; a duration
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:+-]{0,127}$")
 _LOT_RE = re.compile(r"^[0-9]{1,9}$")
+#: a conversation cursor or page size (`?after=`, `?limit=`)
+_SEQ_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
 _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
@@ -237,6 +242,24 @@ def _agent(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-agent-detail/1", "agent": row}
 
 
+def _chat(ctx: Context, db, params, query) -> dict:
+    """An agent's shared conversation, ascending from `after` (L83): the same
+    `ameesh-conversation/1` history `ameesh chat` reads. No relation filter
+    yet: the API's token is the machine owner's; filtering by the 0033 §9
+    relations arrives with the OIDC tokens of team mode (L86)."""
+    from . import conversation, registry
+    if registry.get(db, params["agent"]) is None:
+        raise ApiError(404, "not_found", "unknown agent")
+    after = _checked(_one(query, "after"), _SEQ_RE, "after")
+    limit = _checked(_one(query, "limit"), _SEQ_RE, "limit")
+    try:
+        return conversation.history(
+            db, params["agent"], after=int(after) if after is not None else 0,
+            limit=min(int(limit), MAX_CHAT) if limit is not None else CHAT_PAGE)
+    except ValueError as exc:
+        raise ApiError(400, "bad_query", str(exc)) from exc
+
+
 def _lots(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli, stagnation
     limit = _checked(_one(query, "limit"), _LOT_RE, "limit")
@@ -336,6 +359,12 @@ ROUTES = (
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
           _agent),
+    Route(API + "/agents/{agent}/chat", "ameesh-conversation/1",
+          "An agent's shared conversation (`ameesh chat <agent>`, L78/L83)", _chat,
+          query=(("after", {"type": "integer", "minimum": 0},
+                  "entries after this sequence number (default 0)"),
+                 ("limit", {"type": "integer", "minimum": 1, "maximum": MAX_CHAT},
+                  "entries at most (default %d)" % CHAT_PAGE))),
     Route(API + "/lots", "ameesh-lots/1", "Lots (`ameesh work list --json`)", _lots,
           query=(("state", {"type": "string"}, "state of the lots"),
                  ("assignee", {"type": "string"}, "assignee of the lots"), _LIMIT)),
@@ -436,6 +465,17 @@ SCHEMAS = {
     "ameesh-agent-detail/1": _obj("ameesh-agent-detail/1", ["agent"],
                                   agent=_obj(None, ["name", "key_ready"], name=_STR,
                                              key_ready={"type": "boolean"})),
+    "ameesh-conversation/1": _obj(
+        "ameesh-conversation/1",
+        ["agent", "entries", "last_seq", "oldest_seq", "next_seq", "more", "gap"],
+        agent=_STR,
+        entries={"type": "array", "items": _obj(
+            None, ["seq", "kind", "author", "text", "ts"],
+            seq={"type": "integer"}, kind=_STR, author=_STR, text=_STR, ts=_NUM,
+            truncated={"type": "boolean"}, session=_STR_NULL, turn=_STR_NULL,
+            event_id=_STR_NULL, project=_STR, lot=_STR_NULL, meta=_OBJ)},
+        last_seq={"type": "integer"}, oldest_seq={"type": ["integer", "null"]},
+        next_seq={"type": "integer"}, more={"type": "boolean"}, gap={"type": "boolean"}),
     "ameesh-lots/1": _obj("ameesh-lots/1", ["lots"], lots={
         "type": "array", "items": _obj(None, ["id", "title", "state", "delays"],
                                        id={"type": "integer"}, title=_STR, state=_STR)}),
