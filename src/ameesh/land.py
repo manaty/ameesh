@@ -510,18 +510,26 @@ class _Landing:
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
-        reason = "merged by ameesh (%s)" % merged["sha"][:12]
+        # #1682: a merge GitHub's auto-merge made at the frozen head, before
+        # the queue replayed anything, is constated: the queue's gates never
+        # ran on the merged tree, and the record must not say they did
+        constated = merged.get("state") == "constated"
+        who = "merged by GitHub auto-merge, constated by ameesh" if constated else "merged by ameesh"
+        reason = "%s (%s)" % (who, merged["sha"][:12])
         gates_text = ", ".join("`%s`" % g for g in project.gates)
         _passive(self.db, row.get("assignee"), self.lot, (
-            "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on "
-            "the merged tree: %s. The branch sweep closes the lot."
-            % (row["target"], self.lot, row.get("title") or "", merged["sha"][:12],
+            "Merge queue of %s, lot #%d « %s »: %s (%s%s)%s. %s The branch sweep closes the lot."
+            % (row["target"], self.lot, row.get("title") or "", who, merged["sha"][:12],
                ", PR #%s" % pr if pr else ", on %s" % (base or "?")[:12],
                "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
-               if merged.get("state") == "replayed" else "", gates_text)),
+               if merged.get("state") == "replayed" else "",
+               "The queue's gates (%s) did not run on the merged tree: only the PR's "
+               "required checks did." % gates_text if constated
+               else "Gates passed on the merged tree: %s." % gates_text)),
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
-        how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
-            row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
+        how = self.record(reason, "merge queue of %s: %s, %s%s" % (
+            row["target"], "constated GitHub auto-merge" if constated else "landed by ameesh",
+            merged["sha"][:12], ", PR #%s" % pr if pr else ""))
         review = self.review_after_merge(merged_sha=str(merged.get("sha") or ""), pr=pr)
         return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
                      "review_lot": review},
@@ -913,12 +921,14 @@ def _after_merge(landing: _Landing, pr, after, unread, *, sha: str | None = None
     """#194 r8: PR `pr` is merged (by this call or found merged): landed if
     into its target, otherwise reported. `sha` names the merged head when the
     caller knows it (#1682: a merge found before the queue pushed its own
-    merge commit; the default is the `landing_sha` the queue recorded)."""
+    merge commit, recorded as constated; the default is the `landing_sha`
+    the queue recorded)."""
+    state = "pr" if sha is None else "constated"
     if sha is None:
         sha = landing.row["landing_sha"]
     if after != _branch_of(landing.row["target"]):
         return _merged_in_doubt(landing, pr, after, unread)
-    return landing.landed({"sha": sha, "state": "pr", "files": []}, None, pr=pr)
+    return landing.landed({"sha": sha, "state": state, "files": []}, None, pr=pr)
 
 
 def _merged_sha(db, lot: int) -> str:

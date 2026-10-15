@@ -72,6 +72,14 @@ class AutoMergeConstatTest(PrLandTest):
         self.assertIn(self.tip(4)[:12], row["reason"])
         self.assertEqual(gh.disarm_calls, 1)
         self.assertFalse(any("--match-head-commit" in c for c in gh.calls))
+        # the queue never replayed this merge: the record says who merged, and
+        # never that the queue's gates passed on the merged tree
+        self.assertIn("constated", row["reason"])
+        self.assertNotIn("merged by ameesh", row["reason"])
+        self.assertTrue(any("did not run on the merged tree" in body
+                            for _, body, _ in self.sent))
+        self.assertFalse(any("Gates passed on the merged tree" in body
+                             for _, body, _ in self.sent))
 
     def test_a_merge_at_another_head_stays_fail_closed(self):
         gh = self.race(head="f" * 40)
