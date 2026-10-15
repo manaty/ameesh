@@ -301,7 +301,7 @@ def hook_lines(cfg, ids, environ=None) -> dict:
     return {"lines": lines, "ok": ok}
 
 
-def runner_coverage(names: list[str], run=_systemctl) -> dict | None:
+def runner_coverage(names: list[str], run=_systemctl, *, db=None) -> dict | None:
     """L'unité d'exécuteur ACTIVÉE (démarrée au boot) qui mène chaque agent,
     ou None pour un agent qu'aucune ne mène. None en entier sans systemd.
 
@@ -312,6 +312,7 @@ def runner_coverage(names: list[str], run=_systemctl) -> dict | None:
     `--agents a,b` la limite à ces agents ; sans `--agents`, une instance
     `x@<agent>` mène son agent, une unité simple les mène tous
     (l'`agent-runner.service` de BASCULE.md)."""
+    from .agent_names import resolve
     scopes = []
     for scope in ((), (SYSTEM,)):
         listing = run(*scope, "list-unit-files", "--type=service", "--no-legend", "--plain")
@@ -337,9 +338,10 @@ def runner_coverage(names: list[str], run=_systemctl) -> dict | None:
             if match:
                 for name in match.group(1).split(","):
                     if name:
-                        covered.setdefault(name, unit)
+                        covered.setdefault(resolve(name, db=db, operation="systemd.runner"), unit)
             elif "@" in unit:
-                covered.setdefault(unit.split("@", 1)[1].rsplit(".service", 1)[0], unit)
+                covered.setdefault(resolve(unit.split("@", 1)[1].rsplit(".service", 1)[0],
+                                           db=db, operation="systemd.runner"), unit)
             else:
                 generic.append(unit)
     out: dict[str, str | None] = {}
@@ -367,7 +369,7 @@ def missing_runner_lines(cfg, db, run=_systemctl) -> list[str]:
     agents = served_agents(cfg, db)
     if not agents:
         return []
-    coverage = runner_coverage([row["name"] for row in agents], run=run)
+    coverage = runner_coverage([row["name"] for row in agents], run=run, db=db)
     if coverage is None:
         return ["runners    : systemd unavailable — units not checked"]
     manquants = sorted(name for name, unit in coverage.items() if unit is None)
