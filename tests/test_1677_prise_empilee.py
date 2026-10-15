@@ -452,8 +452,11 @@ class InactiviteTest(_Empile):
                     if r["name"] == name)
 
     def repos(self, now):
+        # #1677 : le repos de la prise et des alertes se lit sur les lots
+        # actionnables, pas sur le temps depuis le dernier tour.
         return [r["name"] for r in sous_utilisation.idle_agents(
-            storage.of(self.db).operations.listing(), now, 900, waiting_free=True)]
+            storage.of(self.db).operations.listing(), now, 900,
+            waiting_free=True, actionable_idle=True)]
 
     def test_un_verdict_bloquant_rend_le_lot_actionnable(self):
         # dernier tour à l'instant : le temps ne dit plus rien (#1677)

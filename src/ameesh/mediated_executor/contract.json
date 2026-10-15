@@ -3929,7 +3929,7 @@
   }
  ],
  "refused": {
-  "interface_total": 405,
+  "interface_total": 406,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4329,6 +4329,7 @@
     "resolutions",
     "resolve_delegation",
     "returned_delegations",
+    "review_proposals",
     "save_measure",
     "set_app",
     "set_branch",

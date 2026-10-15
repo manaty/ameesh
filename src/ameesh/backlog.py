@@ -746,7 +746,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     def candidates(threshold: float, skip=(), waiting_free: bool = False) -> list:
         out = []
         for row in sous_utilisation.idle_agents(listing, now, threshold,
-                                                waiting_free=waiting_free):
+                                                waiting_free=waiting_free,
+                                                actionable_idle=True):
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
                 continue

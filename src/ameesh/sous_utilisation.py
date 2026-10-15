@@ -452,7 +452,7 @@ def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
 
 
 def idle_agents(listing: list, now: float, idle_s: float, *,
-                waiting_free: bool = False) -> list:
+                waiting_free: bool = False, actionable_idle: bool = False) -> list:
     """Les agents réveillables au repos : mode `execute`, exécuteur vivant (pas
     une session attachée), au repos (ni en tour, ni en pause de budget, ni
     arrêtés). Partagé par `idle_capacity`, `backlog_empty` et la prise
@@ -461,14 +461,15 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
     (`session_lot_busy`) occupent l'agent, comme pour la prise
     (`backlog._awaited`).
 
-    #1677 : le repos se lit sur les lots **actionnables** (`actionable_lots`,
-    lu par `operations.listing` : rien qui l'occupe, aucune correction
-    attendue d'un verdict bloquant), jamais sur le temps depuis le dernier
-    tour — un agent sans lot prend des tours de courrier toutes les quelques
-    minutes et ne serait donc jamais « au repos ». `idle_s` ne sert plus que
-    de repli pour une liste qui ne porte pas encore ce champ (bancs, appels
-    anciens) : il garde alors son sens d'origine, « au repos depuis au moins
-    `idle_s` »."""
+    #1677 : `actionable_idle` lit le repos sur les lots **actionnables**
+    (`actionable_lots`, lu par `operations.listing` : rien qui l'occupe,
+    aucune correction attendue d'un verdict bloquant) au lieu du temps depuis
+    le dernier tour — un agent sans lot prend des tours de courrier toutes les
+    quelques minutes et ne serait donc jamais « au repos » (N9). La **prise**
+    de lots et les alertes de sous-utilisation s'en servent ; la remise
+    (`handoff.hand`, L233b) garde son contrat d'origine, « au repos depuis au
+    moins `idle_s` », qu'un relevé sans `actionable_lots` (bancs, appels
+    anciens) impose de toute façon."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -482,10 +483,9 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
         if waiting_free and (row.get("has_pending_prompt")
                              or session_lot_busy(row, waiting_free=True)):
             continue
-        if "actionable_lots" in row:
-            if int(row.get("actionable_lots") or 0) > 0:
-                continue
-        else:
+        if int(row.get("actionable_lots") or 0) > 0:
+            continue
+        if not (actionable_idle and "actionable_lots" in row):
             since = idle_since(row)
             if not since or now - since < idle_s:
                 continue
@@ -557,7 +557,8 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     pressured = pressured or {}
     # L165b : un agent dont tous les lots attendent un autre est au repos
-    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True)
+    idle = [row for row in idle_agents(listing, now, idle_s, waiting_free=True,
+                                       actionable_idle=True)
             if row["name"] not in held]
     on_hold = sorted((row["name"], row.get("host")) for row in idle
                      if row.get("host") in held_hosts)
@@ -663,7 +664,7 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             not team or ((by_name.get(n) or {}).get("team") or "").strip() == team)]
         if not names:
             continue
-        parts = ["Idle capacity: %d wakeable agent(s) without an actionable lot: %s."
+        parts = ["Idle capacity: %d wakeable agent(s) without a lot: %s."
                  % (len(names), ", ".join(names))]
         if lots:
             parts.append("Open lots without an agent: %s." % ", ".join(
@@ -859,7 +860,7 @@ def backlog_empty(db, listing: list, now: float, *,
     invité à remplir la file (`ameesh work backlog add`)."""
     if idle_s <= 0:
         return []
-    idle = idle_agents(listing, now, idle_s)
+    idle = idle_agents(listing, now, idle_s, actionable_idle=True)
     if not idle:
         return []
     if storage.of(db).work.backlog(open_only=True, limit=1):
