@@ -33,9 +33,11 @@ de son fichier (il les a importés).
 
     commit, genere, outils     commit mesuré, date, versions (Python, coverage)
     measure, mesure            parts, processus mesurés (dont sans contexte),
-                               sous-processus Python lancés sans la mesure,
-                               surcoût (L148 stage 6 : les deux graphies,
-                               l'anglaise d'abord, une release)
+                               artefacts de mesure illisibles (jamais comptés
+                               comme mesure valide), sous-processus Python
+                               lancés sans la mesure, surcoût (L148 stage 6 :
+                               les deux graphies, l'anglaise d'abord, une
+                               release)
     modules.<m>                durations et durees (mêmes valeurs), échecs sous
                                mesure (14 jours)
     blocs.<fichier>.<bloc>     empreinte, lignes [début, fin], modules
@@ -65,6 +67,7 @@ import os
 import pathlib
 import platform
 import re
+import sqlite3
 import subprocess
 import sys
 import sysconfig
@@ -248,17 +251,27 @@ def _json_lines(motif: str):
                     continue  # ligne coupée (processus tué en écrivant)
 
 
-def _coverage(dossiers: list[str]) -> tuple[dict, int, int]:
-    """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés
-    et celui des processus sans contexte (environnement remplacé par le test :
-    leurs lignes ne sont attribuées à aucun module)."""
+def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict]]:
+    """{fichier relatif: {ligne: {modules}}}, le nombre de processus mesurés,
+    celui des processus sans contexte (environnement remplacé par le test :
+    leurs lignes ne sont attribuées à aucun module) et les artefacts de mesure
+    illisibles (part annulée en cours d'écriture) : signalés, jamais comptés
+    comme mesure valide ni attribués à un module."""
     lignes: dict = collections.defaultdict(lambda: collections.defaultdict(set))
     processus = sans_contexte = 0
+    incomplets: list[dict] = []
     for dossier in dossiers:
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
-            from coverage import CoverageData
+            from coverage import CoverageData, CoverageException
             donnees = CoverageData(basename=fichier)
-            donnees.read()
+            try:
+                donnees.read()
+            except (CoverageException, sqlite3.DatabaseError, OSError) as exc:
+                incomplets.append({
+                    "fichier": os.path.relpath(fichier, dossier),
+                    "erreur": f"{type(exc).__name__}: {exc}",
+                })
+                continue
             processus += 1
             contextes = donnees.measured_contexts()
             if contextes and not any(context_module(c) for c in contextes):
@@ -271,7 +284,7 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int]:
                     modules = {m for m in map(context_module, contextes) if m}
                     if modules:
                         lignes[relatif][ligne] |= modules
-    return lignes, processus, sans_contexte
+    return lignes, processus, sans_contexte, incomplets
 
 
 def _version_coverage() -> str:
@@ -297,7 +310,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
               table_durees: dict | None = None) -> dict:
     """Les mesures des parts → la carte."""
     maintenant = maintenant or datetime.datetime.now(datetime.timezone.utc)
-    lignes, processus, sans_contexte = _coverage(dossiers)
+    lignes, processus, sans_contexte, incomplets = _coverage(dossiers)
 
     # blocs de tout src/, exécutés ou non
     carte_blocs: dict[str, dict] = {}
@@ -391,6 +404,7 @@ def merge(dossiers: list[str], commit: str, precedente: dict | None = None,
     # L148 stage 6 : les deux graphies pendant une release, l'anglaise d'abord.
     measure = {"parts": len(dossiers), "processus": processus,
                "processus_sans_contexte": sans_contexte,
+               "artefacts_incomplets": incomplets,
                "sous_processus_sans_mesure": _per_module(sans_mesure),
                "surcout": surcout}
     return {
@@ -437,6 +451,10 @@ def summary(carte: dict) -> str:
         f"* {mesure['processus']} processus mesurés en {mesure['parts']} parts, dont "
         f"{mesure['processus_sans_contexte']} sans contexte de test",
     ]
+    if mesure.get("artefacts_incomplets"):
+        lignes.append("* artefacts de mesure illisibles, jamais comptés comme mesure valide : "
+                      + ", ".join(f"{i['fichier']} ({i['erreur']})"
+                                  for i in mesure["artefacts_incomplets"]))
     if mesure["surcout"]:
         lignes.append("* surcoût de la mesure : " + ", ".join(
             f"{p} ×{r}" for p, r in sorted(mesure["surcout"].items())))
