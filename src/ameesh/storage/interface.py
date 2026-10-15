@@ -2899,6 +2899,12 @@ class CiResults(Domain):
         """Les exécutions encore `running` du dépôt."""
 
     @abc.abstractmethod
+    def running_on(self, branches: Sequence[str]) -> list[dict]:
+        """Les exécutions encore `running` d'une branche de base, tous dépôts
+        confondus (#846) : un main rouge est lu sans attendre la conclusion de
+        ses jobs agrégateurs, qui peut rester des heures en file."""
+
+    @abc.abstractmethod
     def conclude(self, repo: str, run_id: int, status: str) -> bool:
         """`running` → `status` ; False si elle était déjà conclue."""
 
