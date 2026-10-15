@@ -3,6 +3,8 @@
 import errno
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -47,11 +49,13 @@ class JobReapingTest(unittest.TestCase):
 
     def _job_without_handle(self, mismatch=False):
         tracker = self.tracker()
-        pid = os.fork()
-        if pid == 0:
-            os.setsid()
-            time.sleep(60)
-            os._exit(0)
+        # #1749 : un enfant de `Popen` a un propriétaire (celui qui l'attend) ;
+        # le moissonneur d'orphelins doit préserver son statut. Un enfant
+        # forké à la main n'en a plus — c'est un adopté, moissonnable.
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import time; time.sleep(60)"],
+                                 start_new_session=True)
+        pid = child.pid
         try:
             until = time.monotonic() + 5
             while os.getpgid(pid) != pid:
@@ -98,9 +102,12 @@ class JobReapingTest(unittest.TestCase):
                         os.waitpid(pid, os.WNOHANG)
         finally:
             try:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-            except (ChildProcessError, ProcessLookupError):
+                child.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
                 pass
 
     def test_replacement_observation_is_not_reaped_for_old_job(self):
