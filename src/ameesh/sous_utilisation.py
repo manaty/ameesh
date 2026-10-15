@@ -236,30 +236,52 @@ def latest_account_gauges(db, now: float) -> dict:
     return out
 
 
+def pace_multipliers(cfg) -> dict:
+    """`{(harnais, compte): pace_multiplier}` des comptes déclarés (#1075).
+
+    Les comparaisons qui lisent l'historique des jauges sans passer par
+    `accounts.evaluate` (sous-utilisation) doivent suivre le rythme du profil
+    (#1028) ; un harnais sans compte déclaré garde 1.0, et une configuration
+    illisible ne fait jamais tomber l'alerte."""
+    from . import accounts as accounts_mod
+    try:
+        declared = accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+    except Exception:  # noqa: BLE001 - configuration invalide : rythme nominal
+        return {}
+    return {(harness, profile.name): profile.pace_multiplier
+            for harness, items in declared.items() for profile in items}
+
+
 def plan_underused(db, listing: list, now: float, *,
                    tail_s: float = DEFAULT_PLAN_TAIL_S,
                    used_pct: float = DEFAULT_PLAN_USED_PCT,
                    pace_gap_pct: float = DEFAULT_PLAN_PACE_GAP_PCT,
-                   paid=None, held=()) -> list:
+                   paid=None, held=(), multipliers: dict | None = None) -> list:
+    """`multipliers` (#1075/#1028) : `{(harnais, compte): pace_multiplier}` des
+    comptes déclarés — la comparaison au rythme perçu suit le profil, pas le
+    rythme nominal ; un compte absent garde 1.0."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
         return []
+    multipliers = multipliers or {}
     out: list = []
     spend = None
     spend_read = False
     for (harness, account), gauges in sorted(latest_account_gauges(db, now).items(),
                                               key=lambda kv: (kv[0][0], kv[0][1] or "")):
+        rythme = float(multipliers.get((harness, account), 1.0))
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
         for gauge, seen in live:
-            if any(other.exceeded(now) for other, _ in live if other is not gauge):
+            if any(other.exceeded(now, multiplier=rythme)
+                   for other, _ in live if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
             elapsed = gauge.elapsed(now)
-            cap = gauge.pace_cap(now)
+            cap = gauge.pace_cap(now, rythme)
             used = float(gauge.used or 0.0)
             reason = None
             tail = min(float(tail_s), PLAN_TAIL_MAX_FRACTION * gauge.window_s)
@@ -1179,7 +1201,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         canons = []
     paid = paid_harnesses(getattr(cfg, "host", None))
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
-                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held)
+                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held,
+                         multipliers=pace_multipliers(cfg))
     orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
                                canons=canons)
     for alert in out:
