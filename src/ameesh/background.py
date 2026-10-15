@@ -323,7 +323,7 @@ class Tracker:
         if not vivants and not conteneurs and not any(
                 h.live() for h in (handles or {}).values()):
             if cgroup:
-                from . import turn_cgroup
+                from .platform import turn_cgroup
                 try:
                     populated = turn_cgroup.populated(cgroup)
                 except Exception:
@@ -475,7 +475,7 @@ class Tracker:
         # détaché (double fork + setsid) n'apparaît dans aucun relevé de pid.
         cgroup_live = None
         if entry.cgroup:
-            from . import turn_cgroup
+            from .platform import turn_cgroup
             try:
                 cgroup_live = turn_cgroup.populated(entry.cgroup)
             except Exception:
@@ -576,7 +576,7 @@ class Tracker:
         Rend True s'il survit quelque chose (cgroup non vidé, ou `unverified`) ;
         False si le cgroup est vidé et enlevé. Les zombies adoptés sont
         moissonnés au passage pour les codes de sortie (télémétrie)."""
-        from . import turn_cgroup
+        from .platform import turn_cgroup
         try:
             emptied = turn_cgroup.kill(entry.cgroup)
         except Exception as exc:
@@ -834,7 +834,7 @@ class Tracker:
             # L498 : le cgroup doit avoir été vidé (par `_kill` à l'échéance,
             # ou de lui-même) ; on enlève le répertoire vide. S'il est encore
             # peuplé, la ressource reste orpheline, avec son chemin.
-            from . import turn_cgroup
+            from .platform import turn_cgroup
             try:
                 if not turn_cgroup.remove(entry.cgroup):
                     orphelin = True

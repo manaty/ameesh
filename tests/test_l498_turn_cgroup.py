@@ -5,7 +5,7 @@ Trois étages, sans jamais toucher un cgroup réel en dehors du témoin
 explicitement autorisé (`TemoinCgroupReelTest`, qui se saute de lui-même
 quand la délégation manque) :
 
-* les primitives de `ameesh.turn_cgroup` contre une **fausse** monture cgroup
+* les primitives de `ameesh.platform.turn_cgroup` contre une **fausse** monture cgroup
   construite dans un dossier temporaire (`root_dir=`) : lecture de
   `/proc/self/cgroup`, validation des identifiants, refus des liens,
   `cgroup.kill`, `cgroup.events`, `memory.peak`, ligne de commande ;
@@ -45,7 +45,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from . import support  # isole l'environnement de l'hôte (L142)
-from ameesh import background, turn_cgroup
+from ameesh import background
+from ameesh.platform import turn_cgroup
 from ameesh.runner import AgentWorker, Runner
 
 #: racine du dépôt : `cwd` et `PYTHONPATH` des sous-processus hermétiques
@@ -317,7 +318,7 @@ class TrampolineTest(unittest.TestCase):
 
     def run_module(self, args: list) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "ameesh.turn_cgroup", *args],
+            [sys.executable, "-m", "ameesh.platform.turn_cgroup", *args],
             cwd=REPO, env=support.child_env(), capture_output=True, text=True,
             timeout=30)
 
@@ -400,7 +401,7 @@ class TemoinCgroupReelTest(unittest.TestCase):
     #: le grand enfant écrit son pid, se détache de la session et dort
     SNIPPET = (
         "import os, sys, time\n"
-        "from ameesh import turn_cgroup\n"
+        "from ameesh.platform import turn_cgroup\n"
         "if not turn_cgroup.enter(sys.argv[1]):\n"
         "    sys.exit(3)\n"
         "pid = os.fork()\n"
@@ -475,7 +476,7 @@ class TemoinCgroupReelTest(unittest.TestCase):
             try:
                 try:
                     proc = subprocess.Popen(
-                        [sys.executable, "-m", "ameesh.turn_cgroup",
+                        [sys.executable, "-m", "ameesh.platform.turn_cgroup",
                          "--cgroup", self.mount, "--ready-fd", str(ready_w),
                          "--", "/bin/sh", "-c", "cat /proc/self/cgroup > %s" % vu],
                         cwd=REPO, env=support.child_env(), pass_fds=(ready_w,),
@@ -628,7 +629,7 @@ class SonTurnCgroupRootTest(unittest.TestCase):
     def test_sonde_une_fois_puis_cache(self):
         runner = self._runner()
         with mock.patch("ameesh.runner.log"), \
-                mock.patch("ameesh.turn_cgroup.root_for_runner",
+                mock.patch("ameesh.platform.turn_cgroup.root_for_runner",
                            return_value=("/user.slice/x/unit", "")) as sonde:
             self.assertEqual(runner.turn_cgroup_root(), "/user.slice/x/unit")
             self.assertEqual(runner.turn_cgroup_root(), "/user.slice/x/unit")
@@ -648,7 +649,7 @@ class SonTurnCgroupRootTest(unittest.TestCase):
             return "/u", ""
         worker = threading.Thread(target=lambda: results.append(runner.turn_cgroup_root()))
         with mock.patch("ameesh.runner.log"), \
-                mock.patch("ameesh.turn_cgroup.root_for_runner", side_effect=probe):
+                mock.patch("ameesh.platform.turn_cgroup.root_for_runner", side_effect=probe):
             worker.start()
             try:
                 self.assertTrue(started.wait(5))
@@ -662,7 +663,7 @@ class SonTurnCgroupRootTest(unittest.TestCase):
     def test_sans_delegation_rend_none_sans_lever(self):
         runner = self._runner()
         with mock.patch("ameesh.runner.log"), \
-                mock.patch("ameesh.turn_cgroup.root_for_runner",
+                mock.patch("ameesh.platform.turn_cgroup.root_for_runner",
                            return_value=(None, "own cgroup unknown")) as sonde:
             self.assertIsNone(runner.turn_cgroup_root())
             self.assertIsNone(runner.turn_cgroup_root())
@@ -671,10 +672,10 @@ class SonTurnCgroupRootTest(unittest.TestCase):
     def test_sans_delegation_rien_n_est_cree(self):
         runner = self._runner()
         with mock.patch("ameesh.runner.log"), \
-                mock.patch("ameesh.turn_cgroup.root_for_runner",
+                mock.patch("ameesh.platform.turn_cgroup.root_for_runner",
                            return_value=(None, "own cgroup unknown")), \
-                mock.patch("ameesh.turn_cgroup.create") as creation, \
-                mock.patch("ameesh.turn_cgroup.command") as commande:
+                mock.patch("ameesh.platform.turn_cgroup.create") as creation, \
+                mock.patch("ameesh.platform.turn_cgroup.command") as commande:
             self.assertIsNone(runner.turn_cgroup_root())
         creation.assert_not_called()
         commande.assert_not_called()
@@ -700,9 +701,9 @@ class ReconciliationTest(unittest.TestCase):
 
     def test_tue_les_orphelins_et_epargne_les_tours_vivants(self):
         runner = self._runner()
-        with mock.patch("ameesh.turn_cgroup.orphans",
+        with mock.patch("ameesh.platform.turn_cgroup.orphans",
                         return_value=["/u/turn-a", "/u/turn-b", "/u/autre"]) as orphelins, \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=True) as tuer, \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=True) as tuer, \
                 mock.patch("ameesh.runner.log"):
             self.assertEqual(runner.reconcile_turn_cgroups(), 1)
         orphelins.assert_called_once_with("/u")
@@ -714,25 +715,25 @@ class ReconciliationTest(unittest.TestCase):
             with runner._turn_cgroups_lock:
                 runner._turn_cgroups_live.add("new")
             return ["/u/turn-new"]
-        with mock.patch("ameesh.turn_cgroup.orphans", side_effect=enumerate_and_launch), \
-                mock.patch("ameesh.turn_cgroup.kill") as kill:
+        with mock.patch("ameesh.platform.turn_cgroup.orphans", side_effect=enumerate_and_launch), \
+                mock.patch("ameesh.platform.turn_cgroup.kill") as kill:
             self.assertEqual(runner.reconcile_turn_cgroups(), 0)
         kill.assert_not_called()
 
     def test_le_travail_de_fond_en_grace_est_vivant(self):
         runner = self._runner(live=())
         runner.background.entries = [self._entry("c"), self._entry("d", state="done")]
-        with mock.patch("ameesh.turn_cgroup.orphans",
+        with mock.patch("ameesh.platform.turn_cgroup.orphans",
                         return_value=["/u/turn-c", "/u/turn-d"]), \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=True) as tuer, \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=True) as tuer, \
                 mock.patch("ameesh.runner.log"):
             self.assertEqual(runner.reconcile_turn_cgroups(), 1)
         self.assertEqual(tuer.call_args_list, [mock.call("/u/turn-d")])
 
     def test_startup_nomme_les_orphelins_preexistants(self):
         runner = self._runner(live=())
-        with mock.patch("ameesh.turn_cgroup.orphans", return_value=["/u/turn-b"]), \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=True), \
+        with mock.patch("ameesh.platform.turn_cgroup.orphans", return_value=["/u/turn-b"]), \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=True), \
                 mock.patch("ameesh.runner.log") as journal:
             self.assertEqual(runner.reconcile_turn_cgroups(startup=True), 1)
         messages = [appel.args[0] for appel in journal.call_args_list]
@@ -740,8 +741,8 @@ class ReconciliationTest(unittest.TestCase):
 
     def test_cgroup_qui_ne_se_vide_pas_est_signale_sans_lever(self):
         runner = self._runner(live=())
-        with mock.patch("ameesh.turn_cgroup.orphans", return_value=["/u/turn-b"]), \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=False), \
+        with mock.patch("ameesh.platform.turn_cgroup.orphans", return_value=["/u/turn-b"]), \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=False), \
                 mock.patch("ameesh.runner.log_async") as journal:
             self.assertEqual(runner.reconcile_turn_cgroups(), 0)
         messages = [appel.args[0] for appel in journal.call_args_list]
@@ -749,8 +750,8 @@ class ReconciliationTest(unittest.TestCase):
 
     def test_kill_en_exception_ne_leve_pas(self):
         runner = self._runner(live=())
-        with mock.patch("ameesh.turn_cgroup.orphans", return_value=["/u/turn-b"]), \
-                mock.patch("ameesh.turn_cgroup.kill",
+        with mock.patch("ameesh.platform.turn_cgroup.orphans", return_value=["/u/turn-b"]), \
+                mock.patch("ameesh.platform.turn_cgroup.kill",
                            side_effect=RuntimeError("noyau muet")), \
                 mock.patch("ameesh.runner.log_async") as journal:
             self.assertEqual(runner.reconcile_turn_cgroups(), 0)
@@ -760,7 +761,7 @@ class ReconciliationTest(unittest.TestCase):
     def test_sans_racine_rien_n_est_balaye(self):
         runner = self._runner(root=None)
         with mock.patch("ameesh.runner.log"), \
-                mock.patch("ameesh.turn_cgroup.orphans") as orphelins:
+                mock.patch("ameesh.platform.turn_cgroup.orphans") as orphelins:
             self.assertEqual(runner.reconcile_turn_cgroups(), 0)
         orphelins.assert_not_called()
 
@@ -768,7 +769,7 @@ class ReconciliationTest(unittest.TestCase):
         runner = self._runner(live=())
         runner.background = SimpleNamespace(lock=None, entries=[])
         with mock.patch("ameesh.runner.log_async"), \
-                mock.patch("ameesh.turn_cgroup.orphans") as orphelins:
+                mock.patch("ameesh.platform.turn_cgroup.orphans") as orphelins:
             self.assertEqual(runner.reconcile_turn_cgroups(), 0)
         orphelins.assert_not_called()
 
@@ -852,8 +853,8 @@ class RessourceDuTourTest(unittest.TestCase):
         worker = self._ouvrir()
         store = mock.Mock()
         with mock.patch("ameesh.runner.storage.of", return_value=store), \
-                mock.patch("ameesh.turn_cgroup.memory_peak", return_value=4096), \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=True) as tuer, \
+                mock.patch("ameesh.platform.turn_cgroup.memory_peak", return_value=4096), \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=True) as tuer, \
                 mock.patch("ameesh.turn_processes.group_running", return_value=False), \
                 mock.patch("ameesh.runner.log") as journal, \
                 mock.patch("ameesh.runner.log_async"):
@@ -870,8 +871,8 @@ class RessourceDuTourTest(unittest.TestCase):
         worker = self._ouvrir()
         store = mock.Mock()
         with mock.patch("ameesh.runner.storage.of", return_value=store), \
-                mock.patch("ameesh.turn_cgroup.memory_peak", return_value=None), \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=False), \
+                mock.patch("ameesh.platform.turn_cgroup.memory_peak", return_value=None), \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=False), \
                 mock.patch("ameesh.turn_processes.group_running", return_value=False), \
                 mock.patch("ameesh.runner.log") as journal, \
                 mock.patch("ameesh.runner.log_async"):
@@ -886,8 +887,8 @@ class RessourceDuTourTest(unittest.TestCase):
 
     def test_fermeture_sans_ligne_base_nettoie_encore_le_cgroup(self):
         worker = self._worker()
-        with mock.patch("ameesh.turn_cgroup.memory_peak", return_value=None), \
-                mock.patch("ameesh.turn_cgroup.kill", return_value=True) as tuer, \
+        with mock.patch("ameesh.platform.turn_cgroup.memory_peak", return_value=None), \
+                mock.patch("ameesh.platform.turn_cgroup.kill", return_value=True) as tuer, \
                 mock.patch("ameesh.turn_processes.group_running", return_value=False), \
                 mock.patch("ameesh.runner.log"), \
                 mock.patch("ameesh.runner.storage.of") as store:
@@ -897,7 +898,7 @@ class RessourceDuTourTest(unittest.TestCase):
 
     def test_fermeture_sans_cgroup_ni_ligne_base_ne_fait_rien(self):
         worker = self._worker()
-        with mock.patch("ameesh.turn_cgroup.kill") as tuer, \
+        with mock.patch("ameesh.platform.turn_cgroup.kill") as tuer, \
                 mock.patch("ameesh.runner.storage.of") as store:
             worker._close_turn_resource("t1", 4242)
         tuer.assert_not_called()
@@ -907,8 +908,8 @@ class RessourceDuTourTest(unittest.TestCase):
         worker = self._ouvrir()
         store = mock.Mock()
         with mock.patch("ameesh.runner.storage.of", return_value=store), \
-                mock.patch("ameesh.turn_cgroup.memory_peak", return_value=None), \
-                mock.patch("ameesh.turn_cgroup.kill",
+                mock.patch("ameesh.platform.turn_cgroup.memory_peak", return_value=None), \
+                mock.patch("ameesh.platform.turn_cgroup.kill",
                            side_effect=RuntimeError("noyau muet")), \
                 mock.patch("ameesh.turn_processes.group_running", return_value=False), \
                 mock.patch("ameesh.runner.log"), \
@@ -934,7 +935,7 @@ class TravailDeFondTest(unittest.TestCase):
 
     def test_cgroup_peuple_est_un_survivant(self):
         tracker = self._tracker()
-        with mock.patch("ameesh.turn_cgroup.populated", return_value=True) as peuple:
+        with mock.patch("ameesh.platform.turn_cgroup.populated", return_value=True) as peuple:
             self.assertEqual(tracker.survivors("t1", None, cgroup="/u/turn-t1"),
                              ([], []))
         peuple.assert_called_once_with("/u/turn-t1")
@@ -943,9 +944,9 @@ class TravailDeFondTest(unittest.TestCase):
         tracker = self._tracker()
         for verdict in (False, None):
             with self.subTest(verdict=verdict), \
-                    mock.patch("ameesh.turn_cgroup.populated", return_value=verdict):
+                    mock.patch("ameesh.platform.turn_cgroup.populated", return_value=verdict):
                 self.assertIsNone(tracker.survivors("t1", None, cgroup="/u/turn-t1"))
-        with mock.patch("ameesh.turn_cgroup.populated",
+        with mock.patch("ameesh.platform.turn_cgroup.populated",
                         side_effect=RuntimeError("cgroup muet")):
             self.assertIsNone(tracker.survivors("t1", None, cgroup="/u/turn-t1"))
 

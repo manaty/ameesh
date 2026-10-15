@@ -107,9 +107,10 @@ below is not used at all.
   (`src/ameesh/platform/host.py:648`), checks it is a delegated, writable
   directory, and creates `turn-<id>/`.
 - Placement must happen **before the harness executes anything**. Route: a
-  trampoline module (`src/ameesh/turn_cgroup.py`, modelled on
-  `src/ameesh/platform/audit_guard.py`), launched as
-  `python -m ameesh.turn_cgroup --cgroup <path> --ready-fd <n> -- <harness argv>`:
+  trampoline module (`src/ameesh/platform/turn_cgroup.py` — the platform layer
+  is the only place that reads `/proc`, L63 — modelled on
+  `src/ameesh/platform/audit_guard.py`), launched by its file path
+  (`python <paquet>/platform/turn_cgroup.py --cgroup <path> --ready-fd <n> -- <harness argv>`):
   1. writes its own pid to `<path>/cgroup.procs`;
   2. re-reads `/proc/self/cgroup` and refuses unless the path is exactly the
      expected one, inside the runner's delegated root, with no symlink escape;
@@ -256,3 +257,34 @@ from the route decision: code and witness tests first (inert wherever
 delegation is unavailable), then the measurement window is framed with
 mesh-design (decision 4), then the canary unit settings are applied, then the
 measurements; any extension beyond the canary needs the owner again.
+
+# Corrections after the 11h package removal (15/10)
+
+The lot was composed in the 11h package (`030e91e1f`) then removed
+(`043e14d8e`) on an identified cause. Three fixes, all at the source:
+
+1. **L63**: the trampoline read `/proc/self/cgroup` from
+   `src/ameesh/turn_cgroup.py`, outside the platform layer
+   (`tests/test_l63_platform.py`). The module moved to
+   `src/ameesh/platform/turn_cgroup.py` — the platform package is the only
+   place that reads `/proc`, and it already hosts standalone trampolines
+   (`audit_guard`, `offload_shell`). It stays stdlib-only and is still launched
+   by its file path (`command()`), so the trampoline does not import `ameesh`;
+   the runner/background import it as `ameesh.platform.turn_cgroup`.
+2. **turn_grace contract**: the two `background.survivors` doubles in
+   `tests/test_turn_grace.py` did not accept the new `cgroup=` keyword; the
+   `TypeError` forced the doubt cleanup and killed the child. The migrated-child
+   witness now also moves the child into a foreign `turn-*` cgroup **when one
+   is in play** (ownership is the cgroup, not the pgid); on hosts without
+   delegation (`cgroup is None`) the PID/PGID claim remains the proof, as
+   before.
+3. **Reconciliation**: `8df92de29` enumerated `turn-*` before checking that
+   the background state was readable, leaving
+   `test_etat_du_fond_illisible_ne_tue_rien` red. The readability probe now
+   runs before enumeration; the enumeration-before-snapshot order that makes
+   the create/race safe is kept.
+
+Witnesses replayed on the corrected head: `test_l63_platform` +
+`test_l498_turn_cgroup` + `test_l498_doctor` = 78 OK (3 skipped: no cgroup
+delegation on the bench host), `test_turn_grace` = 25 OK. No suite run: lot CI
+comes after the reviews.

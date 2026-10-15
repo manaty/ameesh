@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L498 : un cgroup v2 délégué par tour (propriété stable, nettoyage borné).
 
+Ce module vit dans la couche plateforme (L63) : il lit `/proc/self/cgroup`, et
+la couche plateforme est le seul endroit d'ameesh qui lit l'OS. Le trampoline
+reste **autonome** (bibliothèque standard seule) : lancé par son chemin de
+fichier, il n'importe aucun module d'ameesh, comme `platform/audit_guard.py`
+et `platform/offload_shell.py`.
+
 Ce fichier sert à deux choses.
 
 1. Les primitives de l'exécuteur et du suivi du travail de fond : reconnaître
@@ -11,9 +17,10 @@ Ce fichier sert à deux choses.
    (`/user.slice/…/turn-<id>`, la forme de `/proc/self/cgroup`) ; leur chemin
    noyau est `CGROUP_ROOT` + ce chemin.
 
-2. Un trampoline autonome, lancé par l'exécuteur à la place du harnais :
+2. Un trampoline autonome, lancé par l'exécuteur à la place du harnais
+   (`command()` rend le chemin de ce fichier) :
 
-       python turn_cgroup.py --cgroup <chemin> --ready-fd <n> -- <harnais…>
+       python <paquet>/platform/turn_cgroup.py --cgroup <chemin> --ready-fd <n> -- <harnais…>
 
    Il se déplace DANS le cgroup du tour AVANT que le harnais n'exécute quoi
    que ce soit, relit `/proc/self/cgroup`, refuse si la position n'est pas
@@ -344,7 +351,7 @@ def main(args: list) -> int:
         return _fail("unexpected argument %r" % (arg,))
     argv = args[index:]
     if not cgroup or ready_fd is None or not argv:
-        return _fail("usage: turn_cgroup.py --cgroup PATH --ready-fd FD -- ARGV")
+        return _fail("usage: ameesh.platform.turn_cgroup --cgroup PATH --ready-fd FD -- ARGV")
     if _target(cgroup) is None:
         return _fail("cgroup %s outside %s or behind a link" % (cgroup, CGROUP_ROOT))
     if not enter(cgroup):

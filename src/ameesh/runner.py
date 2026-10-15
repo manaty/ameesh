@@ -3583,7 +3583,7 @@ class AgentWorker(threading.Thread):
                 conteneurs = []
         emptied = None
         if cgroup:
-            from . import turn_cgroup
+            from .platform import turn_cgroup
             peak = turn_cgroup.memory_peak(cgroup)
             started = time.monotonic()
             try:
@@ -3963,7 +3963,7 @@ class AgentWorker(threading.Thread):
         cgroup_path = None
         ready_r = ready_w = None
         try:
-            from . import turn_cgroup
+            from .platform import turn_cgroup
             if not audit_exempt:
                 root = self.runner.turn_cgroup_root()
                 if root is not None:
@@ -6698,7 +6698,7 @@ class Runner:
         journalisée une fois — le code reste inerte là où la délégation n'est
         pas posée."""
         if not self._turn_cgroup_probed:
-            from . import turn_cgroup
+            from .platform import turn_cgroup
             root, reason = turn_cgroup.root_for_runner()
             self._turn_cgroup_root = root
             # Publish readiness only after the result, including to workers
@@ -6738,10 +6738,14 @@ class Runner:
         root = self.turn_cgroup_root()
         if root is None:
             return 0
-        from . import turn_cgroup
-        # Enumerate before taking the live snapshot. A turn created during
-        # enumeration is then in live; one created later is absent from paths.
-        # Creation and publication share _turn_cgroups_lock with the snapshot.
+        from .platform import turn_cgroup
+        # Fail-closed : un état du fond illisible ne balaie rien, donc on le
+        # sonde AVANT d'énumérer. L'énumération précède la prise de référence
+        # qui décide : un tour créé pendant l'énumération est dans `live`, un
+        # tour créé après est absent des chemins. Création et publication
+        # partagent `_turn_cgroups_lock` avec la référence.
+        if self._live_turn_ids() is None:
+            return 0
         paths = turn_cgroup.orphans(root)
         live = self._live_turn_ids()
         if live is None:
