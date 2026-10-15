@@ -438,6 +438,46 @@ la **seule** unité désignée, preuves d'environnement réel et de comptes
 inchangés ; si le feu n'est pas donné, maintien du report-only (§3quinquies) et
 fusion manuelle du rang 1 par l'orchestrateur (§6).
 
+### 3septies. Attestation du build 1.11.1 sur l'hôte du pilote — 15/10 19:30Z (dev3)
+
+Le gate « le build de l'hôte doit porter `#1333` » est levé par deux relevés de
+**lecture seule** sur `pc-smichea`, recoupés depuis `ameesh-agents-1` :
+
+| pièce | état constaté | source |
+|---|---|---|
+| version installée | `ameesh --version` = **1.11.1** ; lanceur `~/.local/bin/ameesh` → `~/.local/share/ameesh/venv/bin/ameesh` (shebang de ce venv) ; `direct_url` = `src-0dffda4` | `mesh-design` 19:27Z ; `ameesh-cx2` 19:29Z |
+| marqueur `#1333` | `radar.py` importé du `site-packages` de ce venv : SHA256 `6a44a7da506d858d0a814b2dd51c23a1509cd9d2c965cf216375cb6933f0a4ff`, identique octet à octet à `#1333` @`5918aa3e` et à `main` `3df9a1ee`/`0dffda4` ; `_branch_target` (toutes formes de branche), `_symbolic_head`, `target_commit`, certification `published_tip` présents | `mesh-design` 19:27Z ; `ameesh-cx2` 19:29Z |
+| unité | `ameesh-runner-agent@orchestrateur.service` active/running (PID 1137685), `ExecStart` sur ce venv ; **aucun** `zzz-radar-nexlink.conf` dans ses `DropInPaths` (radar non armé) | `ameesh-cx2` 19:29Z |
+
+Contre-vérifications faites depuis `ameesh-agents-1` (même version 1.11.1) :
+
+* `sha256sum` du `radar.py` installé ici = `6a44a7da…` ; `git show
+  5918aa3e:src/ameesh/radar.py` et `git show 3df9a1ee:src/ameesh/radar.py`
+  donnent le **même** SHA (le paquet installé, le correctif et `main` sont le
+  même fichier) ;
+* `radar.parse_settings` rejoué sur le build 1.11.1 avec la carte §2
+  (`land: "pr"`) → sortie **identique** à §2 (cible `develop`, `main`/tags/
+  releases protégés, `develop` libre, `pr merge`, 2 portes, 1 généré) ;
+  `radar`, `land`, `merge_queue` importables, `LAND_MODES = ('off', 'local',
+  'pr')` ;
+* portes Nexlink sur `develop` `febe26e7b` : blobs `scripts/domains-export.mjs`
+  `0d40d0f1…` et `scripts/check-rollbacks.mjs` `ff114d2a…`, **inchangés** depuis
+  la mesure verte du 13/10.
+
+Reste au pré-vol §4 étape 0, **sur l'hôte** (lecture seule, non qualifiable
+depuis `ameesh-agents-1`, sans accès à `pc-smichea`) : Node, `gh auth status`,
+clone (`toplevel`, non-bare, `remote`, `fetch`), existence de `$SRC`
+(`critiques-2.json`), présence du drop-in `zz-compte-owner-1013.conf` et état de
+départ de l'unité (`Environment`, `DropInPaths`), état courant de
+`radar-nexlink.json` (`land: "off"`, SHA256). Ensuite, inchangé : créneau,
+**feu distinct** `mesh-design`, application par le bureau (§7.4), orchestrateur
+Nexlink prévenu la veille.
+
+Attention à la coupure : si `pc-smichea` est redéployé à la coupure 23:00 Paris
+(21:00Z, canon §11bis), le pré-vol doit être **refait** sur le build déployé —
+il portera toujours `#1333` (présent dans `main` depuis `3df9a1ee`, et `main`
+est en avant) mais son SHA changera.
+
 ## 4. Runbook d'application (sur décision du bureau)
 
 **Profil dédié** (§3, §3bis) — pas le `critiques-2.json` partagé. `SRC` est le
@@ -671,3 +711,9 @@ Tranché le 13/10 :
    l'orchestrateur est prévenu la veille du créneau, les paquets Nexlink
    restent sur le chemin actuel jusque-là. (source : courrier orchestrateur
    15/10 13:18:59Z, #58691)
+   **Mise à jour 15/10 19:30Z** : le build en staging sur `pc-smichea` est
+   attesté `1.11.1`, `radar.py` = `6a44a7da…` (= `#1333` = `main 3df9a1ee`),
+   unité `orchestrateur` active sans drop-in radar — relevés `mesh-design`
+   (19:27Z) et `ameesh-cx2` (19:29Z), recoupés depuis `ameesh-agents-1`
+   (§3septies). Le gate « build doit porter `#1333` » est levé ; restent le
+   pré-vol §4 étape 0 sur l'hôte, le **créneau** et le **feu distinct**.
