@@ -318,11 +318,19 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dic
     for dossier in dossiers:
         part = os.path.basename(os.path.normpath(dossier)) or dossier
         for fichier in sorted(glob.glob(os.path.join(dossier, "cov", ".coverage*"))):
-            # #1707 : la garde 0 octet précède l'import et la lecture — un
-            # fichier vide ne fait lever aucune erreur à coverage et ne rend
-            # aucune mesure ; perte nommée, jamais comptée comme mesurée.
-            if os.path.getsize(fichier) == 0:
-                raison = "DataError: fichier de couverture vide (0 octet)"
+            # #1707 : un fichier de 0 octet n'a jamais reçu son schéma SQLite :
+            # la part a été interrompue avant d'écrire (un processus réellement
+            # mesuré écrit toujours le schéma, même sans ligne tracée). Le
+            # constat précède l'import et la lecture : CoverageData.read()
+            # initialiserait le fichier et masquerait le vide.
+            try:
+                vide = os.path.getsize(fichier) == 0
+            except OSError:
+                vide = False  # disparu entre le glob et ici : la lecture tranchera
+            if vide:
+                # #1257 x #1690 : la perte alimente les deux projections.
+                raison = ("DataError: fichier de couverture vide (0 octet) : "
+                          "écriture interrompue avant le schéma")
                 ignorees.append({"part": part, "fichier": os.path.basename(fichier),
                                  "raison": raison})
                 incomplets.append({"fichier": os.path.relpath(fichier, dossier),
