@@ -208,7 +208,10 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         if prev == "qa" and state in ("build", "merged"):
             ev_verdicts.append((at, "ok" if state == "merged" else "blocked",
                                 ev.get("actor") or None))
-        if state == "merged" and merged is None:
+        if state == "merged":
+            # #1693 (N4) : la DERNIÈRE entrée en merged date la livraison — un
+            # lot rouvert par correction `merged → build` puis refusionné porte
+            # deux transitions, la première annulée.
             merged = at
         if state in _WAITING and prev not in _WAITING:
             blocks += 1
