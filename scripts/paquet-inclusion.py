@@ -577,8 +577,14 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         return False
 
     # 1. Chaque lot attendu doit apparaître au manifeste (ou être expliqué).
+    # Une mention faible (prose sans retrait du lot) ne lève pas l'omission :
+    # « retour à l'état #1333 » sous « Retraits » ne dit pas que #1333 est exclu.
     for lot in expected:
         if lot in composed:
+            continue
+        if lot in manifest.weak and lot not in explained and lot not in excused:
+            omissions.append({"lot": lot, "reason": "absent du manifeste "
+                              f"(mention faible seulement : {manifest.weak[lot]})"})
             continue
         if explain(lot, "absent"):
             continue

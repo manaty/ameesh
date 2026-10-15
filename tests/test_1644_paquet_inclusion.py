@@ -207,6 +207,16 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertIn(400, exclusions)
         self.assertEqual(payload["omissions"], [])
 
+    def test_mention_faible_ne_leve_pas_l_omission(self) -> None:
+        # Prose sous « Retraits » qui cite #500 sans le retirer (paquet 11h :
+        # « retour de radar.py à l'état #1333 ») : l'omission reste bloquante.
+        with self.manifest.open("a", encoding="utf-8") as handle:
+            handle.write("\nRetour des tests à l'état #500, conservé.\n")
+        code, payload = inclusion.run(self.namespace(expected=[500]))
+        self.assertEqual(code, 1)
+        self.assertEqual([item["lot"] for item in payload["omissions"]], [500])
+        self.assertIn("mention faible", payload["omissions"][0]["reason"])
+
     def test_fichier_attendu_lisible(self) -> None:
         fichier = pathlib.Path(self.tmp.name) / "attendus.txt"
         fichier.write_text(

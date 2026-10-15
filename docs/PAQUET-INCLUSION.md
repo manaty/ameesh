@@ -52,9 +52,11 @@ manifeste doivent être présents localement (sinon `git fetch` d'abord).
    composition, ou une exclusion consignée : ligne de la table de composition
    dont la note dit retrait/revert/report, table dont l'en-tête dit
    « retiré/revert », ou mention en prose sous un titre « Retrait »/« Report ».
-   Sinon : *inclusion manquante* (défaut bloquant). Une mention en prose sans
-   mot-clé de retrait est une **explication faible** : elle n'est pas bloquante
-   mais reste affichée « à confirmer ».
+   Sinon : *inclusion manquante* (défaut bloquant). Une mention en prose qui ne
+   retire pas le lot (pas de mot-clé de retrait, ou lot qui n'est pas le sujet
+   de la ligne) est une **explication faible** : elle ne lève jamais une
+   inclusion manquante ; elle n'explique qu'un contenu partiel ou absent d'un
+   lot composé, affiché « à confirmer ».
 2. **Manifeste × arbre.** Pour chaque entrée de composition, le delta du commit
    (`commit^..commit`, premier parent) doit encore être présent à la tête,
    vérifié **ligne par ligne**, pas par ascendance : toutes les lignes ajoutées
