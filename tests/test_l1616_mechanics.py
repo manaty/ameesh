@@ -237,6 +237,10 @@ class TestRules(MechanicsTest):
                 rules.reviews_for(["README.md", path])
         self.assertEqual(rules.reviews_for(["src/ameesh/mechanics.py"]),
                          mechanics.ReviewNeed("sensitive", 2))
+        # ni liste vide ni chaîne nue : zéro avis serait un repli
+        for paths in ([], (), "src/ameesh/mechanics.py"):
+            with self.subTest(paths=paths), self.assertRaises(mechanics.MechanicsError):
+                rules.reviews_for(paths)
 
     def test_malformed_federation_blocks_refuse_with_mechanics_error(self):
         from ameesh import canon
@@ -259,8 +263,14 @@ class TestRules(MechanicsTest):
             target[keys[-1]] = value
             with self.subTest(keys=keys), self.assertRaises(mechanics.MechanicsError):
                 mechanics._review_policy(declaration, "ameesh", "0" * 40)
+        # `default` seul est une politique complète (review.parse) ; sans
+        # `default`, la classification est incomplète
         declaration = copy.deepcopy(original)
         del declaration["review_policies"]["risk_classes"]["projects"]["ameesh"]["rules"]
+        policy, _rules = mechanics._review_policy(declaration, "ameesh", "0" * 40)
+        self.assertEqual(policy.default, "light")
+        declaration = copy.deepcopy(original)
+        del declaration["review_policies"]["risk_classes"]["projects"]["ameesh"]["default"]
         with self.assertRaises(mechanics.MechanicsError):
             mechanics._review_policy(declaration, "ameesh", "0" * 40)
 
@@ -330,9 +340,9 @@ class TestStrictness(MechanicsTest):
 
 
 class TestSyncReport(MechanicsTest):
-    def _canon(self, commit: str, repo: str, mode: str = "git"):
+    def _canon(self, commit: str, repo: str, mode: str = "git", prefix: str = ""):
         return SimpleNamespace(sources=[SimpleNamespace(mode=mode, commit=commit,
-                                                        repo=repo)])
+                                                        repo=repo, prefix=prefix)])
 
     def test_compiled_configuration_is_reported(self):
         repo = self.repo()
@@ -357,6 +367,14 @@ class TestSyncReport(MechanicsTest):
         done = canon_sync.sync_mechanics(self._canon(bad.git("rev-parse", "HEAD"), bad.root))
         self.assertEqual(done.status, "invalid")
         self.assertTrue(done.to_dict()["error"])
+
+    def test_canon_under_a_sub_directory_is_refused(self):
+        # le document à la racine Git n'est pas celui d'un canon en sous-dossier
+        repo = self.repo()
+        done = canon_sync.sync_mechanics(
+            self._canon(repo.git("rev-parse", "HEAD"), repo.root, prefix="knowledge"))
+        self.assertEqual(done.status, "invalid")
+        self.assertIn("knowledge", done.to_dict()["error"])
 
 
 if __name__ == "__main__":

@@ -188,6 +188,12 @@ class Mechanics:
         Un chemin non léger sans nombre d'avis déclaré fait refuser : le
         lecteur ne suppose jamais un repli (`train_reviews`, PR85).
         """
+        if isinstance(paths, (str, bytes)):
+            raise MechanicsError("a list of repository paths is required")
+        paths = list(paths)
+        if not paths:
+            # un changement sans fichier ne se classe pas : zéro avis serait un repli
+            raise MechanicsError("no path to classify")
         risk, reviews = "light", 0
         for path in paths:
             if not isinstance(path, str):
@@ -446,11 +452,14 @@ def _review_policy(federation: dict, project: str, commit: str
         raise MechanicsError("project %r is not declared under risk_classes.projects"
                              % project)
     declaration = scoped[project]
-    if not isinstance(declaration, dict) or set(declaration) != {"default", "rules"}:
+    # `default` seul est une politique complète (review.parse) ; `rules` absent = []
+    if not isinstance(declaration, dict) or "default" not in declaration \
+            or set(declaration) - {"default", "rules"}:
         raise MechanicsError("complete risk classification required for project %r" % project)
-    if not isinstance(declaration["rules"], list) or any(
+    risk_rules = declaration.get("rules", [])
+    if not isinstance(risk_rules, list) or any(
             not isinstance(rule, dict) or set(rule) != {"paths", "class"}
-            for rule in declaration["rules"]):
+            for rule in risk_rules):
         raise MechanicsError("explicit risk rules required for project %r" % project)
     policy, problems = review.parse(declaration)
     if problems:

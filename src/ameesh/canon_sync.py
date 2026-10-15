@@ -1619,6 +1619,14 @@ def sync_mechanics(canon: Canon) -> MechanicsSync:
         done.status = "untrusted"
         done.error = "no exact canon commit applied"
         return done
+    if source.prefix:
+        # le lecteur strict lit `processus/mecanique.yaml` à la racine Git du
+        # canon : sous un sous-répertoire, il lirait un autre fichier que celui
+        # du canon appliqué — refus explicite, jamais un document voisin
+        done.status = "invalid"
+        done.error = ("canon under a sub-directory (%s): the mechanics are read "
+                      "at the Git root only" % source.prefix)
+        return done
     try:
         document = mechanics.load_global(source.repo, source.commit)
     except mechanics.MechanicsAbsent as exc:
