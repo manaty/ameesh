@@ -380,6 +380,13 @@ class TurnResources(interface.TurnResources):
             " WHERE agent = %s AND status = 'running'"
             " ORDER BY started_at DESC, id DESC", (agent,))
 
+    def last_ended(self, host, agent) -> dict | None:
+        rows = self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND agent = %s AND ended_at IS NOT NULL"
+            " ORDER BY ended_at DESC, id DESC LIMIT 1", (host, agent))
+        return rows[0] if rows else None
+
     def orphans(self, host=None, limit=50) -> list[dict]:
         where, params = "", []
         if host:
