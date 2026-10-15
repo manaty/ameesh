@@ -127,12 +127,19 @@ def _stale_lot(alert: dict) -> str:
     hold = ("if the lot is parked on another open lot, declare the dependency that stops "
             "the reminders (the alert stops while the wait is planned): "
             "ameesh work dependencies %d --add <blocker>" % lot)
+    # #1664 : une porte hors mesh (fenêtre opérateur, décision humaine sans
+    # demande ouverte) n'est portée par aucun lot ; le pilote la consigne en
+    # hold, qui éteint la relance comme une dépendance déclarée.
+    park = ("if it is parked on a gate no open lot carries (operator window, human "
+            "decision), the pilot records the hold that stops the reminders: "
+            "ameesh work note %d \"hold: <reason>\" (the pilot lifts it with an "
+            "\"unhold: <reason>\" note or a state change)" % lot)
     return ("%s Expected action: if it was merged outside a PR, close it: ameesh work merged %d "
             "--sha <merge commit>; if it was delivered outside the target (report, note, head "
             "reviewed on a branch, no merge), close it: ameesh work close %d --delivered "
-            "--sha <reviewed head>; %s; otherwise %s; if it is no longer needed: ameesh work "
+            "--sha <reviewed head>; %s; %s; otherwise %s; if it is no longer needed: ameesh work "
             "close %d --abandoned (or --superseded-by <id>)."
-            % (head, lot, lot, hold, move, lot))
+            % (head, lot, lot, hold, park, move, lot))
 
 
 def _plan_underused(alert: dict) -> str:

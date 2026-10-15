@@ -20,6 +20,18 @@ A lot is stale when it is open and inactive beyond the configured threshold
   existing plan dependency sources.
 - A direct prerequisite declared with `ameesh work dependencies <id> --add <blocker>`
   names another open execution lot ([L385](WORK-DEPENDENCIES.md)).
+- An explicit **hold**: a journal note whose text begins with `hold:` (for
+  example `ameesh work note <id> "hold: operator window"`), written by a
+  **pilot** — a human actor (`human:<id>`) or an orchestrator/design agent
+  (`AMEESH_ALERT_ORCHESTRATORS`, or the `orchestrateur`/`conception` role on its
+  Agent card in the canon), the same authority as a state correction. It
+  carries the gate no open lot represents — an operator window, a human
+  decision with no open request. The hold is attributed and dated (`by`,
+  `since`) and only an explicit lift (`unhold:`, `hold lifted:`,
+  `hold released:`, `hold cleared:`) or a state change ends it: an ordinary
+  note (triage, status report) does not, and a later `hold:` note re-arms it.
+  The runner wake keeps its own, older convention (`LotSessions.HOLD_PREFIX`,
+  last non-empty note decides); the two are deliberately separate.
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
@@ -42,6 +54,12 @@ or:
 {"what": "dependency", "lots": [123, 124]}
 ```
 
+or:
+
+```json
+{"what": "hold", "by": "mesh-design", "since": 1760544000.0}
+```
+
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its
 six-hour reminder for that episode. The output limit is applied **after**
@@ -51,5 +69,5 @@ blockers outside the current project or progress window.
 
 Only structured fields influence this decision. A wait mentioned in mail,
 a note or a commit requirement remains actionable until it is represented
-by a planned date, commitment/plan dependency or direct prerequisite link. This preserves
-alerts for unexplained waits.
+by a planned date, commitment/plan dependency, direct prerequisite link or an
+explicit `hold:` note. This preserves alerts for unexplained waits.

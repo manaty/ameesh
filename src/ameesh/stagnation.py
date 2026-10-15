@@ -308,8 +308,13 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    # #1664 : le journal est déjà lu ici ; les holds explicites en viennent,
+    # sans deuxième lecture.
+    waits = planned_waits.read(
+        db, rows, now=now, packages=packages, open_items=open_items,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, [event for lot_events in events.values() for event in lot_events]))
     out: dict[int, dict] = {}
     for row in rows:
         rid = int(row["id"])
@@ -326,9 +331,9 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                     "last_activity_ts": round(last, 3) if last is not None else None,
                     "project": projects.lot_project(row, agent_projects,
                                                     package_team=package.get("team")),
-                    "planned_wait": holds.get(rid),
+                    "planned_wait": waits.get(rid),
                     "dependencies": dependencies.get(rid, []),
-                    "stale": None if rid in holds else
+                    "stale": None if rid in waits else
                              stale(row.get("state") or "", last, now, threshold)}
     return out
 

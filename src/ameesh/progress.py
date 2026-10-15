@@ -752,13 +752,17 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
-    holds = planned_waits.read(db, items, now=now, packages=packages,
-                              dependencies=[e for edges in dependencies.values() for e in edges])
+    waits = planned_waits.read(
+        db, items, now=now, packages=packages,
+        dependencies=[e for edges in dependencies.values() for e in edges],
+        holds=planned_waits.pilot_holds(
+            db, [event for lot_events in events.values() for event in lot_events],
+            cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
                       messages_ts=messages.get(int(item["id"])), agent_states=states,
-                      planned_wait=holds.get(int(item["id"])),
+                      planned_wait=waits.get(int(item["id"])),
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]

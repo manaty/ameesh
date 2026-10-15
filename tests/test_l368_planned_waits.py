@@ -7,6 +7,7 @@ import time
 import unittest
 
 from ameesh import plan, planned_waits as W, progress, roadmap, stagnation, storage, work
+from ameesh import work_dependencies as D
 from tests.support import PgTestCase
 
 
@@ -17,9 +18,10 @@ class UnitTest(unittest.TestCase):
                 "epic": {"id": "epic", "present": True},
                 "prerequisite": {"id": "prerequisite", "present": True}}
 
-    def resolve(self, *, dates=None, commitments=(), items=(), rows=None, now=None):
+    def resolve(self, *, dates=None, commitments=(), items=(), rows=None, now=None,
+                holds=None):
         return W.resolve(rows or self.rows, dates or {}, commitments, self.packages,
-                         items, now=self.now if now is None else now)
+                         items, now=self.now if now is None else now, holds=holds)
 
     def test_future_start_ends_at_local_midnight_without_changing_activity(self):
         dates = {1: {"planned_start": "2026-10-13"}}
@@ -69,6 +71,81 @@ class UnitTest(unittest.TestCase):
             {1: {"what": "scheduled", "start": "2026-10-13", "package": "epic"}})
         self.assertEqual(W.resolve(self.rows, {1: {"planned_start": "2026-10-12"}}, [],
                                     packages, [], now=self.now), {})
+
+    def test_explicit_hold_is_a_planned_wait_until_lifted_or_moved(self):
+        """#1664 : `hold:` tient le lot (alerte stale éteinte) ; une note
+        ordinaire (triage, relevé) ne le lève pas, seuls une levée explicite
+        (`unhold:`…) ou un changement d'état le font."""
+        def event(note, state="build", actor="mesh-design", ts=1.0, ident=1):
+            return {"work_item_id": 1, "state": state, "note": note,
+                    "actor": actor, "created_ts": ts, "id": ident}
+
+        hold = W.explicit_holds([event("created", state="intake", ts=0.5, ident=1),
+                                 event("hold: fenêtre opérateur", ts=1.0, ident=2)])
+        self.assertEqual(hold, {1: {"what": "hold", "by": "mesh-design", "since": 1.0}})
+        self.assertEqual(self.resolve(holds=hold),
+                         {1: {"what": "hold", "by": "mesh-design", "since": 1.0}})
+        # une note ordinaire ne lève pas la retenue
+        self.assertEqual(W.explicit_holds([event("hold: op", ident=2),
+                                           event("triage: relevé", ts=2.0, ident=3)]),
+                         {1: {"what": "hold", "by": "mesh-design", "since": 1.0}})
+        # une levée explicite la lève
+        for lift in ("unhold: feu reçu", "hold lifted: feu reçu",
+                     "hold released: feu reçu", "hold cleared: feu reçu"):
+            with self.subTest(lift=lift):
+                self.assertEqual(W.explicit_holds([event("hold: op", ident=2),
+                                                   event(lift, ts=2.0, ident=3)]), {})
+        # un changement d'état lève
+        self.assertEqual(W.explicit_holds([event("hold: op", state="qa", ident=2),
+                                           event("qa → build", state="build", ts=2.0,
+                                                 ident=3)]), {})
+        # une note vide ne compte pas ; un hold reposé après du bruit tient
+        again = W.explicit_holds([event("hold: op", ident=2),
+                                  event("triage: relevé", ts=2.0, ident=3),
+                                  event("", ts=2.5, ident=4),
+                                  event("hold: retour opérateur", ts=3.0, ident=5)])
+        self.assertEqual(again[1]["since"], 3.0)
+        # l'ordre est celui de l'écriture (created_ts, id), pas celui de la liste
+        self.assertEqual(W.explicit_holds([event("hold: op", ts=2.0, ident=3),
+                                           event("triage", ts=1.0, ident=2)]),
+                         {1: {"what": "hold", "by": "mesh-design", "since": 2.0}})
+        self.assertEqual(W.explicit_holds([event("triage", ts=2.0, ident=3),
+                                           event("hold: op", ts=1.0, ident=2)]),
+                         {1: {"what": "hold", "by": "mesh-design", "since": 1.0}})
+
+    def test_only_the_allowed_author_holds_and_lifts(self):
+        """#1664 : `allowed` restreint le hold à un pilote — le hold d'un autre
+        acteur ne compte pas, et lui seul peut le lever."""
+        def event(note, actor, ts, ident):
+            return {"work_item_id": 1, "state": "build", "note": note,
+                    "actor": actor, "created_ts": ts, "id": ident}
+
+        self.assertEqual(W.explicit_holds([event("hold: op", "dev7", 1.0, 2)],
+                                          allowed={"mesh-design"}), {})
+        self.assertEqual(W.explicit_holds([event("hold: op", "dev7", 1.0, 2)],
+                                          allowed={"dev7"})[1]["by"], "dev7")
+        # la note et la levée d'un autre acteur ne comptent pas
+        events = [event("hold: op", "mesh-design", 1.0, 2),
+                  event("triage: relevé", "dev7", 2.0, 3),
+                  event("unhold: à tort", "dev7", 3.0, 4)]
+        self.assertEqual(W.explicit_holds(events, allowed={"mesh-design"})[1]["since"], 1.0)
+        # la levée du pilote compte
+        self.assertEqual(W.explicit_holds(
+            events + [event("unhold: feu reçu", "mesh-design", 4.0, 5)],
+            allowed={"mesh-design"}), {})
+        # un prédicat d'autorisation est accepté
+        self.assertEqual(W.explicit_holds([event("hold: op", "mesh-design", 1.0, 2)],
+                                          allowed=lambda who: who == "mesh-design")[1]["by"],
+                         "mesh-design")
+
+    def test_hold_outranks_a_declared_dependency_and_its_label(self):
+        hold = {1: {"what": "hold", "by": "pilote", "since": 1700000000.0}}
+        commitment = {"status": "open", "work_item_id": 1, "depends_on": ["#2"]}
+        self.assertEqual(self.resolve(commitments=[commitment],
+                                      items=[{"id": 2, "state": "qa"}], holds=hold), hold)
+        label = D.wait_label(hold[1])
+        self.assertTrue(label.startswith("hold by pilote since "), label)
+        self.assertIsNone(D.wait_label(None))
 
 
 class PgTest(PgTestCase):
@@ -142,3 +219,46 @@ class PgTest(PgTestCase):
         rows = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)
         self.assertEqual(rows[0]["planned_wait"]["lots"], [blocker["id"]])
         self.assertIsNone(rows[0]["stale"])
+
+    def test_hold_note_suppresses_stagnation_until_lifted_or_moved(self):
+        """#1664 : une note `hold:` d'un pilote éteint la relance 6 h et ses vues
+        (work, progression) ; une note ordinaire ne la lève pas, seuls une levée
+        explicite ou un changement d'état le font ; le hold d'un acteur sans
+        autorité ne compte pas."""
+        lot = self.item("parked on an operator window")
+        work.note(self.db, lot["id"], "hold: fenêtre opérateur + accès",
+                  actor="human:pilote")
+        self.old(lot)
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        row = plan.annotate(self.db, [work.get(self.db, lot["id"])], now=self.now)[0]
+        self.assertEqual(row["planned_wait"]["what"], "hold")
+        self.assertEqual(row["planned_wait"]["by"], "human:pilote")
+        self.assertIsNone(row["stale"])
+        snap = progress.snapshot(self.db, self.cfg, project="acme", now=self.now, gantt=False)
+        held = {r["id"]: r for r in snap["lots"]}[lot["id"]]
+        self.assertEqual(held["planned_wait"]["what"], "hold")
+        self.assertIsNone(held["stale"])
+        # une note ordinaire ne lève pas la retenue
+        work.note(self.db, lot["id"], "triage: relevé de passage", actor="dev7")
+        self.old(lot)
+        self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
+        # le hold d'un acteur sans autorité ne compte pas
+        other = self.item("hold sans autorité")
+        work.note(self.db, other["id"], "hold: décision d'équipe", actor="dev7")
+        self.old(other)
+        self.assertEqual([r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)],
+                         [other["id"]])
+        # une levée explicite du pilote rallume la relance
+        work.note(self.db, lot["id"], "unhold: fenêtre ouverte", actor="human:pilote")
+        self.old(lot)
+        self.assertIn(lot["id"],
+                      [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # un hold reposé tient, et un changement d'état le lève
+        work.note(self.db, lot["id"], "hold: re-park", actor="human:pilote")
+        self.old(lot)
+        self.assertNotIn(lot["id"],
+                         [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        work.move(self.db, lot["id"], "build", actor="human:pilote")
+        self.old(lot)
+        self.assertIn(lot["id"],
+                      [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
