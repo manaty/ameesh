@@ -230,9 +230,10 @@ class Policy:
     artifacts: tuple | None = None
     #: L230: inactivity (seconds) of a worktree before its artifacts go
     artifact_idle: float = build_artifacts.DEFAULT_IDLE_S
-    #: L230: names of the user's processes whose unreadability (not dumpable:
-    #: capabilities, setuid) does not block a deletion; empty by default, set
-    #: per host in its Host card
+    #: L230/L162: names of the user's processes whose unreadability (not
+    #: dumpable: capabilities, setuid) does not block a deletion — the build
+    #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
+    #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
@@ -1770,12 +1771,15 @@ def unsaved_git_work(path: str) -> str:
     return ""
 
 
-def tmp_holder(path: str) -> str:
+def tmp_holder(path: str, allow=()) -> str:
     """Le processus qui tient `path` (fichier ouvert dedans, dossier courant,
     chemin sur sa ligne de commande), en clair ; vide si aucun. Si l'OS ne
-    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed)."""
+    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed).
+    `allow` (L230) : noms des processus dont l'illisibilité n'est pas un doute
+    — le choix de l'hôte, vide par défaut ; un détenteur constaté reste dit."""
     try:
-        found = platform.holders(_real(path), needle=os.path.abspath(path))
+        found = platform.holders(_real(path), needle=os.path.abspath(path),
+                                 allow=allow)
     except platform.NotAvailable as exc:
         return "holders unreadable (%s)" % exc
     if not found:
@@ -1880,7 +1884,7 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
     work = unsaved_git_work(path)
     if work:
         return "garde", "git work to keep — %s" % work
-    holder = tmp_holder(path)
+    holder = tmp_holder(path, allow=policy.unreadable_ok)
     if holder:
         return "attend", holder
     return "suppression", "left by turn %s of %s, unchanged for %s, held by no " \
