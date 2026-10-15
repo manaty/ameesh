@@ -11,14 +11,14 @@ Ce que ces tests protègent :
   base, et un courrier en attente est remis même avec un marqueur frais ;
 * le marqueur lui-même : posé après un passage complet, invalidé par un envoi
   local, et un cache de barre d'état de quelques secondes ;
-* le coût : le chemin rapide n'importe pas le paquet complet et son temps CPU
-  reste très en dessous d'un import de `ameesh.cli`.
+* le coût d'import : le vrai sous-processus rapide ne charge ni `ameesh.cli`,
+  ni le backend, ni psycopg. Le CPU se mesure après installation (protocole
+  du lot #1604), sans seuil dépendant de la machine dans la CI (#1785).
 """
 from __future__ import annotations
 
 import json
 import os
-import resource
 import subprocess
 import sys
 import tempfile
@@ -293,38 +293,3 @@ class HookRapideTest(PgTestCase):
                                      "empêcher le marqueur")
         self.assertFalse(marque["pending"])
 
-    # -- coût --------------------------------------------------------------
-    def test_temoin_cout_cpu_du_chemin_rapide(self):
-        """Témoin de coût : le chemin rapide reste loin d'un import complet."""
-        env = self._marqueur_frais()
-        charge = ("import sys; sys.argv = ['agent-mail', 'hook', 'claude'];"
-                  "import ameesh.entry as e; e.main()")
-
-        def cpu_enfants() -> float:
-            usage = resource.getrusage(resource.RUSAGE_CHILDREN)
-            return usage.ru_utime + usage.ru_stime
-
-        avant = cpu_enfants()
-        rapide = subprocess.run([sys.executable, "-c", charge],
-                                input=self._posttooluse(), capture_output=True,
-                                text=True, timeout=60, env=env, cwd=self.tmp)
-        cout_rapide = cpu_enfants() - avant
-        self.assertEqual(rapide.returncode, 0, rapide.stderr)
-
-        avant = cpu_enfants()
-        lourd = subprocess.run([sys.executable, "-c", "import ameesh.cli"],
-                               capture_output=True, text=True, timeout=120, env=env,
-                               cwd=self.tmp)
-        cout_lourd = cpu_enfants() - avant
-        self.assertEqual(lourd.returncode, 0, lourd.stderr)
-
-        self.assertLess(cout_rapide, cout_lourd,
-                        "le chemin rapide coûte %.3fs CPU, l'import complet %.3fs"
-                        % (cout_rapide, cout_lourd))
-        # borne relative, jamais en secondes : le CPU d'un démarrage Python
-        # dépend de la machine (runner lent, cache .pyc froid), pas son rapport
-        # à l'import complet mesuré dans le même processus (mesuré : 0,05 contre
-        # 0,30 s). Une régression qui réimporterait le paquet atteint ce rapport.
-        self.assertLess(cout_rapide, cout_lourd / 2,
-                        "chemin rapide : %.3fs CPU, plus de la moitié d'un import "
-                        "complet (%.3fs)" % (cout_rapide, cout_lourd))
