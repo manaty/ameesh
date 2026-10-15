@@ -82,6 +82,16 @@ class Operations(interface.Operations):
     def listing(self, *, today: str | None = None) -> list[dict]:
         import datetime as _dt
         today = today or _dt.date.today().isoformat()
+        # #1726 : une relecture désignée (#705) sans verdict courant occupe son
+        # relecteur — sans quoi, sans lot à lui, il passerait pour « au repos »
+        # et la prise lui donnerait un lot ou une autre relecture. La colonne
+        # `reviewer` n'existe qu'après la migration 0421.
+        review_due = ""
+        if has_reviewer(self.db):
+            review_due = ("""
+                     + (SELECT count(*) FROM work_items w
+                         WHERE w.state = 'qa' AND w.reviewer = r.name
+                           AND """ + _current_verdict("w") + """ IS NULL)""")
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
@@ -155,7 +165,10 @@ class Operations(interface.Operations):
                   -- regelée depuis n'attend plus de correction). Aucun lot
                   -- actionnable = au repos, quel que soit le temps depuis le
                   -- dernier tour.
-                  SELECT count(*) AS n FROM work_items w
+                  -- #1726 : une relecture désignée sans verdict courant
+                  -- (relecteur #705, lot en qa) compte aussi : l'agent doit
+                  -- son verdict avant de prendre autre chose.
+                  SELECT count(*)""" + review_due + """ AS n FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                      AND (w.state NOT IN """ + _WAITING_ON_OTHERS + """
                           OR (w.state = 'qa' AND """ + _current_verdict("w") + """ = 'blocked'))
