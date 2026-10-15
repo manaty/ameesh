@@ -123,7 +123,8 @@ def read(profile, *, now: float | None = None, directory=None,
 
     Un instantané dont la plus courte fenêtre s'est remise à zéro depuis
     `updatedAt` ne dit plus rien de fiable (#1561) : None, l'appelant
-    retombe sur les journaux.
+    retombe sur les journaux. Ses seaux portent leur date de relevé
+    (`read_at`, #1648) : l'appelant peut comparer deux sources datées.
     """
     now = time.time() if now is None else now
     path = snapshot_path(profile, directory=directory, environ=environ)
@@ -140,6 +141,7 @@ def read(profile, *, now: float | None = None, directory=None,
     limits = raw.get("limits")
     if not isinstance(limits, list) or not limits:
         return None
+    stamp = _iso_epoch(raw.get("updatedAt")) or stat.st_mtime
     gauges = []
     for item in limits:
         if not isinstance(item, dict):
@@ -154,10 +156,9 @@ def read(profile, *, now: float | None = None, directory=None,
             key = "%s@%s" % (key, scope)
         gauges.append(Gauge("claude", key, _fraction(item.get("percent")),
                             _iso_epoch(item.get("resetsAt")), window,
-                            scope=scope))
+                            read_at=stamp, scope=scope))
     if not gauges:
         return None
-    stamp = _iso_epoch(raw.get("updatedAt")) or stat.st_mtime
     if now - stamp > min(g.window_s for g in gauges):
         return None
     return Gauges(gauges)
