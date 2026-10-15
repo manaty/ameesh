@@ -138,6 +138,7 @@ sont plus posées : le choix par retard sur le rythme les remplace.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -814,6 +815,25 @@ def model_scoped(gauges, model):
         return kept
 
 
+def _widget_key(profile: Profile, items: list) -> str:
+    """#1789/N3 : la clé du fichier du widget pour ce compte.
+
+    Le widget nomme ses fichiers d'après le dossier de configuration
+    (`~/.claude` → `claude.json`, `~/.claude-secondary` →
+    `claude-secondary.json`) : `snapshot_key`. Deux dossiers déclarés de même
+    nom ne s'y distinguent pas ; la clé passe alors au **chemin complet**
+    (empreinte courte), que le widget n'écrit pas — le lecteur reste inerte
+    plutôt que d'afficher les jauges d'un autre compte (une clé fondée sur le
+    nom du compte lirait, elle, le fichier d'un autre dossier)."""
+    from . import widget_usage
+    key = widget_usage.snapshot_key(profile)
+    if sum(widget_usage.snapshot_key(p) == key for p in items
+           if p.harness == "claude" and p.kind == "config_dir") > 1:
+        chemin = os.path.realpath(profile.home()).encode("utf-8")
+        return "path-%s" % hashlib.sha1(chemin).hexdigest()[:12]
+    return key
+
+
 def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
               model=None, now: float | None = None) -> list:
     """Les jauges de forfait du compte.
@@ -828,12 +848,17 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
     ses drapeaux d'overage repris du journal ; sinon les journaux
     `rate_limit_event.unifiedWindows`, comme avant. `model` filtre les seaux
     de modèle (`model_scoped`).
-    """
-    if profile.harness == "claude":
+
+    #1789/N3 : le widget ne se lit que pour un compte à dossier de
+    configuration. Une clé API n'en a pas — `home()` retombe sur le dossier
+    par défaut, et `accounts list` afficherait les jauges du primaire sur sa
+    ligne ; les journaux, eux, sont nommés par compte (`primary_of`)."""
+    if profile.harness == "claude" and profile.kind == "config_dir":
         from . import widget_usage
         primary = primary_of(profile.harness, items, environ)
         primary_name = primary.name if primary is not None else None
-        gauges = widget_usage.read(profile, now=now)
+        gauges = widget_usage.read(profile, now=now,
+                                   key=_widget_key(profile, items))
         if gauges is not None:
             journal = book.claude_gauges(account=profile.name,
                                          primary=primary_name)
@@ -844,6 +869,13 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
             gauges = book.claude_gauges(account=profile.name,
                                         primary=primary_name)
         return model_scoped(gauges, model)
+    if profile.harness == "claude":
+        primary = primary_of(profile.harness, items, environ)
+        return model_scoped(
+            book.claude_gauges(
+                account=profile.name,
+                primary=primary.name if primary is not None else None),
+            model)
     if profile.harness == "codex":
         # Un seul mécanisme (cost.CostBook) : argument > AMEESH_CODEX_SESSIONS >
         # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte qui désigne un
@@ -1265,9 +1297,27 @@ def lost_at_reset(gauges, now: float) -> float:
     tôt (`expiry`). 0.0 : rien n'expire (aucune fenêtre en cours : relevé
     échu, non daté ou absent — une lecture périmée n'annonce aucune perte).
 
-    C'est le score du choix : consommer d'abord ce qui va être perdu."""
+    C'est la part en jeu ; `lost_rate` en fait le score du choix en la
+    rapportant au temps qui reste."""
     found = expiry(gauges, now)
     return found[1] if found is not None else 0.0
+
+
+def lost_rate(gauges, now: float) -> float:
+    """#1789/N1 : la part perdue **par seconde** d'ici la remise à zéro — la
+    capacité inutilisée de la fenêtre qui se remet à zéro le plus tôt
+    (`lost_at_reset`), rapportée au temps qui reste.
+
+    C'est le score principal du choix : entre deux comptes utilisables,
+    consommer d'abord celui dont le budget s'évapore le plus vite, et non le
+    plus en retard sur son rythme — le retard ne dit pas ce qui sera perdu.
+    L'ordre déclaré, la fraîcheur et la garde de budget ne bougent pas. 0.0 :
+    rien n'expire (relevé échu, non daté ou absent, remise à zéro passée)."""
+    found = expiry(gauges, now)
+    if found is None:
+        return 0.0
+    remaining = float(found[0]) - now
+    return found[1] / remaining if remaining > 0 else 0.0
 
 
 def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | None]:
@@ -1357,20 +1407,25 @@ def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
       en premier, pour ne pas laisser un forfait inutilisé), puis un relevé
       courant, puis un relevé périmé, qui ne passe jamais avant un état
       vérifié ;
+    * la perte par seconde d'ici la remise à zéro (`lost_rate`, la plus
+      rapide d'abord, #1789/N1) ;
     * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
     * l'échéance de la capacité inutilisée (la plus proche d'abord, 0034 §1) ;
     * la part de fenêtre perdue à cette remise à zéro (`lost_at_reset`, la
       plus grosse d'abord) ;
     * l'ordre déclaré (`priority`, L226b « primaries last »).
 
-    Les critères de budget précèdent l'ordre déclaré : demande du propriétaire
-    du 2026-10-15 (#1580) — le choix automatique ne suit plus un ordre fixe de
-    priorités, il consomme d'abord ce qui sera perdu à la remise à zéro."""
+    Le budget qui s'évapore passe avant le retard et l'ordre déclaré : demande
+    du propriétaire du 2026-10-15 (#1580) — le choix automatique ne suit plus
+    un ordre fixe de priorités, il consomme d'abord ce qui sera perdu à la
+    remise à zéro. Le retard reste le critère suivant : à perte égale, il
+    équilibre les comptes et porte les plafonds fixes (L226b)."""
     result = evaluations[profile.name]
     gauges = result.gauges
     found = expiry(gauges, now)
     # #1561 : absent (0, L117), courant (1), périmé (2) — le périmé après tout
-    # état vérifié ; #1580 : les critères de budget avant l'ordre déclaré.
+    # état vérifié ; #1580/#1789 : le budget perdu avant le retard, lui-même
+    # avant l'ordre déclaré.
     if not gauges:
         freshness = 0
     elif stale_reading(gauges, now):
@@ -1378,6 +1433,7 @@ def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
     else:
         freshness = 1
     return (freshness,
+            -round(lost_rate(gauges, now), 9),
             round(lag(gauges, now, result.limits)[0], 6),
             found[0] if found is not None else float("inf"),
             -round(lost_at_reset(gauges, now), 6),
@@ -1388,15 +1444,17 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
     """Les comptes plaçables, du premier à consommer au dernier (0034 amendée).
 
-    Clé (#1561, #1580) : d'abord un relevé **courant** — un compte dont le
-    relevé est périmé (une fenêtre remise à zéro depuis la lecture, une autre
+    Clé (#1561, #1580, #1789) : d'abord un relevé **courant** — un compte dont
+    le relevé est périmé (une fenêtre remise à zéro depuis la lecture, une autre
     encore ouverte) ne passe jamais avant un compte dont l'état est vérifié,
-    quel que soit l'ordre de bascule ; puis les critères de budget — le retard
-    sur le rythme (`lag`, le plus petit rapport d'abord), l'échéance de la
-    capacité inutilisée (la plus proche d'abord ; sans fenêtre en cours,
-    après), la part perdue à cette remise à zéro (`lost_at_reset`, la plus
-    grosse d'abord, #1580) ; puis l'ordre déclaré (`priority`, L226b « le
-    compte par défaut en dernier », décision owner du 2026-10-07).
+    quel que soit l'ordre de bascule ; puis le budget **qui s'évapore** — la
+    perte par seconde d'ici la remise à zéro (`lost_rate`, la plus rapide
+    d'abord, #1789/N1), le retard sur le rythme (`lag`, le plus petit rapport
+    d'abord), l'échéance de la capacité inutilisée (la plus proche d'abord ;
+    sans fenêtre en cours, après), la part perdue à cette remise à zéro
+    (`lost_at_reset`, la plus grosse d'abord, #1580) ; puis l'ordre déclaré
+    (`priority`, L226b « le compte par défaut en dernier », décision owner du
+    2026-10-07).
 
     #1672 : ce dernier recours est **borné**. Un relevé plus vieux que ce qui
     reste de chaque fenêtre encore ouverte (`cost.reading_outdated`) est une
@@ -1432,7 +1490,8 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     faute de relevé courant, et le dit.
 
     L'ordre déclaré ne s'annonce que s'il a réellement décidé, les critères de
-    budget étant à égalité (`_rank_key`, #1580)."""
+    budget étant à égalité (`_rank_key`, #1580) ; la perte par seconde
+    s'annonce de même quand c'est elle qui a décidé (#1789/N1)."""
     first = ranked[0]
     gauges = evaluations[first.name].gauges
     if not gauges:
@@ -1451,7 +1510,13 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
         if len(ranked) > 1:
             mine = _rank_key(first, evaluations, now)
             other = _rank_key(ranked[1], evaluations, now)
-            if mine[:4] == other[:4] and mine[4] != other[4]:
+            if mine[0] == other[0] and mine[1] != other[1]:
+                # #1789/N1: the budget that evaporates fastest decided (the
+                # freshness of the two readings is equal, so it really is the
+                # first criterion that differs)
+                why = "%s, losing its budget fastest" % explain(
+                    evaluations[first.name], now)
+            elif mine[:-1] == other[:-1] and mine[-1] != other[-1]:
                 # L226b: the failover order decided, the budget criteria tied
                 why = "%s, first in the failover order (priority %d)" % (
                     explain(evaluations[first.name], now), priority(first))

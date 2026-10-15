@@ -226,6 +226,31 @@ class GardesMargeTest(unittest.TestCase):
         evaluate.assert_not_called()
         self.assertEqual(offer.capacity, 0)
 
+    def test_l_usage_d_un_compte_ecarte_compte_dans_l_unite(self):
+        """#1789/N5 : un compte que la garde écarte (fenêtre courte au seuil)
+        garde ses agents ; son usage de la fenêtre longue entre donc dans
+        l'unité observée — sinon la capacité annoncée est trop grande."""
+        now = 1_000_000.0
+        sature = accounts.Profile("codex", "sature", path="/tmp/sature", hourly_usd=1)
+        libre = accounts.Profile("codex", "libre", path="/tmp/libre", hourly_usd=1)
+        gauges = {
+            "sature": [cost.Gauge("codex", "court", 1.0, now + 18000, 18000),
+                       cost.Gauge("codex", "long", 0.95, now + 6 * JOUR, 7 * JOUR)],
+            "libre": [cost.Gauge("codex", "long", 0.03, now + 6 * JOUR, 7 * JOUR)],
+        }
+        book = mock.Mock(db=object())
+        book.spent.return_value = 0
+        book.codex_gauges.side_effect = lambda **kw: gauges[
+            next(name for name in gauges if name in kw["sessions"])]
+        with mock.patch.object(accounts, "check", return_value=[]):
+            offer = rebalance._offer([sature, libre], ["a", "b"], now, book)
+        # 0,95 + 0,03 sur deux agents : l'unité vaut 0,49 (et non le plancher
+        # de 5 %, qui annoncerait 2 agents portés au lieu d'aucun)
+        self.assertAlmostEqual(offer.unit, 0.49)
+        self.assertEqual(offer.accounts, ("libre",))
+        self.assertAlmostEqual(offer.free, 1 / 7 - 0.03)
+        self.assertEqual(offer.capacity, int((1 / 7 - 0.03) / 0.49))
+
     def test_les_critiques_de_roles_et_declaration_restant_dans_leur_famille(self):
         from ameesh import auditor, registry, sous_utilisation
         cfg = SimpleNamespace(accounts={}, critical_agents=("config-critical",), host="test")
