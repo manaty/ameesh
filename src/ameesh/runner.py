@@ -2580,8 +2580,7 @@ class AgentWorker(threading.Thread):
             # Clé du marqueur (L60) : la même pour l'écriture de fin de tour et
             # pour sa réparation, qui ne double donc plus la ligne.
             cree = travail.get("created_ts")
-            cle = ("%s:%d:%.6f" % (self.name, debut, float(cree))
-                   if cree is not None else None)
+            cle = self._spend_key(debut, cree)
             usage = book.record(self.name, start=debut, key=cle,
                                 turn=travail.get("turn") or None,
                                 session=travail.get("session") or None,
@@ -2594,7 +2593,8 @@ class AgentWorker(threading.Thread):
             self.last_turn_reread_session = usage.session
             # #1469 : la ligne écrite prend la place de la réservation ; une
             # réparation (tour interrompu, `incertain` par défaut) la garde
-            self._account_settle("kept" if incertain else "settled")
+            # Un échec lève : le marqueur reste, la réparation règle par la clé.
+            account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
             registry.pending_spend_clear(self.db, self.name)
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -2667,16 +2667,10 @@ class AgentWorker(threading.Thread):
             log_async("[%s] announced model not persisted (%s): turns suspended"
                       % (self.name, " ".join(str(exc).split())[:120]))
 
-    def _account_settle(self, state: str) -> None:
-        """#1469 : clôt la réservation ouverte de l'agent (aucune : rien).
-
-        Un échec laisse la réservation ouverte — comptée, jamais perdue ; la
-        réservation suivante de l'agent la garde (`kept`)."""
-        try:
-            account_budget.settle(self.db, self.name, state=state)
-        except db_mod.DbError as exc:
-            log_async("[%s] account reservation not closed (%s): kept counted"
-                      % (self.name, " ".join(str(exc).split())[:160]))
+    def _spend_key(self, debut: int, cree) -> str | None:
+        """La clé du tour (L60) : grand livre, marqueur et réservation #1469."""
+        return ("%s:%d:%.6f" % (self.name, int(debut), float(cree))
+                if cree is not None else None)
 
     def _compta_termine(self, model_annonce: str | None = None, *,
                         incertain: bool = False) -> None:
@@ -3863,19 +3857,24 @@ class AgentWorker(threading.Thread):
                 or self._state_read("turn_harness") != harness:
             self.fail_turn("accounting unavailable", "turn harness not written")
             return False
-        # #1469 : réservation atomique du tour sur l'enveloppe du compte de
-        # facturation, avant le marqueur ; refusée, le tour ne part pas
-        # Un résumé de bascule peut imposer l’ancien compte : réserver
-        # celui appliqué au harnais, pas celui choisi pour le prochain tour.
-        refus = account_budget.reserve(self.db, self.name, compte)
-        if refus:
-            self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
-            return False
         if not self._compta_marque(events_start, label, model):
-            self._account_settle("released")  # rien n'est parti
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
             return False
+        # #1469 : réservation atomique du tour sur l'enveloppe du compte de
+        # facturation, sous la clé du marqueur (le règlement la retrouve par
+        # elle, jamais par agent) ; refusée, le tour ne part pas et le
+        # marqueur est retiré. Un résumé de bascule peut imposer l'ancien
+        # compte : réserver celui appliqué au harnais (`compte`).
+        if account_budget.billing_of(compte):
+            marqueur = registry.pending_spend_get(self.db, self.name) or {}
+            refus = account_budget.reserve(
+                self.db, self.name, compte,
+                self._spend_key(events_start, marqueur.get("created_ts")))
+            if refus:
+                registry.pending_spend_clear(self.db, self.name)  # rien n'est parti
+                self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
+                return False
 
         heartbeat_done = threading.Event()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),

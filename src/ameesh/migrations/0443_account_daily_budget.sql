@@ -20,7 +20,9 @@
 -- turn the reservation is `settled` (the real cost is in `turn_costs`, tagged
 -- with `billing_account`), or `kept` when the outcome is uncertain (error,
 -- crash, lost lease): it then keeps counting in full for its day until a human
--- releases it (`released`). At most one open reservation per agent.
+-- releases it (`released`). At most one open reservation per agent: a
+-- reservation still open when the agent reserves again belongs to a turn that
+-- never settled and becomes `kept`. Settlement is by the turn's `spend_key`.
 
 create table if not exists account_budgets (
     billing_account text primary key
@@ -39,6 +41,9 @@ create table if not exists account_reservations (
     period          date not null,
     state           text not null default 'open'
         check (state in ('open', 'settled', 'kept', 'released')),
+    -- the turn's ledger key (`spend_pending` marker, `turn_costs.spend_key`):
+    -- settlement finds its reservation and its ledger row by it, never by agent
+    spend_key       text not null unique,
     created_at      timestamptz not null default now(),
     closed_at       timestamptz,
     closed_by       text

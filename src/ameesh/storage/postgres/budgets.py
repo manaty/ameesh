@@ -61,7 +61,7 @@ class Budgets(interface.Budgets):
     # -- #1469 (migration 0443): daily envelope per billing account ----------
     #: the calendar day of each envelope, in its own zone, and its bounds
     _USAGE = (
-        "with p as (select coalesce(%s::timestamptz, now()) as at),"
+        "with p as (select coalesce(%s::timestamptz, clock_timestamp()) as at),"
         " w as ("
         " select billing_account, usd_per_day, tz, (p.at at time zone tz)::date as period"
         " from account_budgets, p{where}),"
@@ -117,53 +117,59 @@ class Budgets(interface.Budgets):
                 (scope, old, None if usd is None else float(usd), actor))
         return True, old
 
-    def account_reserve(self, account, agent, usd) -> dict:
+    def account_reserve(self, account, agent, usd, spend_key) -> dict:
         """Atomic admission (advisory lock on the account, one transaction).
 
-        A reservation of this agent still open belongs to a turn that never
-        settled: it is `kept` (counted in full for its day), never released.
-        Rend {"ok", "id", "usage"}: `usage` is the envelope before this
-        reservation (None without an envelope: reserved, no cap).
+        The instant of the decision is read once AFTER the lock (a wait across
+        midnight must not use the day of the BEGIN), and serves for the usage,
+        the period and `created_at`. A reservation of this agent still open
+        belongs to a turn that never settled: it is `kept` (counted in full
+        for its day), never released. Rend {"ok", "id", "usage"}: `usage` is
+        the envelope before this reservation (None: reserved, no cap).
         """
         with self.db.transaction() as tx:
             tx.query("select pg_advisory_xact_lock(hashtext(%s))",
                      ("ameesh-account-budget:%s" % account,))
-            tx.execute("update account_reservations set state = 'kept', closed_at = now(),"
+            at = tx.query("select clock_timestamp()::text as at")[0]["at"]
+            tx.execute("update account_reservations set state = 'kept', closed_at = %s,"
                        " closed_by = 'unsettled turn' where agent = %s and state = 'open'",
-                       (agent,))
+                       (at, agent))
             rows = tx.query(self._USAGE.format(where=" where billing_account = %s"),
-                            (None, account))
+                            (at, account))
             usage = rows[0] if rows else None
             if usage is not None:
                 used = usage["settled"] + usage["reserved"] + usage["kept"]
                 if used + float(usd) > usage["usd"] + 1e-9:
                     return {"ok": False, "id": None, "usage": usage}
             got = tx.query(
-                "insert into account_reservations (billing_account, agent, usd, period)"
-                " values (%s, %s, %s, (now() at time zone coalesce((select tz from"
-                " account_budgets where billing_account = %s), 'Europe/Paris'))::date)"
-                " returning id", (account, agent, float(usd), account))
+                "insert into account_reservations (billing_account, agent, usd, period,"
+                " spend_key, created_at) values (%s, %s, %s, (%s::timestamptz at time zone"
+                " coalesce((select tz from account_budgets where billing_account = %s),"
+                " 'Europe/Paris'))::date, %s, %s) returning id",
+                (account, agent, float(usd), at, account, spend_key, at))
         return {"ok": True, "id": int(got[0]["id"]), "usage": usage}
 
-    def account_settle(self, agent, *, state, actor) -> dict | None:
-        """Closes the agent's open reservation (`settled`, `kept` or `released`).
+    def account_settle(self, spend_key, *, state, actor) -> dict | None:
+        """Settles the reservation of ONE turn, found by its ledger key.
 
-        In the same transaction, the agent's ledger rows written since the
-        reservation are tagged with its billing account: the real cost takes
-        the place of the reservation atomically, never both nor neither."""
+        In the same transaction the turn's ledger row (same `spend_key`) is
+        tagged with the reservation's account: the real cost takes the place
+        of the reservation atomically. A reservation already `kept` (the agent
+        reserved again meanwhile) keeps counting; its row is still tagged."""
         with self.db.transaction() as tx:
-            rows = tx.query("select id, billing_account, usd::float8 as usd"
-                            " from account_reservations where agent = %s and state = 'open'"
-                            " for update", (agent,))
+            rows = tx.query("select id, billing_account, agent, state,"
+                            " usd::float8 as usd from account_reservations"
+                            " where spend_key = %s for update", (spend_key,))
             if not rows:
                 return None
             row = rows[0]
-            tx.execute("update turn_costs c set billing_account = r.billing_account"
-                       " from account_reservations r where r.id = %s and c.agent = r.agent"
-                       " and c.billing_account is null and c.recorded_at >= r.created_at",
-                       (row["id"],))
-            tx.execute("update account_reservations set state = %s, closed_at = now(),"
-                       " closed_by = %s where id = %s", (state, actor, row["id"]))
+            tx.execute("update turn_costs set billing_account = %s"
+                       " where spend_key = %s and billing_account is null",
+                       (row["billing_account"], spend_key))
+            if row["state"] == "open":
+                tx.execute("update account_reservations set state = %s,"
+                           " closed_at = clock_timestamp(), closed_by = %s where id = %s",
+                           (state, actor, row["id"]))
         return row
 
     def account_release(self, reservation_id, *, actor) -> dict | None:

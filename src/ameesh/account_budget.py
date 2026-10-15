@@ -86,13 +86,17 @@ def reason(db, profile) -> str:
     return ""
 
 
-def reserve(db, agent: str, profile) -> str:
-    """Reserves the turn bound on the profile's account; '' = admitted."""
+def reserve(db, agent: str, profile, spend_key: str | None) -> str:
+    """Reserves the turn bound on the profile's account, under the turn's
+    ledger key (`spend_key`); '' = admitted."""
     account = billing_of(profile)
     if not account:
         return ""
+    if not spend_key:
+        return "account %s: turn without a ledger key, not reserved" % account
     try:
-        got = _api(db).account_reserve(account, agent, float(profile.reserve_usd))
+        got = _api(db).account_reserve(account, agent, float(profile.reserve_usd),
+                                       spend_key)
     except db_mod.Unavailable:
         raise
     except db_mod.DbError as exc:
@@ -102,9 +106,13 @@ def reserve(db, agent: str, profile) -> str:
     return exhausted_reason(account, got["usage"])
 
 
-def settle(db, agent: str, *, state: str = "settled", actor: str = "runner"):
-    """Closes the agent's open reservation; None when it has none."""
-    return _api(db).account_settle(agent, state=state, actor=actor)
+def settle(db, spend_key: str | None, *, state: str = "settled", actor: str = "runner"):
+    """Settles the reservation of the turn `spend_key`; None when it has none.
+
+    Raises `db.DbError`: the caller keeps its accounting marker for the repair."""
+    if not spend_key:
+        return None
+    return _api(db).account_settle(spend_key, state=state, actor=actor)
 
 
 def usage(db) -> list:
