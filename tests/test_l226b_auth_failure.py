@@ -878,7 +878,7 @@ class LegacySessionTest(_CapsBase):
                 mock.patch.object(accounts, "profiles", return_value=items), \
                 mock.patch.object(auth_failure, "failing", return_value=failing or {}), \
                 mock.patch.object(accounts, "gauges_of",
-                                  side_effect=lambda _b, p, _i, _e=None: (
+                                  side_effect=lambda _b, p, _i, _e=None, **_kw: (
                                       gauges or {}).get(p.name, quiet)), \
                 mock.patch.object(registry, "clear_session", return_value=False):
             account_turn.continuity(worker)
@@ -976,7 +976,7 @@ class UnpacedChoiceTest(_AuthBase):
         try:
             worker.rotation_forcee = "test"
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i, _e=None: self.overage), \
+                                   side_effect=lambda _b, _p, _i, _e=None, **_kw: self.overage), \
                     mock.patch.object(worker, "current_session", return_value="sess-1"), \
                     mock.patch.object(worker, "run_turn", return_value=False) as tour:
                 self.assertFalse(worker.budget_ok())
@@ -988,7 +988,7 @@ class UnpacedChoiceTest(_AuthBase):
             # out of overage: the guard lets it through, the pause is lifted
             worker.agent = registry.get(self.db, "ovr")  # as `pick` reloads it
             with mock.patch.object(accounts, "gauges_of",
-                                   side_effect=lambda _b, _p, _i, _e=None: self.paced):
+                                   side_effect=lambda _b, _p, _i, _e=None, **_kw: self.paced):
                 self.assertTrue(worker.budget_ok())
             self.assertEqual(registry.get(self.db, "ovr")["status"], "idle")
         finally:

@@ -87,7 +87,10 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
                                  agent=worker.name, paced=pause,
                                  session_account=session_account(worker, items),
-                                 critical=is_critical(worker), margin=bool(margin))
+                                 critical=is_critical(worker), margin=bool(margin),
+                                 # #1580 (tranche 3) : les seaux propres au
+                                 # modèle de l'agent comptent pour lui seul
+                                 model=book.model_of(worker.name))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -142,7 +145,10 @@ def fallback(worker, reason: str, limits=None) -> str:
                 choice = accounts.choose(
                     worker.db, worker.cfg.host, harness, items, book, agent=worker.name,
                     critical=True, session_account=session_account(worker, items)
-                    if session_harness(worker) == harness else None)
+                    if session_harness(worker) == harness else None,
+                    # #1580 (tranche 3) : même portée par modèle sous un
+                    # harnais emprunté
+                    model=book.model_of(worker.name))
                 if choice.profile is None or choice.auth_blocked:
                     continue
                 profile = choice.profile
@@ -456,7 +462,7 @@ def continuity(worker) -> bool:
 
 
 def summary_possible(old, book, items, now: float | None = None, *,
-                     sick: dict | None = None) -> tuple[bool, str]:
+                     sick: dict | None = None, model=None) -> tuple[bool, str]:
     """L'ancien compte peut-il encore porter le tour de résumé d'une rotation ?
     (L39, décision 0030) `(vrai, "")` ou `(faux, raison)`.
 
@@ -481,7 +487,8 @@ def summary_possible(old, book, items, now: float | None = None, *,
             sick[old.name].get("reason") or "?")
     now = time.time() if now is None else now
     try:
-        gauges = accounts.gauges_of(book, old, items) if book is not None else []
+        gauges = (accounts.gauges_of(book, old, items, model=model, now=now)
+                  if book is not None else [])
     except Exception as exc:
         # L226b : jauges illisibles — pas d'appel de modèle dans le doute
         return False, "%s gauges unreadable (%s)" % (old.harness, exc)
@@ -751,7 +758,10 @@ def rotate(worker, harness: str, old, new, session: str, *, new_label: str | Non
                                      tools={worker.name: harness})
             possible, raison = summary_possible(
                 old, book, accounts.profiles(worker.cfg, harness),
-                sick=auth_failure.failing(worker.db, worker.cfg.host, harness))
+                sick=auth_failure.failing(worker.db, worker.cfg.host, harness),
+                # #1580 (tranche 3) : le seau d'un autre modèle ne bloque pas
+                # le résumé de cet agent
+                model=book.model_of(worker.name))
         except Exception as exc:
             possible, raison = False, "state of the old account unreadable (%s)" % exc
         if not possible:
