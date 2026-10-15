@@ -437,7 +437,7 @@ class WorkItems(interface.WorkItems):
         sql += " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(
-            sql.replace("__COLUMNS__", ITEM_COLUMNS).replace(
+            sql.replace("__COLUMNS__", item_columns(self.db)).replace(
                 "__STATES__", ", ".join(["%s"] * len(wanted))),
             tuple(params))
 
