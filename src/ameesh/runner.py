@@ -41,7 +41,7 @@ import threading
 import time
 import uuid
 
-from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
+from . import account_budget, account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import persona_memory as memory_mod
@@ -167,6 +167,9 @@ BOOT_REVIEW_START = ("running", 0)
 #: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
 LIVE_REVIEW_EVERY_S = 300.0
 LIVE_REVIEW_IDLE_S = 600.0
+#: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
+#: l'alerte `mail_undeliverable` est de 15 min)
+DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: #339 r2: a process of this user whose environment cannot be read keeps a
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
@@ -433,6 +436,8 @@ class AgentWorker(threading.Thread):
         #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
+        #: #1469 : le marqueur comptable du tour lancé par CE worker
+        self._compta_travail: dict | None = None
         self._account_override = None
         #: L242b (3) : harnais emprunté par un agent critique au seuil sur le
         #: sien, `(harnais, compte ou None)`, et harnais imposé au tour de
@@ -1181,8 +1186,14 @@ class AgentWorker(threading.Thread):
             return False
         if self.session_turns < self.runner.session_min_turns:
             return False
+        # #706 : la latence d'un tour autorisé ne suffit pas à oublier la
+        # session. Le plancher suit aussi un plafond propre à l'agent ; le
+        # facteur 2 laisse une marge pour atteindre le point sûr après la
+        # borne du tour. Sans plafond, garder le seuil de latence configuré.
+        latency_threshold = max(self.runner.session_max_turn_seconds,
+                                2 * self.turn_max_seconds())
         return (self.session_tokens >= self.runner.session_max_tokens
-                or self.last_turn_seconds >= self.runner.session_max_turn_seconds)
+                or self.last_turn_seconds >= latency_threshold)
 
     def context_max_tokens(self) -> int:
         """Plafond de contexte effectif (L60) : réglage de l'agent
@@ -2424,6 +2435,10 @@ class AgentWorker(threading.Thread):
             self._compta_repare()
             raison = ("turn accounting unavailable" if self._compta_en_echec
                       else self.budget_reason())
+        if not raison:
+            # #1469 : l'enveloppe du compte de facturation retenu (y compris
+            # le repli d'un critique) — aucune exception ne la dépasse
+            raison = account_budget.reason(self.db, self._account)
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
@@ -2522,9 +2537,12 @@ class AgentWorker(threading.Thread):
         """
         self._annonce_ram = ""  # un tour neuf n'a encore rien annoncé
         try:
-            registry.pending_spend_put(self.db, self.name, int(start), tour,
-                                       model if model is not None else "")
-            return True
+            # Capture in the write itself: a replacement may write its marker
+            # as soon as ours commits, before a separate read (#1469).
+            self._compta_travail = registry.pending_spend_begin(
+                self.db, self.name, int(start), tour,
+                model if model is not None else "")
+            return self._compta_travail is not None
         except db_mod.Unavailable:
             raise  # L72 : rien lancé ; la consigne est remise au retour de la base
         except db_mod.DbError as exc:
@@ -2533,7 +2551,7 @@ class AgentWorker(threading.Thread):
                       % (self.name, " ".join(str(exc).split())[:160]))
             return False
 
-    def _compta_ecrit(self, travail: dict) -> bool:
+    def _compta_ecrit(self, travail: dict, *, incertain: bool = True) -> bool:
         """Écrit une ligne du grand livre, puis efface le marqueur en base.
 
         Rejouable après panne : le marqueur n'est effacé qu'après une écriture
@@ -2567,8 +2585,7 @@ class AgentWorker(threading.Thread):
             # Clé du marqueur (L60) : la même pour l'écriture de fin de tour et
             # pour sa réparation, qui ne double donc plus la ligne.
             cree = travail.get("created_ts")
-            cle = ("%s:%d:%.6f" % (self.name, debut, float(cree))
-                   if cree is not None else None)
+            cle = self._spend_key(debut, cree)
             usage = book.record(self.name, start=debut, key=cle,
                                 turn=travail.get("turn") or None,
                                 session=travail.get("session") or None,
@@ -2579,7 +2596,15 @@ class AgentWorker(threading.Thread):
             # Mesure du plafond de contexte (L60), lue sur la ligne écrite.
             self.last_turn_reread = usage.reread_tokens
             self.last_turn_reread_session = usage.session
-            registry.pending_spend_clear(self.db, self.name)
+            # #1469 : la ligne écrite prend la place de la réservation ; une
+            # réparation (tour interrompu, `incertain` par défaut) la garde
+            # Un échec lève : le marqueur reste, la réparation règle par la clé.
+            # Le backend médié ne réserve aucun compte local : la dépense
+            # fournisseur est comptée au relais, pas sur l'appareil (L111).
+            if not self.runner.mediated:
+                account_budget.settle(self.db, cle, state="kept" if incertain else "settled")
+            registry.pending_spend_clear(self.db, self.name, cree)
+            self._compta_travail = None
             self._annonce_ram = ""
             self._compta_en_echec = False
             return True
@@ -2651,7 +2676,13 @@ class AgentWorker(threading.Thread):
             log_async("[%s] announced model not persisted (%s): turns suspended"
                       % (self.name, " ".join(str(exc).split())[:120]))
 
-    def _compta_termine(self, model_annonce: str | None = None) -> None:
+    def _spend_key(self, debut: int, cree) -> str | None:
+        """La clé du tour (L60) : grand livre, marqueur et réservation #1469."""
+        return ("%s:%d:%.6f" % (self.name, int(debut), float(cree))
+                if cree is not None else None)
+
+    def _compta_termine(self, model_annonce: str | None = None, *,
+                        incertain: bool = False) -> None:
         """Après un tour : écrit la ligne du grand livre.
 
         Le modèle **annoncé par le flux** du harnais prime sur celui figé au
@@ -2660,10 +2691,17 @@ class AgentWorker(threading.Thread):
         # L72 : le tour a eu lieu ; sa ligne de grand livre attend la base
         # plutôt que d'être remise à une réparation ultérieure.
         travail = self._avec_reprise("turn accounting", self._compta_en_attente)
+        propre = getattr(self, "_compta_travail", None)
+        if propre and (not travail or travail.get("created_ts") != propre.get("created_ts")):
+            # #1469 : le marqueur en base n'est plus celui de ce tour (reprise
+            # par un remplaçant, ou déjà réparé) : on règle CE tour par sa propre
+            # clé (la ligne est dédoublonnée par `spend_key`), sans toucher au
+            # marqueur d'un autre
+            travail = dict(propre, model=self._annonce_ram or propre.get("model"))
         if travail:
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
-            self._compta_ecrit(travail)
+            self._compta_ecrit(travail, incertain=incertain)
         elif travail is not None:
             self._compta_en_echec = True
 
@@ -3839,6 +3877,22 @@ class AgentWorker(threading.Thread):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
             return False
+        # #1469 : réservation atomique du tour sur l'enveloppe du compte de
+        # facturation, sous la clé du marqueur (le règlement la retrouve par
+        # elle, jamais par agent) ; refusée, le tour ne part pas et le
+        # marqueur est retiré. Un résumé de bascule peut imposer l'ancien
+        # compte : réserver celui appliqué au harnais (`compte`).
+        if account_budget.billing_of(compte):
+            marqueur = self._compta_travail or {}
+            refus = account_budget.reserve(
+                self.db, self.name, compte,
+                self._spend_key(events_start, marqueur.get("created_ts")))
+            if refus:
+                registry.pending_spend_clear(self.db, self.name,
+                                             marqueur.get("created_ts"))  # rien n'est parti
+                self._compta_travail = None
+                self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
+                return False
 
         heartbeat_done = threading.Event()
         self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
@@ -4147,7 +4201,10 @@ class AgentWorker(threading.Thread):
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
-        self._compta_termine(modele_annonce)
+        # #1469 : issue incertaine (erreur, bail perdu, préemption, arrêt
+        # par plafond) : la réservation du compte reste comptée en entier
+        self._compta_termine(modele_annonce, incertain=bool(
+            error or result_code or lost or preempte or clos))
         if clos and not lost and not preempte and not self.restarting.is_set():
             # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
             # le code de sortie est celui de l'arrêt demandé.
@@ -5879,6 +5936,7 @@ class Runner:
                 # L230: the worktrees are walked at most every few hours
                 artifact_scan=build_artifacts.due(time.time()))
             self.expire_threads_once(db)
+            self.sweep_dead_letters_once(db)
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("cleanup: %s" % "; ".join(
@@ -5946,6 +6004,40 @@ class Runner:
                     "y" if report["dropped"] == 1 else "ies", report["before"],
                     "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
         return reports
+
+    def sweep_dead_letters_once(self, db, now: float | None = None,
+                                clock: float | None = None) -> dict | None:
+        """L976 : le courrier en souffrance (destinataire arrêté ou inconnu)
+        est re-livré au successeur déclaré, sinon expiré après
+        `mail_dead_letter_days`, au plus une fois par heure depuis le ménage
+        (le seuil d'alerte est de 15 min) ; l'alerte `mail_undeliverable` se
+        vide donc sans geste humain. Ne lève jamais."""
+        now = time.time() if now is None else now
+        # l'intervalle se compte sur l'horloge monotone (r8), le seuil sur l'horloge murale
+        tick = time.monotonic() if clock is None else clock
+        due = getattr(self, "_dead_letters_next", None)
+        if due is not None and tick < due:
+            return None
+        self._dead_letters_next = tick + DEAD_LETTER_SWEEP_EVERY_S
+        if getattr(self, "mediated", False) or db is None:
+            return None               # exécuteur médié : pas de base, pas de balayage
+        try:
+            from . import undeliverable
+            report = undeliverable.sweep(self.cfg, db, now=now, dry_run=self.dry_run)
+        except Exception as exc:      # jamais fatal pour l'exécuteur
+            log_async("dead-letter sweep failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        suffix = " [dry-run]" if self.dry_run else ""
+        for action in report["forwarded"]:
+            log_async("undeliverable mail: %d message(s) for %s re-delivered to %s%s"
+                      % (action["count"], action["old"], action["new"], suffix))
+        for action in report["expired"]:
+            log_async("undeliverable mail: %d message(s) for %s expired after %d day(s)%s"
+                      % (action["count"], action["recipient"], report["days"], suffix))
+        for action in report["refused"]:
+            log_async("undeliverable mail: %s not re-delivered to %s (%s)"
+                      % (action["old"], action["new"], action["reason"].splitlines()[0]))
+        return report
 
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
