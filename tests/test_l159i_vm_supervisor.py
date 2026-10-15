@@ -171,6 +171,42 @@ class VMSupervisor(unittest.TestCase):
                     'state': 'available', 'seq': 1, 'until_ts': None, 'expires_ts': expiry}))
                 self.assertEqual(gate.state().state, expected)
 
+    def test_legacy_file_gate_stale_heartbeat_falls_back_and_absent_one_is_obeyed(self):
+        """N6 : sur le chemin legacy (`lending=False`), un `expires_ts` périmé
+        retombe sur le repli, un état sans `expires_ts` reste obéi."""
+        from ameesh.mediated_executor.host_gate import from_config
+        from ameesh.config import Config
+        import dataclasses
+        cfg = dataclasses.replace(Config(), host_gate='file', host_gate_lending=False,
+                                  host_gate_path=str(self.state), host_gate_fallback='available')
+        gate = from_config(cfg)
+        self.addCleanup(gate.close)
+        with patch('ameesh.mediated_executor.host_gate.time.time', return_value=100):
+            self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1',
+                'state': 'stopped', 'seq': 3, 'until_ts': None, 'expires_ts': 99}))
+            self.assertEqual(gate.state().state, 'available')
+            self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1',
+                'state': 'stopped', 'seq': 4, 'until_ts': None}))
+            self.assertEqual(gate.state().state, 'stopped')
+
+    def test_unsupported_python_refused_before_any_launch(self):
+        """N3 : le wipe de révocation exige `shutil.rmtree(dir_fd=)` (3.11) ;
+        sur 3.9/3.10 `supervise` refuse avant de lancer, au lieu de lever une
+        TypeError au moment d'effacer le volume."""
+        with patch.object(V.sys, 'version_info', (3, 10, 14)):
+            with self.assertRaisesRegex(ValueError, r'requires Python >= 3\.11'):
+                self.supervise(lambda _: self.fail('launched'))
+        with patch.object(V.sys, 'version_info', (3, 11, 0)):
+            self.assertEqual(self.supervise(lambda _: Process(0)), 0)
+
+    def test_require_supported_python_bounds(self):
+        """N3 : la borne se contrôle sans dépendre du Python qui exécute la
+        suite."""
+        V.require_supported_python((3, 11, 0))
+        V.require_supported_python((3, 12, 4))
+        with self.assertRaisesRegex(ValueError, r'requires Python >= 3\.11.*found 3\.9'):
+            V.require_supported_python((3, 9, 18))
+
     def test_wipe_does_not_follow_guest_symlink(self):
         protected = self.root / 'protected'
         protected.mkdir()
