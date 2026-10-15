@@ -257,8 +257,8 @@ for nom in "${HOTES[@]}"; do
   f="$TRAVAIL/staging-$$-$nom.env"
   ( umask 077; : > "$f" )
   case "$(mode_de "$nom")" in
-    agents) printf 'AGENTS_SSH=%s\nHOTE_AGENTS=%s\n' "${CIBLE[$nom]}" "$nom" > "$f" ;;
-    serveur) printf 'VM=%s\nPERSONAS_VM=%s\n' "$ADRESSE_MESH" "$PERSONAS_VM_VAL" > "$f" ;;
+    agents) printf 'AGENTS_SSH=%q\nHOTE_AGENTS=%q\n' "${CIBLE[$nom]}" "$nom" > "$f" ;;
+    serveur) printf 'VM=%q\nPERSONAS_VM=%q\n' "$ADRESSE_MESH" "$PERSONAS_VM_VAL" > "$f" ;;
     poste) ;;
   esac
   FICHIER_HOTE[$nom]=$f
