@@ -127,8 +127,9 @@ class WidgetUsageTest(unittest.TestCase):
         ]))
         gauges = widget_usage.read(_profil(self.compte, "secondaire"),
                                    now=self.now, directory=self.dossier)
-        self.assertAlmostEqual(gauges[0].used, 0.42)     # un widget en 0..100
-        self.assertAlmostEqual(gauges[1].used, 1.0)      # borné à 1
+        # au-delà de 1 : à sec, jamais lu comme un pourcentage (1.05 ≠ 1 %)
+        self.assertAlmostEqual(gauges[0].used, 1.0)
+        self.assertAlmostEqual(gauges[1].used, 1.0)
 
     def test_inertie_source_absente_ou_illisible(self):
         profil = _profil(self.compte, "secondaire")
@@ -364,16 +365,21 @@ class ChooseAvecWidgetTest(_Base):
             json.dump({"schemaVersion": 1, "ready": True,
                        "updatedAt": _iso(self.now - 60), "limits": limites}, fh)
 
-    def _choix(self, modele: str) -> str:
+    def _choix(self, modele: str, registre: bool = False) -> str:
         self.now = time.time()
         comptes = self._comptes()
         self._widget("claude-fable", 1.0)
         self._widget("claude-autre", None)
         runner, worker = self._worker("wf", "claude", {"claude": comptes})
-        os.makedirs(os.path.join(self.cfg.state_dir, worker.name), exist_ok=True)
-        with open(os.path.join(self.cfg.state_dir, worker.name, "model"), "w",
-                  encoding="utf-8") as fh:
-            fh.write(modele + "\n")
+        if registre:
+            # `ameesh set <agent> model=…` : le modèle est au registre, sans
+            # fichier d'état — c'est lui que le runner passe au tour
+            worker.agent = dict(worker.agent or {}, model=modele)
+        else:
+            os.makedirs(os.path.join(self.cfg.state_dir, worker.name), exist_ok=True)
+            with open(os.path.join(self.cfg.state_dir, worker.name, "model"), "w",
+                      encoding="utf-8") as fh:
+                fh.write(modele + "\n")
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db,
                              tools={worker.name: "claude"})
         with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
@@ -386,6 +392,10 @@ class ChooseAvecWidgetTest(_Base):
 
     def test_autre_modele_ignore_le_seau_de_modele(self):
         self.assertEqual(self._choix("claude-opus-5-5"), "primaire")
+
+    def test_modele_du_registre(self):
+        self.assertEqual(self._choix("claude-fable-5", registre=True), "secondaire")
+        self.assertEqual(self._choix("claude-opus-5-5", registre=True), "primaire")
 
 
 if __name__ == "__main__":
