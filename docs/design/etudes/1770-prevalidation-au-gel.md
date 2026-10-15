@@ -34,15 +34,21 @@ prevalidation:
   contracts: [tests/parts/toujours.txt]   # contrats toujours inclus (chemins dépôt)
   hosts: [ameesh-agents-1]                # hôtes d'exécution autorisés (VM agents)
   timeout_seconds: 3600                   # délai du run distant
+  parts_script: scripts/test-parts.py     # lanceur de part du dépôt (facultatif)
 ```
 
-Chaque clé est obligatoire et relue : clé inconnue, classe inconnue ou en
-double, chemin non canonique (absolu, `..` sortant, antislash), hôte hors
-étiquette ou en double, délai non entier positif — tout refuse au chargement.
+Chaque clé est relue : clé inconnue, classe inconnue ou en double, chemin non
+canonique (absolu, `..` sortant, antislash), hôte hors étiquette ou en double,
+délai non entier positif — tout refuse au chargement. `parts_script` est
+facultatif : déclaré, il doit porter un chemin de dépôt (`null` refuse) ;
+absent, c'est le consommateur qui applique la convention du plan L161f
+(`scripts/test-parts.py`, contrat CLI `run --plan --part --driver --flow`),
+demandée par le pilote Nexlink pour que son propre outil de sélection se
+déclare au bloc sans imposer le nom ameesh.
 
 Le lecteur ne porte aucune valeur par défaut : `Document.prevalidation` et
 `Mechanics.prevalidation` valent `None` quand le bloc est absent, et `to_dict()`
-n'émet alors pas la clé.
+n'émet alors pas la clé ; `parts_script` n'est émis que s'il est déclaré.
 
 ## Consommateur
 
@@ -50,7 +56,8 @@ n'émet alors pas la clé.
 exact et rend `(document, bloc)` ; sans bloc, il lève
 `PrevalidationError(cause="block-missing")`. La sélection et l'exécution
 (`src/ameesh/prevalidation.py`) ne reçoivent leurs paramètres que du bloc : ni
-classe, ni hôte, ni délai codés en dur.
+classe, ni hôte, ni délai codés en dur ; le lanceur de part vient du bloc quand
+il le nomme, sinon de la seule convention du schéma.
 
 ## Commande explicite
 
@@ -97,37 +104,40 @@ c'est l'effet voulu de l'ordre de mise en service.
 ## Raccord générique par projet
 
 Le geste est générique : `--project` choisit la fiche du canon, `--canon-repo`
-et `--repo` les dépôts, `--plan` le plan du projet ; classes, contrats, hôtes et
-délai ne viennent que du bloc `prevalidation` du canon du projet, jamais d'une
-valeur codée en dur.
+et `--repo` les dépôts, `--plan` le plan du projet ; classes, contrats, hôtes,
+délai et lanceur de part ne viennent que du bloc `prevalidation` du canon du
+projet, jamais d'une valeur codée en dur.
 
 Chaque projet fournit quatre pièces :
 
 1. **son plan**, schéma `ameesh-test-plan/1` — les parts portent chacune une
    liste explicite de modules ; une part sans liste serait « le reste de la
    suite » et refuse `selection-unsafe` ;
-2. **son lanceur de part** `scripts/test-parts.py`, chemin dépôt, contrat CLI
-   `run --plan <plan> --part <n> --driver <d> --flow <fichier>` : c'est le seul
-   chemin de code encore propre à ameesh, donc le point d'adaptation d'un projet
-   qui a ses propres outils de sélection ;
+2. **son lanceur de part**, chemin dépôt, contrat CLI
+   `run --plan <plan> --part <n> --driver <d> --flow <fichier>` : ameesh garde
+   `scripts/test-parts.py` (convention appliquée quand le bloc ne dit rien), un
+   autre projet déclare le sien par `parts_script` ;
 3. **son bloc canon** : `classes` (P0-P3), `contracts` (chemins dépôt toujours
-   sélectionnés), `hosts` (étiquettes des VM d'exécution), `timeout_seconds` ;
+   sélectionnés), `hosts` (étiquettes des VM d'exécution), `timeout_seconds`,
+   `parts_script` s'il déroge à la convention ;
 4. **son stockage de rapport**, s'il persiste : ameesh écrit
    `prevalidation_reports` (0450), clé `(work_item_id, head_sha)`.
 
-### Adaptateur Nexlink (à valider par son pilote)
+### Adaptateur Nexlink (validé par son pilote)
 
 Aucune carte Nexlink n'est écrite ici : le bloc et l'hôte d'exécution se
-déclarent dans le canon Nexlink, par son pilote. Points d'accroche, repris de
-l'étude L161 (« ameesh first, Nexlink next ») :
+déclarent dans le canon Nexlink, par son pilote. Réponse du pilote (19:57) :
+le chemin du lanceur est bien paramétré par le bloc, Nexlink n'a pas
+`scripts/test-parts.py`, et son adaptateur sera un lot Nexlink de son ressort
+après la fusion de #1770. Points d'accroche, repris de l'étude L161
+(« ameesh first, Nexlink next ») :
 
 - base de comparaison `develop`, jamais `main` ;
 - sélection par `jest --findRelatedTests` et `vitest related --run`, test de la
   migration modifiée d'abord (`sql-tests.sh <n>`), carte e2e plus tard (L161h) ;
 - pas de CI GitHub de lot ni de suite complète : la prévalidation n'exécute que
   la sélection du plan ;
-- un lanceur de part Nexlink, ou bien l'extension du bloc par le chemin de ce
-  lanceur si le pilote préfère le paramétrer plutôt que d'imposer le nom ;
+- un lanceur de part Nexlink déclaré par `parts_script` ;
 - son propre stockage de rapport si Nexlink persiste les siens.
 
 L'application à Nexlink appartient à son pilote (§7 : une règle vaut pour tous

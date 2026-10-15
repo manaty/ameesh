@@ -63,7 +63,8 @@ _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "build", "ci", "reviews", "me
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "build", "ci")
 #: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
 PREVALIDATION_CLASSES = ("P0", "P1", "P2", "P3")
-_PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "timeout_seconds")
+_PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "parts_script",
+                       "timeout_seconds")
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
 _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
@@ -99,21 +100,27 @@ class Prevalidation:
     Absent (`None`), le consommateur explicite refuse et l'accroche automatique
     reste inactive : aucune valeur ne se suppose. Présent, il porte exactement
     les paramètres relus — classes du plan L161f retenues, contrats toujours
-    inclus, hôtes d'exécution autorisés, délai du run distant.
+    inclus, hôtes d'exécution autorisés, délai du run distant, et le lanceur de
+    part du dépôt quand le bloc le nomme (`parts_script`, `None` sinon : la
+    convention du schéma reste au consommateur, jamais au lecteur).
     """
 
     classes: tuple[str, ...]
     contracts: tuple[str, ...]
     hosts: tuple[str, ...]
     timeout_seconds: int
+    parts_script: str | None = None
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "classes": list(self.classes),
             "contracts": list(self.contracts),
             "hosts": list(self.hosts),
             "timeout_seconds": self.timeout_seconds,
         }
+        if self.parts_script is not None:
+            out["parts_script"] = self.parts_script
+        return out
 
 
 @dataclass(frozen=True)
@@ -412,13 +419,31 @@ def _prevalidation(value, where: str) -> Prevalidation:
         if item in out_hosts:
             raise MechanicsError("%s.hosts: duplicate host %s" % (where, item))
         out_hosts.append(item)
+    # le lanceur de part est optionnel : absent, la convention du schéma
+    # s'applique chez le consommateur ; déclaré, il est relu comme un chemin
     return Prevalidation(
         classes=ordered,
         contracts=tuple(out_contracts),
         hosts=tuple(out_hosts),
         timeout_seconds=_positive_int(data.get("timeout_seconds"),
                                       where + ".timeout_seconds"),
+        parts_script=_parts_script(data, where),
     )
+
+
+def _parts_script(data, where: str) -> str | None:
+    """Le lanceur de part déclaré (`None` : la convention du schéma).
+
+    Un `null` explicite refuse : la clé déclarée doit porter un chemin, comme
+    les contrats. Absente, la clé ne suppose rien — c'est le consommateur qui
+    applique `scripts/test-parts.py`."""
+    if "parts_script" not in data:
+        return None
+    value = data["parts_script"]
+    if not _repository_path(value):
+        raise MechanicsError("%s.parts_script: not a repository path: %r"
+                             % (where, value))
+    return value
 
 
 def _timezone(value, where: str) -> str:
