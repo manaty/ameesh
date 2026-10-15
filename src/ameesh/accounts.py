@@ -63,6 +63,20 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    matin), puis l'ordre déclaré ;
 4. sinon pause : tous les comptes sont au seuil.
 
+**Fraîcheur du relevé** (#1561) : un relevé **périmé** — une fenêtre datée
+s'est remise à zéro depuis la lecture (typiquement la fenêtre de 5 h) alors
+qu'une autre court encore (les 7 jours) — n'est plus un instantané courant de
+l'état du compte : la fenêtre encore ouverte n'en est qu'une borne
+inférieure, le compte a pu servir depuis. Un tel compte est **non vérifié** :
+il ne passe jamais avant un compte à relevé courant, quel que soit l'ordre de
+bascule (étape 3, `rank`), et sa raison le dit (`explain`) au lieu d'annoncer
+un « 30 % utilisé » trompeur ; il reste utilisable, et sans compte vérifié il
+est essayé (L71, « essayé, pas écarté ») — son premier tour rapporte sa
+jauge. Un relevé **absent** garde la règle L117 : un compte jamais utilisé
+compte pour 0 % et passe en premier, pour ne pas laisser un forfait inutilisé.
+Le relevé porte son horodatage (`Gauge.read_at`) : marqueur de compte Claude,
+date du journal de session Codex.
+
 **Failover order and caps** (L226b, owner decision 2026-10-07, "primaries
 last, capped"): step 3 ranks by the account's `priority` first (the harness's
 default account last), the pace only breaking ties. Each window is held to
@@ -70,6 +84,15 @@ the lowest of its pace cap (or `short_window_cap` on the short window), the
 account's fixed `cap` (50 % for the default account) and `overage_cap`
 (80 %) when the account may be billed beyond its plan; an account in overage
 is never chosen. These caps apply to continuity too (`limits`, `evaluate`).
+
+**Plafond de rythme par compte et fin de fenêtre** (#1176, décision de
+l'owner du 2026-10-14) : `pace_ceiling` remplace les 90 % en dur, et
+`pace_ceiling_end` relève le plafond dans les `pace_ceiling_end_hours`
+dernières heures avant la remise à zéro d'une fenêtre — **seulement** quand
+l'overage y est impossible, prouvé par un relevé frais (`overage_impossible`) :
+un compte dont l'overage est possible, inconnu ou dont la preuve est périmée
+garde son plafond de base (et `overage_cap` s'il peut être facturé). Le refus
+d'overage et la coupure d'un tour sur `isUsingOverage` sont inchangés.
 
 **Authentication failure** (L226b, table `credential_health`): an account
 reported `failing` (by the L226a sentinel or by a turn that failed on
@@ -84,11 +107,11 @@ Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
 Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
 de compte qui précède chaque tour ; Codex : les journaux de session du
 `CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
-0 % (`Gauge.used_at`, L71) : un compte sans relevé récent est essayé, pas
+0 % (`Gauge.used_at`, L71) : un compte sans relevé courant est essayé, pas
 écarté — son premier tour rapporte sa jauge.
 
-Chaque choix porte sa raison (`Choice.why`, « sans relevé : 0 % utilisé, le
-plus en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
+Chaque choix porte sa raison (`Choice.why`, « no reading: unverified, le plus
+en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
 (rythme 55 %) »), journalisée par l'exécuteur (`account_turn.choose`).
 
 La ligne `account_active` garde le **dernier compte choisi** pour une
@@ -101,13 +124,18 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import stat
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
+from .cost import PACE_CEILING, stale_reading
+
+#: #1469: a billing account id (`openai-manaty`), the same on every host
+BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 TYPES = ("config_dir", "api_key_env")
 #: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
@@ -123,6 +151,14 @@ OTHER_PRIORITY = 50
 OVERAGE_MODES = ("auto", "allowed", "none")
 #: windows up to this length are "short" (`short_window_cap`): 5 h for both plans
 SHORT_WINDOW_S = 6 * 3600.0
+#: #1176 : relèvement de fin de fenêtre. Dans les `pace_ceiling_end_hours`
+#: dernières heures avant `resets_at`, le plafond de rythme d'un compte dont
+#: l'overage est **impossible** (prouvé par un relevé frais, voir
+#: `overage_impossible`) monte jusqu'à `pace_ceiling_end`. Sans
+#: `pace_ceiling_end` déclaré, aucun relèvement : le plafond de base tient.
+PACE_CEILING_END_HOURS = 6.0
+#: Raison affichée du plafond effectif (`accounts list`) quand il est relevé.
+CEILING_REASON_END = "end of window, overage impossible"
 
 
 def _account_key(harness: str, key: str, default: str = "") -> str:
@@ -200,6 +236,21 @@ class Profile:
     #: pace). Configured per account in the host's `accounts` key; there is no
     #: implicit value, neither by name nor by default folder.
     pace_multiplier: float = 1.0
+    #: #1469: the provider billing account this profile spends from, shared by
+    #: every key, profile name, agent and host that bills it (`account_budget`);
+    #: empty = no daily account envelope applies
+    billing_account: str = ""
+    #: #1469: dollars reserved before each turn on that billing account (the
+    #: bound of one turn), settled at the real cost when the turn ends
+    reserve_usd: float = 2.0
+    #: #1176: the account's own pace ceiling (default `cost.PACE_CEILING`),
+    #: and its end-of-window raise. Within `pace_ceiling_end_hours` of a
+    #: window's `resets_at`, the ceiling rises to `pace_ceiling_end` when the
+    #: account's overage is impossible (fresh proof, `overage_impossible`);
+    #: `None` = no raise, the base ceiling always holds.
+    pace_ceiling: float = PACE_CEILING
+    pace_ceiling_end: float | None = None
+    pace_ceiling_end_hours: float = PACE_CEILING_END_HOURS
 
     @property
     def default(self) -> bool:
@@ -263,6 +314,57 @@ def _pace_multiplier(harness: str, name: str, value) -> float:
         raise AccountError("account %s/%s: pace_multiplier must be a finite number > 0"
                            % (harness, name))
     return multiplier
+
+
+def _ratio(harness: str, name: str, key: str, value) -> float:
+    """Un plafond de compte dans ]0, 1] (#1176), validé strictement."""
+    if isinstance(value, bool):
+        raise AccountError("account %s/%s: %s must be in ]0, 1]" % (harness, name, key))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise AccountError("account %s/%s: unreadable %s" % (harness, name, key))
+    if not math.isfinite(number) or not 0 < number <= 1:
+        raise AccountError("account %s/%s: %s must be in ]0, 1]" % (harness, name, key))
+    return number
+
+
+def _pace_ceiling(harness: str, name: str, item: dict) -> tuple[float, float | None, float]:
+    """(`pace_ceiling`, `pace_ceiling_end`, `pace_ceiling_end_hours`) d'un
+    profil compte (#1176), validés strictement.
+
+    Absent : 0.90 (`cost.PACE_CEILING`), aucun défaut implicite selon le
+    harnais, le nom ou le dossier. `pace_ceiling_end` absent : aucun
+    relèvement. `pace_ceiling_end_hours` absent avec un `pace_ceiling_end`
+    déclaré : 6 h ; déclaré seul (sans `pace_ceiling_end`), c'est une erreur —
+    un réglage sans effet serait un piège.
+    """
+    ceiling = (PACE_CEILING if item.get("pace_ceiling") is None
+               else _ratio(harness, name, "pace_ceiling", item.get("pace_ceiling")))
+    end, hours = item.get("pace_ceiling_end"), item.get("pace_ceiling_end_hours")
+    if end is None:
+        if hours is not None:
+            raise AccountError("account %s/%s: pace_ceiling_end_hours without "
+                               "pace_ceiling_end" % (harness, name))
+        return ceiling, None, PACE_CEILING_END_HOURS
+    end = _ratio(harness, name, "pace_ceiling_end", end)
+    if end < ceiling:
+        raise AccountError("account %s/%s: pace_ceiling_end must be >= pace_ceiling"
+                           % (harness, name))
+    if hours is None:
+        return ceiling, end, PACE_CEILING_END_HOURS
+    if isinstance(hours, bool):
+        raise AccountError("account %s/%s: pace_ceiling_end_hours must be a finite "
+                           "number > 0" % (harness, name))
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        raise AccountError("account %s/%s: unreadable pace_ceiling_end_hours"
+                           % (harness, name))
+    if not math.isfinite(hours) or hours <= 0:
+        raise AccountError("account %s/%s: pace_ceiling_end_hours must be a finite "
+                           "number > 0" % (harness, name))
+    return ceiling, end, hours
 
 
 def parse(raw) -> dict[str, list[Profile]]:
@@ -329,6 +431,19 @@ def parse(raw) -> dict[str, list[Profile]]:
                 raise AccountError("account %s/%s: priority must be an integer"
                                    % (harness, name))
             pace_multiplier = _pace_multiplier(harness, name, item.get("pace_multiplier"))
+            billing = str(item.get("billing_account") or "")
+            if billing and not BILLING_RE.match(billing):
+                raise AccountError("account %s/%s: invalid billing_account %r"
+                                   % (harness, name, billing))
+            try:
+                reserve = float(item.get("reserve_usd", 2.0))
+            except (TypeError, ValueError):
+                raise AccountError("account %s/%s: unreadable reserve_usd" % (harness, name))
+            if not reserve > 0 or reserve == float("inf"):
+                raise AccountError("account %s/%s: reserve_usd must be positive"
+                                   % (harness, name))
+            pace_ceiling, pace_ceiling_end, pace_ceiling_end_hours = _pace_ceiling(
+                harness, name, item)
             overage = str(item.get("overage") or "auto")
             if overage not in OVERAGE_MODES:
                 raise AccountError("account %s/%s: overage must be one of %s"
@@ -363,6 +478,10 @@ def parse(raw) -> dict[str, list[Profile]]:
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
                 pace_multiplier=pace_multiplier,
+                billing_account=billing, reserve_usd=reserve,
+                pace_ceiling=pace_ceiling,
+                pace_ceiling_end=pace_ceiling_end,
+                pace_ceiling_end_hours=pace_ceiling_end_hours,
             ))
         out[harness] = profiles
     return out
@@ -569,12 +688,17 @@ class Evaluation:
     profile: Profile
     reason: str = ""                     #: '' = sous le seuil
     gauges: list = field(default_factory=list)
-    until: float | None = None           #: heure de libération si au seuil (#777)
+    until: float | None = None           #: heure de libération si au seuil
+                                         #: (#777) : croisement du rythme ou
+                                         #: remise à zéro (#898)
     problems: list = field(default_factory=list)
     #: L242b (4) : la fenêtre qui retient le compte et son usage, (clé, part)
     held: tuple | None = None
     #: L226b: {gauge key: (cap, label)}, the cap each window is held to
     limits: dict = field(default_factory=dict)
+    #: #1176 : {clé de jauge: Ceiling}, le plafond de rythme effectif du compte
+    #: (de base ou relevé en fin de fenêtre), avec sa raison
+    ceilings: dict = field(default_factory=dict)
     #: L226b: held back by an absolute rule (in overage, past a fixed cap),
     #: not only by its pace: no budget setting lifts it
     hard: bool = False
@@ -630,6 +754,92 @@ def overage_capable(profile: Profile, overage) -> bool:
     return bool(overage is not None and overage.capable)
 
 
+# --------------------------------------------------------------------------
+# #1176 : plafond de rythme par compte et relèvement de fin de fenêtre
+# --------------------------------------------------------------------------
+
+class Ceiling(NamedTuple):
+    """Le plafond de rythme effectif d'une fenêtre (#1176).
+
+    * `value` : le plafond à appliquer à `now` (`pace_ceiling`, ou
+      `pace_ceiling_end` quand le relèvement s'applique) ;
+    * `reason` : '' pour le plafond de base, `CEILING_REASON_END` quand il est
+      relevé (affiché par `accounts list`) ;
+    * `from_ts` : l'heure à partir de laquelle le relèvement s'applique
+      (`resets_at` moins `pace_ceiling_end_hours`) quand il est configuré ET
+      prouvé ; None sinon. Sert à annoncer la fin de pause ;
+    * `end` : le plafond relevé, None sans relèvement.
+    """
+
+    value: float
+    reason: str = ""
+    from_ts: float | None = None
+    end: float | None = None
+
+
+def overage_impossible(gauges, now: float) -> bool:
+    """L'overage est-il impossible pour ce compte, prouvé par un relevé frais ?
+
+    Une seule source, jamais une déclaration de configuration : le relevé de
+    jauges, `overage.capable` **explicitement faux** (Claude `overageStatus`,
+    Codex `credits.has_credits`) et frais — au moins une fenêtre encore en
+    cours (un relevé dont toutes les fenêtres sont remises à zéro est périmé,
+    L71), et pas en overage.
+
+    #1176 (B2) : le `.claude.json` du compte a été retiré de cette preuve.
+    Son `cachedExtraUsageDisabledReason` peut dater d'une autre fenêtre, et
+    le mtime du **contenant** ne date pas la valeur : Claude Code réécrit ce
+    fichier pour d'autres raisons (une clé étrangère ajoutée suffisait à
+    faire relever le plafond alors que la capacité d'overage restait
+    inconnue). Aucune preuve fraîche rattachée à la capacité n'étant
+    démontrable, la suppression conservatrice s'impose : information
+    inconnue, absente ou périmée ⇒ pas de relèvement.
+
+    Toute autre situation — information absente, inconnue, périmée, ou
+    overage possiblement facturé — vaut « non » : le plafond de base tient.
+    """
+    read = getattr(gauges, "overage", None)
+    if read is None or read.capable is not False:
+        return False
+    if in_overage(gauges, now):
+        return False
+    return any(not g.reset_passed(now) for g in gauges)
+
+
+def pace_ceiling(profile: Profile, gauges, gauge, now: float) -> Ceiling:
+    """Le plafond de rythme effectif de cette fenêtre, et sa raison (#1176).
+
+    Le plafond de base est `profile.pace_ceiling` (défaut `PACE_CEILING`).
+    Dans les `pace_ceiling_end_hours` dernières heures avant la remise à zéro
+    de la fenêtre (`resets_at`), il monte à `pace_ceiling_end` si — et
+    seulement si — `overage_impossible` le prouve pour ce compte. Une fenêtre
+    sans date, un relèvement non déclaré, une preuve absente ou périmée
+    laissent le plafond de base : jamais de relèvement dans le doute.
+    """
+    base = profile.pace_ceiling
+    end = profile.pace_ceiling_end
+    if end is None or end <= base or not gauge.resets_at:
+        return Ceiling(base)
+    if in_overage(gauges, now):
+        # un compte en overage n'est jamais choisi : son plafond ne se relève pas
+        return Ceiling(base)
+    from_ts = float(gauge.resets_at) - profile.pace_ceiling_end_hours * 3600.0
+    left = float(gauge.resets_at) - now
+    if left < 0.0:
+        return Ceiling(base)
+    if not overage_impossible(gauges, now):
+        return Ceiling(base)
+    if now >= from_ts:
+        return Ceiling(end, CEILING_REASON_END, from_ts, end)
+    return Ceiling(base, from_ts=from_ts, end=end)
+
+
+def pace_ceilings(profile: Profile, gauges, now: float) -> dict:
+    """{clé de jauge: Ceiling} pour toutes les fenêtres du compte (#1176)."""
+    return {gauge.key: pace_ceiling(profile, gauges, gauge, now)
+            for gauge in gauges}
+
+
 def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tuple[float, str]]:
     """[(cap, label)]: the caps that hold on every window of the account
     whatever its pace (L226b): its fixed cap (`account_cap`), and
@@ -650,7 +860,7 @@ def fixed_caps(profile: Profile, gauges, *, critical: bool = False) -> list[tupl
 
 
 def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
-           reserve: bool = False) -> dict:
+           reserve: bool = False, ceilings: dict | None = None) -> dict:
     """{gauge key: (cap, label)}: the usage each window of the account is held
     to (L226b), the lowest of
     * the pace cap of the guard (0019), or on the short window the account's
@@ -660,16 +870,33 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
     `critical` (L242b): see `fixed_caps`. `reserve` (L242b (2), a
     non-critical agent): the pace cap, or the short window cap that replaces
-    it, is lowered by `RESERVE`, and never exceeds the pace cap minus
-    `RESERVE`, min(80 %, elapsed); the fixed caps are not lowered. #777 :
-    la réserve ne s'applique pas sous `PACE_MARGIN` d'écoulé — le plafond de
-    rythme y vaut `max(écoulé, marge)`, il ne bloque pas le début de fenêtre.
+    it, is lowered by `RESERVE` —
+    `max(min(PACE_CEILING, multiplier × elapsed + PACE_MARGIN) − RESERVE,
+    PACE_MARGIN)` — and the fixed caps are not lowered. #777 : tant que
+    `multiplier × elapsed ≤ RESERVE` (soit `≤ PACE_MARGIN` quand la réserve
+    vaut la marge) la réserve ne s'applique pas, le plafond de rythme y vaut
+    la marge (10 points) et non `multiplier × écoulé + marge − RESERVE` — à
+    8 % d'écoulé avec `multiplier = 2` il vaut 16 % (#1028 P3) ; l'énoncé de
+    la décision du propriétaire (« plafond = max(écoulé, marge) ») décrit ce
+    début de fenêtre. En fin de fenêtre le seuil vaut
+    `PACE_CEILING − RESERVE` (80 %), il ne suit plus `max(écoulé, marge)`
+    (#1028 N1).
+
+    `ceilings` (#1176, `pace_ceilings`) : les plafonds effectifs déjà
+    calculés pour ce compte ; sans eux, ils le sont ici. Le plafond de rythme
+    est celui du compte (`pace_ceiling`), ou son plafond de fin de fenêtre
+    quand `overage_impossible` le prouve.
     """
     fixed = fixed_caps(profile, gauges, critical=critical)
     cut = RESERVE if reserve else 0.0
+    if ceilings is None:
+        ceilings = pace_ceilings(profile, gauges, now)
     out = {}
     for gauge in gauges:
-        pace = (gauge.held_cap(now, cut, profile.pace_multiplier), "pace cap")
+        ceiling = ceilings.get(gauge.key)
+        pace = (gauge.held_cap(now, cut, profile.pace_multiplier,
+                               ceiling.value if ceiling is not None
+                               else profile.pace_ceiling), "pace cap")
         if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
             base = (max(0.0, profile.short_window_cap - cut), "short window cap")
             if reserve:
@@ -683,7 +910,7 @@ def limits(profile: Profile, gauges, now: float, *, critical: bool = False,
 
 
 def _release(profile: Profile, depasses, hard, now: float,
-             cut: float) -> tuple[float | None, object | None]:
+             cut: float, ceilings: dict | None = None) -> tuple[float | None, object | None]:
     """La fenêtre qui bloque le plus longtemps, et l'heure où elle libère.
 
     Ne se rattrapent pas par l'écoulé, et attendent donc leur remise à zéro :
@@ -698,20 +925,31 @@ def _release(profile: Profile, depasses, hard, now: float,
     relevé (il porte alors le libellé « pace cap »), mais il ne rattrape
     jamais un usage au-dessus du plafond court — voir #777 r2, un compte
     `short_window_cap` 0,75 à 70 % d'usage avec 30 % d'écoulé.
+
+    `ceilings` (#1176) : le plafond effectif de chaque fenêtre. Un relèvement
+    de fin de fenêtre déjà prouvé peut libérer la fenêtre avant sa remise à
+    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro.
     """
     dated = []
     for gauge in depasses:
         if not gauge.resets_at:
             return None, None
+        ceiling = (ceilings or {}).get(gauge.key)
         short = (profile.short_window_cap is not None
                  and gauge.window_s <= SHORT_WINDOW_S)
         if any(gauge is held for held, _ in hard) or (
                 short and gauge.used_at(now) >= max(0.0, profile.short_window_cap - cut)):
             free = float(gauge.resets_at)
         else:
-            free = gauge.free_at(now, cut, profile.pace_multiplier)
+            free = gauge.free_at(now, cut, profile.pace_multiplier,
+                                 ceiling.value if ceiling is not None
+                                 else profile.pace_ceiling)
             if free is None:
                 return None, None
+            if (ceiling is not None and ceiling.from_ts is not None
+                    and ceiling.end is not None and ceiling.from_ts > now
+                    and gauge.used_at(now) < ceiling.end - cut):
+                free = min(free, ceiling.from_ts)
         dated.append((free, gauge))
     return max(dated, key=lambda pair: pair[0])
 
@@ -724,7 +962,12 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
     `critical` (L242b) : pour un agent critique, sans le plafond implicite de
     50 % du compte par défaut (`fixed_caps`). `reserve` : pour un agent non
-    critique, le rythme moins `RESERVE` (`limits`)."""
+    critique, le rythme moins `RESERVE` (`limits`).
+
+    #1176 : le plafond de rythme est celui du compte (`pace_ceiling`), relevé
+    en fin de fenêtre (`pace_ceiling_end`) quand `overage_impossible` le
+    prouve ; le refus d'overage (`in_overage`) et ses règles sont inchangés.
+    """
     result = Evaluation(profile)
     result.problems = check(profile, environ)
     if result.problems:
@@ -744,7 +987,9 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # (none dated, or a reading without windows: no date, never a guess)
         result.until = max(resets) if resets and len(resets) == len(spent) else None
         return result
-    result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve)
+    result.ceilings = pace_ceilings(profile, result.gauges, now)
+    result.limits = limits(profile, result.gauges, now, critical=critical, reserve=reserve,
+                           ceilings=result.ceilings)
     depasses = []
     for gauge in result.gauges:
         # fenêtre remise à zéro depuis le relevé : vierge (L71 : `used_at`
@@ -760,20 +1005,25 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         gauge, (cap, label) = hard[0] if hard else (depasses[0],
                                                     result.limits[depasses[0].key])
         result.held = (gauge.key, gauge.used)
+        ceiling = result.ceilings.get(gauge.key)
+        raised = ", %s" % ceiling.reason if ceiling is not None and ceiling.reason else ""
         if label == "pace cap":
             result.reason = ("plan %s %s: %.0f%% used with %.0f%% of the window elapsed "
-                             "(pace cap %.0f%%)" % (
+                             "(pace cap %.0f%%%s)" % (
                                  profile.harness, gauge.key, gauge.used * 100,
-                                 gauge.elapsed(now) * 100, cap * 100))
+                                 gauge.elapsed(now) * 100, cap * 100, raised))
         else:
             result.reason = "%s plan %s: %.0f%% used (%s %.0f%%)" % (
                 profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
         if reserve and not hard:
             result.reason += ", %.0f points kept for critical agents" % (RESERVE * 100)
         # #373 r2 : la pause affichée est celle de la fenêtre qui bloque le
-        # plus longtemps ; #777 : à l'heure où elle libère vraiment.
+        # plus longtemps ; #777, #898 : à l'heure où elle libère vraiment —
+        # croisement du rythme, ou remise à zéro quand il ne rattrape plus ;
+        # #1176 : le relèvement de fin de fenêtre peut la libérer avant la
+        # remise à zéro.
         result.until, late = _release(profile, depasses, hard, now,
-                                      RESERVE if reserve else 0.0)
+                                      RESERVE if reserve else 0.0, result.ceilings)
         if late is not None:
             result.held = (late.key, late.used)
         return result
@@ -895,14 +1145,29 @@ def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | N
 
 def explain(result: Evaluation, now: float) -> str:
     """Le retard d'un compte sur son rythme, lisible : « seven_day 35 %
-    utilisé (rythme 55 %) », « sans relevé : 0 % utilisé »."""
-    _ratio, gauge = lag(result.gauges, now, result.limits)
-    if gauge is None:
+    utilisé (rythme 55 %) », « sans relevé : non vérifié ».
+
+    #1561 : un relevé périmé (une fenêtre remise à zéro depuis, l'autre
+    encore ouverte) ne se lit plus comme une mesure courante — la raison dit
+    « non vérifié » et rappelle la dernière valeur connue. Un relevé absent
+    est « non vérifié » aussi : sa valeur n'est pas un 0 % mesuré (L117 le
+    fait passer premier, mais la raison ne ment pas)."""
+    gauges = result.gauges
+    if not gauges:
+        return "no reading: unverified"
+    if stale_reading(gauges, now):
+        last = lag(gauges, now, result.limits)[1]
+        suffix = (", last %s %.0f%%" % (last.key, last.used * 100)
+                  if last is not None else "")
+        return "stale reading (window reset since the reading): unverified" + suffix
+    _ratio, gauge = lag(gauges, now, result.limits)
+    if gauge is None:                       # jamais avec des jauges : ceinture
         return "no reading: 0% used"
-    if all(g.reset_passed(now) for g in result.gauges):
+    if all(g.reset_passed(now) for g in gauges):
         return "stale reading (window reset): 0% used"
     cap, label = result.limits.get(gauge.key) or (
-        gauge.pace_cap(now, result.profile.pace_multiplier), "pace cap")
+        gauge.pace_cap(now, result.profile.pace_multiplier, result.profile.pace_ceiling),
+        "pace cap")
     bound = ("pace %.0f%%" % (cap * 100)) if label == "pace cap" \
         else "%s %.0f%%" % (label, cap * 100)
     if not gauge.resets_at:
@@ -915,10 +1180,21 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
     """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
-    Clé : L226b, the failover order first (`priority`: the default account
-    last, owner decision 2026-10-07), then le retard sur le rythme (`lag`, le
-    plus petit rapport d'abord), puis l'échéance de la capacité inutilisée (la
-    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré.
+    Clé (#1561) : d'abord un relevé **courant** — un compte dont le relevé est
+    périmé (une fenêtre remise à zéro depuis la lecture, une autre encore
+    ouverte) ne passe jamais avant un compte dont l'état est vérifié, quel que
+    soit l'ordre de bascule ; puis L226b, l'ordre de bascule (`priority` : le
+    compte par défaut en dernier, décision owner du 2026-10-07) ; puis le
+    retard sur le rythme (`lag`, le plus petit rapport d'abord) ; puis
+    l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
+    fenêtre en cours, après) ; puis l'ordre déclaré.
+
+    Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
+    un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
+    laisser un forfait inutilisé ; c'est le seul cas où l'absence passe avant
+    un relevé courant. Un compte non vérifié (relevé périmé) reste utilisable :
+    sans compte vérifié il est essayé (L71, « essayé, pas écarté »), et son
+    premier tour rapporte sa jauge.
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
@@ -928,7 +1204,10 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
         result = evaluations[profile.name]
         gauges = result.gauges
         found = expiry(gauges, now)
-        return (priority(profile), round(lag(gauges, now, result.limits)[0], 6),
+        # Absent : L117 (premier). Périmé : après tout relevé courant (#1561).
+        unverified = bool(gauges) and stale_reading(gauges, now)
+        return (1 if unverified else 0,
+                priority(profile), round(lag(gauges, now, result.limits)[0], 6),
                 found[0] if found is not None else float("inf"), index)
     usable = [(i, p) for i, p in enumerate(items)
               if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
@@ -937,10 +1216,20 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
-    « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
-    primaire seven_day 35 % utilisé (rythme 55 %) »."""
+    « no reading: unverified, tried first (L117) ; avant : primaire seven_day
+    35 % utilisé (rythme 55 %) »."""
     first = ranked[0]
-    if len(ranked) > 1 and priority(first) < priority(ranked[1]):
+    gauges = evaluations[first.name].gauges
+    if not gauges:
+        # L117 (amendement 0034 du 2026-10-10) : un compte jamais utilisé
+        # compte pour 0 % et passe en premier — la raison le dit, sans
+        # prétendre à un 0 % mesuré (#1561).
+        why = "no reading: unverified, tried first (L117)"
+    elif stale_reading(gauges, now):
+        # #1561 : aucun relevé courant n'est disponible ; il est essayé faute
+        # de mieux (L71), pas choisi sur un rythme qui n'est plus mesuré.
+        why = "%s, tried (no current reading)" % explain(evaluations[first.name], now)
+    elif len(ranked) > 1 and priority(first) < priority(ranked[1]):
         # L226b: the failover order decided, not the pace
         why = "%s, first in the failover order (priority %d)" % (
             explain(evaluations[first.name], now), priority(first))
@@ -1200,6 +1489,10 @@ def report(cfg, db, book, *, now: float | None = None,
     commandes d'affichage (`ameesh accounts list`, `ameesh cost report`) ;
     le relevé revient aux exécuteurs (avant chaque tour) ou à une demande
     explicite.
+
+    Chaque jauge porte son plafond effectif (`pace_ceiling`, #1176) et sa
+    raison (`ceiling_reason`, vide pour le plafond de base) : le relèvement de
+    fin de fenêtre s'y lit, comme dans la raison du compte.
     """
     now = time.time() if now is None else now
     declared = parse(getattr(cfg, "accounts", None) or {})
@@ -1226,20 +1519,34 @@ def report(cfg, db, book, *, now: float | None = None,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
+                # #1075/#1028 : le rythme du compte, pour les affichages qui
+                # lisent ses jauges hors d'`evaluate` (cost.report, progress)
+                "pace_multiplier": profile.pace_multiplier,
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
                 "overage": _overage_row(profile, result.gauges, now),
                 "gauges": [
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
-                    # relevé reste lisible (`last_used`)
+                    # relevé reste lisible (`last_used`) ; #1176 : le plafond
+                    # effectif de la fenêtre et sa raison ; #1561 : `read_at`
+                    # date le relevé, `stale` (posé par `_forecast`) dit qu'il
+                    # n'est plus un instantané courant.
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
                      "cap": (result.limits.get(g.key)
-                             or (g.pace_cap(now, result.profile.pace_multiplier),))[0],
+                             or (g.pace_cap(now, result.profile.pace_multiplier,
+                                            result.profile.pace_ceiling),))[0],
+                     "pace_ceiling": (result.ceilings.get(g.key)
+                                      or Ceiling(result.profile.pace_ceiling)).value,
+                     "ceiling_reason": (result.ceilings.get(g.key)
+                                        or Ceiling(result.profile.pace_ceiling)).reason,
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
-                     "reset_passed": g.reset_passed(now)}
+                     "reset_passed": g.reset_passed(now),
+                     "read_at": getattr(g, "read_at", None)}
                     for g in result.gauges
                 ],
                 "_gauges": list(result.gauges),
+                "_limits": result.limits,
+                "_ceilings": result.ceilings,
             })
         _forecast(rows[len(rows) - len(items):], items, now)
     return rows
@@ -1261,15 +1568,26 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
-    (`next`, avec sa raison `why`, la même que celle du choix — L117)."""
+    (`next`, avec sa raison `why`, la même que celle du choix — L117).
+
+    #1561 : un relevé périmé n'annonce ni perte ni échéance — la capacité
+    inutilisée qu'il décrit (30 % d'une fenêtre de 7 j encore ouverte) n'est
+    qu'une borne inférieure, et l'annonce « 70 % perdus à la remise à zéro »
+    était fausse. Le compte porte `stale` pour les affichages."""
     evaluations = {}
     for row, profile in zip(rows, items):
-        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"])
+        # #1176 : les plafonds effectifs et les plafonds retenus sont ceux du
+        # rapport — `why` explique le choix avec le même plafond que `choose`.
+        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"],
+                            limits=row.get("_limits") or {},
+                            ceilings=row.get("_ceilings") or {})
         evaluations[profile.name] = result
-        row["losses"] = [
+        stale = bool(row["_gauges"]) and stale_reading(row["_gauges"], now)
+        row["stale"] = stale
+        row["losses"] = [] if stale else [
             {"key": g.key, "resets_at": found[0], "in_s": found[0] - now, "lost": found[1]}
             for g in row["_gauges"] for found in [g.expiring(now)] if found is not None]
-        found = expiry(row["_gauges"], now)
+        found = None if stale else expiry(row["_gauges"], now)
         row["expires_in_s"] = (found[0] - now) if found is not None else None
         row["next"] = False
         row["why"] = ""
@@ -1292,13 +1610,23 @@ def format_rows(rows: list[dict]) -> str:
         actif = ("forced" if row["forced"] else "yes") if row["active"] else ""
         etat = "ok" if row["ok"] else "limit" if not row["problems"] else "invalid"
         gauges = ", ".join(
-            "%s %.0f%% (pace %.0f%%%s)" % (
+            "%s %.0f%% (pace %.0f%%%s%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
+                # #1176 : le plafond effectif et sa raison, quand il est relevé
+                ", ceiling %.0f%%, %s" % (g["pace_ceiling"] * 100, g["ceiling_reason"])
+                if g.get("ceiling_reason") else "",
                 ", reset passed, last reading %.0f%%"
                 % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))
+        if row.get("stale"):
+            # #1561 : le relevé n'est plus un instantané courant (une fenêtre
+            # remise à zéro, une autre encore ouverte) — la valeur lue n'est
+            # qu'une borne inférieure, pas un « 30 % utilisé » d'aujourd'hui.
+            lines.append("%-9s %-14s %-7s %-8s ↳ reading not current: "
+                         "window reset since the reading (unverified)"
+                         % ("", "", "", ""))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
         if row.get("losses"):

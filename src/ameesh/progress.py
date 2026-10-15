@@ -154,14 +154,15 @@ def parse_since(text: str | None, now: float) -> float:
 
 def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
                           declared: Iterable[dict] | None = None) -> dict:
-    """Les jalons d'un lot : requested / frozen / verdict / merged.
+    """Les jalons d'un lot : requested / frozen / verdict / merged / delivered.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
 
     * `declared` — les lignes de la table des jalons de lot (L10,
       `work_item_milestones` : `kind`, `at_ts`, `actor`, `verdict`) ; quand
       le lot y a au moins un gel ou un verdict DÉCLARÉ, gels et verdicts
-      viennent de là ; `requested` et `merged` en viennent dès qu'ils y sont ;
+      viennent de là ; `requested`, `merged` et `delivered` (#988) en viennent
+      dès qu'ils y sont ;
     * sinon, déduction depuis le journal des transitions (`work_item_events`,
       dans l'ordre d'écriture) : gel = entrée en `qa`, verdict = sortie de
       `qa` vers `merged` (ok) ou vers `build` (blocked).
@@ -173,10 +174,15 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     Rend :
 
     * `requested`, `frozen` (PREMIER gel), `verdict` (verdict retenu = le
-      plus récent), `merged` : instants ou None ;
+      plus récent), `merged`, `delivered` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
-    * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : son auteur ;
-    * `verdict_current` : le verdict retenu est-il postérieur au dernier gel ?
+    * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
+      verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
+      #705), sinon l'auteur du dernier verdict ;
+    * `verdict_current` : le verdict retenu porte-t-il sur le dernier gel ?
+      Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
+      renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
+      ne compte pas ; sans SHA des deux côtés, comparaison des instants ;
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
@@ -210,19 +216,24 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     rows = [r for r in (declared or []) if r.get("at_ts") is not None]
     if any(r.get("kind") in ("frozen", "verdict") for r in rows):
         source = "milestones"
-        freezes = sorted(r["at_ts"] for r in rows if r.get("kind") == "frozen")
-        verdicts = [(r["at_ts"], r.get("verdict") or "ok", r.get("actor") or None)
+        freezes = [{"at_ts": r["at_ts"], "sha": (r.get("sha") or "").strip()}
+                   for r in rows if r.get("kind") == "frozen"]
+        verdicts = [{"at_ts": r["at_ts"], "kind": r.get("verdict") or "ok",
+                     "actor": r.get("actor") or None, "sha": (r.get("sha") or "").strip()}
                     for r in rows if r.get("kind") == "verdict"]
     else:
         source = "events"
-        freezes, verdicts = ev_freezes, ev_verdicts
+        freezes = [{"at_ts": at, "sha": ""} for at in ev_freezes]
+        verdicts = [{"at_ts": at, "kind": kind, "actor": actor, "sha": ""}
+                    for (at, kind, actor) in ev_verdicts]
     # Une source à la fois, pour des instants cohérents entre eux (le jalon
     # automatique `merged` et l'événement de la même transition diffèrent de
     # quelques microsecondes) : la table entière quand elle porte des
     # déclarations, sinon le journal, la table ne comblant que ses trous.
     auto = {}
     for r in rows:
-        if r.get("kind") in ("requested", "merged") and r.get("kind") not in auto:
+        if (r.get("kind") in ("requested", "merged", "delivered")
+                and r.get("kind") not in auto):
             auto[r["kind"]] = r["at_ts"]          # lignes en ordre chronologique
     if source == "milestones":
         requested = auto.get("requested", requested)
@@ -230,37 +241,81 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     else:
         requested = requested if requested is not None else auto.get("requested")
         merged = merged if merged is not None else auto.get("merged")
+    # #988 : un lot livré hors cible est clos par `close --delivered` ; le jalon
+    # `delivered` (sinon l'instant de fermeture) date la livraison, que `merged`
+    # ne porte pas.
+    delivered = auto.get("delivered")
+    if delivered is None and item.get("state") == "closed" \
+            and item.get("close_reason") == "delivered":
+        delivered = item.get("closed_ts")
 
     for act in actions:
         if act.get("connector") != MERGE_CONNECTOR:
             continue
         if act.get("approved_ts"):
-            verdicts.append((act["approved_ts"], "ok",
-                             act.get("auth_approver") or act.get("last_actor") or None))
+            verdicts.append({"at_ts": act["approved_ts"], "kind": "ok",
+                             "actor": act.get("auth_approver") or act.get("last_actor") or None,
+                             "sha": (act.get("sha") or "").strip()})
         if act.get("state") == "confirmed" and merged is None:
             merged = act.get("finished_ts")
 
-    verdicts.sort(key=lambda v: v[0])
+    freezes.sort(key=lambda f: f["at_ts"])
+    verdicts.sort(key=lambda v: v["at_ts"])
     last = verdicts[-1] if verdicts else None
     last_frozen = freezes[-1] if freezes else None
+    verdict_current = _verdict_applies(last, last_frozen)
+    # #705 : avant tout verdict — ou après un regel, le verdict précédent ne
+    # vaut plus — le relecteur DÉSIGNÉ (`work move … qa --reviewer`) est celui
+    # qu'on attend ; quand un verdict courant existe, c'est son auteur qui a
+    # réellement relu.
+    designated = (item.get("reviewer") or "").strip() or None
+    reviewer = last["actor"] if last else None
+    if designated and not verdict_current:
+        reviewer = designated
     return {
         "requested": requested,
-        "frozen": freezes[0] if freezes else None,
-        "last_frozen": last_frozen,
-        "verdict": last[0] if last else None,
-        "verdict_kind": last[1] if last else None,
-        "reviewer": last[2] if last else None,
-        "verdict_current": bool(last) and (last_frozen is None or last[0] >= last_frozen),
+        "frozen": freezes[0]["at_ts"] if freezes else None,
+        "last_frozen": last_frozen["at_ts"] if last_frozen else None,
+        "verdict": last["at_ts"] if last else None,
+        "verdict_kind": last["kind"] if last else None,
+        "reviewer": reviewer,
+        "verdict_current": verdict_current,
         "merged": merged,
-        "blocked_verdicts": sum(1 for v in verdicts if v[1] == "blocked"),
+        "delivered": delivered,
+        "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
         "blocks": blocks,
         "source": source,
     }
 
 
+def _same_commit(a: str | None, b: str | None) -> bool:
+    """Deux identifiants qui nomment le même commit (préfixe admis, casse ignorée).
+    Un identifiant vide n'est jamais « le même commit »."""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
+    """Le verdict retenu porte-t-il sur la tête du dernier gel ?
+
+    Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
+    renouvelé plus tard — nomme le même commit, et un avis d'une autre tête ne
+    compte pas. Sans SHA des deux côtés (déduction par le journal, action de
+    fusion), on retombe sur l'instant : l'avis doit suivre le dernier gel."""
+    if verdict is None:
+        return False
+    if freeze is None:
+        return True
+    if _same_commit(verdict.get("sha"), freeze.get("sha")):
+        return True
+    if not (verdict.get("sha") and freeze.get("sha")):
+        return verdict["at_ts"] >= freeze["at_ts"]
+    return False
+
+
 def lot_state(work_state: str, jalons: dict) -> str:
     """État affiché d'un lot (décision 0024) : en revue, il n'est approuvé
-    que par un verdict `ok` postérieur au DERNIER gel."""
+    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA)."""
     if work_state in ("merged", "promoted"):
         return "merged"
     if work_state == "closed":
@@ -268,8 +323,11 @@ def lot_state(work_state: str, jalons: dict) -> str:
     if work_state in _WAITING:
         return "blocked"
     if work_state == "qa":
-        last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
-        if jalons.get("verdict_kind") == "ok" and (jalons.get("verdict") or 0) >= last_frozen:
+        current = jalons.get("verdict_current")
+        if current is None:                 # jalons partiels : repli par les instants
+            last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
+            current = (jalons.get("verdict") or 0) >= last_frozen
+        if jalons.get("verdict_kind") == "ok" and current:
             return "approved"
         return "review"
     return "active"
@@ -322,7 +380,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "assignee": item.get("assignee") or None,
         "reviewer": jalons["reviewer"],
         "milestones": {k: _round(jalons[k])
-                       for k in ("requested", "frozen", "verdict", "merged")},
+                       for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
         "verdict": jalons["verdict_kind"],
         "milestones_source": jalons["source"],
@@ -352,8 +410,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "dependencies": dependencies or [],
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
-        # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
-        "estimate": estimates_mod.view(item, merged_ts=jalons.get("merged"), now=now),
+        # L157 : durée estimée, réel mesuré (début → fusion ou livraison hors
+        # cible, #988), écart (champ ajouté)
+        "estimate": estimates_mod.view(
+            item, merged_ts=jalons.get("merged") or jalons.get("delivered"), now=now),
     }
 
 
@@ -472,6 +532,13 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     (`balance.compare`). `accounts` : tous les comptes déclarés de l'hôte,
     toutes leurs fenêtres, la capacité perdue à la prochaine remise à zéro et
     le prochain compte choisi (`accounts.report`, L74).
+
+    `plans` : un plan par jauge. Pour un harnais **sans** compte déclaré, la
+    jauge vient de `gauges` et le rythme est nominal (1.0) ; pour un harnais à
+    comptes déclarés, le plan est celui du compte **actif** — sa jauge
+    (`accounts.report`, `_gauges`) et son `pace_multiplier`, jamais un
+    croisement des deux (#1028 P2). Le rendu texte écarte ces harnais, déjà
+    montrés compte par compte.
     """
     # Les harnais payés au token viennent des descripteurs (L16) : plus de liste
     # fermée dans le code. `None` = les relire maintenant.
@@ -508,6 +575,19 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     for bucket in spend.values():
         for key in bucket:
             bucket[key] = round(bucket[key], 6)
+    # #1075/#1028 : le plan d'un harnais à comptes déclarés est celui de son
+    # compte ACTIF — ses jauges (`accounts.report`, `_gauges`) et son rythme
+    # (`pace_multiplier` du profil). Appliquer le rythme du compte actif aux
+    # jauges du dossier par défaut mélangerait deux comptes : `used`,
+    # `pace_cap` et `exceeded` ne décriraient plus aucun compte (R1 #1028,
+    # P2). Le rendu texte écarte ces harnais, déjà montrés compte par compte ;
+    # le JSON garde la même valeur qu'`accounts.report`.
+    actifs = {row["harness"]: row for row in (accounts or []) if row.get("active")}
+    plans = [_plan_view(g, now, 1.0) for g in gauges if g.harness not in actifs]
+    for harness, row in actifs.items():
+        multiplicateur = float(row.get("pace_multiplier") or 1.0)
+        plans.extend(_plan_view(g, now, multiplicateur)
+                     for g in row.get("_gauges") or [])
     return {
         "currency": "USD",
         "paid_harnesses": list(paid),
@@ -515,13 +595,21 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "spend": spend,
         "real": list(real or []),
         "by_agent": [r for r in by_agent if r["usd"] or r["turns"] or r["failed_turns"]],
-        "plans": [{
-            "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-            "pace_cap": round(g.pace_cap(now), 4), "elapsed": round(g.elapsed(now), 4),
-            "resets_ts": _round(g.resets_at), "window_s": g.window_s,
-            "exceeded": g.exceeded(now),
-        } for g in gauges],
+        "plans": plans,
         "accounts": [_account_view(row) for row in (accounts or [])],
+    }
+
+
+def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float) -> dict:
+    """Un plan de `budget.plans` : la jauge et le rythme du même compte."""
+    return {
+        "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
+        "pace_cap": round(g.pace_cap(now, multiplier), 4),
+        "elapsed": round(g.elapsed(now), 4),
+        "resets_ts": _round(g.resets_at), "window_s": g.window_s,
+        # #1561 : quand le relevé a été produit (None : source non datée)
+        "read_at": _round(getattr(g, "read_at", None)),
+        "exceeded": g.exceeded(now, multiplier=multiplier),
     }
 
 
@@ -533,6 +621,8 @@ def _account_view(row: dict) -> dict:
         "active": bool(row.get("active")), "forced": bool(row.get("forced")),
         "ok": bool(row.get("ok")), "reason": row.get("reason") or "",
         "next": bool(row.get("next")), "why": row.get("why") or "",
+        # #1561 : relevé périmé (non vérifié) ; ni perte ni échéance annoncées
+        "stale": bool(row.get("stale")),
         "expires_in_s": row.get("expires_in_s"),
         "gauges": [{
             "key": g["key"], "used": round(float(g["used"]), 4),
@@ -540,6 +630,7 @@ def _account_view(row: dict) -> dict:
             "pace_cap": round(float(g["cap"]), 4), "elapsed": round(float(g["elapsed"]), 4),
             "resets_ts": _round(g.get("resets_at")),
             "reset_passed": bool(g.get("reset_passed")),
+            "read_at": _round(g.get("read_at")),
         } for g in row.get("gauges") or []],
         "losses": [{"key": l["key"], "resets_ts": _round(l["resets_at"]),
                     "in_s": int(l["in_s"]), "lost": round(float(l["lost"]), 4)}
@@ -852,13 +943,15 @@ def format_text(snap: dict, width: int | None = None) -> str:
             state = "STALE %s (%s)" % (_duration(stale["idle_s"]), state)
         closed = lot.get("closed")
         if closed:
-            state = ("abandoned" if closed.get("reason") == "abandoned"
+            state = ("delivered outside the target" if closed.get("reason") == "delivered"
+                     else "abandoned" if closed.get("reason") == "abandoned"
                      else "superseded by #%s" % closed.get("superseded_by"))
         line("#%s %s — %s%s" % (lot["id"], state, lot["title"],
                                 " [%s]" % lot["epic"] if lot.get("epic") else ""), "  ")
-        line("requested %s · frozen %s · verdict %s%s · merged %s" % (
+        line("requested %s · frozen %s · verdict %s%s · merged %s%s" % (
             _hm(m["requested"], now), _hm(m["frozen"], now), _hm(m["verdict"], now),
-            " (%s)" % lot["verdict"] if lot["verdict"] else "", _hm(m["merged"], now)),
+            " (%s)" % lot["verdict"] if lot["verdict"] else "", _hm(m["merged"], now),
+            " · delivered %s" % _hm(m["delivered"], now) if m.get("delivered") else ""),
             "    ")
         extra = []
         if lot["assignee"]:

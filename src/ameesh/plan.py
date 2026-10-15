@@ -50,24 +50,28 @@ def milestone_of(package_id: str | None, packages: dict) -> str | None:
     return _ancestor(package_id, packages, "milestone")
 
 
-def item_unit_status(state: str) -> str:
-    """merged | abandoned | open, pour un lot (`work_items`)."""
+def item_unit_status(state: str, close_reason: str | None = None) -> str:
+    """merged | abandoned | open, pour un lot (`work_items`). Un lot livré hors
+    cible (`closed` + `delivered`, #988) compte comme livré, pas comme
+    abandonné : sa livraison a bien eu lieu."""
     if state in work_mod.MERGED_STATES:
         return "merged"
     if state == "closed":
-        return "abandoned"
+        return "merged" if close_reason == "delivered" else "abandoned"
     return "open"
 
 
 def package_status(items: list[dict]) -> str:
     """État d'une fiche `lot` d'après ses lots : pending (aucun lot créé),
-    merged (tous ses lots vivants fusionnés), abandoned (tous fermés), open."""
+    merged (tous ses lots vivants fusionnés ou livrés hors cible), abandoned
+    (tous fermés), open."""
     if not items:
         return "pending"
-    live = [i for i in items if i.get("state") != "closed"]
-    if not live:
+    statuses = [item_unit_status(i.get("state") or "", i.get("close_reason"))
+                for i in items]
+    if all(status == "abandoned" for status in statuses):
         return "abandoned"
-    if all(i.get("state") in work_mod.MERGED_STATES for i in live):
+    if all(status == "merged" for status in statuses if status != "abandoned"):
         return "merged"
     return "open"
 
@@ -103,7 +107,7 @@ def summarize(packages: Iterable[dict], items: Iterable[dict]) -> dict:
                             and milestone_of(p["id"], by_id) == root]
         direct = [i for h in holders for i in by_package.get(h, [])]
         statuses = [lot_status[p["id"]] for p in lots] + [
-            item_unit_status(i.get("state") or "") for i in direct]
+            item_unit_status(i.get("state") or "", i.get("close_reason")) for i in direct]
         return lots, direct, statuses
 
     epics = []

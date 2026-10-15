@@ -52,7 +52,8 @@ class TurnCosts(interface.TurnCosts):
                cum_cached_input_tokens, cum_output_tokens, account=None,
                spend_key=None, source=None, executor=None, lease_owner=None,
                lease_epoch=None, void_reason=None, price_fallback=None,
-               cache_write_tokens=None) -> bool:
+               cache_write_tokens=None, work_item_id=None, started_at=None,
+               turn_id=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -84,6 +85,19 @@ class TurnCosts(interface.TurnCosts):
             # L225 (0059) : écritures de cache Claude, pour `cost correct`
             cols.append("cache_write_tokens")
             values.append(int(cache_write_tokens))
+        if work_item_id is not None:
+            # #796 (0423) : le lot servi par le tour
+            cols.append("work_item_id")
+            values.append(int(work_item_id))
+        if started_at is not None:
+            # #796 (0423) : début du tour, epoch de l'horloge de la base
+            cols.append("started_at")
+            values.append(float(started_at))
+        if turn_id is not None:
+            # #796 (0423) : l'identifiant du tour, pour le relier à ses
+            # ressources (`turn_resources.turn_id`)
+            cols.append("turn_id")
+            values.append(str(turn_id))
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
@@ -92,7 +106,8 @@ class TurnCosts(interface.TurnCosts):
             values.append(spend_key)
             suffix = " on conflict (spend_key) do nothing"
         sql = ("insert into turn_costs (" + ", ".join(cols) + ") values ("
-               + ", ".join(["%s"] * len(cols)) + ")")
+               + ", ".join("to_timestamp(%s)" if c == "started_at" else "%s"
+                           for c in cols) + ")")
         if not suffix:
             self.db.execute(sql, tuple(values))
             return True
@@ -136,7 +151,7 @@ class TurnCosts(interface.TurnCosts):
         if not names:
             return []
         return self.db.query(
-            "select harness, account, extract(epoch from recorded_at)::float8 as ts,"
+            "select agent, harness, account, extract(epoch from recorded_at)::float8 as ts,"
             " usd::float8 as usd from turn_costs"
             " where recorded_at > to_timestamp(%s) and void_reason is null"
             " and source <> 'device'"

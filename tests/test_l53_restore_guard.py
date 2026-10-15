@@ -166,7 +166,7 @@ class RestoreGuardTest(PgTestCase):
                         session_backup={"target": self.conf.target, "encrypt": False})), \
                     mock.patch.object(db_mod, "connect", return_value=self.db), \
                     mock.patch.object(self.db, "close"), \
-                    mock.patch.object(sb, "_agent_home", return_value=(self.args.home, ())), \
+                    mock.patch.object(sb, "_agent_home", return_value=self.args.home), \
                     mock.patch.object(sb, "get") as get, \
                     mock.patch('sys.stderr', io.StringIO()) as err:
                 self.assertEqual(sb.main(["restore", "restore-b", "--key", self.key,

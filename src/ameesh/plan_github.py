@@ -20,6 +20,10 @@ réimporté comme état — au plus signalé comme **proposition**.
     lots créés AVANT la fusion sont fermés (un lot ouvert ensuite pour la
     même fiche n'est pas fermé par une ancienne PR). Idempotent (`already`) ;
     un lot fermé (abandonné, remplacé) n'est jamais rouvert (`refused`).
+    #759 : une PR fusionnée ne ferme un lot que si aucune autre PR ouverte ni
+    branche déclarée du lot (`branch`, autre que la sienne) n'y reste liée —
+    sinon le lot reste ouvert et son journal porte `stage merged`. Une PR qui
+    se déclare finale (`ameesh-work: <n> final`) ferme le lot malgré tout.
 
 `ameesh work project-github --repo R [--dry-run]`
     une issue par fiche `lot` (titre, lien vers la fiche, labels `ameesh` et
@@ -77,7 +81,7 @@ from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
 from .connectors.git_merge import resolve_gh
-from .plan_git import WORK_TRAILER_RE, partial_lots, short_branch
+from .plan_git import WORK_TRAILER_RE, final_lots, partial_lots, short_branch
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$")
 _LOT_LINE_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-lot[ \t]*:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$")
@@ -316,18 +320,109 @@ def _iso_ts(text: str | None) -> float | None:
         return None
 
 
+def _targets_of_pr(db, st, pr: dict, repo: str, idents: Iterable[str],
+                   by_issue: dict | None = None):
+    """Les lots qu'une PR désigne : lignes `ameesh-work:`, `Closes #n` (via
+    `issue_ref`), fiches (`packages_of_pr`), et branche `lot/<id>-…` d'un
+    dépôt même sans fiche. Rend `(targets, by_issue)` — `by_issue` n'est
+    construit qu'à la demande (une fois par relevé)."""
+    explicit = work_items_of_pr(pr)
+    closes = issues_of_pr(pr, repo)
+    if closes:
+        # L126 : « Closes #n » désigne le lot dont l'issue est n (issue_ref)
+        if by_issue is None:
+            by_issue = _lots_by_issue_ref(st)
+        explicit = sorted(set(explicit) | {lot for issue in closes
+                                           for lot in by_issue.get(issue.casefold(), ())})
+    packages = packages_of_pr(pr, idents)
+    if not explicit and not packages:
+        # L118b : `lot/<id>-…` sans fiche de ce nom désigne le lot <id>
+        # #312 r1 : seulement une branche du dépôt même (pas d'un fork),
+        # et la branche enregistrée du lot s'il en porte une
+        head = LOT_HEAD_RE.match(pr.get("headRefName") or "")
+        if head and pr.get("isCrossRepository") is False:
+            item = work_mod.get(db, int(head.group(1)))
+            if item is None or not item.get("branch") \
+                    or short_branch(item["branch"]) == pr["headRefName"]:
+                explicit = [int(head.group(1))]
+    if explicit:
+        return [(i, None) for i in explicit], by_issue
+    return ([(int(item["id"]), pid) for pid in packages
+             for item in st.work.by_package(pid)], by_issue)
+
+
+def _stage_reason(item: dict, pr: dict, open_refs: list[str] | None) -> str | None:
+    """#759 : pourquoi une PR fusionnée NE ferme PAS ce lot (None : elle ferme).
+
+    Une PR qui se déclare finale pour le lot (`ameesh-work: <id> final`) ferme
+    toujours. Sinon le lot reste ouvert si une PR ouverte le désigne encore,
+    ou si sa branche déclarée n'est pas celle de la PR fusionnée (autre étape,
+    gel en attente) : son journal porte alors `stage merged`."""
+    if int(item["id"]) in final_lots(pr.get("body")):
+        return None
+    reasons = []
+    if open_refs:
+        reasons.append("PR ouverte %s" % ", ".join(sorted(set(open_refs))))
+    branch = item.get("branch") or ""
+    if branch and short_branch(branch) != (pr.get("headRefName") or ""):
+        reasons.append("branche déclarée %s" % short_branch(branch))
+    if not reasons:
+        return None
+    return "stage merged: %s — lot non fermé" % " ; ".join(reasons)
+
+
+def open_prs_of_repo(gh, repo: str) -> list[dict]:
+    """#759 : TOUTES les PR ouvertes du dépôt (REST paginé, sans plafond).
+
+    La décision de fermer un lot exige de connaître exhaustivement les PR
+    ouvertes qui le désignent encore : un `gh pr list --limit` tronqué
+    laisserait une PR liée invisible et le lot se fermerait à tort. Les
+    champs rendus sont ceux de `gh pr list --json` attendus par
+    `_targets_of_pr` (le `--limit` du relevé des fusions ne s'y applique
+    pas)."""
+    rows = _lines(gh, ["api", "--paginate",
+                       "repos/%s/pulls?state=open&per_page=100" % repo,
+                       "--jq", ".[] | @json"])
+    out: list[dict] = []
+    for row in rows:
+        head = row.get("head") or {}
+        head_repo = (head.get("repo") or {}).get("full_name")
+        out.append({"number": row.get("number"),
+                    "headRefName": head.get("ref") or "",
+                    "isCrossRepository": head_repo != repo,
+                    "body": row.get("body") or "",
+                    "url": row.get("html_url") or ""})
+    return out
+
+
 def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -> dict:
-    """Ferme les lots dont la PR est fusionnée. Rend le compte rendu."""
+    """Ferme les lots dont la PR est fusionnée. Rend le compte rendu.
+
+    #759 : une PR fusionnée ne ferme un lot que si aucune autre PR ouverte ni
+    branche déclarée du lot n'y reste liée, sauf si elle se déclare finale
+    pour ce lot (`ameesh-work: <id> final`) ; sinon le lot reste ouvert et son
+    journal porte `stage merged`."""
     check_repo(repo)
     prs = _json(gh, ["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(int(limit)),
                      "--json", "number,headRefName,isCrossRepository,body,state,mergeCommit,mergedBy,"
                      "mergedAt,url"])
     if not isinstance(prs, list):
         raise GithubError("gh pr list: list expected")
+    open_prs = open_prs_of_repo(gh, repo)
     st = storage.of(db)
     idents = [p["id"] for p in st.packages.all() if p.get("kind") in work_mod.LINKABLE_KINDS]
     results: list[dict] = []
     by_issue: dict | None = None
+    # #759 : les lots encore désignés par une PR ouverte ne se ferment pas
+    open_lots: dict[int, list[str]] = {}
+    for pr in sorted(open_prs, key=lambda p: int(p.get("number") or 0)):
+        ref = "%s#%s" % (repo, pr.get("number"))
+        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
+        # L118b : une PR ouverte qui ne livre qu'une partie du lot le retient
+        # aussi — `ameesh-work-partial:` n'est pas une ligne `ameesh-work:`,
+        # elle n'apparaît donc pas dans `targets` (#759, incident #147).
+        for item_id in sorted({i for i, _pid in targets} | partial_lots(pr.get("body"))):
+            open_lots.setdefault(item_id, []).append(ref)
     for pr in sorted(prs, key=lambda p: int(p.get("number") or 0)):
         if (pr.get("state") or "MERGED") != "MERGED":
             continue
@@ -336,31 +431,9 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
         sha = commit.get("oid") if isinstance(commit, dict) else ""
         login = ((pr.get("mergedBy") or {}).get("login") if isinstance(pr.get("mergedBy"), dict)
                  else None)
+        actor = "github:%s" % login if login else "github"
         merged_ts = _iso_ts(pr.get("mergedAt"))
-        explicit = work_items_of_pr(pr)
-        closes = issues_of_pr(pr, repo)
-        if closes:
-            # L126 : « Closes #n » désigne le lot dont l'issue est n (issue_ref)
-            if by_issue is None:
-                by_issue = _lots_by_issue_ref(st)
-            explicit = sorted(set(explicit) | {lot for issue in closes
-                                               for lot in by_issue.get(issue.casefold(), ())})
-        packages = packages_of_pr(pr, idents)
-        if not explicit and not packages:
-            # L118b : `lot/<id>-…` sans fiche de ce nom désigne le lot <id>
-            # #312 r1 : seulement une branche du dépôt même (pas d'un fork),
-            # et la branche enregistrée du lot s'il en porte une
-            head = LOT_HEAD_RE.match(pr.get("headRefName") or "")
-            if head and pr.get("isCrossRepository") is False:
-                item = work_mod.get(db, int(head.group(1)))
-                if item is None or not item.get("branch") \
-                        or short_branch(item["branch"]) == pr["headRefName"]:
-                    explicit = [int(head.group(1))]
-        if explicit:
-            targets = [(i, None) for i in explicit]
-        else:
-            targets = [(int(item["id"]), pid) for pid in packages
-                       for item in st.work.by_package(pid)]
+        targets, by_issue = _targets_of_pr(db, st, pr, repo, idents, by_issue)
         # L118b : une PR qui ne livre qu'une partie d'un lot ne le ferme pas
         partial = partial_lots(pr.get("body"))
         targets = [(i, pid) for i, pid in targets if i not in partial]
@@ -373,16 +446,30 @@ def sync_github(db, gh, repo: str, *, limit: int = 200, dry_run: bool = False) -
             elif merged_ts is not None and item.get("created_ts") \
                     and float(item["created_ts"]) > merged_ts:
                 entry.update(result="later", detail="work item created after the merge: not closed")
-            elif dry_run:
-                state = item["state"]
-                entry.update(result=("already" if state in work_mod.MERGED_STATES else
-                                     "refused" if state == "closed" else "would-merge"),
-                             detail="%s (dry run)" % state)
             else:
-                done = work_mod.close_merged(
-                    db, item_id, sha=sha or "", actor="github:%s" % login if login else "github",
-                    source="sync-github", pr_ref=ref)
-                entry.update(result=done["result"], detail=done["detail"])
+                # #759 : un lot encore lié (PR ouverte, autre branche déclarée)
+                # n'est pas fermé par cette PR ; un lot déjà fermé suit son sort
+                text = (_stage_reason(item, pr, open_lots.get(item_id))
+                        if item["state"] not in work_mod.MERGED_STATES
+                        and item["state"] != "closed" else None)
+                if text:
+                    if not dry_run:
+                        # un relevé répété ne remplit pas le journal du même constat
+                        previous = work_mod.events(db, item_id, 1)
+                        if not previous or previous[0].get("note") != text:
+                            work_mod.note(db, item_id, text, actor=actor)
+                    entry.update(result="stage-merged",
+                                 detail=text + (" (dry run)" if dry_run else ""))
+                elif dry_run:
+                    state = item["state"]
+                    entry.update(result=("already" if state in work_mod.MERGED_STATES else
+                                         "refused" if state == "closed" else "would-merge"),
+                                 detail="%s (dry run)" % state)
+                else:
+                    done = work_mod.close_merged(
+                        db, item_id, sha=sha or "", actor=actor,
+                        source="sync-github", pr_ref=ref)
+                    entry.update(result=done["result"], detail=done["detail"])
             results.append(entry)
     return {"repo": repo, "dry_run": bool(dry_run), "pull_requests": len(prs),
             "results": results,
@@ -1115,7 +1202,9 @@ def lot_issue_state(item: dict) -> tuple[str, str | None]:
     if state in work_mod.MERGED_STATES:
         return "closed", "completed"
     if state == "closed":
-        return "closed", "not_planned"
+        # #988 : livré hors cible = terminé, pas « non prévu »
+        return "closed", ("completed" if item.get("close_reason") == "delivered"
+                          else "not_planned")
     return "open", None
 
 
@@ -1296,6 +1385,8 @@ def _closing(item: dict, *, repo: str, public: bool, issue_of) -> str | None:
     if state == "promoted":
         return "Work item %d delivered: issue closed by ameesh." % n
     if state == "closed":
+        if item.get("close_reason") == "delivered":
+            return "Work item %d delivered outside the target: issue closed by ameesh." % n
         other = item.get("superseded_by")
         if item.get("close_reason") == "superseded" and other:
             number = issue_of(int(other))
