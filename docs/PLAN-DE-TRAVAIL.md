@@ -94,6 +94,13 @@ reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
 designate one.
 
+The **review class** of the lot (canon §2, #1822) routes that wait too: a light
+lot's review happens after the merge, so a light lot with no current verdict
+waits for the merge, not for a verdict — even when a reviewer is designated.
+The class is read once per pass, and only for lots whose wait would otherwise
+be a verdict; when it cannot be read (no repository, no freeze, unreadable
+policy), the prudent verdict wait is kept instead of guessing a class.
+
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
 `AMEESH_STALE_AFTER`, default 6 h) is **stale**: it is reported with the

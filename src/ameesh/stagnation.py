@@ -140,12 +140,30 @@ def _waiting(what: str, who) -> dict:
     return {"what": what, "who": who, "label": with_who % who if who else without}
 
 
+def _merge_wait(actions: list[dict], responsible, assignee) -> dict:
+    """L'attente d'une fusion : la dernière action `git-merge` tranche (L26)."""
+    merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
+    last = merges[-1] if merges else None
+    if last is not None:
+        if last.get("state") == "approved":
+            return _waiting("merge", last.get("proposed_by"))
+        if last.get("state") == "failed":
+            return _waiting("fix", assignee)
+    return _waiting("merge", responsible)
+
+
 def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
-            responsible: str | None = None) -> dict | None:
+            responsible: str | None = None,
+            review_class: str | None = None) -> dict | None:
     """Ce qu'attend un lot ouvert, et de qui : `{what, who, label}` (voir le module).
 
     `jalons` : la forme de `progress._jalons_de_lot` ; `responsible` : le
-    responsable humain de la fiche WorkPackage du lot, s'il en a une."""
+    responsable humain de la fiche WorkPackage du lot, s'il en a une.
+    `review_class` : la classe de revue du lot (`lot_class.LIGHT`, ...) quand
+    l'appelant l'a résolue ; la relecture d'un lot **léger** suit la fusion
+    (§2), donc un lot léger sans verdict courant attend la fusion, pas un
+    verdict (#1822). `None` (classe inconnue) garde l'attente prudente d'un
+    verdict, sans deviner aucune classe."""
     state = item.get("state") or ""
     assignee = item.get("assignee") or None
     if state in DONE_STATES:
@@ -174,16 +192,42 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         return _waiting("build", assignee)
     # qa : en revue
     if jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current"):
-        merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
-        last = merges[-1] if merges else None
-        if last is None or last.get("state") == "cancelled":
-            return _waiting("merge", responsible)
-        if last.get("state") == "approved":
-            return _waiting("merge", last.get("proposed_by"))
-        if last.get("state") == "failed":
-            return _waiting("fix", assignee)
-        return _waiting("merge", responsible)
+        return _merge_wait(actions, responsible, assignee)
+    from . import lot_class  # import tardif : lot_class lit work et canon
+    if review_class == lot_class.LIGHT:
+        # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
+        # n'est dû avant, même si un relecteur est désigné (#1822).
+        return _merge_wait(actions, responsible, assignee)
     return _waiting("verdict", jalons.get("reviewer"))
+
+
+def class_value(reading: dict | None) -> str | None:
+    """La classe d'une lecture `lot_class.of_lot`, ou None au moindre doute.
+
+    Un doute (dépôt, gel ou politique illisibles) ne devine aucune classe :
+    l'appelant garde l'attente prudente (#1822)."""
+    if not isinstance(reading, dict) or reading.get("doubt"):
+        return None
+    return str(reading.get("class") or "") or None
+
+
+def review_class_of(db, row: dict, *, cfg=None, memo: dict | None = None) -> str | None:
+    """La classe de revue du lot `row`, lue une fois par passage (`memo`).
+
+    `lot_class.of_lot` ne lève jamais ; la lecture reste donc sûre dans une vue
+    groupée, et tout doute rend None (attente prudente, #1822)."""
+    from . import lot_class
+
+    rid = int(row["id"])
+    if memo is not None and rid in memo:
+        return memo[rid]
+    try:
+        value = class_value(lot_class.of_lot(db, rid, cfg=cfg, item=row))
+    except Exception:  # noqa: BLE001 - une vue ne tombe pas sur la classe
+        value = None
+    if memo is not None:
+        memo[rid] = value
+    return value
 
 
 #: attentes dont le `who` est un agent qui doit travailler (L36)
@@ -300,12 +344,20 @@ def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict]:
 
 def describe(db, rows: list[dict], *, now: float | None = None,
              threshold: float = DEFAULT_THRESHOLD_S,
-             open_items: list[dict] | None = None) -> dict[int, dict]:
+             open_items: list[dict] | None = None,
+             cfg=None, review_class: dict | None = None) -> dict[int, dict]:
     """Pour chaque lot (lignes de `work_items`) : `{waiting, waiting_for,
     last_activity_ts, project, stale}`. `project` (#705, lu par
     `projects.lot_project`) : le projet du lot, dont l'orchestrateur est
     prévenu quand un lot en qa n'a pas de relecteur désigné. Une lecture
-    groupée, aucune requête par lot."""
+    groupée, aucune requête par lot.
+
+    `cfg` et `review_class` (#1822) : le contexte de résolution de la classe de
+    revue. La classe n'est lue — une fois par passage — que pour les lots dont
+    l'attente serait un verdict : un lot léger attend la fusion, pas un verdict
+    (§2). `review_class` porte les classes déjà résolues par l'appelant
+    (`{id: classe ou None}`) ; une classe absente ou douteuse garde l'attente
+    prudente d'un verdict, sans deviner."""
     from . import progress  # import tardif : progress importe ce module
     from . import projects
 
@@ -323,15 +375,25 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items,
                               dependencies=[e for edges in dependencies.values() for e in edges])
     out: dict[int, dict] = {}
+    classes: dict = {}
+    known = review_class or {}
     for row in rows:
         rid = int(row["id"])
         acts = actions.get(rid, [])
         package = packages.get(row.get("package_id")) or {}
         jalons = progress._jalons_de_lot(row, events.get(rid, []), acts, milestones.get(rid))
-        detail = with_availability(
-            waiting(row, jalons, acts,
-                    responsible=package.get("responsible")),
-            states, externals)
+        detail = waiting(row, jalons, acts,
+                         responsible=package.get("responsible"))
+        # #1822 : la classe n'est lue que pour un lot qui attendrait un
+        # verdict ; déjà résolue par l'appelant, elle ne l'est pas relue.
+        if detail is not None and detail.get("what") == "verdict":
+            cls = known[rid] if rid in known else review_class_of(
+                db, row, cfg=cfg, memo=classes)
+            if cls:
+                detail = waiting(row, jalons, acts,
+                                 responsible=package.get("responsible"),
+                                 review_class=cls)
+        detail = with_availability(detail, states, externals)
         last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                              messages.get(rid), events_ts=last_events.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
@@ -346,13 +408,16 @@ def describe(db, rows: list[dict], *, now: float | None = None,
 
 
 def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
-                  now: float | None = None, limit: int = 500) -> list[dict]:
+                  now: float | None = None, limit: int = 500,
+                  cfg=None, review_class: dict | None = None) -> list[dict]:
     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
 
     Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
     `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26), `waiting`
     (`{what, who, label}`, L29) et `project` (#705 : le projet du lot, dont
-    l'orchestrateur est prévenu quand aucun relecteur n'est désigné)."""
+    l'orchestrateur est prévenu quand aucun relecteur n'est désigné).
+    `cfg`/`review_class` : le contexte de classe de revue (#1822), transmis à
+    `describe`."""
     from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
@@ -365,7 +430,8 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             if r.get("last_activity_ts") is not None
             and now - float(r["last_activity_ts"]) >= float(threshold_s)
             and not sous_utilisation.is_backlog_item(r)]
-    described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items)
+    described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items,
+                         cfg=cfg, review_class=review_class)
     out = []
     for row in rows:
         lot = int(row["id"])
