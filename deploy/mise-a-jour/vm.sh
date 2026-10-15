@@ -120,16 +120,15 @@ paquet_git() {
   git -C "$DEPOT" cat-file -e "$sha^{commit}" 2>/dev/null \
     || { echo "commit $sha absent du dépôt local : paquet git impossible" >&2; return 1; }
   base=$(tete_clone_distante) || true
-  git -C "$DEPOT" update-ref refs/mise-a-jour/vm "$sha"
-  if ! { [[ $base =~ ^[0-9a-fA-F]{40}$ ]] \
-         && git -C "$DEPOT" cat-file -e "$base^{commit}" 2>/dev/null \
-         && git -C "$DEPOT" bundle create -q "$TRAVAIL/ameesh.bundle" \
-              refs/mise-a-jour/vm "^$base" 2>/dev/null; }; then
-    rm -f "$TRAVAIL/ameesh.bundle"
-    git -C "$DEPOT" bundle create -q "$TRAVAIL/ameesh.bundle" refs/mise-a-jour/vm \
-      || { git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm; rm -f "$TRAVAIL/ameesh.bundle"; return 1; }
-  fi
-  git -C "$DEPOT" update-ref -d refs/mise-a-jour/vm
+  [[ $base =~ ^[0-9a-fA-F]{40}$ ]] \
+    && git -C "$DEPOT" cat-file -e "$base^{commit}" 2>/dev/null || base=
+  # #1155 : la création du paquet est déléguée à `paquet-git.sh` (exclusions
+  # calculées sur les objets réellement présents chez le destinataire, ref
+  # temporaire retirée dans tous les cas) ; #1252 B4 : une base inconnue ou
+  # égale au commit visé est ignorée, le paquet reste autonome.
+  "$ICI/paquet-git.sh" "$DEPOT" refs/mise-a-jour/vm "$sha" \
+    "$TRAVAIL/ameesh.bundle" "$base" \
+    || { rm -f "$TRAVAIL/ameesh.bundle"; return 1; }
   distant=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$hote" \
               'umask 077; mktemp /tmp/ameesh.bundle.XXXXXX') \
     || { rm -f "$TRAVAIL/ameesh.bundle"
