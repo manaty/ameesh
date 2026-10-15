@@ -49,7 +49,11 @@ AGENT_COLUMNS = """
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
-    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake
+    turn_max_seconds, turn_mail_max, turn_grace_seconds, lot_wake,
+    -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
+    -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
+    -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
+    session_harness, session_cwd, session_origin
 """
 
 
@@ -160,6 +164,32 @@ def placement_admitted_sql(alias: str = "agent_registry") -> str:
 
 
 # --------------------------------------------------------------------------
+# verrou par nom (L976)
+# --------------------------------------------------------------------------
+
+#: L976 : verrou advisory par nom, partagé par TOUS les chemins de création
+#: d'une ligne du registre et par la décision « boîte morte »
+#: (`mailbox.forward`, `mailbox.expire_dead_letters`). `FOR SHARE`/`FOR UPDATE`
+#: ne verrouillent que les lignes PRÉSENTES : sans ce verrou, une inscription
+#: concurrente pouvait se committer entre la lecture d'absence et l'écriture,
+#: et le courrier d'un agent vivant était expiré ou renvoyé (relecture codex3,
+#: B1 résiduel). La décision prend le verrou dans une instruction À PART, avant
+#: sa lecture : l'instantané de l'instruction suivante voit alors l'inscription
+#: qui a gagné le verrou.
+NAME_LOCK_EXPR = "pg_advisory_xact_lock(hashtextextended(%s, 0))"
+#: la prise de verrou seule (décision : instruction à part, avant la lecture)
+NAME_LOCK_SQL = "SELECT " + NAME_LOCK_EXPR
+#: la même prise de verrou, en CTE d'une instruction de création (le verrou
+#: est alors tenu jusqu'à la fin de l'instruction, donc du commit)
+NAME_LOCK_CTE = "WITH l AS (SELECT " + NAME_LOCK_EXPR + " AS _)"
+
+
+def name_lock_key(name: str) -> str:
+    """Clé du verrou advisory d'un nom (insensible à la casse)."""
+    return "ameesh-agent-registry:" + (name or "").lower()
+
+
+# --------------------------------------------------------------------------
 # lignes du registre
 # --------------------------------------------------------------------------
 
@@ -171,12 +201,14 @@ class Agents(interface.Agents):
         # (`execute`) n'est jamais basculé par une inscription.
         rows = self.db.query(
             """
+            __LOCK__
             INSERT INTO agent_registry
                 (name, chantier, harness, host, cwd, session_id, status, status_text,
                  model, budget_usd, mode, last_seen, updated_at)
-            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
-                    coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
-                    now(), now())
+            SELECT %s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+                   coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
+                   now(), now()
+              FROM l
             ON CONFLICT (name) DO UPDATE SET
                 chantier    = coalesce(nullif(%s,''), agent_registry.chantier),
                 harness     = coalesce(nullif(%s,''), agent_registry.harness),
@@ -196,8 +228,9 @@ class Agents(interface.Agents):
                 last_seen   = now(),
                 updated_at  = now()
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", AGENT_COLUMNS),
-            (name, chantier, harness, host, cwd, session_id, status, status_text,
+            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__COLUMNS__", AGENT_COLUMNS),
+            (name_lock_key(name),
+             name, chantier, harness, host, cwd, session_id, status, status_text,
              model, budget_usd, mode, chantier, harness, host, status),
         )
         return rows[0]
@@ -212,11 +245,13 @@ class Agents(interface.Agents):
         # écrits seulement s'il n'y avait pas encore de session).
         rows = self.db.query(
             """
+            __LOCK__
             INSERT INTO agent_registry
                 (name, chantier, harness, host, cwd, session_id, mode,
                  last_seen, updated_at)
-            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
-                    'externe', now(), now())
+            SELECT %s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+                   'externe', now(), now()
+              FROM l
             ON CONFLICT (name) DO UPDATE SET
                 chantier = CASE WHEN agent_registry.mode = 'execute'
                                 THEN agent_registry.chantier
@@ -247,8 +282,8 @@ class Agents(interface.Agents):
                 updated_at = CASE WHEN agent_registry.mode = 'execute'
                                   THEN agent_registry.updated_at ELSE now() END
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", AGENT_COLUMNS),
-            (name, chantier, harness, host, cwd, session_id, harness),
+            """.replace("__LOCK__", NAME_LOCK_CTE).replace("__COLUMNS__", AGENT_COLUMNS),
+            (name_lock_key(name), name, chantier, harness, host, cwd, session_id, harness),
         )
         return rows[0]
 
@@ -903,21 +938,33 @@ class Leases(interface.Leases):
 
 class PendingSpend(interface.PendingSpend):
 
-    def put(self, name, start_index, turn, model) -> bool:
+    def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
+        return self.put_get(name, start_index, turn, model,
+                            work_item_id=work_item_id, turn_id=turn_id) is not None
+
+    def put_get(self, name, start_index, turn, model,
+                work_item_id=None, turn_id=None) -> dict | None:
+        """Return THIS marker in its write, before any replacement can change it."""
         rows = self.db.query(
             """
-            INSERT INTO spend_pending (agent, start_index, turn, model, created_at)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
+                                       turn_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (agent) DO UPDATE SET
-                start_index = excluded.start_index,
-                turn        = excluded.turn,
-                model       = excluded.model,
-                created_at  = now()
-            RETURNING agent
+                start_index  = excluded.start_index,
+                turn         = excluded.turn,
+                model        = excluded.model,
+                work_item_id = excluded.work_item_id,
+                turn_id      = excluded.turn_id,
+                created_at   = now()
+            RETURNING agent, start_index, turn, model, work_item_id, turn_id,
+                      extract(epoch from created_at)::float8 as created_ts
             """,
-            (name, int(start_index), turn, model),
+            (name, int(start_index), turn, model,
+             None if work_item_id is None else int(work_item_id),
+             turn_id or None),
         )
-        return bool(rows)
+        return rows[0] if rows else None
 
     def set_model(self, name, model) -> bool:
         rows = self.db.query(
@@ -929,7 +976,7 @@ class PendingSpend(interface.PendingSpend):
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT agent, start_index, turn, model,
+            SELECT agent, start_index, turn, model, work_item_id, turn_id,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,
@@ -940,4 +987,13 @@ class PendingSpend(interface.PendingSpend):
     def clear(self, name) -> bool:
         rows = self.db.query("DELETE FROM spend_pending WHERE agent = %s RETURNING agent",
                              (name,))
+        return bool(rows)
+
+    def clear_if(self, name, created_ts) -> bool:
+        """#1469 : efface le marqueur seulement s'il est encore celui de ce tour
+        (même `created_ts`) — jamais celui d'un remplaçant, en une instruction."""
+        rows = self.db.query(
+            "DELETE FROM spend_pending WHERE agent = %s"
+            " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
+            " RETURNING agent", (name, float(created_ts)))
         return bool(rows)

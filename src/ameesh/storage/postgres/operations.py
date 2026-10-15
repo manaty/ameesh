@@ -18,6 +18,7 @@ from typing import Any
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
+from .work import has_reviewer
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -230,7 +231,23 @@ class Operations(interface.Operations):
                    cwd = coalesce(%s::text, r.cwd),
                    session_id = %s,
                    session_account = %s::text,
+                   -- #1037 : la session adoptée est connue AVANT tout tour ;
+                   -- son ouverture est celle du harnais adopté (le déclencheur
+                   -- de 0384 garde les trois tant que origin = session).
+                   session_harness = %s,
+                   session_cwd = coalesce(%s::text, r.cwd),
+                   session_origin = %s,
                    session_work_item = NULL,
+                   -- #1037 : un changement de harnais DÉCLARÉ emporte les
+                   -- réglages du harnais précédent : les garder ferait lancer
+                   -- le nouveau harnais avec le modèle, l'effort ou le tier de
+                   -- l'ancien (r.harness = la valeur d'avant l'UPDATE).
+                   model = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                                THEN NULL ELSE r.model END,
+                   effort = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                                 THEN NULL ELSE r.effort END,
+                   tier = CASE WHEN r.harness IS DISTINCT FROM %s::text
+                               THEN NULL ELSE r.tier END,
                    session_reset_at = clock_timestamp(),
                    pending_prompt = concat_ws(E'\\n\\n', %s::text,
                                               r.current_prompt, r.pending_prompt),
@@ -249,7 +266,8 @@ class Operations(interface.Operations):
             RETURNING r.name, verrou.session_id AS previous_session,
                       verrou.mode AS previous_mode, verrou.harness AS previous_harness
             """,
-            (name, harness, host, cwd, session_id, session_account, prompt, status_text),
+            (name, harness, host, cwd, session_id, session_account, harness, cwd,
+             session_id, harness, harness, harness, prompt, status_text),
         )
         return rows[0] if rows else None
 
@@ -314,9 +332,13 @@ class Operations(interface.Operations):
             " ORDER BY updated_at DESC, id DESC", (name,))
 
     def open_lots_activity(self, limit) -> list[dict]:
-        return self.db.query(
-            """
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
+        sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   w.priority, w.app, w.workstream, __REVIEWER__,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
@@ -333,14 +355,16 @@ class Operations(interface.Operations):
              WHERE w.state NOT IN """ + _CLOSED + """
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
-            """,
-            (int(limit) if limit is not None else None,))
+            """).replace("__REVIEWER__", reviewer)
+        return self.db.query(
+            sql, (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
-               " input_tokens, cached_input_tokens, output_tokens,"
-               " extract(epoch from recorded_at)::float8 AS recorded_ts"
+               " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " extract(epoch from recorded_at)::float8 AS recorded_ts,"
+               " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
                " AND void_reason IS NULL")
         params: list = [float(since_s)]

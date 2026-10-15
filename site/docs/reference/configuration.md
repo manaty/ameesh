@@ -8,6 +8,12 @@ ameesh reads its configuration from, in order of precedence:
    `AMEESH_CONFIG`), whose keys are the setting names below;
 3. built-in defaults.
 
+A path named by `AMEESH_CONFIG` (or the alias `AGENT_MESH_CONFIG`) must exist:
+an explicitly named missing file stops ameesh with `config file not found`
+before any connection, instead of silently reading another configuration
+(#1127). Without either variable, `~/.config/ameesh/config.json` is read, and
+the historical `~/.config/agent-mesh/config.json` is the fallback.
+
 No secret is stored in the repository. The database password comes from
 `PGPASSWORD` or `~/.pgpass` (mode `0600`), or from a full DSN.
 
@@ -40,7 +46,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_LOT_WAKE`, `_MARGIN`, `_MAX` | `lot_wake`, `lot_wake_margin`, `lot_wake_max` | on, 60 s, 3 | the runner wakes an idle agent that holds an actionable lot (`intake`/`build`) after `mail_batch` + margin, with the instruction to resume it; at most N fruitless wake-ups per lot (doubling back-off in the database), then the auditor takes over (L165b); per agent `ameesh set <agent> lot_wake=off`, per host `AMEESH_LOT_WAKE=0` |
 | `AMEESH_INTERRUPT_SENDERS` | `interrupt_senders` | — | senders whose `--urgent` messages interrupt a turn |
 | `AMEESH_SESSION_MAX_TOKENS` | `session_max_tokens` | 150000 | rotate the session above this size |
-| `AMEESH_SESSION_MAX_TURN_SECONDS` | `session_max_turn_seconds` | 900 | rotate after a turn longer than this |
+| `AMEESH_SESSION_MAX_TURN_SECONDS` | `session_max_turn_seconds` | 3600 | rotate after a turn longer than this; the threshold is floored at twice the effective turn cap (`turn_max_seconds`, the agent's own setting included) — a turn allowed to last 1,800 s does not, by itself, make the session be forgotten; without a turn cap, the configured threshold applies alone |
 | `AMEESH_CONTEXT_MAX_TOKENS` | `context_max_tokens` | 15000000 | close the turn at the next safe point and rotate the session when the turn re-reads more input tokens (cache included) than this; per agent: `ameesh set <agent> context_max_tokens=…`; 0 = off |
 | `AMEESH_TURN_MAX_SECONDS` | `turn_max_seconds` | 1800 | close a turn that runs longer at the next safe point (end of the running tool call); work resumes next turn, same session; per agent: `ameesh set <agent> turn_max_seconds=…`; 0 = no limit |
 | `AMEESH_TURN_MAIL_MAX` | `turn_mail_max` | 5 | messages the mail hook delivers during one runner-led turn; the rest wait for the next turn and the agent is asked to wrap up; per agent: `ameesh set <agent> turn_mail_max=…`; 0 = no bound |

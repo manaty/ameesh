@@ -220,6 +220,78 @@ def host_dir(env: Mapping[str, str] | None = None) -> str:
     return os.path.abspath(os.path.expanduser("~/.config/ameesh/harnesses"))
 
 
+# --------------------------------------------------------------------------
+# empreinte du paquet au démarrage (L780)
+# --------------------------------------------------------------------------
+
+def _package_version() -> str:
+    """La version du paquet installé (`ameesh.version`) ; ne lève jamais."""
+    try:
+        from . import version
+        return version()
+    except Exception:          # paquet illisible : l'empreinte se tait
+        return "unknown"
+
+
+def package_digests() -> dict[str, str]:
+    """Empreintes sha256 des descripteurs LIVRÉS par le paquet, par nom de
+    fichier (L780).
+
+    Le dossier de l'hôte est exclu : un épinglage local (`AMEESH_HARNESSES_DIR`
+    ou `~/.config/ameesh/harnesses/`) change sans qu'il faille redémarrer
+    l'exécuteur — `adapters.SPECS` le relit à chaque tour."""
+    directory = package_dir()
+    out: dict[str, str] = {}
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(directory, name), "rb") as fh:
+                out[name] = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            continue
+    return out
+
+
+#: L780 : empreinte du paquet à l'import de ce processus — version installée et
+#: descripteurs livrés. Un exécuteur de longue durée la compare à l'état du
+#: disque AVANT d'écrire l'état du canon : une livraison sous lui (mise à jour
+#: du paquet, `git pull` d'un arbre source) rend son validateur trop vieux, ses
+#: constats ne valent plus.
+_BOOT_VERSION = _package_version()
+_BOOT_PACKAGE_DIGESTS = package_digests()
+
+
+def stale_reason() -> str:
+    """Pourquoi ce processus est plus vieux que le paquet installé ('' si non).
+
+    L780 : un exécuteur qui tourne pendant une livraison garde l'ancien code
+    (validateur de descripteurs compris) alors que le paquet sur disque a
+    changé. Ses constats — par exemple un descripteur neuf refusé par l'ancien
+    validateur, `harness-permission-mode-invalid` — ne doivent être ni écrits
+    dans `canon_state` ni vider les responsables des agents de l'hôte.
+    `canon_sync.sync` refuse alors d'écrire (`CanonStale`) et
+    `Runner.canon_sync_once` saute la passe en le signalant : le remède est un
+    redémarrage de l'exécuteur entre deux tours.
+    """
+    now_version = _package_version()
+    if now_version != _BOOT_VERSION:
+        return ("the installed package changed since this process started "
+                "(%s -> %s)" % (_BOOT_VERSION, now_version))
+    now = package_digests()
+    boot = _BOOT_PACKAGE_DIGESTS
+    changed = [name for name in sorted(set(boot) | set(now))
+               if boot.get(name) != now.get(name)]
+    if changed:
+        return ("the package descriptors changed since this process started (%s)"
+                % ", ".join(changed[:5]))
+    return ""
+
+
 def _source_of(path: str) -> str:
     """Provenance d'un fichier de descripteur : `hôte` sous le dossier de l'hôte.
 

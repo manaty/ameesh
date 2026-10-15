@@ -5,6 +5,9 @@
   ameesh watch disable --agent A                removes it
   ameesh watch show [--agent A] [--json]        the watches of the mesh
   ameesh watch send --agent A                   one firing (what the timer runs)
+  ameesh watch at --agent A --in 45m --message M  one-shot wake (lot #1020)
+  ameesh watch cancel --agent A --wake S        removes an armed wake
+  ameesh watch fire --agent A --wake S          what a wake unit runs
 
 A watch is a systemd user timer (`ameesh-watch-<agent>.timer`) that runs
 `ameesh watch send` every period: it sends the agent the instruction
@@ -13,12 +16,28 @@ The watch is recorded in the database (`agent_watches`, 0362): `ameesh
 projects` shows it from any host, and enabling or disabling it is noted in
 the agent's thread. A timer whose watch was disabled, or moved to another
 host, sends nothing.
+
+A **wake** (`at`) is the one-shot of the same tooling: a systemd user timer
+`ameesh-wake-<len(agent)>-<agent>-<slug>.timer` that fires once and sends the
+agent its own message. Outside a turn nothing sets `AGENT_MAIL_NAME` (the
+runner sets it only for the session it launches), so the wake applies the
+identity by construction on its exec line (`env AGENT_MAIL_NAME=<agent> …`)
+and `watch fire` refuses to fire without it: seven hand-made watches lost
+their wake on 2026-10-13 because their unit carried no identity (mesh-design,
+lot #1020). A wake lives in the user units directory of the host
+(`ameesh-wake-<len(agent)>-<agent>-<slug>.{service,timer,env,wake.json}`), is
+removed once it has fired, and needs no `agent_watches` row. Its dedicated
+prefix and the length of the agent keep it away from the periodic watches and
+from the other wakes (lot #1039).
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
+import re
+import shlex
 import shutil
 import string
 import subprocess
@@ -36,6 +55,12 @@ SENDER = "veille"
 DEFAULT_EVERY_S = 1800
 MIN_EVERY_S = 60
 UNIT_PREFIX = "ameesh-watch-"
+#: lot #1039: the one-shot wakes carry their own prefix. Named
+#: `ameesh-watch-<agent>-<slug>` they were exactly the units of the periodic
+#: watch of an agent called `<agent>-<slug>`: arming a wake stopped that
+#: watch's timer, overwrote its units and, after the firing, removed them —
+#: the watch was lost while its `agent_watches` row still showed it active.
+WAKE_PREFIX = "ameesh-wake-"
 #: the hand-written units L121 replaces (`ameesh-veille-<agent>.timer`)
 LEGACY_PREFIX = "ameesh-veille-"
 #: the directory of the user units (tests: a temporary one)
@@ -63,6 +88,20 @@ PINNED_ENV = {
 #: a firing longer than this is stopped by systemd: it never holds the watch's
 #: row (and the moves or disables waiting for it) for long (codex r2, #303)
 FIRING_TIMEOUT_S = 300
+#: lot #1020: the identity a wake unit carries BY CONSTRUCTION. The runner
+#: sets it for the session it launches, but not for a systemd unit an agent
+#: arms for later: without this line the wake fails at the deadline with
+#: `unbound sender` and is lost (seven watches, 2026-10-13).
+IDENTITY_ENV = "AGENT_MAIL_NAME"
+#: the slug of a wake names its units and its state file
+WAKE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+#: a wake fires at least this far in the future
+MIN_WAKE_S = 10
+#: the identity witness reads the installed unit back through these two
+#: properties: the declaration (`Environment=`) and the copy applied on the
+#: exec line (`ExecStart`), which no environment file can override
+WITNESS_PROPERTY = "Environment"
+WITNESS_EXEC_PROPERTY = "ExecStart"
 CONSIGNE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "consignes", "veille.md")
 
@@ -172,11 +211,154 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
     return {unit_name(agent, "service"): service, unit_name(agent, "timer"): timer}
 
 
+def wake_name(agent: str, slug: str, suffix: str) -> str:
+    """The name of one of the files of the wake `<slug>` of `agent`.
+
+    `ameesh-wake-<len(agent)>-<agent>-<slug>.<suffix>`: the dedicated prefix
+    keeps a wake away from the periodic watch units (`ameesh-watch-<agent>.…`),
+    and the length of the agent makes the pair (agent, slug) readable back, so
+    `a`/`b-c` and `a-b`/`c` — which flatten to the same text — never share a
+    file (lot #1039)."""
+    return "%s%d-%s-%s.%s" % (WAKE_PREFIX, len(agent), agent, slug, suffix)
+
+
+def wake_env_name(agent: str, slug: str) -> str:
+    """The pinned environment file of a wake (its own: disabling the periodic
+    watch of the agent must not take the configuration of an armed wake)."""
+    return "%s%d-%s-%s.env" % (WAKE_PREFIX, len(agent), agent, slug)
+
+
+def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
+               directory: str = "") -> dict[str, str]:
+    """The service and the timer of the one-shot wake `<slug>` of `agent`.
+
+    A wake runs outside a turn, where the runner's `AGENT_MAIL_NAME` is
+    absent. `Environment=` alone does not hold it: systemd lets an
+    `EnvironmentFile=` override `Environment=` whatever their order
+    (documented, and verified on systemd 255), so the identity is ALSO
+    applied by `env` on the exec line — the child environment carries it even
+    if a host file names another agent. `Restart=on-failure` keeps a wake
+    whose firing failed (database down): it retries until it is sent.
+    """
+    service = (
+        "[Unit]\n"
+        "Description=ameesh one-shot wake of %(agent)s (%(slug)s)\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "TimeoutStartSec=%(timeout)d\n"
+        "Environment=\"PATH=%(path)s\"\n"
+        "EnvironmentFile=-%(host_env)s\n"
+        "EnvironmentFile=-%(own_env)s\n"
+        "Environment=\"%(identity)s=%(agent)s\"\n"
+        "Restart=on-failure\n"
+        "RestartSec=2min\n"
+        "ExecStart=\"%(env)s\" \"%(identity)s=%(agent)s\" "
+        "\"%(ameesh)s\" watch fire --agent %(agent)s --wake %(slug)s\n"
+        % {"agent": agent, "slug": slug, "ameesh": ameesh, "path": path,
+           "env": _env_binary(),
+           "host_env": HOST_ENV_FILE,
+           "own_env": os.path.join(directory, wake_env_name(agent, slug)),
+           "identity": IDENTITY_ENV, "timeout": FIRING_TIMEOUT_S})
+    timer = (
+        "[Unit]\n"
+        "Description=ameesh one-shot wake of %(agent)s (%(slug)s), in %(delay)ds\n"
+        "[Timer]\n"
+        "OnActiveSec=%(delay)d\n"
+        "AccuracySec=1s\n"
+        % {"agent": agent, "slug": slug, "delay": int(delay_s)})
+    return {wake_name(agent, slug, "service"): service,
+            wake_name(agent, slug, "timer"): timer}
+
+
+def parse_wake_delay(text: str | None, at: str | None, *, now: float | None = None) -> int:
+    """The delay of a wake, from `--in 45m` or `--at 2026-10-13T20:00:00Z`
+    (absolute, timezone required: the deadline of a wake is not read twice)."""
+    from . import stagnation
+    if bool(text) == bool(at):
+        raise WatchError("give exactly one of --in DURATION or --at TIME")
+    if text:
+        try:
+            delay = stagnation.parse_duration(text)
+        except stagnation.StaleError as exc:
+            raise WatchError("--in: %s" % exc) from exc
+    else:
+        try:
+            when = datetime.datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise WatchError("--at: unreadable time %r (%s)" % (at, exc)) from exc
+        if when.tzinfo is None:
+            raise WatchError("--at: %r has no timezone (use 2026-10-13T20:00:00Z)" % at)
+        reference = datetime.datetime.now(datetime.timezone.utc) \
+            if now is None else datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+        delay = (when - reference).total_seconds()
+    if delay < MIN_WAKE_S:
+        raise WatchError("a wake fires at least %d s from now, got %gs" % (MIN_WAKE_S, delay))
+    return int(round(delay))
+
+
 def _ameesh_binary() -> str:
     found = shutil.which("ameesh")
     if found:
         return os.path.abspath(found)
     return os.path.join(os.path.expanduser("~"), ".local", "bin", "ameesh")
+
+
+def _env_binary() -> str:
+    """`env` (coreutils), which applies the wake's identity on its exec line:
+    systemd's `EnvironmentFile=` overrides `Environment=` (verified on
+    systemd 255), so the identity must be set on the command itself."""
+    found = shutil.which("env")
+    return os.path.abspath(found) if found else "/usr/bin/env"
+
+
+def _systemctl_quiet(run: Callable, *args: str) -> None:
+    """`systemctl --user …` whose failure is not one: a cleanup runs after the
+    message is committed, and must never make the firing fail (watch send's
+    rule: nothing fails a firing after its message is committed)."""
+    try:
+        run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _systemctl_show(run: Callable, prop: str, unit: str) -> str:
+    """One property of a unit, read back from systemd (the witness of #1020)."""
+    try:
+        proc = run(["systemctl", "--user", "show", "-p", prop, "--value", unit],
+                   capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WatchError("systemctl --user show -p %s %s: %s" % (prop, unit, exc)) from exc
+    if proc.returncode != 0:
+        raise WatchError("systemctl --user show -p %s %s: code %s %s" % (
+            prop, unit, proc.returncode, (proc.stderr or "").strip()[:200]))
+    return proc.stdout or ""
+
+
+def _environment_tokens(text: str) -> set[str]:
+    """The `NAME=value` tokens systemd renders for the Environment property."""
+    try:
+        return set(shlex.split(text))
+    except ValueError:
+        return set((text or "").split())
+
+
+def _remove_files(directory: str, names: list[str]) -> None:
+    for name in names:
+        try:
+            os.remove(os.path.join(directory, name))
+        except FileNotFoundError:
+            pass
+
+
+def _disarm(directory: str, agent: str, slug: str, run: Callable) -> None:
+    """Stops and removes the wake `<slug>` of `agent` (best effort: also the
+    path taken after a firing, where nothing may fail the committed message)."""
+    _systemctl_quiet(run, "stop", wake_name(agent, slug, "timer"))
+    _remove_files(directory, [wake_name(agent, slug, "service"),
+                              wake_name(agent, slug, "timer"),
+                              wake_env_name(agent, slug),
+                              wake_name(agent, slug, "wake.json")])
+    _systemctl_quiet(run, "daemon-reload")
 
 
 def _systemctl(run: Callable, *args: str) -> None:
@@ -385,6 +567,147 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
     return "instruction sent to %s" % agent
 
 
+def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
+        run: Callable = subprocess.run, env: dict | None = None,
+        actor: str | None = None) -> str:
+    """Arms (or re-arms) the one-shot wake `<slug>` of `agent` on this host.
+
+    The unit declares the identity and applies it with `env` on its exec line
+    (an environment file can override `Environment=`), and the witness reads
+    both back from the installed unit: a wake whose unit does not carry
+    `AGENT_MAIL_NAME` (or whose timer did not start) is refused and removed,
+    never left to lose its message at the deadline (#1020, the seven muted
+    watches)."""
+    if not platform.is_linux():
+        raise WatchError("a wake needs systemd (Linux)")
+    if registry.get(db, agent) is None:
+        raise WatchError("unknown agent: %s" % agent)
+    if not WAKE_RE.match(slug or ""):
+        raise WatchError("--wake: %r (lowercase letters, digits and dashes)" % slug)
+    message = (message or "").strip()
+    if not message:
+        raise WatchError("--message: empty")
+    host = cfg.host or ""
+    if not host:
+        raise WatchError("this host has no name (host of the configuration)")
+    actor = actor or authorize(cfg, db, agent)
+    directory = unit_dir(env)
+    os.makedirs(directory, exist_ok=True)
+    source = os.environ if env is None else env
+    path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
+    files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory)
+    files[wake_env_name(agent, slug)] = pinned_env(dict(source), host)
+    files[wake_name(agent, slug, "wake.json")] = json.dumps(
+        {"agent": agent, "slug": slug, "message": message, "host": host,
+         "armed_ts": time.time()}, ensure_ascii=False, sort_keys=True) + "\n"
+    _systemctl_quiet(run, "stop", wake_name(agent, slug, "timer"))
+    for name, text in files.items():
+        tmp = os.path.join(directory, "." + name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, os.path.join(directory, name))
+    _systemctl(run, "daemon-reload")
+    _systemctl(run, "start", wake_name(agent, slug, "timer"))
+    # the witness: read the installed unit back; without the identity the
+    # firing fails rc=2 at the deadline and the wake is lost silently.
+    try:
+        carried = _systemctl_show(run, WITNESS_PROPERTY,
+                                  wake_name(agent, slug, "service"))
+        applied = _systemctl_show(run, WITNESS_EXEC_PROPERTY,
+                                  wake_name(agent, slug, "service"))
+        state = _systemctl_show(run, "ActiveState",
+                                wake_name(agent, slug, "timer")).strip()
+    except WatchError as exc:
+        _disarm(directory, agent, slug, run)
+        raise WatchError("wake %s of %s not armed: witness unreadable (%s)"
+                         % (slug, agent, exc)) from exc
+    wanted = "%s=%s" % (IDENTITY_ENV, agent)
+    if wanted not in _environment_tokens(carried):
+        _disarm(directory, agent, slug, run)
+        raise WatchError(
+            "wake %s of %s not armed: the unit does not carry %s (read back: %r); "
+            "a wake without identity loses its message at the deadline (#1020)"
+            % (slug, agent, wanted, carried.strip()))
+    if wanted not in (applied or ""):
+        # EnvironmentFile wins over Environment= in systemd: only the exec
+        # line, read back here, proves the identity the child will carry.
+        _disarm(directory, agent, slug, run)
+        raise WatchError(
+            "wake %s of %s not armed: its exec line does not apply %s "
+            "(read back: %r); an environment file may override Environment=, and "
+            "a wake without identity loses its message at the deadline (#1020)"
+            % (slug, agent, wanted, (applied or "").strip()))
+    if state != "active":
+        _disarm(directory, agent, slug, run)
+        raise WatchError("wake %s of %s not armed: its timer is %r after start"
+                         % (slug, agent, state or "unknown"))
+    return ("wake %s of %s armed in %ds on %s by %s (unit %s, %s pinned)"
+            % (slug, agent, delay_s, host, actor,
+               wake_name(agent, slug, "timer"), wanted))
+
+
+def disarm(cfg: Config, db, agent: str, slug: str, *,
+           run: Callable = subprocess.run, env: dict | None = None,
+           actor: str | None = None) -> str:
+    """Removes an armed wake of `agent` (its own, or by an orchestrator or a
+    human, the rule of `watch disable`)."""
+    if not WAKE_RE.match(slug or ""):
+        raise WatchError("--wake: %r (lowercase letters, digits and dashes)" % slug)
+    if registry.get(db, agent) is None:
+        raise WatchError("unknown agent: %s" % agent)
+    actor = actor or authorize(cfg, db, agent)
+    directory = unit_dir(env)
+    if not os.path.exists(os.path.join(directory, wake_name(agent, slug, "wake.json"))):
+        raise WatchError("no wake %s of %s" % (slug, agent))
+    _disarm(directory, agent, slug, run)
+    return "wake %s of %s cancelled by %s" % (slug, agent, actor)
+
+
+def fire(cfg: Config, db, agent: str, slug: str, *,
+         run: Callable = subprocess.run, env: dict | None = None) -> str:
+    """One firing of the wake `<slug>`: sends `agent` its own message, then
+    removes the wake. Refuses without the identity its unit must carry
+    (`AGENT_MAIL_NAME=<agent>`, #1020): a wake unit armed by hand without it
+    is stopped here, with a readable error, instead of losing its message."""
+    if not WAKE_RE.match(slug or ""):
+        raise WatchError("--wake: %r (lowercase letters, digits and dashes)" % slug)
+    source = os.environ if env is None else env
+    identity = (source.get(IDENTITY_ENV) or "").strip()
+    if identity != agent:
+        raise WatchError(
+            "wake %s of %s refused: %s=%r — a wake unit carries %s=%s "
+            "(ameesh watch at); without it the message is lost at the deadline (#1020)"
+            % (slug, agent, IDENTITY_ENV, identity, IDENTITY_ENV, agent))
+    directory = unit_dir(env)
+    state_path = os.path.join(directory, wake_name(agent, slug, "wake.json"))
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise WatchError("wake %s of %s: no readable wake (%s)"
+                         % (slug, agent, exc)) from exc
+    if state.get("agent") != agent or state.get("slug") != slug:
+        raise WatchError("wake %s of %s: the state file names %s/%s"
+                         % (slug, agent, state.get("agent"), state.get("slug")))
+    message = str(state.get("message") or "").strip()
+    if not message:
+        raise WatchError("wake %s of %s: empty message" % (slug, agent))
+    # read before the delivery: once the message is committed, nothing may
+    # fail the firing (the unit would retry and send it twice)
+    row = registry.get(db, agent)
+    from . import mail
+    host = cfg.host or ""
+    with db.transaction() as tx:
+        mailbox_id = mail.send(tx, agent, agent, message, host=host, thread=False)
+    fil.record(cfg, db, sender=agent, recipients=[agent], text=message,
+               project=fil.agent_project(row) if row else None,
+               mailbox_ids=[mailbox_id],
+               meta={"action": "wake", "wake": slug, "host": host, "audit": "watch"})
+    _disarm(directory, agent, slug, run)
+    return "wake %s fired: message sent to %s" % (slug, agent)
+
+
 def show(db, agent: str | None = None) -> list[dict]:
     return [dict(row, every=every_text(int(row["every_s"])))
             for row in storage.of(db).watches.list(agent)]
@@ -419,6 +742,21 @@ def build_parser() -> argparse.ArgumentParser:
     look.add_argument("--json", action="store_true")
     fire = sub.add_parser("send", help="one firing (what the timer runs)")
     fire.add_argument("--agent", required=True)
+    wake = sub.add_parser("at", help="arm a one-shot wake (identity pinned on the unit)")
+    wake.add_argument("--agent", required=True)
+    wake.add_argument("--in", dest="in_", metavar="DURATION",
+                      help="delay: 45m, 2h… (one of --in or --at)")
+    wake.add_argument("--at", metavar="TIME",
+                      help="absolute time, ISO 8601 with timezone (2026-10-13T20:00:00Z)")
+    wake.add_argument("--message", required=True, help="what the wake sends its agent")
+    wake.add_argument("--wake", default="wake", metavar="SLUG",
+                      help="name of the wake (default: wake)")
+    off_wake = sub.add_parser("cancel", help="remove an armed wake")
+    off_wake.add_argument("--agent", required=True)
+    off_wake.add_argument("--wake", required=True, metavar="SLUG")
+    run_wake = sub.add_parser("fire", help="one firing of a wake (what its unit runs)")
+    run_wake.add_argument("--agent", required=True)
+    run_wake.add_argument("--wake", required=True, metavar="SLUG")
     return parser
 
 
@@ -430,6 +768,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_mod.load()
     try:
         every = parse_every(args.every) if args.command == "enable" else None
+        delay = parse_wake_delay(args.in_, args.at) if args.command == "at" else None
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db)
@@ -443,6 +782,12 @@ def main(argv: list[str] | None = None) -> int:
                 print("watch of %s disabled" % args.agent)
             elif args.command == "send":
                 print(send(cfg, db, args.agent))
+            elif args.command == "at":
+                print(arm(cfg, db, args.agent, args.wake, delay, args.message))
+            elif args.command == "cancel":
+                print(disarm(cfg, db, args.agent, args.wake))
+            elif args.command == "fire":
+                print(fire(cfg, db, args.agent, args.wake))
             else:
                 rows = show(db, args.agent)
                 if args.json:

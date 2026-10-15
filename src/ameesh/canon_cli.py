@@ -53,6 +53,14 @@ confiance configurée d'un canon qui n'est pas le canon par défaut est la `ref`
 de SON entrée `canons` (AMEESH_CANONS n'en donne pas : amorçage par
 `canon sync --canon <id> --bootstrap-ref BRANCHE`). `--bootstrap-ref` ne sert
 qu'aux canons dont le registre n'est pas encore amorcé.
+
+L814 : le journal des authentificateurs est unique par canon, tous hôtes
+confondus. Avant de juger, `canon sync` (et la passe de l'exécuteur) rattrape
+le clone de l'hôte : quand un dernier commit appliqué est inconnu du dépôt,
+les dépôts du canon sont fetchés et le canon relu ; le checkout du clone
+canonique est ensuite avancé à la révision lue (fast-forward seulement). Un
+checkout qui ne peut pas la contenir (clone divergé, modifications locales)
+fait refuser l'écriture des authentificateurs — registre inchangé.
 """
 from __future__ import annotations
 
@@ -405,6 +413,8 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
                                  bootstrap_ref=args.bootstrap_ref or "")
     except canon_sync.CanonUnreadable as exc:
         return _print_unreadable(args, canon, exc, sink=sink)
+    except canon_sync.CanonStale as exc:
+        return _print_stale(args, canon, exc, sink=sink)
     auth_errors = report.authenticators.errors if report.authenticators else []
     if args.json:
         data = report.to_dict()
@@ -592,6 +602,31 @@ def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
               "Placement card (or the host policy) by PR on the canon, then "
               "ameesh canon sync" % len(refused))
     return code
+
+
+def _print_stale(args: argparse.Namespace, canon: canon_mod.Canon,
+                 exc: canon_sync.CanonStale, sink: list | None = None) -> int:
+    """Processus plus vieux que le paquet installé (L780) : rien n'a été écrit.
+
+    `canon_state`, responsables et placements restent au dernier passage
+    valide ; l'appelant demande un redémarrage entre deux tours."""
+    if args.json:
+        data = {
+            "host": exc.host, "source": canon.source_label(),
+            "untrusted": canon.untrusted,
+            "canon_status": "outdated", "diagnostic": exc.reason,
+            "actions": [], "errors": 0, "findings": [],
+        }
+        if sink is not None:
+            data.update(canon_id=canon.id, default=canon.is_default)
+            sink.append(data)
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        return 1
+    print("canon sync on %s — OUTDATED CODE (%s): registry unchanged "
+          "(canon_state, responsables, placements); restart between turns"
+          % (exc.host, exc.reason))
+    return 1
 
 
 def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,

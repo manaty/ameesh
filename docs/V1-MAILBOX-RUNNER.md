@@ -317,7 +317,7 @@ test (three messages → three notifications) caught the bug.
   the interruption and its reason.
 * **Session rotation (0018)**: when the session exceeds
   `AMEESH_SESSION_MAX_TOKENS` (default 150,000) or a turn lasted more than
-  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 900 s), after at least
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3,600 s), after at least
   `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**, a
   summary turn is played in the session, the summary is written to the thread
   (R12), the old session id is kept in
@@ -329,6 +329,12 @@ test (three messages → three notifications) caught the bug.
   within the bound, states the cut. An empty final answer (for Codex: the
   agent's last message empty) is not a summary: the rotation is
   cancelled, and the account cutover uses the deterministic brief (L39).
+  The latency threshold has a floor of **twice the effective turn cap**
+  (`turn_max_seconds`, the agent's own setting included): a turn allowed to
+  last 1,800 s does not, by itself, make the session be forgotten; a higher
+  explicitly configured threshold is kept, and with no turn cap
+  (`turn_max_seconds=0`) the configured threshold applies alone
+  ([EXPLOITATION.md](EXPLOITATION.md#plafonds-pendant-le-tour-l105)).
   The size is read
   from the usage in each harness's stream (keys normalized by
   `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
@@ -383,6 +389,20 @@ and the cap of 3 nudges, counted locally in
 `~/.local/state/agent-mesh/hooks/<nom>.stops`): a test compares the output of the
 v0 script and that of v1 for the four events.
 
+**Fast path of the hooks and the status line (#1604).** The `agent-mail`
+console script goes through `ameesh.entry`, which serves `statusline` and
+`hook <harness>` without importing `ameesh.cli` (database, psycopg). A local
+mailbox marker (`<state_dir>/mail/<agent>.json`) records the outcome of the
+last COMPLETE read: a `PostToolUse` hook skips the database only when the
+marker is fresh (`AMEESH_HOOK_FAST_TTL`, 15 s by default) and says there is
+nothing to deliver. `Stop`, `SessionStart` and `UserPromptSubmit` always go
+through the database; a local send (`send`, `forward`, `sweep`) invalidates the
+recipient's marker; the status line is cached for a few seconds
+(`AMEESH_STATUSLINE_TTL`, 5 s). The fast path delivers no mail and writes no
+registry: it cannot confuse an identity or a session, at worst it delays a
+delivery, which the next complete pass (at the latest the `Stop` hook) catches
+up.
+
 **Identity tied to the lease, never to the directory (mesh-design incident of 2026-10-09).**
 A session only has an identity if `AGENT_MAIL_NAME` is set; if
 `AMEESH_RUNNER_ID` and `AMEESH_LEASE_EPOCH` are set too (it is the
@@ -394,6 +414,16 @@ only a display name for the status bar and `whoami --cwd`
 (explicitly marked "diagnostic, non autoritaire" (diagnostic, not authoritative)). `send` then requires
 `--from`, `status` and `whoami` refuse, and `inbox <nom>` remains a read
 without consumption.
+
+**Git identity of a session (#834).** The runner sets the four variables
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME` and
+`GIT_COMMITTER_EMAIL` for every turn, and for an `attach` session, from the agent
+name of the lease (`<name>@ameesh.invalid`, the address the mediated device
+already uses). Git environment variables override configuration, so a repository
+whose `.git/config` is shared by all its worktrees can no longer attribute one
+agent's commit to another (incident of 2026-10-13, where a resumed session
+without these variables committed under the name of the agent that had written
+`user.name` first). No git configuration is read or written for this.
 
 **External sessions: explicit binding (L41, decision 0030).** An interactive
 session launched by a human has neither a lease nor `AGENT_MAIL_NAME`. It only has
@@ -437,7 +467,11 @@ registers an unknown agent as `externe`.
 the identity bound to the session, `whoami`); "all" skips stopped agents.
 Undeliverable mail raises the `mail_undeliverable` alert, and `ameesh
 mail forward <ancien> <nouveau>` re-delivers a dead mailbox to a live agent,
-keeping the original sender and date. Details:
+keeping the original sender and date. The executor's cleanup also sweeps dead
+mailboxes (`ameesh mail sweep`, L976): a stopped agent's mail goes to its bound
+successor, and mail nobody can read expires after `mail_dead_letter_days`
+(7 by default), with a thread trace — the alert clears without a human.
+Details:
 [EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
 
 **Hooks: write first, mark after.** The JSON is written to stdout and

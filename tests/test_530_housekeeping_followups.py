@@ -147,6 +147,24 @@ class FollowUpTest(unittest.TestCase):
         self.assertEqual(result["after"], 0)
         self.assertFalse(result["over_quota"])
         self.assertFalse(any(os.path.exists(p) for p in names))
+        # #762 (codex P3): the old code credited this first half too, so the
+        # test proved nothing about the rule. It is discriminating only with
+        # the converse: a name the walk does not see keeps the inode alive,
+        # the last name does not go, and NOTHING is credited.
+        other = os.path.join(self.root, "codex4")
+        os.makedirs(other)
+        inside = os.path.join(other, "c")
+        _write(inside, size=5)
+        keep = os.path.join(self.base, "keep")
+        os.link(inside, keep)                    # a name outside the eviction
+        result = menage.evict_lru([other], self.root, 0)
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(result["evicted"], 0)
+        self.assertEqual(result["after"], B)
+        self.assertEqual(result["unremovable"], B)
+        self.assertTrue(result["blocked"])
+        self.assertFalse(os.path.exists(inside))
+        self.assertTrue(os.path.exists(keep))
 
     def test_multi_link_inode_kept_alive_outside_the_root_credits_nothing(self):
         # #530: every name the walk saw is gone, but a link outside the managed

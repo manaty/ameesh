@@ -50,12 +50,19 @@ class WorkflowFsClassTest(unittest.TestCase):
 
     def test_release_seulement(self):
         # pas de rejeu sur une PR ordinaire : tête ou base `release/`, push sur
-        # une branche de release, ou exécution à la main
+        # une branche de release, ou exécution à la main. #1247 R2 : le `if:`
+        # ne peut pas interroger un nom de branche — le plan le dit par son
+        # output `release`, posé par un step qui reçoit les branches par `env:`.
         self.assertIn("needs.plan.outputs.code == 'true'", self.job)
         self.assertIn("github.event_name == 'workflow_dispatch'", self.job)
         self.assertIn("startsWith(github.ref_name, 'release/')", self.job)
-        self.assertIn("startsWith(github.head_ref, 'release/')", self.job)
-        self.assertIn("startsWith(github.base_ref, 'release/')", self.job)
+        self.assertIn("needs.plan.outputs.release == 'true'", self.job)
+        self.assertNotIn("github.head_ref", self.job)
+        self.assertNotIn("github.base_ref", self.job)
+        plan = _job(self.texte, "plan")
+        self.assertIn("release: ${{ steps.release.outputs.release }}", plan)
+        self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', plan)
+        self.assertIn('case "$HEAD_REF" in release/*) release=true ;; esac', plan)
 
     def test_autre_classe_posee_et_verifiee(self):
         # la classe par défaut est lue (stat -f), l'autre est exigée, et TMPDIR

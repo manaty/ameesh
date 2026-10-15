@@ -58,6 +58,39 @@ class MailTest(PgTestCase):
         self.assertEqual(history[0]["status"], "delivered")
         self.assertIsNotNone(history[0]["delivered_ts"])
 
+    def test_remise_horodatee_par_message(self):
+        """#796 : chaque message remis porte SON instant de remise (l'instant
+        réel où il entre dans le contexte), pas l'horodatage de transaction
+        partagé par tout un lot — c'est ce qui rend le délai de réaction
+        mesurable message par message.
+
+        Tout se lit sur l'horloge de la base, dans UNE transaction : `now()`
+        (début de transaction) y est figé pendant que `clock_timestamp()`
+        avance. Une remise qui recopierait `now()` — l'ancien défaut, un seul
+        instant pour tout un lot — daterait les messages du début de
+        transaction ; la remise par message les date après lui. Aucune horloge
+        Python, donc aucun écart d'horloge entre la machine de test et la base ;
+        le sommeil force 50 ms d'écart, donc aucune dépendance à la résolution
+        de l'horloge."""
+        registry.upsert(self.db, "beta", harness="codex", host="autre")
+        ids = [mail.send(self.db, "alpha", "beta", "message %d" % i, host="laptop")
+               for i in range(5)]
+        with self.db.transaction() as tx:
+            debut = tx.query(
+                "select extract(epoch from now())::float8 as at_epoch")[0]["at_epoch"]
+            tx.query("select pg_sleep(0.05)")
+            self.assertEqual(mail.mark_delivered(tx, ids), len(ids))
+            stamps = [row["delivered_ts"] for row in tx.query(
+                "select extract(epoch from delivered_at)::float8 as delivered_ts"
+                " from agent_mailbox where id in (%s) order by id"
+                % ", ".join(str(int(i)) for i in ids))]
+            fin = tx.query(
+                "select extract(epoch from clock_timestamp())::float8 as at_epoch")[0]["at_epoch"]
+        self.assertEqual(len(stamps), len(ids))
+        # l'instant de chaque message tombe dans la fenêtre de la remise, lue
+        # sur la même horloge que les timbres...
+        self.assertTrue(all(debut < s <= fin for s in stamps), (debut, stamps, fin))
+
     def test_normalize_forme_commune(self):
         mail.send(self.db, "alpha", "beta", "coucou", host="laptop")
         row = mail.normalize(mail.unread(self.db, "beta")[0])
