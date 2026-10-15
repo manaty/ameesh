@@ -1390,7 +1390,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
+                if args.claim:
+                    # #1787 N2 : un claim qui retombe dans la file d'équipe
+                    # (#540) n'a pas pris : refus lisible, code 1.
+                    print("claim refused: %s" % out["queue_warning"], file=sys.stderr)
+                    return 1
                 print("warning: %s" % out["queue_warning"], file=sys.stderr)
+            elif out.get("noop"):
+                # #1787 N3 : le porteur qui re-claim son propre lot : no-op.
+                print("lot #%d already assigned to %s: claim is a no-op, nothing changed"
+                      % (out["item"]["id"], out["item"]["assignee"]))
             elif out["previous"] == out["item"]["assignee"]:
                 print("lot #%d: branch %s (assigned to %s)" % (
                     out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))

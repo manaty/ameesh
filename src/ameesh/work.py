@@ -811,7 +811,10 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     #1026 : `claim` n'attribue le lot que s'il est **sans assigné**. Un lot
     déjà pris est refusé en nommant son porteur, et l'écriture est
     conditionnelle à `assignee` encore vide : deux prises concurrentes, une
-    seule gagne, l'autre refuse sans changer la main."""
+    seule gagne, l'autre refuse sans changer la main.
+
+    #1787 : une re-prise par le porteur lui-même (`claim` sur son propre lot)
+    est un no-op réussi (`noop`), sans écriture ni ligne de journal."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -821,6 +824,11 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
     if claim and previous:
+        if previous == check["assignee"]:
+            if branch:
+                row = set_branch(db, item_id, branch, branch_target, actor=actor)
+                return {"item": row, "check": check, "previous": previous, "noop": True}
+            return {"item": item, "check": check, "previous": previous, "noop": True}
         raise WorkError("lot %s already assigned to %s: claim refused, nothing changed"
                         % (item_id, previous))
     if previous == check["assignee"]:
