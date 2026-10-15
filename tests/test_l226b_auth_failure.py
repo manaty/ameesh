@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -17,6 +18,7 @@ from ameesh import (account_turn, accounts, auth_failure, cost, exploitation, re
                     sentinel, storage)
 
 from .support import FAKEBIN, REPO
+from .test_cost import Sandbox
 from .test_l30_accounts import _Base, _codex_rollout
 
 
@@ -256,6 +258,34 @@ class OverageReadingTest(unittest.TestCase):
                 sessions=os.path.join(tmp, "sessions"))
             self.assertEqual(len(gauges), 1)
             self.assertEqual(gauges.overage, cost.Overage(True, False))
+
+
+class ClaudeJournalOverageTest(Sandbox, unittest.TestCase):
+    """#1649: the overage flags of a Claude journal reach the L226b guard
+    through the per-account path (journal -> claude_gauges -> gauges_of)."""
+
+    def test_flags_survive_the_account_path_and_its_cache(self):
+        tmp = tempfile.mkdtemp(prefix="ameesh-1649-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        items = accounts.parse({"claude": [
+            {"name": "primaire"},
+            {"name": "secondaire", "path": tmp, "check_credentials": False}]})["claude"]
+        profile = items[1]
+        self.agent("a", "claude")
+        self.events("a", {"type": cost.ACCOUNT_MARKER, "harness": "claude",
+                          "account": "secondaire", "ts": self.now},
+                    {"type": "rate_limit_event", "rate_limit_info": {
+                        "status": "allowed", "overageStatus": "allowed",
+                        "isUsingOverage": True, "unifiedWindows": {"five_hour": {
+                            "utilization": 1.0, "resetsAt": self.now + 3600}}}})
+        for _ in range(2):              # a fresh read, then the shared cache
+            gauges = accounts.gauges_of(self.book(), profile, items)
+            self.assertAlmostEqual(gauges[0].used, 1.0)
+            self.assertEqual(gauges.overage, cost.Overage(True, True))
+            self.assertIn((profile.overage_cap, "overage cap"),
+                          accounts.fixed_caps(profile, gauges))
+            self.assertTrue(accounts.in_overage(gauges, self.now))
+            gauges.clear()              # the caller's copy, not the cached one
 
 
 class _AuthBase(_Base):

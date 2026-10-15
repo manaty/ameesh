@@ -802,8 +802,9 @@ class CostBook:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
-        # A caller must not mutate the cached list seen by another CostBook.
-        return list(best[1]) if best else []
+        # A caller must not mutate the cached list seen by another CostBook;
+        # the copy keeps the reading's overage flags (L226b, #1649).
+        return Gauges(best[1], best[2]) if best else []
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -2029,7 +2030,11 @@ def _racy(stat, now_ns: int) -> bool:
 
 
 def _claude_account_readings(events: list, mtime: float) -> dict:
-    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    """Attribute all accounts in one pass; None is a verified legacy stream.
+
+    Each reading is (stamp, gauges, overage): the overage flags stay beside
+    the gauges, so the shared cache keeps them too (L226b, #1649).
+    """
     marked = any(_is_claude_marker(e) for e in events)
     current, stamp = None, 0.0 if marked else mtime
     readings = {}
@@ -2043,7 +2048,7 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
             gauges = _claude_windows(event)
             if gauges is not None:
-                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+                readings[current] = (stamp, gauges, _claude_overage(event))
     return readings
 
 
