@@ -818,8 +818,10 @@ jobs:
   # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
   # compares it with the content since the last tag. Any other PR: nothing to check.
   # #1343 : chaque PR de tests est une demande de gel (étiquette ci-lot/ci-full) ;
-  # le numéro est vérifié sur la base du payload, sans quoi un lot qui change la
-  # version obtiendrait un `tests` vert sans que le numéro soit regardé.
+  # le numéro est vérifié sur la base du merge-ref (HEAD^1, exactement la base du
+  # payload — la porte de gel du job plan vérifie ses deux parents), sans quoi un
+  # lot qui change la version obtiendrait un `tests` vert sans que le numéro soit
+  # regardé.
   version:
     name: version number
     if: github.event_name == 'pull_request'
@@ -830,11 +832,11 @@ jobs:
         with:
           fetch-depth: 0  # the tags, and the range since the last one
       - name: number against content
-        env:
-          # la base du payload est celle du merge-ref (vérifiée par le job plan)
-          VERSION_BASE: ${{ github.event.pull_request.base.sha }}
-        run: |
-          python3 scripts/version-level.py pr "$VERSION_BASE" HEAD
+        # #1343 : la porte `gel` du job plan vérifie que HEAD est le merge-ref
+        # composé de la base du payload (HEAD^1) et de la tête étiquetée (HEAD^2),
+        # et refuse sinon ; `HEAD^1` est donc la base exacte, et la commande garde
+        # la forme du contrat L158 (tests/test_l158_version_level.py).
+        run: python3 scripts/version-level.py pr HEAD^1 HEAD
 
   # nom de vérification stable : vert seulement si toutes les parts le sont
   # (L161a : une poussée de documentation seule sur main, ses lecteurs verts ;
@@ -852,10 +854,12 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: bilan des parts
-        env:
-          CI_EVENT: ${{ github.event_name }}
         run: |
-          echo "plan    : ${{ needs.plan.result }} (mode ${{ needs.plan.outputs.mode }}, tête ${{ needs.plan.outputs.sha }}, base ${{ needs.plan.outputs.base }})"
+          # #940 : le contrat (tests/test_940_agregat_bash.py) exige cet
+          # enchaînement exact « - name: bilan des parts » puis « run: | »
+          # (pas d'`env:` intercalé) et refuse toute expression qu'il ne couvre
+          # pas ; `${{ github.event_name }}` reste donc dans le script.
+          echo "plan    : ${{ needs.plan.result }} (version seule : ${{ needs.plan.outputs.version_only }}, doc seule : ${{ needs.plan.outputs.docs_only }})"
           echo "doc     : ${{ needs.doc-readers.result }}"
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
@@ -865,16 +869,17 @@ jobs:
           # un plan refusé (étiquette étrangère, SHA qui ne nomme pas la tête,
           # composition qui a bougé) rougit ici : rien n'a tourné, jamais vert.
           test "${{ needs.plan.result }}" = success
-          # L158 : la version est vérifiée sur chaque PR (demande de gel).
-          if [ "$CI_EVENT" = "pull_request" ]; then
-            test "${{ needs.version.result }}" = success
-          fi
+          # L158 : la version est vérifiée sur chaque PR (demande de gel) ;
+          # ailleurs elle est sautée, et c'est légitime. #940 : sous `bash -e`,
+          # l'échec de la branche gauche du `&&` interne est exempté — sortie
+          # explicite après le repli légitime.
+          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; } || exit 1
           # #1343 : une demande de gel ne prend jamais les voies version seule
           # (#L157) ou documentation seule (L161a) ; si le plan en produisait
           # une, le check requis rougit au lieu de verdir sans tests.
-          if [ "$CI_EVENT" = "pull_request" ]; then
-            test "${{ needs.plan.outputs.version_only }}" = "false" || exit 1
-            test "${{ needs.plan.outputs.docs_only }}" = "false" || exit 1
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            test "${{ needs.plan.outputs.version_only }}" = "false"
+            test "${{ needs.plan.outputs.docs_only }}" = "false"
           fi
           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
