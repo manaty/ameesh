@@ -1364,8 +1364,9 @@ class WorkItems(Domain):
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
-        `after_commit` reçoit les écritures de fil différées et la méthode les
-        vide après le commit. Absents, rien ne change."""
+        `after_commit` reçoit les écritures de fil différées, que **l'appelant**
+        vide après le commit qu'il tient (un `with` imbriqué ne commite pas).
+        Absents, rien ne change."""
 
     @abc.abstractmethod
     def delays(self, limit: int, *, ids: Sequence[int] | None = None) -> list[dict]:

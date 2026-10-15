@@ -151,7 +151,7 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(len(self.mailbox()), 1)  # la marque est celle de la base
         self.assertEqual(len(self.marks()), 1)
 
-    def test_the_engine_restarts_on_the_new_head(self):
+    def test_a_moved_freeze_refuses_without_writing(self):
         first = self.freeze(SHA_A)
         port = pg.PgPort(self.db)
         # le gel bouge entre la lecture du moteur et son écriture
@@ -163,7 +163,12 @@ class Test1617ReviewDesignationPg(PgTestCase):
             return original(lot, freeze_id)
 
         port.recorded = moved
-        out = self.run_apply(port, candidates=self.two_families())
+        with self.assertRaises(rd.FreezeMoved):
+            self.run_apply(port, candidates=self.two_families())
+        self.assertEqual(self.mailbox(), [])   # rien n'est écrit sur l'ancienne tête
+        self.assertEqual(self.marks(), [])
+        # la nouvelle tête se désigne sur un nouvel appel, avec ses propres entrées
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
         self.assertEqual(out["state"], rd.DESIGNATED)
         self.assertEqual(out["freeze"]["sha"], SHA_B)
         self.assertIn(SHA_B, self.mailbox()[0]["body"])
@@ -284,9 +289,10 @@ class Test1617FrozenHook(PgTestCase):
 
     Le raccord est branché mais **inactif** : sans callback, un gel ne désigne
     personne. Avec un callback, la marque et les courriers tiennent dans la
-    transaction du jalon `frozen`, le fil externe n'est vidé qu'après le commit
-    (par `add_milestone`), et une exception du callback annule le jalon avec
-    tout ce qu'il portait.
+    transaction du jalon `frozen` ; le fil externe reste dans `after_commit`,
+    que **l'appelant** vide après le commit qu'il tient (un `with` imbriqué ne
+    commite pas), et une exception du callback annule le jalon avec tout ce
+    qu'il portait.
     """
 
     def setUp(self):
@@ -365,7 +371,12 @@ class Test1617FrozenHook(PgTestCase):
         self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
         self.assertEqual(pg.designation_of(self.marks()[0])["freeze"],
                          {"id": int(row["id"]), "sha": SHA_A})
-        self.assertEqual(drained, [self.schema])  # vidée après le commit, par le jalon
+        # le fil n'est pas publié par le jalon : c'est l'appelant qui le vide
+        self.assertTrue(threads)
+        self.assertEqual(drained, [])
+        for record in threads:
+            record(self.db.cfg, self.db)
+        self.assertEqual(drained, [self.schema])
 
     def test_a_raising_callback_rolls_the_freeze_back(self):
         def hook(tx, milestone, threads):
@@ -383,6 +394,39 @@ class Test1617FrozenHook(PgTestCase):
         self.assertEqual(self.milestones(), [])   # le jalon a suivi le rollback
         self.assertEqual(self.marks(), [])
         self.assertEqual(self.mailbox(), [])
+
+    def test_a_nested_freeze_publishes_no_thread_before_the_outer_commit(self):
+        threads: list = []
+        drained: list = []
+        threads.append(lambda cfg, db: drained.append(cfg.schema))
+        with self.assertRaises(RuntimeError):
+            with self.db.transaction() as tx:
+                work.milestone(tx, self.lot, "frozen", sha=SHA_A, actor="me",
+                               on_frozen=self.designated, after_commit=threads)
+                self.assertEqual(len(self.mailbox(tx)), 2)  # écrit dans la transaction
+                self.assertEqual(drained, [])               # rien de publié
+                raise RuntimeError("boom")
+        # rollback externe : ni jalon, ni marque, ni courrier, aucune trace de fil
+        self.assertEqual(self.milestones(), [])
+        self.assertEqual(self.marks(), [])
+        self.assertEqual(self.mailbox(), [])
+        self.assertTrue(threads)
+        self.assertEqual(drained, [])
+
+    def test_a_nested_freeze_publishes_the_thread_after_the_outer_commit(self):
+        threads: list = []
+        drained: list = []
+        threads.append(lambda cfg, db: drained.append(cfg.schema))
+        with self.db.transaction() as tx:
+            work.milestone(tx, self.lot, "frozen", sha=SHA_A, actor="me",
+                           on_frozen=self.designated, after_commit=threads)
+            self.assertEqual(drained, [])
+        self.assertEqual(drained, [])  # commit externe fait, fil toujours en attente
+        for record in threads:
+            record(self.db.cfg, self.db)
+        self.assertEqual(drained, [self.schema])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
+        self.assertEqual(len(self.marks()), 1)
 
     def test_the_callback_is_refused_outside_a_freeze(self):
         with self.assertRaises(work.WorkError):

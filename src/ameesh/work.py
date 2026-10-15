@@ -1133,9 +1133,12 @@ def milestone(
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
     laisse `after_commit` recevoir les écritures de fil différées
-    (`mail.send(..., after_commit=…)`) ; `milestone` vide la liste après le
-    commit. Absent (le défaut), le gel ne désigne personne : le raccord de la
-    désignation des relecteurs se branche à l'activation du lot #1617, pas ici.
+    (`mail.send(..., after_commit=…)`) ; c'est **l'appelant** qui vide la liste
+    après le COMMIT qu'il tient (celui du `with` interne sur une connexion
+    racine, celui de sa propre transaction si l'appel est imbriqué : un `with`
+    imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
+    le raccord de la désignation des relecteurs se branche à l'activation du
+    lot #1617, pas ici.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))

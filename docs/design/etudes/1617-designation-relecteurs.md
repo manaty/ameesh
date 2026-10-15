@@ -39,12 +39,15 @@ déjà lues et rend une décision :
   charge est le nombre de lots ouverts de l'agent.
 - **sélection** : `required` relecteurs (1 ou 2). Pour deux avis, les familles
   sont distinctes entre elles et chacune diffère de la famille de **chaque**
-  auteur ou correcteur de la tête ; un auteur est écarté par son nom même si sa
-  famille est inconnue. Un seul candidat par famille (le moins chargé), puis
-  les familles les moins chargées ; à charge égale, l'ordre des noms tranche.
-- **attente explicite** : s'il manque des familles indépendantes, l'état est
-  `waiting` avec le nombre manquant, et une **notification de capacité** part
-  vers le pilote — jamais une admission implicite.
+  auteur ou correcteur de la tête ; un auteur dont la famille réelle est
+  inconnue (vide ou étiquette) fait **attendre** la désignation — l'écarter par
+  son seul nom laisserait passer un relecteur de sa famille réelle (B3, revue
+  Claude dev1). Un seul candidat par famille (le moins chargé), puis les
+  familles les moins chargées ; à charge égale, l'ordre des noms tranche.
+- **attente explicite** : s'il manque des familles indépendantes, ou qu'une
+  famille d'auteur est inconnue, l'état est `waiting` avec le nombre manquant,
+  et une **notification de capacité** part vers le pilote — jamais une
+  admission implicite.
 - **courriers** : chaque relecteur reçoit le lot, le jalon `frozen` et le SHA
   **exact** à relire, la commande de verdict sur ce SHA, et la règle du §2
   (corriger soi-même un bloquant fait de lui un auteur : son avis ne compte
@@ -62,13 +65,15 @@ le registre et le courrier :
   marque idempotente par `(lot, jalon frozen)`, courriers déposés dans la même
   transaction.
 
-Le moteur relit le dernier gel à chaque essai : un `StaleFreeze` le fait
-repartir sur la nouvelle tête (au plus trois essais, puis échec à rejouer, sans
-boucle). Un même gel rejoué rend la désignation enregistrée sans second
-courrier ; un gel nouveau est un autre objet, donc une nouvelle désignation —
-l'ancienne ne compte plus. Aucun retour à une ancienne tête n'est possible :
-le gel est relu sous verrou, et un SHA qui n'est pas un identifiant de commit
-est refusé.
+Le gel est relu **une fois**, et les chemins, auteurs et la classe fournis sont
+ceux de ce gel : si le `Port` refuse un gel devenu périmé (`StaleFreeze`, rien
+n'est écrit), `apply` lève `FreezeMoved` et ne désigne **pas** la nouvelle tête
+avec les entrées de l'ancienne (un SHA de courrier changé ne suffit pas) —
+l'appelant recollecte les entrées du nouveau gel, puis rejoue (B1, revue Codex
+cx2). Un même gel rejoué rend la désignation enregistrée sans second courrier ;
+un gel nouveau est un autre objet, donc une nouvelle désignation — l'ancienne
+ne compte plus. Aucun retour à une ancienne tête n'est possible : le gel est
+relu sous verrou, et un SHA qui n'est pas un identifiant de commit est refusé.
 
 ## Le port Postgres (`src/ameesh/review_designation_pg.py`)
 
@@ -137,15 +142,20 @@ touche ni `work.py` ni `storage/postgres/work.py`. Le raccord est branché :
 - `storage.postgres.work.add_milestone` appelle `on_frozen(tx, milestone,
   after_commit)` **dans la transaction du jalon**, juste après l'INSERT du
   `frozen` — le port `PgPort(tx, after_commit=…)` y écrit la marque et les
-  courriers atomiquement —, puis vide `after_commit` **après le commit**
-  (`mail.send(..., after_commit=…)`, motif #315). Une exception du callback
-  annule le jalon avec tout ce qu'il portait ; `on_frozen` sur un autre kind
+  courriers atomiquement —, et **ne vide pas** `after_commit` : c'est
+  l'appelant qui tient le commit qui la vide après son COMMIT (sur une
+  connexion racine, le `with` interne commite et l'appelant vide au retour ;
+  dans une transaction déjà ouverte, le `with` imbriqué ne commite pas — vider
+  là publierait le fil avant le commit externe, B2 de la revue Codex cx2). Une
+  exception du callback annule le jalon avec tout ce qu'il portait ;
+  `on_frozen` sur un autre kind
   est refusé.
 
 **Rien n'est activé** : le défaut est `on_frozen=None`, la CLI `work milestone`
 ne fournit aucun callback, et un gel ne désigne donc personne. Le raccord est
-prouvé par 4 tests base réelle : le jalon et la désignation ne sont visibles
-que dans la transaction, le fil externe n'est vidé qu'après le commit, une
+prouvé par 6 tests base réelle : le jalon et la désignation ne sont visibles
+que dans la transaction, le fil reste dans `after_commit` et c'est l'appelant
+qui le publie après son commit (appel racine comme appel imbriqué), une
 exception annule le jalon, la marque et les courriers, et le callback est
 refusé hors d'un `frozen`.
 
@@ -154,30 +164,34 @@ refusé hors d'un `frozen`.
 `tests/test_1617_review_designation.py` — 28 tests ciblés, sans base :
 maximum des règles par chemin et zéro du léger ; deux familles SQL/sécurité/prod
 distinctes et hors auteur ; correcteur devenu auteur écarté (nom et famille) ;
-famille lue sur la session et non sur le nom ; indisponibilité et charge ;
-attente explicite notifiée une fois ; provenance d'auteur inconnue = attente,
-puis désignation quand la preuve arrive ; capacité revenue = désignation sur le
-même gel ; politique Nexlink (deux avis `supabase`, un par défaut) ; même gel
-rejoué = un seul courrier ; nouveau gel = nouvelle désignation sans retour à
-l'ancienne tête ; gel qui bouge pendant l'écriture = reprise sur la nouvelle
-tête, trois mouvements = échec sans boucle ; tête invalide ou non gelée
-refusée.
+famille d'auteur inconnue = attente (jamais écartée par le seul nom) ; famille
+lue sur la session et non sur le nom ; indisponibilité et charge ; attente
+explicite notifiée une fois ; provenance d'auteur inconnue = attente, puis
+désignation quand la preuve arrive ; capacité revenue = désignation sur le même
+gel ; politique Nexlink (deux avis `supabase`, un par défaut) ; même gel rejoué
+= un seul courrier ; nouveau gel = nouvelle désignation sans retour à
+l'ancienne tête ; gel qui bouge pendant l'écriture = `FreezeMoved` sans rien
+écrire, la nouvelle tête n'est désignée que sur un nouvel appel avec ses
+entrées ; tête invalide ou non gelée refusée.
 
-`tests/test_1617_review_designation_pg.py` — 19 tests sur base réelle (psql) :
+`tests/test_1617_review_designation_pg.py` — 21 tests sur base réelle (psql) :
 désignation écrite et courriers partis une fois, rejeu sans second courrier ;
 un second écrivain (autre connexion) sous le verrou rend la marque de la base
 sans remailer ; gel périmé refusé sans rien écrire (ni marque ni message) ;
-reprise du moteur sur la nouvelle tête ; attente notifiée une seule fois puis
+gel qui bouge pendant l'écriture = `FreezeMoved` sans écriture, la nouvelle
+tête se désigne sur un nouvel appel ; attente notifiée une seule fois puis
 désignation sur le même gel ; attente sans destinataire refusée ; destinataire
 inconnu du registre refusé (un courrier qui ne réveille personne) ; provenance
 d'auteur inconnue = attente, désignation quand la preuve arrive ; nouveau gel =
 nouvelle désignation, la marque de l'ancien gel reste attachée à sa tête ;
-transaction du hook (fil vidé après commit seulement) ; annulation = ni
-courrier ni marque. Les 4 tests du raccord du gel : sans callback le gel ne
-désigne personne ; le callback voit le jalon dans sa transaction (invisible
-d'une autre connexion) et y écrit la désignation, le fil n'étant vidé qu'après
-le commit ; une exception du callback annule le jalon, la marque et les
-courriers ; le callback est refusé hors d'un `frozen`.
+transaction du hook (fil différé, publié par l'appelant après son commit) ;
+annulation = ni courrier ni marque. Les 6 tests du raccord du gel : sans
+callback le gel ne désigne personne ; le callback voit le jalon dans sa
+transaction (invisible d'une autre connexion) et y écrit la désignation, le fil
+restant à l'appelant ; une exception du callback annule le jalon, la marque et
+les courriers ; un gel imbriqué ne publie aucune trace avant le commit externe
+(et rien ne survit à son rollback) ; après le commit externe, l'appelant vide
+la liste ; le callback est refusé hors d'un `frozen`.
 
 ## Reste avant activation
 
@@ -195,5 +209,10 @@ courriers ; le callback est refusé hors d'un `frozen`.
   équivalent) pour rattraper un gel resté sans désignation ;
 - preuve de livraison sur un **gel réel** : désignation sans agent, tête exacte
   remise, durée et doublons mesurés (le compteur de courriers par gel) ;
+- revues : R Claude dev1 (tête `d176acf2`) a trouvé et corrigé B3 (famille
+  d'auteur inconnue) → `f6abe89a` ; R Codex cx2 (`f6abe89a`) a rendu `blocked`
+  sur B1 (gel bougé) et B2 (commit externe), corrigés ici ; comme dev1 est
+  auteur de sa correction, la composition des deux familles sur la nouvelle
+  tête est à arbitrer par le pilote ;
 - deux avis indépendants hors auteur pour cette porte (sécurité de la chaîne
   d'admission), puis paquet à la coupure.

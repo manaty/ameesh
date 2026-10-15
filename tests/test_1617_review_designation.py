@@ -73,7 +73,7 @@ class FakePort:
 
 
 class MovingPort(FakePort):
-    """Le gel bouge pendant l'écriture : le commit refuse, puis le moteur relit."""
+    """Le gel bouge pendant l'écriture : le commit refuse, le moteur s'arrête."""
 
     def __init__(self, freezes, moves):
         super().__init__(freezes)
@@ -339,26 +339,29 @@ class ApplyTest(unittest.TestCase):
                              authors=self.authors)
         self.assertEqual(self.port.stale_refusals, 1)
 
-    def test_a_freeze_that_moves_during_the_write_restarts_on_the_new_head(self):
+    def test_a_freeze_that_moves_during_the_write_refuses_without_writing(self):
         self.port = MovingPort({1617: [{"id": 1, "sha": SHA_A}]},
                                [{"id": 2, "sha": SHA_B}])
-        out = self.apply()
-        self.assertEqual(out["freeze"], {"id": 2, "sha": SHA_B})
+        with self.assertRaises(rd.FreezeMoved):
+            self.apply()
         self.assertEqual(self.port.stale_refusals, 1)
-        self.assertEqual(len(self.port.commits), 1)
+        self.assertEqual(self.port.commits, [])
+        self.assertEqual(self.port.messages, [])
+        self.assertEqual(self.port.records, {})
+
+    def test_the_new_head_is_designated_only_on_a_fresh_call(self):
+        self.port = MovingPort({1617: [{"id": 1, "sha": SHA_A}]},
+                               [{"id": 2, "sha": SHA_B}])
+        with self.assertRaises(rd.FreezeMoved):
+            self.apply()
+        # les entrées du nouveau gel sont fournies par l'appelant, pas reprises
+        out = self.apply(policy_ref="canon@newhead")
+        self.assertEqual(out["freeze"], {"id": 2, "sha": SHA_B})
+        self.assertEqual(self.port.commits[-1]["policy_ref"], "canon@newhead")
         self.assertEqual(len(self.port.messages), 2)
         for _to, body in self.port.messages:
             self.assertIn(SHA_B, body)
             self.assertNotIn(SHA_A, body)
-
-    def test_repeated_freeze_moves_fail_the_gesture_instead_of_looping(self):
-        moves = [{"id": n, "sha": "%040x" % n} for n in (2, 3, 4)]
-        self.port = MovingPort({1617: [{"id": 1, "sha": SHA_A}]}, moves)
-        with self.assertRaises(rd.DesignationError):
-            self.apply()
-        self.assertEqual(self.port.commits, [])
-        self.assertEqual(self.port.messages, [])
-        self.assertEqual(self.port.stale_refusals, 3)
 
     def test_an_unfrozen_or_invalid_head_is_refused(self):
         for freezes in ({}, {1617: [{"id": 1, "sha": "main"}]},

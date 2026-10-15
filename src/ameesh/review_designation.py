@@ -73,6 +73,15 @@ class StaleFreeze(DesignationError):
     gel et recommence (jamais un retour à une ancienne tête)."""
 
 
+class FreezeMoved(StaleFreeze):
+    """Le gel a bougé pendant l'écriture : rien n'a été écrit, et les entrées
+    du gel examiné (chemins, auteurs, classe) ne valent plus.
+
+    Le moteur ne désigne pas avec les entrées d'une autre tête : l'appelant
+    recollecte les chemins, auteurs et la classe du **nouveau** gel, puis
+    rejoue. Un SHA de courrier changé ne suffit pas (revue Codex cx2, B1)."""
+
+
 # --------------------------------------------------------------------------
 # la politique : nombre d'avis requis par chemin
 # --------------------------------------------------------------------------
@@ -277,11 +286,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - la famille vient de la session réelle (`Candidate.family`), jamais du nom ;
     - un candidat indisponible, sans famille connue, ou auteur lui-même est
       écarté ;
+    - un auteur dont la famille réelle est inconnue (vide ou étiquette) fait
+      **attendre** la désignation : sans elle, l'indépendance d'un relecteur ne
+      se prouve pas (canon §2) ;
     - à charge égale, l'ordre des noms tranche : la sélection est déterministe.
 
     Rend `{state, required, reviewers, missing, why, forbidden}` : `waiting`
-    quand il manque des familles indépendantes, avec le nombre manquant —
-    jamais une admission implicite.
+    quand il manque des familles indépendantes ou qu'une famille d'auteur est
+    inconnue, avec le nombre manquant — jamais une admission implicite.
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
@@ -413,9 +425,6 @@ def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
 # le raccord : une seule écriture transactionnelle côté Port
 # --------------------------------------------------------------------------
 
-#: essais de `apply` quand le gel bouge pendant l'écriture (conflit transactionnel)
-FREEZE_ATTEMPTS = 3
-
 
 class Port(Protocol):
     """Le raccord réel : base, registre et courrier. Le moteur ne fait aucun E/S.
@@ -464,10 +473,12 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     être établie, donc la désignation attend au lieu de deviner — un état
     explicite, jamais un repli.
 
-    Le gel est relu à chaque essai : si le `Port` refuse un gel devenu périmé
-    (`StaleFreeze`, rien n'a été écrit), la désignation repart sur le nouveau
-    dernier gel — jamais un retour à une ancienne tête. Trois gels successifs
-    pendant l'écriture font échouer le geste, à rejouer : on ne boucle pas.
+    Le gel est relu **une fois**, et les entrées fournies (chemins, auteurs,
+    classe) sont celles de ce gel : si le `Port` refuse un gel devenu périmé
+    (`StaleFreeze`, rien n'a été écrit), `apply` lève `FreezeMoved` — désigner
+    la nouvelle tête avec les chemins ou les auteurs de l'ancienne serait une
+    admission implicite. L'appelant recollecte les entrées du nouveau gel,
+    puis rejoue.
     """
     item = dict(lot_item or {})
     lot = int(item.get("id") or 0)
@@ -480,73 +491,71 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         if not isinstance(author, Mapping) or not str(author.get("name") or "").strip():
             raise DesignationError("an author is {name, family}, not %r" % (author,))
     unknown = [str(value) for value in (unknown_authors or ()) if str(value).strip()]
-    last = None
-    for _attempt in range(FREEZE_ATTEMPTS):
-        freeze = port.latest_freeze(lot)
-        if not freeze or not str(freeze.get("sha") or "").strip():
-            raise DesignationError("lot #%d is not frozen: no frozen milestone" % lot)
-        sha = str(freeze["sha"]).strip().lower()
-        if not _SHA.fullmatch(sha):
-            raise DesignationError(
-                "the freeze of lot #%d names %r, not a commit id" % (lot, freeze["sha"]))
-        freeze = {"id": int(freeze["id"]), "sha": sha}
-        required = required_count(rules, paths)
-        if risk != "light" and required == 0:
-            raise DesignationError(
-                "review count unknown for a non-light lot (#%d, class %s)" % (lot, risk))
-        if required == 0:
-            return {"state": NONE, "required": 0, "reviewers": [], "missing": 0,
-                    "why": "light lot: no review before merge", "freeze": freeze}
-        existing = port.recorded(lot, freeze["id"])
-        if existing and existing.get("state") == DESIGNATED:
-            out = dict(existing)
-            out["replayed"] = True
-            return out
-        if unknown:
-            # Une preuve d'auteur manquante interdit de prouver l'indépendance :
-            # attente explicite, notification, aucun relecteur désigné.
-            why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
-                   % (len(unknown), ", ".join(unknown[:5])))
-            selection = {"state": WAITING, "required": required, "reviewers": [],
-                         "missing": required, "why": why}
-        else:
-            selection = select(required=required, authors=authors, candidates=candidates,
-                               families=families)
-        if selection["state"] == WAITING and existing:
-            # L'attente de ce gel est déjà enregistrée et notifiée : on n'en
-            # renvoie pas une seconde, mais la sélection a été retentée — si la
-            # capacité est revenue, la branche ci-dessous désigne enfin.
-            out = dict(existing)
-            out["replayed"] = True
-            return out
-        state = selection["state"]
-        messages = []
-        if state == DESIGNATED:
-            for rank, reviewer in enumerate(selection["reviewers"], start=1):
-                messages.append({
-                    "to": reviewer["name"],
-                    "family": reviewer["family"],
-                    "body": reviewer_message(item, freeze=freeze, required=required,
-                                             rank=rank, reviewer=reviewer, authors=authors,
-                                             base=base, risk=risk, policy_ref=policy_ref),
-                })
-        else:
+    freeze = port.latest_freeze(lot)
+    if not freeze or not str(freeze.get("sha") or "").strip():
+        raise DesignationError("lot #%d is not frozen: no frozen milestone" % lot)
+    sha = str(freeze["sha"]).strip().lower()
+    if not _SHA.fullmatch(sha):
+        raise DesignationError(
+            "the freeze of lot #%d names %r, not a commit id" % (lot, freeze["sha"]))
+    freeze = {"id": int(freeze["id"]), "sha": sha}
+    required = required_count(rules, paths)
+    if risk != "light" and required == 0:
+        raise DesignationError(
+            "review count unknown for a non-light lot (#%d, class %s)" % (lot, risk))
+    if required == 0:
+        return {"state": NONE, "required": 0, "reviewers": [], "missing": 0,
+                "why": "light lot: no review before merge", "freeze": freeze}
+    existing = port.recorded(lot, freeze["id"])
+    if existing and existing.get("state") == DESIGNATED:
+        out = dict(existing)
+        out["replayed"] = True
+        return out
+    if unknown:
+        # Une preuve d'auteur manquante interdit de prouver l'indépendance :
+        # attente explicite, notification, aucun relecteur désigné.
+        why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
+               % (len(unknown), ", ".join(unknown[:5])))
+        selection = {"state": WAITING, "required": required, "reviewers": [],
+                     "missing": required, "why": why}
+    else:
+        selection = select(required=required, authors=authors, candidates=candidates,
+                           families=families)
+    if selection["state"] == WAITING and existing:
+        # L'attente de ce gel est déjà enregistrée et notifiée : on n'en
+        # renvoie pas une seconde, mais la sélection a été retentée — si la
+        # capacité est revenue, la branche ci-dessous désigne enfin.
+        out = dict(existing)
+        out["replayed"] = True
+        return out
+    state = selection["state"]
+    messages = []
+    if state == DESIGNATED:
+        for rank, reviewer in enumerate(selection["reviewers"], start=1):
             messages.append({
-                "to": notify,
-                "family": "",
-                "body": capacity_message(item, freeze=freeze, required=required,
-                                         missing=selection["missing"], why=selection["why"]),
-                "capacity": True,
+                "to": reviewer["name"],
+                "family": reviewer["family"],
+                "body": reviewer_message(item, freeze=freeze, required=required,
+                                         rank=rank, reviewer=reviewer, authors=authors,
+                                         base=base, risk=risk, policy_ref=policy_ref),
             })
-        last = {"freeze": freeze, "required": required, "state": state,
-                "selection": selection, "messages": tuple(messages)}
-        try:
-            return port.commit(lot, freeze=freeze, required=required, state=state,
-                               reviewers=selection["reviewers"], missing=selection["missing"],
-                               why=selection["why"], authors=authors, policy_ref=policy_ref,
-                               notify=notify, messages=tuple(messages))
-        except StaleFreeze:
-            continue  # le gel a bougé : on repart du dernier, rien n'a été écrit
-    raise DesignationError(
-        "the freeze of lot #%d moved %d times while designating (last: %s): retry later"
-        % (lot, FREEZE_ATTEMPTS, (last or {}).get("freeze", {}).get("sha", "?")[:12]))
+    else:
+        messages.append({
+            "to": notify,
+            "family": "",
+            "body": capacity_message(item, freeze=freeze, required=required,
+                                     missing=selection["missing"], why=selection["why"]),
+            "capacity": True,
+        })
+    try:
+        return port.commit(lot, freeze=freeze, required=required, state=state,
+                           reviewers=selection["reviewers"], missing=selection["missing"],
+                           why=selection["why"], authors=authors, policy_ref=policy_ref,
+                           notify=notify, messages=tuple(messages))
+    except StaleFreeze as exc:
+        # Rien n'a été écrit. Les entrées fournies valaient pour l'ancien gel :
+        # les recollecter pour le nouveau avant de rejouer (B1, revue codex cx2).
+        raise FreezeMoved(
+            "the freeze of lot #%d moved during the write (was %s): nothing written; "
+            "recollect the paths, authors and class of the new freeze, then retry"
+            % (lot, sha[:12])) from exc
