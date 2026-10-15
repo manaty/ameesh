@@ -276,6 +276,10 @@ class VmAgentsHarness(unittest.TestCase):
         (self.origin / 'deploy/mise-a-jour').mkdir(parents=True)
         shutil.copy2(SCRIPT, self.origin / 'deploy/mise-a-jour/vm.sh')
         shutil.copy2(BAIL, self.origin / 'deploy/mise-a-jour/bail.sh')
+        # #1155 x #1252 : vm.sh délègue la création du paquet à ce script
+        # (union composée) — le banc le copie à côté, comme bail.sh.
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/paquet-git.sh',
+                     self.origin / 'deploy/mise-a-jour/paquet-git.sh')
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')
