@@ -209,6 +209,7 @@ last resort. Each account takes these optional settings in the host's
 | `overage` [`auto`] | may the account be billed beyond its plan? `auto` reads it from the harness (Claude `overageStatus`, Codex `credits.has_credits`), `allowed` or `none` declare it |
 | `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
 | `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
+| `pace_multiplier` [1.0] | multiplies the **elapsed share** of the pace cap: `min(90 %, elapsed × m + 10 points)`. Set per account, no implicit value (#1075: `2.0` on the Codex primary to spend its plan reserve without a reset). The reserve, the fixed caps, the overage rules, the gauges and the reset dates are unchanged |
 
 A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
 on the short window), `cap`, and `overage_cap` when the account may be billed.
@@ -442,6 +443,47 @@ Then declare the account with the `oauth_token` type (after the lot above).
 To rotate a token, run the same steps again and revoke the old token in the
 claude.ai settings.
 
+### Git HTTPS: the helper written by `gh auth setup-git` carries an absolute path
+
+The provisioning step of the [L232 study](design/etudes/l232-autonomous-host-provisioning.md)
+(`gh auth setup-git`) writes in the global config, for `https://github.com`
+and `https://gist.github.com`, the empty reset helper followed by
+`!<absolute path of the gh binary that ran it> auth git-credential`. That
+path is frozen at the moment of the command: a config copied from another
+host (a VM's `/home/ubuntu/.local/bin/gh`) or a `gh` moved since (mise
+update) leaves a helper that no longer exists. Every HTTPS GitHub operation
+then fails on the credential lookup while `gh auth status` stays healthy —
+the sentinel probes `gh`, not `git`, so it sees nothing (incident #1063).
+
+Repair on the host itself, after backing up the global file that carries the
+faulty entry (`~/.gitconfig` or `~/.config/git/config`, shown by the first
+command); the empty line is what clears a helper inherited from another scope:
+
+```sh
+# locate the scope and file holding the frozen helper (global, XDG, system)
+git config --show-origin --show-scope --get-regexp '^credential\.'
+cfg=$(git config --global --show-origin --get-regexp '^credential\.' |
+      awk -F'\t' 'sub(/^file:/,"",$1) {print $1; exit}')
+[ -n "$cfg" ] && cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M)"
+for url in https://github.com https://gist.github.com; do
+  git config --global --replace-all "credential.$url.helper" ""
+  git config --global --add "credential.$url.helper" '!gh auth git-credential'
+done
+GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/<org>/<private-repo> HEAD >/dev/null && echo ok
+```
+
+The value is single-quoted on purpose: pasted into an interactive shell, a
+double-quoted `!gh` triggers history expansion — `event not found` when no `gh`
+command is in history, otherwise the previous `gh` command is substituted and
+the helper is written broken.
+
+Re-running `gh auth setup-git` on the host has the same effect, with that
+host's current absolute path. The PATH form above survives a later move of
+`gh`, as long as `git` runs with a PATH that finds it (the runner units set
+the mise shims explicitly). Never copy `~/.gitconfig` between two hosts:
+re-run the command on the target and verify it with a private
+`git ls-remote`.
+
 
 ## 7. Critical agents: never paused while an account has headroom (L242b)
 
@@ -551,14 +593,19 @@ change.
 earlier, so that the margin left is for the critical ones:
 
 * on a plan, a non-critical agent stops 10 points below the pace cap
-  (`accounts.RESERVE`). With a 90 % pace cap it stops at 80 %: min(80 %,
-  elapsed), no head start above the linear pace (mesh-design, 2026-10-12).
-  The short window cap, when set, is lowered the same way, and never exceeds
-  min(80 %, elapsed) for a non-critical agent. The fixed caps (50 % of the
-  primary, `cap`, `overage_cap`) are not: they hold for everyone. The reason
-  then says "10 points kept for critical agents". This holds with or without
-  declared accounts. It also holds on a host with no critical agent: the
-  reserve is then simply not used;
+  (`accounts.RESERVE`): `max(min(80 %, elapsed × m), 10 %)` — the pace cap
+  `min(90 %, elapsed × m + 10)` minus the reserve, floored at the 10-point
+  margin. The reserve never blocks the start of a window (#777): while
+  `elapsed × m` is at most the 10-point margin, the threshold is the margin,
+  not `elapsed × m` (the plain reserve subtraction, which would block at
+  1 %); beyond it the threshold follows `elapsed × m`, and the end-of-window
+  cap is 80 % (90 % − 10), not more (mesh-design, 2026-10-12; #1028). The
+  short window cap, when set, is lowered the same way, and never exceeds that
+  threshold for a non-critical agent. The fixed caps (50 % of the primary,
+  `cap`, `overage_cap`) are not: they hold for everyone. The reason then says
+  "10 points kept for critical agents". This holds with or without declared
+  accounts. It also holds on a host with no critical agent: the reserve is
+  then simply not used;
 * on pay-per-token, a non-critical agent stops at `noncritical_hourly_share`
   of the mesh hourly cap. The setting is in the host configuration
   (`AMEESH_NONCRITICAL_HOURLY_SHARE`; between 0 and 1; default 0.75, a
@@ -587,9 +634,13 @@ counted amount next to the estimate.
 **A budget pause is shown as one.** The pause reason starts with the account
 that frees first: "pause (account secondaire, five_hour 96 %) until 14:20;
 all claude accounts at threshold — …". It is the agent's `status_text`
-("budget : pause (…) until 14:20; …"). An account held by several windows
-frees when the last of them resets: the label names that window, and the
-date when it is not today ("until 14/10 09:00"). Without declared accounts the
+("budget : pause (…) until 14:20; …"). The announced time is the real one: a
+window held by the pace alone frees when the elapsed part catches up with the
+usage (the guard is re-evaluated on every turn, #898), while a usage at the
+pace ceiling (90 %, less the reserve kept for critical agents) only falls back
+at the window reset. An account held by several windows frees with the last of
+them: the label names that window, and the date when it is not today ("until
+14/10 09:00"). Without declared accounts the
 account is `(default)`, the harness's own. `ameesh progress` and the alerts read
 `paused`, never `stopped`, for a budget pause. `ameesh attach` says it.
 

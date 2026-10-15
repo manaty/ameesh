@@ -110,7 +110,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain", "db_connections_high")
+                 "land_uncertain", "db_connections_high",
+                 # #513 : la dépense comptée s'écarte des soldes (barème faux)
+                 "budget_drift")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -194,6 +196,7 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
+    "budget_drift": "counted spend strays from the provider balance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
@@ -1270,9 +1273,10 @@ class Notifier:
     def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
         orchestrateurs et à l'auditeur, avec l'action attendue
-        (`alert_briefs`). Une fois à la levée, une relance si l'alerte dure
-        `REMIND_AFTER_S` ; indépendant de `notify.types` (qui ne règle que
-        l'humain). Jamais fatal au passage."""
+        (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 : il le lit
+        à sa passe, `ameesh alerts --json`). Une fois à la levée, une relance
+        si l'alerte dure `REMIND_AFTER_S` ; indépendant de `notify.types` (qui
+        ne règle que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
         alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
         for key in list(sent):

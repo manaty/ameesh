@@ -332,6 +332,18 @@ class RechercheIncompleteTest(_Verifie):
         with self.assertRaises(reprise.SessionSearchIncomplete):
             reprise.find_session("deepseek", racine, "abc", strict=True)
 
+    def test_find_session_deepseek_real_id(self):
+        """A dsh session id already carries `session-` (`session-b126155c-…`):
+        its folder is found as is, never as `session-session-…`."""
+        racine = os.path.join(self.tmp, "dsh-reel")
+        ident = "session-b126155c-0d1e-4f2a-9b3c-5d6e7f809a1b"
+        dossier = os.path.join(racine, "sessions", "-work", ident)
+        os.makedirs(dossier)
+        self.assertEqual(reprise.find_session("deepseek", racine, ident), dossier)
+        self.assertEqual(reprise.find_session("deepseek", racine, ident, strict=True), dossier)
+        # a bare id still maps to its prefixed folder
+        self.assertEqual(reprise.find_session("deepseek", racine, ident[len("session-"):]), dossier)
+
     def test_claude_illisible_session_gardee(self):
         home = os.path.join(self.tmp, "claude-tour-illisible")
         _session_claude(home, CLAUDE)

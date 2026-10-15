@@ -3,6 +3,8 @@
 """Test plan from the measured test → code map (L161f).
 
     scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                              [--base SHA] [--ref REF]
+                              [--base-ref B] [--head-ref H]
                               [--github-output F] [--summary F] [--annotations]
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
@@ -24,21 +26,78 @@ so the split never differs between parts.
 * P2 — failed under measure in the last 7 days (map history);
 * P3 — the rest.
 
-**Phase 1: nothing is skipped.** Every part runs P0, P1 (shortest first),
-P2, then P3 (alphabetical); only the order changes. The plan also says
-whether a phase 2 selection ("impacted only", lot L161i) would have been
-safe for this change; it is recorded, never applied.
+**Lot branches: impacted + contract (L1211, canon §3).** On a pull request
+whose source and target are lot branches, only the impacted modules (P0, P1)
+and the contract list (`tests/parts/toujours.txt`: droits, rôles, migrations,
+objets globaux du cluster) run; any doubt — no map, a stale or unsure
+selection, a changed block without a test, test infrastructure, a removed
+file outside documentation, an empty contract list — gives the full suite
+(`lot_selection`). On `main` every module runs, P0 and
+P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
+driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
+matrix.
+
+**Release pull requests keep the full suite (canon §3).** A pull request
+whose source or target is `release/**` or the package integration branch
+(§12) is a release PR: like the `push` to those branches, it runs the full
+suite under both drivers (`PARTS` in full), with no version-only or
+documentation-only fast lane and without the psql pilot list — the branch
+context comes from the workflow (`--base-ref`, `--head-ref`, L1211). The
+same holds for the fallback plan, so an unreadable map never narrows a
+release to the pilot list. Only the full suite prepares the merge of a
+release.
+
+**Documentation-only** (L161a): a pull request whose whole diff is
+documentation, and a push to `main` whose whole pushed range (`--base`,
+`github.event.before`, to the new head) is documentation, runs only its
+declared readers (`tests/parts/lecteurs-doc.txt`, plus the impacted ones)
+and skips the parts. A push to any other ref keeps the full suite (release
+branches in particular); so do a branch created by the push, a rewritten
+history and any event but `pull_request` and `push` on `main`. A pushed
+version number never takes the lane: L157 is a pull-request rule.
 
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
 the map counts as changed, so the selection widens, never narrows. Map
 missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
-falls back to the textual heuristic of L161b (`--since HEAD^1`) and the
-plan is marked unsure. A file the map cannot judge (Python outside
-`src/ameesh`, a non-documentation file no test reads, a syntax error) uses
-the textual heuristic for that file and marks the plan unsure; test
-infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
-`.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
+falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
+default) and the plan is marked unsure. A file the map cannot judge (Python
+outside `src/ameesh`, a non-documentation file no test reads, a syntax
+error) uses the textual heuristic for that file and marks the plan unsure;
+test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+`.github/`, `pyproject.toml` beyond its version line) marks it unsure too,
+unless the target already changed it since the map and the branch does not
+change it itself (the merge base with the target to the head): the target's
+own full suite validated that change, and a late map must never send every
+lot branch back to the full suite (#1314). The branch's own change to the
+foundation still marks the plan unsure, and the version-only exemption of
+`pyproject.toml` (L157) is judged on that own range.
+A file removed outside documentation marks it unsure as well: the map knows
+the readers it measured, never the ones it cannot see (an import by a
+computed name, a config read by the code).
+
+**A block without a measure does not force the full suite** (#1339). A new
+block (a file the map does not know, a function or a class it has never
+seen) and a changed block no test executes are covered as soon as a test is
+*proven* to load their file: the modules the map measured on it, or — when
+none has executed it — the tests the *guaranteed* import graph reaches
+(`src/ameesh/**` and `tests/**` at HEAD; a test that imports a changed
+module which imports the new file counts, through that module's measured
+importers; only the imports the module body executes itself count). Every
+test that *may* load the file joins the selection too, the complete import
+graph's lazy and conditional imports included: a new block has no measured
+caller, and a test can reach it by a computed name (`dir()` then `getattr`)
+as soon as it has loaded the file. The selection falls back to the full
+suite when no test is proven to load such a file: a dynamic import
+(`importlib.import_module`) leaves no static edge, an import under `if
+TYPE_CHECKING:` never runs at runtime, a lazy, conditional or `with`-guarded
+import is only a candidate, and a from-import proves the module it names,
+never a member as a file (`from ameesh import new_feature` loads nothing
+when the package `__init__` binds `new_feature = object()`; `import
+ameesh.new_feature` and `from ameesh.new_feature import x` keep the proof) —
+none of them certifies that a test loads the file, so the full suite stays
+(`phase2_why` names it).
+
 Any error while reading the map gives the fallback plan, never a failure.
 
 **Changed lines without a test**: an existing block whose fingerprint
@@ -65,6 +124,7 @@ import collections
 import datetime
 import importlib.util
 import json
+import math
 import os
 import pathlib
 import re
@@ -84,15 +144,35 @@ MAX_AGE_H = 48
 PHASE2_MAX_AGE_H = 24
 #: failures under measure younger than this make a module P2
 RECENT_FAILURE_DAYS = 7
-#: parts per driver (pull request, other events)
-PARTS = {"psycopg": (4, 4), "psql": (1, 6)}
+#: parts per driver (pull request, other events). Le pilote psql d'une PR est
+#: en trois parts depuis #947 : sur les runners auto-hébergés, huit jobs se
+#: partagent un hôte, la part unique pesait 21,7-26,6 min au repos (médiane
+#: 24,5) pour un plafond de 30 min et l'atteignait dès que la flotte était
+#: saturée (24/24 runners) ; trois parts pèsent ~8 min chacune, ce qui tient au
+#: ralentissement mesuré de 2,5-3x. psycopg garde quatre parts (max 17,7 min
+#: saturé) ; la suite psql complète reste en six parts.
+#: L1211 : ces nombres sont des plafonds. Une branche de lot ne lance que les
+#: impactés et le contrat : une part par pilote suffit, et une part de plus par
+#: PR_TARGET_PART_S d'estimation, sans jamais dépasser le plafond.
+PARTS = {"psycopg": (4, 4), "psql": (3, 6)}
+#: L1211 : budget nominal d'une part sur une branche de lot, en secondes. À
+#: 2,5-3x sous saturation, 300 s tiennent dans le plafond de 30 min de psycopg
+#: comme dans celui de 45 min de psql.
+PR_TARGET_PART_S = 300
+#: L1211 : une PR dont la source ou la cible est sur ces branches est une PR
+#: de release (canon §3, §12) : suite complète, les deux pilotes, sans voie
+#: version/doc ni liste pilote psql.
+RELEASE_PREFIXES = ("release/", "integration/")
 #: entries listed in the job summary, per category
 SUMMARY_LIMIT = 25
 
 MIGRATIONS_DIR = "src/ameesh/migrations/"
 CODE_ROOT = "src/ameesh/"
-#: changes that trigger the "always" list
-ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/")
+#: changes that trigger the "always" list (#749: the runner drives turns,
+#: leases and orphan settlement through objects global to the cluster, which
+#: the per-schema measure of the map cannot see)
+ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/",
+                   "src/ameesh/runner.py")
 #: test infrastructure: the map cannot judge a change there
 FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".github/",
               "scripts/test-parts.py", "scripts/test-plan.py", "scripts/map.py",
@@ -149,6 +229,31 @@ def is_ancestor(commit: str, head: str = "HEAD", repo: pathlib.Path = REPO) -> b
     return True
 
 
+def is_merge_commit(head: str = "HEAD", repo: pathlib.Path = REPO) -> bool:
+    """True when `head` is a merge commit: two parents or more."""
+    try:
+        parents = _git(repo, "rev-list", "--parents", "-n", "1", head).split()
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return len(parents) > 2
+
+
+def own_changes(base: str, head: str = "HEAD",
+                repo: pathlib.Path = REPO) -> set[str] | None:
+    """Paths this branch changes itself: the base it merges (its target's tip,
+    `HEAD^1` of the merge commit GitHub tested) to its head.
+
+    `HEAD^1` is that base only on a pull request's merge commit; on a plain
+    commit it is the branch's previous commit, and its diff would not cover the
+    whole branch: the range is then refused, and the caller keeps its
+    conservative doubt. None as well when the diff cannot be read.
+    """
+    if base == "HEAD^1" and not is_merge_commit(head, repo):
+        return None
+    changes = changed_files(base, head, repo)
+    return None if changes is None else {path for _, path in changes}
+
+
 def show(path: str, rev: str = "HEAD", repo: pathlib.Path = REPO) -> str | None:
     try:
         return _git(repo, "show", f"{rev}:{path}")
@@ -163,6 +268,259 @@ def existed(path: str, rev: str, repo: pathlib.Path = REPO) -> bool:
     except (OSError, subprocess.CalledProcessError):
         return False
     return True
+
+
+# -- static imports (#1339) -----------------------------------------------
+
+def _dotted(path: str) -> str:
+    """Dotted module name of a repository Python file, `""` outside the two
+    measured packages: `src/ameesh/x/y.py` → `ameesh.x.y`, `tests/test_a.py` →
+    `tests.test_a`; an `__init__.py` names its package."""
+    p = pathlib.PurePosixPath(path)
+    if p.suffix != ".py":
+        return ""
+    parts = list(p.parts)
+    if parts[:2] == ["src", "ameesh"]:
+        parts = parts[1:]
+    elif parts[:1] != ["tests"]:
+        return ""
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def _module_files(name: str, known: set[str]) -> set[str]:
+    """The repository files a dotted name may designate: the module itself, its
+    package `__init__` and every parent package (importing a submodule runs
+    each of them). `known` limits the result to the files of this tree."""
+    if not name:
+        return set()
+    parts = name.split(".")
+    root = "src" if parts[0] == "ameesh" else ""
+    found: set[str] = set()
+    for i in range(1, len(parts) + 1):
+        base = "/".join(([root] if root else []) + parts[:i])
+        for candidate in (f"{base}.py", f"{base}/__init__.py"):
+            if candidate in known:
+                found.add(candidate)
+    return found
+
+
+def _type_checking_names(tree: ast.AST) -> set[str]:
+    """Names bound to `typing.TYPE_CHECKING`: the plain one and any alias
+    (`from typing import TYPE_CHECKING as TC`)."""
+    names = {"TYPE_CHECKING"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "typing":
+            for alias in node.names:
+                if alias.name == "TYPE_CHECKING":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _never_runs(test: ast.expr, names: set[str]) -> bool:
+    """Whether an `if` guard is false when the code runs: `TYPE_CHECKING`
+    (always false at runtime, whatever `typing` calls it) or a false constant.
+    `not TYPE_CHECKING` is true, so it is not caught here."""
+    if isinstance(test, ast.Constant):
+        return not test.value
+    if isinstance(test, ast.Name):
+        return test.id in names
+    if isinstance(test, ast.Attribute):
+        return test.attr == "TYPE_CHECKING"
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_never_runs(value, names) for value in test.values)
+    return False
+
+
+class _RuntimeImports(ast.NodeVisitor):
+    """The import statements that may run, and those the module certainly runs
+    when it is imported.
+
+    The body of `if TYPE_CHECKING:` — and of any other guard that never runs,
+    `if False:` — loads nothing and is left out; everything else stays, lazy
+    imports included: they may run. `guaranteed` keeps only the imports the
+    module body executes itself: at the top level (a class body runs at
+    import, a function body does not), outside any condition, loop, `try` or
+    `with` — a `with` body may never run (its `__enter__` may fail, or an
+    earlier statement may raise and be suppressed), so it is no proof.
+    A lazy or conditional import alone is a possible load, never a proof
+    (relecture Codex, B2 résiduel)."""
+
+    def __init__(self, names: set[str]) -> None:
+        self.names = names
+        self.imports: list[ast.stmt] = []
+        self.guaranteed: list[ast.stmt] = []
+        self._deferred = 0  # inside a function or lambda body: not run at import
+        self._guarded = 0   # inside a condition, a loop or a try: may not run
+
+    def _visit_function(self, node: ast.AST) -> None:
+        self._deferred += 1
+        self.generic_visit(node)
+        self._deferred -= 1
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+    visit_Lambda = _visit_function
+
+    def _visit_guarded(self, node: ast.AST) -> None:
+        self._guarded += 1
+        self.generic_visit(node)
+        self._guarded -= 1
+
+    visit_For = _visit_guarded
+    visit_AsyncFor = _visit_guarded
+    visit_While = _visit_guarded
+    visit_Try = _visit_guarded
+    visit_TryStar = _visit_guarded
+    visit_Match = _visit_guarded
+    visit_With = _visit_guarded
+    visit_AsyncWith = _visit_guarded
+
+    def visit_If(self, node: ast.If) -> None:
+        if _never_runs(node.test, self.names):
+            # the guard never runs: only its `else` does (at module level)
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self._visit_guarded(node)
+
+    def _record(self, node: ast.stmt) -> None:
+        self.imports.append(node)
+        if not self._deferred and not self._guarded:
+            self.guaranteed.append(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._record(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._record(node)
+
+
+def _imported_files(source: str, path: str, known: set[str], *,
+                    guaranteed: bool = False) -> set[str]:
+    """The repository files `source` may load at runtime: any depth, a lazy
+    import included (it may run). An import under `if TYPE_CHECKING:` runs
+    never — the flag is false at runtime — so it leaves no edge and never
+    certifies that a test loads a new file (relecture Codex, B2). With
+    `guaranteed`, only the imports executed by the module body itself are
+    kept: a lazy, conditional or `with`-guarded import may load the file, it
+    does not prove that importing `source` loads it (B2 résiduel). A
+    from-import (`from ameesh import db`) proves its resolved module (the
+    package `ameesh`, whose `__init__` runs), never the member as a file:
+    the package may already bind the name (`db = object()`), and then the
+    submodule is not imported at all (B2 résiduel) — `import ameesh.db` and
+    `from ameesh.db import x` name the module itself and keep the proof.
+    Only `ameesh.*` and `tests.*` names are resolved; a syntax error leaves
+    no edge."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    dotted = _dotted(path)
+    if pathlib.PurePosixPath(path).name == "__init__.py":
+        package = dotted
+    else:
+        package = dotted.rsplit(".", 1)[0] if "." in dotted else ""
+    names: set[str] = set()
+    collector = _RuntimeImports(_type_checking_names(tree))
+    collector.visit(tree)
+    for node in (collector.guaranteed if guaranteed else collector.imports):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                base = package
+                for _ in range(node.level - 1):
+                    base = base.rsplit(".", 1)[0] if "." in base else ""
+                module = f"{base}.{module}" if module else base
+            if module:
+                names.add(module)
+                # Un from-import charge son module ; un membre peut déjà être
+                # un objet du module (`from ameesh import db` avec
+                # `db = object()` dans `__init__`), donc un fichier enfant
+                # n'est qu'une cible possible, jamais une preuve.
+                if not guaranteed:
+                    names.update(f"{module}.{alias.name}" for alias in node.names
+                                 if alias.name != "*")
+    return {f for name in names if name.split(".")[0] in ("ameesh", "tests")
+            for f in _module_files(name, known)}
+
+
+def _tree_python_files(head: str, repo: pathlib.Path) -> list[str]:
+    """Python files of the measured packages at `head` (git, not the working
+    tree: a documentation plan judges its base as well)."""
+    try:
+        out = _git(repo, "ls-tree", "-r", "--name-only", head)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return sorted(p for p in out.splitlines()
+                  if p.endswith(".py")
+                  and (p.startswith("src/ameesh/") or p.startswith("tests/")))
+
+
+def _tree_sources(head: str, paths: list[str], repo: pathlib.Path) -> dict[str, str]:
+    """Content of `paths` at `head`, in one `git cat-file --batch` call."""
+    if not paths:
+        return {}
+    try:
+        proc = subprocess.run(["git", "cat-file", "--batch"], cwd=repo, check=True,
+                              input="".join(f"{head}:{p}\n" for p in paths).encode(),
+                              capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    out, pos, sources = proc.stdout, 0, {}
+    for path in paths:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        header = out[pos:end].split()
+        pos = end + 1
+        if len(header) == 2 and header[1] == b"missing":
+            continue  # a missing object: `--batch` prints `<name> missing`
+        if len(header) != 3:
+            break
+        try:
+            size = int(header[2])
+        except ValueError:
+            break
+        chunk = out[pos:pos + size]
+        if header[1] == b"blob":
+            sources[path] = chunk.decode("utf-8", "replace")
+        pos += size + 1
+    return sources
+
+
+def _import_graph(head: str, repo: pathlib.Path, *,
+                  guaranteed: bool = False) -> dict[str, set[str]]:
+    """Reverse static import graph at `head`: for each file, the files whose
+    source imports it. A dynamic import (`importlib.import_module`) leaves no
+    edge: a new file no test imports keeps the full suite (#1339). With
+    `guaranteed`, only the edges the importing module executes itself are
+    kept: importing that module certainly loads the target, while a lazy or
+    conditional import only may."""
+    files = _tree_python_files(head, repo)
+    known = set(files)
+    reverse: dict[str, set[str]] = {}
+    for path, source in _tree_sources(head, files, repo).items():
+        for target in _imported_files(source, path, known, guaranteed=guaranteed):
+            if target != path:
+                reverse.setdefault(target, set()).add(path)
+    return reverse
+
+
+def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
+    """`path` and every file that imports it, directly or not."""
+    seen, stack = {path}, [path]
+    while stack:
+        for source in reverse.get(stack.pop(), ()):
+            if source not in seen:
+                seen.add(source)
+                stack.append(source)
+    return seen
 
 
 # -- the map --------------------------------------------------------------
@@ -214,6 +572,15 @@ class Impact:
         self.unsure: list[str] = []          # why the map cannot judge everything
         self.textual: list[str] = []         # files left to the L161b heuristic
         self.foundation: list[str] = []
+        self.removed: list[str] = []         # files removed outside documentation
+        #: #1339 : blocs sans mesure couverts par les tests qui importent leur
+        #: fichier (fichier → modules), et fichiers qu'aucun test n'importe
+        self.importers: dict[str, list[str]] = {}
+        #: #1339 : sous-ensemble des importateurs qui *prouvent* le chargement
+        #: (mesure, ou import exécuté au niveau module) ; les autres ne sont que
+        #: des candidats de sélection (relecture Codex, B2 résiduel)
+        self.certified: dict[str, list[str]] = {}
+        self.uncovered: list[str] = []
 
     def hit(self, modules, reason: str) -> None:
         for m in modules:
@@ -224,6 +591,82 @@ class Impact:
             self.unsure.append(reason)
         if path and path not in self.textual:
             self.textual.append(path)
+
+
+def _measured_importers(card: dict, path: str, modules: list[str]) -> set[str]:
+    """Test modules the map saw load `path`: any block of the file executed by
+    a test means that test imported it (a subprocess run included)."""
+    found: set[str] = set()
+    for info in card.get("blocs", {}).get(path, {}).values():
+        found |= set(info.get("modules", ()))
+    return found & set(modules)
+
+
+def _reaching_tests(card: dict, path: str, modules: list[str],
+                    reverse: dict[str, set[str]]) -> set[str]:
+    """Tests that load `path` at HEAD: those that reach it through the static
+    import graph, plus, for every file of that closure, the tests the map
+    measured on it — a test that imports a changed module which imports the
+    new one (#1339). The graph given decides the strength: the complete one
+    selects every possible importer, the guaranteed one proves the load."""
+    reached = _reverse_closure(reverse, path)
+    found = {m for m in modules if f"tests/{m}.py" in reached}
+    for source in reached:
+        found |= _measured_importers(card, source, modules)
+    return found
+
+
+def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
+                        head: str, repo: pathlib.Path) -> None:
+    """#1339 : un bloc nouveau ou modifié sans couverture mesurée ne force plus
+    la suite complète dès qu'un test charge son fichier.
+
+    Deux ensembles se séparent (relecture Codex, B2 résiduel) :
+
+    - la **sélection** : tous les tests qui peuvent charger le fichier — les
+      modules mesurés dessus, et ceux du graphe d'import complet (imports
+      paresseux et conditionnels compris) — rejoignent les impactés. Un bloc
+      nouveau n'a par définition aucun appelant mesuré, et un test peut
+      l'atteindre par un nom calculé (`dir()` puis `getattr`), donc chaque
+      test qui a chargé le fichier peut l'exécuter (B1) ; élargir ne nuit pas.
+    - la **preuve** : la mesure, ou un chargement garanti au niveau module (le
+      graphe des imports que le corps du fichier exécute à l'import). Un test
+      n'est certifié que par une preuve : un import paresseux, conditionnel ou
+      sous `with` seul ne lève pas le doute, et un from-import ne prouve que
+      son module résolu — pas le membre, que le paquet peut lier à un objet
+      (`from ameesh import new_feature` avec `new_feature = object()` dans
+      `__init__`). `uncovered` porte le fichier et la suite complète reste —
+      au lieu de certifier une couverture qu'un test dynamique (`importlib`)
+      assurerait sans être sélectionné (B2).
+    """
+    unknown_files = {b.split("::", 1)[0] for b in impact.unknown_blocks}
+    untested_files = {u["file"] for u in impact.untested}
+    targets = sorted(unknown_files | untested_files)
+    if not targets:
+        return
+    reverse: dict[str, set[str]] | None = None
+    proven_reverse: dict[str, set[str]] | None = None
+    for path in targets:
+        measured = _measured_importers(card, path, modules)
+        if reverse is None:
+            reverse = _import_graph(head, repo)
+        #: sélection : les importateurs mesurés, plus tous ceux qui *peuvent*
+        #: charger le fichier (le graphe complet : paresseux et conditionnels)
+        potential = measured | _reaching_tests(card, path, modules, reverse)
+        if measured:
+            proven = measured
+        else:
+            if proven_reverse is None:
+                proven_reverse = _import_graph(head, repo, guaranteed=True)
+            proven = _reaching_tests(card, path, modules, proven_reverse)
+        if potential:
+            for m in sorted(potential):
+                impact.p1.setdefault(m, f"{path} (imported)")
+            impact.importers[path] = sorted(potential)
+        if not proven:
+            impact.uncovered.append(path)
+            continue
+        impact.certified[path] = sorted(proven)
 
 
 def _db_modules(card: dict) -> set[str]:
@@ -359,19 +802,40 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
     if status in ("A", "D"):
         listers, where = _dir_listers(card, path, card["commit"], repo)
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
+    # a removal outside documentation is already a doubt, raised by `judge`:
+    # only a removed document stays quiet here (the docs lane)
     if not readers and not listers and not is_doc(path) and status != "D":
         impact.doubt(f"{path}: read by no measured test", path)
 
 
 def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
-          head: str = "HEAD", repo: pathlib.Path = REPO) -> Impact:
-    """The impact of `changes` (since the map commit) on the test modules."""
+          head: str = "HEAD", repo: pathlib.Path = REPO,
+          own: set[str] | None = None, own_base: str | None = None) -> Impact:
+    """The impact of `changes` (since the map commit) on the test modules.
+
+    `own` is the set of paths the branch itself changes — `own_base` (the base
+    it merges, `HEAD^1` of a pull request's merge commit) to `head` — and
+    `None` when that range cannot be read or is not trustworthy. A file of the
+    CI foundation (`is_foundation`) that the target already changed since the
+    map commit, and that this branch does not change, raises no doubt: the
+    target's own full suite validated it, and a late map must not send every
+    lot branch back to the full suite (#1314). The version-only exemption of
+    `pyproject.toml` (L157) is judged on that same own range, so a target
+    change to the file no longer breaks it.
+    """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
     for m in modules:
         if m not in known_modules:
             impact.p0[m] = "unknown to the map"
     for status, path in changes:
+        # a removal has no new blocks to judge, and the map only knows the
+        # readers it measured: an import by a computed name, a config read by
+        # the code, a template — the removal is a doubt, never a silent
+        # selection (R2 bureau, B1). `--no-renames`: a rename is D + A here.
+        if status == "D" and not is_doc(path):
+            impact.removed.append(path)
+            impact.unsure.append(f"file removed: {path}")
         # a file read as data (a .py, a test module, a migration as well): its
         # readers, whatever the kind of file and even when its blocks did not change
         impact.hit(card.get("donnees", {}).get(path, ()), path)
@@ -386,7 +850,15 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
                                     f"{where})")
             continue
         if is_foundation(path):
-            if path == "pyproject.toml" and _version_line_only(head, card["commit"], repo):
+            # #1314 : un fichier du socle déjà changé par la cible depuis la
+            # carte ne compte que s'il diffère entre la base de fusion et la
+            # tête du lot ; sinon une carte en retard ferait retomber toute
+            # branche de lot sur la suite complète.
+            if own is not None and path not in own:
+                impact.hit(card.get("donnees", {}).get(path, ()), path)
+                continue
+            version_base = own_base if own is not None else card["commit"]
+            if path == "pyproject.toml" and _version_line_only(head, version_base, repo):
                 impact.hit(card.get("donnees", {}).get(path, ()), path)
                 continue
             impact.foundation.append(path)
@@ -401,6 +873,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
             _migration(card, impact, status, path, head, repo)
         else:
             _data(card, impact, status, path, repo)
+    #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
+    #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
+    #: exécuté au niveau module (relecture Codex, B2 résiduel).
+    _resolve_unmeasured(card, impact, modules, head, repo)
     return impact
 
 
@@ -416,6 +892,15 @@ def _version_line_only(head: str, base: str, repo: pathlib.Path) -> bool:
 def always_hits(changes: list[tuple[str, str]], always: list[str]) -> dict[str, str]:
     trigger = next((p for _, p in changes if p.startswith(ALWAYS_TRIGGERS)), None)
     return {m: f"always list ({trigger})" for m in always} if trigger else {}
+
+
+def psql_pr_modules(pilot: list[str], always: list[str]) -> list[str]:
+    """#749 : modules du pilote psql d'une PR, augmentes de la liste « always »
+    declenchee par le diff (contrat de base, baux et orphelins). Le pilote psql
+    d'une PR ne voit sinon que `tests/parts/pilote-psql.txt` : une regression
+    qu'il est le seul a voir, dans un module hors liste, attendait la suite
+    complete de main (rouge de release de l'incident #749)."""
+    return sorted(set(pilot) | set(always))
 
 
 def recent_failures(card: dict | None, now: datetime.datetime) -> dict[str, str]:
@@ -449,27 +934,83 @@ def textual(modules: list[str], files: list[str]) -> dict[str, str]:
 
 # -- the plan -------------------------------------------------------------
 
+def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
+    """Why the impacted-only selection would not be safe for this change
+    (L1211): the plan then runs the full suite rather than decide on a doubt."""
+    if impact is not None and impact.removed:
+        return f"file removed: {impact.removed[0]}"
+    if not out["sure"]:
+        return out["unsure"][0] if out["unsure"] else "selection unsure"
+    if age is None:
+        return "map without a generation date"
+    if age > PHASE2_MAX_AGE_H:
+        return f"map older than {PHASE2_MAX_AGE_H} h ({age:.0f} h)"
+    if impact is None:
+        return "selection unsure"
+    if impact.uncovered:
+        # #1339 : le bloc sans mesure ne force plus la suite complète dès
+        # qu'un test charge son fichier ; sans importateur *prouvé*, si — un
+        # import paresseux ou conditionnel ne prouve rien (Codex, B2 résiduel).
+        return (f"{len(impact.uncovered)} file(s) with unmeasured blocks no test "
+                f"is guaranteed to load: {impact.uncovered[0]}")
+    if impact.foundation:
+        return f"test infrastructure changed: {impact.foundation[0]}"
+    return "selection unsafe"
+
+
 def classify(modules: list[str], card: dict | None, now: datetime.datetime,
              base_fallback: str = "HEAD^1", head: str = "HEAD",
-             repo: pathlib.Path = REPO) -> dict:
+             repo: pathlib.Path = REPO, *, docs_only: bool = False) -> dict:
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
-    out = {"map": None, "sure": False, "phase2_safe": False, "unsure": [],
-           "untested": [], "unknown_blocks": [], "foundation": [], "changed": 0}
+    out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
+           "unsure": [], "contract": list(always),
+           "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
+           "importers": {}, "certified": {}, "uncovered": [], "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
                       "used": not problem, "problem": problem}
     impact = None
     if not problem:
-        changes = changed_files(card["commit"], head, repo)
+        # A documentation-only range has already been checked by nature().
+        # CI changes on its base do not belong to that range; use the map to
+        # find readers of its documents, not to rejudge the base's code.
+        diff_base = base_fallback if docs_only else card["commit"]
+        changes = changed_files(diff_base, head, repo)
         if changes is None:
-            problem = f"diff from map commit {card['commit'][:12]} unreadable"
+            kind = "documentation base" if docs_only else "map commit"
+            problem = f"diff from {kind} {diff_base[:12]} unreadable"
             out["map"]["used"], out["map"]["problem"] = False, problem
         else:
+            # #1314 : le range propre de la branche (base de fusion → tête)
+            # distingue ses changements de ceux déjà portés par la cible. Pour
+            # la voie documentation, `changes` est déjà ce range ; s'il est
+            # illisible ou non fiable (HEAD^1 hors commit de fusion), le doute
+            # du socle est conservé (repli sûr).
+            own_paths = ({path for _, path in changes} if docs_only
+                         else own_changes(base_fallback, head, repo))
             try:
-                impact = judge(card, changes, modules, head, repo)
+                impact = judge(card, changes, modules, head, repo, own=own_paths,
+                               own_base=base_fallback)
+                if docs_only:
+                    inherited = changed_files(card["commit"], base_fallback, repo)
+                    if inherited is None:
+                        raise ValueError("documentation base diff unreadable")
+                    baseline = judge(card, inherited, modules, base_fallback, repo)
+                    # Keep readers that changed on the base: the old map may
+                    # not yet record their new documentation dependencies.
+                    impact.p0.update(baseline.p0)
+                    for module, reason in baseline.p1.items():
+                        impact.p1.setdefault(module, reason)
+                    infrastructure = {f"test infrastructure changed: {path}"
+                                      for path in baseline.foundation}
+                    for reason in baseline.unsure:
+                        if reason not in infrastructure:
+                            impact.doubt(reason)
+                    if baseline.unknown_blocks or baseline.untested:
+                        impact.doubt("documentation base contains unmeasured code")
             except Exception as exc:  # any doubt: fallback, never a failed plan
                 problem = f"map unusable ({type(exc).__name__}: {exc})"
                 out["map"]["used"], out["map"]["problem"] = False, problem
@@ -490,13 +1031,20 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 classes[m] = ("P1", p1[m])
         out.update(unsure=impact.unsure, untested=impact.untested,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
+                   removed=impact.removed, importers=impact.importers,
+                   certified=impact.certified, uncovered=impact.uncovered,
                    sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
-                              and not impact.unknown_blocks and not impact.foundation
-                              and not impact.untested)
+                              and not impact.uncovered and not impact.foundation
+                              and not impact.removed)
     changes = changes or []
     out["changed"] = len(changes)
-    for m, r in always_hits(changes, always).items():
+    out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
+    triggered = always_hits(changes, always)
+    #: #749 : la liste declenchee est publiee pour que le pilote psql d'une PR
+    #: la rejoigne (make_plan), au lieu d'attendre la suite complete de main.
+    out["always"] = sorted(triggered)
+    for m, r in triggered.items():
         if classes.get(m, ("P3",))[0] not in ("P0", "P1"):
             classes[m] = ("P1", r)
     for m, r in recent_failures(card, now).items():
@@ -537,11 +1085,104 @@ def split(modules: list[str], driver: str, n: int, card: dict | None,
     return result
 
 
-def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
-           repo: pathlib.Path = REPO) -> dict:
-    """Version-only or documentation-only pull request (L157, L161a)."""
-    out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
+def _branch(ref: str | None) -> str:
+    """A branch name, from `GITHUB_BASE_REF`/`GITHUB_HEAD_REF` or `refs/heads/…`."""
+    ref = ref or ""
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
+def _env_ref(name: str, value: str | None) -> str:
+    """The explicit branch ref, or the environment's (`GITHUB_*`)."""
+    return os.environ.get(name, "") if value is None else value
+
+
+def release_pr(base_ref: str | None = None, head_ref: str | None = None) -> str:
+    """Why this pull request is a release one (canon §3), or "".
+
+    A source or target branch under `release/**` or `integration/**` is a
+    release PR: the full suite, both drivers, no version/documentation fast
+    lane and no psql pilot list — the target of a lot PR, `main`, keeps the
+    selection. The reason goes to the plan and the summary.
+    """
+    for role, ref in (("target", _branch(base_ref)), ("source", _branch(head_ref))):
+        if ref.startswith(RELEASE_PREFIXES):
+            return (f"{role} branch {ref}: release/** and integration/** run the "
+                    f"full suite (canon §3)")
+    return ""
+
+
+def lot_selection(event: str, state: dict, modules: list[str],
+                  classes: dict[str, tuple[str, str]],
+                  release: str = "") -> tuple[list[str] | None, str]:
+    """Modules a lot branch runs (L1211): impacted plus contract.
+
+    `None` means the full suite: an event other than a pull request, a
+    release pull request (`release`, `release_pr`), or any doubt the plan
+    cannot decide through — no usable map, a selection that is not safe
+    (stale map, unmeasured blocks no test is guaranteed to load, test
+    infrastructure, a removed file), an empty contract list. The reason goes
+    to the summary.
+    """
     if event != "pull_request":
+        return None, "main, release/** and the integration branch run the full suite"
+    if release:
+        return None, release
+    contract = [m for m in state.get("contract", []) if m in modules]
+    if not contract:
+        return None, "contract list (tests/parts/toujours.txt) empty or unreadable"
+    if not (state.get("map") and state["map"].get("used")):
+        unsure = state.get("unsure") or ["no map"]
+        return None, f"map not usable ({unsure[0]})"
+    if not state.get("phase2_safe"):
+        return None, f"selection unsure ({state.get('phase2_why') or 'no reason'})"
+    return sorted({m for m in modules if classes[m][0] in ("P0", "P1")}
+                  | set(contract)), ""
+
+
+def lot_part_count(driver: str, modules: list[str], card: dict | None) -> int:
+    """Parts of a lot branch for `driver` (L1211): one, plus one per
+    `PR_TARGET_PART_S` of estimate; `make_plan` caps it at `PARTS`."""
+    if not modules:
+        return 1
+    estimate = sum(weights(modules, driver, card).values())
+    return max(1, math.ceil(estimate / PR_TARGET_PART_S))
+
+
+#: the branch whose documentation-only pushes take the fast lane (L161a)
+DOC_PUSH_REF = "main"
+#: git's null object id: `github.event.before` of a branch created by the push
+NULL_SHA = "0" * 40
+
+
+def pushed_range(base: str, head: str, repo: pathlib.Path = REPO) -> bool:
+    """True if `base` is the tip before a push to `head` (fast-forward).
+
+    `github.event.before` on a branch created by the push is the null sha,
+    and a rewritten history leaves a tip that is not an ancestor: both keep
+    the full suite."""
+    if base in ("", NULL_SHA) or not re.fullmatch(r"[0-9a-fA-F]{40}", base):
+        return False
+    return is_ancestor(base, head, repo)
+
+
+def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
+           repo: pathlib.Path = REPO, ref: str = "") -> dict:
+    """Version-only pull request (L157), documentation-only change (L161a).
+
+    On a push, `base` is the tip before the push (`github.event.before`), so
+    the diff covers every pushed commit. Only a push to `main` takes the
+    documentation lane: a push to a release branch keeps the full suite, and
+    version-only stays a pull-request rule (a pushed version always runs)."""
+    out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
+    if event == "push":
+        if ref.removeprefix("refs/heads/") != DOC_PUSH_REF:
+            out["why"] = f"push to {ref or 'an unknown ref'}: full suite"
+            return out
+        if not pushed_range(base, head, repo):
+            out["why"] = ("pushed range unknown (new branch or rewritten history): "
+                          "full suite")
+            return out
+    elif event != "pull_request":
         return out
     try:
         names = _git(repo, "diff", "--name-only", "--no-renames", base, head).splitlines()
@@ -549,9 +1190,11 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     except (OSError, subprocess.CalledProcessError) as exc:
         out["why"] = f"diff unreadable ({exc})"
         return out
-    out["version_only"], why = version_only.version_only(names, patch)
+    version_why = ""
+    if event == "pull_request":
+        out["version_only"], version_why = version_only.version_only(names, patch)
     out["docs_only"], doc_why = version_only.docs_only(names)
-    out["why"] = why if out["version_only"] else doc_why
+    out["why"] = version_why if out["version_only"] else doc_why
     out["files"] = names
     return out
 
@@ -572,23 +1215,36 @@ def doc_readers(classes: dict, card: dict,
 
 
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
-              head: str = "HEAD", repo: pathlib.Path = REPO) -> dict:
+              head: str = "HEAD", repo: pathlib.Path = REPO,
+              base: str = "HEAD^1", ref: str = "",
+              base_ref: str | None = None, head_ref: str | None = None) -> dict:
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
-            "tested": _rev(head, repo), **nature(event, head=head, repo=repo)}
-    plan.update(classify(modules, card, now, head=head, repo=repo))
+            "tested": _rev(head, repo), "release": release,
+            "refs": {"base": base_ref, "head": head_ref},
+            **nature(event, base=base, head=head, repo=repo, ref=ref)}
+    plan.update(classify(modules, card, now, base_fallback=base, head=head, repo=repo,
+                         docs_only=bool(plan["docs_only"] and not release)))
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
+    #: #749 : modules « always » declenches par le diff (contrat de base, baux
+    #: et orphelins), a rejoindre au pilote psql sur une PR.
+    always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
-    if plan["docs_only"]:
-        # the fast lane needs a map that judged everything: a missing, stale or
-        # unusable map, or an unsure selection, runs the full suite
+    if plan["docs_only"] and not release:
+        # The fast lane needs a usable map and a sure judgement of the actual
+        # documentation range. Missing readers or a bad map keep the full suite.
         full = None
         if not (plan["map"] and plan["map"]["used"]):
-            full = f"documentation, map not usable ({plan['unsure'][0]}): full suite"
+            reason = next(iter(plan["unsure"]), "map unusable")
+            full = f"documentation, map not usable ({reason}): full suite"
         elif not plan["sure"]:
-            full = f"documentation, selection unsure ({plan['unsure'][0]}): full suite"
+            reason = next(iter(plan["unsure"]), "selection unsure")
+            full = f"documentation, selection unsure ({reason}): full suite"
         else:
             plan["doc_readers"], db_readers = doc_readers(plan["classes"], card, modules)
             if db_readers:  # doc-readers has no Postgres: the full parts run them
@@ -596,21 +1252,47 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
                         f"({', '.join(db_readers)}): full suite")
         if full:
             plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
+    if release:
+        #: canon §3 : une PR de release passe la suite complète, les deux
+        #: pilotes, sans voie version seule ni documentation seule.
+        plan["version_only"] = plan["docs_only"] = False
+        plan["doc_readers"] = []
+        plan["why"] = release
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
+    #: L1211 : la sélection impactés+contrat est réservée aux PR de lot ; une
+    #: PR de release garde la suite complète, y compris dans le repli.
+    lot_pr = pr and not release
+    #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
+    #: tout doute rend la suite complète (lot_selection). La sélection se
+    #: contente d'une part par pilote tant que l'estimation le permet.
+    selection, why = ((None, "") if skip
+                      else lot_selection(event, plan, modules, classes, release))
+    chosen_set = None if selection is None else set(selection)
+    contract = [m for m in plan.get("contract", []) if m in modules]
     plan["parts"] = {}
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
-        if driver == "psql" and pr:
-            selected = read_list(PILOT_FILE, modules, required=True)
-        plan["parts"][driver] = [] if skip else split(
-            selected, driver, n_pr if pr else n_other, card, classes)
+        if driver == "psql" and lot_pr:
+            selected = psql_pr_modules(read_list(PILOT_FILE, modules, required=True),
+                                       always)
+        if chosen_set is not None:
+            selected = [m for m in selected if m in chosen_set]
+        n = n_pr if lot_pr else n_other
+        if chosen_set is not None:
+            n = min(n, lot_part_count(driver, selected, card))
+        plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
     every = [m for m in modules]
     weighed = weights(every, "psycopg", card)
     chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
-    plan["selection"] = {"modules": len(every), "impacted": len(chosen),
-                         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
-                         "total_estimate_s": round(sum(weighed.values()), 1)}
+    ran = sorted({m for ps in plan["parts"].values() for p in ps for m in p["modules"]})
+    plan["selection"] = {
+        "mode": "skipped" if skip else ("impacted" if chosen_set is not None else "full"),
+        "why": plan["why"] if skip else why,
+        "modules": len(every), "impacted": len(chosen), "contract": len(contract),
+        "selected": len(ran), "skipped": len(every) - len(ran),
+        "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
+        "total_estimate_s": round(sum(weighed.values()), 1)}
     return plan
 
 
@@ -621,25 +1303,37 @@ def _rev(rev: str, repo: pathlib.Path) -> str:
         return ""
 
 
-def fallback_plan(event: str, error: str) -> dict:
+def fallback_plan(event: str, error: str, base_ref: str | None = None,
+                  head_ref: str | None = None) -> dict:
     """The plan when planning itself failed: full suite, alphabetical order."""
-    modules = parts.modules()
+    base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
+    head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
+    release = release_pr(base_ref, head_ref) if event == "pull_request" else ""
     pr = event == "pull_request"
+    #: L1211 : le repli d'une PR de release garde les deux pilotes complets,
+    #: jamais la liste pilote psql d'une PR de lot.
+    lot_pr = pr and not release
+    why = "planning failed" + (f"; {release}" if release else "")
+    modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
-            "version_only": False, "docs_only": False, "why": "planning failed",
-            "map": None, "sure": False, "phase2_safe": False,
+            "version_only": False, "docs_only": False, "why": why,
+            "release": release, "refs": {"base": base_ref, "head": head_ref},
+            "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
-            "unknown_blocks": [], "foundation": [], "changed": 0, "doc_readers": [],
-            "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+            "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
+            "importers": {}, "certified": {}, "uncovered": [],
+            "doc_readers": [],
+            "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
-        n = n_pr if pr else n_other
+        n = n_pr if lot_pr else n_other
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
-             "pilot_list": driver == "psql" and pr, "estimate_s": 0}
+             "pilot_list": driver == "psql" and lot_pr, "estimate_s": 0}
             for i in range(1, n + 1)]
-    plan["selection"] = {"modules": len(modules), "impacted": 0, "impacted_estimate_s": 0,
-                         "total_estimate_s": 0}
+    plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
+                         "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,
+                         "impacted_estimate_s": 0, "total_estimate_s": 0}
     return plan
 
 
@@ -684,9 +1378,19 @@ def summary(plan: dict) -> str:
     lines.append(f"* {plan['changed']} file(s) changed since the "
                  f"{'map commit' if m and m['used'] else 'parent commit'}; impacted (P0, P1): "
                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
-                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg); phase 1: nothing skipped")
-    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; phase 2 safe: "
-                 f"{'yes' if plan['phase2_safe'] else 'no'}")
+                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
+    if sel.get("mode") == "impacted":
+        lines.append(f"* lot branch (L1211): impacted + {sel['contract']} contract module(s), "
+                     f"{sel['selected']} module(s) run, {sel['skipped']} left to main, "
+                     f"release/** and the integration branch")
+    elif sel.get("mode") == "skipped":
+        lines.append("* parts skipped (see above)")
+    else:
+        lines.append(f"* full suite: {sel['selected']} module(s) run"
+                     + (f" ({sel['why']})" if sel.get("why") else ""))
+    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; impacted-only safe: "
+                 f"{'yes' if plan['phase2_safe'] else 'no'}"
+                 + (f" ({plan['phase2_why']})" if plan.get("phase2_why") else ""))
     for reason in plan["unsure"][:SUMMARY_LIMIT]:
         lines.append(f"  * {reason}")
     by_class = collections.defaultdict(list)
@@ -702,6 +1406,17 @@ def summary(plan: dict) -> str:
     if plan["unknown_blocks"]:
         lines.append("* new blocks, unknown to the map: " + _listing(
             [f"`{b}`" for b in plan["unknown_blocks"]]))
+    if plan.get("certified"):
+        lines.append("* unmeasured blocks covered by their importers: " + _listing(
+            [f"`{f}` ({len(ms)} module(s))" for f, ms in sorted(plan["certified"].items())]))
+    if plan.get("uncovered"):
+        files = []
+        for f in plan["uncovered"]:
+            candidates = plan.get("importers", {}).get(f, [])
+            files.append(f"`{f}`" + (f" (candidates: {', '.join(f'`{m}`' for m in candidates)})"
+                                     if candidates else ""))
+        lines.append("* **unmeasured blocks no test is guaranteed to load** (full suite): "
+                     + _listing(files))
     return "\n".join(lines) + "\n"
 
 
@@ -821,6 +1536,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--map", help="carte.json.gz (scripts/map.py)")
     p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
+    p.add_argument("--base", default="HEAD^1",
+                   help="tip before a push (github.event.before); HEAD^1 by default, "
+                        "the first parent of a pull request's merge commit")
+    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                   help="github.ref; a documentation-only push takes the fast lane "
+                        "on main only")
+    p.add_argument("--base-ref", default=None,
+                   help="target branch of a pull request (default: $GITHUB_BASE_REF)")
+    p.add_argument("--head-ref", default=None,
+                   help="source branch of a pull request (default: $GITHUB_HEAD_REF)")
     p.add_argument("--github-output", help="appends the job outputs to this file")
     p.add_argument("--summary", help="appends the Markdown summary to this file")
     p.add_argument("--annotations", action="store_true",
@@ -839,10 +1564,12 @@ def main(argv: list[str] | None = None) -> int:
         if card is None and args.map:
             print(f"map: {why}", file=sys.stderr)
         try:
-            plan = make_plan(args.event, card)
+            plan = make_plan(args.event, card, base=args.base, ref=args.ref,
+                             base_ref=args.base_ref, head_ref=args.head_ref)
         except Exception as exc:  # planning must never block the suite
             print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
-            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}")
+            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}",
+                                 base_ref=args.base_ref, head_ref=args.head_ref)
         pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
                                           + "\n", encoding="utf-8")
         if args.github_output:
