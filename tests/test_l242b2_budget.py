@@ -17,7 +17,7 @@ from unittest import mock
 from ameesh import (account_turn, accounts, alert_briefs, budget, config, cost, exploitation,
                     notify, progress, registry, storage)
 
-from .support import PgTestCase
+from .support import EMPTY_CONFIG, PgTestCase
 from .test_l242b_critical_accounts import _Comptes
 from .test_l30_accounts import _Base as _L30Base, _codex_rollout
 
@@ -92,11 +92,15 @@ class ReserveForfaitTest(_Comptes):
 
 
 class DebutDeFenetreTest(unittest.TestCase):
-    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début
-    (décision du propriétaire du 2026-10-13, option b : « pas de réserve sur
-    une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »), et
-    la pause annonce l'heure où le rythme rattrape l'usage, pas la remise à
-    zéro (remarque de l'auditeur)."""
+    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début.
+    Décision du propriétaire du 2026-10-13, option b : « pas de réserve sur une
+    fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) » — cet
+    énoncé décrit le début de fenêtre, qui s'entend `multiplier × écoulé` face
+    à la marge (`multiplier = 1`, `reserve = 10` ici : à 8 % d'écoulé avec
+    `multiplier = 2` le seuil vaut 16 %, pas 10 % — #1028 P3) ; en fin de
+    fenêtre le seuil vaut `PACE_CEILING − réserve` (80 %), il ne suit plus
+    `max(écoulé, marge)` (#1028 N1). La pause annonce l'heure où le rythme
+    rattrape l'usage, pas la remise à zéro (remarque de l'auditeur)."""
 
     SEPT_JOURS = 7 * 86400.0
 
@@ -302,13 +306,13 @@ class PartDuPlafondHoraireTest(_Paye):
         self.assertIn("(cap 20.00 $)", self.book.over("ds"))
 
     def test_configuration(self):
-        cfg = config.load({"AMEESH_CONFIG": "/nonexistent"})
+        cfg = config.load({"AMEESH_CONFIG": EMPTY_CONFIG})
         self.assertEqual(cfg.noncritical_hourly_share, 0.75)
-        cfg = config.load({"AMEESH_CONFIG": "/nonexistent",
+        cfg = config.load({"AMEESH_CONFIG": EMPTY_CONFIG,
                            "AMEESH_NONCRITICAL_HOURLY_SHARE": "0.5"})
         self.assertEqual(cfg.noncritical_hourly_share, 0.5)
         for wrong in ("2", "-0.1", "x"):
-            cfg = config.load({"AMEESH_CONFIG": "/nonexistent",
+            cfg = config.load({"AMEESH_CONFIG": EMPTY_CONFIG,
                                "AMEESH_NONCRITICAL_HOURLY_SHARE": wrong})
             self.assertEqual(cfg.noncritical_hourly_share, 0.75, wrong)
 

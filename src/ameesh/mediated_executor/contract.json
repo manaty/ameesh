@@ -4051,6 +4051,7 @@
    ],
    "mailbox": [
     "dead_letters",
+    "expire_dead_letters",
     "forward",
     "history",
     "human_messages",

@@ -13,6 +13,12 @@ sous-utilisation se trompaient et la frise restait vide.
   assigné s'il ne l'est pas déjà, par l'attribution gardée (L37). Un lot
   qui appartient à un AUTRE agent n'est jamais repris en silence : le
   courrier d'un relecteur sur le lot de l'auteur ne doit pas le lui voler.
+  #859 : un lot DÉJÀ assigné à un agent ne se réattribue que sur un rôle
+  déclaré (canon ou `AMEESH_ALERT_ORCHESTRATORS`, `is_orchestrator` avec
+  `history=False`) ou d'un humain ; l'historique de distribution (L94) ne
+  suffit pas — un agent qui a confié un lot ne peut pas, par un `--lot`,
+  donner le sien ni celui d'un autre. Un lot SANS assigné reste
+  distribuable par l'historique (le bureau distribue ainsi, canon §4).
 * `--new-lot "titre"` : crée le lot, assigné au destinataire, en un geste.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
@@ -71,6 +77,23 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
         return False
 
 
+def _may_reassign(cfg, db, sender: str) -> bool:
+    """#859 : qui peut réattribuer par courrier un lot DÉJÀ assigné à un agent.
+    Un humain (préfixe `human:` ou nom connu de la configuration ou du canon),
+    ou un agent dont le RÔLE est déclaré orchestrateur (fiche du canon,
+    `AMEESH_ALERT_ORCHESTRATORS`). L'historique de distribution (L94) ne suffit
+    pas : sinon tout agent ayant confié un lot reprendrait ceux des autres."""
+    name = (sender or "").strip()
+    if name.startswith(work_mod.HUMAN_PREFIX):
+        return True
+    try:
+        if work_mod.known_human(db, name, cfg):
+            return True
+    except Exception:
+        pass
+    return is_orchestrator(cfg, db, name, history=False)
+
+
 def resolve_lot(db, ref: str) -> dict | None:
     """Le lot OUVERT désigné par `ref` : son numéro (`12`, `#12`), sinon une
     référence unique (issue, fiche du plan, branche, premier mot du titre).
@@ -95,7 +118,8 @@ def resolve_lot(db, ref: str) -> dict | None:
 
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
-                 estimate=None, app: str | None = None, new_project: bool = False) -> dict:
+                 estimate=None, app: str | None = None, new_project: bool = False,
+                 parent_lot: int | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
@@ -106,11 +130,16 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
-    déposé), un avertissement pour un humain."""
+    déposé), un avertissement pour un humain.
+    #1193: `parent_lot` is the explicit parent of the suite lot created by
+    `new_lot` — the blocking edge is written together with the creation
+    (refused without `new_lot`)."""
     out = {"lot": None, "work_item_id": lot, "assigned": False, "created": False,
            "branch": None, "warnings": [], "orchestrator": False}
     if recipient == "all" or ":" in recipient:
         return out
+    if parent_lot is not None and new_lot is None:
+        raise AssignmentError("--parent-lot goes with --new-lot (the parent of the suite)")
     if new_lot is None:
         # le cas courant (aucune option, destinataire déjà sur un lot) ne lit
         # rien d'autre : la détection d'un orchestrateur peut lire le canon
@@ -152,7 +181,7 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
                           if new_project and app is not None else "")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
                                 source="mail", app=project, cfg=cfg, branch=branch,
-                                estimate=minutes, note=introduced)
+                                estimate=minutes, note=introduced, parent_lot=parent_lot)
             out.update(created=True, assigned=True, branch=item.get("branch"))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))
@@ -165,7 +194,22 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             else:
                 current = (item.get("assignee") or "").strip()
                 if current != recipient:
-                    if current and current != sender \
+                    # #859 : un lot déjà tenu par un AGENT ne se réattribue
+                    # par un `--lot` que sur un rôle déclaré (ou d'un humain).
+                    # L'historique de distribution (L94) ne donne que le droit
+                    # de confier un lot encore libre ; il ne permet pas de
+                    # donner le sien ni de reprendre celui d'un autre.
+                    bloque = (bool(current)
+                              and not current.startswith(work_mod.HUMAN_PREFIX)
+                              and not _may_reassign(cfg, db, sender))
+                    if bloque:
+                        out["warnings"].append(
+                            "lot #%d is already assigned to %s: not reassigned to %s "
+                            "by mail (--lot hands an unassigned lot; to hand it "
+                            "over: ameesh work assign %d %s)"
+                            % (int(item["id"]), current, recipient, int(item["id"]),
+                               recipient))
+                    elif current and current != sender \
                             and not current.startswith(work_mod.HUMAN_PREFIX):
                         out["warnings"].append(
                             "lot #%d belongs to %s: not reassigned to %s (to "

@@ -50,6 +50,10 @@ class MedieBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l109-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        self.config_vide = os.path.join(self.tmp, "config-vide.json")
+        with open(self.config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         self.cfg = dataclasses.replace(
             config_mod.Config(), backend="mediated", exec_url="https://mesh.exemple",
             state_dir=os.path.join(self.tmp, "etat"), v0_state=os.path.join(self.tmp, "v0"),
@@ -159,7 +163,7 @@ class GardesTest(MedieBase):
     def test_register_refuse(self):
         from ameesh import runner as runner_mod
         env = {"AMEESH_BACKEND": "mediated", "AMEESH_EXEC_URL": "https://mesh.exemple",
-               "AMEESH_CONFIG": os.path.join(self.tmp, "absent.json")}
+               "AMEESH_CONFIG": self.config_vide}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(runner_mod.main(["register", "x", "dsh"]), 2)
 
@@ -214,6 +218,23 @@ class BailEtPanneTest(MedieBase):
         self.db.book.hold("inge-front", runner.runner_id, 42)
         agent = {"name": "inge-front", "harness": "dsh", "cwd": self.tmp, "status": "queued"}
         return AgentWorker(runner, agent, lease)
+
+    def test_reglement_sans_reservation_locale_ne_bloque_pas_le_marqueur(self):
+        """#1469 : le backend médié n'a pas d'enveloppe de compte locale."""
+        worker = self._worker()
+        # r2 : le marqueur n'est effacé que s'il est encore celui de ce tour
+        self.responder.script["pending_spend.get"] = {
+            "agent": "inge-front", "start_index": 0, "turn": "prompt", "model": "m",
+            "created_ts": 123.0}
+        self.responder.script["pending_spend.clear"] = True
+        usage = types.SimpleNamespace(reread_tokens=0, session=None)
+        with mock.patch("ameesh.cost.CostBook") as book:
+            book.return_value.record.return_value = usage
+            self.assertTrue(worker._compta_ecrit({
+                "start": 0, "created_ts": 123.0, "turn": "prompt", "model": "m"}))
+        self.assertFalse(worker._compta_en_echec)
+        self.assertIn("pending_spend.clear", self.transport.ops())
+        self.assertFalse(any(op.startswith("budgets.") for op in self.transport.ops()))
 
     def test_provider_health_stays_on_the_relay_server(self):
         worker = self._worker()
@@ -344,8 +365,12 @@ class SessionTest(unittest.TestCase):
         self.responder = self.server.responder
         self.responder.script["leases.state"] = {
             "lease_owner": OWNER, "lease_epoch": 42, "status": "running", "live": True}
+        #: config VIDE mais existante : un chemin explicite absent est refusé (#1127)
+        config_vide = os.path.join(self.tmp, "config-vide.json")
+        with open(config_vide, "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
         env = {
-            "AMEESH_CONFIG": os.path.join(self.tmp, "absent.json"),
+            "AMEESH_CONFIG": config_vide,
             "AMEESH_STATE": os.path.join(self.tmp, "etat"),
             "AGENT_MAIL_STATE": os.path.join(self.tmp, "v0"),
             "AGENT_MAIL_CONFIG": os.path.join(self.tmp, "conf"),
