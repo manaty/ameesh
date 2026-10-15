@@ -22,7 +22,8 @@
 #               sur main, release/**, integration/** ou validation/** et
 #               hors tête de PR ouverte, #1635) et sur l'appel du portier
 #               de paquet (workflow_call).
-# Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+# Le job final « tests » agrège les parts : c'est le nom de vérification stable
+# hors lancement manuel, qui publie « tests (dispatch) » (#1635).
 #
 # §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
 # `pull_request` de sa PR porte le check requis `tests` ; le portier
@@ -734,7 +735,9 @@ jobs:
   # #748 : la part « autre système de fichiers », quand elle tourne — release
   # ou exécution à la main — compte comme les autres)
   tests:
-    name: tests
+    # Une PR peut être ouverte sur ce SHA après la garde ou la fin du run :
+    # un dispatch ne doit jamais publier le contexte requis de cette PR.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests' }}
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}

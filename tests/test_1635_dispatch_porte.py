@@ -10,7 +10,9 @@ seul check `tests` (success) du commit 859e0658, un commit de la PR #923.
 Le job `plan` refuse donc un lancement à la main hors main, release/**,
 integration/** et validation/** (étape avant checkout), puis sur un commit qui
 est la tête d'une PR ouverte (scripts/dispatch-guard.py) ; le refus fait
-échouer `plan`, et l'agrégat `tests` rougit. Ces témoins rejouent le script
+échouer `plan`, et l'agrégat rougit. Un dispatch publie en outre un contexte
+distinct, même si une PR est ouverte sur ce SHA après la garde ou le run.
+Ces témoins rejouent le script
 exact de l'étape sous `bash -e`, le script de garde avec une API simulée, et
 l'agrégat de #940 : aucun accès réseau, aucune base, aucune suite.
 """
@@ -48,6 +50,15 @@ REFUSED = ("refs/heads/lot/1635-dispatch-porte", "refs/heads/main2",
 
 def workflow() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def aggregate_name(event: str) -> str:
+    name = workflow().split("\n  tests:\n", 1)[1].split("    name: ", 1)[1].splitlines()[0]
+    if not name.startswith("${{"):
+        return name
+    expression = name[3:-2].strip().replace("github.event_name", "event_name")
+    expression = expression.replace("&&", "and").replace("||", "or")
+    return eval(expression, {"__builtins__": {}}, {"event_name": event})
 
 
 def step(name: str) -> str:
@@ -114,7 +125,7 @@ class WorkflowStepsTest(unittest.TestCase):
                 self.assertEqual(run_ref_step(ref).returncode == 0, guard.ref_admitted(ref))
         self.assertFalse((REPO / "pwned").exists())
 
-    def test_a_failed_plan_reddens_the_required_check(self):
+    def test_a_failed_plan_reddens_the_aggregate(self):
         self.assertIn('test "${{ needs.plan.result }}" = success',
                       workflow()[workflow().index("\n  tests:\n"):])
 
@@ -188,6 +199,18 @@ class RequiredCheckTest(unittest.TestCase):
 
     def test_without_guard_the_dispatch_was_green(self):
         self.assertEqual(self.aggregate("success"), 0)
+
+    def test_dispatch_before_a_pr_opens_cannot_publish_its_required_context(self):
+        # La PR peut être ouverte après la garde (ou après la fin du run).
+        ok, why = guard.check(ADMITTED[3], SHA, "manaty/ameesh", "t", api([]))
+        self.assertTrue(ok, why)
+        self.assertEqual(self.aggregate("success"), 0)
+        self.assertNotEqual(aggregate_name("workflow_dispatch"), "tests")
+
+    def test_pr_and_push_keep_the_required_context(self):
+        for event in ("pull_request", "push"):
+            with self.subTest(event=event):
+                self.assertEqual(aggregate_name(event), "tests")
 
     def test_lot_branch_dispatch_is_red(self):
         ref_ok = run_ref_step("refs/heads/lot/1211-ci-impactes-contrat").returncode == 0
