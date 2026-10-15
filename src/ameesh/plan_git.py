@@ -20,7 +20,9 @@ qui a un tel gel, la fusion est constatée, dans cet ordre :
 1. **ancêtre** : le commit du dernier gel est ancêtre de la branche cible —
    sauf si un revert postérieur en a annulé le contenu (#1825 : un paquet
    fusionné puis retiré par `git revert` laisse la tête ancêtre de la cible
-   alors que le contenu n'y est plus) ;
+   alors que le contenu n'y est plus). Détection au mieux : un revert hors
+   de la fenêtre lue (MAX_REVERT_SCAN) ou sans `patch-id --verbatim` n'est
+   pas vu, et l'ancêtre ferme alors comme avant #1825 ;
 2. **patch-id exact** (rebase, cherry-pick) : chaque commit du gel absent
    de la cible (`cible..gel`, hors fusions) a son `git patch-id --verbatim`
    parmi ceux des commits de la cible depuis leur base commune ; ou
@@ -70,7 +72,8 @@ class _NoVerbatim(Exception):
 PATCH_ID = ("patch-id", "--verbatim")
 
 #: #1825 : commits lus au plus après un gel, à la recherche d'un revert (borne
-#: de coût) ; plus ancien, un revert n'est pas vu — jamais de fermeture à tort
+#: de coût) ; plus ancien, un revert n'est pas vu et la preuve d'avant #1825
+#: (ancêtre, patch-id) ferme le lot : un faux positif reste possible
 MAX_REVERT_SCAN = 200
 #: `git revert` écrit « This reverts commit <sha>. » — et, pour une fusion,
 #: « This reverts commit <sha>, reversing changes made to <parent>. » (la
@@ -249,9 +252,11 @@ def _effective_revert(repo: str, since: str, ref: str, carries) -> dict | None:
     <sha>`), si son diff annule exactement l'apport de ce commit (patch-id) et
     si aucun commit postérieur ne réapplique cet apport. Rend
     `{ref, undone, detail}`, ou None. La lecture est bornée à
-    MAX_REVERT_SCAN commits (les plus récents) : au-delà, on ne conclut pas —
-    même silence qu'avant #1825, jamais une fermeture à tort. Sans
-    `patch-id --verbatim` (git < 2.40), aucun revert n'est retenu."""
+    MAX_REVERT_SCAN commits (les plus récents). None ne prouve PAS l'absence
+    de revert : au-delà de la borne, ou sans `patch-id --verbatim` (git <
+    2.40, aucun revert n'est retenu), l'appelant retombe sur sa preuve
+    d'avant #1825 (ancêtre, patch-id, citation) et peut fermer à tort un lot
+    annulé — détection au mieux, pas une garantie."""
     out = _out(repo, "log", "--format=%H%x00%B%x1e",
                "--max-count=%d" % MAX_REVERT_SCAN, "%s..%s" % (since, ref))
     for record in (out or "").split("\x1e"):
