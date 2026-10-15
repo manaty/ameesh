@@ -730,7 +730,6 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
         if startable and blocked:
             parts.append("Waiting for a prerequisite: %s." % waiting_text(blocked))
         if startable or not lots:
-            # #1026 : la prise d'un lot sans assigné passe par --claim.
             parts.append("Give them work tied to a lot: ameesh mail send <agent> "
                          "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
                          "<agent> --claim.")
