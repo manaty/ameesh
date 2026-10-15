@@ -58,6 +58,37 @@ class DestinationTest(unittest.TestCase):
                 card(canon.HostPolicy(work_root='/two'))])
 
 
+class HookReservationPagingTest(unittest.TestCase):
+    def test_reserved_prefix_does_not_hide_available_mail(self):
+        for projects, reserved, bound, cap in [(['alpha'], 2, 2, None),
+                                              (['alpha', 'beta'], 200, 2, None),
+                                              (['alpha'], 199, 2, None),
+                                              (['alpha', 'beta'], 200, 2, 200)]:
+            with self.subTest(projects=projects, reserved=reserved, cap=cap):
+                rows = [dict(id=i, work_item_id='') for i in range(1, reserved + 3)]
+                active = set(range(1, reserved + 1))
+
+                def reserve(*args, ids, limit, **kwargs):
+                    selected = [row for row in rows
+                                if row['id'] in ids and row['id'] not in active][:limit]
+                    active.update(row['id'] for row in selected)
+                    return selected
+
+                bk = SimpleNamespace(kind='pg', db=object())
+                binding = SimpleNamespace(bound_to_lease=False)
+                remise = cli._Remise(None, bk, 'worker', binding)
+                with mock.patch.object(registry, 'get', return_value=dict(
+                        name='worker', projects=projects)), \
+                        mock.patch.object(canon, 'load_configured', return_value=[]), \
+                        mock.patch.object(mail, 'unread', side_effect=lambda db, name, limit:
+                                          rows[:min(limit, cap or limit)]), \
+                        mock.patch.object(mail, 'reserve', side_effect=reserve), \
+                        mock.patch.object(mail, 'normalize', side_effect=lambda row: row):
+                    self.assertEqual([row['id'] for row in remise.prendre(bound)],
+                                     [] if cap else [reserved + 1, reserved + 2])
+                self.assertEqual(remise.ouverte, cap is None)
+
+
 class RoutingTest(sessions._Base):
     _env = sessions.RoutageTest._env
     tour = sessions.RoutageTest.tour

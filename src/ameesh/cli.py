@@ -659,17 +659,22 @@ class _Remise:
                 self.msgs = self.msgs[:max(0, limite)]
             return self.msgs
         borne = 200 if limite is None else max(1, limite)
-        ids = self._deliverable(borne)
-        if not ids:
-            self.msgs = []
-            return self.msgs
-        # Tous les candidats lus sont passés : une réservation active est
-        # écartée par le SQL avant sa borne, elle ne mange pas la place (#811 R3).
-        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=borne)
-        self.ouverte = bool(rows)
-        self.msgs = [mail.normalize(row) for row in rows]
+        besoin, lus = borne, 0
+        self.msgs = []
+        while len(self.msgs) < borne:
+            ids = self._deliverable(besoin)
+            if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
+                break
+            lus = len(ids)
+            # Les réservations actives (y compris celles de notre jeton) sont
+            # écartées avant la LIMIT SQL. Compléter depuis une page plus large
+            # si elles occupaient le préfixe lu, même en mono-projet (#811 R3).
+            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                                ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                                limit=borne - len(self.msgs))
+            self.msgs.extend(mail.normalize(row) for row in rows)
+            self.ouverte = bool(self.msgs)
+            besoin = max(mail.UNREAD_LIMIT, besoin * 2, lus * 2)
         return self.msgs
 
     def _deliverable(self, borne: int) -> list[int]:
