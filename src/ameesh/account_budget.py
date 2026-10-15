@@ -52,8 +52,21 @@ def billing_of(profile) -> str:
     return (getattr(profile, "billing_account", "") or "") if profile is not None else ""
 
 
-def _until(reset_ts) -> str:
-    return time.strftime("%H:%M", time.localtime(float(reset_ts))) if reset_ts else "?"
+def moment(ts, tz, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """An instant read in the ACCOUNT's zone (a UTC host must still say the
+    reset is at 00:00 Paris); the host's zone only if `tz` is unknown here."""
+    if not ts:
+        return "—"
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(float(ts), ZoneInfo(tz or DEFAULT_TZ)).strftime(fmt)
+    except Exception:  # noqa: BLE001 - zone unknown to this host
+        return time.strftime(fmt, time.localtime(float(ts)))
+
+
+def _until(reset_ts, tz=None) -> str:
+    return moment(reset_ts, tz, "%H:%M") if reset_ts else "?"
 
 
 def used(row: dict) -> float:
@@ -62,7 +75,8 @@ def used(row: dict) -> float:
 
 def exhausted_reason(account: str, row: dict) -> str:
     return "account %s %.2f/%.2f $ (calendar day %s) until %s" % (
-        account, used(row), float(row["usd"]), row["tz"], _until(row.get("reset_ts")))
+        account, used(row), float(row["usd"]), row["tz"],
+        _until(row.get("reset_ts"), row.get("tz")))
 
 
 def reason(db, profile) -> str:

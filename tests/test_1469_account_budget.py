@@ -411,3 +411,52 @@ class AccountBudgetTest(PgTestCase):
                 get(self.db, "capture") is not None), (40., 0., True))
         finally:
             old.watchdog_stop.set()
+
+    def test_fils_d_un_meme_executeur_partagent_le_pilote(self):
+        """Review (bureau): the workers of one runner share ONE driver
+        (`runner.db`). With psycopg, two interleaved `transaction()` blocks
+        nested (savepoint), both commits failed ("wrong nesting level") and
+        the session stayed inside an open transaction, holding the account
+        lock. Admission stays exact and every settlement goes through (one
+        per turn, with or without a reservation)."""
+        self._spend("x", 90.0, billing=OPENAI)
+        shared = self.connect()
+        results, errors = [], []
+        try:
+            barrier = threading.Barrier(8)
+
+            def go(i):
+                barrier.wait()
+                try:
+                    results.append(account_budget.reserve(
+                        shared, "s%d" % i, _profile(OPENAI), "s%d:0:1.0" % i))
+                    account_budget.settle(shared, "libre%d:0:1.0" % i)
+                except Exception as exc:  # noqa: BLE001 - reported below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=go, args=(i,)) for i in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(60)
+        finally:
+            shared.close()
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(1 for r in results if r == ""), 5, results)
+        # committed, seen from another session
+        self.assertAlmostEqual(self._usage(OPENAI)["reserved"], 10.0)
+
+    def test_remise_dite_dans_la_zone_du_compte(self):
+        """Review (bureau): a host in UTC still says the reset is at 00:00 in
+        the account's zone, in the pause reason and in `ameesh budget`."""
+        import time
+        row = self._usage(OPENAI, at="2026-07-14 12:00:00+02")
+        try:
+            with mock.patch.dict(os.environ, {"TZ": "UTC"}):
+                time.tzset()
+                self.assertTrue(account_budget.exhausted_reason(OPENAI, row).endswith(
+                    " until 00:00"), account_budget.exhausted_reason(OPENAI, row))
+                self.assertEqual(account_budget.moment(row["reset_ts"], row["tz"]),
+                                 "2026-07-15 00:00")
+        finally:
+            time.tzset()

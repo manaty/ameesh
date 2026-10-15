@@ -350,6 +350,7 @@ def format_status(data: dict) -> str:
         if sp.get("24h_counted_usd") is not None:
             out.append("daily cap counts %s (same rule)" % _fmt_usd(sp["24h_counted_usd"]))
     if data.get("accounts"):
+        from . import account_budget
         out.append("billing account envelopes (calendar day, shared by all agents and hosts):")
         for a in data["accounts"]:
             out.append("  %-18s limit %s · spent %s · reserved %s · kept %s · remaining %s"
@@ -357,7 +358,7 @@ def format_status(data: dict) -> str:
                            a["billing_account"], _fmt_usd(a["usd"]), _fmt_usd(a["settled"]),
                            _fmt_usd(a["reserved"]), _fmt_usd(a["kept"]),
                            _fmt_usd(a["remaining"]), a["period"], a["tz"],
-                           _moment(a.get("reset_ts"))))
+                           account_budget.moment(a.get("reset_ts"), a["tz"])))
     if data["paused"]:
         out.append("paused for budget:")
         for p in data["paused"]:

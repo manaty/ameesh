@@ -220,6 +220,10 @@ class BailEtPanneTest(MedieBase):
     def test_reglement_sans_reservation_locale_ne_bloque_pas_le_marqueur(self):
         """#1469 : le backend médié n'a pas d'enveloppe de compte locale."""
         worker = self._worker()
+        # r2 : le marqueur n'est effacé que s'il est encore celui de ce tour
+        self.responder.script["pending_spend.get"] = {
+            "agent": "inge-front", "start_index": 0, "turn": "prompt", "model": "m",
+            "created_ts": 123.0}
         self.responder.script["pending_spend.clear"] = True
         usage = types.SimpleNamespace(reread_tokens=0, session=None)
         with mock.patch("ameesh.cost.CostBook") as book:
