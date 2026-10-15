@@ -1194,6 +1194,30 @@ def _review_after_merge(db, item_id, *, sha: str = "", pr_ref=None, repo=None) -
                     type(exc).__name__, str(exc)[:160])}
 
 
+def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
+                               repo=None) -> dict:
+    """L539 (#1104) : reprendre la relecture manquante d'un lot **déjà** fusionné.
+
+    B1 de la R1 : ce chemin est rappelé par `sync-github` pour des lots
+    fusionnés avant l'activation (`review_catch_up_bound`, migration 0438) —
+    sans borne, chacun recevrait sa relecture avec l'échéance du jour, le
+    rattrapage historique que l'arbitrage pilote du 15/10 exclut. Le prédicat
+    partagé (`review_lot.catch_up_eligible`) dit la même vérité que `catch_up`
+    (borne, relecture manquante, marque terminale, tentatives) ; hors bornes,
+    rien n'est tenté et le lot reste au seul rattrapage borné."""
+    try:
+        from . import review_lot
+        if not review_lot.catch_up_eligible(db, int(item_id)):
+            return {"id": None, "created": False,
+                    "why": "hors bornes du rattrapage (fusion antérieure à l'activation"
+                           " ou marque terminale) : laissé à review_lot.catch_up"}
+        return _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+    except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
+        return {"id": None, "created": False,
+                "why": "reprise de relecture impossible : %s: %s" % (
+                    type(exc).__name__, str(exc)[:160])}
+
+
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None) -> dict:
@@ -1226,8 +1250,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     travail de l'assigné, puis sur le dépôt du projet, et un doute n'ouvre
     rien. Le lot de la file l'ouvre à l'atterrissage : l'ouverture est
     idempotente. Un lot déjà fusionné (`already`) reprend lui aussi l'ouverture
-    manquante — la fusion reste acquise ; `review_lot.catch_up` reprend les
-    lots fusionnés que les relevés ne sélectionnent plus.
+    manquante — la fusion reste acquise, et seulement dans les bornes du
+    rattrapage (`review_lot.catch_up_eligible`, B1 de la R1 #1104) ;
+    `review_lot.catch_up` reprend les lots fusionnés que les relevés ne
+    sélectionnent plus.
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -1237,8 +1263,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         if state in MERGED_STATES:
             # L539 (#1104) : la fusion est acquise, mais sa relecture peut
             # manquer (l'ouverture avait échoué). Ce chemin idempotent la
-            # reprend sans jamais rouvrir ni défaire la fusion (R1 #1104 P2-2).
-            review = _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+            # reprend sans jamais rouvrir ni défaire la fusion (R1 #1104 P2-2),
+            # et seulement dans les bornes du rattrapage (B1 de la R1) : un lot
+            # fusionné avant l'activation n'est pas relu rétroactivement.
+            review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
             detail = "already %s" % state
             if not review.get("id"):
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")

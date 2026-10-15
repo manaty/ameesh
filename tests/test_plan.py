@@ -490,7 +490,9 @@ class GithubTest(_PlanDb):
         # GitHub n'a pas de dépôt local, donc pas d'intervalle de fusion
         # prouvé : la classe est doublée ici (R1 #1104 P2-1 : sans intervalle
         # prouvé, `class_at_merge` ne classe jamais) ; la lecture de classe a
-        # ses propres témoins (test_1104…).
+        # ses propres témoins (test_1104…). Non couvert ici (N2 de la R1,
+        # assumé) : la route GitHub `repo=None` → `_repo_of_agent` puis
+        # `lot_class.repository`, qui exige un dépôt local sur l'agent.
         a = work.add(self.db, title="léger", package="cat-recherche")
         work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="alice")
         self.merged_pr(1, "lot/cat-recherche-index")

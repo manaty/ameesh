@@ -513,3 +513,32 @@ def catch_up(db, *, repo: str = "", target: str = "",
             out["failed"] += 1
             mark(lot, state, "erreur")
     return out
+
+
+def catch_up_eligible(db, lot: int, *, retry_s: float = ATTEMPT_RETRY_S,
+                      max_attempts: int = CATCH_UP_MAX_ATTEMPTS) -> bool:
+    """L539 (#1104, B1 de la R1) : ce lot déjà fusionné serait-il encore
+    sélectionné par le rattrapage borné (`catch_up`) ?
+
+    La même vérité que le balayage (filtre partagé, `missing_ref_eligible`) :
+    borne d'activation lisible (migration 0438, fail-closed sinon) et jalon
+    `merged` à elle ou après, relecture toujours manquante, aucune marque
+    terminale, tentatives sous le plafond et espacées du délai. Sert au chemin
+    `already` de `close_merged` : sans cette borne, chaque passage de
+    `sync-github` relancerait l'ouverture pour les ~1019 fusions antérieures à
+    l'activation (B1). Best effort : toute panne de lecture ferme la porte, le
+    lot reste au rattrapage et n'est jamais rouvert par ce chemin."""
+    try:
+        ops = storage.of(db).work
+        bound = ops.review_catch_up_bound()
+        if bound is None:      # fail-closed : jamais de balayage historique
+            return False
+        reader = getattr(ops, "missing_ref_eligible", None)
+        if reader is None:     # magasin d'une version antérieure : rien tenté
+            return False
+        return bool(reader(int(lot), ref_prefix=PREFIX + "#",
+                           attempt_prefix=ATTEMPT_PREFIX, retry_s=float(retry_s),
+                           terminal_prefix=TERMINAL_PREFIX,
+                           max_attempts=int(max_attempts), since=bound))
+    except Exception:  # noqa: BLE001 - pas de base : rien à reprendre
+        return False

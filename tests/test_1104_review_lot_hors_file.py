@@ -316,6 +316,36 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual(third["result"], "already")
         self.assertEqual(len(self.review_lots(lot)), 1)
 
+    def test_un_lot_fusionne_avant_l_activation_ne_reprend_pas(self):
+        """B1 de la R1 : `close_merged` rappelé (`already`, comme le fait
+        `sync-github`) sur un lot fusionné **avant** l'activation ne relance pas
+        l'ouverture — sinon chaque passage rendrait une relecture due le jour
+        même aux ~1019 fusions historiques. Le lot reste au rattrapage borné,
+        qui l'écarte aussi ; le prédicat partagé le dit."""
+        lot = self.lot()
+        sha = self.merge_lot(lot, "lot/1104-historique")
+        with mock.patch.object(review_lot, "open_for_merge",
+                               side_effect=RuntimeError("panne d'écriture")):
+            done = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
+        self.assertEqual(done["result"], "merged", done)
+        self.assertEqual(self.review_lots(lot), [])
+        self.assertTrue(review_lot.catch_up_eligible(self.db, lot),
+                        "fusionné à l'instant : le rattrapage le reprendrait")
+        self.db.execute(
+            "UPDATE work_item_milestones SET at = now() - interval '1 day'"
+            " WHERE work_item_id = %s AND kind = 'merged'", (lot,))
+        self.assertFalse(review_lot.catch_up_eligible(self.db, lot),
+                         "fusion antérieure à la borne : rien n'est dû")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               side_effect=RuntimeError("classe non lue hors bornes")):
+            again = work.close_merged(self.db, lot, sha=sha, actor="claude1", source="test")
+        self.assertEqual(again["result"], "already", again)
+        self.assertEqual(self.review_lots(lot), [], "relecture historique non due")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            caught = review_lot.catch_up(self.db)
+        self.assertEqual((caught["examined"], caught["opened"]), (0, 0), caught)
+
     def test_saturation_vingt_pourvus_ne_cachent_pas_un_manquant_ancien(self):
         """R2 #1104 P2-2, témoin de saturation 1 : vingt parents **pourvus**
         plus récents ne cachent plus un parent ancien dont l'ouverture a
@@ -486,9 +516,14 @@ class CatchUpWitnessTest(_Witness):
         _git(self.repo, "checkout", "-q", "develop")
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
              "lot/1104-sql-terminal")
-        plan_git.sync_branches(self.db, host=self.cfg.host)   # le relevé fusionne
+        # N1 de la R1 : le relevé porte lui-même un rattrapage borné
+        # (`sync_branches`) qui marquerait la classe terminale avant nous ;
+        # on l'isole pour que la valeur attendue dise qui marque — ici,
+        # c'est bien le `catch_up` explicite, une seule fois.
+        with mock.patch.object(review_lot, "catch_up", return_value={}):
+            plan_git.sync_branches(self.db, host=self.cfg.host)   # le relevé fusionne
         first = review_lot.catch_up(self.db, retry_s=0)
-        self.assertIn(first["examined"], (0, 1), first)
+        self.assertEqual((first["examined"], first["terminal"]), (1, 1), first)
         second = review_lot.catch_up(self.db, retry_s=0)
         self.assertEqual(second["examined"], 0, second)
         self.assertEqual(self.review_lots(lot), [])
