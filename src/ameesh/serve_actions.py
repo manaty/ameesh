@@ -18,9 +18,7 @@ ameesh-approve and returns the **link**: the human signs on that origin with
 their passkey, and the receipt comes back through `ameesh action
 fetch-receipt`, never through this API.
 
-Not here yet: pausing and resuming an agent, and acknowledging an alert. No
-library function does them today (lot #375 note): their routes come with
-their primitive.
+Pausing and resuming an agent comes with its primitive in L87b (#1462).
 """
 from __future__ import annotations
 
@@ -295,8 +293,21 @@ def _approval_request(ctx, db, params, body) -> dict:
                                              "action_id", "approver", "digest")}
 
 
+def _ack_alert(ctx, db, params, body) -> dict:
+    from . import alert_ack
+    try:
+        return alert_ack.acknowledge(ctx.cfg, db, params["key"], actor=ctx.human,
+                                     principal=principal(ctx))
+    except alert_ack.AckRefused as exc:
+        status = {"not_found": 404, "forbidden": 403, "native_only": 403}.get(exc.code, 400)
+        raise ActionError(status, exc.code, str(exc)) from exc
+
+
 _TEXT = ({"type": "string", "minLength": 1, "maxLength": MAX_TEXT}, True)
 ACTIONS = (
+    Action("/alerts/{key}/ack", "ack_alert",
+           "Acknowledge an alert as its human recipient; the alert remains visible",
+           _ack_alert, {}),
     Action("/agents/{agent}/messages", "message",
            "Message to an agent: its mailbox and its thread (`agent-mail send`)", _message,
            {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False),
