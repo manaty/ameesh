@@ -5284,9 +5284,12 @@ class Runner:
         except SystemExit as exc:
             log_async("config reload refused: %s" % exc)
             return False
-        # l'identité de l'exécuteur (hôte, bail) et les options de ligne de
-        # commande ne se rechargent pas : elles ont décidé les baux en cours
-        gelés = {"host": self.cfg.host, "runner_id": self.cfg.runner_id}
+        # l'identité de l'exécuteur (hôte, bail), la base qu'il lit (sa
+        # connexion est ouverte : une bascule de `dsn` ne s'applique qu'au
+        # redémarrage, jamais à moitié) et les options de ligne de commande
+        # ne se rechargent pas : elles ont décidé les baux en cours
+        gelés = {key: getattr(self.cfg, key) for key in
+                 ("host", "runner_id", "dsn", "schema", "driver", "backend", "exec_url")}
         gelés.update(self._cfg_overrides)
         fresh = dataclasses.replace(fresh, **gelés)
         if fresh == self.cfg:

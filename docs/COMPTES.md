@@ -131,7 +131,7 @@ dans le canon :
   l'hôte est relue à chaud (#1466) : un compte ajouté, retiré ou corrigé dans
   `config.json` prend effet au tour suivant, sans redémarrage de l'exécuteur.
 * Profils (#1466) : un exécuteur peut être lancé sur un fichier nommé
-  (`AMEESH_CONFIG`, rangé sous `~/.config/ameesh/…`). Ce **profil** est une
+  (`AMEESH_CONFIG`, rangé sous `~/.config/ameesh/runner-profiles/`). Ce **profil** est une
   superposition : les clés qu'il ne déclare pas — les comptes, notamment —
   viennent de `config.json`. Une clé déclarée par le profil l'emporte (une
   isolation voulue se déclare), et l'écart est affiché par `ameesh doctor`,

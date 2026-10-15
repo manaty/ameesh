@@ -102,6 +102,17 @@ class ConfigProfilTest(unittest.TestCase):
         self.assertEqual(cfg.config_base, "")
         self.assertEqual(cfg.config_shadowed, ())
 
+    def test_un_fichier_a_cote_de_config_json_reste_autonome(self):
+        """Revue Claude #1466 : `config-ancienne-base.json`, la configuration
+        d'une AUTRE base rangée à côté de `config.json`, n'emprunte pas les
+        clés de l'hôte (ni comptes, ni `github`, ni `critical_agents`)."""
+        ancienne = self._write(os.path.join(self.cfgdir, "config-ancienne-base.json"),
+                               {"host": "ancienne"})
+        cfg = self.load(AMEESH_CONFIG=ancienne)
+        self.assertEqual(cfg.accounts, {})
+        self.assertEqual(cfg.host, "ancienne")
+        self.assertEqual(cfg.config_base, "")
+
     def test_une_base_explicite_se_nomme(self):
         ailleurs = self._write(os.path.join(self.tmp, "ailleurs.json"),
                                {"inherit": self.host, "host": "profil"})

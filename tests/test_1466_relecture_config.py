@@ -60,6 +60,21 @@ class RelectureConfigTest(unittest.TestCase):
                                           "AMEESH_CONFIG": self.profil}):
             self.assertFalse(runner.reload_config())
 
+    def test_la_base_lue_ne_se_relit_pas(self):
+        """Revue Claude #1466 : une bascule de `dsn`/`schema` dans l'hôte ne
+        s'applique qu'au redémarrage (la connexion de l'exécuteur est ouverte) ;
+        le reste de la relecture passe."""
+        runner = self._runner()
+        dsn, schema = runner.cfg.dsn, runner.cfg.schema
+        self._write(self.host, {"budget_usd_per_hour": 250, "dsn": "postgresql://autre/base",
+                                "schema": "autre",
+                                "accounts": {"deepseek": [{"name": "cle-a"}]}})
+        with mock.patch.dict(os.environ, {"HOME": self.home,
+                                          "AMEESH_CONFIG": self.profil}):
+            self.assertTrue(runner.reload_config())
+        self.assertEqual(runner.cfg.budget_usd_per_hour, 250.0)
+        self.assertEqual((runner.cfg.dsn, runner.cfg.schema), (dsn, schema))
+
     def test_un_plafond_releve_dans_l_hote_est_relu(self):
         """Le cas du boguet : le profil ne dit rien du plafond ; l'hôte le
         relève, et l'exécuteur en cours doit le suivre sans redémarrer."""

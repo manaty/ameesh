@@ -495,10 +495,12 @@ class Config:
         return texte
 
 
-#: dossier de la configuration de l'hôte : ses fichiers sont des profils, qui
-#: héritent de `config.json` (#1466)
+#: dossier des profils d'exécuteur : ses fichiers héritent de `config.json`
+#: (#1466). Les autres fichiers du dossier de l'hôte (par exemple
+#: `config-ancienne-base.json`, la configuration d'une AUTRE base) restent
+#: autonomes : ils n'empruntent ni `github` ni `critical_agents` à l'hôte.
 def _config_dir_default() -> str:
-    return os.path.dirname(_expand(DEFAULT_CONFIG))
+    return os.path.join(os.path.dirname(_expand(DEFAULT_CONFIG)), "runner-profiles")
 
 
 def _read_json_object(path: str) -> dict:
@@ -515,16 +517,18 @@ def _read_json_object(path: str) -> dict:
 def _inherit_base(cfg_path: str, raw: dict) -> str:
     """La base héritée d'un fichier de configuration (#1466), ou ''.
 
-    Un **profil** — un fichier de configuration rangé sous le dossier de la
-    configuration de l'hôte (`~/.config/ameesh/`) — est une superposition : les
+    Un **profil** — un fichier de configuration rangé sous le dossier des
+    profils d'exécuteur (`~/.config/ameesh/runner-profiles/`) — est une
+    superposition : les
     clés qu'il ne déclare pas (comptes, plafonds, canon…) viennent du
     `config.json` de l'hôte. C'est ce qui évite qu'un profil périmé fasse
     tourner des exécuteurs sur des comptes ou des plafonds d'hier.
 
     `"inherit"` force la règle : `false` rend le fichier autonome (aucun
-    héritage), une chaîne nomme une autre base. Hors du dossier de l'hôte, un
-    fichier reste autonome : le banc de tests et les configurations nommées
-    dans un dossier temporaire ne lisent jamais la configuration du poste."""
+    héritage), une chaîne nomme une autre base. Hors du dossier des profils, un
+    fichier reste autonome : le banc de tests, les configurations nommées dans
+    un dossier temporaire et celles d'une autre base rangées à côté de
+    `config.json` ne lisent jamais la configuration du poste."""
     inherit = raw.get("inherit", None)
     if inherit is False:
         return ""
