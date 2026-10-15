@@ -63,6 +63,17 @@ class ContractTest(unittest.TestCase):
             prov.capture(env)  # pas d'acteur
 
 
+    def test_intent_outside_a_turn_writes_nothing(self):
+        """Le hook `pre-commit` hors tour managé n'atteste rien (jamais bloquant)."""
+        repo = tempfile.mkdtemp(prefix="ameesh-1465-intent-")
+        try:
+            subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+            self.assertIsNone(prov.prepare_commit_intent(repo, environ={}))
+            self.assertIsNone(prov.read_commit_intent(repo))
+        finally:
+            shutil.rmtree(repo, ignore_errors=True)
+
+
 class PgProvenanceTest(PgTestCase):
     """La lecture réelle : la preuve jointe au fait, ou `unknown`."""
 
@@ -191,30 +202,104 @@ class PgProvenanceTest(PgTestCase):
         self._commit(repo, env, "un")
         return repo, env
 
-    def _commit(self, repo, env, message):
+    def _stage(self, repo, message):
         with open(os.path.join(repo, "f.txt"), "a", encoding="utf-8") as fh:
             fh.write(message + "\n")
         subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+
+    def _commit_only(self, repo, env, message):
         subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True,
                        capture_output=True, env=env)
+        return self._head(repo)
+
+    def _commit(self, repo, env, message):
+        self._stage(repo, message)
+        return self._commit_only(repo, env, message)
+
+    def _head(self, repo):
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
                                        text=True).strip()
 
-    def test_record_commit_accepts_only_head_by_its_committer(self):
+    def _attest(self, repo, *, actor="mty-amh-impl-07", turn="t" * 32,
+                harness="deepseek"):
+        """Le hook `pre-commit` : l'attestation écrite avant le commit."""
+        return prov.prepare_commit_intent(repo, environ={
+            "AGENT_MAIL_NAME": actor, "AMEESH_TURN_ID": turn,
+            "AMEESH_HARNESS": harness})
+
+    def _commit_attested(self, repo, env, message, **kw):
+        """Le tour réel : index prêt, attestation, puis le commit."""
+        self._stage(repo, message)
+        self._attest(repo, **kw)
+        return self._commit_only(repo, env, message)
+
+    def test_an_inherited_head_is_unknown_not_attributed_to_the_new_turn(self):
+        """Témoin cx3 15/10 04:37 : un HEAD hérité n'est pas une création.
+
+        Le commit a été créé sous un tour antérieur, par le même acteur (donc
+        même committer Git) ; il est resté HEAD. Le tour suivant ne peut pas se
+        l'approprier : sans attestation de création dans CE tour, l'origine
+        reste inconnue (`None`), jamais devinée."""
+        repo, env = self._repo()  # commit unique, créé sous l'ancien tour
+        inherited = self._head(repo)
+        ident = {"actor": "mty-amh-impl-07", "session": "s-new", "turn": "n" * 32,
+                 "harness": "codex"}
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, inherited, identity=ident, cwd=repo)
+        self.assertIsNone(prov.receipt_for_commit(self.db, inherited))
+
+    def test_an_attestation_written_after_the_commit_attests_nothing(self):
+        """Une attestation posée sur le HEAD déjà né ne le crée pas."""
+        repo, env = self._repo()
+        head = self._head(repo)
+        self._attest(repo)  # head attesté == le commit lui-même
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, head, identity={
+                "actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                "harness": "deepseek"}, cwd=repo)
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
+    def test_an_attestation_from_another_turn_is_refused(self):
+        repo, env = self._repo()
+        head = self._commit_attested(repo, env, "deux", turn="a" * 32)
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, head, identity={
+                "actor": "mty-amh-impl-07", "session": "s-1", "turn": "b" * 32,
+                "harness": "deepseek"}, cwd=repo)
+        self.assertIsNone(prov.receipt_for_commit(self.db, head))
+
+    def test_an_amended_commit_is_the_attested_creation(self):
         ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
                  "harness": "deepseek"}
         repo, env = self._repo()
-        old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
-                                      text=True).strip()
-        head = self._commit(repo, env, "deux")
-        # un ancien commit, même complet et présent, n'est pas le HEAD courant
+        first = self._head(repo)
+        self._commit_attested(repo, env, "deux")
+        amended_from = self._head(repo)
+        # l'amend part du HEAD attesté : mêmes parents que lui
+        self._attest(repo)
+        subprocess.run(["git", "commit", "-q", "--amend", "-m", "deux-amende"],
+                       cwd=repo, check=True, capture_output=True, env=env)
+        amended = self._head(repo)
+        self.assertNotEqual(amended, amended_from)
+        self.assertNotEqual(amended, first)
+        row = prov.record_commit(self.db, amended, identity=ident, cwd=repo)
+        self.assertTrue(row["recorded"])
+        self.assertEqual(prov.receipt_for_commit(self.db, amended)["session"], "s-1")
+
+    def test_record_commit_accepts_the_creation_attested_by_this_turn(self):
+        ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
+                 "harness": "deepseek"}
+        repo, env = self._repo()
+        old = self._head(repo)  # hérité, sans attestation de ce tour
+        # un ancien commit, même complet et présent, n'est pas enregistrable
         with self.assertRaises(prov.ProvenanceError):
             prov.record_commit(self.db, old, identity=ident, cwd=repo)
+        head = self._commit_attested(repo, env, "deux")
         row = prov.record_commit(self.db, head, identity=ident, cwd=repo,
                                  work_item_id=int(self.lot["id"]))
         self.assertTrue(row["recorded"])
         self.assertEqual(prov.receipt_for_commit(self.db, head)["session"], "s-1")
-        # rejouer la MÊME identité ne réécrit rien et ne lève pas
+        # l'attestation a été consommée : rejouer la MÊME identité ne lève pas
         again = prov.record_commit(self.db, head, identity=ident, cwd=repo)
         self.assertFalse(again["recorded"])
         # une autre identité pour le même commit est refusée
@@ -225,8 +310,7 @@ class PgProvenanceTest(PgTestCase):
             prov.record_commit(self.db, "pas-un-sha", identity=ident, cwd=repo)
         # un commit dont le committer est un autre agent est refusé
         other, _ = self._repo(actor="autre-agent", name="ameesh-1465-autre-")
-        other_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=other,
-                                             text=True).strip()
+        other_head = self._head(other)
         with self.assertRaises(prov.ProvenanceError):
             prov.record_commit(self.db, other_head, identity=ident, cwd=other)
         self.assertIsNone(prov.receipt_for_commit(self.db, other_head))
@@ -247,9 +331,11 @@ class HookInstallTest(unittest.TestCase):
         out = prov.install_hook(self.tmp)
         self.assertTrue(out["installed"], out)
         self.assertEqual(out["path"], os.path.join(self.tmp, ".git", "hooks", "post-commit"))
-        with open(out["path"], encoding="utf-8") as fh:
-            self.assertIn("ameesh #1465", fh.read())
-        self.assertTrue(os.access(out["path"], os.X_OK))
+        for name in ("pre-commit", "post-commit"):
+            path = os.path.join(self.tmp, ".git", "hooks", name)
+            with open(path, encoding="utf-8") as fh:
+                self.assertIn("ameesh #1465", fh.read())
+            self.assertTrue(os.access(path, os.X_OK))
         self.assertTrue(prov.install_hook(self.tmp)["installed"])
         foreign = "#!/bin/sh\necho autre\n"
         with open(out["path"], "w", encoding="utf-8") as fh:
@@ -257,20 +343,34 @@ class HookInstallTest(unittest.TestCase):
         refused = prov.install_hook(self.tmp)
         self.assertFalse(refused["installed"])
         self.assertIn("foreign", refused["reason"])
+        self.assertIn("post-commit", refused["reason"])
         with open(out["path"], encoding="utf-8") as fh:
             self.assertEqual(fh.read(), foreign)
+        # un `pre-commit` étranger n'est pas écrasé non plus : la paire manque
+        os.unlink(out["path"])
+        pre = os.path.join(self.tmp, ".git", "hooks", "pre-commit")
+        with open(pre, "w", encoding="utf-8") as fh:
+            fh.write(foreign)
+        refused = prov.install_hook(self.tmp)
+        self.assertFalse(refused["installed"])
+        self.assertIn("pre-commit", refused["reason"])
+        with open(pre, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), foreign)
 
-    def test_runner_installs_the_hook_and_skips_mediated_sessions(self):
+    def test_runner_installs_the_hook_pair_and_skips_mediated_sessions(self):
         from ameesh import runner as runner_mod
         fake = types.SimpleNamespace(
             runner=types.SimpleNamespace(mediated=False), name="mty-amh-impl-07")
         runner_mod.AgentWorker._installe_hook_preuve(fake, self.tmp)
-        hook = os.path.join(self.tmp, ".git", "hooks", "post-commit")
-        self.assertTrue(os.path.exists(hook))
-        os.unlink(hook)
+        hooks = [os.path.join(self.tmp, ".git", "hooks", name)
+                 for name in ("pre-commit", "post-commit")]
+        for hook in hooks:
+            self.assertTrue(os.path.exists(hook))
+            os.unlink(hook)
         fake.runner.mediated = True
         runner_mod.AgentWorker._installe_hook_preuve(fake, self.tmp)
-        self.assertFalse(os.path.exists(hook), "pas de hook sur une VM médiée")
+        for hook in hooks:
+            self.assertFalse(os.path.exists(hook), "pas de hook sur une VM médiée")
 
 
 if __name__ == "__main__":

@@ -64,16 +64,30 @@ Règles de refus :
   rien, et une identité divergente est signalée à l'appelant.
 
 Écriture, à l'instant du fait, et **bornée** (frontières fixées après les
-témoins isolés de cx3, 15/10 04:27–04:29) :
+témoins isolés de cx3, 15/10 04:27–04:29 puis 04:37) :
 
 - **jalon** : la même transaction que `work_item_milestones` (le fait et sa
   preuve naissent ensemble) ;
-- **commit** : `ameesh provenance record --commit HEAD` appelé par le hook
-  `post-commit` du dépôt de l'agent, donc pour chaque commit, dans le tour qui
-  le crée. Seul le commit qui est **HEAD du dépôt sous la main** est
-  enregistré, et son committer doit être l'acteur du tour
-  (`<acteur>@ameesh.invalid`, posé par le runner) : un ancien commit ne peut pas
-  être attribué au tour courant ;
+- **commit** : la paire de hooks du dépôt de l'agent. Le `pre-commit` écrit une
+  **attestation de création** — identité du tour, HEAD et arbre de départ, aléa
+  — dans le répertoire git du worktree (`--absolute-git-dir` : les hooks sont
+  partagés, l'attestation ne l'est pas). Le `post-commit` appelle
+  `ameesh provenance record --commit HEAD`, qui exige l'attestation, vérifie
+  que le commit en est bien la création (il part du HEAD attesté, fusion en
+  cours résolue comprise, ou en est la réécriture — amend : mêmes parents que
+  le HEAD attesté —, avec l'arbre attesté), la **consomme** et écrit la preuve.
+  Trois bornes : HEAD du dépôt sous la main, committer de l'acteur du tour
+  (`<acteur>@ameesh.invalid`, posé par le runner), attestation de création de
+  **ce** tour. Un HEAD hérité d'un tour antérieur, même committé par le même
+  agent, n'a pas d'attestation : son origine reste inconnue (écart cx3,
+  15/10 06:37), jamais réattribuée au nouveau tour par le seul couple
+  HEAD + committer ;
+- **chemins couverts** : `git commit` (y compris `-a`, `--amend`, et la
+  résolution d'une fusion par `git commit`) naît avec son attestation. Les
+  commits créés sans `pre-commit` (`git merge --no-ff` sans conflit, `git
+  rebase`, `git cherry-pick`) restent `unknown` : le fournisseur ne devine
+  jamais, et un écrivain `post-merge`/`post-rewrite` sera ajouté si le train
+  #1467 a besoin de ces chemins ;
 - le tour (`AMEESH_TURN_ID`) et le harnais (`AMEESH_HARNESS`) viennent de
   l'environnement du runner ; la session, du registre vivant de l'acteur
   (`registry.live_harness`, #1037), recontrôlée contre l'étiquette du tour ;
@@ -86,10 +100,10 @@ témoins isolés de cx3, 15/10 04:27–04:29) :
 Livré dans les points réversibles de `lot/1465-preuves-par-commit` : migration
 0445, contrat de stockage, fournisseur (`receipt_for_commit`,
 `receipt_for_milestone`), écriture (`ameesh provenance record --commit`,
-`ameesh provenance install`, jalon gel/verdict et sa preuve dans la même
-transaction que `work_item_milestones`), pose du hook à l'ouverture de session
-par le runner (jamais en mode relayé) et témoins
-(`tests/test_1465_provenance.py`).
+`ameesh provenance intent`, `ameesh provenance install` — paire de hooks —,
+jalon gel/verdict et sa preuve dans la même transaction que
+`work_item_milestones`), pose des hooks à l'ouverture de session par le runner
+(jamais en mode relayé) et témoins (`tests/test_1465_provenance.py`).
 
 Reste avant gel : faire relire
 les deux familles requises (SQL sensible, canon §2). L'historique **antérieur**

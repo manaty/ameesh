@@ -25,11 +25,19 @@ La preuve est écrite à l'instant du fait (migration 0445) : le commit par
 transaction que `work_item_milestones`. Le `turn` est l'identifiant du tour
 managé (`AMEESH_TURN_ID`), la `session` celle du registre vivant de l'acteur,
 et le `harness` celui du tour (`AMEESH_HARNESS`), recontrôlé contre le registre.
+
+Un commit n'est enregistrable que s'il a été **créé dans ce tour** : le hook
+`pre-commit` écrit avant le commit une attestation de création (identité du
+tour, HEAD et arbre de départ), que `record_commit` exige et consomme. Un HEAD
+hérité d'un tour antérieur — même committé par le même agent — n'a pas
+d'attestation : son origine reste inconnue (écart cx3, 15/10 04:37).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
+import secrets
 import subprocess
 
 from . import storage
@@ -201,6 +209,143 @@ def resolve_commit(value, *, cwd: str | None = None) -> str | None:
     return sha
 
 
+def _git(cwd: str | None, *args: str) -> str | None:
+    """La sortie de `git` sous la main, ou None (échec, git absent)."""
+    try:
+        run = subprocess.run(["git", *args], capture_output=True, text=True,
+                             cwd=cwd or os.getcwd(), timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if run.returncode != 0:
+        return None
+    return (run.stdout or "").strip()
+
+
+#: L'attestation de création du hook `pre-commit` vit dans le répertoire git DU
+#: worktree (`--absolute-git-dir`) : les hooks sont partagés entre worktrees,
+#: l'attestation ne l'est pas.
+INTENT_NAME = "ameesh-provenance-intent.json"
+
+
+def intent_path(cwd: str | None = None) -> str | None:
+    """Le chemin de l'attestation de ce worktree, ou None hors dépôt."""
+    root = _git(cwd, "rev-parse", "--absolute-git-dir")
+    return os.path.join(root, INTENT_NAME) if root else None
+
+
+def clear_commit_intent(cwd: str | None = None) -> None:
+    """Retire l'attestation du worktree (au mieux : absente n'est pas une erreur)."""
+    path = intent_path(cwd)
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def prepare_commit_intent(cwd: str | None = None, *, environ=None,
+                          actor: str = "") -> dict | None:
+    """Écrit l'attestation du commit qui vient (hook `pre-commit`).
+
+    Elle lie le tour courant au HEAD et à l'arbre d'où le commit va partir.
+    Elle ne bloque jamais un commit : hors tour managé, sans identité ou sans
+    arbre calculable, elle n'est pas écrite (et toute attestation précédente
+    est retirée) — le commit naîtra sans preuve, son origine restera inconnue.
+    Aucune base n'est requise : c'est le hook `post-commit` qui écrit la preuve.
+    """
+    env = os.environ if environ is None else environ
+    path = intent_path(cwd)
+    try:
+        ident = capture(env, actor=actor)
+    except ProvenanceError:
+        ident = None
+    tree = _git(cwd, "write-tree") if ident is not None else None
+    if path is None or ident is None or not tree:
+        if path:
+            clear_commit_intent(cwd)
+        return None
+    intent = {
+        "version": 1,
+        "actor": ident["actor"],
+        "turn": ident["turn"],
+        "harness": ident["harness"],
+        "head": _git(cwd, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") or "",
+        "tree": tree,
+        "nonce": secrets.token_hex(16),
+    }
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(intent, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+        os.chmod(path, 0o600)
+    except OSError:
+        return None
+    return intent
+
+
+def read_commit_intent(cwd: str | None = None) -> dict | None:
+    """L'attestation en cours de ce worktree, ou None si absente ou illisible."""
+    path = intent_path(cwd)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("actor", "turn", "harness", "head", "tree", "nonce"):
+        if not isinstance(data.get(key), str):
+            return None
+    return data
+
+
+def _parents(cwd: str | None, sha: str) -> list[str] | None:
+    """Les parents du commit, ou None s'il ne se lit pas."""
+    out = _git(cwd, "rev-list", "--parents", "-n", "1", sha)
+    if out is None:
+        return None
+    fields = out.split()
+    if not fields or fields[0] != sha:
+        return None
+    return fields[1:]
+
+
+def _attests_creation(cwd: str | None, commit: str, intent: dict) -> bool:
+    """Le commit est-il exactement la création annoncée par l'attestation ?
+
+    Structurel, jamais temporel : le commit part du HEAD attesté (commit posé
+    dessus, y compris une fusion en cours résolue par `git commit`), ou en est
+    la réécriture (amend : mêmes parents que le HEAD attesté), et porte l'arbre
+    attesté. Le commit attesté lui-même n'est jamais sa propre création."""
+    parents = _parents(cwd, commit)
+    if parents is None:
+        return False
+    tree = _git(cwd, "rev-parse", "%s^{tree}" % commit)
+    if not tree or tree != intent["tree"]:
+        return False
+    head = intent["head"]
+    if not head:
+        return not parents
+    if commit == head:
+        return False
+    head_parents = _parents(cwd, head)
+    if head_parents is None:
+        return False
+    if parents and parents[0] == head:
+        return True
+    # amend/rewrite : le commit remplace le HEAD attesté, il en reprend les parents
+    return parents == head_parents
+
+
+def _same_identity(row, identity: dict) -> bool:
+    return (row["actor"] == identity["actor"] and row["session"] == identity["session"]
+            and row["turn"] == identity["turn"] and row["harness"] == identity["harness"])
+
+
 def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
                            cwd: str | None = None) -> dict | None:
     """L'identité exacte du tour courant, ou None si le fait n'y est pas déclaré.
@@ -227,15 +372,17 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
 
 def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
                   cwd: str | None = None) -> dict:
-    """Écrit la preuve exacte d'un commit, ou refuse une divergence.
+    """Écrit la preuve exacte d'un commit créé dans ce tour, ou refuse.
 
     C'est le point d'écriture du hook `post-commit` : l'identité vient du tour
-    courant (jamais de l'appelant). Le contrat est **borné** (relecture cx3,
-    15/10 04:27) : seul le commit qui est **HEAD du dépôt sous la main** peut
-    être enregistré, et son committer doit être l'acteur du tour
-    (`<acteur>@ameesh.invalid`, posé par le runner). Un ancien commit ne peut
-    donc pas être attribué au tour courant, et l'historique antérieur reste
-    inconnu.
+    courant (jamais de l'appelant). Trois bornes : le commit est **HEAD du
+    dépôt sous la main**, son committer est l'acteur du tour
+    (`<acteur>@ameesh.invalid`, posé par le runner), et il est **attesté comme
+    création de ce tour** par le hook `pre-commit` (identité du tour, HEAD et
+    arbre de départ) — attestation consommée par l'écriture. Un HEAD hérité
+    d'un tour antérieur, même committé par le même agent, n'a pas d'attestation
+    de création : son origine reste inconnue (écart cx3, 15/10 04:37), jamais
+    réattribuée au nouveau tour.
 
     Une preuve déjà écrite pour ce commit n'est pas réécrite : une identité
     différente est une erreur."""
@@ -259,21 +406,54 @@ def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
             "commit %s was not committed by %s (committer %r)"
             % (full[:12], identity["actor"], email or "?"))
     subject = subject_of_commit(full)
-    row = storage.of(db).provenance.add(
-        subject, full, identity["actor"], identity["session"], identity["turn"],
-        identity["harness"], work_item_id=work_item_id)
-    if not row["recorded"]:
-        same = (row["actor"] == identity["actor"] and row["session"] == identity["session"]
-                and row["turn"] == identity["turn"] and row["harness"] == identity["harness"])
-        if not same:
+    ops = storage.of(db).provenance
+    existing = ops.get(subject)
+    if existing is not None:
+        # La preuve est déjà écrite : rejouer la même identité ne réécrit rien
+        # (l'attestation a été consommée par la première écriture).
+        if not _same_identity(existing, identity):
             raise ProvenanceError(
                 "%s: already recorded for %s/%s, not %s/%s"
-                % (subject, row["actor"], row["turn"], identity["actor"], identity["turn"]))
+                % (subject, existing["actor"], existing["turn"],
+                   identity["actor"], identity["turn"]))
+        return dict(existing, recorded=False)
+    intent = read_commit_intent(cwd)
+    if intent is None:
+        raise ProvenanceError(
+            "no creation attestation for %s: only a commit created in this turn"
+            " can be recorded" % full[:12])
+    if (intent["actor"] != identity["actor"] or intent["turn"] != identity["turn"]
+            or intent["harness"] != identity["harness"]):
+        raise ProvenanceError(
+            "creation attestation of %s/%s/%s is not from this turn (%s/%s/%s)"
+            % (intent["actor"], intent["turn"][:8], intent["harness"],
+               identity["actor"], identity["turn"][:8], identity["harness"]))
+    if not _attests_creation(cwd, full, intent):
+        raise ProvenanceError(
+            "commit %s is not the creation attested for this turn" % full[:12])
+    row = ops.add(subject, full, identity["actor"], identity["session"],
+                  identity["turn"], identity["harness"], work_item_id=work_item_id)
+    if not row["recorded"] and not _same_identity(row, identity):
+        raise ProvenanceError(
+            "%s: already recorded for %s/%s, not %s/%s"
+            % (subject, row["actor"], row["turn"], identity["actor"], identity["turn"]))
+    clear_commit_intent(cwd)
     return row
 
 
-#: le hook posé par `ameesh provenance install` — il ne bloque JAMAIS un
-#: commit : sans tour managé, sans base ou sans ameesh, il sort 0.
+#: les hooks posés par `ameesh provenance install` — ils ne bloquent JAMAIS un
+#: commit : hors tour managé, sans base ou sans ameesh, ils sortent 0.
+#: `pre-commit` atteste la création (identité du tour, HEAD et arbre de départ),
+#: `post-commit` écrit la preuve en consommant l'attestation.
+PRE_COMMIT_HOOK = """#!/bin/sh
+# ameesh #1465 — attestation de creation du commit, avant qu'il naisse.
+# Ne bloque jamais un commit : hors tour manage ou sans ameesh, sort 0.
+[ "${AMEESH_TURN_ID:-}" ] || exit 0
+command -v ameesh >/dev/null 2>&1 || exit 0
+ameesh provenance intent >/dev/null 2>&1 || exit 0
+exit 0
+"""
+
 HOOK = """#!/bin/sh
 # ameesh #1465 — preuve d'origine du commit, dans le tour qui l'a cree.
 # Ne bloque jamais un commit : hors tour manage ou sans base, sort 0.
@@ -284,32 +464,48 @@ exit 0
 """
 
 
-def install_hook(repo: str) -> dict:
-    """Pose le hook `post-commit` dans le dépôt `repo` (hooks partagés).
-
-    Idempotent : un hook absent ou déjà le nôtre est (ré)écrit ; un hook
-    ÉTRANGER n'est jamais écrasé — on le signale, l'agent décide. Rend
-    `{"path", "installed", "reason"}`."""
-    common = subprocess.run(["git", "rev-parse", "--git-common-dir"],
-                            capture_output=True, text=True, cwd=repo, timeout=20)
-    git_dir = (common.stdout or "").strip()
-    if common.returncode != 0 or not git_dir:
-        return {"path": "", "installed": False,
-                "reason": "not a git repository: %s" % (repo,)}
-    if not os.path.isabs(git_dir):
-        git_dir = os.path.join(repo, git_dir)
-    path = os.path.join(git_dir, "hooks", "post-commit")
+def _install_one(path: str, content: str) -> dict:
+    """Pose un hook ; un hook ÉTRANGER n'est jamais écrasé."""
+    name = os.path.basename(path)
     if os.path.exists(path):
         with open(path, encoding="utf-8", errors="replace") as fh:
             current = fh.read()
-        if current != HOOK and "ameesh #1465" not in current:
+        if current != content and "ameesh #1465" not in current:
             return {"path": path, "installed": False,
-                    "reason": "a foreign post-commit hook is already installed"}
+                    "reason": "a foreign %s hook is already installed" % name}
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(HOOK)
+        fh.write(content)
     os.chmod(path, 0o755)
     return {"path": path, "installed": True, "reason": "installed"}
+
+
+def install_hook(repo: str) -> dict:
+    """Pose la paire `pre-commit`/`post-commit` dans le dépôt `repo`.
+
+    Idempotent : un hook absent ou déjà le nôtre est (ré)écrit ; un hook
+    ÉTRANGER n'est jamais écrasé — on le signale, l'agent décide. `installed`
+    n'est vrai que si les DEUX hooks sont les nôtres : une preuve exacte a
+    besoin de l'attestation de création et de son écriture. Rend
+    `{"path", "installed", "reason", "hooks"}`."""
+    common = _git(repo, "rev-parse", "--git-common-dir")
+    if not common:
+        return {"path": "", "installed": False, "hooks": {},
+                "reason": "not a git repository: %s" % (repo,)}
+    if not os.path.isabs(common):
+        common = os.path.join(repo, common)
+    hooks = os.path.join(common, "hooks")
+    out = {name: _install_one(os.path.join(hooks, name), content)
+           for name, content in (("pre-commit", PRE_COMMIT_HOOK),
+                                 ("post-commit", HOOK))}
+    blocked = [name for name, row in out.items() if not row["installed"]]
+    return {
+        "path": out["post-commit"]["path"],
+        "installed": not blocked,
+        "hooks": out,
+        "reason": "" if not blocked else "; ".join(
+            "%s: %s" % (name, out[name]["reason"]) for name in blocked),
+    }
 
 
 def _connect():
@@ -331,9 +527,12 @@ def build_parser():
     rec.add_argument("--lot", type=int, default=None, help="attach to a work item")
     rec.add_argument("--quiet", action="store_true")
     rec.add_argument("--json", action="store_true")
-    inst = sub.add_parser("install", help="install the post-commit hook")
+    inst = sub.add_parser("install", help="install the provenance hooks")
     inst.add_argument("--repo", default=".", help="repository (default: cwd)")
     inst.add_argument("--json", action="store_true")
+    att = sub.add_parser("intent",
+                         help="write the creation attestation (pre-commit hook)")
+    att.add_argument("--json", action="store_true")
     show = sub.add_parser("show", help="read the receipt, or nothing if unknown")
     show.add_argument("--commit", default="")
     show.add_argument("--milestone", type=int, default=None)
@@ -354,6 +553,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("post-commit hook NOT installed: %s" % out["reason"], file=sys.stderr)
         return 0 if out["installed"] else 1
+    if args.command == "intent":
+        # aucune base requise : le hook `pre-commit` atteste, `post-commit` écrit
+        attestation = prepare_commit_intent()
+        if args.json:
+            print(json.dumps(attestation, sort_keys=True))
+        return 0
     db = _connect()
     try:
         if args.command == "record":

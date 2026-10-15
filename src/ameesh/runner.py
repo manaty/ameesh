@@ -1866,22 +1866,24 @@ class AgentWorker(threading.Thread):
                   % (self.name, session))
 
     def _installe_hook_preuve(self, cwd: str) -> None:
-        """#1465 : pose le hook `post-commit` dans le dépôt de la session.
+        """#1465 : pose la paire de hooks `pre-commit`/`post-commit` du dépôt.
 
         Une seule fois par session OUVERTE, et jamais en mode relayé : la base
         n'est pas joignable depuis une VM médiée, le hook n'y servirait à rien.
-        Le hook ne bloque jamais un commit ; un échec ici ne touche pas le tour
-        (l'origine des commits restera inconnue, jamais devinée)."""
+        Le `pre-commit` atteste la création du commit dans le tour, le
+        `post-commit` écrit la preuve ; aucun ne bloque un commit, et un échec
+        ici ne touche pas le tour (l'origine des commits restera inconnue,
+        jamais devinée)."""
         if getattr(self.runner, "mediated", False):
             return
         try:
             from . import review_provenance
             out = review_provenance.install_hook(cwd)
         except Exception as exc:  # noqa: BLE001 - la preuve ne casse pas le tour
-            log_async("[%s] post-commit hook install failed: %s" % (self.name, exc))
+            log_async("[%s] provenance hooks install failed: %s" % (self.name, exc))
             return
         if not out["installed"] and out.get("path"):
-            log_async("[%s] post-commit hook not installed: %s"
+            log_async("[%s] provenance hooks not installed: %s"
                       % (self.name, out["reason"]))
 
     def _ecarte_session_fille(self, refusee: str) -> None:
