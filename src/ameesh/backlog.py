@@ -124,6 +124,119 @@ class BacklogError(ValueError):
 
 
 # --------------------------------------------------------------------------
+# la route d'un défaut non bloquant (canon §2, owner du 15/10/2026)
+# --------------------------------------------------------------------------
+
+#: ce qui désigne une suite de relecture : N1/N2, P2, P3, « non bloquant »,
+#: « suite » d'un lot, « suivi »/« follow-up » d'une relecture. Le `N` seul est
+#: cherché en majuscule (`STANDALONE_N`) : le `n'` français n'est pas un N.
+FOLLOWUP_MARKERS = re.compile(
+    r"(?:^|[\s\[(\"«])("
+    r"n[0-9]+\b"                       # N1, N2…
+    r"|p[23]\b"                        # P2, P3
+    r"|non[ -]?bloquant\w*|pas bloquant"
+    # « Suite #956 », « L242c suite (N #414) », « suite de la R1 », « suite du
+    # lot » : la suite doit viser une référence. « suite à la demande de
+    # l'owner », « suite au courrier » sont du français ordinaire, pas une
+    # suite de relecture — la requête humaine garde son lot sans avertissement.
+    r"|suites?\s*(?:#|\(|n[0-9]|n\b|de la r[0-9]|du lot|r[0-9]\b)"
+    # « suivi de la R1 », « suivi du lot #956 », « follow-up on the review » :
+    # le suivi doit viser une relecture ou une référence. « suivi des coûts
+    # mensuels », « follow-up commercial » sont du travail ordinaire, pas une
+    # suite de relecture (R1 cx2, P2 2).
+    r"|suivis?\s+(?:(?:de|des|du|la|le|un|une)\s+|d'|l')*"
+    r"(?:r[0-9]\b|#[0-9]|relectures?|avis|verdicts?|d[eé]fauts?|correctifs?"
+    r"|lots?\b|n[0-9]|p[23]\b)"
+    r"|follow[ -]?ups?\s*(?:(?:of|on|for|to|the)\s+)*"
+    r"(?:r[0-9]\b|#[0-9]|reviews?|defects?|findings?)"
+    r")", re.I)
+#: le « N » seul (majuscule), marqueur du canon pour un défaut non bloquant
+STANDALONE_N = re.compile(r"(?:^|[\s\[(\"«])N\b")
+
+#: une suite de **tests** n'est pas une suite de relecture : la locution est
+#: neutralisée avant l'examen, sans masquer un N/P2/P3 explicite (R1 cx2, P2 3)
+TEST_SUITE = re.compile(
+    r"suites? (?:de |des |du )?tests?\b|tests?[ -]?suites?\b|suites? compl[eè]?tes?\b"
+    r"|suites? ci\b", re.I)
+#: un défaut bloquant (B/P1), un incident réel, une panne, une régression : le
+#: lot est légitime — sauf régression explicitement mineure (N/P2/P3), voir
+#: `followup_hint`
+BLOCKING_DEFECT = re.compile(
+    r"(?:^|[\s\[(\"«])(?:b[0-9]+\b|bloquant\w*)|(?:^|[\s\[(\"«])p1\b"
+    r"|\bincidents?\b|\bpannes?\b|\bindisponib\w*|\br[eé]gressions?\b", re.I)
+#: le « B » seul du canon, en majuscule (« B : suite #956 — perte de
+#: messages », R1 cx2, P2 1) : un b minuscule isolé n'est pas un verdict
+BLOCKING_B = re.compile(r"(?:^|[\s\[(\"«])B[0-9]*\b")
+#: « P2 sensible » : sur ameesh seulement, il garde son caractère bloquant
+SENSITIVE_P2 = re.compile(r"p2[^.;\n]{0,30}sensible|sensible[^.;\n]{0,30}p2", re.I)
+#: un lot de relecture après fusion est la règle, pas une suite de relecture
+REVIEW_LOT_TITLE = re.compile(r"^\s*revue\s*#", re.I)
+REVIEW_REF = "review-after-merge:"
+
+
+def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
+                  app: str = "") -> str:
+    """L'avertissement de route, ou "" : ce lot ressemble-t-il à une suite de
+    relecture (N, P2, P3) qui ne doit **pas** être un lot ?
+
+    Canon §2 (owner, 15/10/2026) : « un défaut non bloquant (N, P2, P3) ne
+    bloque jamais. Il ne crée pas de lot : il va au backlog (`ameesh work
+    backlog add`, avec sa valeur et son chantier), regroupé avec les autres
+    défauts mineurs du même chantier ». Sur ameesh, un P2 de la classe sensible
+    bloque encore : « P2 sensible » n'y est pas signalé (`app="ameesh"`), mais
+    l'est sur les autres projets, où la règle générale s'applique.
+
+    L'avertissement est **consultatif** : rien n'est refusé, une demande
+    d'humain et un incident réel passent. On ne signale que ce qui porte un
+    marqueur explicite de suite (N1/N2, P2/P3, « suite #lot », « suivi d'une
+    relecture », « non bloquant »). Un défaut bloquant nommé (B/B1, P1,
+    incident, panne) garde son lot même quand le titre ou la source cite une
+    suite N : le marqueur non bloquant ne dégrade pas un bloquant (R1 cx2,
+    P2 1). « non bloquant »/« pas bloquant » nie le bloquant, ce n'est pas une
+    occurrence positive ; une régression annoncée explicitement mineure
+    (N/P2/P3) reste une suite mineure, « régression » ne valant pas à lui seul
+    un bloquant (R2 cx2, P2). Une locution de suite de **tests** est neutralisée
+    avant l'examen : elle ne vaut pas marqueur, mais ne masque pas un N/P2/P3
+    explicite (R1 cx2, P2 3). « Suivi »/« follow-up » ne vaut marqueur que
+    visant une relecture ou une référence ; « suivi des coûts mensuels » reste
+    du travail ordinaire, sans avertissement (R1 cx2, P2 2)."""
+    text = " ".join([str(title or ""), str(source or "")]).strip()
+    if not text:
+        return ""
+    if str(issue_ref or "").startswith(REVIEW_REF) \
+            or REVIEW_LOT_TITLE.search(str(title or "")):
+        return ""                       # la relecture après fusion est la règle
+    # Une locution de suite de **tests** ne doit pas servir de marqueur : on la
+    # neutralise, sans masquer un N/P2/P3 explicite (R1 cx2, P2 3).
+    text = TEST_SUITE.sub(" ", text)
+    if SENSITIVE_P2.search(text) and str(app or "").strip().lower() == "ameesh":
+        return ""                       # ameesh : un P2 sensible bloque encore
+    if not (FOLLOWUP_MARKERS.search(text) or STANDALONE_N.search(text)):
+        return ""
+    # Un bloquant explicite (B/B1, P1, incident, panne) est prioritaire : il
+    # garde son lot même avec une référence N historique (R1 cx2, P2 1).
+    # « non bloquant » / « pas bloquant » qualifie le défaut : ce n'est pas une
+    # occurrence positive de « bloquant ». Une régression peut être
+    # explicitement mineure (N/P2/P3), sans annuler B/P1/incident/panne.
+    blocking_text = re.sub(r"\b(?:non[ -]?bloquant\w*|pas bloquant\w*)", " ",
+                           text, flags=re.I)
+    explicit_minor = bool(re.search(
+        r"(?:^|[\s\[(\"«])(?:n[0-9]+\b|p[23]\b|non[ -]?bloquant\w*|pas bloquant)",
+        text, re.I) or STANDALONE_N.search(text))
+    if explicit_minor:
+        blocking_text = re.sub(r"\br[eé]gressions?\b", " ", blocking_text, flags=re.I)
+    if BLOCKING_DEFECT.search(blocking_text) or BLOCKING_B.search(text):
+        return ""
+    where = " --app %s" % app if app else ""
+    short = " ".join(str(title or "").split())[:60]
+    return ("this looks like a non-blocking follow-up (N, P2, P3): canon §2 does not "
+            "create a lot for it — record it in the backlog "
+            "(`ameesh work backlog add --title \"%s\" --value \"<valeur attendue>\" "
+            "--score <1-100>`%s), grouped with the other minor defects of the same "
+            "workstream" % (short, where))
+
+
+# --------------------------------------------------------------------------
 # la file
 # --------------------------------------------------------------------------
 

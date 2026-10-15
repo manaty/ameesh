@@ -1373,6 +1373,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
             if warn_estimate:
                 print("warning: %s" % estimates.missing(item["id"]), file=sys.stderr)
+            # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne
+            # crée pas de lot, elle va au backlog — avertissement, pas refus.
+            if item.get("route_hint"):
+                print("warning: %s" % item["route_hint"], file=sys.stderr)
             _print_deep_analysis(item.get("deep_analysis"))
             _print_assignment(check)
             if item.get("queue_warning"):
