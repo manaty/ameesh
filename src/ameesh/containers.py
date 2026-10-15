@@ -134,9 +134,9 @@ class Runtime:
         return out
 
     def list_all(self, stopped: bool = False) -> list[dict] | None:
-        """Tous les conteneurs EN COURS (L73, lecture seule) : `id`, `name`,
+        """Les conteneurs de l'hôte (L73, lecture seule) : `id`, `name`,
         `image`, `created`, `status`, `labels` ; None si le moteur ne répond
-        pas.
+        pas. Sans `stopped`, seuls ceux qui tournent (`ps`).
 
         `stopped=True` (#1411) : aussi ceux qui ne tournent plus (`ps -a`) —
         un conteneur étiqueté sorti ou jamais démarré ne consomme plus de
