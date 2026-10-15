@@ -264,7 +264,10 @@ class PriseMultiProjetsTest(_Base):
         self.assertTrue(backlog.lot_fits({"lot_team": "nexlink", "id": autre["id"]},
                                          {"team": "ameesh",
                                           "projects": ["ameesh", "nexlink"]}))
-        work.assign(self.db, autre["id"], "m1")
+        # #540 (canon §4) : m1 a déjà un lot non démarré, l'attribution
+        # explicite doit donc être motivée pour ne pas partir en file d'équipe.
+        work.assign(self.db, autre["id"], "m1",
+                    force="attribution explicite (test L243-3)")
         self.assertEqual(work.get(self.db, autre["id"])["assignee"], "m1")
 
     def test_amelioration_d_un_autre_projet_attend_aussi(self):
