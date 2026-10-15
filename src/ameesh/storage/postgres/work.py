@@ -387,7 +387,14 @@ class WorkItems(interface.WorkItems):
         d'écrit), puis journalise la transition. `held` (L233) : et si une
         demande de décision ouverte le tient — vérifiée dans la même
         instruction, la demande verrouillée (voir l'interface). Un passage
-        vers un état terminal libère la réservation de migration (#956)."""
+        vers un état terminal libère la réservation de migration (#956).
+
+        #1693 (N4) : une correction `merged → build` retire le jalon `merged`
+        de la frise, dans la transaction de la transition. Une fusion annulée
+        ne doit ni dater la livraison (affichage, délais, mesure L157c) ni
+        rester comme seule trace d'une fusion : le journal garde la fusion et
+        la correction, et la vraie fusion écrit son propre jalon (le trigger
+        de 0013 le recrée alors que plus rien ne le porte)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
         sql = """
             UPDATE work_items
@@ -402,7 +409,10 @@ class WorkItems(interface.WorkItems):
             """.replace("__COLUMNS__", item_columns(self.db)).replace("__HELD__", _HELD if held else "")
         params = ((state, loops, state, state, int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
-        if state not in ("merged", "promoted", "closed"):
+        # #1693 (N4) : la correction `merged → build` emporte le jalon `merged`
+        # dans la même transaction (voir la docstring).
+        drop_merged = current == "merged" and state == "build"
+        if state not in ("merged", "promoted", "closed") and not drop_merged:
             rows = self.db.query(sql, params)
             if not rows:
                 return None
@@ -413,8 +423,12 @@ class WorkItems(interface.WorkItems):
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
-            self._release_migration(tx, item_id, rows[0],
-                                    why="état %s" % state, actor=actor)
+            if drop_merged:
+                tx.execute("DELETE FROM work_item_milestones"
+                           " WHERE work_item_id = %s AND kind = 'merged'", (int(item_id),))
+            if state in ("merged", "promoted", "closed"):
+                self._release_migration(tx, item_id, rows[0],
+                                        why="état %s" % state, actor=actor)
             return rows[0]
 
     def designate_reviewer(self, item_id, reviewer, *, actor) -> dict | None:
@@ -1442,11 +1456,14 @@ class WorkItems(interface.WorkItems):
                     " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
                 if not latest or int(latest[0]["id"]) != int(frozen_id):
                     return None
+            # #1693 (N1) : une nouvelle fusion (après une correction `merged →
+            # build`) devient la dernière PR de référence du lot — c'est elle
+            # qu'un relevé suivant doit reconnaître pour ne pas refermer le lot.
             rows = tx.query(
                 """
                 UPDATE work_items
                    SET state = 'merged', updated_at = now(), closed_at = NULL,
-                       pr_ref = coalesce(%s, pr_ref),
+                       pr_ref = coalesce(nullif(%s, ''), pr_ref),
                        migration_landed = coalesce(%s, migration_landed),
                        migration_landed_repo = coalesce(%s, migration_landed_repo)
                  WHERE id = %s AND state = %s
@@ -1457,9 +1474,14 @@ class WorkItems(interface.WorkItems):
                 return None
             WorkItems(tx)._event(int(item_id), "merged", note, actor)
             self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
+            # #1693 (N4) : le jalon visé est le plus récent encore sans commit.
+            # Après une correction, celui de la fusion annulée a été retiré, le
+            # trigger de 0013 vient d'en poser un ; sans correction, c'est le seul.
             tx.query(
                 "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                " WHERE id = (SELECT id FROM work_item_milestones"
+                "              WHERE work_item_id = %s AND kind = 'merged' AND sha = ''"
+                "              ORDER BY at DESC, id DESC LIMIT 1) RETURNING id",
                 (sha or "", actor or "", note or "", int(item_id)))
             return rows[0]
 
