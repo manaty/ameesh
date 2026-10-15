@@ -94,6 +94,29 @@ class MailLinksLotsTest(_Base):
         self.assertIn("belongs to dev1: not reassigned", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
+    def test_historique_ne_reassigne_pas_un_lot_deja_assigne(self):
+        # #859 : un agent qui a confié des lots (historique L94, comme le
+        # bureau) n'est pas orchestrateur pour autant : son `--lot` ne
+        # réattribue pas un lot DÉJÀ assigné.
+        self.agent("dist")
+        autre = work.add(self.db, title="à distribuer")
+        work.assign(self.db, int(autre["id"]), "dev1", actor="dist")
+        self.assertIn("dist", storage.of(self.db).operations.assigners(since_s=HEURE * 720))
+        self.assertTrue(assignments.is_orchestrator(self.cfg, self.db, "dist"))
+        self.assertFalse(assignments.is_orchestrator(self.cfg, self.db, "dist", history=False))
+        lot = work.add(self.db, title="tenu par dist", assignee="dist")
+        proc = self.send("dev2", "Pour information sur ce lot.", "--from", "dist",
+                         "--lot", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("already assigned to dist: not reassigned", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dist")
+        # l'historique garde le droit de confier un lot SANS assigné (le
+        # bureau distribue ainsi, canon §4) : rien ne change de ce côté.
+        libre = work.add(self.db, title="libre")
+        proc = self.send("dev2", "À toi.", "--from", "dist", "--lot", str(libre["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, libre["id"])["assignee"], "dev2")
+
     def test_new_lot_cree_et_assigne(self):
         proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
                          "--new-lot", "CI plus rapide", "--estimate", "2h", "--app", "p",

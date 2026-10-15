@@ -274,6 +274,8 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         spend["1h_counted_usd"] = round(book.paid_hour(paid), 6)
         spend["noncritical_hourly_share"] = getattr(cfg, "noncritical_hourly_share", 1.0)
         spend["24h_usd"] = round(book.spent("all", 86400, harnesses=paid), 6)
+        # #513 : idem contre le plafond par jour glissant
+        spend["24h_counted_usd"] = round(book.paid_spent(paid, 86400), 6)
         for agent in sorted(limits.agents):
             spend["agents"][agent] = {
                 "1h_usd": round(book.spent(agent, 3600, harnesses=paid), 6),
@@ -342,6 +344,8 @@ def format_status(data: dict) -> str:
                            _fmt_usd(sp["1h_counted_usd"]),
                            "; non-critical agents stop at %.0f%% of it" % (share * 100)
                            if share is not None and share < 1 else ""))
+        if sp.get("24h_counted_usd") is not None:
+            out.append("daily cap counts %s (same rule)" % _fmt_usd(sp["24h_counted_usd"]))
     if data["paused"]:
         out.append("paused for budget:")
         for p in data["paused"]:
