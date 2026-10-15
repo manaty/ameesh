@@ -41,7 +41,9 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
 * l'attribution est conditionnelle (assigné encore vide) : deux preneurs
   concurrents ne prennent pas le même élément.
 * une dépendance explicite encore ouverte exclut l'élément avant la borne
-  de sélection ; le graphe est revérifié dans la transaction de prise.
+  de sélection ; le graphe est revérifié dans la transaction de prise. Un
+  interblocage de cette transaction avec une autre (#1496) vaut une prise
+  perdue entre-temps : l'élément reste libre, le passage continue.
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
 sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
@@ -88,7 +90,7 @@ import re
 import time
 
 from . import storage
-from .db import Db
+from .db import Db, DbError, is_deadlock
 
 ITEM_TYPE = "improvement"
 PRIORITIES = (1, 2, 3)
@@ -518,6 +520,25 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if team in teams[name]] or known)
 
 
+def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None:
+    """La prise conditionnelle d'un élément prêt (`assign`, `ready_only`), ou
+    None s'il a été pris, ou bloqué, entre-temps.
+
+    #1496 : la prise verrouille l'élément et ses amonts ; une transaction
+    hors du graphe qui les verrouille dans l'autre ordre peut l'interbloquer.
+    Le serveur annule alors la prise entière (rien d'écrit) : c'est une prise
+    perdue entre-temps, comme une course perdue, et non une panne du passage.
+    L'élément reste libre et le prochain passage le revérifie en entier ;
+    toute autre erreur remonte."""
+    try:
+        return st.work.assign(int(item["id"]), assignee, current=None, note=note,
+                              actor=SENDER, take=take, ready_only=True)
+    except DbError as exc:
+        if not is_deadlock(exc):
+            raise
+        return None
+
+
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
               max_per_hour: int = DEFAULT_TAKE_MAX_PER_HOUR,
               alerts: list | None = None, listing: list | None = None, paid=None,
@@ -656,11 +677,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     # non démarré (il en a reçu un depuis sa sélection).
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
-                    done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                          note="%s par %s, au repos" % (LOT_TAKE_NOTE,
-                                                                        check["assignee"]),
-                                          actor=SENDER, take=work.takes_rule(check),
-                                          ready_only=True)
+                    done = _assign_ready(st, item, check["assignee"],
+                                         "%s par %s, au repos" % (LOT_TAKE_NOTE,
+                                                                  check["assignee"]),
+                                         work.takes_rule(check))
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 lots.remove(item)
@@ -722,9 +742,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 AUTO_TAKE_NOTE, check["assignee"], item.get("value_score"),
                 item.get("expected_value") or "")
             try:
-                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
-                                      note=note, actor=SENDER, take=work.takes_rule(check),
-                                      ready_only=True)
+                done = _assign_ready(st, item, check["assignee"], note,
+                                     work.takes_rule(check))
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
             queue.remove(item)
