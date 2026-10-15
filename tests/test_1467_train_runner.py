@@ -259,6 +259,60 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
         self.mechanics.load.assert_called_with(self.publisher, self.base, self.project.name)
 
+    def dst_passage(self, epochs):
+        # Explicit consumer fixture, not an implementation of the calendar.
+        # The cross-branch probe overrides this with #1757's real loader.
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.merge_named_fire = False
+        rules.packet_cutoffs = tuple("%02d:00" % hour for hour in range(24))
+        rules.last_packet = lambda now: max(at for at in epochs if at <= now)
+        rules.next_packet = lambda now: min(at for at in epochs if at > now)
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        return self.passage()
+
+    def pending_packet_across_dst(self, instants):
+        first, second, following = [datetime.fromisoformat(at).timestamp() for at in instants]
+        self.db.execute("UPDATE merge_queue SET queued_at=to_timestamp(%s)", [first - 1])
+        passage = self.dst_passage((first, second, following))
+        rules = passage.runtime(self.db).policy.schedule
+        self.assertEqual(rules.last_packet(first + 5), first)
+        self.assertEqual(rules.last_packet(second + 5), second)
+        start = train_ci.GitHub.start
+        with mock.patch.object(train_ci.GitHub, "start", autospec=True, side_effect=start) as ci_start:
+            result, deadline = passage.scheduled_step(self.db, first + 5)
+            self.assertEqual(result["result"], "ci", result)
+            self.assertEqual(deadline, second)
+            plan = result["plan"]
+            other_db = db_mod.connect(self.__class__.cfg)
+            self.addCleanup(other_db.close)
+            resumed = self.dst_passage((first, second, following))
+            pending = dict(head=plan["head"], tree=plan["tree"], status="pending", complete=False)
+            with mock.patch.object(train_ci.GitHub, "read", return_value=pending):
+                result, deadline = resumed.scheduled_step(other_db, second + 5)
+            self.assertEqual(result["result"], "ci", result)
+            self.assertEqual(train.digest(result["plan"]), train.digest(plan))
+            self.assertEqual(deadline, following)
+            self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+            self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+            result, _ = resumed.scheduled_step(other_db, second + 10)
+            self.assertEqual(result["result"], "landed", result)
+            self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
+            ci_start.assert_called_once()
+        self.assertEqual(self.git(self.origin, "for-each-ref", "--format=%(refname)",
+                                  "refs/heads/integration/").splitlines(),
+                         ["refs/heads/" + plan["branch"]])
+
+    def test_pending_packet_survives_repeated_hour_on_fresh_connection(self):
+        self.pending_packet_across_dst(("2026-10-25T02:00:00+02:00",
+                                       "2026-10-25T02:00:00+01:00",
+                                       "2026-10-25T03:00:00+01:00"))
+
+    def test_pending_packet_survives_spring_gap_on_fresh_connection(self):
+        self.pending_packet_across_dst(("2026-03-29T01:00:00+01:00",
+                                       "2026-03-29T03:00:00+02:00",
+                                       "2026-03-29T04:00:00+02:00"))
+
     def test_missing_invalid_or_incompatible_compiled_policy_refuses_before_effect(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
         self.mechanics.load.side_effect = train.TrainError("mechanics absent")

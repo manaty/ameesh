@@ -51,6 +51,12 @@ def stamp(hour):
 
 
 class RealMechanicsTest(TrainRunnerTest):
+    def dst_passage(self, epochs):
+        # The shared SQL/Git assertions must use the exact supplier's calendar.
+        if not hasattr(self, "dst_canon"):
+            self.dst_canon = self.hourly_canon()
+        return self.passage(policy_commit=self.dst_canon)
+
     def hourly_canon(self):
         hours = json.dumps(["%02d:00" % hour for hour in range(24)])
         return self.revise(MECHANICS.replace('  cutoffs: ["11:00", "23:00"]',
@@ -270,7 +276,9 @@ if __name__ == "__main__":
         names = [name for name in RealMechanicsTest.__dict__ if name.startswith("test_")]
         names += ["test_new_clone_reads_real_history_then_lands_exact_ci_head_across_connections",
                   "test_competing_runner_cannot_touch_the_reserved_train_or_share_its_clone",
-                  "test_missing_provenance_cannot_publish_or_be_replaced_by_current_registry"]
+                  "test_missing_provenance_cannot_publish_or_be_replaced_by_current_registry",
+                  "test_pending_packet_survives_repeated_hour_on_fresh_connection",
+                  "test_pending_packet_survives_spring_gap_on_fresh_connection"]
         if args.test:
             if not set(args.test) <= set(names):
                 parser.error("unknown consumer witness")

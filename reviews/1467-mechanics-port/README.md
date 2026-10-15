@@ -25,13 +25,14 @@ distante sont simulés ; Git, Postgres, les verrous et la promotion locale
 sont réels et jetables.
 
 `probe.py` charge uniquement le blob Python du fournisseur au commit
-complet, dans un répertoire temporaire. Il propose quatorze scénarios ciblés :
+complet, dans un répertoire temporaire. Il propose seize scénarios ciblés :
 coupure modifiée dans le canon, fuseau modifié, fichier absent, famille
 exclue, nombre d'avis modifié, parcours publication/feu/promotion avec
 nouvelle connexion, concurrence de runners, provenance inconnue, calendrier
 du service, fusion automatique, absence du bloc de fusion, cadence horaire
 et retrait pendant la CI, refus du calendrier release comme remplacement
-d'un calendrier paquet absent.
+d'un calendrier paquet absent, reprise SQL d'une CI pendant l'heure répétée
+d'octobre et le saut de mars.
 
 Avec `--canon` et `--canon-commit`, le même fournisseur lit aussi les objets
 réels du canon exact. Le premier raccord a utilisé le candidat home
@@ -110,3 +111,21 @@ sur son commit exact `53cf2e01` (un témoin psycopg, 3,4 s), sans publication
 ni réservation cible.
 La preuve interbranches du fournisseur #1757 et du calendrier réel (23/25
 occurrences aux changements d'heure) attend ses objets publiés.
+
+Les deux témoins DST de `tests.test_1467_train_runner` passent par la file,
+la publication Git, la persistance du manifeste puis une connexion SQL et un
+`Passage` neufs. Une CI encore en cours après le changement d'heure conserve
+son plan et n'est lancée qu'une fois ; sa conclusion verte promeut sa tête
+exacte. Le calendrier de ces tests est une fixture d'epochs explicites.
+Ces deux témoins passent sous `ameesh heavy` avec psycopg (2/2, 39,0 s)
+et psql (2/2, 37,4 s) ; Git et SQL sont réels, CI et provenance simulées.
+Dans `probe.py`, les mêmes assertions chargent le calendrier horaire avec
+le fournisseur exact, sur un unique commit de canon de fixture conservé
+pendant la reprise : aucun calendrier simulé n'est utilisé par ce raccord.
+Ces deux exécutions interbranches restent à faire après livraison de #1757 :
+
+```sh
+# Ajouter ces options à la commande interbranches ci-dessus :
+--test test_pending_packet_survives_repeated_hour_on_fresh_connection \
+--test test_pending_packet_survives_spring_gap_on_fresh_connection
+```

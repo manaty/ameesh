@@ -53,6 +53,11 @@ composition prend le dernier créneau réel fourni. Ces comportements sont
 éprouvés avec des epochs explicites dans le banc du consommateur ; le calcul
 du calendrier et son raccord Git/SQL restent à qualifier sur le fournisseur
 exact #1757.
+Le banc Git/SQL conserve aussi le même manifeste pendant une CI à travers
+chacun des deux changements d'heure, après reconstruction du passage sur une
+connexion fraîche, puis promeut la tête exacte avec un seul lancement CI.
+Il utilise des epochs de fixture ; le probe interbranches réemploie les mêmes
+assertions avec le calendrier chargé par le fournisseur exact, encore attendu.
 L'ancien calendrier autonome de 11 h/23 h reste
 uniquement un banc de préparation ; aucun profil actif ne le sélectionne.
 
