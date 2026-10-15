@@ -175,6 +175,7 @@ class PauseTest(PgTestCase):
         worker = object.__new__(AgentWorker)
         threading.Thread.__init__(worker)
         worker.db, worker.name, worker.epoch = self.db, "worker", epoch
+        worker.state_dir, worker.resident = self.tmp, None
         worker.runner = mock.Mock(runner_id="runner-test")
         with mock.patch.object(worker, "_run_turn", side_effect=AssertionError("turn launched")):
             self.assertFalse(worker.run_turn({"kind": "prompt", "prompt": "picked prompt"}))
@@ -188,6 +189,7 @@ class PauseTest(PgTestCase):
         worker = object.__new__(AgentWorker)
         threading.Thread.__init__(worker)
         worker.db, worker.name, worker.proc = self.db, "worker", None
+        worker.lock, worker.resident = threading.Lock(), None
         worker.rotation_forcee = "forced by restart"
         worker.runner = mock.Mock()
         with mock.patch.object(worker, "_held_by_pressure", return_value=False), \
