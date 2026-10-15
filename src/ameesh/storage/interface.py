@@ -2479,10 +2479,12 @@ class Operations(Domain):
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee, `package_id`, type et `priority` (le délai court du canon §9
-        pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
-        lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
+        assignee, `lot_team` (équipe du lot : la sienne, sinon celle de son
+        paquet ou du parent, sinon son `app`), `package_id`, type et `priority`
+        (le délai court du canon §9 pour un P1, #789), app, workstream, reviewer
+        (#705 : le projet du lot et son relecteur désigné). Les plus anciennement
+        actifs d'abord. `limit=None` lit toute la vérité avant le filtrage des
+        attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
