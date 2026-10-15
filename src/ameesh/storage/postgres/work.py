@@ -845,10 +845,15 @@ class WorkItems(interface.WorkItems):
         le jalon — la désignation des relecteurs y dépose sa marque et ses
         courriers atomiquement — et une exception annule le jalon avec elle.
         `after_commit` est la liste des écritures de fil différées
-        (`mail.send(..., after_commit=…)`, motif #315) ; c'est `add_milestone`
-        qui la vide **après** le commit, l'appelant ne la vide pas lui-même.
-        Sans callback ni liste, rien ne change : le gel branché par défaut ne
-        désigne personne. Un `on_frozen` sur un autre kind est refusé."""
+        (`mail.send(..., after_commit=…)`, motif #315) : `add_milestone` ne la
+        vide **pas**, c'est l'appelant qui tient le commit qui la vide après
+        son COMMIT. Sur une connexion racine le `with` commite, l'appelant vide
+        la liste juste après le retour ; dans une transaction déjà ouverte le
+        `with` imbriqué ne commite pas (psql et psycopg), et la vider ici
+        publierait le fil avant le commit externe — un rollback laisserait des
+        traces sans gel ni marque (revue codex cx2, B2). Sans callback ni
+        liste, rien ne change : le gel branché par défaut ne désigne personne.
+        Un `on_frozen` sur un autre kind est refusé."""
         if on_frozen is not None and kind != "frozen":
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
@@ -867,9 +872,6 @@ class WorkItems(interface.WorkItems):
             milestone = rows[0]
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
-        # le fil externe après le commit seulement : un gel annulé n'y laisse rien
-        for record in threads:
-            record(self.db.cfg, self.db)
         return milestone
 
     def delays(self, limit, *, ids=None) -> list[dict]:
