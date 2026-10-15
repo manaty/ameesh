@@ -1187,6 +1187,16 @@ class ContentDeliveryTest(_Base):
         self.assertTrue(found["merged"])
         self.assertEqual(found["how"], "ancestor")
 
+    def test_1776_gel_vide_dans_paquet_reverte(self):
+        sha = self.gel_vide("agent/1776-nested")
+        # Le lot entre dans une branche de paquet, elle-même fusionnée.
+        _git(self.repo, "branch", "-m", "develop", "packet1776")
+        _git(self.repo, "checkout", "-q", "-b", "develop", "main")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet", "packet1776")
+        self.assertTrue(plan_git.probe(self.repo, sha, "develop")["merged"])
+        self.retirer()
+        self.assertFalse(plan_git.probe(self.repo, sha, "origin/develop")["merged"])
+
 
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""

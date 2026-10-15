@@ -136,28 +136,30 @@ def _applies(repo: str, tree: str, patch: bytes, *, reverse: bool = False) -> bo
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _introducing_merge(repo: str, sha: str, head: str) -> tuple[str, str] | None:
-    """Le commit de fusion qui a fait entrer `sha` dans `head` : son premier
-    parent (l'arbre d'avant) et lui-même.
+def _introduced_range(repo: str, sha: str, head: str) -> tuple[str, str] | None:
+    """Le gel et sa base commune avec la cible avant sa première introduction.
 
     Un gel vide (`commit --allow-empty`) ne porte aucun diff propre : la
-    preuve de contenu du lot est le delta de la fusion qui l'a introduit dans
-    la cible (#1776). None quand l'entrée n'est pas une fusion (avance
+    preuve de contenu du lot part de cette base, sans les autres membres de
+    la fusion (#1776). None quand l'entrée n'est pas une fusion (avance
     rapide), quand `sha` n'est pas ancêtre de `head`, ou quand git ne peut
     pas la lire — un doute ne conclut jamais au retrait."""
     if _git(repo, "merge-base", "--is-ancestor", sha, head).returncode != 0:
         return None
-    out = _out(repo, "rev-list", "--first-parent", "--ancestry-path",
-               "%s..%s" % (sha, head))
+    out = _out(repo, "rev-list", "--topo-order", "--reverse", "--merges",
+               "--ancestry-path", "%s..%s" % (sha, head))
     if not out:
         return None
-    # rev-list rend du plus récent au plus ancien : le plus ancien descendant
-    # de `sha` sur la chaîne des premiers parents est là où le lot est entré.
-    entry = out.split()[-1]
-    parents = (_out(repo, "rev-list", "--parents", "-n", "1", entry) or "").split()
-    if len(parents) < 3:
-        return None
-    return parents[1], entry
+    # Traverser aussi les branches de paquet : --first-parent masque leur
+    # fusion du lot. La première entrée topologique par un parent secondaire
+    # isole le lot, plutôt que le diff de tous les membres du paquet.
+    for entry in out.split():
+        parents = (_out(repo, "rev-list", "--parents", "-n", "1", entry) or "").split()
+        if len(parents) >= 3 and _git(
+                repo, "merge-base", "--is-ancestor", sha, parents[1]).returncode == 1:
+            base = _out(repo, "merge-base", parents[1], sha)
+            return (base, sha) if base else None
+    return None
 
 
 def _content_gone(repo: str, sha: str, head: str) -> str | None:
@@ -169,7 +171,7 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
     qa-01, #498 / 043e14d8e). Le contenu est jugé là quand le diff du gel se
     défait sur l'arbre de la cible, et retiré quand il s'y réapplique
     proprement. Un gel vide ne porte aucun diff : sa preuve est le delta de
-    la fusion qui l'a introduit (#1776). Arbres évolués (les deux échouent) :
+    son entrée dans la cible (#1776). Arbres évolués (les deux échouent) :
     seuls les fichiers ajoutés par le lot et disparus, ou supprimés et
     revenus, prouvent le retrait — un doute ne conclut jamais au retrait."""
     parent = _out(repo, "rev-parse", "--verify", "--quiet", sha + "^1")
@@ -180,9 +182,8 @@ def _content_gone(repo: str, sha: str, head: str) -> str | None:
     if diff.returncode != 0:
         return None
     if not diff.stdout.strip():
-        # gel vide : la preuve de contenu est le delta de la fusion qui l'a
-        # fait entrer dans la cible
-        entry = _introducing_merge(repo, sha, head)
+        # gel vide : isoler son contenu à son entrée, y compris dans un paquet.
+        entry = _introduced_range(repo, sha, head)
         if entry is None:
             return None
         proof_parent, proof = entry
