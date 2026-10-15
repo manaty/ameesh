@@ -342,12 +342,14 @@ class _Base(PgTestCase):
 
     def _ressource_fermee(self, agent: str, timeout: float = 10.0) -> dict:
         """#1708 : attendre la **ligne du registre**, pas seulement la mort du
-        pid — le nettoyage peut l'écrire après. Sous charge (deux suites
+        pid — le nettoyage peut l'écrire après. La grâce renseigne déjà
+        ended_ts : seul un statut terminal prouve la fermeture. Sous charge (deux suites
         partageant le Postgres de banc), un `ended_ts` encore nul faisait
         rougir un test sain sur un simple décalage d'ordonnancement."""
         def fermee():
             lignes = self._ressources(agent)
-            if lignes and lignes[0]["ended_ts"] is not None:
+            if (lignes and lignes[0]["ended_ts"] is not None
+                    and lignes[0]["status"] in ("done", "orphan")):
                 return lignes[0]
             return None
         return self.wait_for(fermee, timeout=timeout)
