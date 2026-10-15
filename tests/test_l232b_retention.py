@@ -178,6 +178,20 @@ class RetentionTest(unittest.TestCase):
         self.assertTrue(other.exists())
         self.assertTrue((self.root / "old.dump").exists(), "a catalogued set is never expired by age")
 
+    def test_expire_unregistered_command_fails_when_a_candidate_is_refused(self):
+        # Un refus n'est pas silencieux : la commande sort non nulle et le
+        # fichier, qui n'expirera jamais, reste visible dans le JSON.
+        public = self.daily("ameesh-public.dump", age=15 * 24 * 3600)
+        public.chmod(0o644)
+        result = subprocess.run([sys.executable, str(PATH), "--root", str(self.root),
+                                 "expire-unregistered", "--now", "2000000",
+                                 "--max-age", str(14 * 24 * 3600)],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(result.stdout)["refused"], ["ameesh-public.dump"])
+        self.assertIn("refused", result.stderr)
+        self.assertTrue(public.exists())
+
     def test_unregistered_daily_expiry_refuses_unsafe_candidates(self):
         target = self.root / "target"
         target.write_bytes(b"private target")
@@ -241,6 +255,19 @@ class RetentionTest(unittest.TestCase):
         self.assertTrue(fresh.exists())
         self.assertEqual(len(list(self.root.glob("ameesh-*.dump"))), 2, "fresh and new dumps survive")
 
+    def test_server_refused_unregistered_dump_fails_the_run_after_prune(self):
+        # Un dump non privé n'expire jamais : la course quotidienne doit sortir
+        # non nulle, sans empêcher prune de tourner.
+        self.artifact(rollback=0)
+        retention.protect(self.root, "old", accepted=True)
+        public = self.daily("ameesh-public.dump", age=15 * 24 * 3600, now=time.time())
+        public.chmod(0o644)
+        result = subprocess.run(["sh", "-c", self.server_script()], capture_output=True,
+                                env=dict(os.environ))
+        self.assertNotEqual(result.returncode, 0, "a refused candidate must fail the daily run")
+        self.assertTrue(public.exists())
+        self.assertFalse((self.root / "old.dump").exists(), "prune still ran")
+
     def remote_artifact(self):
         path = self.root / "remote.dump"
         path.write_bytes(b"synthetic remote recovery")
@@ -288,8 +315,11 @@ class RetentionTest(unittest.TestCase):
                     retention.protect(self.root, "remote", accepted=True)
                     retention.protect(self.root, "local", accepted=True)
                 adapter.objects["host-2/remote.dump"] = altered
-                with self.assertRaises(retention.RetentionError):
+                with self.assertRaises(retention.RetentionError) as caught:
                     retention.prune(self.root, now=1000, remote_adapter=adapter)
+                # L'erreur nomme l'ensemble et l'objet à réconcilier.
+                self.assertIn("remote", str(caught.exception))
+                self.assertIn("host-2/remote.dump", str(caught.exception))
                 self.assertFalse(any(call[0] == "delete" for call in adapter.calls))
                 self.assertTrue((self.root / "local.dump").exists())
                 self.assertTrue((self.root / "remote.dump").exists())

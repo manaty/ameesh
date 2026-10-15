@@ -10,7 +10,8 @@
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
 #   migrer       migrations de REF, lancées depuis son instantané AVANT de
 #                l'installer : base du mesh (UNE fois), puis ancienne base ;
-#                refusé si l'une n'est pas additive (voir MIGRER_APRES)
+#                refusé si l'une n'est pas additive — garde inconditionnelle,
+#                MIGRER_APRES ne la désactive jamais (docs/BASCULE.md, L232b)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
 #                installé dans le venv (dépendance psycopg comprise) ; refusé
 #                tant qu'une base n'a pas les migrations de REF
@@ -186,7 +187,6 @@ ameesh_de() {
   local cible=$1; shift
   PYTHONPATH="$cible/src" "$VENV/bin/python" -m ameesh "$@"
 }
-installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
   local ref=${1:-HEAD} cible court
