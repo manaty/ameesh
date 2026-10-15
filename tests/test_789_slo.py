@@ -145,6 +145,20 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["targets"], ("assignee",))
 
+    def test_intake_garde_son_origine_au_demarrage(self):
+        events = [_ev("intake", T0), _ev("intake", T0 + 7200,
+                  "assigned to executant (before: nobody)")]
+        item = _item(assignee="executant")
+        before = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                        now=T0 + 8100), "intake_started")
+        events.append(_ev("build", T0 + 8100))
+        item.update(state="build", updated_ts=T0 + 8100)
+        after = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                       now=T0 + 8200), "intake_started")
+        self.assertEqual(before["elapsed_s"], 900)
+        self.assertEqual(after["started_ts"], before["started_ts"])
+        self.assertEqual(after["elapsed_s"], before["elapsed_s"])
+
     def test_build_sans_evenement(self):
         events = [_ev("intake", T0), _ev("build", T0 + 600)]
         item = _item(state="build", assignee="executant", updated_ts=T0 + 600)
@@ -180,6 +194,15 @@ class MesureTest(unittest.TestCase):
         jalons = _jalons(item, events)
         jalons["verdict"], jalons["verdict_kind"] = T0 + 1800, "blocked"
         rows = slo.lot_steps(item, jalons, events, now=T0 + 10_000)
+        self.assertEqual([r for r in rows if r["step"] == "verdict_merge"], [])
+
+    def test_nouveau_gel_invalide_le_go_precedent(self):
+        item = _item(state="qa", assignee="executant")
+        declared = [{"kind": "verdict", "verdict": "ok", "at_ts": T0 + 1800},
+                    {"kind": "frozen", "at_ts": T0 + 2000}]
+        jalons = progress._work_item_milestones(item, [], [], declared)
+        self.assertFalse(jalons["verdict_current"])
+        rows = slo.lot_steps(item, jalons, [], now=T0 + 10000)
         self.assertEqual([r for r in rows if r["step"] == "verdict_merge"], [])
 
     def test_breaches_trie_par_gravite(self):
