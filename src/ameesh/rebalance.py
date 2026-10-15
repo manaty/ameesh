@@ -125,7 +125,11 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
         if profile.kind == "api_key_env":
             continue  # une clé API ne constitue pas une capacité de forfait
         # seuil des non-critiques : la réserve reste aux agents critiques (L242b)
-        result = accounts.evaluate(book, profile, items, now, record=False, reserve=True)
+        # #1580 (tranche 3) : `model=''` — la marge se lit sur les fenêtres
+        # générales ; un seau propre à un modèle (Fable) ne l'annule pas pour
+        # les agents d'un autre modèle. La capacité par modèle reste à faire.
+        result = accounts.evaluate(book, profile, items, now, record=False,
+                                   reserve=True, model="")
         if not result.ok or result.hard:
             continue
         # Une fenêtre échue ne mesure pas la suivante, et une courte échue

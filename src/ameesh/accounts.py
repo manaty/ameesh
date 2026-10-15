@@ -714,10 +714,50 @@ class Evaluation:
         return not self.hard
 
 
-def gauges_of(book, profile: Profile, items: list[Profile]) -> list:
-    """Les jauges de forfait du compte, lues dans SES journaux."""
+def model_scoped(gauges, model):
+    """Les jauges qui comptent pour une session de modèle `model`.
+
+    #1580 (tranche 3) : un seau propre à un modèle (`Gauge.scope`, le `title`
+    du widget omarchy) ne compte que pour une session de ce modèle. `model`
+    `None` : pas de session (affichage) — tous les seaux sont rendus ;
+    `''` : session de modèle inconnu — les seaux de modèle sont **écartés**,
+    jamais attribués au hasard. Les fenêtres générales passent toujours.
+    """
+    if model is None or not any(getattr(g, "scope", "") for g in gauges):
+        return gauges
+    session = (model or "").strip().lower()
+    kept = [g for g in gauges
+            if not getattr(g, "scope", "") or (session and g.scope in session)]
+    if len(kept) == len(gauges):
+        return gauges
+    from .cost import Gauges  # import local : accounts n'importe pas cost
+    try:
+        return Gauges(kept, getattr(gauges, "overage", None))
+    except TypeError:           # un lecteur qui rend une simple liste
+        return kept
+
+
+def gauges_of(book, profile: Profile, items: list[Profile], *,
+              model=None, now: float | None = None) -> list:
+    """Les jauges de forfait du compte.
+
+    Claude : le fichier du widget omarchy d'abord quand il est frais (#1580
+    tranche 3 : il porte les seaux propres à un modèle, invisibles des
+    journaux), ses drapeaux d'overage repris du journal ; sinon les journaux
+    `rate_limit_event.unifiedWindows`, comme avant. Les autres harnais lisent
+    leurs journaux. `model` filtre les seaux de modèle (`model_scoped`).
+    """
     if profile.harness == "claude":
-        return book.claude_gauges(account=profile.name, primary=items[0].name)
+        from . import widget_usage
+        gauges = widget_usage.read(profile, now=now)
+        if gauges is not None:
+            journal = book.claude_gauges(account=profile.name, primary=items[0].name)
+            overage = getattr(journal, "overage", None)
+            if overage is not None:
+                gauges.overage = overage
+        else:
+            gauges = book.claude_gauges(account=profile.name, primary=items[0].name)
+        return model_scoped(gauges, model)
     if profile.harness == "codex":
         # Un seul mécanisme (cost.CostBook) : argument > AMEESH_CODEX_SESSIONS >
         # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte déclaré a son
@@ -956,13 +996,16 @@ def _release(profile: Profile, depasses, hard, now: float,
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
              environ=None, *, record: bool = True, critical: bool = False,
-             reserve: bool = False) -> Evaluation:
+             reserve: bool = False, model=None) -> Evaluation:
     """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
 
     `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit.
     `critical` (L242b) : pour un agent critique, sans le plafond implicite de
     50 % du compte par défaut (`fixed_caps`). `reserve` : pour un agent non
-    critique, le rythme moins `RESERVE` (`limits`).
+    critique, le rythme moins `RESERVE` (`limits`). `model` (#1580 tranche 3) :
+    le modèle de la session ; `None` = pas de session (affichage), tous les
+    seaux comptent, `''` = modèle inconnu, les seaux de modèle sont écartés
+    (`gauges_of`).
 
     #1176 : le plafond de rythme est celui du compte (`pace_ceiling`), relevé
     en fin de fenêtre (`pace_ceiling_end`) quand `overage_impossible` le
@@ -973,7 +1016,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if result.problems:
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
         return result
-    result.gauges = gauges_of(book, profile, items)
+    result.gauges = gauges_of(book, profile, items, model=model, now=now)
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
@@ -1291,7 +1334,8 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
-           paced: bool = True, critical: bool = False, margin: bool = False) -> Choice:
+           paced: bool = True, critical: bool = False, margin: bool = False,
+           model: str = "") -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     `session_account` : le compte sous lequel tourne la session en cours de
@@ -1323,6 +1367,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     harnais emprunté ne revient au sien qu'avec la réserve des non-critiques
     (`RESERVE`) sous le rythme — sans cette marge, chaque franchissement du
     plafond coûterait une rotation avec résumé.
+
+    `model` (#1580 tranche 3) : le modèle de la session qui va tourner ; ses
+    seaux propres (widget omarchy) comptent pour lui seul. Défaut `''` :
+    modèle inconnu, les seaux de modèle sont écartés — jamais attribués au
+    hasard ; l'appelant qui connaît le modèle de l'agent le passe.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -1338,7 +1387,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         if profile.name not in cache:
             cache[profile.name] = evaluate(book, profile, items, now, environ,
                                            record=not simulate,
-                                           reserve=margin or not critical)
+                                           reserve=margin or not critical,
+                                           model=model)
         return cache[profile.name]
 
     active_name = row.get("account")
