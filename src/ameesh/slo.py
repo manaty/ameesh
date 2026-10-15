@@ -221,13 +221,13 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     started = _first_event(events, "build")
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
+        ready = assigned if assigned is not None else requested
         if started is not None:
-            out.append(_row(step, requested, now=now, critical=critical,
+            out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
-                            elapsed_s=int(max(0.0, started - float(requested)))))
+                            elapsed_s=int(max(0.0, started - float(ready)))))
         else:
             # pas encore démarré : le délai court depuis que le lot est prêt
-            ready = assigned or requested
             out.append(_row(step, ready, now=now, critical=critical))
 
     if state == "build":
@@ -238,7 +238,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
 
     verdict, kind = jalons.get("verdict"), jalons.get("verdict_kind")
     merged = jalons.get("merged")
-    if kind == "ok" and verdict is not None:
+    if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
         if merged is not None:
             out.append(_row(step, verdict, now=now, critical=critical,
