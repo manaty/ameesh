@@ -3821,6 +3821,9 @@ class AgentWorker(threading.Thread):
         fin = tour.wait(RESIDENT_END_WAIT_S)
         if fin is None:
             return 1, "resident turn did not end"
+        # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
+        # courant, fenêtre, relu du tour et relu cumulé de la session.
+        rp.record_turn(fin)
         if fin.status == resident.COMPLETED:
             return 0, None
         if fin.status == resident.INTERRUPTED:

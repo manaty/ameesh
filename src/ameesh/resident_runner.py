@@ -51,6 +51,16 @@ PROTOCOLS = ("claude-stream-json",)
 TURN_FILE = "resident-turn"
 #: environment variable that points the hook to `TURN_FILE`
 TURN_FILE_ENV = "AMEESH_TURN_ID_FILE"
+#: local setting: cumulative re-read of a resident session before rotation
+#: (L81, study §6.2); 0 = never rotate on the cumulative re-read alone
+REREAD_MAX_SETTING = "resident_reread_max"
+#: study §6.2: a session that re-read about 50 M tokens is rotated
+DEFAULT_REREAD_MAX = 50_000_000
+#: study §6.2: native compaction when the context reaches half the window
+COMPACT_SHARE = 0.5
+#: what a finished resident turn asks for (L81, study §6.2)
+COMPACT = "compact"
+ROTATE = "rotate"
 
 ON = ("on", "1", "true", "yes")
 
@@ -91,6 +101,43 @@ def sleep_seconds(value: str | None) -> float:
     if seconds != seconds or seconds < 0:
         return float(DEFAULT_SLEEP_S)
     return seconds
+
+
+def reread_max(value: str | None) -> float:
+    """The `resident_reread_max` setting in tokens; unreadable or empty:
+    default. 0 = never rotate on the cumulative re-read alone."""
+    try:
+        tokens = float((value or "").strip())
+    except ValueError:
+        return float(DEFAULT_REREAD_MAX)
+    if tokens != tokens or tokens < 0:
+        return float(DEFAULT_REREAD_MAX)
+    return tokens
+
+
+def turn_reread(usage: dict | None) -> int:
+    """Tokens a turn re-read (sum of its model calls): the measure of the L60
+    context ceiling, carried by `TurnResult.usage`."""
+    return sum(int((usage or {}).get(key) or 0) for key in
+               ("input_tokens", "cache_read_input_tokens",
+                "cache_creation_input_tokens"))
+
+
+def maintenance(*, context: int | None, window: int | None, reread: int,
+                session_reread: int, cap: float = 0, reread_max: float = 0,
+                share: float = COMPACT_SHARE) -> str:
+    """What a finished resident session asks for (L81, study §6.2): `ROTATE`
+    when a hard bound is reached — the per-agent L60 ceiling on the turn's
+    re-read, or the session's cumulative re-read — `COMPACT` when the context
+    fills `share` of its window, else ''. Rotation wins: it is the hard
+    bound, and a compaction could not bring the session back under it."""
+    if cap and reread >= cap:
+        return ROTATE
+    if reread_max and session_reread >= reread_max:
+        return ROTATE
+    if context and window and share > 0 and context >= share * window:
+        return COMPACT
+    return ""
 
 
 def _binary_stamp(path: str) -> tuple:
@@ -165,6 +212,12 @@ class ResidentProcess:
         self.started = time.monotonic()
         self.last_used = self.started
         self.turns = 0
+        #: L81 measurement (study §6.1): context of the last call, its window,
+        #: tokens re-read by the last turn and since the session opened
+        self.last_context: int | None = None
+        self.context_window: int | None = None
+        self.last_reread = 0
+        self.session_reread = 0
         #: its `turn_resources` row (under `life_id`) is open
         self.resource_open = False
         #: a close is under way (`AgentWorker._close_resident`)
@@ -202,6 +255,28 @@ class ResidentProcess:
                 out.append(self.events.get_nowait())
             except queue.Empty:
                 return out
+
+    def record_turn(self, result) -> None:
+        """L81 measurement of a finished turn (study §6.1): the context of its
+        last call, the window when the harness gives it, the tokens the turn
+        re-read and the cumulative re-read of the session."""
+        usage = getattr(result, "usage", None) or {}
+        context = usage.get("context_tokens")
+        if context is not None:
+            self.last_context = int(context)
+        window = usage.get("context_window")
+        if window:
+            self.context_window = int(window)
+        self.last_reread = turn_reread(usage)
+        self.session_reread += self.last_reread
+
+    def maintenance_due(self, *, cap: float = 0, reread_max: float = 0,
+                        share: float = COMPACT_SHARE) -> str:
+        """What this session asks for after its last turn (L81): '' while it
+        may go on, else `COMPACT` or `ROTATE` (study §6.2)."""
+        return maintenance(context=self.last_context, window=self.context_window,
+                           reread=self.last_reread, session_reread=self.session_reread,
+                           cap=cap, reread_max=reread_max, share=share)
 
     def stream(self, turn: resident.Turn, tick: float = 0.1) -> Iterator[tuple[dict, dict]]:
         """The events of `turn`, until it ends. The driver emits an event
