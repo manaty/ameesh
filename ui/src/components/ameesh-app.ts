@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // <ameesh-app>: the default assembly of the components, full screen (the
 // standalone page /ui/), with internal navigation (study §2.2). L88 gives
-// the frame: who is connected to which mesh, in which mode; the screens
-// arrive with L89. Outputs are DOM events (`ameesh:*`), never navigation.
+// the frame and the seven read screens (L89). Outputs are DOM events (`ameesh:*`), never navigation.
 import { LitElement, css, html } from "lit";
 import { ApiError, type Client, type Schemas } from "../api/client";
 import { languageOf, pick, translate, type Params } from "../i18n/index";
@@ -21,6 +20,7 @@ export class AmeeshApp extends LitElement {
     theme: { reflect: true },
     standalone: { type: Boolean },
     state: { state: true },
+    section: { state: true }, project: {}, agent: {}, lot: {},
   };
   static override styles = [base, css`
     :host { display: block; min-height: 100%; background: var(--_page); }
@@ -28,11 +28,14 @@ export class AmeeshApp extends LitElement {
              padding: 12px 16px; border-bottom: 1px solid var(--_grid);
              background: var(--_surface); }
     h1 { font-size: 1.25rem; margin: 0; }
-    nav ul { display: flex; gap: 8px; list-style: none; margin: 0; padding: 8px 16px; }
-    nav a { color: var(--_ink); padding: 2px 6px; border-radius: 4px; }
-    nav a[aria-current="page"] { font-weight: 600; text-decoration: none;
+    nav ul { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 0; padding: 8px 16px; }
+    nav button { color: var(--_ink); padding: 2px 6px; border-radius: 4px; }
+    nav button[aria-current="page"] { font-weight: 600; text-decoration: none;
                                  box-shadow: inset 0 -2px var(--_build); }
     main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+    form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-bottom: 20px; }
+    label { display: grid; gap: 4px; }
+    input { min-width: 0; max-width: 100%; }
     .error { display: flex; gap: 12px; align-items: center; }
   `];
 
@@ -43,6 +46,10 @@ export class AmeeshApp extends LitElement {
    * becomes the page's; embedded, the host page is never touched. */
   standalone = false;
   state: State = { kind: "idle" };
+  section = "projects";
+  project = "";
+  agent = "";
+  lot = "";
   #config: AmeeshConfig | null = null;
   #load: AbortController | null = null;
   #onConfig = () => void this.refresh();
@@ -50,6 +57,9 @@ export class AmeeshApp extends LitElement {
   override connectedCallback(): void {
     super.connectedCallback();
     this.#config = configOf(this);
+    this.addEventListener("ameesh:open-project", this.#navigate);
+    this.addEventListener("ameesh:open-agent", this.#navigate);
+    this.addEventListener("ameesh:open-lot", this.#navigate);
     this.#config?.addEventListener(CONFIG_CHANGED, this.#onConfig);
     void this.refresh();
   }
@@ -58,6 +68,9 @@ export class AmeeshApp extends LitElement {
     super.disconnectedCallback();
     this.#config?.removeEventListener(CONFIG_CHANGED, this.#onConfig);
     this.#load?.abort();
+    this.removeEventListener("ameesh:open-project", this.#navigate);
+    this.removeEventListener("ameesh:open-agent", this.#navigate);
+    this.removeEventListener("ameesh:open-lot", this.#navigate);
   }
 
   override updated(changed: Map<string, unknown>): void {
@@ -109,6 +122,36 @@ export class AmeeshApp extends LitElement {
     return this.#t("error.other", { code });
   }
 
+  #navigate = (event: Event): void => {
+    const detail = (event as CustomEvent).detail;
+    if (detail && "project" in detail) this.project = typeof detail.project === "string" ? detail.project : "";
+    if (event.type === "ameesh:open-project") this.lot = "";
+    if (typeof detail?.agent === "string") this.agent = detail.agent;
+    if (typeof detail?.lot === "string" || typeof detail?.lot === "number") this.lot = String(detail.lot);
+    this.section = event.type === "ameesh:open-project" ? "timeline"
+      : event.type === "ameesh:open-agent" ? "agent" : "thread";
+  };
+
+  #screen() {
+    const client = this.#client;
+    switch (this.section) {
+      case "timeline": return html`<ameesh-timeline .client=${client} project=${this.project} theme=${this.theme}></ameesh-timeline>`;
+      case "agent": return html`<ameesh-agent .client=${client} project=${this.project} agent=${this.agent} theme=${this.theme}></ameesh-agent>`;
+      case "alerts": return html`<ameesh-alerts .client=${client} theme=${this.theme}></ameesh-alerts>`;
+      case "hosts": return html`<ameesh-hosts .client=${client} theme=${this.theme}></ameesh-hosts>`;
+      case "budget": return html`<ameesh-budget .client=${client} project=${this.project} theme=${this.theme}></ameesh-budget>`;
+      case "thread": return html`<ameesh-thread .client=${client} project=${this.project} lot=${this.lot} theme=${this.theme}></ameesh-thread>`;
+      default: return html`<ameesh-projects .client=${client} theme=${this.theme}></ameesh-projects>`;
+    }
+  }
+
+  #select(event: SubmitEvent): void {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const value = (name: string) => (form.elements.namedItem(name) as HTMLInputElement).value.trim();
+    this.project = value("project"); this.agent = value("agent"); this.lot = value("lot");
+  }
+
   override render() {
     const state = this.state;
     const ready = state.kind === "ready" ? state : null;
@@ -122,7 +165,9 @@ export class AmeeshApp extends LitElement {
             version: ready.discovery.version, mode: ready.discovery.mode })}</span>` : ""}
       </header>
       <nav aria-label=${this.#t("app.nav")}>
-        <ul><li><a href="#overview" aria-current="page">${this.#t("app.home")}</a></li></ul>
+        <ul>${["projects", "timeline", "agent", "alerts", "hosts", "budget", "thread"].map((section) => html`
+          <li><button type="button" aria-current=${this.section === section ? "page" : "false"}
+            @click=${() => { this.section = section; }}>${this.#t(section === "projects" ? "app.home" : "view." + section)}</button></li>`)}</ul>
       </nav>
       <main id="overview" aria-live="polite" aria-busy=${state.kind === "loading"}>
         ${state.kind === "loading" ? html`<p class="muted">${this.#t("app.loading")}</p>` : ""}
@@ -131,7 +176,13 @@ export class AmeeshApp extends LitElement {
             <p class="critical">${this.#error(state.code)}</p>
             <button type="button" @click=${() => this.refresh()}>${this.#t("app.retry")}</button>
           </div>` : ""}
-        ${ready ? html`<p>${this.#t("app.empty")}</p>` : ""}
+        ${ready ? html`
+          <form @submit=${this.#select}>
+            <label>${this.#t("field.project")}<input name="project" .value=${this.project}></label>
+            <label>${this.#t("view.agent")}<input name="agent" .value=${this.agent}></label>
+            <label>${this.#t("field.lot")}<input name="lot" inputmode="numeric" .value=${this.lot}></label>
+            <button type="submit">${this.#t("app.show")}</button>
+          </form>${this.#screen()}` : ""}
       </main>`;
   }
 }

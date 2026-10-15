@@ -159,6 +159,60 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=raw):
                 radar.parse_settings(raw)
 
+    def test_full_suite_is_declared_by_workflow_file(self):
+        """L756: la suite complète est une identité (le fichier de workflow),
+        jamais un nom d'affichage libre."""
+        raw = {"projects": {"x": {"repo": "/r", "full_suite":
+                                  [".github/workflows/backend-suite.yml",
+                                   ".github/workflows/desktop-suite.yaml"]}}}
+        project = radar.parse_settings(raw).projects["x"]
+        self.assertEqual(project.full_suite, (".github/workflows/backend-suite.yml",
+                                              ".github/workflows/desktop-suite.yaml"))
+        single = radar.parse_settings({"projects": {
+            "x": {"repo": "/r", "full_suite": ".github/workflows/a.yml"}}}).projects["x"]
+        self.assertEqual(single.full_suite, (".github/workflows/a.yml",))
+        self.assertEqual(single.full_suite_required, ())
+        self.assertEqual(single.full_suite_tolerated, ())
+        named = radar.parse_settings({"projects": {"x": {"repo": "/r", "full_suite": [
+            {"path": ".github/workflows/tests.yml",
+             "jobs": ["plan", "psycopg *"], "tolerate": ["bilan des impactés"]},
+            ".github/workflows/backend-suite.yml"]}}}).projects["x"]
+        self.assertEqual(named.full_suite, (".github/workflows/tests.yml",
+                                            ".github/workflows/backend-suite.yml"))
+        self.assertEqual(named.full_suite_required,
+                         ((".github/workflows/tests.yml", ("plan", "psycopg *")),))
+        self.assertEqual(named.full_suite_tolerated,
+                         ((".github/workflows/tests.yml", ("bilan des impactés",)),))
+        for bad in (["Backend suite"],                                # un nom libre
+                    ["backend-suite.yml"],                            # hors .github/workflows
+                    [".github/workflows/a.txt"],                      # pas un workflow
+                    ["/etc/.github/workflows/a.yml"],                 # absolu
+                    [".github/workflows/../a.yml"],                   # remonte
+                    [".github/workflows/a.yml", ".github/workflows/a.yml"],  # doublon
+                    [{"path": ".github/workflows/a.yml"},             # jobs manquants
+                     {"path": ".github/workflows/a.yml", "jobs": []},
+                     {"path": ".github/workflows/a.yml", "jobs": [1]},
+                     {"path": ".github/workflows/a.yml", "jobs": ["a", "a"]},
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"], "extra": 1},
+                     {"path": ".github/workflows/a.yml", "jobs": ["*"]},      # * seul
+                     {"path": ".github/workflows/a.yml", "jobs": ["a*b"]},    # * non final
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"],
+                      "tolerate": ["a"]},                            # requis et toléré
+                     {"path": ".github/workflows/a.yml", "jobs": ["a"],
+                      "tolerate": [1]},
+                     {"path": ".github/workflows/a.yml",
+                      "tolerate": ["a"]},                              # toléré sans requis
+                     {"jobs": ["a"]},
+                     {"path": 1, "jobs": ["a"]},
+                     [{"path": ".github/workflows/a.yml", "jobs": ["a"]},
+                      ".github/workflows/a.yml"]],                    # doublon entre formes
+                    [1],
+                    "Backend suite"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    radar.parse_settings({"projects": {"x": {"repo": "/r",
+                                                             "full_suite": bad}}})
+
 
 class ConflictsCommandTest(unittest.TestCase):
     """`ameesh conflicts` lit le journal de l'hôte, sans base."""

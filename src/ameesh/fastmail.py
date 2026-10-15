@@ -211,7 +211,11 @@ def remember_liaison(cfg: Config, name: str, harness: str, session_id: str,
     """Note la liaison qui vient d'être résolue en base, pour les hooks rapides."""
     if not (NAME_RE.match(name or "") and session_id):
         return
-    _ecrire_json(liaison_path(cfg, harness, session_id), {
+    try:
+        chemin = liaison_path(cfg, harness, session_id)
+    except (AttributeError, TypeError):
+        return      # configuration incomplète : un cache ne fait jamais échouer le hook
+    _ecrire_json(chemin, {
         "name": name, "harness": harness, "session": session_id,
         "pid": int(pid) if pid else None, "ts": time.time(),
     })
