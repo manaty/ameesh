@@ -73,6 +73,20 @@ class _Base(PgTestCase):
 class MergedCommandTest(_Base):
     """`ameesh work merged <id> --sha S`."""
 
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "declared-repo")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "remote", "add", "origin", "git@github.com:acme/web.git")
+
+    def proof(self, lot):
+        self.db.execute("UPDATE work_items SET issue_ref = %s WHERE id = %s",
+                        ("acme/web#9", lot["id"]))
+        _git(self.repo, "commit", "--allow-empty", "-qm",
+             "Deliver\n\nameesh-work: %d" % lot["id"])
+        return _git(self.repo, "rev-parse", "HEAD")
+
     def test_tout_etat_ouvert_passe_merged_en_une_fois(self):
         for state in ("intake", "build", "qa", "blocked", "waiting_human"):
             lot = work.add(self.db, title="lot %s" % state, actor="orch")
@@ -83,23 +97,25 @@ class MergedCommandTest(_Base):
                 hold_for_owner(self.db, lot["id"])
             elif state != "intake":
                 work.move(self.db, lot["id"], state)
-            done = work.merged(self.db, lot["id"], sha=SHA.upper(), actor="claude1",
+            sha = self.proof(lot)
+            done = work.merged(self.db, lot["id"], sha=sha.upper(), actor="claude1", repo=self.repo,
                                note="fusion locale sur develop")
             self.assertEqual((done["result"], done["item"]["state"]), ("merged", "merged"),
                              state)
             jalon = self.merged_milestone(lot["id"])
-            self.assertEqual((jalon["sha"], jalon["actor"]), (SHA, "claude1"))
+            self.assertEqual((jalon["sha"], jalon["actor"]), (sha, "claude1"))
             note = work.events(self.db, lot["id"])[0]
             self.assertEqual(note["actor"], "claude1")
             self.assertEqual(note["note"], "merge declared by claude1 (commit %s) — fusion "
-                                           "locale sur develop" % SHA[:12])
+                                           "locale sur develop" % sha[:12])
 
     def test_idempotent_et_jamais_de_reouverture(self):
         lot = work.add(self.db, title="lot")
-        work.merged(self.db, lot["id"], sha=SHA, actor="claude1")
+        sha = self.proof(lot)
+        work.merged(self.db, lot["id"], sha=sha, actor="claude1", repo=self.repo)
         again = work.merged(self.db, lot["id"], sha="abcdef1", actor="claude2")
         self.assertEqual(again["result"], "already")
-        self.assertEqual(self.merged_milestone(lot["id"])["sha"], SHA)   # rien de réécrit
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)   # rien de réécrit
         ferme = work.add(self.db, title="abandonné")
         work.close(self.db, ferme["id"], abandoned=True)
         with self.assertRaises(work.WorkError) as ctx:
@@ -111,11 +127,14 @@ class MergedCommandTest(_Base):
 
     def test_cli_acteur_lie_par_defaut(self):
         lot = work.add(self.db, title="lot")
-        proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA, "--note", "à la main",
+        sha = self.proof(lot)
+        proc = self.mesh("work", "merged", str(lot["id"]), "--sha", sha[:12], "--repo", self.repo,
+                         "--note", "à la main",
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("lot #%d → merged (commit %s, declared by claude1)"
-                      % (lot["id"], SHA[:12]), proc.stdout)
+                      % (lot["id"], sha[:12]), proc.stdout)
+        self.assertEqual(self.merged_milestone(lot["id"])["sha"], sha)
         self.assertEqual(self.merged_milestone(lot["id"])["actor"], "claude1")
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA,
                          env=self.env(AGENT_MAIL_NAME="claude1"))
@@ -123,6 +142,20 @@ class MergedCommandTest(_Base):
         self.assertIn("already merged", proc.stdout)
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
+
+    def test_commit_d_un_autre_lot_ne_modifie_ni_etat_ni_jalon(self):
+        mine = work.add(self.db, title="redemption", app="nexlink", issue_ref="acme/web#9")
+        other = work.add(self.db, title="git identity")
+        sha = self.proof(other)
+        before = work.events(self.db, mine["id"])
+        milestones = work.milestones(self.db, mine["id"])
+        proc = self.mesh("work", "merged", str(mine["id"]), "--sha", sha,
+                         "--repo", self.repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nexlink: redemption", proc.stderr)
+        self.assertEqual(work.get(self.db, mine["id"])["state"], "intake")
+        self.assertEqual(work.events(self.db, mine["id"]), before)
+        self.assertEqual(work.milestones(self.db, mine["id"]), milestones)
 
 
 class CorrectionTest(_Base):
@@ -193,7 +226,7 @@ class CorrectionTest(_Base):
         # #759 : une PR d'étape a fermé le lot trop tôt ; l'orchestrateur le
         # corrige en `build`, le journal le dit, et le lot repart.
         lot = work.add(self.db, title="fermé trop tôt")
-        work.merged(self.db, lot["id"], sha=SHA, actor="orch")
+        work.close_merged(self.db, lot["id"], sha=SHA, actor="orch")
         with self.assertRaises(work.WorkError) as ctx:
             work.move(self.db, lot["id"], "build", actor="orch")
         self.assertIn("--correct", str(ctx.exception))          # la marche à suivre
@@ -215,7 +248,7 @@ class CorrectionTest(_Base):
         # et le lot repart dans la machine à états
         self.assertEqual(work.move(self.db, lot["id"], "qa")["state"], "qa")
         # la vraie fusion écrit SON jalon, daté et signé par elle
-        work.merged(self.db, lot["id"], sha="beef1234", actor="orch")
+        work.close_merged(self.db, lot["id"], sha="beef1234", actor="orch")
         merged = [m for m in work.milestones(self.db, lot["id"])
                   if m["kind"] == "merged"]
         self.assertEqual(len(merged), 1)
@@ -1524,10 +1557,10 @@ class CurrentLotTest(_Base):
                                                   "title": "REV-118 : relecture",
                                                   "state": "intake", "source": "mail"})
         # le lot cité est fusionné : le lot de session (ouvert) reprend la main
-        work.merged(self.db, self.relu["id"], sha=SHA, actor="claude2")
+        work.close_merged(self.db, self.relu["id"], sha=SHA, actor="claude2")
         self.assertEqual(self.lot_of("claude1")["source"], "session")
         # le lot de session est fusionné à son tour : jamais affiché
-        work.merged(self.db, self.vieux["id"], sha=SHA, actor="claude1")
+        work.close_merged(self.db, self.vieux["id"], sha=SHA, actor="claude1")
         self.assertIsNone(self.lot_of("claude1"))
 
     def test_etiquettes_resolues_dans_la_vue(self):
@@ -1552,7 +1585,7 @@ class CurrentLotTest(_Base):
                         (str(self.vieux["id"]),))
         autre = work.add(self.db, title="autre", assignee="claude1",
                          force="test: second lot of claude1 (#540)")
-        work.merged(self.db, self.vieux["id"], sha=SHA, actor="claude1")
+        work.close_merged(self.db, self.vieux["id"], sha=SHA, actor="claude1")
         rows = exploitation.annotate(self.cfg, self.db, [{"name": "claude1"}])
         self.assertEqual((rows[0]["lot"]["id"], rows[0]["lot"]["source"]),
                          (str(autre["id"]), "assigned"))

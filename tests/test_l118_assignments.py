@@ -266,7 +266,7 @@ class MailLinksLotsTest(_Base):
         """#858/R1 : un lot fermé/fusionné n'est pas un destinataire non
         réveillable ; le rattachement refuse avant tout dépôt."""
         lot = work.add(self.db, title="RT-9 : cercle de confiance")
-        work.merged(self.db, lot["id"], sha="a" * 40)
+        work.close_merged(self.db, lot["id"], sha="a" * 40)
         proc = self.send("dev1", "Reprends ce lot.", "--from", "orch",
                          "--lot", str(lot["id"]))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)

@@ -47,7 +47,7 @@ class _Base(PgTestCase):
 
     def promoted(self, assignee="dev1"):
         lot = self.lot("deployed", assignee=assignee)
-        work.merged(self.db, lot["id"], sha="a" * 40, actor=assignee)
+        work.close_merged(self.db, lot["id"], sha="a" * 40, actor=assignee)
         work.move(self.db, lot["id"], "promoted", note="déployé", actor="auditeur")
         return lot
 
