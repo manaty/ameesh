@@ -3,14 +3,20 @@
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
   agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
-                 [--estimate 2h] [--app PROJECT]] [--queue]
+                 [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
-                                                 from an orchestrator, --lot assigns the work item
-                                                 to the recipient and --new-lot creates it (L118),
+                                                 from a declared orchestrator, --lot hands an
+                                                 unassigned work item (or one held by a human)
+                                                 to the recipient — an item already held by an
+                                                 agent is never reassigned by mail, whoever
+                                                 holds it (#1066) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
+                                                 #540: a recipient who already has a work item
+                                                 not started does not get it (team queue, the
+                                                 message is not dropped) unless --force "reason";
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
@@ -26,6 +32,11 @@
                                                  re-delivers the pending mail of a stopped
                                                  agent (or one missing from the registry) to a
                                                  live agent: sender and date kept
+  agent-mail sweep [--days N] [--dry-run] [--json]
+                                                 L976: re-delivers the dead mail of a stopped
+                                                 agent to its successor, expires the rest past
+                                                 `mail_dead_letter_days` (7; 0 = never), with
+                                                 a thread trace; run daily by the runner
   agent-mail list                                agents, host, lease, unread
   agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
@@ -78,6 +89,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
+from . import fastmail
 from . import fil, identity, mail, migrations, platform, registry, signing, storage
 from . import session_bindings as sb
 from .config import NAME_RE, Config
@@ -213,6 +225,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     expires = None
     lot = None
     new_lot = None
+    parent_lot = None
     app = None
     kind = "notify"
     urgent = False
@@ -235,7 +248,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
+    force = None
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--parent-lot",
+                 "--kind", "--estimate", "--app", "--force"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -250,10 +265,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 lot = value
             elif flag == "--new-lot":
                 new_lot = value if value is not None else ""
+            elif flag == "--parent-lot":
+                parent_lot = value if value is not None else ""
             elif flag == "--estimate":
                 estimate = value if value is not None else ""
             elif flag == "--app":
                 app = value if value is not None else ""
+            elif flag == "--force":
+                # #540 : forcer la file d'équipe, avec sa raison (journal du lot)
+                force = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -284,7 +304,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
-              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]]] "
+              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
+              "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
@@ -313,6 +334,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
               "existing one: ameesh work plan <id> --estimate 2h)", file=sys.stderr)
         return 2
+    if parent_lot is not None and new_lot is None:
+        print("--parent-lot goes with --new-lot (the parent of the created suite; for an "
+              "existing lot: ameesh work dependencies <id> --add <parent>)", file=sys.stderr)
+        return 2
+    if parent_lot is not None:
+        number = str(parent_lot).strip().lstrip("#")
+        if not number.isdigit() or int(number) <= 0:
+            print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
+            return 2
+        parent_lot = int(number)
     dest, text = args[0], " ".join(args[1:]).strip()
     binding = None
     if not sender:
@@ -350,7 +381,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         if bk.kind == "pg":
             from . import undeliverable
             if undeliverable.registry_rows(bk.db, [name])[name] is None:
-                print("copy refused: unknown agent: %s (nothing dropped)" % name,
+                print("copy refused: unknown agent: %s (nothing delivered)" % name,
                       file=sys.stderr)
                 return 2
     # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
@@ -400,7 +431,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             notes = undeliverable.check_send(cfg, bk.db, sender=sender, dest=dest, queue=queue,
                                              explicit=explicit, binding=binding)
         except undeliverable.Refused as exc:
-            print("message not dropped — %s" % exc, file=sys.stderr)
+            print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         for note in notes:
             print("warning: %s" % note, file=sys.stderr)
@@ -429,14 +460,18 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
-        from . import assignments, plan_git
+        from . import assignments, plan_git, work
         try:
+            if (force or "").strip():
+                # #540 : l'auteur du forçage est l'identité de la session
+                sender = work.forcer(cfg, bk.db, sender)
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project)
-        except assignments.AssignmentError as exc:
-            print("message not dropped — %s" % exc, file=sys.stderr)
+                estimate=estimate, app=app, new_project=new_project, force=force,
+                parent_lot=parent_lot)
+        except (assignments.AssignmentError, work.WorkError) as exc:
+            print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]
         for warning in linked["warnings"]:
@@ -445,9 +480,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             thread_meta = {"avertissement": "; ".join(linked["warnings"])}
         item = linked["lot"]
         if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
+            # #858 : un lot créé pour un destinataire non attribuable à
+            # l'instant est créé sans assigné (l'avertissement dit pourquoi).
+            if linked["created"]:
+                quoi = ("created and assigned to %s" % dest if linked["assigned"]
+                        else "created for %s without assignee" % dest)
+            else:
+                quoi = "assigned to %s" % dest if linked["assigned"] else "linked"
             print("lot #%d %s%s%s" % (
-                int(item["id"]), "created and assigned to %s" % dest if linked["created"]
-                else "assigned to %s" % dest if linked["assigned"] else "linked",
+                int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
         if payload.get("ack") and (linked["created"] or linked["assigned"]):
@@ -462,18 +503,23 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
                       payload=payload or None, cc=cc,
                       include_stopped=queue, skipped=skipped)
+    # #1604 : un envoi local touche la boîte des destinataires de CET hôte ;
+    # leur marqueur local repasse à « à vérifier » sans attendre la base. Un
+    # destinataire d'un autre hôte n'a pas de marqueur ici : rien à faire.
+    for nom in set(targets) | set(cc):
+        fastmail.bump(cfg, nom)
     if skipped:
-        print("warning: not dropped for %s (%s) — --queue to drop anyway" % (
+        print("warning: not delivered to %s (%s) — --queue to deliver anyway" % (
             ", ".join(sorted(skipped)), "stopped: nobody reads their mailbox"
             if len(skipped) > 1 else "stopped: nobody reads its mailbox"), file=sys.stderr)
     if not targets:
         print("no recipient")
     elif signed:
-        print("dropped for: %s (signed %s, expires %s)" % (
+        print("delivered to %s (signed %s, expires %s)" % (
             ", ".join(targets), signed["signature_key"][:12],
             time.strftime("%H:%M", time.localtime(signed["expires_us"] / 1_000_000))))
     else:
-        print("dropped for: " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
+        print("delivered to " + ", ".join(targets) + _send_note(dest, urgent, payload, cc))
     return 0
 
 
@@ -607,7 +653,16 @@ def cmd_statusline(cfg: Config) -> int:
     parts.append("\033[2m%s\033[0m" % short)
     if unread:
         parts.append("\033[33m✉ %d\033[0m" % unread)
-    print("  ·  ".join(parts))
+    ligne = "  ·  ".join(parts)
+    print(ligne)
+    # #1604 : le rendu est fréquent ; la ligne et l'état de la boîte sont
+    # réutilisés quelques secondes par le chemin rapide (jamais bloquant).
+    try:
+        fastmail.write_statusline(cfg, fastmail.statusline_key(data), ligne)
+        if binding.ok:
+            fastmail.note(cfg, name, pending=bool(unread), unread=unread)
+    except Exception:
+        pass
     return 0
 
 
@@ -643,25 +698,43 @@ class _Remise:
         self.jeton = mail.new_token()
         self.msgs: list[dict] = []
         self.ouverte = False
+        #: #1604 : la réservation a-t-elle pu laisser des non-lus derrière
+        #: elle (plafond atteint) ? Sert au marqueur de boîte, sans requête.
+        self.reste = 0
+        #: la remise a-t-elle été soldée (remise) ou abandonnée (rendue) ?
+        self.solde = False
 
     def prendre(self, limite: int | None = None) -> list[dict]:
         """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
         if not self.pg:
-            self.msgs = self.bk.unread(self.name)
-            if limite is not None:
-                self.msgs = self.msgs[:max(0, limite)]
+            tous = self.bk.unread(self.name)
+            self.msgs = tous if limite is None else tous[:max(0, limite)]
+            self.reste = len(tous) - len(self.msgs)
             return self.msgs
+        taille = 200 if limite is None else max(1, limite)
         rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
                             porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                            limit=200 if limite is None else max(1, limite))
+                            limit=taille)
         self.ouverte = bool(rows)
         self.msgs = [mail.normalize(row) for row in rows]
+        # une réservation pleine peut cacher des non-lus : on le dit (au pire
+        # pour rien, le prochain hook reviendra par le chemin complet).
+        self.reste = 1 if len(rows) >= taille else 0
         return self.msgs
+
+    def restants_apres(self) -> int:
+        """#1604 : non-lus restants après cette remise, sans nouvelle requête.
+
+        Une remise soldée a livré ses messages ; une remise abandonnée les a
+        rendus à la boîte. Dans les deux cas, `reste` compte ce que la
+        réservation n'a pas pu voir (plafond)."""
+        return (0 if self.solde else len(self.msgs)) + self.reste
 
     def _ids(self) -> list[int]:
         return [int(m["id"]) for m in self.msgs if m.get("id") is not None]
 
     def solder(self) -> None:
+        self.solde = True
         if not self.pg:
             self.bk.mark_read(self.name, self.msgs)
             return
@@ -771,33 +844,34 @@ def _attente(bk, name: str, hors: list[dict]) -> int:
         return 0
 
 
+def _marque_boite(cfg: Config, name: str, attente: int) -> None:
+    """#1604 : note l'état de la boîte après un passage COMPLET par la base.
+
+    Le chemin rapide du hook ne s'autorise à ne pas ouvrir la base que sur un
+    marqueur frais ; ce marqueur ne se pose donc qu'ici, après une lecture
+    réelle, et jamais sur une exception. Aucune requête : `attente` vient de la
+    réservation (ou du compte déjà lu). Best-effort : un cache qui échoue ne
+    fait pas échouer le hook."""
+    try:
+        fastmail.note(cfg, name, pending=bool(attente), unread=int(attente))
+    except Exception:
+        pass
+
+
 def _register_stamp(cfg: Config, name: str) -> str:
-    return os.path.join(cfg.state_dir, "hooks", name + ".inscription")
+    return fastmail.register_stamp(cfg, name)
 
 
 def _register_due(cfg: Config, name: str, key: list) -> bool:
     """L61 : l'inscription de cette session est-elle à refaire ? Oui si la
     clé (harnais, dossier, session, bail) a changé ou si la dernière date de
-    plus de REGISTER_EVERY_S. Un état local illisible : oui."""
-    try:
-        with open(_register_stamp(cfg, name), encoding="utf-8") as fh:
-            last = json.load(fh)
-        return (last.get("key") != key
-                or not 0 <= time.time() - float(last.get("ts") or 0) < REGISTER_EVERY_S)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return True
+    plus de REGISTER_EVERY_S. Un état local illisible : oui. #1604 : le même
+    format est relu sans base par le chemin rapide (`fastmail`)."""
+    return fastmail.register_due(cfg, name, key)
 
 
 def _register_done(cfg: Config, name: str, key: list) -> None:
-    path = _register_stamp(cfg, name)
-    try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = "%s.%d" % (path, os.getpid())
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"key": key, "ts": time.time()}, fh)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    fastmail.register_done(cfg, name, key)
 
 
 def hook_foreign_harness(tool: str) -> str:
@@ -916,6 +990,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # Only the agent's own harness may register sessions or deliver mail.
         _foreign_hook_refused(cfg, bk, name, tool, attendu, data.get("session_id"))
         return 0
+    if binding.source == "session" and binding.ok:
+        # #1604 : l'identité de CETTE session est notée localement pour que les
+        # hooks rapides (PostToolUse) n'aient pas à rouvrir la base ; le
+        # marqueur de boîte, lui, reste seul juge de ce qu'il y a à faire.
+        fastmail.remember_liaison(cfg, name, tool, str(data.get("session_id") or ""),
+                                  pid=(binding.session or {}).get("pid"))
     # L166 : sous bail, la session de l'agent est celle que l'exécuteur lit
     # dans le flux du harnais, jamais celle d'un hook. dsh déclenche les hooks
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
@@ -957,7 +1037,10 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # conclure son tour — jamais tant qu'un travail lancé pendant le tour
         # tourne encore (processus de fond, conteneurs du tour) : il le saura,
         # et l'invitation viendra après.
-        tour = os.environ.get("AMEESH_TURN_ID") or ""
+        # L76 : un processus résident garde son environnement d'un tour à
+        # l'autre — le tour en cours est nommé dans un fichier
+        from . import resident_runner
+        tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
         etat = tour_lit(cfg, name, tour) if borne else None
         if etat is not None and etat["remis"] >= borne:
@@ -977,6 +1060,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                         "additionalContext": avis_borne_travail(attente, borne, travail)}}):
                     etat["differe"] = True
             _tour_ecrit(cfg, name, etat)
+            # La borne n'a rien réservé : le marqueur dit le non-lu restant,
+            # pour que le chemin rapide ne conclue pas « rien à faire ».
+            _marque_boite(cfg, name, attente)
             return 0
         remise = _Remise(bk, name, binding)
         try:
@@ -1030,6 +1116,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 _tour_ecrit(cfg, name, etat)
         finally:
             remise.abandonner()
+            # #1604 : marqueur posé seulement après un passage complet sans
+            # exception (une base en panne ne doit pas se dire « rien à faire »),
+            # et sans requête : la réservation sait ce qu'elle a laissé.
+            if sys.exc_info()[0] is None:
+                _marque_boite(cfg, name, remise.restants_apres())
     except Exception:
         return 0
     return 0
@@ -1221,6 +1312,8 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     if not moved:
         print("no pending message for %s: nothing to forward" % old)
         return 0
+    # #1604 : le successeur local a du courrier neuf ; son marqueur le dit.
+    fastmail.bump(cfg, new)
     senders: dict = {}
     for row in moved:
         senders[row.get("sender") or "?"] = senders.get(row.get("sender") or "?", 0) + 1
@@ -1230,6 +1323,78 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     print("senders: %s; original sender and date kept, forward noted in the thread"
           % ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
                                                        key=lambda kv: (-kv[1], kv[0]))))
+    return 0
+
+
+_SWEEP_USAGE = "usage: agent-mail sweep [--days N] [--dry-run] [--json]"
+
+
+def _sweep_line(action, kind) -> str:
+    """Une ligne du compte rendu de `ameesh mail sweep`."""
+    ids = action.get("messages") or []
+    suffix = " (#%s)" % ", #".join(str(i) for i in ids) if ids else ""
+    if kind == "forwarded":
+        return ("%s (stopped): %d message(s) %s re-delivered to %s%s"
+                % (action["old"], action["count"],
+                   "would be" if action.get("dry_run") else "were", action["new"], suffix))
+    return ("%s (%s): %d message(s) %s expired%s"
+            % (action["recipient"], "unknown" if action.get("unknown") else "stopped",
+               action["count"], "would be" if action.get("dry_run") else "were", suffix))
+
+
+def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
+    """L976 : re-livre au successeur, ou expire après la rétention, le courrier
+    en souffrance (`undeliverable.sweep`) — le même passage que le ménage de
+    l'exécuteur, à la main."""
+    from . import undeliverable
+    try:
+        opts, positional = _options(rest, ("--days",), ("--dry-run", "--json"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
+        return 2
+    if positional:
+        print(_SWEEP_USAGE, file=sys.stderr)
+        return 2
+    days = opts.get("--days")
+    if days is not None:
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            print("--days expects a whole number of days\n%s" % _SWEEP_USAGE, file=sys.stderr)
+            return 2
+        if days < 0:
+            print("--days must be >= 0\n%s" % _SWEEP_USAGE, file=sys.stderr)
+            return 2
+    try:
+        result = undeliverable.sweep(cfg, bk.db, days=days, actor=_actor(),
+                                     dry_run=bool(opts.get("--dry-run")))
+    except ValueError as exc:
+        print("sweep refused — %s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
+        return 1
+    if opts.get("--json"):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    actions = result["forwarded"] + result["expired"]
+    if not actions:
+        print("no dead letter to sweep (retention %d day(s), 0 = never)"
+              % result["days"])
+        return 0
+    if result["dry_run"]:
+        print("dry run: retention %d day(s); %d recipient(s) to sweep:"
+              % (result["days"], len(actions)))
+    for action in result["forwarded"]:
+        print("  " + _sweep_line(action, "forwarded"))
+    for action in result["expired"]:
+        print("  " + _sweep_line(action, "expired"))
+    for action in result["refused"]:
+        print("  %s: re-delivery to %s refused — %s" % (
+            action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
+    if not result["dry_run"]:
+        # #1604 : les successeurs locaux ont du courrier neuf.
+        for action in result["forwarded"]:
+            fastmail.bump(cfg, action.get("new") or "")
+        print("retention %d day(s); dead mail stays in the mailbox, marked expired"
+              % result["days"])
     return 0
 
 
@@ -1568,6 +1733,12 @@ def main(argv: list[str] | None = None) -> int:
                       "registry", file=sys.stderr)
                 return 1
             return cmd_forward(bk, cfg, rest)
+        if command == "sweep":
+            if bk.kind != "pg":
+                print("the dead-letter sweep requires the database (AMEESH_DSN): the file "
+                      "fallback has no registry", file=sys.stderr)
+                return 1
+            return cmd_sweep(bk, cfg, rest)
         if command in ("bind", "unbind", "bindings"):
             if bk.kind != "pg":
                 print("session bindings require the database (AMEESH_DSN): "

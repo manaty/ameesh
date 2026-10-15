@@ -8,13 +8,18 @@ from . import config, db as db_mod, estimates, handoffs, host_preflight, registr
 from .config import NAME_RE
 
 
-def drain(cfg, db, host, *, duration=None, critical=()):
+def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
+    """`actor`: the human the API authenticated (L87); otherwise the session's
+    corrector (a human, an orchestrator or a design agent)."""
     if not isinstance(host, str) or not NAME_RE.fullmatch(host):
         raise ValueError("invalid host name")
     if duration is not None and (isinstance(duration, bool) or not isinstance(duration, int)
                                  or not 30 <= duration <= 7 * 86400):
         raise ValueError("drain duration outside 30 seconds..7 days")
-    actor = work.corrector(cfg, db)
+    if actor is None:
+        actor = work.corrector(cfg, db)
+    elif not actor.startswith(work.HUMAN_PREFIX):
+        raise ValueError("drain: an explicit actor is a human (human:<id>)")
     critical = set(critical) | critical_names(cfg, db)
     return storage.of(db).host_lifecycle.drain(host, actor=actor, duration=duration, critical=critical)
 

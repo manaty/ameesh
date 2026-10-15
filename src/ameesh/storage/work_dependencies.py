@@ -28,3 +28,18 @@ class WorkDependencies(abc.ABC):
         Finished blockers remain visible for audit, but are not blocking;
         a reopened blocker becomes blocking again. No rendering limit.
         """
+
+    @abc.abstractmethod
+    def lock(self) -> None:
+        """Take the schema-wide dependency-graph lock in the current transaction.
+
+        A lot that closes can release its dependents: the closure reads the
+        graph to decide whether the last wait just fell, then writes the wake
+        mail. Two concurrent closures must not both read the graph before the
+        other commits — each would see the other blocker still open and no one
+        would wake the dependent. Taking this lock before the read and holding
+        it until the transaction ends (the write included) serialises them:
+        the second closure reads the first one's commit, so exactly one of the
+        two sees the last wait fall. Same lock as the graph edits (`add`,
+        `remove`), so a closure never decides on a graph being edited.
+        """

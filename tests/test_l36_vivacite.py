@@ -46,7 +46,9 @@ class L36CliTest(PgTestCase):
         self.register("alpha", "claude", cwd=self.tmp)
         self.register("beta", "codex", cwd=self.tmp)
         for title, who in (("un", "alpha"), ("deux", "alpha"), ("trois", "beta")):
-            proc = self.mesh("work", "add", "--title", title, "--assignee", who)
+            proc = self.mesh("work", "add", "--title", title, "--assignee", who,
+                             "--actor", "human:test",
+                             "--force", "test: two lots for alpha (#540)")
             self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
