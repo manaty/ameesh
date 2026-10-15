@@ -189,15 +189,61 @@ class ReviewGateTest(unittest.TestCase):
         self.assertFalse(out["ok"], "l'avis de la famille de l'auteur ne compte pas")
         self.assertEqual([a["actor"] for a in out["accepted"]], ["rev1"])
 
-    def test_a_doubt_keeps_one_verdict_without_supposing_a_family(self):
+    def test_a_doubt_never_supposes_a_family_and_needs_two(self):
+        # B/P1 cx1 (57812f9b..979f2e2b) : un doute (politique ou diff illisible)
+        # peut cacher SQL/la sécurité/la prod ; il garde donc les deux avis des
+        # domaines critiques et l'indépendance ne s'y suppose jamais.
         klass = {"class": "sensitive", "doubt": True, "files": []}
         out = self.gate(_marks(_mark("frozen", A)), klass=klass)
         self.assertFalse(out["ok"])
-        self.assertEqual(out["required"], 1)
-        out = self.gate(_marks(_mark("frozen", A), _verdict("ghost")), klass=klass)
-        self.assertTrue(out["ok"], out["why"])
+        self.assertEqual(out["required"], 2)
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass)
+        self.assertFalse(one["ok"], "un avis ne suffit pas sur un doute")
+        ghost = self.gate(_marks(_mark("frozen", A), _verdict("ghost"), _verdict("rev1")),
+                          klass=klass)
+        self.assertFalse(ghost["ok"], "une famille inconnue ne prouve pas l'indépendance")
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=klass)
+        self.assertTrue(two["ok"], two["why"])
         out = self.gate(_marks(_mark("frozen", A), _verdict("author")), klass=klass)
         self.assertFalse(out["ok"], "l'auteur ne relit pas son propre travail")
+
+    def test_an_unknown_author_family_never_proves_independence(self):
+        # B/P1 cx1 : quand la famille de l'auteur n'est pas connue, l'ancien
+        # code sautait la comparaison et acceptait n'importe quelle famille.
+        klass = {"class": "sensitive", "files": [self.SQL]}
+        item = {"assignee": "inconnu"}       # famille absente du registre simulé
+        out = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=klass, item=item)
+        self.assertFalse(out["ok"], "l'indépendance ne se suppose jamais")
+        self.assertIn("no known model family", out["why"])
+        self.assertEqual(out["required"], 2)
+        plain = {"class": "sensitive", "doubt": False, "files": [self.PLAIN]}
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")),
+                        klass=plain, item=item)
+        self.assertFalse(one["ok"], "même un avis unique exige une famille d'auteur connue")
+
+    def test_a_human_author_has_no_model_family_to_compare(self):
+        # un auteur humain n'a pas de famille de modèle : il n'y a rien à
+        # comparer, seules les familles des relecteurs comptent (l'exemption
+        # ne vaut que pour `human:`, jamais pour un agent au registre muet).
+        klass = {"class": "sensitive", "files": [self.SQL]}
+        item = {"assignee": "human:alice"}
+        one = self.gate(_marks(_mark("frozen", A), _verdict("rev1")), klass=klass, item=item)
+        self.assertFalse(one["ok"], "deux avis restent requis pour SQL")
+        two = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev2")),
+                        klass=klass, item=item)
+        self.assertTrue(two["ok"], two["why"])
+        same = self.gate(_marks(_mark("frozen", A), _verdict("rev1"), _verdict("rev3")),
+                         klass=klass, item=item)
+        self.assertFalse(same["ok"], "deux avis de la même famille ne comptent qu'une fois")
+
+    def test_normal_lot_keeps_a_verdict_without_a_family(self):
+        # hors classe sensible, un lot normal garde un avis d'un autre agent,
+        # même de famille inconnue : la famille n'y est pas exigée.
+        out = self.gate(_marks(_mark("frozen", A), _verdict("ghost")),
+                        klass="normal", item={"assignee": "inconnu"})
+        self.assertTrue(out["ok"], out["why"])
 
     def test_a_newer_ok_from_another_reviewer_does_not_mask_a_block(self):
         klass = {"class": "sensitive", "files": [self.SQL]}

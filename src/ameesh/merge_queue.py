@@ -119,8 +119,9 @@ CRITICAL_REVIEWS = 2
 def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
-    Un doute de classe (politique ou diff illisible, `files` vide) ne le
-    suppose pas : le compte reste celui d'un lot sensible ordinaire."""
+    Un doute de classe (politique ou diff illisible, `files` vide) ne se
+    suppose jamais rassurant : `required_verdicts` le compte alors comme un
+    domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
     for entry in (klass or {}).get("files") or ():
         if str(entry.get("class") or "") == "light":
             continue
@@ -134,7 +135,9 @@ def critical_scope(klass) -> bool:
 def required_verdicts(klass) -> int:
     """Le nombre d'avis indépendants que la classe exige : 0 pour un lot léger,
     1 pour normal, 1 pour sensible (2 s'il touche SQL, la sécurité ou la prod).
-    Un doute de classe garde l'exigence d'un avis, sans supposer le domaine.
+    Un doute de classe (politique ou diff illisible, `files` vide) ne se
+    suppose jamais rassurant : il garde l'exigence des domaines critiques
+    (deux avis), faute de pouvoir exclure SQL, la sécurité ou la prod.
     Un lot release n'est jamais léger : il garde un avis (la procédure de
     release et la protection de cible restent au pilote ; le feu, lui, refuse
     la classe release avant tout compte)."""
@@ -143,6 +146,8 @@ def required_verdicts(klass) -> int:
     cls = str(klass.get("class") or lot_class.SENSITIVE)
     if cls == lot_class.LIGHT:
         return 0
+    if klass.get("doubt"):
+        return CRITICAL_REVIEWS
     if cls in (lot_class.NORMAL, lot_class.RELEASE):
         return 1
     return CRITICAL_REVIEWS if critical_scope(klass) else SENSITIVE_REVIEWS
@@ -208,11 +213,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 
     Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
     normal et pour un lot sensible hors SQL/sécurité/prod, 2 pour un lot
-    sensible qui touche ces domaines. Les avis comptés sont **indépendants** :
-    jamais le travail de l'auteur ; pour une classe sensible calculée, une
-    famille de modèle connue et autre que celle de l'auteur ; pour deux avis,
-    deux familles distinctes. Un doute de classe garde l'exigence d'un avis
-    sans supposer la famille (canon §2, décision 18855a).
+    sensible qui touche ces domaines ou dont la classe reste un doute. Les avis
+    comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
+    classe sensible, une famille de modèle connue et autre que celle de
+    l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
+    suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
+    décision 18855a).
 
     Rend `{ok, why, class, required, accepted, blocked, author, author_family,
     on_freeze}` ; ne lève jamais.
@@ -253,16 +259,21 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     author_family = actor_family(db, author)
     out["author_family"] = author_family
-    # une classe sensible **calculée** (`doubt is False`) exige une autre
-    # famille de modèle, même pour un seul avis ; un doute de classe garde
-    # l'exigence d'un avis sans supposer ni la famille ni le domaine (l'ancien
-    # comportement). Deux avis (domaine critique) exigent toujours les familles.
-    # une classe sensible **calculée** (`doubt is False`) exige une autre
-    # famille de modèle, même pour un seul avis ; un doute de classe garde
-    # l'exigence d'un avis sans supposer ni la famille ni le domaine (l'ancien
-    # comportement). Deux avis (domaine critique) exigent toujours les familles.
-    sensitive = (cls == lot_class.SENSITIVE and klass.get("doubt") is False) \
-        or required >= 2
+    # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
+    # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
+    # sécurité ou la prod — n'accepte que des familles connues et autres que
+    # celle de l'auteur. Famille d'auteur inconnue (agent absent du registre,
+    # harnais non reconnu) : aucun avis ne peut être prouvé indépendant, la
+    # porte refuse et le dit. Un auteur humain n'a pas de famille de modèle :
+    # il n'y a rien à comparer, seules les familles des relecteurs comptent.
+    strict = required >= 2 or cls == lot_class.SENSITIVE
+    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
+    if strict and not author_family and not author_human:
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
+                      "no known model family, so no verdict can be proven independent "
+                      "(canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, author or "(none)"))
+        return out
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
@@ -270,11 +281,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if author and actor and actor.lower() == author.lower():
             continue                      # on ne relit pas son propre travail
         family = actor_family(db, actor)
-        if sensitive:
+        if strict:
             if not family:
-                continue                  # la famille doit être connue...
-            if author_family and family == author_family:
-                continue                  # ... et autre que celle de l'auteur
+                continue                  # famille du relecteur inconnue : non prouvée
+            if family == author_family:
+                continue                  # la famille de l'auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
     if required >= 2:
@@ -295,7 +306,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                     for e in accepted) or "aucun"
     need = ("two independent verdicts from different model families, neither the author's"
             if required >= 2 else
-            "one verdict from another family than the author's" if sensitive
+            "one verdict from another family than the author's" if strict
             else "one verdict from another agent")
     out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent review "
                   "verdict(s) required, %s; got %s"
