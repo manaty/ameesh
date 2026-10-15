@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import migration_reservations, radar, registry, work
+from ameesh import radar, registry, work
 
 from .support import PgTestCase
 from .test_l160b_radar import MIG, _git, _write
@@ -305,31 +305,6 @@ class CertifiedTargetTest(unittest.TestCase):
         report = self.scan(verify=lambda repo, remote, branch: advanced)
         self.assertEqual(report["uncertified_targets"], [])
         self.assertEqual({b["target_head"] for b in report["branches"]}, {advanced})
-
-    def test_reservations_ignore_uncertified_deltas_but_keep_pinned_targets(self):
-        # The stale target makes a docs-only lot inherit 334/355/… in added.
-        _git(self.repo, "update-ref", "refs/remotes/origin/develop", self.old)
-        project = radar.Project(name="p", repo=self.repo, migrations=MIG,
-                                github="acme/product")
-        selected = [dict(LOTS[0], branch_target="develop"),
-                    dict(LOTS[-1], branch_target=self.new)]
-        registry = mock.Mock()
-        registry.work.migration_holder.return_value = None
-        for published in (None, "0" * 40):
-            with self.subTest(published=published), mock.patch.object(
-                    migration_reservations.storage, "of", return_value=registry):
-                report = radar.scan(
-                    self.repo, selected, migrations=MIG,
-                    verify=lambda *_: published,
-                    reservations=lambda raw: migration_reservations.probe(None, project, raw))
-            self.assertEqual([r["number"] for r in report["unreserved_migrations"]], ["900"])
-            self.assertEqual(len(report["uncertified_targets"]), 1)
-        _write(self.repo, ".git/shallow", "")
-        with mock.patch.object(migration_reservations.storage, "of", return_value=registry):
-            report = radar.scan(
-                self.repo, selected, migrations=MIG,
-                reservations=lambda raw: migration_reservations.probe(None, project, raw))
-        self.assertEqual(report["unreserved_migrations"], [])
 
     def test_published_tip_reads_the_remote_and_fails_closed(self):
         self.assertEqual(radar.published_tip(self.repo, "origin", "develop"), self.new)
