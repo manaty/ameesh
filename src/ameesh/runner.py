@@ -5974,7 +5974,11 @@ class Runner:
                             clock: float | None = None) -> list | None:
         """L361: thread retention (0033 §9), at most once a day, from the
         housekeeping pass: entries older than `thread_retention_days` leave
-        this host's thread files. Never raises."""
+        this host's thread files. Never raises.
+
+        L361b : l'hôte médié n'a pas de transaction ; la connexion de
+        l'exécuteur (`self.db`) porte l'opération serveur `threads.recount`,
+        qui verrouille, recompte et expire en une seule fois."""
         now = time.time() if now is None else now
         # the day counted on the monotonic clock (r8), the wall clock kept
         # for the retention thresholds
@@ -5983,12 +5987,20 @@ class Runner:
         if due is not None and tick < due:
             return None
         self._threads_expire_next = tick + 86400.0
-        if getattr(self, "mediated", False):  # no database, no local housekeeping
-            log_async("thread expiry skipped: %s" % fil.EXPIRY_UNAVAILABLE)
-            return None
+        if db is None:
+            db = getattr(self, "db", None)
+        if db is None and not self.dry_run and fil.expiry_unavailable(self.cfg, None):
+            # L361b : un hôte médié n'a pas de ménage local ; sa connexion
+            # d'exécuteur porte `threads.recount`. Sans elle, rien n'expire.
+            try:
+                db = db_mod.connect(self.cfg)
+            except db_mod.DbError as exc:
+                log_async("thread expiry skipped: index unavailable (%s)"
+                          % " ".join(str(exc).split())[:200])
+                return None
         try:
             reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
-        except fil.ExpiryUnavailable as exc:  # mediated host: said once per pass
+        except fil.ExpiryUnavailable as exc:  # said once per pass
             log_async("thread expiry skipped: %s" % exc)
             return None
         except Exception as exc:  # never fatal for the runner
@@ -6138,8 +6150,9 @@ class Runner:
 
     def _start_thread_expiry_notice(self) -> None:
         """#421 r7 : un exécuteur médié n'a pas de ménage local ; l'expiration
-        des fils non disponible y est dite au démarrage puis une fois par
-        jour (`expire_threads_once`), quel que soit l'intervalle du ménage."""
+        des fils y a son propre réveil, une fois par jour (L361b : elle passe
+        par l'opération serveur `threads.recount`), quel que soit l'intervalle
+        du ménage. Une erreur de l'avis est journalisée, le suivant arrive."""
         def avis() -> None:
             try:
                 self.expire_threads_once(None)
