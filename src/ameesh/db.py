@@ -929,6 +929,8 @@ class PsycopgDriver:
         self._reconnect_lock = threading.Lock()
         #: transactions explicites ouvertes : jamais de reconnexion au milieu
         self._tx_depth = 0
+        #: #1469 : un seul fil à la fois dans un bloc `transaction()`
+        self._tx_lock = threading.RLock()
         self._schema_ok: bool | None = None
         #: vérification de schéma différée, jointe à la prochaine requête
         self._schema_pending = False
@@ -1143,20 +1145,29 @@ class PsycopgDriver:
     def transaction(self):
         """Transaction explicite sur la connexion (BEGIN … COMMIT, ROLLBACK sur
         exception) ; rend le pilote lui-même, dont les requêtes passent par
-        cette connexion. Imbriquée : un point de sauvegarde."""
-        self._live()
-        if self._schema_missing:
-            raise SchemaMissing(_schema_message(self))
-        if self._schema_pending:
-            self._settle_schema()
-        self._tx_depth += 1
-        try:
-            with self.conn.transaction():
-                yield self
-        except self._psycopg.Error as exc:
-            raise _map_error(exc) from exc
-        finally:
-            self._tx_depth -= 1
+        cette connexion. Imbriquée : un point de sauvegarde.
+
+        #1469 : les fils d'un exécuteur partagent ce pilote (`runner.db`). Le
+        bloc tient `_tx_lock` (réentrant) de BEGIN à COMMIT : sans lui, le bloc
+        d'un autre fil devenait un point de sauvegarde du premier, psycopg
+        refusait les deux COMMIT (« wrong nesting level ») et la session
+        restait dans une transaction ouverte, verrous gardés ; et un verrou
+        consultatif de transaction, réentrant dans une session, ne
+        sérialisait pas deux fils du même exécuteur."""
+        with self._tx_lock:
+            self._live()
+            if self._schema_missing:
+                raise SchemaMissing(_schema_message(self))
+            if self._schema_pending:
+                self._settle_schema()
+            self._tx_depth += 1
+            try:
+                with self.conn.transaction():
+                    yield self
+            except self._psycopg.Error as exc:
+                raise _map_error(exc) from exc
+            finally:
+                self._tx_depth -= 1
 
     def listen(self, channels: Iterable[str]) -> "Listener":
         try:

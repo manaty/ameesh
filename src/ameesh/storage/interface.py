@@ -55,7 +55,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
-   pending_spend   put set_model get clear
+   pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
    turn_costs      last_reading insert spent ledger correct
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
@@ -435,7 +435,14 @@ class Catalog(Domain):
 
 
 class PendingSpend(Domain):
-    """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent."""
+    """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
+
+    Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
+    `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
+    `get`, dans la même instruction ; `clear_if(name, created_ts)` ne retire
+    que ce marqueur. Absentes de l'interface distante : elle garde les
+    opérations de base, avec le contrôle du bail côté serveur.
+    """
 
     @abc.abstractmethod
     def put(self, name: str, start_index: int, turn: str | None, model: str | None) -> bool:
