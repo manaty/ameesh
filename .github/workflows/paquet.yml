@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# §12 : une tête de paquet ne lance qu'une seule suite complète.
+#
+# Une poussée sur une branche d'intégration déclenchait deux suites complètes :
+# le run `push integration/**` de tests.yml et le run `pull_request` de la PR
+# ouverte sur la même tête. Les deux portaient le check requis `tests` sur le
+# même commit ; annuler l'un laissait l'agrégat rouge de l'autre et bloquait la
+# fusion (incident #1342 : run push 38653682693 annulé, PR #1050 bloquée par
+# son `tests` en échec).
+#
+# tests.yml ne se déclenche plus sur `push integration/**`. Ce portier, lui,
+# lit les PR ouvertes de la branche poussée (`scripts/test-plan.py couverture`,
+# API GitHub en lecture seule) :
+#   - une PR ouverte porte exactement la tête poussée : la suite complète est
+#     déjà portée par son run `pull_request`, le portier n'appelle rien. Son
+#     propre check n'est jamais nommé `tests` : aucune validation ne peut être
+#     déduite de l'existence d'un autre run ;
+#   - aucune PR, une PR sur une autre tête, une base hors du périmètre de
+#     tests.yml, une API illisible : la suite complète tourne ici, par
+#     `workflow_call` de tests.yml. Un push sans PR garde donc sa validation,
+#     et le repli est toujours « la suite tourne ».
+#
+# Le portier ne lit jamais un run et ne touche à aucun run existant : le run
+# conservé (celui de la PR) garde son statut. Seule la concurrence ci-dessous
+# remplace un portier périmé de la même branche par le suivant.
+name: paquet
+
+on:
+  push:
+    branches: ["integration/**"]
+
+# une poussée plus récente remplace le portier de la même branche : une tête
+# dépassée n'a plus de décision à porter, et sa suite éventuelle n'a plus
+# d'objet.
+concurrency:
+  group: paquet-${{ github.ref }}
+  cancel-in-progress: true
+
+# la suite appelée publie ses flux (checks: write, L161c) et le portier lit
+# les PR (pull-requests: read) ; lui-même n'écrit aucun check.
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  # décide si une PR ouverte couvre exactement cette tête ; ne regarde que des
+  # PR, jamais un run.
+  couverture:
+    name: couverture (PR ouverte sur cette tête)
+    runs-on: [self-hosted, linux, ameesh-ci]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      covered: ${{ steps.pr.outputs.covered }}
+      covered_pr: ${{ steps.pr.outputs.covered_pr }}
+    steps:
+      - uses: actions/checkout@v4
+      # le repli est dans la commande : contexte incomplet, API illisible ou
+      # non listée écrivent covered=false et sortent 0 — la suite tourne.
+      - id: pr
+        name: PR ouverte sur cette tête ?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/test-plan.py couverture
+          --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" --sha "$GITHUB_SHA"
+          --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+
+  # aucune PR ne couvre la tête : la suite complète tourne ici (push sans PR).
+  # `always()` : si le portier échoue, sa sortie est vide (covered ≠ true) et
+  # la suite part quand même — un portier en panne ne supprime jamais une
+  # validation.
+  suite:
+    name: suite complète du paquet
+    needs: couverture
+    if: always() && needs.couverture.outputs.covered != 'true'
+    uses: ./.github/workflows/tests.yml
