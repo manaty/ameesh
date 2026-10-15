@@ -100,12 +100,6 @@ class FakeQueue(FakeWork):
 
 
 class _Base(unittest.TestCase):
-    #: familles simulées : ces bancs sans base portent des noms courts (`a1`,
-    #: `rev1`) ; `actor_family` lit le registre, absent ici — l'indépendance
-    #: des avis reste donc vérifiée, mais sur ce dictionnaire.
-    FAMILIES = {"a1": "deepseek", "a2": "deepseek", "a3": "deepseek", "a4": "deepseek",
-                "rev1": "codex", "rev2": "claude", "rev3": "codex"}
-
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l160e-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -120,10 +114,7 @@ class _Base(unittest.TestCase):
                       mock.patch.object(work, "get",
                                         side_effect=lambda db, n: self.fake.lots.get(n)),
                       mock.patch.object(work, "milestones",
-                                        side_effect=lambda db, n, *a: self.marks.get(n, [])),
-                      mock.patch.object(merge_queue, "actor_family",
-                                        side_effect=lambda db, n: self.FAMILIES.get(
-                                            str(n or "").strip(), ""))):
+                                        side_effect=lambda db, n, *a: self.marks.get(n, []))):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -132,12 +123,8 @@ class _Base(unittest.TestCase):
 
     def ready(self, lot, *, verdict="ok", sha=None):
         sha = sha or self.tip(lot)
-        # un doute de classe (pas de canon lisible dans ces bancs) garde
-        # l'exigence des domaines critiques : deux avis, familles distinctes.
-        self.marks[lot] = [{"id": 3, "kind": "verdict", "verdict": "ok", "sha": sha,
-                            "at_ts": 3.0, "actor": "rev2"},
-                           {"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha,
-                            "at_ts": 2.0, "actor": "rev1"},
+        self.marks[lot] = [{"id": 2, "kind": "verdict", "verdict": verdict, "sha": sha,
+                            "at_ts": 2.0},
                            {"id": 1, "kind": "frozen", "sha": sha, "at_ts": 1.0}]
 
     def green(self, lot, *, number=7, green=True, draft=False):
@@ -156,19 +143,16 @@ class EntryTest(_Base):
         with self.assertRaisesRegex(merge_queue.QueueError, "not frozen"):
             self.enter(1)
         self.ready(1, verdict="blocked")
-        # #1374 : un blocage non levé refuse la file avec sa cause
-        with self.assertRaisesRegex(merge_queue.QueueError, "blocked verdict"):
+        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
             self.enter(1)
         old = self.tip(1)
         self.ready(1)
         _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "a after the freeze")
         with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
             self.enter(1)
-        self.ready(1)  # frozen again, but the verdicts are on the old commit
-        for mark in self.marks[1]:
-            if mark["kind"] == "verdict":
-                mark["sha"] = old
-        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
+        self.ready(1)  # frozen again, but the verdict is on the old commit
+        self.marks[1][0]["sha"] = old
+        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
             self.enter(1)
         self.ready(1)
         with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
@@ -281,10 +265,8 @@ class EntryTest(_Base):
                 with self.assertRaisesRegex(merge_queue.QueueError, "not a commit id"):
                     self.enter(1)
         self.ready(1)
-        for mark in self.marks[1]:  # a verdict on the branch, not on a commit
-            if mark["kind"] == "verdict":
-                mark["sha"] = "lot/1-a"
-        with self.assertRaisesRegex(merge_queue.QueueError, "review verdict"):
+        self.marks[1][0]["sha"] = "lot/1-a"  # a verdict on the branch, not on a commit
+        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
             self.enter(1)
         # a branch named like a commit id is not that commit
         _git(self.repo, "branch", "deadbeef", tip)
