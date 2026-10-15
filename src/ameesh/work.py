@@ -120,7 +120,8 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
 
     text = (explicit or "").strip()
     if text:
-        return text, None
+        from .agent_names import resolve
+        return resolve(text, db=db, operation="work.actor"), None
     binding = identity.resolve_binding(cfg, db)
     if binding.name:
         if binding.ok:
@@ -150,6 +151,8 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     from . import assignments, identity, registry
 
     text = (explicit or "").strip()
+    from .agent_names import resolve
+    text = resolve(text, db=db, operation="work.corrector")
     binding = identity.resolve_binding(cfg, db)
     # A rejected runner/session identity must never fall back to the human
     # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
@@ -296,6 +299,8 @@ def add(
     route to the backlog, to be shown by the caller. Nothing is ever refused:
     a human request, a blocking defect and the review-after-merge lot pass
     unchanged."""
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     return _create(db, title=title, type=type, source=source, app=app, body=body,
                    issue_ref=issue_ref, workstream=workstream, assignee=assignee,
                    budget_usd=budget_usd, actor=actor, package=package, externe=externe,
@@ -675,6 +680,8 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
 
 def open_lots(db: Db, assignee: str) -> list[dict]:
     """L118 : les lots ouverts d'un assigné (ni livrés, ni fermés)."""
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.open_lots")
     return storage.of(db).work.open_for(assignee)
 
 
@@ -832,7 +839,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     """
     from . import registry
 
-    name = (assignee or "").strip()
+    from .agent_names import resolve
+    name = resolve((assignee or "").strip(), db=db, operation="work.assignee")
     if not name:
         raise WorkError("empty assignee")
     if name.startswith(HUMAN_PREFIX):
@@ -913,6 +921,8 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     déjà pris est refusé en nommant son porteur, et l'écriture est
     conditionnelle à `assignee` encore vide : deux prises concurrentes, une
     seule gagne, l'autre refuse sans changer la main."""
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.assign")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1069,6 +1079,8 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
 
     Rend `{item, delegation, replaced, check, previous, message_id, warning}`.
     """
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="work.delegate")
     within_s = parse_within(within)
     item = get(db, item_id)
     if item is None:
@@ -1192,6 +1204,8 @@ def mark_delegate_turn(db: Db, agent: str, lots) -> list[int]:
     """L40 : un tour de `agent` commence sur ces lots (lot du tour, lots des
     messages du tour). Ceux qui lui sont délégués reçoivent leur premier tour,
     une seule fois : la délégation ne reviendra pas au délégant."""
+    from .agent_names import resolve as resolve_agent_name
+    agent = resolve_agent_name(agent, db=db, operation="work.mark_delegate_turn")
     ids = sorted({int(str(lot).strip()) for lot in lots or ()
                   if str(lot or "").strip().isdigit()})
     if not ids:
@@ -1572,6 +1586,8 @@ def get(db: Db, item_id: int) -> dict | None:
 
 def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
                limit: int = 50) -> list[dict]:
+    from .agent_names import resolve as resolve_agent_name
+    assignee = resolve_agent_name(assignee, db=db, operation="work.list_items")
     if state and state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)

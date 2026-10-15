@@ -199,6 +199,8 @@ class DepotTest(unittest.TestCase):
                     conn.active = conn.executor_locked = conn.agent_locked = False
 
             def query(conn, sql, params):
+                if "ameesh_resolve_agent_name" in sql:
+                    return [{"name": params[0]}]
                 if "JOIN executors" in sql:
                     return [{"ok": 1}] if conn.live and not conn.revoked else []
                 if "FROM executors" in sql:
@@ -257,6 +259,8 @@ class DepotTest(unittest.TestCase):
                 yield conn
 
             def query(conn, sql, params):
+                if "ameesh_resolve_agent_name" in sql:
+                    return [{"name": params[0]}]
                 if "JOIN executors" in sql or "FROM executors" in sql:
                     return [{"ok": 1}]
                 if "FOR UPDATE" in sql:

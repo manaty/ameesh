@@ -63,9 +63,12 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
     orchestrateur ; `work.CORRECTOR_ROLES` ajoute les agents de conception).
     `history=False` (#740) : les lots confiés ne comptent pas, seule une
     déclaration compte."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="assignments.is_orchestrator")
     from . import sous_utilisation as su
 
-    declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
+    declared = {resolve_agent_name(su._bare(n), db=db, operation="authority.orchestrator")
+                for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
                 if n.strip()}
     if name in declared:
         return True
@@ -169,6 +172,9 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     #1193: `parent_lot` is the explicit parent of the suite lot created by
     `new_lot` — the blocking edge is written together with the creation
     (refused without `new_lot`)."""
+    from .agent_names import resolve as resolve_agent_name
+    sender = resolve_agent_name(sender, db=db, operation="assignments.link_message")
+    recipient = resolve_agent_name(recipient, db=db, operation="assignments.link_message")
     out = {"lot": None, "work_item_id": lot, "assigned": False, "created": False,
            "branch": None, "warnings": [], "orchestrator": False}
     if recipient == "all" or ":" in recipient:
@@ -340,6 +346,8 @@ def _queued(item: dict) -> str:
 def _is_chat(db, name: str) -> bool:
     """L123 : le chat du propriétaire n'a jamais de lot ; lui écrire (réponse
     d'un orchestrateur) ne confie pas de travail."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="assignments._is_chat")
     from . import registry
     from .chat import CHAT_PREFIX, is_chat_agent
     return name.startswith(CHAT_PREFIX) and is_chat_agent(registry.get(db, name))
