@@ -450,13 +450,22 @@ def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
 
 def idle_agents(listing: list, now: float, idle_s: float, *,
                 waiting_free: bool = False) -> list:
-    """Les agents réveillables au repos sans lot ni courrier depuis au moins
-    `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
-    au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
-    `idle_capacity`, `backlog_empty` et la prise automatique (L119) ;
-    `waiting_free` : voir `free_of_lots` (L165b) ; une consigne en attente
-    et un lot de session qui l'occupe (`session_lot_busy`) occupent l'agent,
-    comme pour la prise (`backlog._awaited`)."""
+    """Les agents réveillables au repos : mode `execute`, exécuteur vivant (pas
+    une session attachée), au repos (ni en tour, ni en pause de budget, ni
+    arrêtés). Partagé par `idle_capacity`, `backlog_empty` et la prise
+    automatique (L119) ; `waiting_free` : voir `free_of_lots` (L165b) ; une
+    consigne en attente et un lot de session qui l'occupe
+    (`session_lot_busy`) occupent l'agent, comme pour la prise
+    (`backlog._awaited`).
+
+    #1677 : le repos se lit sur les lots **actionnables** (`actionable_lots`,
+    lu par `operations.listing` : rien qui l'occupe, aucune correction
+    attendue d'un verdict bloquant), jamais sur le temps depuis le dernier
+    tour — un agent sans lot prend des tours de courrier toutes les quelques
+    minutes et ne serait donc jamais « au repos ». `idle_s` ne sert plus que
+    de repli pour une liste qui ne porte pas encore ce champ (bancs, appels
+    anciens) : il garde alors son sens d'origine, « au repos depuis au moins
+    `idle_s` »."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -470,9 +479,13 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
         if waiting_free and (row.get("has_pending_prompt")
                              or session_lot_busy(row, waiting_free=True)):
             continue
-        since = idle_since(row)
-        if not since or now - since < idle_s:
-            continue
+        if "actionable_lots" in row:
+            if int(row.get("actionable_lots") or 0) > 0:
+                continue
+        else:
+            since = idle_since(row)
+            if not since or now - since < idle_s:
+                continue
         idle.append(row)
     return idle
 

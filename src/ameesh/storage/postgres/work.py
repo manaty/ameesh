@@ -19,6 +19,7 @@ from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
 from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
+from .work_dependencies import last_verdict as _last_verdict, not_blocking as _not_blocking
 
 #: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
 #: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
@@ -447,16 +448,23 @@ class WorkItems(interface.WorkItems):
                 # peut apparaître entre le contrôle et l'attribution. Verrouiller
                 # aussi les amonts empêche leur réouverture pendant la prise.
                 tx.execute(_DEPENDENCIES_LOCK)
+                # #1677 : un bloqueur en `qa` dont le dernier verdict est
+                # favorable (ok) n'empêche plus la prise — il attend sa fusion,
+                # le lot pris s'empile sur sa tête gelée. Le verdict est lu sous
+                # le même verrou que l'état, donc une correction (`blocked`)
+                # arrivée avant la prise la refuse.
                 rows = tx.query(
-                    "SELECT id, state, assignee FROM work_items"
-                    " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
-                    "                         WHERE work_item_id = %s)"
-                    " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
+                    "SELECT w.id, w.state, w.assignee, " + _last_verdict("w") +
+                    " AS last_verdict FROM work_items w"
+                    " WHERE w.id = %s OR w.id IN (SELECT blocker_id FROM work_item_dependencies"
+                    "                              WHERE work_item_id = %s)"
+                    " ORDER BY w.id FOR UPDATE", (int(item_id), int(item_id)))
                 item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
                 if current is not None or item is None or item["state"] != "intake" \
                         or item["assignee"] is not None:
                     return None
                 if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
+                       and not (r["state"] == "qa" and r.get("last_verdict") == "ok")
                        for r in rows):
                     return None
             behind = None
@@ -1366,6 +1374,21 @@ class WorkItems(interface.WorkItems):
         return int(rows[0]["n"]) if rows else 0
 
     def unassigned_lots(self, limit) -> list[dict]:
+        # #1677 : les lots dont tous les bloqueurs sont terminés **ou** en `qa`
+        # à dernier verdict favorable sont prenables ; `stack_on` décrit ces
+        # bloqueurs (lot, branche, tête gelée) pour le courrier de prise.
+        stack_on = (
+            "(SELECT string_agg('#' || b.id::text || ' ('"
+            "                    || coalesce(nullif(btrim(b.branch), ''), '—')"
+            "                    || ', gel ' || coalesce(f.sha, '—') || ')',"
+            "                  ', ' ORDER BY b.id)"
+            "   FROM work_item_dependencies d"
+            "   JOIN work_items b ON b.id = d.blocker_id"
+            "   LEFT JOIN LATERAL (SELECT m.sha FROM work_item_milestones m"
+            "                       WHERE m.work_item_id = b.id AND m.kind = 'frozen'"
+            "                       ORDER BY m.at DESC, m.id DESC LIMIT 1) f ON true"
+            "  WHERE d.work_item_id = work_items.id AND b.state = 'qa'"
+            "    AND " + _last_verdict("b") + " = 'ok')")
         return self.db.query(
             ("SELECT w.*,"
             "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
@@ -1380,14 +1403,15 @@ class WorkItems(interface.WorkItems):
             "  FROM (SELECT %s,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
-            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
+            "               " + stack_on + " AS stack_on"
             "          FROM work_items"
             "         WHERE state = 'intake' AND assignee IS NULL"
             "           AND type <> 'improvement'"
             "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
             "                             JOIN work_items b ON b.id = d.blocker_id"
             "                            WHERE d.work_item_id = work_items.id"
-            "                              AND b.state NOT IN " + _CLOSED + ")) w"
+            "                              AND NOT " + _not_blocking("b") + ")) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
             " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
