@@ -94,6 +94,46 @@ aucune règle.
 Tant que le bloc canon n'est pas publié, la commande refuse donc toujours :
 c'est l'effet voulu de l'ordre de mise en service.
 
+## Raccord générique par projet
+
+Le geste est générique : `--project` choisit la fiche du canon, `--canon-repo`
+et `--repo` les dépôts, `--plan` le plan du projet ; classes, contrats, hôtes et
+délai ne viennent que du bloc `prevalidation` du canon du projet, jamais d'une
+valeur codée en dur.
+
+Chaque projet fournit quatre pièces :
+
+1. **son plan**, schéma `ameesh-test-plan/1` — les parts portent chacune une
+   liste explicite de modules ; une part sans liste serait « le reste de la
+   suite » et refuse `selection-unsafe` ;
+2. **son lanceur de part** `scripts/test-parts.py`, chemin dépôt, contrat CLI
+   `run --plan <plan> --part <n> --driver <d> --flow <fichier>` : c'est le seul
+   chemin de code encore propre à ameesh, donc le point d'adaptation d'un projet
+   qui a ses propres outils de sélection ;
+3. **son bloc canon** : `classes` (P0-P3), `contracts` (chemins dépôt toujours
+   sélectionnés), `hosts` (étiquettes des VM d'exécution), `timeout_seconds` ;
+4. **son stockage de rapport**, s'il persiste : ameesh écrit
+   `prevalidation_reports` (0450), clé `(work_item_id, head_sha)`.
+
+### Adaptateur Nexlink (à valider par son pilote)
+
+Aucune carte Nexlink n'est écrite ici : le bloc et l'hôte d'exécution se
+déclarent dans le canon Nexlink, par son pilote. Points d'accroche, repris de
+l'étude L161 (« ameesh first, Nexlink next ») :
+
+- base de comparaison `develop`, jamais `main` ;
+- sélection par `jest --findRelatedTests` et `vitest related --run`, test de la
+  migration modifiée d'abord (`sql-tests.sh <n>`), carte e2e plus tard (L161h) ;
+- pas de CI GitHub de lot ni de suite complète : la prévalidation n'exécute que
+  la sélection du plan ;
+- un lanceur de part Nexlink, ou bien l'extension du bloc par le chemin de ce
+  lanceur si le pilote préfère le paramétrer plutôt que d'imposer le nom ;
+- son propre stockage de rapport si Nexlink persiste les siens.
+
+L'application à Nexlink appartient à son pilote (§7 : une règle vaut pour tous
+les projets, avec un lot d'application par projet) : ce lot ne crée ni carte ni
+bloc Nexlink, et ne lance aucune de ses suites.
+
 ## Raccords
 
 - #1616 (lecteur) : extension additive, tête gelée non élargie ; ce delta est
