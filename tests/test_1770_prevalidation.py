@@ -176,6 +176,16 @@ class RunTest(unittest.TestCase):
         self.assertIn(pv.SECONDS_MARK, script)
         self.assertIn("exit $ec", script)
         self.assertNotIn("--fallback", script)
+        # sans clé au bloc, la convention du plan L161f s'applique
+        self.assertIn(pv.DEFAULT_PARTS_SCRIPT + " run --plan", script)
+
+    def test_script_distant_suit_le_lanceur_du_bloc(self):
+        """Le bloc peut nommer un autre lanceur de part (#1770, Nexlink)."""
+        sel = pv.selection(plan_sain(), head=A)
+        script = pv.remote_script(sel.plan_path or "plan.json", sel.parts,
+                                  parts_script="tools/nexlink-parts.py")
+        self.assertIn("tools/nexlink-parts.py run --plan", script)
+        self.assertNotIn(pv.DEFAULT_PARTS_SCRIPT, script)
 
     def test_classify(self):
         self.assertEqual(pv.classify(0), "green")
