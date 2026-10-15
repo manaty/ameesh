@@ -218,11 +218,16 @@ class Progress(interface.Progress):
             tuple([float(since_ts)] * 6 + params))
 
     def ci_suite(self, *, since_ts, limit) -> list[dict]:
-        # #1476 : la suite complète tourne sur main, release/** et
-        # integration/**, en poussée comme en PR (source ou cible) ; une
-        # exécution annulée ou remplacée n'a pas de durée de suite. La borne
-        # est PAR DÉPÔT : un dépôt très actif ne chasse pas les autres de la
-        # lecture (row_number, pas un LIMIT global).
+        # #1476 : seuls les contextes qui GARANTISSENT la suite complète
+        # comptent — poussée ou PR `release/**`|`integration/**` (source ou
+        # cible) et exécution manuelle (`workflow_dispatch`, toujours
+        # complète). Une poussée sur `main` est écartée : une plage poussée
+        # entièrement documentaire y prend la voie rapide L161a (make_plan
+        # laisse les deux matrices vides) et `ci_runs` ne garde ni le mode du
+        # plan ni les jobs, donc la compter tirerait la médiane vers le bas.
+        # Une exécution annulée ou remplacée n'a pas de durée de suite. La
+        # borne est PAR DÉPÔT : un dépôt très actif ne chasse pas les autres
+        # de la lecture (row_number, pas un LIMIT global).
         return self.db.query(
             """
             SELECT repo, run_id, branch, base, event, duration_s, concluded_ts FROM (
@@ -235,9 +240,9 @@ class Progress(interface.Progress):
                   FROM ci_runs
                  WHERE status IN ('success', 'failure') AND concluded_at IS NOT NULL
                    AND concluded_at >= to_timestamp(%s)
-                   AND (branch = 'main' OR branch LIKE 'release/%%'
-                        OR branch LIKE 'integration/%%'
-                        OR base LIKE 'release/%%' OR base LIKE 'integration/%%')
+                   AND (branch LIKE 'release/%%' OR branch LIKE 'integration/%%'
+                        OR base LIKE 'release/%%' OR base LIKE 'integration/%%'
+                        OR event = 'workflow_dispatch')
             ) t
              WHERE rn <= %s
              ORDER BY concluded_ts DESC, run_id DESC
