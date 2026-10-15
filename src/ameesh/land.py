@@ -248,10 +248,13 @@ def _json(proc, what: str, kind):
 
 
 def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
-    """The open PR of `branch`: `{number, head, base, ci: green|red|pending}`."""
+    """The open PR of `branch`: `{number, head, base, ci: green|red|pending,
+    auto}`. `auto` (#1656) says GitHub auto-merge is armed: its
+    `--match-head-commit` is checked when it is armed, never again, so a head
+    rewritten under it would be merged without a new proof."""
     from . import radar
     proc = gh(["pr", "list", "--repo", slug, "--head", branch, "--state", "open", "--json",
-               "number,headRefOid,baseRefName,statusCheckRollup"])
+               "number,headRefOid,baseRefName,statusCheckRollup,autoMergeRequest"])
     if proc.returncode != 0:
         raise LandError("gh pr list: %s" % (proc.stderr or proc.stdout).strip()[:300])
     rows = _json(proc, "gh pr list", list)
@@ -262,7 +265,22 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
     return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
-            "base": rows[0].get("baseRefName"), "ci": ci}
+            "base": rows[0].get("baseRefName"), "ci": ci,
+            "auto": bool(rows[0].get("autoMergeRequest"))}
+
+
+def pr_disable_auto(slug: str, number, gh=_gh) -> str | None:
+    """#1656: disarms GitHub auto-merge on PR `number`; the error, or None.
+
+    A `gh pr merge --auto --match-head-commit` only checks the head when it
+    is armed: GitHub keeps no link to that commit. A head rewritten after
+    (even under `[skip ci]`) is then merged with no new qualification. Any
+    PR the queue manages is merged by ameesh itself, on the exact frozen
+    head; its auto-merge, whoever armed it, is disarmed first."""
+    proc = gh(["pr", "merge", str(number), "--repo", slug, "--disable-auto"])
+    if proc.returncode == 0:
+        return None
+    return (proc.stderr or proc.stdout or "").strip()[:300] or "exit %d" % proc.returncode
 
 
 def pr_merge(slug: str, number, sha: str, method: str, gh=_gh) -> str | None:
@@ -679,6 +697,19 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if status is None:
         return landing.eject("no open PR for %s" % row["branch"],
                              "Open the PR, then ameesh work queue add %d." % lot)
+    # #1656: never leave an active auto-merge on a PR the queue manages. It
+    # would merge whatever head it finds — a rewritten one included, even
+    # under `[skip ci]` — with no new fire, freeze or parts proof (GitHub
+    # checks `--match-head-commit` only when the auto-merge is armed). ameesh
+    # merges itself, on the exact frozen head; disarm first, fail closed.
+    if status.get("auto"):
+        error = pr_disable_auto(slug, status["number"], gh=gh)
+        if error is not None:
+            return landing.eject(
+                "PR #%s: auto-merge armed and not disarmed (%s)" % (status["number"], error),
+                "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
+                "queue add %d: an armed auto-merge merges a head the queue has not "
+                "qualified (#1656)." % (status["number"], lot))
     if status.get("base") != branch:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
@@ -772,6 +803,19 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
             return {"lot": lot, "result": "landed", "review_lot": review}
         return landing.eject("its PR is no longer open",
                              "Reopen it, then ameesh work queue add %d." % lot)
+    # #1656: an armed auto-merge would merge the head it finds without the
+    # parts proof and without the base re-read below — and would land a head
+    # rewritten after the fire. ameesh is the only actor that merges a PR it
+    # manages: disarm first, fail closed.
+    if status.get("auto"):
+        error = pr_disable_auto(slug, status["number"], gh=gh)
+        if error is not None:
+            return landing.eject(
+                "PR #%s: auto-merge armed and not disarmed (%s) — it could merge a head "
+                "the queue has not qualified" % (status["number"], error),
+                "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
+                "queue add %d; ameesh merges itself on the exact frozen head (#1656)."
+                % (status["number"], lot))
     if status.get("base") != branch:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
