@@ -13,10 +13,10 @@ terminal client on an agent's shared conversation (L79).
         `ameesh_chat`, polling when the driver cannot listen), the agent's
         state and its open lots. A typed line is sent to the agent as mail;
         `!urgent <text>` preempts the turn in progress and `!stop [text]`
-        interrupts it without a new message, both through
-        `AMEESH_INTERRUPT_SENDERS` (refused or delivered as a normal message,
-        never forced); `!quit` leaves. The client writes nothing when it does
-        not come from a human's terminal: it turns read-only there;
+        interrupts it now (a short body is sent when no text is given), both
+        through `AMEESH_INTERRUPT_SENDERS` (refused or delivered as a normal
+        message, never forced); `!quit` leaves. The client writes nothing when
+        it does not come from a human's terminal: it turns read-only there;
   ameesh chat --instruction  prints the chat instructions (text versioned in the repository);
   ameesh chat --dry-run      says what would be launched (or shown), without
         launching, following or writing anything.
@@ -187,7 +187,8 @@ STOP_BODY = "(stop requested from ameesh chat)"
 #: ligne d'aide du client
 CLIENT_HELP_TEXT = (
     "  !urgent <text>  send now, preempting the turn in progress (if authorised)\n"
-    "  !stop [text]    interrupt the turn without a new message (if authorised)\n"
+    "  !stop [text]    interrupt the turn now; a short body is sent when text is "
+    "empty (if authorised)\n"
     "  !state          refresh the agent's state\n"
     "  !quit           leave (also Ctrl-D)\n"
     "  <anything else> sent to the agent as mail"
@@ -259,6 +260,8 @@ class ClientView:
         self.out = out
         self._last = None
         self._text_turn = None
+        self._text_key = None
+        self._texts_seen = set()
 
     def line(self, text=""):
         self.out.write("%s\n" % text)
@@ -279,6 +282,16 @@ class ClientView:
         stamp = _stamp(entry.get("ts"), now=now)
         truncated = bool(entry.get("truncated"))
         if kind == "text":
+            if turn is not None:
+                # #887 : le journal porte parfois deux entrées `text` identiques
+                # pour le même tour ; le client ne les affiche qu'une fois.
+                if (author, turn) != self._text_key:
+                    self._text_key = (author, turn)
+                    self._texts_seen = set()
+                if text in self._texts_seen:
+                    self._last = (kind, author, turn)
+                    return
+                self._texts_seen.add(text)
             if self._last == ("text", author, turn):
                 self._block(text, truncated=truncated)
             else:
@@ -610,7 +623,7 @@ class TerminalClient:
                     return 0
             if self._eof.is_set() and self._queue.empty():
                 return 0
-            signal = None
+            wakeup = None
             if listener is None:
                 self.sleep(self.poll)
             else:
@@ -621,16 +634,22 @@ class TerminalClient:
                     listener.close()
                     listener = None
                 elif item is not None:
-                    signal = item
+                    wakeup = item
             try:
                 cursor = self.read_new(cursor)
             except db_mod.DbError as exc:
                 self.view.line("  … history unavailable: %s" % db_mod.explain(exc, 160))
                 self.sleep(self.poll)
-            if signal is not None and signal.get("channel") == config_mod.CHANNEL_LEASE \
+            if wakeup is not None and wakeup.get("channel") == config_mod.CHANNEL_LEASE \
                     and self.row is not None:
-                for line in state_lines(self.cfg, self.db, self.agent, now=self.now)[1:2]:
-                    self.view.line("  · " + line)
+                # #887 : une coupure de base sur l'état ne fait pas tomber le client.
+                try:
+                    lines = state_lines(self.cfg, self.db, self.agent, now=self.now)[1:2]
+                except db_mod.DbError as exc:
+                    self.view.line("  … state unavailable: %s" % db_mod.explain(exc, 160))
+                else:
+                    for line in lines:
+                        self.view.line("  · " + line)
 
 
 def client_conflicts(args) -> list[str]:
