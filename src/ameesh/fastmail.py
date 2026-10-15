@@ -190,7 +190,10 @@ def inscription_key(tool: str, data: dict, *, runner_id: str | None = None,
     Sans bail, `runner_id` et `epoch` valent None — jamais "" (la clé est
     comparée telle quelle au fichier d'inscription).
     """
-    return [tool, data.get("cwd"), data.get("session_id"), runner_id, epoch]
+    # L166: sous bail, cli.cmd_hook laisse la session au flux du runner et
+    # inscrit None, même si le harnais fournit sa propre session au hook.
+    session_id = None if runner_id and epoch is not None else data.get("session_id")
+    return [tool, data.get("cwd"), session_id, runner_id, epoch]
 
 
 # --------------------------------------------------------------------------

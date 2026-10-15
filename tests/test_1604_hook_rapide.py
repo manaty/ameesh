@@ -21,7 +21,10 @@ import os
 import resource
 import subprocess
 import sys
+import tempfile
 import time
+import unittest
+from unittest import mock
 
 from ameesh import fastmail, registry
 
@@ -37,6 +40,28 @@ SONDE = (
     "print('backend' if 'ameesh.backend' in sys.modules else 'sans-base');"
     "print('psycopg' if 'psycopg' in sys.modules else 'sans-psycopg')"
 )
+
+
+class LeasedFastHookTest(unittest.TestCase):
+    def test_runner_hook_uses_the_full_hooks_l166_registration_key(self):
+        with tempfile.TemporaryDirectory() as state:
+            cfg = fastmail.Config(state_dir=state, backend="pg")
+            env = {"AGENT_MAIL_NAME": "alpha", "AMEESH_RUNNER_ID": "runner-1",
+                   "AMEESH_LEASE_EPOCH": "7", "AMEESH_HARNESS": "claude"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                # L166: cmd_hook registers None, leaving the runner stream
+                # responsible for the authoritative session ID.
+                fastmail.register_done(cfg, "alpha",
+                                       ["claude", state, None, "runner-1", 7])
+                fastmail.note(cfg, "alpha", pending=False)
+                for session in ("main-session", "child-session"):
+                    raw = json.dumps({"hook_event_name": "PostToolUse",
+                                      "cwd": state, "session_id": session})
+                    with self.subTest(session=session):
+                        self.assertTrue(fastmail.hook_rapide(cfg, "claude", raw))
+                # A different lease must still go through the full hook.
+                os.environ["AMEESH_LEASE_EPOCH"] = "8"
+                self.assertFalse(fastmail.hook_rapide(cfg, "claude", raw))
 
 
 class HookRapideTest(PgTestCase):
