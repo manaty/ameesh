@@ -94,8 +94,11 @@ WAITING_WITHOUT_QUESTION = (
     "request — ameesh decide ask --lot %(id)s --question \"…\" --option a=\"…\" (the "
     "lot moves to waiting_human by itself); a decision written in a mail never counts")
 
-#: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité)
-ITEM_COLUMNS = _pg.ITEM_COLUMNS
+#: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité).
+#: Depuis #705 c'est une fonction : la colonne `reviewer` n'existe qu'après la
+#: migration 0421, et la prod peut être en 0373.
+def item_columns(db) -> str:
+    return _pg.item_columns(db)
 
 
 class WorkError(RuntimeError):
@@ -127,9 +130,11 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
                            "\"%s\"; pass --actor <agent|human:id>" % UNKNOWN_ACTOR)
 
 
-def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> str:
+def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
+              history: bool = True) -> str:
     """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
-    si la correction lui est refusée.
+    si la correction lui est refusée. `what` (#705) nomme le geste dans les
+    messages : la désignation du relecteur demande les mêmes autorités.
 
     Réservée aux humains et aux orchestrateurs ou agents de conception. Une
     session qui porte une identité d'agent (`identity.resolve_binding`) corrige
@@ -148,21 +153,26 @@ def corrector(cfg, db, explicit: str | None = None, *, history: bool = True) -> 
     # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
     if not binding.ok and (binding.name or binding.source != "none"
                            or os.environ.get("AGENT_MAIL_NAME")):
-        raise WorkError("correction refused: invalid session identity (%s)"
-                        % (binding.reason or "unbound identity"))
-    refus = ("correction refused: %s is neither a human, an orchestrator nor a design agent "
+        raise WorkError("%s refused: invalid session identity (%s)"
+                        % (what, binding.reason or "unbound identity"))
+    refus = ("%s refused: %%s is neither a human, an orchestrator nor a design agent "
              "(orchestrator or design role on its Agent card in the canon, "
-             "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner")
+             "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner" % what)
     if binding.name:
         if text and text != binding.name:
-            raise WorkError("correction refused: this session belongs to %s, it does not "
-                            "correct on behalf of %s" % (binding.name, text))
+            raise WorkError("%s refused: this session belongs to %s, it does not "
+                            "act on behalf of %s" % (what, binding.name, text))
         if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES,
                                        history=history):
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
-        raise WorkError("correction: say who corrects (--actor human:<id>)")
+        # le libellé historique de la correction reste (la CLI `hosts` le
+        # traduit en « hold: say who holds », #254) ; `what` nomme les autres
+        # gestes (#705, « designation »)
+        if what == "correction":
+            raise WorkError("correction: say who corrects (--actor human:<id>)")
+        raise WorkError("%s: say who does it (--actor human:<id>)" % what)
     if text.startswith(HUMAN_PREFIX):
         return text
     human = known_human(db, text, cfg)
@@ -607,6 +617,77 @@ _ASSIGNEE_HINT = ("register the agent (agent-runner register <name> <harness> �
                   "an external session with a human owner, add --externe")
 
 
+def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
+    """#705 : le relecteur désigné d'une revue est un nom joignable.
+
+    Un agent du registre, ou un humain (`human:…`, ou un nom nu qui en désigne
+    un, normalisé comme pour l'assignation). Un nom inconnu est refusé : la
+    revue attendrait quelqu'un que ni le courrier ni l'alerte ne peuvent
+    joindre — le défaut que ce lot corrige. Un agent arrêté reste accepté : il
+    porte l'attente et sera relancé à sa reprise.
+    """
+    from . import registry
+
+    name = (reviewer or "").strip()
+    if not name:
+        raise WorkError("empty reviewer")
+    if name.startswith(HUMAN_PREFIX):
+        return name
+    if registry.get(db, name) is not None:
+        return name
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    human = known_human(db, name, cfg)
+    if human:
+        return human
+    raise WorkError("reviewer refused: %s is not in the registry (unknown agent): "
+                    "the review would wait for nobody; register it "
+                    "(agent-runner register …), or name a human (human:<id>)" % name)
+
+
+def check_reviewer_choice(db: Db, item: dict, reviewer: str, *, cfg=None) -> str:
+    """#705 : le relecteur désigné est joignable et relit un AUTRE lot.
+
+    L'assigné du lot ne peut pas être son relecteur : le verdict attendu vient
+    d'ailleurs, sinon la désignation ne corrige rien."""
+    name = check_reviewer(db, reviewer, cfg=cfg)
+    assignee = (item.get("assignee") or "").strip()
+    if assignee and name == assignee:
+        raise WorkError("reviewer refused: %s holds lot #%s — a reviewer reviews "
+                        "another agent's work" % (name, item.get("id")))
+    return name
+
+
+def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
+                       actor: str | None = None) -> dict:
+    """#705 : désigne (ou change) le relecteur d'un lot **déjà en `qa`**.
+
+    Geste de pilote : mêmes autorités que la correction (`corrector`) — un
+    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
+    joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
+    `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`."""
+    who = corrector(cfg, db, actor, what="designation")
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] != "qa":
+        raise WorkError(
+            "lot %s is %s, not qa: designate the reviewer on the entry to the "
+            "review (ameesh work move %s qa --reviewer <agent>), or with "
+            "ameesh work reviewer %s <agent> once it is in qa"
+            % (item_id, item["state"], item_id, item_id))
+    name = check_reviewer_choice(db, item, reviewer, cfg=cfg)
+    row = storage.of(db).work.designate_reviewer(item_id, name, actor=who)
+    if row is None:
+        # #705 r2 (B1) : la règle est relue dans l'écriture ; entre la lecture
+        # et elle, le lot a pu quitter qa ou recevoir `name` comme assigné.
+        latest = get(db, item_id)
+        if latest is not None and latest["state"] == "qa":
+            raise WorkError("reviewer refused: %s now holds lot #%s — a reviewer "
+                            "reviews another agent's work" % (name, item_id))
+        raise WorkError("lot %s left qa in the meantime: retry" % item_id)
+    return row
+
+
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
     """L37 (0030, règle 2) : un lot ne va qu'à un agent qu'ameesh sait réveiller.
 
@@ -684,7 +765,9 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
 
     L118 : `branch` (et `branch_target`) posent aussi la branche du lot ; avec
     une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
-    la branche est posée)."""
+    la branche est posée). #705 : si le nouvel assigné est le relecteur désigné
+    du lot, la désignation tombe (le journal le dit) — un relecteur ne relit
+    pas son propre travail."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -828,7 +911,8 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
     l'attribution gardée (`check_assignee`, mêmes refus que `work assign`) et
     doit être un AGENT : une échéance se mesure en tours. Une nouvelle
     délégation remplace la précédente (et son échéance). Un événement
-    (`kind=event`, lié au lot) réveille le délégué.
+    (`kind=event`, lié au lot) réveille le délégué. #705 : déléguer le lot à
+    son relecteur désigné retire la désignation (le journal le dit).
 
     Rend `{item, delegation, replaced, check, previous, message_id, warning}`.
     """
@@ -1147,25 +1231,49 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
-         correct: str | None = None) -> dict:
+         correct: str | None = None, reviewer: str | None = None) -> dict:
     """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
 
     `correct` (la raison) : correction d'un état posé par erreur, hors machine
     à états, limitée à `CORRECTIONS` (un `promoted` à tort revient en
     `merged` ; un `merged` à tort, PR d'étape fusionnée trop tôt, revient en
     `build`) ; le journal la dit (« correction : promoted → merged — raison »).
-    L'appelant a vérifié qui corrige (`corrector`)."""
+    L'appelant a vérifié qui corrige (`corrector`).
+
+    `reviewer` (#705) : le relecteur désigné, seulement en entrant en `qa` —
+    il doit être joignable et différent de l'assigné (`check_reviewer_choice`),
+    et seul un humain ou un orchestrateur le désigne (`corrector`). La
+    désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
+    `stale_lot` le nomment avant tout verdict."""
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
                         "--superseded-by <id>")
+    reviewer = (reviewer or "").strip() or None
+    if reviewer is not None:
+        if state != "qa":
+            raise WorkError(
+                "--reviewer: a reviewer is designated for a review: "
+                "ameesh work move %s qa --reviewer %s" % (item_id, reviewer))
+        if correct is not None:
+            raise WorkError("--reviewer: a correction does not designate a reviewer")
+        if not _pg.has_reviewer(db):
+            # #705 r2 (N1) : sans la colonne (migration 0421), refuser AVANT
+            # d'écrire : sinon le lot entrait en qa sans relecteur, à moitié.
+            raise WorkError(
+                "--reviewer: work_items.reviewer is missing (migration 0421): "
+                "run \"ameesh migrate\", then move the lot to qa with its reviewer")
+        actor = corrector(getattr(db, "cfg", None), db, actor, what="designation")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     current = item["state"]
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))
+    if reviewer is not None:
+        reviewer = check_reviewer_choice(db, item, reviewer,
+                                         cfg=getattr(db, "cfg", None))
     if correct is not None:
         reason = (correct or "").strip()
         if not reason:
@@ -1199,14 +1307,31 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
             % (MAX_QA_LOOPS, item_id))
 
     held = state == "waiting_human"
+    text = note or ("%s → %s" % (current, state))
+    if reviewer:
+        text = "%s — reviewer %s" % (text, reviewer)
     row = storage.of(db).work.move(
         item_id, state, current=current, loops=1 if returning_loop else 0,
-        note=note or ("%s → %s" % (current, state)), actor=actor, held=held)
+        note=text, actor=actor, held=held)
     if row is None:
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
             raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
+    if reviewer:
+        # #705 : la désignation est un geste distinct (journalisé), fait dans la
+        # même foulée que l'entrée en qa ; le lot y est, l'écriture passe.
+        designated = storage.of(db).work.designate_reviewer(item_id, reviewer, actor=actor)
+        if designated is None:
+            # #705 r2 (N2) : entre le move (écrit) et la désignation, le lot a
+            # quitté qa ou l'assigné est devenu le relecteur — ne pas afficher
+            # un relecteur jamais posé ; le move, lui, tient.
+            raise WorkError(
+                "lot %s moved to %s but reviewer %s was not designated (the lot left "
+                "qa, or %s now holds it): the move is written; check the lot "
+                "(ameesh work show %s) and designate the reviewer once it is in qa"
+                % (item_id, state, reviewer, reviewer, item_id))
+        row["reviewer"] = reviewer      # le CLI et les appelants le lisent
     return row
 
 

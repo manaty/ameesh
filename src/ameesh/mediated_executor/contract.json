@@ -4119,6 +4119,7 @@
     "current_delegation",
     "delays",
     "delegate",
+    "designate_reviewer",
     "due_delegations",
     "estimate_history",
     "estimates",
