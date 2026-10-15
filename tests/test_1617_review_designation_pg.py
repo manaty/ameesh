@@ -277,3 +277,119 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.assertEqual(self.mailbox(), [])
         self.assertEqual(self.marks(), [])
         self.assertTrue(threads)  # jamais vidé : c'est l'appelant qui décide, après commit
+
+
+class Test1617FrozenHook(PgTestCase):
+    """Le raccord étroit du gel (#1617) : callback dans la transaction du jalon.
+
+    Le raccord est branché mais **inactif** : sans callback, un gel ne désigne
+    personne. Avec un callback, la marque et les courriers tiennent dans la
+    transaction du jalon `frozen`, le fil externe n'est vidé qu'après le commit
+    (par `add_milestone`), et une exception du callback annule le jalon avec
+    tout ce qu'il portait.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.item = work.add(self.db, title=ITEM["title"], app=ITEM["app"])
+        self.lot = int(self.item["id"])
+        for name in ("r1", "r2", "pilot"):
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host,
+                            status="idle")
+
+    # -- helpers ----------------------------------------------------------
+    def mailbox(self, db=None):
+        return (db or self.db).query(
+            "SELECT id, recipient, body FROM agent_mailbox ORDER BY id")
+
+    def marks(self):
+        return [row["note"] for row in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s ORDER BY id",
+            (self.lot,)) if str(row["note"]).startswith(pg.MARK_PREFIX)]
+
+    def milestones(self):
+        return self.db.query(
+            "SELECT id, kind, sha FROM work_item_milestones WHERE work_item_id = %s"
+            " AND kind = 'frozen' ORDER BY id", (self.lot,))
+
+    def designated(self, tx, milestone, threads):
+        """Le raccord réel : le port écrit dans la transaction du jalon."""
+        return rd.apply(
+            dict(self.item, state="build"), policy=RULES,
+            paths=["src/ameesh/db.py"], port=pg.PgPort(tx, after_commit=threads),
+            authors=[{"name": "author", "family": "deepseek"}],
+            candidates=[rd.Candidate("r1", "claude"), rd.Candidate("r2", "codex")],
+            risk="sensitive", base="c" * 40, policy_ref="canon@deadbeef",
+            notify="pilot")
+
+    # -- tests ------------------------------------------------------------
+    def test_without_callback_the_freeze_designates_nobody(self):
+        row = work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me")
+        self.assertEqual(row["kind"], "frozen")
+        self.assertEqual(len(self.milestones()), 1)
+        self.assertEqual(self.marks(), [])
+        self.assertEqual(self.mailbox(), [])
+
+    def test_the_frozen_callback_designates_in_the_freeze_transaction(self):
+        seen = {}
+
+        def hook(tx, milestone, threads):
+            seen["kind"] = milestone["kind"]
+            seen["id"] = int(milestone["id"])
+            seen["inside"] = len(tx.query(
+                "SELECT id FROM work_item_milestones WHERE id = %s",
+                (int(milestone["id"]),)))
+            other = self.connect()
+            try:
+                # ce que voit un autre écrivain tant que le gel n'est pas commité
+                seen["outside"] = len(other.query(
+                    "SELECT id FROM work_item_milestones WHERE id = %s",
+                    (int(milestone["id"]),)))
+                seen["outside_mail"] = len(other.query("SELECT id FROM agent_mailbox"))
+            finally:
+                other.close()
+            seen["out"] = self.designated(tx, milestone, threads)
+
+        threads: list = []
+        drained: list = []
+        threads.append(lambda cfg, db: drained.append(cfg.schema))
+        row = work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me",
+                             on_frozen=hook, after_commit=threads)
+        self.assertEqual(seen["kind"], "frozen")
+        self.assertEqual(seen["id"], int(row["id"]))
+        self.assertEqual(seen["inside"], 1)       # le jalon, dans la transaction
+        self.assertEqual(seen["outside"], 0)      # et rien dehors avant le commit
+        self.assertEqual(seen["outside_mail"], 0)
+        self.assertEqual(seen["out"]["state"], rd.DESIGNATED)
+        self.assertEqual(seen["out"]["freeze"], {"id": int(row["id"]), "sha": SHA_A})
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
+        self.assertEqual(pg.designation_of(self.marks()[0])["freeze"],
+                         {"id": int(row["id"]), "sha": SHA_A})
+        self.assertEqual(drained, [self.schema])  # vidée après le commit, par le jalon
+
+    def test_a_raising_callback_rolls_the_freeze_back(self):
+        def hook(tx, milestone, threads):
+            pg.PgPort(tx, after_commit=threads).commit(
+                self.lot, freeze={"id": int(milestone["id"]), "sha": SHA_A},
+                required=1, state=rd.DESIGNATED,
+                reviewers=[{"name": "r1", "family": "claude"}], missing=0, why="",
+                messages=[{"to": "r1", "body": "à relire"}])
+            self.assertEqual(len(self.mailbox(tx)), 1)  # écrit, mais pas commité
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            work.milestone(self.db, self.lot, "frozen", sha=SHA_A, actor="me",
+                           on_frozen=hook, after_commit=[])
+        self.assertEqual(self.milestones(), [])   # le jalon a suivi le rollback
+        self.assertEqual(self.marks(), [])
+        self.assertEqual(self.mailbox(), [])
+
+    def test_the_callback_is_refused_outside_a_freeze(self):
+        with self.assertRaises(work.WorkError):
+            work.milestone(self.db, self.lot, "verdict", verdict="ok", sha=SHA_A,
+                           actor="me", on_frozen=lambda *args: None)
+        with self.assertRaises(ValueError):
+            storage.of(self.db).work.add_milestone(
+                self.lot, "verdict", sha=SHA_A, actor="me", verdict="ok", note="",
+                on_frozen=lambda *args: None)
+        self.assertEqual(self.milestones(), [])

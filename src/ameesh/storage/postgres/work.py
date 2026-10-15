@@ -618,9 +618,24 @@ class WorkItems(interface.WorkItems):
             (int(item_id), int(limit)),
         )
 
-    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note) -> dict:
+    def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
+                      on_frozen=None, after_commit=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
-        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot."""
+        s'insère jamais pendant qu'une fermeture sur fusion tient ce lot.
+
+        `on_frozen` (facultatif, #1617) : callback appelé **dans la
+        transaction** du jalon, juste après l'INSERT d'un jalon `frozen`, avec
+        `(tx, milestone, after_commit)`. Il écrit dans la même transaction que
+        le jalon — la désignation des relecteurs y dépose sa marque et ses
+        courriers atomiquement — et une exception annule le jalon avec elle.
+        `after_commit` est la liste des écritures de fil différées
+        (`mail.send(..., after_commit=…)`, motif #315) ; c'est `add_milestone`
+        qui la vide **après** le commit, l'appelant ne la vide pas lui-même.
+        Sans callback ni liste, rien ne change : le gel branché par défaut ne
+        désigne personne. Un `on_frozen` sur un autre kind est refusé."""
+        if on_frozen is not None and kind != "frozen":
+            raise ValueError("on_frozen only makes sense for the `frozen` milestone")
+        threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
             tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
                      (int(item_id),))
@@ -633,7 +648,13 @@ class WorkItems(interface.WorkItems):
                 """,
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
-            return rows[0]
+            milestone = rows[0]
+            if on_frozen is not None:
+                on_frozen(tx, milestone, threads)
+        # le fil externe après le commit seulement : un gel annulé n'y laisse rien
+        for record in threads:
+            record(self.db.cfg, self.db)
+        return milestone
 
     def delays(self, limit, *, ids=None) -> list[dict]:
         if ids is not None:
