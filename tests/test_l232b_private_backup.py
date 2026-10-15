@@ -10,12 +10,18 @@ import unittest
 from unittest import mock
 
 
+# Le canal privé (L232b) passe par psycopg : la part psql de la CI n'en a pas
+# (même règle que test_518_dsn_argv) ; ces témoins y sont sautés et couverts par
+# la part psycopg.
+HAVE_PSYCOPG = importlib.util.find_spec("psycopg") is not None
+
 PATH = Path(__file__).resolve().parents[1] / "deploy/mise-a-jour/sauvegarder-prive.py"
 SPEC = importlib.util.spec_from_file_location("private_backup", PATH)
 backup = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(backup)
 
 
+@unittest.skipUnless(HAVE_PSYCOPG, "psycopg absent (part psql) : canal privé non couvert")
 class PrivateBackupTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ameesh-private-backup-")

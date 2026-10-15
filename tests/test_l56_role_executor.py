@@ -16,7 +16,7 @@ from ameesh import db as db_mod, mail, registry, work, modules
 from ameesh.modules.storage import ModuleStore
 from tests.test_l317_project_modules import federation
 
-from .support import REPO, PgTestCase
+from .support import REPO, PgTestCase, attendu
 from .test_cluster import TEST_DSN, _dsn_for
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
@@ -239,7 +239,8 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute('GRANT %s TO %s' % (q(parent),q(self.role)))
             result = self.run_script(self.role)
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('forbidden DELETE on host_release_fences', result.stderr)
+            self.assertIn('forbidden DELETE on host_release_fences', result.stderr,
+                          attendu(result.stderr))
         finally:
             self.db.execute('REVOKE %s FROM %s' % (q(parent),q(self.role)))
             self.db.execute('DROP OWNED BY %s' % q(parent))
@@ -307,7 +308,8 @@ class RoleExecutorTest(PgTestCase):
             result = subprocess.run(['psql',self.owner_dsn,'-X','-q','-v','ON_ERROR_STOP=1',
                 '-v','role='+controller,'-f',str(sql)], env=env,text=True,capture_output=True,timeout=60)
             self.assertNotEqual(result.returncode,0)
-            self.assertIn('unrelated column write privilege',result.stderr)
+            self.assertIn('unrelated column write privilege',result.stderr,
+                          attendu(result.stderr))
         finally:
             if self.db.query('SELECT 1 FROM pg_roles WHERE rolname=%s',(controller,)):
                 self.db.execute('DROP OWNED BY %s' % q(controller))

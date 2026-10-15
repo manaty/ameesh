@@ -9,14 +9,19 @@ import unittest
 import uuid
 from unittest import mock
 
-import psycopg
-from psycopg import sql
-from psycopg.conninfo import conninfo_to_dict, make_conninfo
+try:  # la restauration réelle parle psycopg ; la part psql de la CI n'en a pas
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+except ImportError:  # pragma: no cover - dépend de la part de CI
+    psycopg = None
 
 from tests.support import TEST_DSN, REQUIRE_DB
 from tests.test_l232b_private_backup import backup
 
 
+@unittest.skipUnless(psycopg is not None,
+                     "psycopg absent (part psql) : restauration réelle non couverte")
 class BackupRestoreTest(unittest.TestCase):
     def setUp(self):
         if not all(shutil.which(tool) for tool in ("pg_dump", "pg_restore")):
