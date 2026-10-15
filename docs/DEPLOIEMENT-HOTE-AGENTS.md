@@ -39,11 +39,14 @@ un agent déplacé, arrêté ou passé en observation est ignoré. Le compte
 Le CLI distant est celui de l’unité :
 `/home/ameesh/.local/share/ameesh/venv/bin/ameesh`.
 La CLI et la lecture de l’horloge passent par `systemd-run --user --pipe
---wait --quiet`, avec `EnvironmentFile=%h/.config/ameesh/env` obligatoire.
-Systemd lit ce fichier avec le même parseur que le runner : les valeurs
-contenant `$USER`, des guillemets ou `#` restent intactes. Un fichier absent
-ou illisible produit une erreur avant toute exécution, sans configuration
-de repli.
+--wait --quiet`, avec `EnvironmentFile` sur un chemin absolu : `systemd-run
+-p` n’étend pas le spécificateur `%h` dans une unité transitoire (#1133), le
+shell expanse donc `$HOME` (`/home/ameesh/.config/ameesh/env`). Les fichiers
+d’unité `deploy/systemd/*.service` gardent `%h`, résolu dans une unité
+installée. Systemd lit ce fichier avec le même parseur que le runner : les
+valeurs contenant `$USER`, des guillemets ou `#` restent intactes. Un
+fichier absent ou illisible produit une erreur avant toute exécution, sans
+configuration de repli.
 
 Une unité active ne suffit pas à prouver la reprise d’un bail. Le contrôle
 partagé avec le poste et le serveur (`deploy/mise-a-jour/bail.sh`, #502/#503)
