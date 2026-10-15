@@ -103,8 +103,12 @@ le poste est déjà à la cible) ; puis, hôte par hôte, `installer`, `redemarr
 redémarrées et baux
 repris (`controler`), `ameesh doctor --harness` vert pour le poste, et une
 sonde de courrier réelle remise à une persona menée de l’hôte
-(`deploy/mise-a-jour/sante-courrier.py`) — elle prouve la chaîne
-message → runner → harnais, pas seulement l’unité active. Un courrier actif
+(`deploy/mise-a-jour/sante-courrier.py`), à laquelle la persona doit répondre
+par un appel d’outil (`agent-mail send <elle-même> --ack <jeton>`) — elle
+prouve la chaîne message → runner → harnais → outils, pas seulement l’unité
+active ni la remise : la remise est notée au lancement du harnais, avant
+qu’un harnais refusé ne sorte en 127 (#1460). Un tour en échec ou bloqué après
+la remise est un KO immédiat. Un courrier actif
 non remis depuis plus de `SOUFFRANCE_COURRIER` (900 s) est un KO.
 
 Un échec sur un hôte déclenche son `retour` automatique (`previous-sha`),

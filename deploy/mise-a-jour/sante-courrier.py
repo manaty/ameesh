@@ -7,9 +7,11 @@ Read-only checks, then one real delivery probe:
 * stuck mail: an ACTIVE message (one that would open a turn) still undelivered
   past ``--souffrance`` while its recipient is idle on the host -> KO;
 * probe: a system message is dropped to one DRIVEN persona of the host (live
-  lease) and its delivery is awaited up to ``--attente`` -> KO if it never
-  comes. This proves the chain message -> runner -> harness hook works, not
-  merely that the unit is active;
+  lease); within ``--attente`` the persona must answer it with a tool call
+  (``agent-mail send <self> --ack <token>``) -> KO otherwise. Delivery alone is
+  recorded when the harness starts, before a refused harness exits 127
+  (#1460): only the answer proves a real turn with working tools, and a
+  failed or blocked turn after delivery is KO at once;
 * dead letters (recipient stopped or unknown) are reported, never blocking.
 
 Run it on the workstation with the workstation venv, where the mesh
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 import time
 
@@ -30,9 +33,13 @@ DEFAULT_ATTENTE = 300.0
 DEFAULT_SOUFFRANCE = 900.0
 
 PROBE_TEMPLATE = """Sonde de sante staging (#1155), hote {hote}, commit {sha}.
-Message automatique du systeme : sa remise au harnais prouve que la chaine de
-courrier du hote fonctionne. Aucune action attendue : ne reponds pas, ne lance
-aucun travail, termine ton tour."""
+Message automatique du systeme : il verifie qu'un tour reel s'execute sur cet
+hote, outils compris. Seule action attendue : lance exactement la commande
+ci-dessous (accuse sans reveil, a toi-meme), puis termine ton tour sans rien
+faire d'autre :
+
+agent-mail send {nom} --ack {jeton}
+"""
 
 
 def personas(db, hote: str) -> list[dict]:
@@ -98,20 +105,45 @@ def choose(rows: list[dict], sonde: str, now: float):
     return menes[0], None
 
 
+def answered(db, name: str, jeton: str) -> bool:
+    """The persona's own ack carrying the token (sent by its tool call)."""
+    return any(m.get("sender") == name and jeton in (m.get("body") or "")
+               for m in mail.unread(db, name))
+
+
+def failed_turn(db, name: str, delivered: float) -> str:
+    """Why the turn that received the probe failed, or "" (same DB clock)."""
+    row = registry.get(db, name) or {}
+    if float(row.get("last_turn_ts") or 0) < delivered:
+        return ""
+    if row.get("last_error") or row.get("status") == "blocked":
+        return str(row.get("last_error") or row.get("status_text") or "blocked")
+    return ""
+
+
 def probe(db, row: dict, sha: str, attente: float) -> dict:
-    """Drop one system message and wait (bounded) for its delivery."""
-    corps = PROBE_TEMPLATE.format(hote=row.get("host") or "", sha=(sha or "")[:9])
+    """Drop one system message and wait (bounded) for the persona's answer."""
+    jeton = "sonde-staging-%s" % secrets.token_hex(6)
+    corps = PROBE_TEMPLATE.format(hote=row.get("host") or "", sha=(sha or "")[:9],
+                                  nom=row["name"], jeton=jeton)
     debut = time.monotonic()
     message_id = mail.send(db, work.SYSTEM_SENDER, row["name"], corps, kind="event",
                            payload={"staging": {"hote": row.get("host"), "sha": sha or ""}})
+    out = {"message": message_id, "destinataire": row["name"], "delai_s": None,
+           "tour": "non remis"}
     fin = debut + attente
     while time.monotonic() < fin:
         message = mail.get(db, message_id)
-        if message and message.get("delivered_ts"):
-            return {"message": message_id, "destinataire": row["name"],
-                    "delai_s": round(time.monotonic() - debut, 1)}
+        livre = float((message or {}).get("delivered_ts") or 0)
+        if livre:
+            out["tour"] = "remis, sans reponse de l'outil"
+            if answered(db, row["name"], jeton):
+                return dict(out, delai_s=round(time.monotonic() - debut, 1), tour="ok")
+            echec = failed_turn(db, row["name"], livre)
+            if echec:
+                return dict(out, tour="tour en echec : %s" % echec[:200])
         time.sleep(2.0)
-    return {"message": message_id, "destinataire": row["name"], "delai_s": None}
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,10 +184,11 @@ def main(argv: list[str] | None = None) -> int:
         if resultat is None:
             print("courrier %s : sonde non passee (%s)" % (args.hote, pourquoi))
         elif resultat["delai_s"] is None:
-            print("courrier %s : KO sonde non remise a %s (message %s, attente %ss)"
-                  % (args.hote, resultat["destinataire"], resultat["message"], args.attente))
+            print("courrier %s : KO sonde a %s, %s (message %s, attente %ss)"
+                  % (args.hote, resultat["destinataire"], resultat["tour"],
+                     resultat["message"], args.attente))
         else:
-            print("courrier %s : sonde remise a %s en %ss (message %s)"
+            print("courrier %s : sonde remise et accusee par %s en %ss (message %s)"
                   % (args.hote, resultat["destinataire"], resultat["delai_s"],
                      resultat["message"]))
     return 1 if verdict == "ko" else 0

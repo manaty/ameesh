@@ -669,6 +669,41 @@ class SanteCourrierTest(unittest.TestCase):
             self.assertEqual(self.mod.dead_letters(db, 'h'),
                              [{'destinataire': 'a', 'n': 2}])
 
+    def sonde(self, etat, repond=False, attente=0.2):
+        """La sonde sur faux courrier/registre (#1460) : remise a 100.0."""
+        envoye = {}
+
+        def send(db, sender, dest, corps, **kw):
+            envoye['jeton'] = corps.split('--ack ')[1].split()[0]
+            return 7
+
+        def unread(db, nom):
+            return [{'sender': nom, 'body': envoye['jeton']}] if repond else []
+
+        with mock.patch.object(self.mod.mail, 'send', side_effect=send), \
+             mock.patch.object(self.mod.mail, 'get', return_value={'delivered_ts': 100.0}), \
+             mock.patch.object(self.mod.mail, 'unread', side_effect=unread), \
+             mock.patch.object(self.mod.registry, 'get', return_value=etat), \
+             mock.patch.object(self.mod.time, 'sleep'):
+            return self.mod.probe(object(), {'name': 'p', 'host': 'h'}, 'abc', attente)
+
+    def test_probe_ko_when_the_harness_exits_127_after_delivery(self):
+        etat = {'last_turn_ts': 101.0, 'status': 'blocked', 'last_error':
+                'hote non pret : the harness could not run (code 127)'}
+        out = self.sonde(etat, attente=60.0)
+        self.assertIsNone(out['delai_s'])
+        self.assertIn('code 127', out['tour'])
+
+    def test_probe_delivered_without_tool_answer_is_ko(self):
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'idle'})
+        self.assertIsNone(out['delai_s'])
+        self.assertEqual(out['tour'], "remis, sans reponse de l'outil")
+
+    def test_probe_ok_only_with_the_persona_answer(self):
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True)
+        self.assertEqual(out['tour'], 'ok')
+        self.assertIsNotNone(out['delai_s'])
+
     def test_choose_explicit_target_must_exist(self):
         with self.assertRaises(SystemExit):
             self.mod.choose([{'name': 'a'}], 'inconnu', 1000.0)
