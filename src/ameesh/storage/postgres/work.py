@@ -298,7 +298,8 @@ class WorkItems(interface.WorkItems):
         return self.db.query(sql, tuple(params))
 
     def items_missing_ref(self, *, states, ref_prefix, limit,
-                          attempt_prefix="", retry_s=0) -> list[dict]:
+                          attempt_prefix="", retry_s=0, terminal_prefix="",
+                          max_attempts=0, since=None) -> list[dict]:
         """L539 (#1104) : les lots dont `ref_prefix + id` n'existe pas encore.
 
         L'anti-jointure est faite **avant** la borne : `limit` borne les
@@ -313,7 +314,13 @@ class WorkItems(interface.WorkItems):
         `retry_s` est exclu **avant** la borne, sinon les mêmes candidats
         confirmés (non-light, doutes, erreurs) consommeraient chaque passage et
         affameraient les plus anciens. Le délai passé, la tentative redevient
-        sélectionnable : le marqueur est un délai, pas une suppression."""
+        sélectionnable : le marqueur est un délai, pas une suppression.
+
+        `since` (arbitrage pilote du 15/10) : ne rend que les lots dont le
+        jalon `merged` est à `since` ou après — la borne d'activation, jamais
+        l'historique. `terminal_prefix`/`max_attempts` : une marque terminale
+        exclut toujours, et un candidat qui a déjà `max_attempts` tentatives
+        n'est plus sélectionné (traitement borné, jamais perpétuel)."""
         wanted = [str(s) for s in (states or ())]
         if not wanted:
             return []
@@ -324,20 +331,53 @@ class WorkItems(interface.WorkItems):
             "                    WHERE r.issue_ref = %s || w.id::text)"
         )
         params: list = list(wanted) + [str(ref_prefix)]
-        if attempt_prefix and float(retry_s) > 0:
+        if since is not None:
+            sql += (
+                "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
+                "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+                "                  AND m.at >= %s)"
+            )
+            params.append(since)
+        if terminal_prefix:
             sql += (
                 "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
                 "                    WHERE e.work_item_id = w.id"
-                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text"
-                "                      AND e.created_at > now() - make_interval(secs => %s))"
+                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text)"
             )
-            params += [str(attempt_prefix), float(retry_s)]
+            params.append(str(terminal_prefix))
+        if attempt_prefix:
+            if int(max_attempts) > 0:
+                sql += (
+                    "   AND (SELECT count(*) FROM work_item_events e"
+                    "         WHERE e.work_item_id = w.id"
+                    "           AND split_part(e.note, ' ', 1) = %s || w.id::text) < %s"
+                )
+                params += [str(attempt_prefix), int(max_attempts)]
+            if float(retry_s) > 0:
+                sql += (
+                    "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                    "                    WHERE e.work_item_id = w.id"
+                    "                      AND split_part(e.note, ' ', 1) = %s || w.id::text"
+                    "                      AND e.created_at > now() - make_interval(secs => %s))"
+                )
+                params += [str(attempt_prefix), float(retry_s)]
         sql += " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(
             sql.replace("__COLUMNS__", ITEM_COLUMNS).replace(
                 "__STATES__", ", ".join(["%s"] * len(wanted))),
             tuple(params))
+
+    def review_catch_up_bound(self):
+        """L539 (#1104) : la borne d'activation (ligne unique de la migration
+        0438), ou None si elle manque — le rattrapage reste alors fermé. Rend
+        une chaîne ISO-8601, identique pour les deux pilotes (`psql` rend le
+        texte, `psycopg` un `datetime`), utilisable telle quelle en paramètre."""
+        rows = self.db.query("SELECT bound_at FROM review_catch_up WHERE id")
+        if not rows:
+            return None
+        value = rows[0]["bound_at"]
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:

@@ -46,6 +46,17 @@ ATTEMPT_PREFIX = "review-after-merge:attempt:#"
 #: les candidats plus anciens passent, qu'un doute se résolve ou qu'une panne
 #: se reprenne. Délai, jamais suppression : le journal garde l'historique.
 ATTEMPT_RETRY_S = 3600
+#: le marqueur de journal d'un candidat **terminal** : un lot non-light
+#: confirmé (le canon §2 ne demande une relecture après fusion que pour un lot
+#: léger) ou un doute épuisé après `CATCH_UP_MAX_ATTEMPTS` tentatives. Le
+#: premier mot de la note est `TERMINAL_PREFIX + <id>` ; la sélection l'exclut
+#: toujours — la marque reste au journal, visible, mais aucune tentative
+#: horaire perpétuelle (arbitrage pilote du 15/10 sur le P2 de la R2 #1104).
+TERMINAL_PREFIX = "review-after-merge:closed:#"
+#: le nombre de tentatives bornées d'un candidat **douteux** (classe non
+#: confirmée : lecture impossible, dépôt absent) avant sa marque terminale.
+#: Un non-light confirmé, lui, est terminal dès la première lecture.
+CATCH_UP_MAX_ATTEMPTS = 3
 #: l'échéance du canon §2 : le jour même de la fusion, heure de Paris
 TZ = "Europe/Paris"
 HOUR = "23:59"
@@ -350,6 +361,7 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         klass = class_at_merge(db, lot, item=item, repo=repo, target=where_target,
                                sha=merged_sha)
         out["class"] = klass.get("class") or ""
+        out["doubt"] = bool(klass.get("doubt"))
         opened = open_after_merge(
             db, lot=lot, klass=klass, item=item, merged_sha=merged_sha, pr=pr,
             target=where_target, actor=actor)
@@ -381,7 +393,8 @@ def merged_sha(db, lot: int) -> str:
 
 def catch_up(db, *, repo: str = "", target: str = "",
              limit: int = CATCH_UP_LIMIT,
-             retry_s: float = ATTEMPT_RETRY_S) -> dict:
+             retry_s: float = ATTEMPT_RETRY_S,
+             max_attempts: int = CATCH_UP_MAX_ATTEMPTS) -> dict:
     """L539 (#1104) : rattrapage des relectures manquantes après une panne.
 
     Les relevés ne sélectionnent que des lots **ouverts** : un lot déjà `merged`
@@ -397,25 +410,36 @@ def catch_up(db, *, repo: str = "", target: str = "",
     déjà pourvus. `merged` et `promoted` sont un seul ensemble ordonné par
     récence : un `promoted` manquant n'est pas affamé par des `merged`.
 
-    Binôme mesh-design (14/10) : un candidat qui n'ouvre rien (classe
-    confirmée non-light, doute, lecture impossible, erreur) reste « manquant » ;
-    sans marqueur, les `limit` plus récents consomment chaque passage et
-    affament les plus anciens (contre-épreuve : vingt sensibles confirmés +
-    un light ancien -> vingt examinés, zéro ouvert, à chaque passage). Chaque
-    tentative sans création est donc journalisée (`log_review_attempt`,
-    marqueur `ATTEMPT_PREFIX<id>`) et exclue avant la borne tant qu'elle a
-    moins de `retry_s` secondes ; le délai écoulé, elle est **réessayée** — un
-    doute peut se résoudre, une panne se reprendre. Toute ouverture réussie
-    sort le parent de la sélection (drain sans doublon, fusion jamais
-    rouverte). Ne lève jamais ; rend `{examined, missing, opened, attempted,
-    failed}` (`attempted` : tentatives sans création marquées)."""
-    out = {"examined": 0, "missing": 0, "opened": 0, "attempted": 0, "failed": 0}
+    Borne d'activation (arbitrage pilote du 15/10, P2 de la R2 #1104) : le
+    rattrapage ne remonte **jamais** avant `review_catch_up_bound()` — la ligne
+    écrite par la migration 0438 à l'activation du lot, commune aux exécuteurs
+    et conservée après redémarrage. Un lot déjà fusionné avant cette activation
+    ne devient pas une relecture due aujourd'hui ; sans borne lisible, le
+    rattrapage est fermé (aucun balayage historique, qui reste une décision du
+    pilote). Le contenu d'un candidat non-light **confirmé** est terminal : une
+    seule lecture, aucune tentative horaire perpétuelle. Un candidat **douteux**
+    (classe non confirmée) est réessayé au plus `max_attempts` fois, espacées de
+    `retry_s`, puis marqué terminal à son tour — le journal garde la trace.
+
+    Ne lève jamais ; rend `{examined, missing, opened, already, attempted,
+    terminal, failed, bound}` (`attempted` : tentatives sans création marquées,
+    `already` : relecture ouverte entre la sélection et le geste, `terminal` :
+    candidats clos par la marque terminale)."""
+    out = {"examined": 0, "missing": 0, "opened": 0, "already": 0,
+           "attempted": 0, "terminal": 0, "failed": 0, "bound": ""}
     try:
         ops = storage.of(db).work
+        bound = ops.review_catch_up_bound()
+        if bound is None:  # fail-closed : jamais de balayage historique
+            return out
+        out["bound"] = bound.isoformat() if hasattr(bound, "isoformat") else str(bound)
         rows = ops.items_missing_ref(states=work.MERGED_STATES,
                                      ref_prefix=PREFIX + "#", limit=int(limit),
                                      attempt_prefix=ATTEMPT_PREFIX,
-                                     retry_s=float(retry_s))
+                                     retry_s=float(retry_s),
+                                     terminal_prefix=TERMINAL_PREFIX,
+                                     max_attempts=int(max_attempts),
+                                     since=bound)
     except Exception:  # noqa: BLE001 - pas de base : rien à rattraper
         return out
 
@@ -427,6 +451,25 @@ def catch_up(db, *, repo: str = "", target: str = "",
                                    work.SYSTEM_SENDER)
         except Exception:  # noqa: BLE001 - marqueur best effort
             pass
+
+    def terminal(lot, state, detail):
+        """Marque le candidat terminal (best effort : le journal le garde)."""
+        try:
+            ops.log_review_attempt(lot, state, "%s%d %s"
+                                   % (TERMINAL_PREFIX, int(lot), detail),
+                                   work.SYSTEM_SENDER)
+        except Exception:  # noqa: BLE001 - marqueur best effort
+            pass
+
+    def attempts(lot):
+        """Le nombre de tentatives déjà marquées au journal du lot."""
+        try:
+            events = ops.events(int(lot), 200) or []
+        except Exception:  # noqa: BLE001 - journal illisible : compteur à zéro
+            return 0
+        token = "%s%d" % (ATTEMPT_PREFIX, int(lot))
+        return sum(1 for e in events
+                   if str(e.get("note") or "").split(" ")[0] == token)
 
     for row in rows:
         lot = int(row["id"])
@@ -442,6 +485,23 @@ def catch_up(db, *, repo: str = "", target: str = "",
                                   target=target or str(row.get("branch_target") or ""))
             if done.get("created"):
                 out["opened"] += 1
+                continue
+            if done.get("id") or "déjà" in str(done.get("why") or ""):
+                # un autre exécuteur a ouvert la relecture entre la sélection
+                # et ici : rien à marquer, le lot est pourvu
+                out["already"] += 1
+                continue
+            klass = str(done.get("class") or "")
+            if not done.get("doubt") and klass and klass != lot_class.LIGHT:
+                # classe confirmée non-light : le canon §2 ne demande une
+                # relecture après fusion que pour un lot léger — terminal
+                out["terminal"] += 1
+                terminal(lot, state, "classe %s confirmée non-light" % klass)
+                continue
+            seen = attempts(lot) + 1
+            if seen >= int(max_attempts):
+                out["terminal"] += 1
+                terminal(lot, state, "doute après %d tentatives" % seen)
             else:
                 out["attempted"] += 1
                 mark(lot, state, "sans ouverture: %s" % (done.get("why") or "?"))

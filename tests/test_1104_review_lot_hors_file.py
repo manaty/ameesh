@@ -362,10 +362,11 @@ class CatchUpWitnessTest(_Witness):
 
 
     def test_vingt_sensibles_confirmes_ne_cachent_pas_un_light_ancien(self):
-        """Contre-épreuve du binôme (14/10) : vingt candidats SQL **prouvés**
-        non-light (sensitive, doute=False) plus récents ne consomment plus
-        chaque passage ; le light ancien est atteint au passage suivant. Le
-        marqueur de tentative est un délai, pas une suppression."""
+        """Contre-épreuve du binôme (14/10), resserrée par l'arbitrage du 15/10 :
+        vingt candidats SQL **prouvés** non-light (sensitive, doute=False) plus
+        récents ne consomment plus chaque passage — leur classe confirmée est
+        **terminale** (une seule lecture, aucune tentative horaire perpétuelle) ;
+        le light ancien est atteint au passage suivant."""
         old = self.merged_lot("light ancien")
         for i in range(review_lot.CATCH_UP_LIMIT):
             self.merged_lot("sensible %d" % i)
@@ -379,7 +380,8 @@ class CatchUpWitnessTest(_Witness):
             first = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
         self.assertEqual((first["examined"], first["missing"], first["opened"]),
                          (review_lot.CATCH_UP_LIMIT, review_lot.CATCH_UP_LIMIT, 0), first)
-        self.assertEqual(first["attempted"], review_lot.CATCH_UP_LIMIT, first)
+        self.assertEqual(first["attempted"], 0, first)
+        self.assertEqual(first["terminal"], review_lot.CATCH_UP_LIMIT, first)
         self.assertEqual(self.review_lots(old), [])
         with mock.patch.object(review_lot, "class_at_merge", side_effect=klass):
             second = review_lot.catch_up(self.db, limit=review_lot.CATCH_UP_LIMIT)
@@ -435,6 +437,118 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual((third["examined"], third["missing"], third["opened"]), (1, 1, 1),
                          third)
         self.assertEqual(len(self.review_lots(lot)), 1)
+
+    # -- arbitrage pilote du 15/10 : borne d'activation, terminal, borné ------
+
+    def test_la_borne_d_activation_ecarte_l_historique(self):
+        """Un lot déjà fusionné **avant** l'activation (la borne écrite par la
+        migration 0438) n'est pas rattrapé ; un lot fusionné après l'est. La
+        borne est écrite à l'activation, pas au premier passage : un lot
+        fusionné avant la première exécution du rattrapage ne serait pas
+        repris autrement (le P2 de la R2 #1104)."""
+        before = self.merged_lot("fusionne avant l'activation")
+        self.db.execute(
+            "UPDATE work_item_milestones SET at = now() - interval '1 day'"
+            " WHERE work_item_id = %s AND kind = 'merged'", (before,))
+        after = self.merged_lot("fusionne apres l'activation")
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            out = review_lot.catch_up(self.db)
+        self.assertEqual((out["examined"], out["missing"], out["opened"]), (1, 1, 1), out)
+        self.assertTrue(out["bound"], out)
+        self.assertEqual(self.review_lots(before), [])
+        self.assertEqual(len(self.review_lots(after)), 1)
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            again = review_lot.catch_up(self.db)
+        self.assertEqual((again["examined"], again["opened"]), (0, 0), again)
+
+    def test_la_borne_est_commune_et_conservee(self):
+        """La borne vit dans la base partagée : un second exécuteur (autre
+        connexion, comme après un redémarrage) lit la même valeur, et le
+        rattrapage la rend telle quelle — aucune réactivation au passage."""
+        bound = storage.of(self.db).work.review_catch_up_bound()
+        self.assertIsNotNone(bound, "la migration 0438 doit écrire la borne")
+        other = self.connect()
+        self.addCleanup(other.close)
+        self.assertEqual(storage.of(other).work.review_catch_up_bound(), bound,
+                         "la borne n'est pas commune aux exécuteurs")
+        out = review_lot.catch_up(self.db)
+        self.assertEqual(out["bound"], bound, out)
+        self.assertEqual(storage.of(self.db).work.review_catch_up_bound(), bound)
+
+    def test_un_non_light_confirme_est_terminal_une_seule_fois(self):
+        """Une classe non-light **confirmée** (ici un `.sql` prouvé par le diff
+        fusionné) est terminale : une seule lecture, aucune tentative horaire
+        perpétuelle, et jamais de lot de relecture (canon §2)."""
+        lot = self.lot()
+        self.frozen_on_branch(lot, "lot/1104-sql-terminal", name="db/x.sql")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
+             "lot/1104-sql-terminal")
+        plan_git.sync_branches(self.db, host=self.cfg.host)   # le relevé fusionne
+        first = review_lot.catch_up(self.db, retry_s=0)
+        self.assertIn(first["examined"], (0, 1), first)
+        second = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual(second["examined"], 0, second)
+        self.assertEqual(self.review_lots(lot), [])
+        events = storage.of(self.db).work.events(lot, 50)
+        terminal = [e for e in events
+                    if str(e.get("note") or "").startswith(
+                        review_lot.TERMINAL_PREFIX + str(lot))]
+        self.assertEqual(len(terminal), 1, terminal)
+        self.assertIn("non-light", str(terminal[0].get("note") or ""))
+
+    def test_un_doute_est_retente_borne_puis_terminal(self):
+        """Un candidat **douteux** (ici une fusion déclarée dont le commit est
+        absent du dépôt) est réessayé, mais un nombre borné de fois : au plus
+        `CATCH_UP_MAX_ATTEMPTS` lectures, puis terminal — jamais une tentative
+        horaire perpétuelle."""
+        lot = self.merged_lot("doute borne")
+        for _ in range(review_lot.CATCH_UP_MAX_ATTEMPTS - 1):
+            out = review_lot.catch_up(self.db, retry_s=0)
+            self.assertEqual((out["examined"], out["attempted"], out["terminal"]),
+                             (1, 1, 0), out)
+        last = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual((last["examined"], last["attempted"], last["terminal"]),
+                         (1, 0, 1), last)
+        after = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual(after["examined"], 0, after)
+        self.assertEqual(self.review_lots(lot), [])
+        events = storage.of(self.db).work.events(lot, 50)
+        terminals = [e for e in events
+                     if str(e.get("note") or "").startswith(
+                         review_lot.TERMINAL_PREFIX + str(lot))]
+        self.assertEqual(len(terminals), 1, terminals)
+        self.assertIn("doute", str(terminals[0].get("note") or ""))
+
+    def test_deux_executeurs_ne_doublent_pas_la_relecture(self):
+        """Concurrence entre exécuteurs : l'autre exécuteur ouvre la relecture
+        entre la sélection et le geste ; le second ne double pas le lot, ne
+        marque pas de tentative et le compte `already` le dit."""
+        lot = self.merged_lot("course entre executeurs")
+        other = self.connect()
+        self.addCleanup(other.close)
+        real = review_lot.open_for_merge
+        calls = {"n": 0}
+
+        def racy(db, lot_id, **kw):
+            if calls["n"] == 0:
+                calls["n"] += 1
+                review_lot.catch_up(other)      # l'autre exécuteur gagne la course
+            return real(db, lot_id, **kw)
+
+        with mock.patch.object(review_lot, "open_for_merge", side_effect=racy), \
+                mock.patch.object(review_lot, "class_at_merge",
+                                  return_value={"class": "light", "why": "témoin"}):
+            out = review_lot.catch_up(self.db)
+        self.assertEqual((out["opened"], out["already"]), (0, 1), out)
+        self.assertEqual(len(self.review_lots(lot)), 1, "relecture doublée")
+        events = storage.of(self.db).work.events(lot, 50)
+        attempts = [e for e in events
+                    if str(e.get("note") or "").startswith(
+                        review_lot.ATTEMPT_PREFIX + str(lot))]
+        self.assertEqual(attempts, [], attempts)
 
 
 class DeclaredMergeWitnessTest(_Witness):
