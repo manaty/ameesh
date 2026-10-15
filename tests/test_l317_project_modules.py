@@ -11,7 +11,7 @@ from unittest import mock
 
 from tests import support  # isolate host config before module tests
 from tests.support import PgTestCase
-from ameesh import canon, canon_sync, db as db_mod, modules, work
+from ameesh import canon, canon_sync, db as db_mod, identity, modules, work
 from ameesh.modules import it
 from ameesh.modules.it.execution import OUTPUT_BYTES, digest, execute
 from ameesh.modules.storage import ModuleStore
@@ -25,20 +25,26 @@ def federation(project="acme", names=None):
 class ModuleConfigurationTest(unittest.TestCase):
     def test_module_refusal_is_per_lot_but_other_database_errors_propagate(self):
         store = mock.Mock()
+        # MagicMock : la fermeture ouvre sa transaction (et prend le verrou de
+        # graphe) avant l'écriture du stockage.
         with mock.patch.object(work, "get", return_value={"id": 1, "state": "qa"}), \
                 mock.patch.object(work.storage, "of", return_value=store):
             store.work.close_merged.side_effect = db_mod.DbError("AMEESH_MODULE_RULE: evidence missing")
-            self.assertEqual(work.close_merged(mock.Mock(), 1)["result"], "refused")
+            self.assertEqual(work.close_merged(mock.MagicMock(), 1)["result"], "refused")
             store.work.close_merged.side_effect = db_mod.DbError("database connection lost")
             with self.assertRaises(db_mod.DbError):
-                work.close_merged(mock.Mock(), 1)
+                work.close_merged(mock.MagicMock(), 1)
     def test_it_cli_parses_artifact_options_after_lot_and_requests_isolated_execution(self):
+        bound = identity.Binding(name="tester", source="runner", runner_id="r1", epoch=2, ok=True)
         with mock.patch.object(it, "item", return_value={"app": "acme"}), \
+                mock.patch("ameesh.identity.require_bound", return_value=bound), \
                 mock.patch("ameesh.modules.it.proof_service.request", return_value={"id": 1}) as request:
             it.main(mock.Mock(), ["proof", "123", "--artifact", "/artifact", "--runner", "python3",
                                  "--", "--help", "quoted argument"], actor="tester")
         request.assert_called_once_with("acme", 123, "/artifact", runner="python3",
-                                        arguments=["--help", "quoted argument"], timeout=60)
+                                        arguments=["--help", "quoted argument"], timeout=60,
+                                        identity={"agent": "tester", "runner_id": "r1",
+                                                  "lease_epoch": 2})
 
     def test_only_named_project_is_enabled(self):
         entries = modules.declarations(federation())

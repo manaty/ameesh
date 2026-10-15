@@ -14,29 +14,57 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `docs/design/decisions/0018-vitesse-des-agents.md`.
 - **Tests** : la suite tourne sur un vrai Postgres avec les deux pilotes ;
   `scripts/test.sh` en local (ou `scripts/test-parallele.sh -n 4`, en parts
-  parallèles), l'intégration continue sur chaque PR : psycopg complet et psql
-  sur les modules de `tests/parts/pilote-psql.txt` ; le psql complet tourne
-  sur `main` et `release/*`. Un module de test qui touche la couche base ou un
-  comportement propre à un pilote s'ajoute à cette liste. Une PR qui ne change
+  parallèles), l'intégration continue sur chaque PR : les tests impactés et le
+  contrat (`tests/parts/toujours.txt` : droits, rôles, migrations), en une à
+  quatre parts psycopg et une à trois parts psql pour rester sous les plafonds
+  des hôtes auto-hébergés mutualisés (#947, L1211) ; la suite complète tourne
+  sur `main`, `release/*` et `integration/*`, et remplace la sélection dès
+  qu'elle ne peut pas décider. Une **PR de release** — source ou cible sous
+  `release/*` ou `integration/*` — garde la suite complète, les deux pilotes,
+  sans voie version seule ni documentation seule ni liste pilote psql, y
+  compris dans le plan de repli (canon §3) ; le plan reçoit pour cela les
+  branches source et cible (`--base-ref`, `--head-ref`). Un module de test qui
+  touche la couche base ou un comportement propre à un pilote s'ajoute à
+  `tests/parts/pilote-psql.txt` ;
+  un test de contrat (droits, rôles, migrations, objet global du cluster)
+  s'ajoute à `tests/parts/toujours.txt`. Une PR de lot qui ne change
   **que le numéro de version** (`pyproject.toml` seul, la seule ligne
   `version = "…"`) ne relance pas la suite : `main` l'a déjà validée pour ce
   contenu ; le contrôle « tests » reste vert (`scripts/version-only.py`, L157).
 - **PR de documentation seule** (L161a) : si chaque fichier changé est sous
   `docs/` ou `site/`, ou un `*.md` hors de `src/`, `tests/`, `.github/` et
-  `examples/`, la CI ne passe que les tests qui lisent la documentation,
+  `examples/`, la CI d'une PR de lot ne passe que les tests qui lisent la
+  documentation,
   sans base (« lecteurs de la doc », moins d'une minute). Un test qui ouvre
   un fichier de `docs/` ou `site/` se déclare dans
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
   vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
   jamais annulée par la fusion suivante.
+- **Release : la suite sur une autre classe de système de fichiers** (#748) :
+  la PR de release (branche `release/**` en tête ou en base) rejoue les parts
+  psycopg avec les racines temporaires sur l'autre classe que celle du runner
+  (tmpfs ↔ disque, lue à l'exécution) ; ce job compte alors dans le check
+  « tests ». Un test qui ne tient que sur la classe ordinaire s'y révèle : le
+  corriger à la source (horodatages, renommage entre périphériques, `TMPDIR`),
+  jamais en le relançant.
+- **Concurrence par hôte de la CI** (#899, pilote, 2026-10-13) : l'occupation
+  d'un hôte de la flotte `ameesh-ci` est bornée par le nombre de runners de cet
+  hôte, fixé par une mesure de capacité (CPU, RAM, disque, PSI ; lot #824), et
+  non par le fan-out d'une exécution : borner le fan-out
+  (`strategy.max-parallel`) ne baisse pas la concurrence par hôte sur une
+  flotte occupée et allonge chaque exécution. Le découpage en parts reste le
+  levier pour passer sous le plafond du job ; chaque part déclare ce plafond
+  (`AMEESH_PLAFOND_MIN`, égal à son `timeout-minutes`) et publie une alerte à
+  80 % de celui-ci dans son check run (`scripts/ci-flow.py`, #899).
 - **Tests indépendants du poste** (L142) : le poste et la CI donnent le même
   verdict. À l'import, `tests/support.py` retire toutes les variables
   `AMEESH_*`, `AGENT_MESH_*` et `AGENT_MAIL_*` de la session (identité
   d'agent, schéma, état, DSN, canon…), sauf les réglages du banc
   (`AMEESH_TEST_DSN`, `AMEESH_REQUIRE_DB`, `AMEESH_DRIVER`, `AMEESH_DB_TRACE`
   et leurs alias `AGENT_MESH_*`), et pointe `AMEESH_CONFIG` et
-  `AGENT_MESH_CONFIG` vers un fichier absent : ni
-  `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus.
+  `AGENT_MESH_CONFIG` vers un fichier **vide mais existant** (`{}`) : ni
+  `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus,
+  et un chemin explicite absent est refusé avant toute connexion (#1127).
   `HOME` reste celui du poste (le banc lit `~/.pgpass`). Les caches de
   gestionnaires de paquets du poste (`npm_config_*`, `pnpm_config_*`,
   `YARN_CACHE_FOLDER`, `XDG_CACHE_HOME`) sont retirés de même (L73) : le
@@ -49,6 +77,16 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Historique : git et les PR** (L160a) : la description de la PR dit ce
   qui change et pourquoi ; aucun journal tenu à la main. Les PR fusionnées
   sont liées depuis `docs/design/index.md`.
+- **Rebaser une branche de lot** : `git rebase --continue`, comme
+  `git commit --amend`, ouvre un éditeur dont le nettoyage par défaut retire
+  une ligne commençant par `#` — le sujet `#<lot> …` disparaît et le corps
+  devient le sujet (lot #1277). Rebasez avec
+  `scripts/rebase-lot.sh <arguments de git rebase>` : il passe
+  `core.commentChar=';'` à chaque invocation, `--continue` compris, et
+  signale un sujet perdu après coup. À défaut,
+  `git -c core.commentChar=';' rebase …` et
+  `git -c core.commentChar=';' commit --amend`. Après tout rebasage,
+  contrôlez `git log --format='%s' <base>..HEAD`.
 - **Ajouter plutôt que modifier** (L160a) : on ajoute des fichiers (un module,
   un test, une page, une décision par sujet) plutôt que de modifier un fichier
   commun, pour que deux PR ouvertes en même temps ne se gênent pas à la fusion.
@@ -67,6 +105,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   nouveaux fichiers source.
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
+
+Les idées qui ne sont pas décidées vont dans le [sas d’explorations](docs/design/explorations/index.md) :
+un fichier par idée, `type: Exploration`, `status: exploration`, avec problème,
+intuitions et questions ouvertes. Ni lots proposés, ni dates, ni estimations,
+ni critère « fait » ; aucun lot, WorkPackage, backlog ou ligne de roadmap ne
+se déduit d’une exploration. Seule une décision explicite de l’owner,
+consignée dans `docs/design/decisions/`, permet la promotion en étude puis en
+lots. Les fiches de plan et de lot pointent vers l’étude décidée. La garde
+`tests.test_l1124_explorations` vérifie cette séparation dans le dépôt.
 
 ## Numérotation des versions
 

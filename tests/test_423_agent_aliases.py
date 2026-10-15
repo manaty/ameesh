@@ -64,6 +64,30 @@ class AgentAliasTest(PgTestCase):
         with self.assertRaises(Exception):
             self.db.execute("UPDATE agent_registry SET aliases = ARRAY['alice'] WHERE name='worker'")
 
+    def test_the_key_holder_namespace_covers_the_primary_name_and_the_alias(self):
+        """#897 N2: la 0364 garde le nom primaire (creation, renommage, cle),
+        la 0418 garde l'alias ; l'exception stopgap du geste du proprietaire
+        reste celle de 0364 (test_330 la pin)."""
+        with self.assertRaises(Exception):
+            self.db.execute("INSERT INTO key_holders (name, human, public_key, "
+                            "public_key_fingerprint, key_role) "
+                            "VALUES ('reviewer', 'human:reviewer', 'k', 'f', 'agent')")
+        with self.assertRaises(Exception):
+            self.db.execute("INSERT INTO key_holders (name, human, public_key, "
+                            "public_key_fingerprint, key_role) "
+                            "VALUES ('old-worker', 'human:old-worker', 'k', 'f', 'agent')")
+        authority.register_human_key(self.db, 'alice', b'x' * 32)
+        with self.assertRaises(Exception):
+            registry.upsert(self.db, 'alice', host=self.cfg.host)
+        with self.assertRaises(Exception):
+            self.db.execute("UPDATE agent_registry SET name = 'alice' WHERE name = 'worker'")
+        with self.assertRaises(Exception):
+            self.db.execute("UPDATE agent_registry SET aliases = ARRAY['alice'] WHERE name = 'worker'")
+        # une cle revoquee occupe toujours le nom
+        authority.revoke_key(self.db, 'alice')
+        with self.assertRaises(Exception):
+            registry.upsert(self.db, 'alice', host=self.cfg.host)
+
     def test_same_lease_and_stale_epoch_remains_fenced(self):
         claimed = registry.claim(self.db, 'old-worker', 'runner-test', 120)
         self.assertEqual(claimed['name'], 'worker')

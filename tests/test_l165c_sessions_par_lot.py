@@ -44,11 +44,15 @@ class _Base(PgTestCase):
         return storage.of(self.db).lot_sessions
 
 
+#: #540 : plusieurs lots non démarrés au même agent, forcés
+_FORCE = "test: several lots for one agent (#540)"
+
+
 class StockageTest(_Base):
     def test_bascule_met_de_cote_puis_reprend(self):
         runner, lease = self.bail("a1")
-        a = work.add(self.db, title="A", assignee="a1")["id"]
-        b = work.add(self.db, title="B", assignee="a1")["id"]
+        a = work.add(self.db, title="A", assignee="a1", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a1", force=_FORCE)["id"]
         epoch = lease["lease_epoch"]
         storage.of(self.db).operations.set_session_work_item("a1", runner.runner_id, epoch,
                                                              str(a))
@@ -74,8 +78,8 @@ class StockageTest(_Base):
 
     def test_compte_harnais_ou_dossier_differents_ecartent_la_session(self):
         runner, lease = self.bail("a2")
-        a = work.add(self.db, title="A", assignee="a2")["id"]
-        b = work.add(self.db, title="B", assignee="a2")["id"]
+        a = work.add(self.db, title="A", assignee="a2", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a2", force=_FORCE)["id"]
         epoch = lease["lease_epoch"]
         for i, autre in enumerate(({"account": "autre"}, {"harness": "codex"},
                                    {"cwd": "/ailleurs"})):
@@ -100,8 +104,8 @@ class StockageTest(_Base):
         vers B met A de côté avec /old ; le retour sur A dans /new ne la
         reprend pas. Une session d'origine inconnue n'est jamais reprise."""
         runner, lease = self.bail("a6")
-        a = work.add(self.db, title="A", assignee="a6")["id"]
-        b = work.add(self.db, title="B", assignee="a6")["id"]
+        a = work.add(self.db, title="A", assignee="a6", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a6", force=_FORCE)["id"]
         epoch = lease["lease_epoch"]
         storage.of(self.db).operations.set_session_work_item("a6", runner.runner_id, epoch,
                                                              str(a))
@@ -144,8 +148,8 @@ class StockageTest(_Base):
         qui tient encore S la met de côté sans origine : jamais reprise."""
         runner, lease = self.bail("a9")
         epoch = lease["lease_epoch"]
-        a = work.add(self.db, title="A", assignee="a9")["id"]
-        b = work.add(self.db, title="B", assignee="a9")["id"]
+        a = work.add(self.db, title="A", assignee="a9", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a9", force=_FORCE)["id"]
         storage.of(self.db).operations.set_session_work_item("a9", runner.runner_id, epoch,
                                                              str(a))
         registry.set_session(self.db, "a9", "S", "X", harness="claude", cwd="/w")
@@ -170,10 +174,10 @@ class StockageTest(_Base):
         runner, lease = self.bail("a7")
         epoch = lease["lease_epoch"]
         cle = dict(harness="claude", account=None, cwd="/w")
-        b = work.add(self.db, title="B", assignee="a7")["id"]
+        b = work.add(self.db, title="B", assignee="a7", force=_FORCE)["id"]
         for fin in ("close", "assign"):
             with self.subTest(fin=fin):
-                a = work.add(self.db, title="A", assignee="a7")["id"]
+                a = work.add(self.db, title="A", assignee="a7", force=_FORCE)["id"]
                 storage.of(self.db).operations.set_session_work_item(
                     "a7", runner.runner_id, epoch, str(a))
                 registry.set_session(self.db, "a7", "sess-" + fin, None, **{
@@ -201,7 +205,7 @@ class StockageTest(_Base):
 
     def test_bascule_fencee_par_le_bail(self):
         runner, lease = self.bail("a3")
-        a = work.add(self.db, title="A", assignee="a3")["id"]
+        a = work.add(self.db, title="A", assignee="a3", force=_FORCE)["id"]
         self.assertIsNone(self.st.switch("a3", "autre", lease["lease_epoch"], to_lot=str(a),
                                          harness="claude", account=None, cwd="/w",
                                          current="s"))
@@ -212,9 +216,9 @@ class StockageTest(_Base):
 
     def test_purge_des_lots_finis_ou_reassignes(self):
         runner, lease = self.bail("a4")
-        a = work.add(self.db, title="A", assignee="a4")["id"]
-        b = work.add(self.db, title="B", assignee="a4")["id"]
-        c = work.add(self.db, title="C", assignee="a4")["id"]
+        a = work.add(self.db, title="A", assignee="a4", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="a4", force=_FORCE)["id"]
+        c = work.add(self.db, title="C", assignee="a4", force=_FORCE)["id"]
         for lot in (a, b, c):
             self.st.note_wake("a4", lot, time.time())
         work.close(self.db, a, abandoned=True, actor="test")
@@ -225,7 +229,7 @@ class StockageTest(_Base):
 
     def test_reveils_comptes_jusqu_a_ce_que_le_lot_vive(self):
         self.bail("a5")
-        a = work.add(self.db, title="A", assignee="a5")["id"]
+        a = work.add(self.db, title="A", assignee="a5", force=_FORCE)["id"]
         t = time.time()
         self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 1)
         self.assertEqual(self.st.note_wake("a5", a, t)["wakes"], 2)
@@ -235,7 +239,7 @@ class StockageTest(_Base):
     def test_lots_actionnables(self):
         self.bail("a6")
         def lot(title, **kw):
-            return work.add(self.db, title=title, assignee="a6", **kw)["id"]
+            return work.add(self.db, title=title, assignee="a6", force=_FORCE, **kw)["id"]
         bas = lot("priorité basse", priority=3)
         haut = lot("priorité haute", priority=1)
         build = lot("en build")
@@ -290,13 +294,13 @@ class RoutageTest(_Base):
     def test_relecture_puis_retour_reprend_la_session_du_lot(self):
         worker = self._worker("w1")
         try:
-            a = work.add(self.db, title="A", assignee="w1")["id"]
+            a = work.add(self.db, title="A", assignee="w1", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             argv = self.tour(worker, a, "commence A", session="sess-A")
             self.assertNotIn("--resume", argv)
             self.assertEqual(registry.get(self.db, "w1")["session_id"], "sess-A")
             work.move(self.db, a, "qa")                    # A part en relecture
-            b = work.add(self.db, title="B", assignee="w1")["id"]
+            b = work.add(self.db, title="B", assignee="w1", force=_FORCE)["id"]
             argv = self.tour(worker, b, "prends B", session="sess-B")
             self.assertNotIn("--resume", argv)             # session distincte
             self.assertIn("dedicated to lot #%d" % b, " ".join(argv))
@@ -318,14 +322,14 @@ class RoutageTest(_Base):
         bascule vers B : le retour sur A ne reprend pas sa session ailleurs."""
         worker = self._worker("w3")
         try:
-            a = work.add(self.db, title="A", assignee="w3")["id"]
+            a = work.add(self.db, title="A", assignee="w3", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             self.tour(worker, a, "commence A", session="sess-A")
             self.assertEqual(self.origine("w3"), ("claude", self._cwd("w3"), "sess-A"))
             self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = %s",
                             (self._cwd("w3-new"), "w3"))
             work.move(self.db, a, "qa")
-            b = work.add(self.db, title="B", assignee="w3")["id"]
+            b = work.add(self.db, title="B", assignee="w3", force=_FORCE)["id"]
             self.tour(worker, b, "prends B", session="sess-B")
             argv = self.tour(worker, a, "retour de relecture sur A", session="sess-A2")
             self.assertNotIn("--resume", argv)
@@ -340,7 +344,7 @@ class RoutageTest(_Base):
         pas."""
         worker = self._worker("w4")
         try:
-            a = work.add(self.db, title="A", assignee="w4")["id"]
+            a = work.add(self.db, title="A", assignee="w4", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             self.tour(worker, a, "commence A", session="sess-A")
             self.db.execute("UPDATE agent_registry SET cwd = %s WHERE name = %s",
@@ -349,7 +353,7 @@ class RoutageTest(_Base):
             self.assertEqual(argv[argv.index("--resume") + 1], "sess-A")
             self.assertEqual(self.origine("w4"), ("claude", self._cwd("w4"), "sess-A"))
             work.move(self.db, a, "qa")
-            b = work.add(self.db, title="B", assignee="w4")["id"]
+            b = work.add(self.db, title="B", assignee="w4", force=_FORCE)["id"]
             self.tour(worker, b, "prends B", session="sess-B")
             argv = self.tour(worker, a, "retour sur A", session="sess-A2")
             self.assertNotIn("--resume", argv)
@@ -362,8 +366,8 @@ class RoutageTest(_Base):
         session a été mise de côté sous `parquee_sous`."""
         worker = self._worker(name)
         self.addCleanup(worker.watchdog_stop.set)
-        a = work.add(self.db, title="A", assignee=name)["id"]
-        b = work.add(self.db, title="B", assignee=name)["id"]
+        a = work.add(self.db, title="A", assignee=name, force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee=name, force=_FORCE)["id"]
         epoch = worker.epoch
         ops = storage.of(self.db).operations
         cwd = registry.get(self.db, name)["cwd"]
@@ -400,10 +404,10 @@ class RoutageTest(_Base):
     def test_le_lot_du_tour_est_l_unique_lot_actionnable(self):
         worker = self._worker("w2")
         try:
-            a = work.add(self.db, title="A", assignee="w2")["id"]
+            a = work.add(self.db, title="A", assignee="w2", force=_FORCE)["id"]
             work.move(self.db, a, "build")
             work.move(self.db, a, "qa")
-            b = work.add(self.db, title="B", assignee="w2")["id"]
+            b = work.add(self.db, title="B", assignee="w2", force=_FORCE)["id"]
             registry.set_pending_prompt(self.db, "w2", "continue")
             self.assertEqual(worker.pick()["lot"], str(b))
         finally:
@@ -437,11 +441,11 @@ class ReveilTest(_Base):
 
     def test_reveil_sur_le_lot_actionnable(self):
         worker = self._worker("r1")
-        qa = work.add(self.db, title="en relecture", assignee="r1")["id"]
+        qa = work.add(self.db, title="en relecture", assignee="r1", force=_FORCE)["id"]
         work.move(self.db, qa, "build")
         work.move(self.db, qa, "qa")
         self.assertIsNone(self.pick(worker), "un lot en qa ne réveille pas")
-        b = work.add(self.db, title="à faire", assignee="r1")["id"]
+        b = work.add(self.db, title="à faire", assignee="r1", force=_FORCE)["id"]
         spec = self.pick(worker)
         self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(b)))
         self.assertIn("Resuming lot #%d" % b, spec["prompt"])
@@ -450,7 +454,7 @@ class ReveilTest(_Base):
 
     def test_backoff_en_base_survit_au_redemarrage(self):
         worker = self._worker("r2")
-        b = work.add(self.db, title="à faire", assignee="r2")["id"]
+        b = work.add(self.db, title="à faire", assignee="r2", force=_FORCE)["id"]
         self.assertIsNotNone(self.pick(worker))
         relance = self._worker("r2")    # nouvel exécuteur, même agent
         relance.runner.idle_nudge = 100_000.0    # plafond du délai doublé
@@ -472,18 +476,18 @@ class ReveilTest(_Base):
 
     def test_desactivable_par_agent_et_par_hote(self):
         worker = self._worker("r3", lot_wake=False)
-        work.add(self.db, title="à faire", assignee="r3")
+        work.add(self.db, title="à faire", assignee="r3", force=_FORCE)
         self.assertIsNone(self.pick(worker))
         storage.of(self.db).operations.set_settings("r3", {"lot_wake": "on"})
         self.assertIsNotNone(self.pick(worker), "l'agent l'emporte sur l'hôte")
         autre = self._worker("r4")
-        work.add(self.db, title="à faire", assignee="r4")
+        work.add(self.db, title="à faire", assignee="r4", force=_FORCE)
         storage.of(self.db).operations.set_settings("r4", {"lot_wake": "off"})
         self.assertIsNone(self.pick(autre))
 
     def test_pas_de_reveil_sans_repos_ni_pendant_le_courrier(self):
         worker = self._worker("r5")
-        work.add(self.db, title="à faire", assignee="r5")
+        work.add(self.db, title="à faire", assignee="r5", force=_FORCE)
         worker.last_activity = time.monotonic()
         self.assertIsNone(self.pick(worker), "pas encore au repos")
         worker.last_activity = time.monotonic() - 10_000
@@ -493,7 +497,7 @@ class ReveilTest(_Base):
 
     def test_lot_tenu_ne_reveille_pas(self):
         worker = self._worker("r6")
-        b = work.add(self.db, title="à faire", assignee="r6")["id"]
+        b = work.add(self.db, title="à faire", assignee="r6", force=_FORCE)["id"]
         work.note(self.db, b, "hold: attend l'hôte de test", actor="r6")
         self.assertIsNone(self.pick(worker))
 
@@ -501,8 +505,8 @@ class ReveilTest(_Base):
 class PurgeTest(_Base):
     def test_le_releve_des_branches_purge_les_lots_finis(self):
         runner, lease = self.bail("p1")
-        a = work.add(self.db, title="A", assignee="p1")["id"]
-        b = work.add(self.db, title="B", assignee="p1")["id"]
+        a = work.add(self.db, title="A", assignee="p1", force=_FORCE)["id"]
+        b = work.add(self.db, title="B", assignee="p1", force=_FORCE)["id"]
         for lot in (a, b):
             self.st.note_wake("p1", lot, time.time())
         work.close(self.db, a, abandoned=True, actor="test")
@@ -522,7 +526,7 @@ class AlerteTest(_Base):
     def test_seulement_apres_un_reveil_sans_effet(self):
         from ameesh import alert_briefs
         self.bail("x1")
-        a = work.add(self.db, title="A", assignee="x1")["id"]
+        a = work.add(self.db, title="A", assignee="x1", force=_FORCE)["id"]
         self.assertEqual(self.alertes(), [], "sans réveil, la règle 1 agit encore")
         activite = self.st.actionable("x1")[0]["activity_ts"]
         self.st.note_wake("x1", a, activite)

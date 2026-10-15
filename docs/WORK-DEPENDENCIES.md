@@ -21,12 +21,49 @@ adds an audit event. Repeating an existing addition or absent removal leaves
 activity and the audit journal unchanged. A removed link is absent from the
 current graph; its addition/removal remains in the audit journal.
 
+A follow-up ("suite") lot is created with its parent in the same operation, so
+the edge cannot be forgotten:
+
+```sh
+ameesh mail send <agent> "…" --new-lot "suite of #212" --estimate 1h --parent-lot 212
+ameesh work add --title "suite of #212" --parent-lot 212
+```
+
+The parent is linked inside the creation transaction: a still-open parent
+becomes a blocking prerequisite, an already finished parent is only traced in
+the new lot's journal, and an unknown parent refuses the whole creation (no
+lot is written). `--parent-lot` without a created lot is refused. No number is
+ever inferred from a title or a body.
+
 A prerequisite blocks while its lot is open. `merged`, `promoted` and `closed`
 prerequisites remain visible with `blocking: false` but stop deferring
 stagnation. A reopened prerequisite becomes blocking again. Closing a blocker
 does not reset activity on the waiting lot: if that lot has already been idle
 for six hours, its stale alert can return immediately. Removing a link is an
 explicit edit and records ordinary activity.
+
+Closing a blocker also wakes the waiting agents. When the closed lot is an
+explicit blocking prerequisite of a waiting lot and that lot has no other wait
+left (no other blocking edge, no open commitment, no future planned start —
+the `planned_wait` truth), `ameesh` deposits a durable `event` mail to the
+assignee of the waiting lot, linked to that lot. Only an explicit edge
+triggers a wake: a `depends_on` commitment (on a lot or a package) never
+triggers one by itself — it only holds a wake back while it points at an open
+lot. The existing runner delivers the mail (LISTEN/NOTIFY, no polling loop, no
+new session); an agent stopped by hand is not restarted — the message waits in
+its mailbox until it resumes.
+
+The wake is part of the closure itself: it is written in the same transaction
+as the state change, after it, under the dependency graph lock. So there is no
+window where the lot is merged but the wake is not yet written — if the mail
+cannot be written, the closure is rolled back and the next sweep or command
+retries both. Two concurrent closures (two blockers of the same dependent)
+serialise on that lock, so exactly one of them sees the last wait fall: no lost
+wake, no duplicate. A dependent with another open blocker is notified by the
+closure that closes its last one, and an unassigned lot gets no recipient.
+A closure that proves nothing (abandoned or superseded) says so in the mail:
+the wait is released, but the lot must be reassessed rather than treated as
+delivered.
 
 `work list/show --json` and `progress --json` expose a `dependencies` array
 with each blocker ID, current state, `blocking`, creation actor and timestamp.
@@ -37,11 +74,17 @@ prerequisites, including satisfied ones.
 Dependencies are read in groups without the view's project or rendering
 limit; a blocker outside the displayed window still suppresses `stale_lot`
 and its reminders. Links combine with existing open commitment dependencies.
-A future planned start takes precedence in the displayed `planned_wait`.
+A future planned start takes precedence in the displayed `planned_wait`, then
+a lot dependency; a dated external hold (`gate:<name>` in an open commitment,
+[PLANNED-WAITS.md](PLANNED-WAITS.md)) comes last and ends by itself at the end
+of its due day.
 
-A dependency controls inactivity alerts, not permission to run, change state,
-merge or deploy. It does not change the lot's state to `blocked` or enforce a
-merge gate. Notes and mail are never parsed into dependency edges.
+A dependency controls inactivity alerts and the ready intake: a lot whose
+prerequisite is not delivered is excluded from the automatic take (L165) and
+is not woken as actionable for its assignee. It is not permission to run,
+change state, merge or deploy, and it does not change the lot's state to
+`blocked` or enforce a merge gate. Notes and mail are never parsed into
+dependency edges.
 
 For a commit prerequisite, link to a lot whose delivery includes verifying
 that commit in the required target. A hash in a note or a local branch does

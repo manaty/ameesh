@@ -2,8 +2,12 @@
 """Sous-commandes `ameesh work` du plan de travail (lot L29).
 
   ameesh work link <id> <fiche>|--none
-  ameesh work close <id> --abandoned | --superseded-by <id> [--note …]
-  ameesh work sync-merges --git-dir D [--target origin/main] [--repo R] [--dry-run] [--json]
+  ameesh work close <id> --abandoned | --superseded-by <id>
+                          | --delivered --sha <reviewed head> [--note …]  (#988)
+  ameesh work sync-merges --git-dir D [--target T] [--repo R] [--dry-run] [--json]
+                          (cible : celle du lot, sinon `ameesh.target` du dépôt,
+                           sinon sa branche par défaut, puis les refs
+                           d'intégration develop/main/master/release/*)
   ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118 : branche
                             ou commit de fusion qui désigne le lot)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
@@ -40,12 +44,19 @@ def add_parsers(work_sub, func) -> None:
     p_link.set_defaults(func=func)
 
     p_close = work_sub.add_parser(
-        "close", help="close an abandoned or superseded work item (closed milestone, L29)")
+        "close", help="close an abandoned, superseded or delivered-outside-target work item "
+                      "(closed milestone, L29; delivered: #988)")
     p_close.add_argument("id", type=int)
     how = p_close.add_mutually_exclusive_group(required=True)
     how.add_argument("--abandoned", action="store_true", help="the work item will not be done")
     how.add_argument("--superseded-by", type=int, default=None, metavar="ID",
                      help="the work item is superseded by this one")
+    how.add_argument("--delivered", action="store_true",
+                     help="delivered outside the target (report, note): the reviewed head "
+                          "stays on its branch, without a merge; counts as delivered in "
+                          "estimates (#988)")
+    p_close.add_argument("--sha", default="",
+                         help="the reviewed head of --delivered (7 to 64 hex characters)")
     p_close.add_argument("--note", default="")
     p_close.add_argument("--actor", default="")
     p_close.set_defaults(func=func)
@@ -53,8 +64,11 @@ def add_parsers(work_sub, func) -> None:
     p_merges = work_sub.add_parser(
         "sync-merges", help="close the work items whose frozen content is merged (git, L29)")
     p_merges.add_argument("--git-dir", default=".", help="local clone (read-only)")
-    p_merges.add_argument("--target", default=plan_git.DEFAULT_TARGET,
-                          help="target branch (default origin/main; no fetch)")
+    p_merges.add_argument("--target", default=None,
+                          help="target branch, alone authoritative (default: the lot's, "
+                               "else the repository's `git config ameesh.target`, else its "
+                               "default branch, then the integration refs "
+                               "develop/main/master/release/*; no fetch)")
     p_merges.add_argument("--repo", default=None,
                           help="owner/repo: failing proof by content, the linked PR")
     p_merges.add_argument("--dry-run", action="store_true", help="report without closing")
@@ -233,10 +247,9 @@ def run(db, args: argparse.Namespace) -> int:
         return 0
     if command == "close":
         row = work.close(db, args.id, abandoned=args.abandoned,
-                         superseded_by=args.superseded_by, note=args.note, actor=args.actor)
-        print("work item #%d closed: %s" % (row["id"], "abandoned"
-                                           if row["close_reason"] == "abandoned"
-                                           else "superseded by #%s" % row["superseded_by"]))
+                         superseded_by=args.superseded_by, delivered=args.delivered,
+                         sha=args.sha, note=args.note, actor=args.actor)
+        print("work item #%d closed: %s" % (row["id"], work.close_label(row)))
         return 0
     if command == "sync-merges":
         return _sync_merges(db, args)
@@ -334,7 +347,8 @@ def _plan(db, args: argparse.Namespace) -> int:
 _BRANCH_RESULTS = {"merged": "CLOSED (delivered)", "already": "already delivered",
                    "refused": "work item closed", "would-merge": "would be closed",
                    "open": "open", "skipped": "skipped", "no-repo": "no repository",
-                   "no-target": "no target", "error": "error"}
+                   "no-target": "no target", "error": "error",
+                   "off-target": "delivered off target (kept open)"}
 
 
 def _sync_branches(db, args: argparse.Namespace) -> int:
@@ -376,7 +390,8 @@ def _sync_merges(db, args: argparse.Namespace) -> int:
         print(json.dumps({"git": report, "github": gh_report}, ensure_ascii=False, indent=2))
         return 1 if refused else 0
     print("%s%s (%s): %d work item(s) closed by content" % (
-        "[dry run] " if args.dry_run else "", report["git_dir"], report["target"],
+        "[dry run] " if args.dry_run else "", report["git_dir"],
+        report["target"] or "no default target",
         report["merged"]))
     for row in report["results"]:
         print("  work item #%-5s %-14s %-11s %-9s %s" % (

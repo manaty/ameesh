@@ -57,11 +57,20 @@ class _Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def fake_process(self, pid: int, *, cwd: str = "/", fds=(), maps=(), comm: str = "bash",
-                     argv0: str | None = None, unreadable: bool = False) -> None:
+                     argv0: str | None = None, state: str = "S",
+                     threads=(), unreadable: bool = False) -> None:
         d = os.path.join(self.proc, str(pid))
         os.makedirs(os.path.join(d, "fd"))
         _write(os.path.join(d, "comm"), text=comm + "\n")
         _write(os.path.join(d, "cmdline"), text="%s\0--flag\0" % (argv0 or "/usr/bin/" + comm))
+        # état du processus (`Z` = zombie, #1678) : /proc/<pid>/stat, champ 3
+        _write(os.path.join(d, "stat"),
+               text="%d (%s) %s 1 %d 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 100\n"
+                    % (pid, comm, state, pid))
+        # ses fils : le meneur, puis `threads` (tid, état)
+        for tid, tstate in ((pid, state),) + tuple(threads):
+            _write(os.path.join(d, "task", str(tid), "stat"),
+                   text="%d (%s) %s 1 %d\n" % (tid, comm, tstate, pid))
         os.symlink(cwd, os.path.join(d, "cwd"))
         os.symlink("/usr/bin/" + comm, os.path.join(d, "exe"))
         os.symlink("/", os.path.join(d, "root"))
@@ -172,6 +181,36 @@ class UserPathsTest(_Base):
         self.assertIn("22 btop", platform.user_paths(allow=["btop"]).doubt())
         with mock.patch.object(process, "PROC", os.path.join(self.base, "none")):
             self.assertIn("unreadable", platform.user_paths().doubt())
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_is_not_a_doubt(self):
+        """#1678 : un zombie (état Z) n'est plus qu'une entrée de table — ses
+        liens /proc illisibles ne sont pas un doute (constat #1665 :
+        « timeout <defunct> » retenait tout le ménage)."""
+        self.fake_process(30, comm="timeout", state="Z", unreadable=True)
+        scan = platform.user_paths()
+        self.assertEqual((scan.doubt(), scan.unreadable, scan.paths), ("", [], {}))
+        # l'état seul décide : le même processus vivant reste un doute
+        self.fake_process(31, comm="timeout", unreadable=True)
+        self.assertEqual(platform.user_paths().doubt(),
+                         "process(es) of the user unreadable: 31 timeout")
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_leader_with_a_live_thread_is_still_a_doubt(self):
+        """Un meneur sorti (`Z`) dont un fil vit encore détient toujours ses
+        fichiers : il reste un doute, il ne libère pas le ménage."""
+        self.fake_process(33, comm="worker", state="Z", threads=((34, "S"),),
+                          unreadable=True)
+        self.assertEqual(platform.user_paths().doubt(),
+                         "process(es) of the user unreadable: 33 worker")
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_a_zombie_does_not_hold_the_housekeeping(self):
+        """#1665 : l'artefact inactif est retiré malgré le zombie présent."""
+        wt = self.worktree()
+        self.fake_process(32, comm="timeout", state="Z", unreadable=True)
+        out = self.go(wt)
+        self.assertEqual(len(out["entries"]), 3)
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_allowed_process_is_logged_and_does_not_block(self):
@@ -550,6 +589,60 @@ class WorktreesTest(_Repo):
         self.assertEqual([os.path.realpath(w["path"]) for w in found], [os.path.realpath(wt)])
 
 
+class OrphanGuardsTest(unittest.TestCase):
+    def test_named_or_recent_worktree_is_kept(self):
+        with tempfile.TemporaryDirectory(prefix="ameesh-1665-") as root:
+            now = time.time() + 3 * 86400
+            for label, branch, owner, state, recent in (
+                ("other-active", "lot/7-x", "other", "build", False),
+                ("other-closed", "lot/7-x", "other", "closed", False),
+                ("unknown", "lot/7-x", None, None, False),
+                ("unreadable", "lot/7-x", None, RuntimeError("offline"), False),
+                ("named-directory", "", "other", "build", False),
+                ("recent-source", "scratch", None, None, True),
+                ("orphan", "scratch", None, None, False),
+                ("own-closed", "lot/7-x", "a1", "closed", False),
+                ("own-active", "lot/7-x", "a1", "build", False),
+                ("own-closed-recent", "lot/7-x", "a1", "closed", True),
+            ):
+                with self.subTest(label=label):
+                    path = os.path.join(root, "a1-7" if label == "named-directory" else label)
+                    os.makedirs(os.path.join(path, "src"))
+                    source = os.path.join(path, "src", "app.py")
+                    with open(source, "w") as out:
+                        out.write("value = 1\n")
+                    if recent:
+                        os.utime(source, (now - 60, now - 60))
+                    row = dict(id=1, path=path, agent="a1", lot=None, branch=branch,
+                               detail=menage.UNATTRIBUTED, status="active", created_ts=now - 3 * 86400)
+                    lookup = mock.Mock(return_value=dict(assignee=owner, state=state)
+                                       if owner else None)
+                    if isinstance(state, Exception):
+                        lookup.side_effect = state
+                    store = SimpleNamespace(work=SimpleNamespace(get=lookup),
+                        housekeeping=SimpleNamespace(worktrees=lambda *args: [row]))
+                    git = dict(exists=True, clean=True, pushed=True, integrated=False,
+                               locked=False, submodules="", gitdir="", reason="not integrated")
+                    with mock.patch.object(menage.storage, "of", return_value=store), \
+                            mock.patch.object(menage, "worktree_state", return_value=git), \
+                            mock.patch.object(menage, "worktree_in_use", return_value=False), \
+                            mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
+                            mock.patch.object(platform, "user_paths", return_value=platform.UserPaths()):
+                        entries, plan = menage._worktree_pass(None, "pc", dry_run=True,
+                                                             protected=set(), now=now)
+                    self.assertEqual(entries, [])
+                    self.assertEqual(plan[0]["action"] == "retrait",
+                                     label in ("orphan", "own-closed"), plan)
+                    if recent:
+                        outcome, freed, reason, built = menage._remove_kept_worktree(
+                            path, root, "", artifacts=None, allow=(),
+                            lock_path=os.path.join(root, "artifacts.lock"),
+                            journal_path=os.path.join(root, "artifacts.journal"),
+                            idle_before=now - DAY)
+                        self.assertEqual((outcome, freed, built), ("garde", 0, []))
+                        self.assertIn("active within 24 h", reason)
+
+
 class _Store:
     def __init__(self, rows, lots):
         self.rows, self.lots, self.statuses = rows, lots, []
@@ -578,7 +671,7 @@ class MergedKeptTest(_Repo):
         with mock.patch.object(menage.storage, "of", return_value=store), \
                 mock.patch.object(menage, "worktree_in_use", return_value=False):
             entries, plan = menage._worktree_pass(
-                None, "pc", dry_run=dry_run, include_lotless=False, protected=set(),
+                None, "pc", dry_run=dry_run, protected=set(),
                 now=time.time(), allow=allow,
                 lock_path=os.path.join(self.base, "state", "artifacts.lock"),
                 journal_path=self.journal_path)

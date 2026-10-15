@@ -749,10 +749,37 @@ def mediated_hosts(db) -> list:
     return [r["host"] for r in rows]
 
 
+#: L790 : un serveur médié périmé ne doit pas répéter le même avertissement à
+#: chaque passe (le runner, lui, ne le dit qu'une fois). Clé = (hôte, raison) ;
+#: l'entrée est oubliée dès qu'une passe réussit, pour qu'une nouvelle
+#: péremption — un autre paquet changé sous le processus — soit signalée.
+_stale_reported: set[tuple[str, str]] = set()
+
+
+def _report_stale_once(host: str, reason: str) -> None:
+    """Avertit une fois par (hôte, raison) qu'un code périmé bloque le canon."""
+    key = (host, reason)
+    if key in _stale_reported:
+        return
+    _stale_reported.add(key)
+    log.warning("canon sync de %s : code périmé (%s) — canon inchangé ; "
+                "redémarrer le serveur médié", host, reason)
+
+
+def _clear_stale(host: str) -> None:
+    """La passe a réussi : la péremption de cet hôte n'est plus à signaler."""
+    for key in [k for k in _stale_reported if k[0] == host]:
+        _stale_reported.discard(key)
+
+
 def sync_canon_once(cfg, db) -> list:
     """Synchronise le canon par défaut pour chaque hôte médié (les
     admissions, la politique et la visibilité de ses agents) ; rend les
-    hôtes synchronisés. Jamais fatal : un échec est journalisé."""
+    hôtes synchronisés. Jamais fatal : un échec est journalisé.
+
+    L790 : un serveur périmé (`CanonStale`) est signalé UNE fois par (hôte,
+    raison), pas à chaque passe — le canon reste au dernier passage valide.
+    """
     from .. import canon as canon_mod
     from .. import canon_sync
     done = []
@@ -768,7 +795,10 @@ def sync_canon_once(cfg, db) -> list:
         try:
             canon_sync.sync(db, canon, host,
                             trusted_ref=canon_sync.configured_ref_for(cfg, canon))
+            _clear_stale(host)
             done.append(host)
+        except canon_sync.CanonStale as exc:
+            _report_stale_once(host, getattr(exc, "reason", "") or str(exc))
         except Exception as exc:
             log.warning("canon sync de %s en échec : %s", host,
                         " ".join(str(exc).split())[:200])

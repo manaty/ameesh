@@ -135,9 +135,11 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 `agent-mail` keeps the v0 interface — and the v0 hook JSON, byte for byte:
 
 ```
-agent-mail send <dest> <texte…> [--from NOM] [--lot ID] [--kind request|reply|notify|event] [--urgent]
+agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
                [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
                                                # (90 s), --urgent sans délai, --ack et --cc sans réveil
+                                               # --lot : étiquette de fil ; confie un lot libre (historique
+                                               # L94, ou --assign #964), jamais un lot tenu par un agent (#1066)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
@@ -346,33 +348,48 @@ section « Base distante ».
 Install (or upgrade an existing install, which also pulls psycopg):
 
 ```bash
-python3 -m venv ~/.local/share/ameesh/venv
-~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>
+uv tool install "git+https://github.com/manaty/ameesh@main"   # or a pinned tag/commit
 ameesh doctor          # driver, schema, and — for a remote database — latency
 ```
+
+The older venv route still works:
+`python3 -m venv ~/.local/share/ameesh/venv && ~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>`.
+Platform state and upgrades: [`site/docs/guides/install.md`](site/docs/guides/install.md).
 
 ## Tests
 
 ```bash
 scripts/test.sh                      # starts the container, runs the suite twice
 scripts/test.sh tests.test_runner    # one module
+scripts/test.sh tests.test_runner tests.test_mail   # several modules
+scripts/test.sh -p 'test_runner*.py'  # discovery by filename
+scripts/test.sh -k 'test_stop'        # discovery filtered by test name
 scripts/test.sh tests.test_bout_en_bout   # the v1 end-to-end test (spec §13)
 scripts/test-parallele.sh -n 4       # N parallel parts per driver, one throwaway Postgres container each
 ```
 
 CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
-on the measured durations of `tests/parts/durees.json`): on a pull request,
-`psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
-`tests/parts/pilote-psql.txt`; the full `psql` suite (6 parts) runs on pushes
-to `main` and `release/*`. The `tests` job aggregates the parts. Each part
-streams its results, one JSON line per test (`--flow`, schema
+on the measured durations of `tests/parts/durees.json`): on a lot pull request,
+`psycopg` runs the impacted modules and the contract list
+(`tests/parts/toujours.txt`, L1211) in one to four parts, and `psql` the driver
+modules of `tests/parts/pilote-psql.txt` among them, in one to three parts so
+that each one stays under the job cap on the shared self-hosted hosts (#947);
+the full suite (4 `psycopg` parts, 6 `psql` parts) runs on pushes to `main`,
+`release/*` and `integration/*` (§12), and on any pull request whose source or
+target is one of those branches (a release PR keeps the full suite under both
+drivers, without the version/documentation fast lanes or the psql pilot list).
+The `tests` job aggregates the parts.
+Each part streams its results, one JSON line per test (`--flow`, schema
 `ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
 the job summary (`scripts/ci-flow.py summary`). A `plan` job reads the measured
 test → code map once per run (`scripts/test-plan.py`, L161f) and every part
-runs from that plan: the test modules impacted by the change (changed code
-blocks, data files, directories, tables) run first, nothing is skipped; map
-missing or stale, the order falls back to the modules whose text names a
-changed file.
+runs from that plan: on `main`, the test modules impacted by the change
+(changed code blocks, data files, directories, tables) run first, nothing is
+skipped; on a lot branch, only the impacted modules and the contract run, and
+any doubt (map missing or stale, an unsure selection, a changed block without a
+test, test infrastructure, a file removed outside documentation) falls back to
+the full suite. The workflow passes the source and target branches
+(`--base-ref`, `--head-ref`) so the plan can tell a lot PR from a release one.
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round

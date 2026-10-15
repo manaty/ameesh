@@ -49,6 +49,12 @@ lasting alert is not resent after a restart; an alert resolved while
 stopped is sent on restart); rate limited per human (beyond that, a
 summary); a failing channel does not block the others and is retried on
 later passes, a bounded number of times.
+
+Channels: `desktop`, `ntfy`, `slack`. L66 — the `desktop` channel follows
+the OS through `ameesh.platform.notify`: `notify-send` on Linux, `osascript`
+on macOS, a Windows toast through `powershell.exe` under WSL2; native
+Windows comes with L67. `ameesh doctor --notify-test` says which backend
+this OS uses (and sends a test if a `desktop` route is configured).
 """
 from __future__ import annotations
 
@@ -59,7 +65,6 @@ import http.client
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -72,6 +77,7 @@ from . import config as config_mod
 from . import db as db_mod
 from . import alert_briefs, exploitation, fil, sous_utilisation, storage
 from .config import Config
+from .platform import notify as platform_notify
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
 STATE_SCHEMA = "ameesh-notify-state/1"
@@ -91,6 +97,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
                  "ci_main_red",
+                 # #845 : la garde de la CI — runner busy sans job (panne) et
+                 # file au-delà du SLO de 15 min (capacité)
+                 "ci_runner_stuck", "ci_queue_saturated",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
                  # L225 : des tours sans tarif au barème échappent à la dépense
@@ -105,12 +114,18 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
                  "critical_budget_pause",
+                 # #1268 : un agent critique enchaîne les échecs de tour réels
+                 "critical_turn_failures",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
                  "merge_blocked",
                  # #194 r6: a PR merged into a wrong base, or not checked
-                 "land_uncertain", "db_connections_high")
+                 "land_uncertain", "db_connections_high",
+                 # #513 : la dépense comptée s'écarte des soldes (barème faux)
+                 "budget_drift",
+                 # #532: a local PgBouncer pool queues its mesh clients
+                 "pgbouncer_pool_waiting")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -135,6 +150,8 @@ TOP_KEYS = ("default_human", "types", "routes", "default", "channels", "rate_per
 #: libellés lisibles des types (R12 : un humain lit ces messages)
 TYPE_LABELS = {
     "db_connections_high": "database connection capacity",
+    "pgbouncer_pool_waiting": "local PgBouncer clients waiting",
+    "pgbouncer_console_unreadable": "local PgBouncer console unreadable",
     "stopped_with_mail": "agent stopped with mail",
     "orphan_lot": "orphan lot",
     "dead_runner": "dead runner",
@@ -144,6 +161,9 @@ TYPE_LABELS = {
     "long_turn": "long turn",
     "session_too_big": "session too big",
     "stale_lot": "stale lot",
+    # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
+    # humains si le type est dans `notify.types`
+    "slo_breach": "internal deadline (SLO) overdue",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
@@ -175,6 +195,8 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "estimate bias",
     "ci_main_red": "CI red on main",
+    "ci_runner_stuck": "CI runner busy with no job running",
+    "ci_queue_saturated": "CI queue beyond its SLO",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",
@@ -192,18 +214,28 @@ TYPE_LABELS = {
     "owner_key_registered": "owner key registered",
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",
+    # #1268 : deux échecs de tour réels d'affilée sur un agent critique
+    "critical_turn_failures": "critical agent failing turns",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
+    "budget_drift": "counted spend strays from the provider balance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
-                "credential_failing", "critical_budget_pause", "owner_key_registered",
-                "land_uncertain", "db_connections_high")
+                "credential_failing", "critical_budget_pause", "critical_turn_failures",
+                "owner_key_registered",
+                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
 QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
+#: types qu'un passage observe depuis la configuration de l'hôte seule, sans
+#: la base du mesh : la console du pool PgBouncer local (#532). Une panne de
+#: base ne les résout jamais, et ne les cache pas non plus. #1179 : la passe
+#: ordinaire ne lit pas cette console (`local_pool=False`) et ne résout donc
+#: jamais ces types ; `run_local_pass` en est seul propriétaire.
+LOCAL_TYPES = ("pgbouncer_pool_waiting", "pgbouncer_console_unreadable")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -695,17 +727,9 @@ def _header(value: str) -> str:
 
 
 def notify_send_bin(env: dict) -> str | None:
-    """`AMEESH_NOTIFY_SEND_BIN` (explicite : sans repli), puis
-    `AMEESH_BIN_DIR/notify-send`, puis le PATH — comme `gh` et les harnais."""
-    explicit = env.get("AMEESH_NOTIFY_SEND_BIN")
-    if explicit:
-        return explicit if os.access(explicit, os.X_OK) else None
-    bin_dir = env.get("AMEESH_BIN_DIR") or env.get("AGENT_MESH_BIN_DIR")
-    if bin_dir:
-        candidate = os.path.join(bin_dir, "notify-send")
-        if os.access(candidate, os.X_OK):
-            return candidate
-    return shutil.which("notify-send", path=env.get("PATH") or os.defpath)
+    """L66 : le binaire `notify-send` de cet environnement (compatibilite) ;
+    la couche plateforme choisit le backend selon l'OS."""
+    return platform_notify.notify_send_bin(env)
 
 
 class Sender:
@@ -720,25 +744,13 @@ class Sender:
         getattr(self, "_" + channel.kind)(channel, message, timeout)
 
     def _desktop(self, channel: Channel, message: Message, timeout: float) -> None:
-        binary = notify_send_bin(self.env)
-        if not binary:
-            raise ChannelError(
-                "notify-send not found on this host (libnotify package): the `desktop` "
-                "channel cannot show anything; install it or remove `desktop` from the "
-                "routes", permanent=True)
+        # L66 : le backend dépend de l'OS (notify-send, osascript, toast WSL2)
         urgency = "critical" if message.urgent else ("low" if message.low else "normal")
         try:
-            proc = subprocess.run(
-                [binary, "--app-name=ameesh", "--urgency=%s" % urgency,
-                 message.title, message.body],
-                capture_output=True, text=True, timeout=timeout, env=self.env)
-        except subprocess.TimeoutExpired:
-            raise ChannelError("notify-send did not answer within %ds" % timeout) from None
-        except OSError as exc:
-            raise ChannelError("notify-send: %s" % exc.strerror) from None
-        if proc.returncode != 0:
-            raise ChannelError("notify-send failed (code %d): %s" % (
-                proc.returncode, _clean(proc.stderr, 160) or "no message"))
+            platform_notify.send(message.title, message.body, urgency=urgency,
+                                 env=self.env, timeout=timeout)
+        except platform_notify.NotifyError as exc:
+            raise ChannelError(str(exc), permanent=exc.permanent) from None
 
     def _ntfy(self, channel: Channel, message: Message, timeout: float) -> None:
         url = "%s/%s" % (str(channel.options["url"]).rstrip("/"), channel.options["topic"])
@@ -787,7 +799,12 @@ class DrySender:
 
 class Router:
     """Le destinataire humain d'une alerte (une instance par passage : les
-    lectures — registre, lots, paquets, canon — sont faites au plus une fois)."""
+    lectures — registre, lots, paquets, canon — sont faites au plus une fois).
+
+    `db` peut être None pour un passage sans la base (`Notifier.run_local_pass`,
+    #532) : le registre et les lots ne sont alors pas lisibles, et la route se
+    limite au champ `responsible` de l'alerte, à la fiche d'hôte du canon et au
+    destinataire par défaut."""
 
     def __init__(self, cfg: Config, db, ncfg: NotifyConfig):
         self.cfg, self.db, self.ncfg = cfg, db, ncfg
@@ -797,8 +814,8 @@ class Router:
 
     def agents(self) -> dict:
         if self._agents is None:
-            self._agents = {row["name"]: row
-                            for row in storage.of(self.db).operations.listing()}
+            self._agents = {} if self.db is None else {
+                row["name"]: row for row in storage.of(self.db).operations.listing()}
         return self._agents
 
     def agent_responsible(self, name) -> str | None:
@@ -807,7 +824,7 @@ class Router:
         return (self.agents().get(name) or {}).get("responsible")
 
     def lot_responsible(self, lot) -> str | None:
-        if lot is None:
+        if lot is None or self.db is None:
             return None
         try:
             item = storage.of(self.db).work.get(int(lot))
@@ -838,6 +855,14 @@ class Router:
 
     def resolve(self, alert: dict) -> tuple:
         """(humain, source) ; source ∈ alerte, agent, lot, hote, defaut ; (None, None)."""
+        if "owner" in (alert.get("targets") or ()):
+            # #789 t2 (canon §9) : un dépassement critique (P1) escalade au
+            # propriétaire — `notify.default_human`, comme le dit la
+            # documentation de ce module. La cible prime le `responsible` de
+            # l'agent, qui peut être un pilote : un P1 ne s'arrête pas à lui.
+            human = normalize_human(self.ncfg.default_human)
+            if human:
+                return human, "defaut"
         if alert.get("type") == "module_deviation":
             # A project procedure finding belongs to the lot, even when its
             # assignee (or their host/responsible human) belongs elsewhere.
@@ -967,7 +992,10 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
-         "decision", "grouped")
+         "decision", "grouped",
+         # #789 t2 (canon §9) : un P1 garde son niveau et ses cibles dans
+         # l'état — la livraison au propriétaire et la résolution les relisent
+         "critical", "targets")
 
 
 # --------------------------------------------------------------------------
@@ -1007,12 +1035,25 @@ class Notifier:
                  ) -> list:
         now = float(self.clock())
         if current is None:
-            current = exploitation.alerts(self.cfg, db, now=now, **(thresholds or {}))
+            # #1179 : la console du pool local n'est pas lue par la passe
+            # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
+            # seul juge de ses alertes. Une console illisible n'y échoue plus.
+            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
+                                          **(thresholds or {}))
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
         notifications = group_orphan_lots(current, router.resolve)
-        wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
+        # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
+        # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
+        # perd pas — elle atteint l'humain même si son type a été retiré de
+        # `notify.types` ; c'est le comportement par défaut qui tient le
+        # contrat « un P1 escalade au propriétaire ». Les dépassements
+        # ordinaires restent filtrables : `slo_breach` s'ajoute à
+        # `notify.types` pour les recevoir sur les canaux humains.
+        wanted = {key_of(a): a for a in notifications
+                  if a.get("type") in self.ncfg.types
+                  or "owner" in (a.get("targets") or ())}
         active = self.state["active"]
         self._reconcile_orphan_groups(active, wanted, router)
         # Persisted deliveries from an older routing policy must not retry or
@@ -1025,12 +1066,20 @@ class Notifier:
         for key in list(active):
             if key in wanted:
                 continue
-            entry = active.pop(key)
-            if entry["alert"].get("type") not in self.ncfg.types:
+            entry = active[key]
+            if entry["alert"].get("type") in LOCAL_TYPES:
+                # #1179 : ces alertes appartiennent à `run_local_pass`, seul à
+                # pouvoir les résoudre ; ne pas les voir ici n'est pas une
+                # preuve de résolution.
+                continue
+            del active[key]
+            if entry["alert"].get("type") not in self.ncfg.types \
+                    and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
             self._resolved(key, entry, now)
+            self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
             if entry is None:
@@ -1041,6 +1090,7 @@ class Notifier:
                 if alert.get("type") in exploitation.ESCALATING:
                     entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
+                self._event(db, "alert.raised", key, alert)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
             elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
@@ -1079,6 +1129,70 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    def run_local_pass(self, now: float | None = None) -> list:
+        """Un passage sans la base du mesh : la console du pool local (#532).
+
+        Le notifieur atteint la base à travers ce même pool : quand
+        `max_client_conn` refuse tout le monde, sa connexion ordinaire échoue
+        alors que la console, elle, répond encore. Ce passage lit donc la
+        console depuis `cfg` seule, puis lève, retente et résout les alertes de
+        `LOCAL_TYPES` — sans connexion ni lecture préalable de la base. Les
+        autres livraisons en cours sont laissées telles quelles : une alerte
+        non observée n'est jamais résolue. Une console illisible est
+        journalisée et ne change rien."""
+        now = float(self.clock() if now is None else now)
+        records: list = []
+        self._records = records
+        from . import pgbouncer_local
+        try:
+            current = pgbouncer_local.probe(self.cfg)
+        except db_mod.Unavailable as exc:
+            self.log("local pool console unreadable (%s): active local alerts kept"
+                     % exc)
+            return records
+        router = Router(self.cfg, None, self.ncfg)
+        wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
+        active = self.state["active"]
+        for key, alert in wanted.items():
+            entry = active.get(key)
+            if entry is None:
+                entry = active[key] = {
+                    "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                    "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
+                    "channels": {}}
+                self._raise(entry, router, now)
+            elif entry["status"] in ("nouvelle", "sans_destinataire", "sans_canal"):
+                # un responsable (ou une route) a pu apparaître depuis
+                self._raise(entry, router, now)
+            else:
+                self._retry(entry, "raised", now)
+        self._local_resolutions(wanted, now)
+        return records
+
+    def _local_resolutions(self, wanted: dict, now: float) -> None:
+        """Résout les alertes locales que la console ne montre plus, et retente
+        les résolutions en vol. Les autres types ne sont jamais touchés : la
+        base peut simplement être non observée."""
+        for key in list(self.state["active"]):
+            if key in wanted:
+                continue
+            entry = self.state["active"][key]
+            if entry["alert"].get("type") not in LOCAL_TYPES:
+                continue
+            del self.state["active"][key]
+            if entry["alert"].get("type") not in self.ncfg.types:
+                self.log("[%s] removed from notify.types: forgotten without resolution"
+                         % entry["alert"].get("type"))
+                continue
+            self._resolved(key, entry, now)
+        for key in list(self.state["resolved"]):
+            entry = self.state["resolved"][key]
+            if entry["alert"].get("type") not in LOCAL_TYPES:
+                continue
+            self._retry(entry, "resolved", now)
+            if not self._pending(entry):
+                del self.state["resolved"][key]
 
     def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
         """Adopt persisted per-lot deliveries before checking for resolutions.
@@ -1190,6 +1304,21 @@ class Notifier:
             self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
 
     # -- levée ----------------------------------------------------------------
+    def _event(self, db, kind: str, key: str, alert: dict) -> None:
+        """L85: the alert in the event log (`GET /api/v1/events`); a base
+        error is said, never fatal to the pass."""
+        if self.dry_run or db is None:
+            return
+        from . import events
+        data = {name: alert.get(name) for name in ("agent", "lot", "host")
+                if alert.get(name) is not None}
+        try:
+            events.record(db, kind, ("alert:%s" % alert.get("type"))[:300],
+                          project=alert.get("project"), alert=alert.get("type"), key=key,
+                          **data)
+        except Exception as exc:  # noqa: BLE001 — the notification goes on
+            self.log("event %s not recorded: %s" % (kind, type(exc).__name__))
+
     def _raise(self, entry: dict, router: Router, now: float) -> None:
         alert = entry["alert"]
         first = entry["status"] == "nouvelle"
@@ -1270,9 +1399,10 @@ class Notifier:
     def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
         """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
         orchestrateurs et à l'auditeur, avec l'action attendue
-        (`alert_briefs`). Une fois à la levée, une relance si l'alerte dure
-        `REMIND_AFTER_S` ; indépendant de `notify.types` (qui ne règle que
-        l'humain). Jamais fatal au passage."""
+        (`alert_briefs` ; `stale_lot` excepté pour l'auditeur, L713 : il le lit
+        à sa passe, `ameesh alerts --json`). Une fois à la levée, une relance
+        si l'alerte dure `REMIND_AFTER_S` ; indépendant de `notify.types` (qui
+        ne règle que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
         alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
         for key in list(sent):
@@ -1324,8 +1454,11 @@ class Notifier:
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
-            if kind in URGENT_TYPES:
-                payload["urgent"] = True        # L242b (5) : le point de l'auditeur
+            # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
+            # (un P1) est propagée au courrier d'agent ; le type reste la
+            # règle générale (L242b (5) : le point de l'auditeur).
+            if kind in URGENT_TYPES or alert.get("urgent"):
+                payload["urgent"] = True
             for field_ in ("module", "rule", "project", "declaration_id", "subject",
                            "lot", "agents", "lots", "harness", "account", "gauge",
                            "idle_agents"):
@@ -1537,11 +1670,17 @@ class Notifier:
         self.emit(record)
 
 
-def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
-    """`--test human:<id>` : un message par canal ; [(canal, None | erreur)]."""
+def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None,
+              kinds: tuple | None = None) -> list:
+    """`--test human:<id>` : un message par canal ; [(canal, None | erreur)].
+
+    `kinds` restreint aux types de canal demandes (L66 : `doctor
+    --notify-test` n'essaie que `desktop`, jamais ntfy ni Slack)."""
     sender = sender or Sender(timeout=ncfg.timeout)
     out = []
     for channel in ncfg.channels_for(human):
+        if kinds and channel.kind not in kinds:
+            continue
         try:
             sender.send(channel, render_test(human, channel, host))
             out.append((channel.name, None))
@@ -1551,6 +1690,54 @@ def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
             out.append((channel.name, "unexpected error: %s" % _clean(_scrub(
                 exc, channel_secrets(channel, getattr(sender, "env", None))), 160)))
     return out
+
+
+def desktop_human(ncfg: NotifyConfig) -> str | None:
+    """L66 : le premier humain dont une route porte un canal `desktop`."""
+    def porte(human: str) -> bool:
+        return any(c.kind == "desktop" for c in ncfg.channels_for(human))
+
+    if ncfg.default_human and porte(ncfg.default_human):
+        return ncfg.default_human
+    for human in sorted(ncfg.routes):
+        if porte(human):
+            return human
+    return None
+
+
+def desktop_probe(cfg, env: dict | None = None) -> tuple[bool, str]:
+    """L66 : `doctor --notify-test` — le canal `desktop` de cet OS.
+
+    Rend `(ok, ligne)`. N'envoie rien si aucune route ne porte de canal
+    `desktop` : la ligne dit alors ce que cet OS utiliserait, et ce qui
+    manque le cas échéant — sans KO, car personne n'a demandé d'affichage
+    sur cet hôte (un binaire absent n'y est pas un défaut). Le KO est
+    réservé à une route `desktop` qui existe et dont le backend manque ou
+    échoue."""
+    env = dict(os.environ if env is None else env)
+    backend, binary, problem = platform_notify.describe(env=env)
+    ou = "WSL2" if platform_notify.is_wsl(env) else platform_notify.SYSTEM
+    try:
+        ncfg = parse_config(getattr(cfg, "notify", None))
+    except NotifyConfigError as exc:
+        return False, "config refused: %s" % exc
+    human = desktop_human(ncfg)
+    if human is None:
+        if problem:
+            return True, "%s (%s) — unavailable: %s; no `desktop` route configured, nothing sent" % (
+                backend or "desktop", ou, problem)
+        return True, "%s (%s) — available; no `desktop` route configured, nothing sent" % (
+            backend, ou)
+    if problem:
+        return False, "KO — %s" % problem
+    results = send_test(ncfg, human, cfg.host, sender=Sender(env=env), kinds=("desktop",))
+    errors = [detail for _name, detail in results if detail]
+    if errors:
+        return False, "%s (%s) — test to %s failed: %s" % (backend, ou, human, errors[0])
+    if not results:
+        return True, "%s (%s) — available; no `desktop` channel on %s's route" % (
+            backend, ou, human)
+    return True, "%s (%s) — test displayed to %s" % (backend, ou, human)
 
 
 # --------------------------------------------------------------------------
@@ -1746,6 +1933,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     db = None
     try:
         while True:
+            # #532 : la console du pool local se lit depuis `cfg` seule, avant
+            # la base — c'est ce qui fait survivre l'alerte au refus qu'elle
+            # signale, puisque la base passe par ce même pool.
+            notifier.run_local_pass()
+            if not args.dry_run:
+                save_state(path, notifier.state)
             try:
                 if db is None:
                     db = db_mod.connect(cfg)

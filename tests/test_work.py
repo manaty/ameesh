@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import registry, work
 
@@ -99,35 +100,71 @@ class WorkTest(PgTestCase):
         self.assertEqual(work.list_items(self.db, assignee="personne"), [])
 
     def test_deplacement_concurrent_un_seul_gagnant(self):
+        """Deux `move` partis du MÊME état : le CAS n'en garde qu'un.
+
+        La barrière est posée APRÈS la lecture de l'état (dans `work.get`),
+        pas au départ des fils. Sans elle, le second appel peut lire l'état
+        déjà déplacé par le premier et appliquer une transition séquentielle
+        parfaitement légale — deux gagnants, course d'ordonnancement (CI du
+        13/10, run 38357726701 : bloqué puis build, `updated_ts` du premier
+        antérieur). Le test mesurerait alors l'ordonnanceur, pas le CAS (§3,
+        défaut dépendant de l'environnement : corrigé à la source)."""
         item = self._add()
         db1, db2 = self.connect(), self.connect()
-        barrier = threading.Barrier(2)
+        lus = threading.Barrier(2, timeout=10)
+        vrai_get = work.get
+        lectures: list = []
         resultats: list = [None, None]
 
+        def get_puis_attendre(db, item_id):
+            row = vrai_get(db, item_id)
+            lectures.append(item_id)
+            lus.wait(timeout=10)  # les deux appels tiennent le même état
+            return row
+
         def bouger(index: int, db, state: str) -> None:
-            barrier.wait(timeout=10)
             try:
                 resultats[index] = work.move(db, item["id"], state, actor="t%d" % index)
             except work.WorkError as exc:
                 resultats[index] = exc
 
         try:
-            threads = [
-                threading.Thread(target=bouger, args=(0, db1, "build")),
-                threading.Thread(target=bouger, args=(1, db2, "blocked")),
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=30)
-            gagnants = [r for r in resultats if isinstance(r, dict)]
-            perdants = [r for r in resultats if isinstance(r, work.WorkError)]
-            self.assertEqual(len(gagnants), 1, resultats)
-            self.assertEqual(len(perdants), 1, resultats)
-            self.assertEqual(work.get(self.db, item["id"])["state"], gagnants[0]["state"])
+            with mock.patch.object(work, "get", side_effect=get_puis_attendre):
+                threads = [
+                    threading.Thread(target=bouger, args=(0, db1, "build")),
+                    threading.Thread(target=bouger, args=(1, db2, "blocked")),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+                # le témoin garde son sens : si `move` cesse de lire par
+                # `work.get`, la barrière ne sert plus et le test redevient
+                # une course d'ordonnancement — on le dit ici, pas en flaky
+                self.assertEqual(len(lectures), 2, "les deux move doivent lire par work.get")
         finally:
             db1.close()
             db2.close()
+        gagnants = [r for r in resultats if isinstance(r, dict)]
+        perdants = [r for r in resultats if isinstance(r, work.WorkError)]
+        self.assertEqual(len(gagnants), 1, resultats)
+        self.assertEqual(len(perdants), 1, resultats)
+        self.assertIn("moved in the meantime", str(perdants[0]), resultats)
+        self.assertEqual(work.get(self.db, item["id"])["state"], gagnants[0]["state"])
+
+    def test_deux_moves_sequentiels_reussissent(self):
+        """Le CAS garde la transition lue, il n'interdit pas l'enchaînement.
+
+        Si le second `move` lit l'état DÉJÀ déplacé, sa transition est légale
+        et réussit : c'est l'autre visage de la course CI du 13/10 (bloqué
+        puis build, deux gagnants) — d'où la barrière posée après la lecture
+        dans le test de course, qui seule mesure le CAS."""
+        item = self._add()
+        premier = work.move(self.db, item["id"], "blocked", actor="t1")
+        second = work.move(self.db, item["id"], "build", actor="t2")
+        self.assertEqual((premier["state"], second["state"]), ("blocked", "build"))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "build")
 
     def test_notify_sur_changement_d_etat(self):
         listener = self.db.listen(["work_item"])
@@ -144,6 +181,60 @@ class WorkTest(PgTestCase):
             self.assertIn(str(item["id"]), recu["payload"])
         finally:
             listener.close()
+
+    def test_close_delivered_hors_cible(self):
+        """#988 : livré hors cible — la tête relue est exigée et le jalon
+        `delivered` la porte ; le lot reste fermé, jamais rouvert."""
+        item = self._add("rapport hors cible")
+        work.move(self.db, item["id"], "build", actor="dev1")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, item["id"], delivered=True)
+        self.assertIn("--sha", str(ctx.exception))
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, item["id"], delivered=True, sha="pas-un-sha")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, item["id"], sha="abcdef1")       # sans --delivered
+        self.assertIn("--delivered", str(ctx.exception))
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, item["id"])                       # aucune porte
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, item["id"], abandoned=True, delivered=True,
+                       sha="abcdef1")                             # deux portes
+        row = work.close(self.db, item["id"], delivered=True, sha="ABCdef1234567",
+                         note="rapport remis", actor="dev1")
+        self.assertEqual((row["state"], row["close_reason"]), ("closed", "delivered"))
+        self.assertIsNone(row["superseded_by"])
+        marks = {m["kind"]: m for m in work.milestones(self.db, item["id"])}
+        self.assertEqual(marks["delivered"]["sha"], "abcdef1234567")
+        self.assertEqual(marks["delivered"]["actor"], "dev1")
+        self.assertIn("rapport remis", marks["delivered"]["note"])
+        self.assertIn("closed", marks)
+        self.assertEqual(work.close_label(row), "delivered outside the target")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, item["id"], abandoned=True)
+        self.assertIn("already closed", str(ctx.exception))
+        with self.assertRaises(work.WorkError) as ctx:
+            work.merged(self.db, item["id"], sha="abcdef1")       # jamais rouvert
+        self.assertIn("delivered outside the target", str(ctx.exception))
+
+    def test_close_delivered_par_la_cli(self):
+        """#988 : la porte `--delivered --sha` est exposée par la CLI."""
+        item = self._add("rapport cli")
+        proc = self.mesh("work", "close", str(item["id"]), "--delivered",
+                         "--sha", "abcdef1234567")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("closed: delivered outside the target", proc.stdout)
+        closed = work.get(self.db, item["id"])
+        self.assertEqual(closed["close_reason"], "delivered")
+        proc = self.mesh("work", "close", str(item["id"]), "--delivered",
+                         "--sha", "abcdef1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("already closed", proc.stderr)
+        other = self._add("sans tête")
+        proc = self.mesh("work", "close", str(other["id"]), "--delivered")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--sha", proc.stderr)
+        self.assertEqual(work.get(self.db, other["id"])["state"], "intake")
 
 
 if __name__ == "__main__":
@@ -249,3 +340,16 @@ class DelaysTest(PgTestCase):
         deux = {row["work_item_id"]
                 for row in work.delays(self.db, ids=[second["id"], first["id"]])}
         self.assertEqual(deux, {first["id"], second["id"]})
+
+    def test_jalon_delivered_et_delais(self):
+        """#988 : `delivered_ts` date la livraison hors cible, `merged_ts` reste
+        nul et `total` court jusqu'à elle."""
+        item = self._add("Rapport livré")
+        work.move(self.db, item["id"], "build")
+        work.close(self.db, item["id"], delivered=True, sha="a" * 40, actor="dev1")
+        row = work.timeline(self.db, item["id"])
+        self.assertIsNotNone(row["delivered_ts"])
+        self.assertIsNone(row["merged_ts"])
+        self.assertIsNotNone(row["total_s"])
+        self.assertGreaterEqual(row["total_s"], 0.0)
+        self.assertEqual(work.last_milestone(row)[0], "delivered")

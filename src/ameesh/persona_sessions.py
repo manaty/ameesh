@@ -25,9 +25,16 @@ def record_start(db, persona: str, session_id: str, *, account: str | None = Non
     # supply an ID that L36/L46 deliberately refuses to install.
     from .agent_names import resolve as resolve_agent_name
     persona = resolve_agent_name(persona, db=db, operation="persona_sessions.record_start")
+    # #1037 : le harnais de l'historique est celui de la SESSION (0384,
+    # `session_harness`, tenu égal à `session_origin` par déclencheur), pas le
+    # harnais déclaré de l'agent — L242b fait tourner un agent sous un harnais
+    # emprunté, et l'historique doit le dire.
     _write(db, best_effort,
         "WITH current_session AS ("
-        "SELECT name AS persona, session_id, harness, host, session_account, session_work_item "
+        "SELECT name AS persona, session_id,"
+        "       CASE WHEN session_origin = session_id THEN coalesce(session_harness, harness)"
+        "            ELSE harness END AS harness,"
+        "       host, session_account, session_work_item "
         "FROM agent_registry WHERE name = %s AND session_id = %s FOR UPDATE"
         "), closed_sessions AS ("
         "UPDATE persona_sessions AS history SET ended_at = now(), "
