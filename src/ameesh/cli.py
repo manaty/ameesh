@@ -8,9 +8,10 @@
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
                                                  from a declared orchestrator, --lot hands an
-                                                 unassigned work item to the recipient — an item
-                                                 already assigned to an agent needs a declared
-                                                 role or a human (#859) — and --new-lot creates it (L118),
+                                                 unassigned work item (or one held by a human)
+                                                 to the recipient — an item already held by an
+                                                 agent is never reassigned by mail, whoever
+                                                 holds it (#1066) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
                                                  #540: a recipient who already has a work item
