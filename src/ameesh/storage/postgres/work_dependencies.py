@@ -5,7 +5,29 @@ from __future__ import annotations
 from ..work_dependencies import WorkDependencies as Contract
 
 _DONE = ("merged", "promoted", "closed")
+_DONE_SQL = "('merged', 'promoted', 'closed')"
 _LOCK = "SELECT pg_advisory_xact_lock(hashtextextended(current_schema() || ':work_dependencies', 0))"
+
+
+def last_verdict(alias: str) -> str:
+    """#1677 : le DERNIER verdict d'un lot (`ok`/`blocked`/NULL), pour l'alias
+    SQL donné. Un lot encore en `qa` avec un dernier verdict favorable ne
+    bloque plus ses dépendants : il attend la fusion, et le lot dépendant
+    s'empile sur sa tête gelée."""
+    return ("(SELECT m.verdict FROM work_item_milestones m"
+            "  WHERE m.work_item_id = %s.id AND m.kind = 'verdict'"
+            "  ORDER BY m.at DESC, m.id DESC LIMIT 1)" % alias)
+
+
+def not_blocking(alias: str) -> str:
+    """#1677 : prédicat SQL « ce lot ne bloque plus » — terminé, ou en `qa`
+    avec un dernier verdict favorable. L'inverse exact du `blocking` rendu par
+    `for_items` et lu par la prise (`unassigned_lots`, `assign ready_only`)."""
+    # coalesce : sans verdict, `last_verdict` vaut NULL et la comparaison
+    # vaudrait NULL — un `NOT NULL` en SQL ne rend ni vrai ni faux, et la
+    # sous-requête `EXISTS` laisserait alors passer le dépendant (#1677).
+    return ("(%s.state IN %s OR (%s.state = 'qa' AND coalesce(%s, '') = 'ok'))"
+            % (alias, _DONE_SQL, alias, last_verdict(alias)))
 
 
 class WorkDependencies(Contract):
@@ -73,7 +95,11 @@ class WorkDependencies(Contract):
             SELECT d.work_item_id, d.blocker_id, d.created_by,
                    extract(epoch FROM d.created_at)::float8 AS created_ts,
                    w.state AS blocker_state,
-                   w.state NOT IN ('merged', 'promoted', 'closed') AS blocking
+                   w.branch AS blocker_branch,
+                   (SELECT m.sha FROM work_item_milestones m
+                     WHERE m.work_item_id = w.id AND m.kind = 'frozen'
+                     ORDER BY m.at DESC, m.id DESC LIMIT 1) AS blocker_frozen_sha,
+                   NOT """ + not_blocking("w") + """ AS blocking
             FROM work_item_dependencies d JOIN work_items w ON w.id = d.blocker_id
             WHERE d.work_item_id IN (""" + ", ".join(["%s"] * len(ids)) + ")"
             " ORDER BY d.work_item_id, d.blocker_id", tuple(ids))

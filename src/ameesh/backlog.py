@@ -433,6 +433,7 @@ def _default_budget_check(cfg, db):
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:
+    stack = (item.get("stack_on") or "").strip()
     return ("Lot #%d, taken on your own (L165): you were idle and this lot of your team "
             "had no taker: %s%s\n"
             "%s can reassign it; if they give you something else, that comes first. "
@@ -441,11 +442,19 @@ def lot_take_message(item: dict, orchestras: list) -> str:
             "production action (deployment, merge, data deletion, production "
             "server, committed spending): propose it to a human and stop there. "
             "If the lot is not for you (capability, context), say so right away "
-            "(ameesh work note %d, and a message to %s) rather than keeping it." % (
+            "(ameesh work note %d, and a message to %s) rather than keeping it."
+            "%s" % (
                 int(item["id"]), item["title"],
                 "\n%s" % item["body"] if (item.get("body") or "").strip() else "",
                 ", ".join(orchestras) if orchestras else "The orchestrator",
-                int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator"))
+                int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator",
+                # #1677 : le lot s'empile sur des bloqueurs encore en qa à
+                # verdict favorable ; leur branche et leur tête gelée sont la
+                # base de départ, le rebase suit leur fusion (file de fusion).
+                ("\nStacked on blocker(s) still in qa with a favourable verdict: %s. "
+                 "Start your branch from that frozen head (the branch above); once the "
+                 "blocker merges, rebase on the new main before landing." % stack)
+                if stack else ""))
 
 
 def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
@@ -649,7 +658,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 lots.remove(item)
                 if done is None:
                     continue                # pris entre-temps : lot suivant
-                done = dict(done, lot_team=item["lot_team"])
+                done = dict(done, lot_team=item["lot_team"],
+                            stack_on=item.get("stack_on"))
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
                                         "team": item["lot_team"]}}
                 message_id = mail.send(db, SENDER, check["assignee"],
