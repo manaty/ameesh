@@ -780,21 +780,23 @@ class NumeroAtterriTest(PgTestCase):
                            migration_landed=452)
         self.assertEqual(done["result"], "merged")
         item = work.get(self.db, lot["id"])
-        # la réservation reste la sienne ; le numéro atterri est un fait à part
-        self.assertEqual((item["migration"], item["migration_repo"]),
-                         (377, "manaty/nexlink"))
+        # #956 (main) : la fusion libère la réservation dans la transaction de
+        # `close_merged` ; le numéro atterri est un fait à part, et le journal
+        # garde les deux (l'atterri ET la réservation d'origine)
+        self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
         self.assertEqual((item["migration_landed"], item["migration_landed_repo"]),
                          (452, "manaty/nexlink"))
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any("migration 452 landed (reserved 377)" in n for n in notes), notes)
+        self.assertTrue(any("migration 377 released (fusion, #956)" in n for n in notes), notes)
         self.assertEqual(
             work.migration_line(item),
             "452 landed in manaty/nexlink (L122) — file"
-            " supabase/migrations/452_<name>.sql (reserved 377)")
+            " supabase/migrations/452_<name>.sql")
         proc = self.mesh("work", "show", str(lot["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("migration: 452 landed in manaty/nexlink (L122) — file"
-                      " supabase/migrations/452_<name>.sql (reserved 377)", proc.stdout)
+                      " supabase/migrations/452_<name>.sql", proc.stdout)
         self.assertNotIn("file supabase/migrations/377", proc.stdout)
         proc = self.mesh("work", "show", str(lot["id"]), "--json")
         self.assertIn('"migration_landed": 452', proc.stdout)
@@ -806,6 +808,20 @@ class NumeroAtterriTest(PgTestCase):
         work.merged(self.db, lot["id"], sha="a" * 40, actor="dev1")
         item = work.get(self.db, lot["id"])
         self.assertIsNone(item["migration_landed"])
+        # #956 (main) : la fusion a libéré la réservation ; sans numéro atterri
+        # enregistré, la vue ne nomme aucune migration — jamais 377 comme
+        # atterrie. La branche « landed number not recorded » reste celle des
+        # lignes héritées d'avant #956, où `migration` survit à l'état terminal.
+        self.assertEqual((item["migration"], item["migration_repo"]), (None, None))
+        self.assertIsNone(work.migration_line(item))
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertNotIn("migration:", proc.stdout)
+        self.assertNotIn("377 landed", proc.stdout)
+        self.assertNotIn("supabase/migrations/377", proc.stdout)
+        # ligne héritée : la réservation est encore là, sans numéro atterri
+        self.db.execute("UPDATE work_items SET migration = 377,"
+                        " migration_repo = 'manaty/nexlink' WHERE id = %d" % lot["id"])
+        item = work.get(self.db, lot["id"])
         self.assertEqual(work.migration_line(item),
                          "377 reserved in manaty/nexlink (L122)"
                          " — landed number not recorded")
