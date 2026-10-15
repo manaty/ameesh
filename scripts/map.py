@@ -368,6 +368,16 @@ def _coverage(dossiers: list[str]) -> tuple[dict, int, int, list[dict], list[dic
                                  "raison": raison})
                 incomplets.append({"fichier": os.path.relpath(fichier, dossier),
                                    "erreur": raison})
+                # #1716 : un `read()` en échec laisse la connexion SQLite
+                # ouverte dans `CoverageData._dbs` (le `with` de coverage n'est
+                # jamais entré) ; on la ferme ici plutôt que de la laisser au
+                # ramasse-miettes (ResourceWarning, relecture du test L161e).
+                fermer = getattr(donnees, "close", None)
+                if fermer is not None:
+                    try:
+                        fermer(force=True)
+                    except Exception:  # noqa: BLE001 — la mesure reste illisible
+                        pass
                 continue
             processus += 1
             if sans_attribution:

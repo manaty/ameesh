@@ -645,6 +645,32 @@ class ArtefactIncompletTest(unittest.TestCase):
         self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
                          [os.path.join("cov", ".coverage")])
         self.assertEqual(vide.stat().st_size, 0)  # la lecture n'a pas eu lieu
+    @unittest.skipUnless(_coverage_installe(),
+                         "coverage requis pour suivre la connexion SQLite")
+    def test_artefact_illisible_ferme_la_connexion_sqlite(self):
+        # #1716 (accessoire de la relecture dev4) : un `read()` en échec
+        # laisse la connexion SQLite ouverte dans `CoverageData._dbs` (le
+        # `with` de coverage n'est jamais entré) ; la fusion la ferme au lieu
+        # de la laisser au ramasse-miettes.
+        import coverage
+
+        fermetures = []
+
+        class Suivi(coverage.CoverageData):
+            def close(self, force: bool = False) -> None:
+                fermetures.append(force)
+                return super().close(force=force)
+
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-3"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage").write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
+        with mock.patch.object(coverage, "CoverageData", Suivi):
+            c = carte.merge([str(part)], "abc")
+        self.assertEqual([i["fichier"] for i in c["mesure"]["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertEqual(fermetures, [True])
 
 
 def _mesure_possible() -> bool:
