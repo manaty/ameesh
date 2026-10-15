@@ -344,8 +344,10 @@ class RepriseTest(_Base):
 
     def test_quota_dans_un_result_marque_is_error(self):
         # #1397 (NO-GO dev1) : Claude ne dit un quota que dans le `result`
-        # marqué `is_error` — ce texte est un canal du CLI, donc classé quota,
-        # et le tour n'est pas un échec rapide (L48 désarmé).
+        # marqué `is_error` — ce texte est un canal du CLI, donc classé quota.
+        # Le sort de L48 pour un quota est la décision de #1270 (R1 dev2 :
+        # quota = cadence lente mais L48 reste armé) ; ce témoin ne fixe que
+        # le classement, commun aux deux têtes.
         _, worker = self._worker("rlq", "claude", {})
         try:
             self.assertIsNotNone(self._tour(
@@ -354,7 +356,7 @@ class RepriseTest(_Base):
             ligne = registry.get(self.db, "rlq")
             etat = rate_limit.state(ligne["status_text"])
             self.assertEqual(etat["kind"], rate_limit.QUOTA)
-            self.assertFalse(worker.fast_failure)
+            self.assertEqual(worker.rate_limit, rate_limit.QUOTA)
         finally:
             worker.watchdog_stop.set()
 
