@@ -726,14 +726,29 @@ class ReservationTest(unittest.TestCase):
         self.assertIsNone(ci.reservation_holder(lot, GEL, BASE, "full", "", now=now))
         self.assertIsNotNone(ci.reservation_holder(lot, GEL, BASE, "lot", "", now=now))
 
+    def test_un_run_de_lot_ne_materialise_pas_une_marque_full(self):
+        """P2-3 (cx2 NO-GO 4847) : un run de lot, même d'un identifiant
+        supérieur, ne matérialise pas la marque `full` d'une demande encore
+        invisible — seul un run `full` la libère."""
+        now = time.time()
+        full = [porte("applied", mode="full", token="6" * 16, seen=0)]
+        self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "lot", "",
+                                                   now=now, runs=[(12, "lot")]))
+        self.assertIsNotNone(ci.reservation_holder(full, GEL, BASE, "full", "",
+                                                   now=now, runs=[(12, "lot")]))
+        self.assertIsNone(ci.reservation_holder(full, GEL, BASE, "lot", "",
+                                                now=now, runs=[(12, "full")]))
+        self.assertIsNone(ci.reservation_holder(full, GEL, BASE, "full", "",
+                                                now=now, runs=[(12, "full")]))
+
     def test_une_execution_superieure_materialise_la_marque(self):
         now = time.time()
         avant = [porte("applied", token="7" * 16, seen=4, ts=now - 300)]
         self.assertIsNone(ci.reservation_holder(avant, GEL, BASE, "lot", "",
-                                                now=now, runs=[12]))
+                                                now=now, runs=[(12, "lot")]))
         apres = [porte("applied", token="7" * 16, seen=12, ts=now)]
         self.assertIsNotNone(ci.reservation_holder(apres, GEL, BASE, "lot", "",
-                                                   now=now, runs=[12]))
+                                                   now=now, runs=[(12, "lot")]))
 
     def test_la_meme_seconde_ne_decide_pas(self):
         # P2-3 : la marque (horodatage base, fractionnaire) et le run (GitHub,
@@ -743,10 +758,10 @@ class ReservationTest(unittest.TestCase):
         t = 1802563200.0
         rouge = [porte("applied", token="7" * 16, seen=0, ts=t + 0.125)]
         self.assertIsNone(ci.reservation_holder(rouge, GEL, BASE, "lot", "",
-                                                now=t + 120, runs=[12]))
+                                                now=t + 120, runs=[(12, "lot")]))
         invisible = [porte("applied", token="8" * 16, seen=12, ts=t + 0.125)]
         self.assertIsNotNone(ci.reservation_holder(invisible, GEL, BASE, "lot", "",
-                                                   now=t + 120, runs=[12]))
+                                                   now=t + 120, runs=[(12, "lot")]))
 
     def test_une_marque_sans_watermark_tient_jusqu_au_ttl(self):
         # une marque d'avant #1343 n'est pas corrélable : elle tient la clé
@@ -754,9 +769,9 @@ class ReservationTest(unittest.TestCase):
         now = time.time()
         legacy = [porte("applied", token="9" * 16, seen=None, ts=now)]
         self.assertIsNotNone(ci.reservation_holder(legacy, GEL, BASE, "lot", "",
-                                                   now=now, runs=[12]))
+                                                   now=now, runs=[(12, "lot")]))
         self.assertIsNone(ci.reservation_holder(legacy, GEL, BASE, "lot", "",
-                                                now=now + ci.RESERVE_TTL_S, runs=[12]))
+                                                now=now + ci.RESERVE_TTL_S, runs=[(12, "lot")]))
 
 
 class CancelPlanTest(GelTestCase):
@@ -1141,6 +1156,24 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(gh.poses(), [LABEL_FULL], "le full couvre le lot")
         self.assertEqual(len(notes), avant, "la demande lot recule avant toute note")
+
+    def test_un_run_de_lot_rouge_ne_libere_pas_une_reservation_full(self):
+        # P2-3 (cx2 NO-GO 4847) : la marque `full` d'un autre porteur reste
+        # tenue tant qu'aucun run `full` n'est visible ; un run de lot, même
+        # rouge et d'un identifiant supérieur, ne la matérialise pas — sans le
+        # correctif, la demande lot repartait et posait une seconde étiquette.
+        self.gele()
+        t = time.time()
+        self.events.append(marque("applied", mode="full", token="5" * 16,
+                                  ts=t + 0.125, seen=0))
+        api = Github(runs=[label_run(12, conclusion="failure", created=t)])
+        gh = Gh()
+        force = argparse.Namespace(**{**vars(self.args), "force": True})
+        with mock.patch.object(ci.time, "time", lambda: t + 120):
+            code, notes = self.run_cmd(api, gh, args=force)
+        self.assertEqual(code, 0)
+        self.assertEqual(gh.poses(), [], "un run de lot ne libère pas le full")
+        self.assertTrue(any("already holds" in n for n in notes), notes)
 
     def test_une_reservation_lot_ne_couvre_pas_la_demande_full(self):
         # P2 delta, garde : un `lot` réservé ne dispense pas du `full` ; la

@@ -921,23 +921,27 @@ def _run_id(row: dict) -> int:
         return 0
 
 
-def _materialized(mark: dict, runs: list[int]) -> bool:
+def _materialized(mark: dict, runs) -> bool:
     """Une exécution visible matérialise-t-elle cette marque (P2-3) ?
 
     Chaque marque `applied` enregistre `seen=` : le plus grand identifiant
     d'exécution connu avant sa pose. Les identifiants des exécutions GitHub
     croissent avec le temps : un run d'identifiant supérieur n'a pu naître
     qu'après elle, donc la demande a produit son exécution et ne tient plus la
-    clé. Une marque sans `seen=` (écrite avant #1343) n'est pas corrélable :
-    elle tient la clé jusqu'au `ttl`, jamais libérée par une comparaison entre
-    l'horloge de la base (marque, fractionnaire) et celle de GitHub (run, à la
-    seconde) — c'est cette comparaison qui bloquait la reprise d'un run rouge
-    né dans la même seconde que sa marque.
+    clé. `runs` porte des couples (identifiant, mode) : la couverture des modes
+    suit celle des exécutions (§ `_covers`) — un run de lot ne matérialise pas
+    une demande de suite complète, seul un `full` le fait (P2-3, cx2). Une
+    marque sans `seen=` (écrite avant #1343) n'est pas corrélable : elle tient
+    la clé jusqu'au `ttl`, jamais libérée par une comparaison entre l'horloge
+    de la base (marque, fractionnaire) et celle de GitHub (run, à la seconde) —
+    c'est cette comparaison qui bloquait la reprise d'un run rouge né dans la
+    même seconde que sa marque.
     """
     seen = mark.get("seen")
     if seen is None:
         return False
-    return any(ident > seen for ident in runs)
+    return any(ident > seen and _covers(run_mode, mark["mode"])
+               for ident, run_mode in runs)
 
 
 def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token: str, *,
@@ -948,11 +952,12 @@ def reservation_holder(events: list[dict], sha: str, base: str, mode: str, token
     Une étiquette posée mais pas encore visible comme exécution dans l'API
     GitHub tient la clé le temps du `ttl` ; `released` (demande refusée), les
     marques périmées et celles que matérialise une exécution visible
-    (`_materialized`) ne tiennent pas. `runs` porte les identifiants des
-    exécutions visibles de la composition : la marque est libérée par
-    corrélation d'identifiants, jamais par une comparaison d'horloges. La
-    couverture des modes suit celle des exécutions (§ `_covers`) : un `full`
-    réservé couvre une demande `lot` de la même composition, l'inverse non.
+    (`_materialized`) ne tiennent pas. `runs` porte les couples (identifiant,
+    mode) des exécutions visibles de la composition : la marque est libérée par
+    corrélation d'identifiants et de mode, jamais par une comparaison
+    d'horloges. La couverture des modes suit celle des exécutions (§ `_covers`) :
+    un `full` réservé couvre une demande `lot` de la même composition, l'inverse
+    non — et seul un run `full` matérialise une marque `full`.
     Appelé sous le verrou de la ligne du lot, il lit les marques commitées des
     autres processus ; le porteur courant est exclu (`token`).
     """
@@ -1393,11 +1398,11 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                            "--force to request the CI again" % runs[-1]["mode"]}
         #: P2 R1/P2-3 : une marque que matérialise une exécution visible (run
         #: rouge court) ne tient plus la clé ; seule une demande encore
-        #: invisible tient, et la corrélation est l'identifiant du run, pas
-        #: l'horloge.
+        #: invisible tient, et la corrélation est le couple (identifiant, mode)
+        #: du run, pas l'horloge — un run de lot ne matérialise pas un `full`.
         held = reservation_holder(request_events(tx, item_id), sha, base, mode, token,
                                   now=time.time(),
-                                  runs=tuple(_run_id(r["row"]) for r in runs))
+                                  runs=tuple((_run_id(r["row"]), r["mode"]) for r in runs))
         if held:
             note("released", "another request (token %s) already holds this composition"
                  % held["token"])
