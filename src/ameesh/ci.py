@@ -129,8 +129,8 @@ STATUS_SCHEMA = "ameesh-ci-status/1"
 #: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
 #: jamais à chaque passage. La fenêtre est écrite dans la base avant le premier
 #: appel HTTP (`ci_guard_scan`) : deux `notify --once` concurrents, ou deux
-#: hôtes, ne la mènent pas deux fois. À 600 s et 63 appels au plus par relevé,
-#: cette garde seule consomme au plus 378 appels/h et par dépôt (hors appels du
+#: hôtes, ne la mènent pas deux fois. À 600 s et 66 appels au plus par relevé,
+#: cette garde seule consomme au plus 396 appels/h et par dépôt (hors appels du
 #: suivi des échecs) ; la durée d'un relevé n'est pas bornée globalement, donc
 #: aucune détection en « <= 10 min » n'est promise.
 GUARD_SCAN_S = 600.0
@@ -145,15 +145,16 @@ GUARD_SCAN_MAX_RUNS = 60
 #: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
 GUARD_PER_PAGE = 100
 #: #845 (revue N/P2 2328 ; arbitrage A) : budget d'appels GitHub d'un relevé de
-#: la garde — les deux listes d'exécutions, un appel par exécution non conclue
-#: (chacune est relue : un run resté `queued` peut porter un job déjà
-#: `in_progress`, R1 cx3 B1), et la liste des runners. Le plafond couvre
-#: exactement `GUARD_SCAN_MAX_RUNS` exécutions : 2 + 60 + 1 = 63. Au-delà, le
-#: relevé est déclaré incomplet et RIEN n'est publié : un relevé partiel ne vaut
-#: pas un relevé complet, et les relevés précédents vieillissent jusqu'à ce que
-#: la fraîcheur (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre
-#: d'appels réellement consommés est journalisé dans `ci_guard_scan`.
-GUARD_SCAN_MAX_CALLS = 63
+#: la garde — une liste d'exécutions par état non conclu (`LIVE_STATUSES`,
+#: #1161 en lit cinq), un appel par exécution non conclue (chacune est relue :
+#: un run resté `queued` peut porter un job déjà `in_progress`, R1 cx3 B1), et
+#: la liste des runners. Le plafond couvre exactement `GUARD_SCAN_MAX_RUNS`
+#: exécutions : len(LIVE_STATUSES) + 60 + 1. Au-delà, le relevé est déclaré
+#: incomplet et RIEN n'est publié : un relevé partiel ne vaut pas un relevé
+#: complet, et les relevés précédents vieillissent jusqu'à ce que la fraîcheur
+#: (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre d'appels
+#: réellement consommés est journalisé dans `ci_guard_scan`.
+GUARD_SCAN_MAX_CALLS = len(LIVE_STATUSES) + GUARD_SCAN_MAX_RUNS + 1
 
 
 class _GuardBudget(RuntimeError):
