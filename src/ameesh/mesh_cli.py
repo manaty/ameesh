@@ -1477,6 +1477,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            if item.get("reviewer"):
+                print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -1581,11 +1583,21 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
-                             correct=args.correct)
-            print("lot #%d → %s (loops %s)%s" % (
+                             correct=args.correct, reviewer=args.reviewer)
+            print("lot #%d → %s (loops %s)%s%s" % (
                 item["id"], item["state"], item["loops"],
+                " — reviewer %s" % item["reviewer"] if item.get("reviewer") else "",
                 " — correction recorded in the log, by %s" % args.actor
                 if args.correct is not None else ""))
+            return 0
+        if args.work_command == "reviewer":
+            # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
+            # sans aller-retour build/qa ; c'est la commande que l'alerte
+            # `stale_lot` recommande à l'orchestrateur du projet.
+            item = work.designate_reviewer(cfg, db, args.id, args.agent, actor=args.actor)
+            print("lot #%d: reviewer %s (state %s, designated by %s)" % (
+                item["id"], item["reviewer"], item["state"],
+                args.actor or "the bound identity"))
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
@@ -2432,7 +2444,22 @@ def build_parser() -> argparse.ArgumentParser:
                          help="correct a state set by mistake (promoted → merged, merged → build), "
                               "outside the state machine, recorded in the log; reserved for humans "
                               "and for orchestrators or design agents")
+    pw_move.add_argument("--reviewer", default=None, metavar="AGENT",
+                         help="#705: designate the reviewer of the review that starts, only "
+                              "when moving to qa: waiting(), the progress view and the stale_lot "
+                              "alert name them before any verdict")
     pw_move.set_defaults(func=cmd_work)
+    pw_reviewer = work_sub.add_parser(
+        "reviewer",
+        help="#705: designate (or change) the reviewer of a lot already in qa, "
+             "without a build/qa round trip")
+    pw_reviewer.add_argument("id", type=int)
+    pw_reviewer.add_argument("agent", metavar="AGENT",
+                             help="a registry agent, or human:<id>; never the lot's assignee")
+    pw_reviewer.add_argument("--actor", default="",
+                             help="who designates: the session's bound identity by default; "
+                                  "a human or an orchestrator (same authority as --correct)")
+    pw_reviewer.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "
                        "on the target): any open state → merged, merged milestone with the commit")

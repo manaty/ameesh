@@ -1347,6 +1347,19 @@ class WorkItems(Domain):
         fail (None) — the lot never ends waiting with no request."""
 
     @abc.abstractmethod
+    def designate_reviewer(self, item_id: int, reviewer: str, *, actor: str) -> dict | None:
+        """#705 : pose (ou change) le relecteur désigné d'un lot **en `qa`**,
+        et journalise ; None (rien d'écrit) si le lot n'est plus en `qa` ou si
+        son assigné est devenu le relecteur (la règle est relue dans
+        l'écriture, pas seulement avant : #705 r2, B1).
+
+        La colonne vient de la migration 0421 : avant elle, la lecture s'en
+        passe (`item_columns`) et l'écriture est refusée avec la marche à
+        suivre. Un exécuteur médié ne désigne jamais de relecteur (opération
+        refusée au contrat L107/L109) : la désignation est un geste
+        d'orchestrateur ou d'humain (`work.designate_reviewer`)."""
+
+    @abc.abstractmethod
     def waiting_episodes(self, item_ids: Sequence[int]) -> dict[int, dict]:
         """L233: for each lot, its current waiting episode, stable across
         notes: `{id: {episode, start_ts, first_ts}}` — `episode`, the id of
@@ -1382,7 +1395,9 @@ class WorkItems(Domain):
         `ready_only` (L165) exige un lot intake sans assigné dont toutes les
         dépendances sont satisfaites ; vérifié sous verrou dans la même
         transaction que l'attribution. La réservation manuelle garde son
-        comportement par défaut."""
+        comportement par défaut. #705 : si le nouvel assigné est le relecteur
+        désigné, la désignation tombe dans la même écriture (le journal la
+        nomme) — un relecteur ne relit pas son propre travail."""
 
     @abc.abstractmethod
     def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
@@ -1405,7 +1420,8 @@ class WorkItems(Domain):
         transaction : délégation en cours remplacée, lot au délégué avec
         délégant, début et échéance (`now + within_s`), ligne au registre des
         délégations, journal. Rend `{item, delegation, replaced}` ; None si
-        le lot a bougé."""
+        le lot a bougé. #705 : déléguer à son relecteur désigné retire la
+        désignation dans la même écriture (le journal la nomme)."""
 
     @abc.abstractmethod
     def current_delegation(self, item_id: int) -> dict | None:
@@ -2461,7 +2477,8 @@ class Operations(Domain):
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
-        pour un P1, #789). Les plus anciennement actifs d'abord. `limit=None`
+        pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
+        son relecteur désigné). Les plus anciennement actifs d'abord. `limit=None`
         lit toute la vérité avant le filtrage des attentes planifiées (L368)."""
 
     @abc.abstractmethod

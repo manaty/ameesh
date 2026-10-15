@@ -290,14 +290,20 @@ def describe(db, rows: list[dict], *, now: float | None = None,
              threshold: float = DEFAULT_THRESHOLD_S,
              open_items: list[dict] | None = None) -> dict[int, dict]:
     """Pour chaque lot (lignes de `work_items`) : `{waiting, waiting_for,
-    last_activity_ts, stale}`. Une lecture groupée, aucune requête par lot."""
+    last_activity_ts, project, stale}`. `project` (#705, lu par
+    `projects.lot_project`) : le projet du lot, dont l'orchestrateur est
+    prévenu quand un lot en qa n'a pas de relecteur désigné. Une lecture
+    groupée, aucune requête par lot."""
     from . import progress  # import tardif : progress importe ce module
+    from . import projects
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
     ids = [int(r["id"]) for r in rows]
     packages = {p["id"]: p for p in st.packages.all(include_absent=True)}
-    states, externals = agent_availability(db)
+    agents = st.progress.agents(None)
+    states, externals = availability_of(agents)
+    agent_projects = {r["name"]: projects.agent_project(r) for r in agents}
     events, milestones, actions, messages = _grouped(st, ids)
     from . import planned_waits
     from . import work_dependencies
@@ -308,16 +314,18 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     for row in rows:
         rid = int(row["id"])
         acts = actions.get(rid, [])
+        package = packages.get(row.get("package_id")) or {}
         jalons = progress._jalons_de_lot(row, events.get(rid, []), acts, milestones.get(rid))
         detail = with_availability(
             waiting(row, jalons, acts,
-                    responsible=(packages.get(row.get("package_id")) or {}).get(
-                        "responsible")),
+                    responsible=package.get("responsible")),
             states, externals)
         last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                              messages.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
+                    "project": projects.lot_project(row, agent_projects,
+                                                    package_team=package.get("team")),
                     "planned_wait": holds.get(rid),
                     "dependencies": dependencies.get(rid, []),
                     "stale": None if rid in holds else
@@ -330,8 +338,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
 
     Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
-    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26) et `waiting`
-    (`{what, who, label}`, L29)."""
+    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26), `waiting`
+    (`{what, who, label}`, L29) et `project` (#705 : le projet du lot, dont
+    l'orchestrateur est prévenu quand aucun relecteur n'est désigné)."""
     from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
@@ -360,5 +369,6 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "idle_s": int(now - float(row["last_activity_ts"])),
             "waiting_for": info["waiting_for"],
             "waiting": info["waiting"],
+            "project": info.get("project"),
         })
     return out[:max(0, int(limit))]

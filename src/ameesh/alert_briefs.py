@@ -10,6 +10,12 @@ appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
   — sauf `stale_lot` (L713) : ce courrier ne le réveille plus, il lit les lots
   stagnants à sa passe (`ameesh alerts --json`).
 
+#705 : pour un lot en `qa`, `stale_lot` va au relecteur DÉSIGNÉ (le verdict
+lui est dû) ; sans relecteur désigné, l'alerte part aux orchestrateurs du
+projet du lot et demande d'en désigner un (`ameesh work reviewer <id>
+<agent>` — le lot est déjà en qa). La désignation à l'entrée en qa se fait,
+elle, par `ameesh work move <id> qa --reviewer <agent>`.
+
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
 `REMIND_AFTER_S` (6 h) plus tard. Ce module rend les textes ; l'envoi et le
@@ -59,6 +65,45 @@ def _of_teams(orchestras, by_name: dict, teams: set) -> list:
     if not teams:
         return list(orchestras)
     return [o for o in orchestras if not _team(by_name, o) or _team(by_name, o) in teams]
+
+
+def _of_project(orchestras, by_name: dict, project, teams: set) -> list:
+    """#705 : les orchestrateurs du PROJET du lot (`team` ou `workstream`),
+    à défaut ceux de l'équipe de l'assigné (routage d'origine), à défaut tous."""
+    project = (project or "").strip()
+    if project:
+        matched = [o for o in orchestras
+                   if project in (_team(by_name, o), _workstream(by_name.get(o) or {}))]
+        if matched:
+            return matched
+    return _of_teams(orchestras, by_name, teams)
+
+
+def _reviewer_missing(alert: dict) -> str:
+    """#705 : un lot en qa SANS relecteur désigné n'attend personne ; le texte
+    demande à l'orchestrateur du projet d'en désigner un (ou de relire lui-même)."""
+    lot = int(alert["lot"])
+    title = alert.get("title")
+    return ("No reviewer designated: lot #%d%s (%s) has been waiting for a verdict for %s "
+            "with no designated reviewer, so the wait belongs to nobody. Expected action: "
+            "designate the reviewer: ameesh work reviewer %d <agent>; or take the "
+            "review yourself and give the verdict: ameesh work milestone %d verdict "
+            "ok|blocked --note \"…\"." % (
+                lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
+                sous_utilisation._duration(alert.get("value") or 0), lot, lot))
+
+
+def _verdict_due(alert: dict) -> str:
+    """#705 : le relecteur DÉSIGNÉ d'un lot en qa qui stagne : le verdict lui est dû."""
+    lot = int(alert["lot"])
+    title = alert.get("title")
+    return ("Verdict expected: lot #%d%s (%s) has been waiting for its verdict for %s; you "
+            "are its designated reviewer. Expected action: review it and give your verdict: "
+            "ameesh work milestone %d verdict ok|blocked --note \"…\"; if you cannot, say so "
+            "on the lot (ameesh work note %d \"hold: <reason>\") so the project's "
+            "orchestrator can hand the review over." % (
+                lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
+                sous_utilisation._duration(alert.get("value") or 0), lot, lot))
 
 
 def _stale_lot(alert: dict) -> str:
@@ -199,12 +244,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
-    l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
+    l'équipe de l'assigné — ou du projet du lot quand aucun relecteur n'est
+    désigné (#705) ; `plan_underused`, ceux des équipes des agents au
     repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
-    rôle explicite et projet, sans repli. Auditeurs : pour tous les types sauf
-    `stale_lot` (L713 : lu à la passe de l'auditeur, sans réveil). Un agent à
-    la fois orchestrateur et auditeur reçoit un seul texte."""
+    rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
+    relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
+    Auditeurs : pour tous les types sauf `stale_lot` (L713 : lu à la passe de
+    l'auditeur, sans réveil). Un agent à la fois orchestrateur et auditeur
+    reçoit un seul texte."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
@@ -249,9 +297,19 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
                     out.setdefault(name, text)
         return out
     else:
+        extra: dict[str, str] = {}
+        no_reviewer = False
         if kind == "stale_lot":
-            text = _stale_lot(alert)
+            waiting = alert.get("waiting") or {}
+            reviewer = waiting.get("who") if waiting.get("what") == "verdict" else None
+            # #705 : en qa, l'attente est celle du relecteur DÉSIGNÉ ; sans
+            # désignation, elle n'est à personne et l'orchestrateur du projet
+            # doit en désigner un.
+            no_reviewer = bool(waiting.get("what") == "verdict" and not reviewer)
+            text = _reviewer_missing(alert) if no_reviewer else _stale_lot(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+            if reviewer and str(reviewer) in by_name:
+                extra[str(reviewer)] = _verdict_due(alert)
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
@@ -264,10 +322,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         else:
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
-        out = {o: text for o in _of_teams(orchestras, by_name, teams)}
+        if no_reviewer:
+            out = {o: text for o in _of_project(orchestras, by_name,
+                                                alert.get("project"), teams)}
+        else:
+            out = {o: text for o in _of_teams(orchestras, by_name, teams)}
         if kind in ("estimate_bias", "waiting_without_question") \
                 and alert.get("agent") in by_name:
             out.setdefault(alert["agent"], text)       # l'estimateur, l'assigné lui-même
+        out.update(extra)
         audit_text = text
     # L713 : le lot stagnant ne réveille plus l'auditeur par courrier ; il le
     # lit à sa passe (`ameesh alerts --json`). Les orchestrateurs gardent

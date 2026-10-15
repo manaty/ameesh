@@ -3929,7 +3929,7 @@
   }
  ],
  "refused": {
-  "interface_total": 394,
+  "interface_total": 395,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4283,6 +4283,7 @@
     "current_delegation",
     "delays",
     "delegate",
+    "designate_reviewer",
     "due_delegations",
     "estimate_history",
     "estimates",

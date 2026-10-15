@@ -175,7 +175,9 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     * `requested`, `frozen` (PREMIER gel), `verdict` (verdict retenu = le
       plus récent), `merged` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
-    * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : son auteur ;
+    * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
+      verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
+      #705), sinon l'auteur du dernier verdict ;
     * `verdict_current` : le verdict retenu porte-t-il sur le dernier gel ?
       Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
       renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
@@ -252,14 +254,23 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     verdicts.sort(key=lambda v: v["at_ts"])
     last = verdicts[-1] if verdicts else None
     last_frozen = freezes[-1] if freezes else None
+    verdict_current = _verdict_applies(last, last_frozen)
+    # #705 : avant tout verdict — ou après un regel, le verdict précédent ne
+    # vaut plus — le relecteur DÉSIGNÉ (`work move … qa --reviewer`) est celui
+    # qu'on attend ; quand un verdict courant existe, c'est son auteur qui a
+    # réellement relu.
+    designated = (item.get("reviewer") or "").strip() or None
+    reviewer = last["actor"] if last else None
+    if designated and not verdict_current:
+        reviewer = designated
     return {
         "requested": requested,
         "frozen": freezes[0]["at_ts"] if freezes else None,
         "last_frozen": last_frozen["at_ts"] if last_frozen else None,
         "verdict": last["at_ts"] if last else None,
         "verdict_kind": last["kind"] if last else None,
-        "reviewer": last["actor"] if last else None,
-        "verdict_current": _verdict_applies(last, last_frozen),
+        "reviewer": reviewer,
+        "verdict_current": verdict_current,
         "merged": merged,
         "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
         "blocks": blocks,
