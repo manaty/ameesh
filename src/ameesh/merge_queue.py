@@ -885,6 +885,23 @@ def radar_project(cfg, repo: str):
     return matching[0] if matching else None
 
 
+def working_clone(cfg, repo: str, project) -> tuple:
+    """Le clone où `queue add` lit les branches fraîches, et le temporaire à
+    retirer (`None` quand c'est le clone du radar).
+
+    Un passage de radar a son clone privé (`radar.clone_dir`) ; un poste agent
+    ou pilote n'en a pas, et la file doit pourtant s'ouvrir de là (§2 : le
+    pilote met un lot en file depuis son poste). On prête alors un clone
+    jetable du dépôt local (`--shared`), le temps de la commande : la lecture
+    reste fraîche (`fetch_fresh`), le dépôt des agents n'est jamais écrit, et
+    rien ne survit à la commande."""
+    from . import radar, resolutions
+    if project is not None:
+        return resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)), None
+    scratch = tempfile.mkdtemp(prefix="ameesh-queue-")
+    return resolutions.Replayer(repo, os.path.join(scratch, "clone")), scratch
+
+
 def run(cfg, db, args) -> int:
     import sys
     from . import radar, resolutions
@@ -892,10 +909,13 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
-            clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
-                if project else None
-            row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
-                        clone=clone, cfg=cfg)
+            clone, scratch = working_clone(cfg, repo, project)
+            try:
+                row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
+                            clone=clone, cfg=cfg)
+            finally:
+                if scratch:
+                    shutil.rmtree(scratch, ignore_errors=True)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
                   "lot #%d queued for %s at %s, class %s; the radar orders the queue at its "
                   "next pass" % (args.id, row["target"], row["frozen_sha"][:12],
