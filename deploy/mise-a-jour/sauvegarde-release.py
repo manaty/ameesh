@@ -12,7 +12,11 @@
   never claims a completed backup for an incomplete artifact;
 - `pin` registers that exact set in the private retention catalog with the
   release's rollback deadline and the enrolled retention window, before any
-  migration. An unaccepted set is never expired;
+  migration. An unaccepted set is never expired. A receipt outside the bounded
+  reuse window is refused before any registration: a new approval never
+  inscribes a dump made under an earlier one. The controller holds; recovery is
+  a new `backup` step, which recreates the set from the live source, or a new
+  operation;
 - `accept` records release acceptance for retention, drops the transient
   receipt, then expires previously accepted sets whose policy window has
   passed. Expiry is best-effort: a set whose remote members have no enrolled
@@ -480,6 +484,18 @@ class RecoverySet:
         if pending is None or pending['manifest_digest'] != request['manifest_digest']:
             return False
         if not self._pending_files(pending):
+            return False
+        # K3: the receipt is evidence of the pre-migration state only inside the
+        # bounded reuse window, and it is bound to the operation, not to the
+        # approval that asked for it. A later `pin` — typically a release held
+        # across days and resumed under a new approval — must not inscribe the
+        # earlier attempt's dump as the current rollback set: refuse BEFORE any
+        # registration (the retry that reuses this receipt would raise with an
+        # empty catalog, so nothing durable to roll back). Recovery is explicit:
+        # a new `backup` step recreates the set from the live source (the stale
+        # members are discarded, never re-stamped), or the operator starts a new
+        # operation with its own receipt. The refusal writes nothing.
+        if self._stale(pending['files']):
             return False
         if self.config['remote'] is not None and pending['remote_verified'] is not True:
             return False

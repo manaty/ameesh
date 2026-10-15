@@ -356,6 +356,24 @@ class RecoverySetTest(unittest.TestCase):
         self.assertEqual(dump.call_count, 1)
         self.assertEqual(restore.call_count, 1)
 
+    def test_stale_receipt_is_refused_at_pin_before_any_registration(self):
+        """K3: a receipt made under an earlier approval is not inscribed as the
+        current rollback set; a new `backup` recreates it from the live source."""
+        self.assertTrue(self.backup())
+        stale = self.stale_stamp()
+        for name in self.value._pending('release-fixture')['files']:
+            os.utime(Path(self.retention) / name, (stale, stale))
+        self.assertFalse(self.perform('pin'))                    # refus, aucune écriture
+        self.assertEqual(self.catalog(), {})
+        self.assertIsNone(self.value._record('release-fixture'))
+        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump) as dump, \
+                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore) as restore:
+            self.assertTrue(self.perform('backup'))
+        self.assertEqual(dump.call_count, 1)                     # recréé, pas re-stampé
+        self.assertEqual(restore.call_count, 1)
+        self.assertTrue(self.perform('pin'))
+        self.assertIsNotNone(self.value._record('release-fixture'))
+
     def test_stale_remote_attempt_reuploads_instead_of_colliding(self):
         upload_credentials, restore_credentials = self.credential_files()
         self.value = self.remote_value(upload_credentials, restore_credentials)
