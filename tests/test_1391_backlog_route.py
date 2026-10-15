@@ -6,11 +6,12 @@ jamais. Il ne crée pas de lot : il va au backlog (`ameesh work backlog add`,
 avec sa valeur et son chantier), regroupé avec les autres défauts mineurs du
 même chantier ». Sur ameesh, un P2 de la classe sensible bloque encore.
 
-Témoins : suite N détectée et orientée, suite de tests légitime non signalée,
-bloquant nommé (B1/P1/incident) et P2 sensible conservés, avertissement rendu
-par les deux points d'entrée de création (`work add`, `mail --new-lot`),
-consigne injectée au relecteur d'après fusion citant la route, et backlog qui
-accepte la suite."""
+Témoins : suite N détectée et orientée, suite de tests légitime non signalée
+(sans masquer un N explicite), suivis ordinaires silencieux, bloquant nommé
+(B/B1/P1/incident/panne) prioritaire même avec une référence N historique, P2
+sensible conservé, avertissement rendu par les deux points d'entrée de création
+(`work add`, `mail --new-lot`), consigne injectée au relecteur d'après fusion
+citant la route, et backlog qui accepte la suite."""
 from __future__ import annotations
 
 import unittest
@@ -54,6 +55,26 @@ class FollowupHintTest(unittest.TestCase):
         ):
             self.assertEqual(backlog.followup_hint(title=title), "", title)
 
+    def test_an_explicit_n_survives_a_test_suite_locution(self):
+        # R1 cx2, P2 3 : « suite de tests » ne vaut pas marqueur, mais ne doit
+        # pas masquer un N/P2/P3 explicite.
+        for title in (
+            "N2 : améliorer les diagnostics de la suite de tests",
+            "P2 : suite de tests instable",
+        ):
+            self.assertIn("backlog", backlog.followup_hint(title=title), title)
+
+    def test_an_ordinary_follow_up_is_not_a_review_suite(self):
+        # R1 cx2, P2 2 : « suivi »/« follow-up » ne vaut marqueur que visant une
+        # relecture ou une référence ; le travail ordinaire reste silencieux.
+        for title in (
+            "Suivi des coûts mensuels",
+            "Suivi mensuel de la file",
+            "Suivi de la production",
+            "follow-up commercial",
+        ):
+            self.assertEqual(backlog.followup_hint(title=title), "", title)
+
     def test_a_blocking_defect_keeps_its_lot(self):
         for title in (
             "B1 : le feu ouvre la PR avant les verdicts",
@@ -62,8 +83,19 @@ class FollowupHintTest(unittest.TestCase):
             "incident de production : base indisponible",
             "panne : le relais ne redémarre plus",
             "régression : la file perd ses lignes",
+            # R1 cx2, P2 1 : un bloquant explicite garde son lot même quand le
+            # titre ou la source cite une suite N historique (B seul compris).
+            "P1 : corriger la panne issue du N2 de la R1",
+            "N2 : corriger la panne issue de la R1",
+            "B : suite #956 — perte de messages",
         ):
             self.assertEqual(backlog.followup_hint(title=title), "", title)
+
+    def test_a_blocking_defect_wins_over_a_historical_n_reference(self):
+        # R1 cx2, P2 1 : le bloquant explicite garde son lot quand la source ne
+        # cite qu'une référence N historique.
+        self.assertEqual(backlog.followup_hint(
+            title="P1 : corriger la panne", source="issue du N2 de la R1"), "")
 
     def test_a_plain_french_suite_keeps_its_lot(self):
         # « suite à / suite au » : du français ordinaire, souvent une demande
