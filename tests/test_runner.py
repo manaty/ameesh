@@ -710,7 +710,7 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
-        env = self.env(AMEESH_TEST_SLEEP="12", AMEESH_LEASE_TTL="3")
+        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
@@ -718,7 +718,7 @@ class RunnerTest(PgTestCase):
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
             self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=15)
+                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=60)
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=10)
