@@ -20,14 +20,22 @@ SSH = r'''#!/usr/bin/env python3
 import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
-command = sys.argv[-1]
+argv = sys.argv[1:]
+command = argv[-1]
+# The real client swallows its stdin even when the remote command does not
+# read it: a caller that shares its stdin with a `while read` loop loses the
+# rest of the list (#1455). Play that, and forward the bytes like ssh does.
+# `-n` redirects the client's stdin from /dev/null, as the real one does.
+stdin = ''
+if '-n' not in argv and not sys.stdin.isatty():
+    stdin = sys.stdin.read()
 with (state / 'ssh.log').open('a') as f:
     f.write(command + '\n')
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/ameesh', os.environ['FAKE_AMEESH'])
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/python', os.environ['FAKE_DB_PYTHON'])
 command = command.replace('$HOME/.config/ameesh/env', str(state / 'runner.env'))
 env = dict(os.environ, FAKE_REMOTE='1')
-sys.exit(subprocess.call(['bash', '-c', command], env=env))
+sys.exit(subprocess.run(['bash', '-c', command], env=env, input=stdin, text=True).returncode)
 '''
 RUNUSER = r'''#!/usr/bin/env python3
 import os, sys
@@ -96,6 +104,7 @@ elif 'show' in args:
         print('{ path=/bin/runner ; argv[]=/bin/runner run ' + option + ' ; }')
 elif 'is-active' in args:
     if scenario == 'inactive': sys.exit(3)
+    if scenario == 'inactive-dev9' and '@dev9.' in args[-1]: sys.exit(3)
     print('active')
 '''
 
@@ -253,6 +262,23 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn('contrôles verts', p.stdout)
         self.assertNotIn('restart', self.units())
+
+    def test_check_visits_every_registered_agent(self):
+        """#1455: the client must not eat the list shared with the `while read`."""
+        p = self.run_vm('controler')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        seen = self.units()
+        for name in ('dev8', 'dev9'):
+            self.assertIn(f'ameesh-runner-agent@{name}.service', seen)
+        self.assertIn('dev8', p.stdout)
+        self.assertIn('dev9', p.stdout)
+
+    def test_check_fails_when_only_the_last_agent_is_broken(self):
+        """#1455: a defect on the last listed agent alone must red the check."""
+        p = self.run_vm('controler', scenario='inactive-dev9')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('dev9', p.stdout)
+        self.assertIn('contrôles en échec', p.stderr)
 
     def test_unit_failures_do_not_report_success(self):
         for scenario in ['restart-error', 'inactive']:
