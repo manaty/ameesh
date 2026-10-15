@@ -15,7 +15,7 @@ import unittest
 
 from ameesh import review_designation as rd
 from ameesh import review_designation_pg as pg
-from ameesh import storage, work
+from ameesh import registry, storage, work
 
 from .support import PgTestCase
 
@@ -63,6 +63,9 @@ class Test1617ReviewDesignationPg(PgTestCase):
         super().setUp()
         self.item = work.add(self.db, title=ITEM["title"], app=ITEM["app"])
         self.lot = int(self.item["id"])
+        for name in ("r1", "r2", "pilot"):
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host,
+                            status="idle")
 
     # -- helpers ----------------------------------------------------------
     def freeze(self, sha=SHA_A):
@@ -172,6 +175,17 @@ class Test1617ReviewDesignationPg(PgTestCase):
         self.freeze()
         with self.assertRaises(rd.DesignationError):
             self.run_apply(pg.PgPort(self.db), candidates=[], notify="")
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(self.marks(), [])
+
+    def test_an_unknown_recipient_writes_nothing(self):
+        self.freeze()
+        port = pg.PgPort(self.db)
+        with self.assertRaises(rd.DesignationError):
+            port.commit(self.lot, freeze=port.latest_freeze(self.lot), required=1,
+                        state=rd.DESIGNATED,
+                        reviewers=[{"name": "ghost", "family": "claude"}],
+                        missing=0, why="", messages=[{"to": "ghost", "body": "à relire"}])
         self.assertEqual(self.mailbox(), [])
         self.assertEqual(self.marks(), [])
 
