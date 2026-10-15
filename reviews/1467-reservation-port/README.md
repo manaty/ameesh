@@ -58,3 +58,26 @@ explicite des anciens tickets et baux, sans substitution silencieuse. Ces deux
 entrées ont été demandées au pilote le 15 octobre à 16:41. Mesh-design a
 confirmé à 16:45 l'absence de plafond dans le canon `579c64d` et la mécanique
 candidate `430e65921`, et demandé les sources au bureau et à l'auteur de #1374.
+
+## Transition des anciennes clés
+
+Source : note de l'auteur impl08 dans #1374 du 15 octobre à 16:53, transmise
+par mesh-design à 16:58. Les anciennes formes pour ameesh sont
+`ameesh:origin/main`, `ameesh:refs/heads/main` et
+`ameesh:refs/remotes/origin/main` ; la forme canonique est `ameesh:main`.
+Pour Nexlink, les mêmes formes de `develop` convergent vers
+`nexlink:develop`. Les formes observées avec plusieurs préfixes doivent aussi
+être inventoriées : `_remote_branch` ne retire qu'un préfixe.
+
+`begin` recalcule la clé, mais `renew` et `observe` conservent le `ticket.key`
+persisté. Un ancien ticket vivant peut donc renouveler une ligne brute pendant
+qu'un écrivain nouveau acquiert la ligne canonique. Une table vide à un relevé
+antérieur ne prouve pas l'exclusion au déploiement.
+
+La bascule doit inventorier les lignes des deux formes et les tickets JSON,
+barrer les nouvelles acquisitions sur l'union des formes pendant le drainage,
+laisser les anciens titulaires terminer ou expirer, puis vérifier l'absence
+d'ancienne ligne vivante **et** d'ancien écrivain capable de réacquérir.
+Aucun ticket vivant n'est renommé : clé, propriétaire et époque restent liés.
+Le relevé de l'auteur (tables vides vers 16:5x) doit être refait au dernier
+geste. Ce contrat n'effectue aucune purge, migration de ticket ni action hôte.

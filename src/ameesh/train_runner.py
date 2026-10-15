@@ -21,7 +21,7 @@ from . import (merge_queue, radar, resolutions, train, train_admissions,
 
 class Passage:
     def __init__(self, cfg, project, *, owner, policy, policy_path,
-                 policy_commit, workflows, provider, mechanics, notify):
+                 policy_commit, workflows, provider, mechanics, notify, impact=None):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
@@ -30,7 +30,20 @@ class Passage:
         self.policy, self.policy_path, self.policy_commit = policy, policy_path, policy_commit
         self.workflows, self.provider, self.notify = workflows, provider, notify
         self.mechanics = mechanics
+        self.impact = impact
         self.epoch = None
+
+    def repository_path(self):
+        target = merge_queue._remote_branch(self.project.target)
+        source = merge_queue.source_of(self.project.repo)
+        return os.path.join(self.cfg.state_dir, "trains", train.digest(
+            [self.project.name, source, target, self.owner]) + ".clone")
+
+    def incident_facts(self, db, *, fallback=None):
+        """Read past packet facts without loading current policy or runtime."""
+        from .train_incidents import PacketFacts
+        return PacketFacts(db, self.project, self.repository_path(),
+                           impact=self.impact, fallback=fallback)
 
     def runtime(self, db):
         """Bind all ports to this passage's storage and private worktree.
@@ -71,11 +84,9 @@ class Passage:
         policy = replace(self.policy, schedule=rules)
         requirement = train_policy.Compiled(rules)
         ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows)
-        source = merge_queue.source_of(self.project.repo)
         # The radar, another target, and another runner may all replay merges
         # concurrently. They must never reset this passage's worktree.
-        directory = os.path.join(self.cfg.state_dir, "trains", train.digest(
-            [self.project.name, source, target, self.owner]) + ".clone")
+        directory = self.repository_path()
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         repository = train_git.Repository(self.project, clone)
         ledger = train_store.Ledger(db, self.project, target, self.owner)

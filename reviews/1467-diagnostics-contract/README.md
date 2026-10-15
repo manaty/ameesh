@@ -43,3 +43,53 @@ Quand ces preuves deviennent disponibles, le consommateur applique les
 champs compilés `ci.environment_red`, `ci.faulty_lot` et
 `merge.post_merge_red` du même canon exact. Le rapport courant `unknown`
 n'autorise aucune exemption environnementale, exclusion ou attribution.
+
+## Lecture après atterrissage
+
+`train_incidents.PacketFacts(db, project, path, impact=..., fallback=...)`
+fournit les ports `lands(repo, head)`, `diagnoses(repo, head)` et
+`links_for(repo, head)`. `path` contient les objets Git publiés ; le lecteur
+ne récupère aucune branche et ne touche pas au checkout. Il relit le manifeste
+SQL par la clé commune, vérifie source/cible, arbre, parents multiparents et
+identités des admissions dans les preuves persistées. Une contradiction
+refuse le relevé ; un manifeste absent peut utiliser le lecteur ordinaire
+`fallback`, dont le traitement des paquets reste prudent.
+
+Chaque membre porte uniquement les fichiers de son diff depuis **sa base de
+divergence avec `plan.base`**, sans résolution heuristique ni diff agrégé. Un
+historique superficiel ou plusieurs bases de divergence sont refusés. Les
+noms d'auteur Git restent absents ; #1681 cherche séparément l'assigné du lot
+candidat. Une branche de lot déplacée après fusion n'altère pas ces faits.
+
+`impact(repo, head)` est un fournisseur qualifié d'artefact mesuré, explicitement
+injecté. Le lecteur contrôle `ameesh-carte/1` et le commit couvert exact avant
+de déléguer à `incident.links_of`. Un artefact absent, périmé ou étranger rend
+`None`, donc `unknown`. Il ne sélectionne aucun chemin local, téléchargement
+ou carte Nexlink. Le callback contextualisé `links_for` évite de transmettre
+la même carte à deux dépôts ou à plusieurs têtes. Le rapport commun est rendu
+seulement si ses cinq champs de paquet correspondent au manifeste exact.
+
+`train_incidents.consume(db, passages, consumer=incident)` route ces trois
+ports par dépôt vers les passages activés explicitement fournis. Une liste
+vide conserve exactement l'appel `incident.consume(db)`. Les autres dépôts
+gardent le lecteur ordinaire d'atterrissage et une carte inconnue. Le
+`Passage.incident_facts` construit son lecteur sur la connexion de l'appel,
+sans charger le canon, le runtime ni son historique courant de qualification.
+
+Le témoin interbranches charge uniquement `incident.py` de #1681 à
+`24ecd619a0b8fcd75750af72d6cc4f368548fb17` et exerce les ports du consommateur :
+
+```sh
+PYTHONPATH=src:. .venv/bin/python reviews/1467-diagnostics-contract/probe.py \
+  --supplier . --commit 24ecd619a0b8fcd75750af72d6cc4f368548fb17
+```
+
+Les cinq témoins utilisent Git réel, stockage et provenance de carte simulés.
+Ils ne rejouent pas la suite du fournisseur. Les sept tests du lecteur sont
+dans `tests/test_1467_train_incidents.py`. Le témoin SQL/Git avec connexion
+fraîche est
+`test_1467_train_runner.TrainRunnerTest.test_post_landing_facts_read_sql_manifest_on_fresh_connection_without_ci`.
+Le dernier raccord dans `incident_once` est :
+`train_incidents.consume(db, getattr(self, 'train_passages', ()), consumer=incident)`.
+Il appartient à la branche du fournisseur #1681 ; les lecteurs seuls ne
+constituent pas une activation ni une sélection de carte qualifiée.

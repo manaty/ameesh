@@ -377,3 +377,24 @@ class TrainRunnerTest(PgTestCase):
         start.assert_not_called()
         promote.assert_not_called()
         self.assertIsNone(passage.epoch)
+
+    def test_post_landing_facts_read_sql_manifest_on_fresh_connection_without_ci(self):
+        passage = self.automatic_passage()
+        plan = passage.step(self.db, self.now)["plan"]
+        self.assertEqual(passage.step(self.db, self.now + 1)["result"], "landed")
+        runtime = passage.runtime(self.db)
+        other = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other.close)
+        with mock.patch.object(passage, "runtime", side_effect=AssertionError("current runtime")):
+            facts = passage.incident_facts(other)
+        self.assertEqual(facts.path, runtime.repository.clone.path)
+        calls = list(self.api_calls)
+        with mock.patch.object(train_ci.GitHub, "read", side_effect=AssertionError("CI read")), \
+                mock.patch.object(train_git.Repository, "target", side_effect=AssertionError("fetch")):
+            rows = facts.lands("o/r", plan["head"])
+            self.assertIsNone(facts.diagnoses("o/r", plan["head"]))
+            self.assertIsNone(facts.links_for("o/r", plan["head"]))
+        self.assertEqual([(r["sha"], r["lot"], r["files"], r["author"]) for r in rows],
+                         [(self.head, plan["members"][0]["work_item_id"], ["content"], "")])
+        self.assertEqual(self.api_calls, calls)
+        self.assertIsNone(passage.epoch)
