@@ -184,6 +184,66 @@ class RoutingTest(sessions._Base):
         self.assertEqual(restants, [mid_b])                   # A remis, B intact
         self.assertNotEqual(mid_a, mid_b)
 
+    def _hook_env(self) -> dict:
+        return {'AGENT_MAIL_NAME': 'worker',
+                'AMEESH_RUNNER_ID': self.worker.runner.runner_id,
+                'AMEESH_LEASE_EPOCH': str(self.worker.epoch),
+                'AMEESH_TURN_ID': ''}
+
+    def _hook(self, out) -> str:
+        payload = json.dumps({'hook_event_name': 'PostToolUse', 'cwd': self.primary,
+                              'session_id': 'session-A'})
+        with mock.patch.dict(os.environ, self._hook_env()), \
+                mock.patch.object(sys, 'stdin', io.StringIO(payload)), \
+                mock.patch.object(sys, 'stdout', out):
+            self.assertEqual(cli.cmd_hook(self.cfg, 'claude'), 0)
+        return out.getvalue()
+
+    def test_hook_and_pick_reach_a_message_behind_a_held_prefix(self):
+        """#811 R3 : deux cents messages d'un lot sans dossier ne masquent plus
+        le message remisable qui les suit — au pick de l'exécuteur comme au
+        hook, qui le remet sans toucher B."""
+        os.rmdir(self.secondary)
+        for n in range(200):
+            mail.send(self.db, 'orch', 'worker', 'B retenu %d' % n,
+                      work_item_id=str(self.b))
+        mid_a = mail.send(self.db, 'orch', 'worker', 'A derrière le préfixe',
+                          work_item_id=str(self.a))
+        spec = self.worker.pick()
+        self.assertIsNotNone(spec)
+        self.assertEqual(spec.get('lot'), str(self.a))
+        self.assertIn('A derrière le préfixe', spec['prompt'])
+        texte = self._hook(io.StringIO())
+        self.assertIn('A derrière le préfixe', texte)
+        self.assertNotIn('B retenu 0', texte)
+        restants = [int(m['id']) for m in mail.unread(self.db, 'worker', limit=300)
+                    if m.get('id')]
+        self.assertNotIn(mid_a, restants)                     # A remis
+        self.assertEqual(len(restants), 200)                  # les B intacts
+
+    def test_active_reservations_do_not_eat_the_hook_bound(self):
+        """#811 R3 : les candidats lus sont passés entiers ; une réservation
+        active (autre jeton) est écartée par le SQL avant sa borne, elle ne
+        vide pas la borne du tour."""
+        from ameesh import backend as backend_mod, identity
+        ids = [mail.send(self.db, 'orch', 'worker', 'A%d' % n, work_item_id=str(self.a))
+               for n in range(4)]
+        # réservation active du bail courant, jamais soldée (panne) : un autre
+        # jeton la porte, la nôtre doit l'écarter sans perdre sa borne
+        mail.reserve(self.db, 'worker', self.worker.runner.runner_id, self.worker.epoch,
+                     'jeton-etranger', ids=ids[:2], porteur='consigne',
+                     ttl_seconds=mail.RESERVATION_TTL)
+        with mock.patch.dict(os.environ, self._hook_env()):
+            bk, _ = backend_mod.open_backend(self.cfg)
+            self.addCleanup(bk.close)
+            binding = identity.resolve_binding(self.cfg, bk.db, harness='claude',
+                                               session_id='session-A')
+            self.assertTrue(binding.bound_to_lease)
+            remise = cli._Remise(self.cfg, bk, 'worker', binding)
+            self.addCleanup(remise.abandonner)
+            msgs = remise.prendre(2)
+        self.assertEqual([int(m['id']) for m in msgs], ids[2:])
+
     def test_lot_wake_skips_a_blocked_lot_and_wakes_the_ready_one(self):
         """#811 B2 : le réveil du lot sans dossier n'est pas consommé ; le lot
         actionnable prêt, derrière lui, est réveillé à sa place."""
