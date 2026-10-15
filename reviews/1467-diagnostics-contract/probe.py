@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Consumer-only #1467/#1681 probe: real Git, fixture storage/map provenance."""
 import argparse
+import ast
 import importlib.util
 import os
 import subprocess
@@ -10,6 +11,7 @@ import types
 import unittest
 from unittest import mock
 
+import ameesh
 from ameesh import ci, train_diagnosis, train_incidents
 from tests.test_1467_train_incidents import PacketFactsTest
 
@@ -51,6 +53,12 @@ class IncidentConsumerTest(PacketFactsTest):
         self.assertEqual(result["missing"], report["missing"])
 
     def test_consume_routes_exact_map_and_manifest_without_cross_repository_assignment(self):
+        self.routing(through_runner=False)
+
+    def test_exact_runner_entry_routes_packet_and_uncovered_repository(self):
+        self.routing(through_runner=True)
+
+    def routing(self, *, through_runner):
         impact = mock.Mock(side_effect=lambda repo, head: self.map(head))
         self.facts.impact = impact
         self.ops.by_issue_ref.return_value = []
@@ -67,6 +75,14 @@ class IncidentConsumerTest(PacketFactsTest):
         passage = types.SimpleNamespace(policy=types.SimpleNamespace(enabled=True),
             incident_facts=mock.Mock(return_value=self.facts))
         fallback = mock.Mock(return_value=[dict(sha="a" * 40, lot=2, files=["one.py"])])
+        result = []
+        consume = supplier.consume
+
+        def observed_consume(*args, **kwargs):
+            lines = consume(*args, **kwargs)
+            result.extend(lines)
+            return lines
+
         with mock.patch.object(supplier, "INTEGRATION",
                                {"o/r": ("main", "p"), "other/r": ("main", "other")}), \
                 mock.patch.object(supplier.storage, "of",
@@ -74,8 +90,18 @@ class IncidentConsumerTest(PacketFactsTest):
                 mock.patch.object(ci, "landed_commits", fallback, create=True), \
                 mock.patch.object(supplier.work, "get", return_value={"assignee": "agent-one"}), \
                 mock.patch.object(supplier.work, "add", side_effect=[{"id": 901}, {"id": 902}]), \
-                mock.patch.object(supplier.work, "assign") as assigned:
-            result = train_incidents.consume(db, [passage], consumer=supplier)
+                mock.patch.object(supplier.work, "assign") as assigned, \
+                mock.patch.object(supplier, "consume", side_effect=observed_consume) as called:
+            if through_runner:
+                runner_log.reset_mock()
+                runner_entry(types.SimpleNamespace(train_passages=(passage,)), db)
+                messages = [call.args[0] for call in runner_log.call_args_list]
+                self.assertEqual(len(messages), 2)
+                self.assertTrue(all("lot #" in message and "ouvert" in message
+                                    for message in messages), messages)
+            else:
+                train_incidents.consume(db, [passage], consumer=supplier)
+            called.assert_called_once()
         by_repo = {row["repo"]: row for row in result}
         self.assertEqual((by_repo["o/r"]["status"], by_repo["o/r"]["lot"]), ("unique", 1))
         self.assertEqual((by_repo["other/r"]["status"], by_repo["other/r"]["lot"]),
@@ -105,6 +131,17 @@ if __name__ == "__main__":
         parser.error("full exact supplier commit required")
     source = subprocess.check_output(["git", "-C", args.supplier, "show",
                                       resolved + ":src/ameesh/incident.py"])
+    runner_source = subprocess.check_output(["git", "-C", args.supplier, "show",
+                                             resolved + ":src/ameesh/runner.py"])
+    runner_class = next(node for node in ast.parse(runner_source).body
+                        if isinstance(node, ast.ClassDef) and node.name == "Runner")
+    entry = next(node for node in runner_class.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "incident_once")
+    runner_log = mock.Mock()
+    namespace = dict(__package__="ameesh", log_async=runner_log)
+    exec(compile(ast.Module(body=[entry], type_ignores=[]),
+                 "<exact supplier Runner.incident_once>", "exec"), namespace)
+    runner_entry = namespace["incident_once"]
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as directory:
         path = os.path.join(directory, "incident.py")
         with open(path, "wb") as output:
@@ -113,6 +150,7 @@ if __name__ == "__main__":
         supplier = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = supplier
         spec.loader.exec_module(supplier)
+        ameesh.incident = supplier
         names = [name for name in IncidentConsumerTest.__dict__ if name.startswith("test_")]
         result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(
             IncidentConsumerTest(name) for name in names))

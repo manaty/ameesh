@@ -76,15 +76,21 @@ gardent le lecteur ordinaire d'atterrissage et une carte inconnue. Le
 `Passage.incident_facts` construit son lecteur sur la connexion de l'appel,
 sans charger le canon, le runtime ni son historique courant de qualification.
 
-Le témoin interbranches charge uniquement `incident.py` de #1681 à
-`24ecd619a0b8fcd75750af72d6cc4f368548fb17` et exerce les ports du consommateur :
+Le raccord #1681 est fourni par deepseek4 le 15 octobre à 17:19 sur
+`6a66ab16729fd3143ce6b4d6a75d3896707d34cf`. Le témoin interbranches charge
+`incident.py` et extrait par AST la méthode exacte `Runner.incident_once` du
+même commit, puis exerce les ports du consommateur et son point d'appel :
 
 ```sh
 PYTHONPATH=src:. .venv/bin/python reviews/1467-diagnostics-contract/probe.py \
-  --supplier . --commit 24ecd619a0b8fcd75750af72d6cc4f368548fb17
+  --supplier . --commit 6a66ab16729fd3143ce6b4d6a75d3896707d34cf
 ```
 
-Les cinq témoins utilisent Git réel, stockage et provenance de carte simulés.
+Les six témoins sont verts avec Git réel, stockage et provenance de carte
+simulés. La chaîne `incident_once → train_incidents.consume → incident.consume`
+ouvre deux incidents, attribue seulement celui du dépôt couvert et garde
+`unknown` pour l'autre, sans double appel du consommateur. Les ports reçoivent
+la connexion de l'appel, le dépôt et la tête attendus.
 Ils ne rejouent pas la suite du fournisseur. Les sept tests du lecteur sont
 dans `tests/test_1467_train_incidents.py`. Le témoin SQL/Git avec connexion
 fraîche est
