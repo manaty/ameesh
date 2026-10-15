@@ -14,7 +14,7 @@ import re
 import time
 import unittest
 
-from ameesh import cost, progress, registry, storage, work
+from ameesh import cost, progress, registry, stagnation, storage, work
 
 from .support import PgTestCase
 
@@ -127,6 +127,69 @@ class JalonsTest(unittest.TestCase):
         self.assertEqual(j["requested"], 100.0)
         self.assertIsNone(j["frozen"])
         self.assertEqual(j["blocked_verdicts"], 0)
+
+    def test_gel_renouvele_meme_sha_preserve_le_verdict(self):
+        """#1389 : un gel administratif renouvelé au MÊME SHA ne refait pas le
+        verdict ; l'avis `ok` posté avant reste courant (lot approuvé)."""
+        sha = "a" * 40
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": sha, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": sha, "verdict": "ok", "actor": "rev1"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": sha, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual(j["last_frozen"], 180.0)
+        self.assertEqual(j["verdict"], 170.0)
+        self.assertTrue(j["verdict_current"])
+        self.assertEqual(progress.lot_state("qa", j), "approved")
+        self.assertEqual(stagnation.waiting({"state": "qa", "assignee": "auteur"}, j)["what"],
+                         "merge")
+
+    def test_verdict_d_une_autre_tete_ne_compte_pas(self):
+        """Un avis nommant une autre tête ne vaut pas pour le gel courant."""
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": "a" * 40, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": "a" * 40, "verdict": "ok",
+             "actor": "rev1"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": "b" * 40, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertFalse(j["verdict_current"])
+        self.assertEqual(progress.lot_state("qa", j), "review")
+        self.assertEqual(stagnation.waiting({"state": "qa", "assignee": "auteur"}, j)["what"],
+                         "verdict")
+
+    def test_gel_renouvele_meme_sha_ne_masque_pas_un_no_go(self):
+        """Un verdict bloquant sur la tête gelée reste bloquant après un gel
+        renouvelé au même SHA : le NO-GO n'est pas masqué (#1389)."""
+        sha = "c" * 40
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": sha, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": sha, "verdict": "blocked",
+             "actor": "rev1"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": sha, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual(j["verdict_kind"], "blocked")
+        self.assertTrue(j["verdict_current"])
+        self.assertEqual(stagnation.waiting({"state": "qa", "assignee": "auteur"}, j)["what"],
+                         "fix")
+
+    def test_plusieurs_lecteurs_le_dernier_avis_sur_la_tete_gagne(self):
+        """Plusieurs lecteurs sur la même tête : l'avis le plus récent tranche ;
+        un `ok` plus récent lève un `blocked` antérieur de la même tête."""
+        sha = "d" * 40
+        declared = [
+            {"kind": "frozen", "at_ts": 150.0, "sha": sha, "actor": "a1"},
+            {"kind": "verdict", "at_ts": 160.0, "sha": sha, "verdict": "blocked",
+             "actor": "rev1"},
+            {"kind": "verdict", "at_ts": 170.0, "sha": sha, "verdict": "ok", "actor": "rev2"},
+            {"kind": "frozen", "at_ts": 180.0, "sha": sha, "actor": "a1"},
+        ]
+        j = progress._jalons_de_lot(self.item, [ev("intake", 100)], [], declared)
+        self.assertEqual((j["verdict_kind"], j["reviewer"]), ("ok", "rev2"))
+        self.assertTrue(j["verdict_current"])
+        self.assertEqual(progress.lot_state("qa", j), "approved")
 
     def test_etats_du_lot(self):
         self.assertEqual(progress.lot_state("build", {}), "active")
@@ -463,6 +526,28 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lots["déduit"]["milestones_source"], "events")
         self.assertEqual(lots["déduit"]["state"], "review")
         self.assertIsNotNone(lots["déduit"]["milestones"]["frozen"])
+
+    def test_gel_renouvele_meme_sha_garde_le_verdict(self):
+        """#1389 : regeler au MÊME SHA après l'avis ne refait pas le verdict ;
+        la frise reste `approved` et l'attente est la fusion, pas une relecture.
+        Un gel sur une AUTRE tête, lui, rouvre la revue."""
+        sha = "a" * 40
+        a = work.add(self.db, title="gel renouvelé", app="demo")
+        work.move(self.db, a["id"], "build")
+        work.move(self.db, a["id"], "qa")
+        work.milestone(self.db, a["id"], "frozen", sha=sha, actor="a1")
+        work.milestone(self.db, a["id"], "verdict", sha=sha, actor="rev1", verdict="ok")
+        work.milestone(self.db, a["id"], "frozen", sha=sha, actor="a1")
+        snap = progress.snapshot(self.db, self.cfg, book=self._book())
+        lot = {l["title"]: l for l in snap["lots"]}["gel renouvelé"]
+        self.assertEqual(lot["state"], "approved")
+        self.assertEqual(lot["waiting_for"]["what"], "merge")
+        # un gel sur une autre tête rouvre bien la revue
+        work.milestone(self.db, a["id"], "frozen", sha="b" * 40, actor="a1")
+        snap = progress.snapshot(self.db, self.cfg, book=self._book())
+        lot = {l["title"]: l for l in snap["lots"]}["gel renouvelé"]
+        self.assertEqual(lot["state"], "review")
+        self.assertEqual(lot["waiting_for"]["what"], "verdict")
 
     def test_vide(self):
         snap = progress.snapshot(self.db, self.cfg, book=self._book())

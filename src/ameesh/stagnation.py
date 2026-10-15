@@ -22,7 +22,8 @@ for all three views, without interpreting notes or changing activity.
    réconciliation (`unknown`) — passe avant tout (`merge-approval`,
    `merge-outcome` pour la fusion `git-merge`, `decision` sinon) ;
 2. `waiting_human` → `decision` (du responsable de la fiche du lot) ;
-3. un verdict `blocked` POSTÉRIEUR au dernier gel → `fix` (l'auteur) ;
+3. un verdict `blocked` portant sur le dernier gel (même SHA, même quand le
+   gel a été renouvelé après l'avis) → `fix` (l'auteur) ;
 4. puis selon l'état : `start`, `build`, `unblock`, `verdict`, `merge`.
 
 `waiting_for` (forme d'origine de L26, champ du même nom de `ameesh-alert/1`)

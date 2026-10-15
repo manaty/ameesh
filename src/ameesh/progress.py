@@ -176,7 +176,10 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
       plus récent), `merged` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
     * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : son auteur ;
-    * `verdict_current` : le verdict retenu est-il postérieur au dernier gel ?
+    * `verdict_current` : le verdict retenu porte-t-il sur le dernier gel ?
+      Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
+      renouvelé plus tard — nomme le même commit ; un avis d'une autre tête
+      ne compte pas ; sans SHA des deux côtés, comparaison des instants ;
     * `blocked_verdicts` : nombre de verdicts bloquants ;
     * `blocks` : nombre de mises en attente (`blocked`, `waiting_human`) ;
     * `source` : `milestones` (table L10) ou `events` (déduction).
@@ -210,12 +213,16 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     rows = [r for r in (declared or []) if r.get("at_ts") is not None]
     if any(r.get("kind") in ("frozen", "verdict") for r in rows):
         source = "milestones"
-        freezes = sorted(r["at_ts"] for r in rows if r.get("kind") == "frozen")
-        verdicts = [(r["at_ts"], r.get("verdict") or "ok", r.get("actor") or None)
+        freezes = [{"at_ts": r["at_ts"], "sha": (r.get("sha") or "").strip()}
+                   for r in rows if r.get("kind") == "frozen"]
+        verdicts = [{"at_ts": r["at_ts"], "kind": r.get("verdict") or "ok",
+                     "actor": r.get("actor") or None, "sha": (r.get("sha") or "").strip()}
                     for r in rows if r.get("kind") == "verdict"]
     else:
         source = "events"
-        freezes, verdicts = ev_freezes, ev_verdicts
+        freezes = [{"at_ts": at, "sha": ""} for at in ev_freezes]
+        verdicts = [{"at_ts": at, "kind": kind, "actor": actor, "sha": ""}
+                    for (at, kind, actor) in ev_verdicts]
     # Une source à la fois, pour des instants cohérents entre eux (le jalon
     # automatique `merged` et l'événement de la même transition diffèrent de
     # quelques microsecondes) : la table entière quand elle porte des
@@ -235,32 +242,59 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         if act.get("connector") != MERGE_CONNECTOR:
             continue
         if act.get("approved_ts"):
-            verdicts.append((act["approved_ts"], "ok",
-                             act.get("auth_approver") or act.get("last_actor") or None))
+            verdicts.append({"at_ts": act["approved_ts"], "kind": "ok",
+                             "actor": act.get("auth_approver") or act.get("last_actor") or None,
+                             "sha": (act.get("sha") or "").strip()})
         if act.get("state") == "confirmed" and merged is None:
             merged = act.get("finished_ts")
 
-    verdicts.sort(key=lambda v: v[0])
+    freezes.sort(key=lambda f: f["at_ts"])
+    verdicts.sort(key=lambda v: v["at_ts"])
     last = verdicts[-1] if verdicts else None
     last_frozen = freezes[-1] if freezes else None
     return {
         "requested": requested,
-        "frozen": freezes[0] if freezes else None,
-        "last_frozen": last_frozen,
-        "verdict": last[0] if last else None,
-        "verdict_kind": last[1] if last else None,
-        "reviewer": last[2] if last else None,
-        "verdict_current": bool(last) and (last_frozen is None or last[0] >= last_frozen),
+        "frozen": freezes[0]["at_ts"] if freezes else None,
+        "last_frozen": last_frozen["at_ts"] if last_frozen else None,
+        "verdict": last["at_ts"] if last else None,
+        "verdict_kind": last["kind"] if last else None,
+        "reviewer": last["actor"] if last else None,
+        "verdict_current": _verdict_applies(last, last_frozen),
         "merged": merged,
-        "blocked_verdicts": sum(1 for v in verdicts if v[1] == "blocked"),
+        "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
         "blocks": blocks,
         "source": source,
     }
 
 
+def _same_commit(a: str | None, b: str | None) -> bool:
+    """Deux identifiants qui nomment le même commit (préfixe admis, casse ignorée).
+    Un identifiant vide n'est jamais « le même commit »."""
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+def _verdict_applies(verdict: dict | None, freeze: dict | None) -> bool:
+    """Le verdict retenu porte-t-il sur la tête du dernier gel ?
+
+    Un avis nomme sa tête (`sha`) : il reste valide tant qu'un gel — même
+    renouvelé plus tard — nomme le même commit, et un avis d'une autre tête ne
+    compte pas. Sans SHA des deux côtés (déduction par le journal, action de
+    fusion), on retombe sur l'instant : l'avis doit suivre le dernier gel."""
+    if verdict is None:
+        return False
+    if freeze is None:
+        return True
+    if _same_commit(verdict.get("sha"), freeze.get("sha")):
+        return True
+    if not (verdict.get("sha") and freeze.get("sha")):
+        return verdict["at_ts"] >= freeze["at_ts"]
+    return False
+
+
 def lot_state(work_state: str, jalons: dict) -> str:
     """État affiché d'un lot (décision 0024) : en revue, il n'est approuvé
-    que par un verdict `ok` postérieur au DERNIER gel."""
+    que par un verdict `ok` qui porte sur le DERNIER gel (même SHA)."""
     if work_state in ("merged", "promoted"):
         return "merged"
     if work_state == "closed":
@@ -268,8 +302,11 @@ def lot_state(work_state: str, jalons: dict) -> str:
     if work_state in _WAITING:
         return "blocked"
     if work_state == "qa":
-        last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
-        if jalons.get("verdict_kind") == "ok" and (jalons.get("verdict") or 0) >= last_frozen:
+        current = jalons.get("verdict_current")
+        if current is None:                 # jalons partiels : repli par les instants
+            last_frozen = jalons.get("last_frozen", jalons.get("frozen")) or 0
+            current = (jalons.get("verdict") or 0) >= last_frozen
+        if jalons.get("verdict_kind") == "ok" and current:
             return "approved"
         return "review"
     return "active"
