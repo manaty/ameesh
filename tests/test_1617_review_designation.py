@@ -276,7 +276,7 @@ class MessageTest(unittest.TestCase):
         text = rd.capacity_message(LOT, freeze={"id": 42, "sha": SHA_A}, required=2,
                                    missing=1, why="1 missing family")
         self.assertIn("Aucune admission implicite", text)
-        self.assertIn("manquantes : 1", text)
+        self.assertIn("manquants : 1", text)
         self.assertIn("frozen #42", text)
 
 
@@ -392,6 +392,41 @@ class ApplyTest(unittest.TestCase):
         with self.assertRaises(rd.DesignationError):
             self.apply(paths=["docs/guide.md"], risk="sensitive")
         self.assertEqual(self.port.commits, [])
+
+    def test_unknown_author_provenance_waits_instead_of_guessing(self):
+        # Une preuve d'auteur (#1465) manquante : l'indépendance ne se prouve
+        # pas, donc on attend — jamais un relecteur désigné au hasard.
+        out = self.apply(unknown_authors=["deadbeef", "cafebabe"])
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertEqual(out["reviewers"], [])
+        self.assertEqual(out["missing"], 2)
+        self.assertIn("provenance unknown", out["why"])
+        self.assertEqual(len(self.port.commits), 1)
+        self.assertEqual(len(self.port.messages), 1)
+        self.assertIn("preuve", self.port.messages[0][1])
+        # La preuve arrive : le même gel peut alors désigner, sans seconde
+        # notification ; la désignation devient la référence.
+        again = self.apply()
+        self.assertEqual(again["state"], rd.DESIGNATED)
+        self.assertFalse(again.get("replayed"))
+        self.assertEqual(len(self.port.messages), 3)  # 1 attente + 2 courriers
+        third = self.apply()
+        self.assertTrue(third.get("replayed"))
+        self.assertEqual(len(self.port.messages), 3)
+
+    def test_capacity_coming_back_designates_on_the_same_freeze(self):
+        pool = candidates(row("claude-one", harness="claude", session="claude"),
+                          row("claude-two", harness="claude", session="claude"))
+        first = self.apply(candidates=pool)
+        self.assertEqual(first["state"], rd.WAITING)
+        self.assertEqual(len(self.port.messages), 1)
+        second = self.apply(candidates=self.pool)  # claude + codex disponibles
+        self.assertEqual(second["state"], rd.DESIGNATED)
+        self.assertFalse(second.get("replayed"))
+        self.assertEqual(len(self.port.messages), 3)
+        third = self.apply(candidates=self.pool)
+        self.assertTrue(third.get("replayed"))
+        self.assertEqual(len(self.port.messages), 3)
 
     def test_no_eligible_reviewer_never_becomes_an_implicit_admission(self):
         authors = [{"name": "a", "family": "deepseek"}, {"name": "b", "family": "codex"},
