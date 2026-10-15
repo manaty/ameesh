@@ -932,6 +932,23 @@ def _open_then_merge(cfg, db, row: dict, marks: list, fire: dict, *, out: dict, 
                          gh=gh, dry_run=dry_run, handle=handle)
 
 
+def _target_lock(db, project, target: str):
+    """Le bail de la cible, commun au train de fusion (#1467) et à la fusion
+    directe du feu.
+
+    `(handle, True)` : un autre hôte tient `land.lock_key(project, target)` :
+    aucun geste. `(None, False)` sans projet ni cible déclarés : il n'y a pas de
+    train à croiser. Le bail est pris après `fire:<lot>` et jamais avant, le
+    train ne prenant jamais `fire:<lot>` : pas de cycle."""
+    if project is None or not target:
+        return None, False
+    ops = storage.of(db).work
+    owner = "fire:%s:%d" % (socket.gethostname(), os.getpid())
+    key = land.lock_key(project, target)
+    epoch = ops.land_lock(key, owner, LOCK_TTL_S)
+    return ((ops, owner, epoch, key), False) if epoch is not None else (None, True)
+
+
 def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, out: dict,
                   slug: str, branch: str, target: str, info: dict, repo: str | None, project,
                   gh, dry_run: bool, handle=None) -> dict:
@@ -984,11 +1001,31 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
         return _not_ready(db, fresh_row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
                           handle=handle)
     head = _norm(fresh_fire.get("sha"))
-    if not _renew(handle):
+    cible, blocked = _target_lock(db, project, target)
+    if blocked:
+        # le train de fusion (ou un autre feu) tient déjà la cible sous le même
+        # bail : aucun geste tant qu'il ne l'a pas rendue (#1467)
         return {"lot": lot, "result": "busy"}
-    ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
-    if ok:
-        out.update(result="merged", detail=error, sha=head)
+    try:
+        if not _renew(handle) or not _renew(cible):
+            return {"lot": lot, "result": "busy"}
+        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
+        if ok:
+            out.update(result="merged", detail=error, sha=head)
+            try:
+                after = _pr_status(slug, branch, gh=gh)
+            except land.LandError:
+                after = None
+            if after is not None and after.get("merged"):
+                return _reconcile(db, fresh_row, fresh_marks, after, slug=slug, repo=repo,
+                                  target=target, dry_run=dry_run)
+            _passive(db, fresh_row.get("assignee"), lot, (
+                "Fire on lot #%d « %s »: PR #%s merged on %s (class %s)."
+                % (lot, fresh_row.get("title") or "", status.get("number"), head[:12],
+                   klass.get("class") or "?")),
+                {"project": fresh_row.get("app") or "", "pr": status.get("number"), "sha": head})
+            return out
+        # la fusion a échoué : relire la PR avant de conclure
         try:
             after = _pr_status(slug, branch, gh=gh)
         except land.LandError:
@@ -996,28 +1033,17 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
         if after is not None and after.get("merged"):
             return _reconcile(db, fresh_row, fresh_marks, after, slug=slug, repo=repo,
                               target=target, dry_run=dry_run)
-        _passive(db, fresh_row.get("assignee"), lot, (
-            "Fire on lot #%d « %s »: PR #%s merged on %s (class %s)."
-            % (lot, fresh_row.get("title") or "", status.get("number"), head[:12],
-               klass.get("class") or "?")),
-            {"project": fresh_row.get("app") or "", "pr": status.get("number"), "sha": head})
+        if after is not None and after.get("head") \
+                and not same_commit(after.get("head"), head, repo):
+            return _invalidate(db, fresh_row, fresh_marks, fresh_fire,
+                               "the PR head moved to %s before the merge, the fire covers %s"
+                               % (after["head"][:12], head[:12]),
+                               status=after, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
+        out.update(result="error", error=error)
         return out
-    # la fusion a échoué : relire la PR avant de conclure
-    try:
-        after = _pr_status(slug, branch, gh=gh)
-    except land.LandError:
-        after = None
-    if after is not None and after.get("merged"):
-        return _reconcile(db, fresh_row, fresh_marks, after, slug=slug, repo=repo, target=target,
-                          dry_run=dry_run)
-    if after is not None and after.get("head") \
-            and not same_commit(after.get("head"), head, repo):
-        return _invalidate(db, fresh_row, fresh_marks, fresh_fire,
-                           "the PR head moved to %s before the merge, the fire covers %s"
-                           % (after["head"][:12], head[:12]),
-                           status=after, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
-    out.update(result="error", error=error)
-    return out
+    finally:
+        if cible is not None:
+            _unlock(cible)
 
 
 def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None, target: str,

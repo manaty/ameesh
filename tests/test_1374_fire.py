@@ -296,11 +296,11 @@ class ActTest(unittest.TestCase):
 
     def _act(self, marks, status, *, gate=(True, "", {"class": "light"}), pr_gate=(True, ""),
              info=None, project=None, dry_run=False, opened=None, fresh=None, renew=True,
-             statuses=None, merge=(True, "PR merged")):
+             statuses=None, merge=(True, "PR merged"), target_blocked=False):
         names = ("_repo_of", "_slug", "_project", "_pr_status", "_repo_info", "_target",
                  "ready_verdicts", "ready_pr", "_merge_pr", "_disarm_auto", "_reconcile",
                  "_invalidate", "_disarm", "_open_pr", "_queue", "_passive", "_wake",
-                 "_leave_queue", "_fresh", "_renew")
+                 "_leave_queue", "_fresh", "_renew", "_target_lock")
         with mock.patch.multiple(fire, **{name: mock.DEFAULT for name in names}) as patched:
             patched["_repo_of"].return_value = None
             patched["_slug"].return_value = "manaty/ameesh"
@@ -323,6 +323,7 @@ class ActTest(unittest.TestCase):
             patched["_leave_queue"].return_value = False
             patched["_fresh"].return_value = fresh if fresh is not None else (self.ROW, marks)
             patched["_renew"].return_value = renew
+            patched["_target_lock"].return_value = (None, True) if target_blocked else (None, False)
             out = fire._act(None, None, self.ROW, marks, gh=lambda *a, **k: None,
                             dry_run=dry_run, repo=None, cache={})
         return out, patched
@@ -404,6 +405,15 @@ class ActTest(unittest.TestCase):
         calls["_merge_pr"].assert_called_once()
         self.assertEqual(calls["_merge_pr"].call_args.args[2], A)
         calls["_open_pr"].assert_not_called()
+
+    def test_direct_merge_yields_to_the_target_lease(self):
+        """#1467 : le train tient la cible sous le même bail -> aucun geste."""
+        marks = _marks(_mark("frozen", A), _mark("fire", A))
+        out, calls = self._act(marks, _status(), target_blocked=True)
+        self.assertEqual(out["result"], "busy")
+        calls["_merge_pr"].assert_not_called()
+        calls["_disarm"].assert_not_called()
+        calls["_reconcile"].assert_not_called()
 
     def test_stale_auto_merge_is_disarmed_before_merging(self):
         marks = _marks(_mark("frozen", A), _mark("fire", A))
@@ -588,6 +598,22 @@ class FireDbTest(PgTestCase):
             self.assertEqual(out, [{"lot": lot, "result": "busy"}])
         finally:
             ops.land_unlock(key, "another-host", epoch)
+
+    def test_target_lease_is_shared_with_the_merge_train(self):
+        """#1467 : la fusion directe prend le bail de cible du train, ou cede."""
+        project = types.SimpleNamespace(name="ameesh")
+        ops = storage.of(self.db).work
+        key = land.lock_key(project, "main")
+        epoch = ops.land_lock(key, "train:runner", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            self.assertEqual(fire._target_lock(self.db, project, "main"), (None, True))
+        finally:
+            ops.land_unlock(key, "train:runner", epoch)
+        handle, blocked = fire._target_lock(self.db, project, "main")
+        self.assertFalse(blocked)
+        self.assertIsNotNone(handle)
+        fire._unlock(handle)
 
     def test_one_rereads_the_milestones_under_the_lease(self):
         """P1-3 : les jalons lus avant le bail ne servent pas au geste."""
