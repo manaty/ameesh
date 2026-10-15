@@ -82,6 +82,60 @@ EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
            for rel in set(SIGNATURES) | set(CONTENUS)}
 
 
+def ecarts_de_classement(cols: dict[str, dict[str, bool]]) -> list[str]:
+    """Colonnes d'un relevé `columns()` ni accordées ni exclues, classées.
+
+    Chaque écart nomme la colonne et l'endroit où la trancher : le contrat des
+    rôles superviseur (`deploy/sql/role-superviseur.sql`, ou
+    `role-superviseur-contenus.sql` pour les contenus) s'il faut la lire, ou
+    `EXCLUES` s'il faut la fermer. Un rouge de ce garde est un classement
+    oublié (#1018), pas un défaut d'environnement : le message doit le dire.
+    """
+    ecarts = []
+    for rel, names in cols.items():
+        for col, lisible in names.items():
+            attendu = col not in EXCLUES.get(rel, set())
+            if lisible == attendu:
+                continue
+            if attendu:
+                ecarts.append(
+                    "%s.%s : refusée — colonne absente du contrat des rôles superviseur "
+                    "(lecture : deploy/sql/role-superviseur.sql ; contenus : "
+                    "deploy/sql/role-superviseur-contenus.sql) ; si elle doit rester "
+                    "fermée, classe-la dans EXCLUES (tests/test_cluster.py)"
+                    % (rel, col))
+            else:
+                ecarts.append(
+                    "%s.%s : lisible — colonne classée fermée (EXCLUES) mais accordée "
+                    "(droit hérité, PUBLIC ou ACL par défaut) ; retire le droit ou "
+                    "reclasse-la" % (rel, col))
+    return ecarts
+
+
+class ClassementColonnesTest(unittest.TestCase):
+    """#1018 : le garde de classement est déterministe ; son message doit
+    désigner le contrat à mettre à jour, pas ressembler à un flake."""
+
+    def test_colonne_neuve_non_classee_nomme_le_contrat(self):
+        ecarts = ecarts_de_classement({"agent_registry": {"roles": False}})
+        self.assertEqual(len(ecarts), 1)
+        self.assertIn("agent_registry.roles", ecarts[0])
+        self.assertIn("deploy/sql/role-superviseur.sql", ecarts[0])
+        self.assertIn("EXCLUES", ecarts[0])
+
+    def test_colonnes_classees_ne_rendent_aucun_ecart(self):
+        self.assertEqual(ecarts_de_classement({
+            "agent_registry": {"roles": True, "public_key": False},
+            "work_items": {"body": False},
+        }), [])
+
+    def test_colonne_exclue_mais_lisible_est_nommee(self):
+        ecarts = ecarts_de_classement({"agent_registry": {"public_key": True}})
+        self.assertEqual(len(ecarts), 1)
+        self.assertIn("agent_registry.public_key", ecarts[0])
+        self.assertIn("lisible", ecarts[0])
+
+
 class ProbeTest(PgTestCase):
     """`doctor --probe` : OK sur un schéma à jour, KO sinon, sans rien écrire."""
 
@@ -497,12 +551,7 @@ class SuperviseurRoleTest(PgTestCase):
     def test_chaque_colonne_est_accordee_ou_exclue(self):
         cols = self.columns()
         self.assertTrue(set(EXCLUES) <= set(cols), set(EXCLUES) - set(cols))
-        ecarts = []
-        for rel, names in cols.items():
-            for col, lisible in names.items():
-                attendu = col not in EXCLUES.get(rel, set())
-                if lisible != attendu:
-                    ecarts.append("%s.%s : %s" % (rel, col, "lisible" if lisible else "refusée"))
+        ecarts = ecarts_de_classement(cols)
         self.assertEqual(ecarts, [], "colonnes ni accordées ni exclues (ou l'inverse)")
 
     def test_le_role_contenus_lit_exactement_les_contenus(self):

@@ -345,11 +345,18 @@ class PgBackend:
                 self.db, name, chantier=identity.chantier_of(name, self.cfg),
                 harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
             return
+        # #1037 : sous bail, le harnais DÉCLARÉ de la ligne n'est jamais
+        # réécrit par un hook — le harnais du tour peut être EMPRUNTÉ (L242b :
+        # un agent critique au seuil tourne sous un autre harnais), et le hook
+        # le faisait clignoter pendant que modèle et session restaient ceux de
+        # la session précédente. `harness=None` : l'ON CONFLICT de `upsert`
+        # garde la valeur existante (la ligne existe — le bail a été vérifié
+        # par `identity.resolve_binding`). Le dossier et l'hôte du tour, eux,
+        # suivent (L61 : sous bail le hook réinscrit le dossier ; L166 a déjà
+        # filtré la session du hook, jamais inscrite sous bail).
         registry.upsert(
-            self.db, name,
-            chantier=identity.chantier_of(name, self.cfg),
-            harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id,
-        )
+            self.db, name, chantier=identity.chantier_of(name, self.cfg),
+            harness=None, host=self.cfg.host, cwd=cwd, session_id=session_id)
 
     def agents(self) -> list[dict]:
         rows = registry.overview(self.db)

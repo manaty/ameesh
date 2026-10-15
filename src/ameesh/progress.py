@@ -472,6 +472,13 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     (`balance.compare`). `accounts` : tous les comptes déclarés de l'hôte,
     toutes leurs fenêtres, la capacité perdue à la prochaine remise à zéro et
     le prochain compte choisi (`accounts.report`, L74).
+
+    `plans` : un plan par jauge. Pour un harnais **sans** compte déclaré, la
+    jauge vient de `gauges` et le rythme est nominal (1.0) ; pour un harnais à
+    comptes déclarés, le plan est celui du compte **actif** — sa jauge
+    (`accounts.report`, `_gauges`) et son `pace_multiplier`, jamais un
+    croisement des deux (#1028 P2). Le rendu texte écarte ces harnais, déjà
+    montrés compte par compte.
     """
     # Les harnais payés au token viennent des descripteurs (L16) : plus de liste
     # fermée dans le code. `None` = les relire maintenant.
@@ -508,6 +515,19 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
     for bucket in spend.values():
         for key in bucket:
             bucket[key] = round(bucket[key], 6)
+    # #1075/#1028 : le plan d'un harnais à comptes déclarés est celui de son
+    # compte ACTIF — ses jauges (`accounts.report`, `_gauges`) et son rythme
+    # (`pace_multiplier` du profil). Appliquer le rythme du compte actif aux
+    # jauges du dossier par défaut mélangerait deux comptes : `used`,
+    # `pace_cap` et `exceeded` ne décriraient plus aucun compte (R1 #1028,
+    # P2). Le rendu texte écarte ces harnais, déjà montrés compte par compte ;
+    # le JSON garde la même valeur qu'`accounts.report`.
+    actifs = {row["harness"]: row for row in (accounts or []) if row.get("active")}
+    plans = [_plan_view(g, now, 1.0) for g in gauges if g.harness not in actifs]
+    for harness, row in actifs.items():
+        multiplicateur = float(row.get("pace_multiplier") or 1.0)
+        plans.extend(_plan_view(g, now, multiplicateur)
+                     for g in row.get("_gauges") or [])
     return {
         "currency": "USD",
         "paid_harnesses": list(paid),
@@ -515,13 +535,19 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "spend": spend,
         "real": list(real or []),
         "by_agent": [r for r in by_agent if r["usd"] or r["turns"] or r["failed_turns"]],
-        "plans": [{
-            "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
-            "pace_cap": round(g.pace_cap(now), 4), "elapsed": round(g.elapsed(now), 4),
-            "resets_ts": _round(g.resets_at), "window_s": g.window_s,
-            "exceeded": g.exceeded(now),
-        } for g in gauges],
+        "plans": plans,
         "accounts": [_account_view(row) for row in (accounts or [])],
+    }
+
+
+def _plan_view(g: cost_mod.Gauge, now: float, multiplier: float) -> dict:
+    """Un plan de `budget.plans` : la jauge et le rythme du même compte."""
+    return {
+        "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
+        "pace_cap": round(g.pace_cap(now, multiplier), 4),
+        "elapsed": round(g.elapsed(now), 4),
+        "resets_ts": _round(g.resets_at), "window_s": g.window_s,
+        "exceeded": g.exceeded(now, multiplier=multiplier),
     }
 
 

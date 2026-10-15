@@ -4,6 +4,7 @@
 `ameesh notify` et leurs seuils réglables."""
 from __future__ import annotations
 
+import dataclasses
 import time
 import unittest
 from unittest import mock
@@ -85,6 +86,21 @@ class PlanUnderusedTest(_Base):
         # seuil réglable, et 0 désactive
         self.assertEqual(self.alertes(plan_pace_gap_pct=40), [])
         self.assertEqual(self.alertes(plan_pace_gap_pct=0), [])
+
+    def test_le_rythme_percu_suit_le_multiplicateur_du_profil(self):
+        # #1028 P3 : 30 % utilisés à 3/7 écoulés — écart 23 points au rythme
+        # nominal (sous le seuil de 25, pas d'alerte), 60 points au rythme du
+        # compte primaire Codex (2 × 3/7 + 10, plafonné à 90 %) → alerte.
+        self.jauge("codex", "codex-10080min", 0.30, 4 * JOUR, 7 * JOUR, account="primaire")
+        self.assertEqual(self.alertes(), [])
+        cfg = dataclasses.replace(self.cfg, accounts={"codex": [
+            {"name": "primaire", "pace_multiplier": 2.0}, {"name": "secondaire"}]})
+        out = _types(exploitation.alerts(cfg, self.db, now=self.now, **_seuils()),
+                     "plan_underused")
+        self.assertEqual([(a["account"], a["reason"]) for a in out],
+                         [("primaire", "sous_rythme")])
+        self.assertAlmostEqual(out[0]["pace_cap"], 0.90, places=4)
+        self.assertIn("allowed pace of 90 %", out[0]["detail"])
 
     def test_debut_de_fenetre_et_fenetre_courte_hors_rythme(self):
         # 10 % écoulés seulement : l'écart ne dit encore rien
