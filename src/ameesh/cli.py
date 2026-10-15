@@ -245,10 +245,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
-    # #964 : `--assign` = le geste explicite qui autorise un `--lot` à
-    # assigner un lot LIBRE (ou tenu par un humain) au destinataire, même
-    # hors détection d'orchestrateur (historique L94 compris) ; jamais un
-    # lot tenu par un agent (#1066).
+    # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
+    # FREE lot (or one held by a human) to the recipient, even outside the
+    # orchestrator detection (L94 history included); never a lot held by an
+    # agent (#1066).
     assign = "--assign" in args
     args = [arg for arg in args if arg != "--assign"]
     # #506: --app may name a project nobody declares yet, on purpose

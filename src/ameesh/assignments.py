@@ -34,10 +34,10 @@ Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
 lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
 Correctif du 2026-10-13 (#1066) : la remise implicite du lot tenu par
 l'expéditeur lui-même est refusée comme celle du lot d'un autre agent.
-Ajout #964 : `--assign` est le geste explicite qui autorise l'attribution
-d'un lot LIBRE (ou tenu par un humain) par un expéditeur que l'historique
-ne détecte pas comme orchestrateur ; il ne prend jamais le lot d'un agent,
-même le sien (la remise passe par `ameesh work assign`).
+Added #964: `--assign` is the explicit gesture that lets a sender the history
+does not detect as an orchestrator hand over a FREE lot (or one held by a
+human); it never takes a lot held by an agent, not even its own (handing over
+goes through `ameesh work assign`).
 """
 from __future__ import annotations
 
@@ -157,12 +157,12 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     message perdu emportait le réveil ; un réveil différé se rattrape à la
     prochaine réclamation.
 
-    `assign` (#964) : le geste explicite `--assign` du courrier. Sans lui, un
-    `--lot` n'assigne que venant d'un expéditeur que la détection
-    d'orchestrateur reconnaît (dont l'historique de distribution, L94) ; il
-    reste sinon une étiquette de fil. Avec lui, tout expéditeur peut confier
-    un lot LIBRE (ou tenu par un humain), jamais un lot tenu par un agent —
-    même le sien (#1066) : la remise passe par `ameesh work assign`.
+    `assign` (#964): the message's explicit `--assign` gesture. Without it, a
+    `--lot` only assigns when it comes from a sender the orchestrator
+    detection recognises (including the distribution history, L94); otherwise
+    it stays a plain thread label. With it, any sender can hand over a FREE
+    lot (or one held by a human), never a lot held by an agent — not even its
+    own (#1066): handing over goes through `ameesh work assign`.
 
     L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
     est obligatoire quand l'expéditeur est un agent (refus, rien n'est
@@ -187,13 +187,15 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         has_open = bool(work_mod.open_lots(db, recipient))
         if lot is None and has_open:
             return out
-        # #964 : `--assign` est le geste explicite qui dispense de la
-        # détection d'orchestrateur. Sans lui, l'historique de distribution
-        # (L94) garde le droit de confier un lot LIBRE — c'est ainsi que le
-        # bureau distribue (canon §4, #859) ; un lot tenu par un agent, lui,
-        # n'est jamais remis par l'étiquette, même à un orchestrateur
-        # déclaré (#1066, plus bas).
-        orchestrator = is_orchestrator(cfg, db, sender)
+        # #964: `--assign` is the explicit gesture that does without the
+        # orchestrator detection. Without it, the distribution history (L94)
+        # keeps the right to hand over a FREE lot — that is how the bureau
+        # distributes (canon §4, #859); a lot held by an agent is never handed
+        # over by the label, even to a declared orchestrator (#1066, below).
+        # #1701 N2: with `--assign` the gesture decides alone, so the
+        # detection (a canon read) is not consulted. `out["orchestrator"]`
+        # has no consumer; it reports the detection only when it ran.
+        orchestrator = is_orchestrator(cfg, db, sender) if not assign else False
         if not assign and not orchestrator:
             # une étiquette qui désigne un lot ouvert est rendue par son
             # numéro, pour tout expéditeur : le fil, l'activité du lot et le
@@ -252,6 +254,13 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         elif lot is not None:
             item = resolve_lot(db, lot)
             if item is None:
+                if assign:
+                    # #1701 N1: the explicit gesture names the lot to assign;
+                    # a reference matching no open lot is refused before any
+                    # deposit instead of degrading to a plain thread label.
+                    raise AssignmentError(
+                        "--assign: --lot %s matches no open lot (nothing is deposited; "
+                        "to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
                 out["warnings"].append(
                     "--lot %s matches no open lot: kept as a plain thread label "
                     "(to create the lot: --new-lot \"title\", or ameesh work add)" % lot)
