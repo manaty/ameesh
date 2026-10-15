@@ -243,15 +243,21 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # Lecture sur l'hôte, jamais depuis PERSONAS_VM ni les unités déjà actives :
 # une unité manquante doit être contrôlée elle aussi. Ignorer et nommer les
 # noms invalides ; ne pas transformer un registre vide en succès.
+# `avec-arretes` inclut les personas arrêtées du registre : le redémarrage de
+# déploiement doit recharger leur unité si elle tourne encore (#1633), là où le
+# contrôleur ne les attend pas (aucun bail d'une persona arrêtée).
 agents_du_registre() {
-  local noms
+  local arretes=${1:-} noms
   noms=$(ameesh_agents list --json | python3 -c 'import json,re,sys
 rows = json.load(sys.stdin)
+avec_arretes = sys.argv[2:] == ["avec-arretes"]
 # Même règle que ameesh.config.NAME_RE (config.py:48), utilisée par
 # registry._check_name : 1 à 64 caractères, lettres/chiffres puis . _ -.
 names = set()
 for r in rows:
-    if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute" or r.get("status") == "stopped":
+    if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
+        continue
+    if r.get("status") == "stopped" and not avec_arretes:
         continue
     name = r.get("name")
     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
@@ -260,7 +266,7 @@ for r in rows:
     names.add(name)
 names = sorted(names)
 if not names: sys.exit("aucun agent à mener sur " + sys.argv[1])
-print("\n".join(names))' "$HOTE_AGENTS") || return 1
+print("\n".join(names))' "$HOTE_AGENTS" "$arretes") || return 1
   printf '%s\n' "$noms"
 }
 
@@ -271,7 +277,9 @@ echec_agent() {
 redemarrer_agents() {
   local liste p st avant ligne heure attendu tenu
   local non_verifiees=() unites=()
-  liste=$(agents_du_registre) || return 1
+  # #1633 : inclure les personas arrêtées pour recharger leur unité encore
+  # active ; le contrôleur, lui, ne les attend pas.
+  liste=$(agents_du_registre avec-arretes) || return 1
   mapfile -t unites <<<"$liste"
   etape "exécuteurs de $HOTE_AGENTS (${#unites[@]}), arrêt prouvé avant chaque démarrage"
   for p in "${unites[@]}"; do
@@ -279,10 +287,25 @@ redemarrer_agents() {
     # toucher une unité que cet hôte ne doit plus mener.
     st=$(ameesh_agents show "$p" --json | python3 -c 'import json,sys
 r=json.load(sys.stdin)
-if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute" or r.get("status") == "stopped":
+if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute":
     print("skip")
 else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
-    if [ "$st" = skip ]; then echo "$p : placement modifié ou arrêté, ignoré"; continue; fi
+    if [ "$st" = skip ]; then echo "$p : placement modifié, ignoré"; continue; fi
+    # #1131/#1633 : persona arrêtée — son unité encore active est seulement
+    # rechargée sur le nouveau code, sans bail ni tour ; une unité déjà
+    # arrêtée n'est pas relancée (elle chargera le nouveau code à son
+    # démarrage).
+    if [ "$st" = stopped ]; then
+      if unite_systemctl "$(unite_agents "$p")" is-active --quiet; then
+        redemarrer_hors_tour "$(unite_agents "$p")" \
+          && unite_systemctl "$(unite_agents "$p")" is-active --quiet \
+          || { echec_agent "$p" "unité d'une persona arrêtée : arrêt non prouvé ou ne redémarre pas"; return 1; }
+        echo "$p : arrêté dans le registre — unité rechargée sur le nouveau code, aucun tour"
+      else
+        echo "$p : arrêté dans le registre — unité déjà arrêtée, rien à recharger"
+      fi
+      continue
+    fi
     ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
       || { echec_agent "$p" "registre, heure de base ou ExecStart illisible, aucun restart"; return 1; }
     avant=$(bail_epoque <<<"$ligne")
@@ -819,10 +842,19 @@ redemarrer() {
   etape "exécuteurs du serveur (${#unites[@]}), arrêt prouvé avant chaque démarrage"
   for p in "${unites[@]}"; do
     st=$(statut "$p")
-    # #1131 : persona arrêtée par le propriétaire — son unité active n'est
-    # pas réactivée (le mode agents filtre déjà `stopped`).
+    # #1131 : persona arrêtée par le propriétaire — un déploiement ne la
+    # réactive pas.
+    # #1633 : son unité encore active est seulement rechargée sur le nouveau
+    # code, sans bail ni tour ; une unité déjà arrêtée n'est pas relancée.
     if [ "$st" = stopped ]; then
-      echo "$p : arrêté dans le registre — unité ameesh-runner@$p ignorée, pas de redémarrage"
+      if unite_systemctl "ameesh-runner@$p" is-active --quiet; then
+        redemarrer_hors_tour "ameesh-runner@$p" && sleep 10 \
+          && unite_systemctl "ameesh-runner@$p" is-active --quiet \
+          || { echo "$p : unité d'une persona arrêtée, ne redémarre pas — journalctl -u ameesh-runner@$p -n 50" >&2; exit 1; }
+        echo "$p : arrêté dans le registre — unité rechargée sur le nouveau code, aucun tour"
+      else
+        echo "$p : arrêté dans le registre — unité déjà arrêtée, rien à recharger"
+      fi
       continue
     fi
     # #502: only a runner that held its lease must take it again (bail.sh)
