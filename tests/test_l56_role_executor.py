@@ -25,10 +25,9 @@ ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
 #: et vivent dans le CLUSTER, pas dans la base du run : sur le banc partagé,
 #: deux runs simultanés du module se marchaient dessus (DROP ROLE 2BP01, ACL
 #: laissée par l'autre run). Les verrous consultatifs étant pris par base, on
-#: sérialise la séquence création/usage/destruction avec un verrou de session
-#: posé sur la base du banc, commune aux runs.
-MODULE_WRITERS_LOCK = "SELECT pg_advisory_lock(hashtextextended('ameesh-role-module-writers', 0))"
-MODULE_WRITERS_UNLOCK = "SELECT pg_advisory_unlock(hashtextextended('ameesh-role-module-writers', 0))"
+#: sérialise la séquence création/usage/destruction dans une transaction
+#: persistante sur la base du banc, commune aux runs (y compris en psql).
+MODULE_WRITERS_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))"
 
 
 class RoleExecutorTest(PgTestCase):
@@ -162,8 +161,8 @@ class RoleExecutorTest(PgTestCase):
         names = ("ameesh_canon_sync", "ameesh_it_proof", "ameesh_it_qa")
         # noms fixes du contrat, partagés par le cluster : sérialiser les runs
         # concurrents du banc (cf. MODULE_WRITERS_LOCK).
-        self.admin_db.execute(MODULE_WRITERS_LOCK)
-        try:
+        with self.admin_db.transaction() as lock_db:
+            lock_db.execute(MODULE_WRITERS_LOCK)
             placeholders = ", ".join(["%s"] * len(names))
             existing = {r["rolname"] for r in self.db.query(
                 "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
@@ -190,8 +189,6 @@ class RoleExecutorTest(PgTestCase):
                     self.db.execute("DROP OWNED BY %s" % q(name))
                     if name not in existing:
                         self.db.execute("DROP ROLE %s" % q(name))
-        finally:
-            self.admin_db.execute(MODULE_WRITERS_UNLOCK)
 
     def test_isolated_writer_records_observed_execution_without_policy_rights(self):
         import sys
