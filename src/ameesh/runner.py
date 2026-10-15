@@ -182,6 +182,10 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 LIVE_REVIEW_START_SLACK_S = 300.0
 #: L85 : rétention du journal d'événements, au plus une fois par heure
 EVENTS_PRUNE_EVERY_S = 3600.0
+#: #1425 (N5) : `measurement_actor` relit les canons ; le balayage des arrêts
+#: délibérés tourne à chaque passe — on espace cette lecture d'une fenêtre,
+#: l'auditeur nommé (`auditeur`) restant résolu sans canon.
+MEASURE_CANONS_TTL_S = 300.0
 
 
 def _finite_ts(value) -> bool:
@@ -5923,6 +5927,85 @@ class Runner:
             log_async("event log: %d event(s) past retention deleted" % gone)
         return gone
 
+    def release_stopped_lots_once(self) -> list[dict]:
+        """#753 : un agent arrêté ne garde pas ses lots. À chaque passe qui
+        atteint la reprise — après les gardes secteur/drainage/code périmé
+        (#1425, N2) —, les lots ouverts d'un agent `stopped` retournent à la
+        file d'équipe, et ses lots promus dont la mesure reste à refaire vont à
+        l'auditeur.
+
+        Seuls les arrêts DÉLIBÉRÉS (`stop_reason` dans
+        `work.RELEASABLE_STOP_REASONS`) dessaisissent : un arrêt automatique et
+        réversible (`erreur` de `stop_after_failures`, `retire_du_canon` que
+        `canon.revive` annule, bail expiré) laisse l'agent reprendre ses lots —
+        sinon une panne fournisseur viderait en rafale tous ses lots (R2
+        Claude, B1). La transaction de `release_agent` revérifie elle-même
+        l'état du registre (`stopped_with`, N3). Ne dépend d'aucun agent : tout
+        exécuteur vivant le fait ; idempotent. Une erreur de base n'est pas
+        fatale à la passe ; `--dry-run` dit ce qui serait fait sans écrire."""
+        from . import work as work_mod
+
+        if getattr(self, "mediated", False):
+            return []  # L109 : le registre est tenu par le serveur
+        try:
+            agents = registry.overview(self.db)
+        except db_mod.DbError as exc:
+            message = "stopped agents not swept (%s)" % exc
+            if message != getattr(self, "_stopped_lots_error", None):
+                log_async(message)
+            self._stopped_lots_error = message
+            return []
+        self._stopped_lots_error = None
+        # #1425 (N5) : ne payer la résolution de l'auditeur (lecture des canons)
+        # que s'il y a un arrêt délibéré à dessaisir ; le balayage tourne à
+        # chaque passe.
+        stopped = [a for a in agents if a.get("status") == "stopped"
+                   and a.get("stop_reason") in work_mod.RELEASABLE_STOP_REASONS]
+        if not stopped:
+            return []
+        cache = getattr(self, "_measure_canons_cache", None)
+        now = time.time()
+        if cache is None or cache[0] <= now:
+            cache = (now + MEASURE_CANONS_TTL_S,
+                     work_mod.configured_canons(getattr(self, "cfg", None)))
+            self._measure_canons_cache = cache
+        measure_actor = work_mod.measurement_actor(
+            self.db, self.cfg, listing=agents, canons=cache[1])
+        measure_reason = ("promoted lot whose measurement is still to be redone: "
+                          "handed to %s (#753)" % measure_actor) if measure_actor else ""
+        out: list[dict] = []
+        # B1 (R2 Claude) : un arrêt automatique et réversible — `erreur` de
+        # `stop_after_failures`, `retire_du_canon` que `canon.revive` annule,
+        # bail expiré — ne dessaisit pas : l'agent relancé retrouve ses lots.
+        # Seul un arrêt délibéré (manuel) les rend.
+        for agent in stopped:
+            try:
+                done = work_mod.release_lots(
+                    self.db, agent["name"],
+                    reason="agent stopped: returned to the team queue (#753)",
+                    actor="runner %s" % self.runner_id,
+                    measure_actor=measure_actor, measure_reason=measure_reason,
+                    dry_run=self.dry_run,
+                    stopped_with=work_mod.RELEASABLE_STOP_REASONS)
+            except db_mod.DbError as exc:
+                message = "stopped lots of %s not released (%s)" % (agent["name"], exc)
+                if message != getattr(self, "_stopped_lots_error", None):
+                    log_async(message)
+                self._stopped_lots_error = message
+                continue
+            for row in done:
+                to = row.get("assigned_to")
+                if to:
+                    log_async("lot #%s handed to %s (%s stopped, measurement to redo)%s"
+                              % (row["id"], to, agent["name"],
+                                 " [dry-run]" if row.get("dry_run") else ""))
+                else:
+                    log_async("lot #%s returned to the team queue (%s stopped)%s"
+                              % (row["id"], agent["name"],
+                                 " [dry-run]" if row.get("dry_run") else ""))
+            out.extend(done)
+        return out
+
     def sweep(self) -> None:
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
@@ -5960,6 +6043,12 @@ class Runner:
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
             return  # host gate closed: registry diagnosis without taking a lease
+        # #1425 (N2) : le dessaisissement des arrêts délibérés vient APRÈS les
+        # gardes (secteur, drainage, code périmé, porte) : sous l'une d'elles
+        # l'exécuteur n'agit pas sur la file, et un runner périmé ne dessaisit
+        # pas avec une logique ancienne. Il précède la reprise des agents : la
+        # file est à jour avant les nouvelles prises.
+        self.release_stopped_lots_once()
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -7914,6 +8003,25 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     # `stopped_with_mail` (l'humain sait qu'il l'a arrêté)
     registry.set_status(db, args[0], "stopped", status_text="stopped by hand",
                         stop_reason="manuel")
+    # #753 : un agent arrêté ne garde pas ses lots — ses lots ouverts
+    # retournent à la file d'équipe (assignee = NULL, journal avec la raison),
+    # et ses lots promus dont la mesure reste à refaire vont à l'auditeur.
+    # `stopped_with` referme la course avec une reprise simultanée (B1/N3).
+    from . import work as work_mod
+    measure_actor = work_mod.measurement_actor(db, cfg)
+    returned = work_mod.release_lots(
+        db, args[0],
+        reason="stopped by hand: returned to the team queue (#753)",
+        actor="stop", measure_actor=measure_actor,
+        measure_reason=("promoted lot whose measurement is still to be redone: "
+                        "handed to %s (#753)" % measure_actor) if measure_actor else "",
+        stopped_with=work_mod.RELEASABLE_STOP_REASONS)
+    for row in returned:
+        to = row.get("assigned_to")
+        if to:
+            log("lot #%s handed to %s (measurement to redo)" % (row["id"], to))
+        else:
+            log("lot #%s returned to the team queue" % row["id"])
     log("agent %s marked stopped" % args[0])
     return 0
 
