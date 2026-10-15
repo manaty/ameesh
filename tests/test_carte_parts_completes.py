@@ -106,15 +106,19 @@ class MiroirDesPartsTest(unittest.TestCase):
         # sur échec : il ne publie rien (quota d'artefacts).
         section = WORKFLOW.split("\n  carte:\n", 1)[1]
         etapes = section.split("    steps:\n", 1)[1]
-        blocs = etapes.split("\n      - ")[1:]
+        # la première étape suit `steps:` sans saut de ligne : on le remet
+        blocs = ("\n" + etapes).split("\n      - ")[1:]
         publication = [b for b in blocs
                        if "actions/upload-artifact" in b or "actions/cache/save" in b]
         self.assertTrue(publication, "aucune étape de publication dans le job carte")
+        # toute condition qui fait tourner une étape après un échec, pas
+        # seulement la graphie `if: always()`
+        sur_echec = re.compile(r"^\s*if:.*(\b(always|failure)\(\)|!\s*cancelled\(\))", re.M)
         for bloc in publication:
-            self.assertNotIn("if: always()", bloc,
-                             "une étape de publication ne tourne pas sur échec")
+            self.assertNotRegex(bloc, sur_echec,
+                                "une étape de publication ne tourne pas sur échec")
         for bloc in blocs:
-            if "if: always()" in bloc:
+            if sur_echec.search(bloc):
                 self.assertIn("continue-on-error: true", bloc,
                               "seul un ménage tolérant tourne sur échec")
         self.assertIn("actions/cache/save@v4", etapes)
