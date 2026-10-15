@@ -12,6 +12,9 @@ import inspect
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import typing
 import unittest
 
@@ -170,6 +173,18 @@ class TableTest(unittest.TestCase):
 class EnveloppesTest(unittest.TestCase):
     def setUp(self):
         self.c = C.load()
+
+    def test_generateur_reproduit_les_dores(self):
+        """La régénération reste complète et conserve les cas ajoutés au contrat."""
+        with tempfile.TemporaryDirectory(prefix="executor-goldens-") as generated:
+            result = subprocess.run(
+                [sys.executable, os.path.join(REPO, "tests", "golden", "generate_executor.py"), generated],
+                cwd=REPO, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(os.listdir(generated)), set(os.listdir(GOLDEN_DIR)))
+            for name in sorted(os.listdir(GOLDEN_DIR)):
+                with self.subTest(family=name), open(os.path.join(generated, name), encoding="utf-8") as fh:
+                    self.assertEqual(json.load(fh), _golden(name))
 
     def test_dores_couvrent_chaque_operation(self):
         covered = {case["op"] for case in _op_cases()}
