@@ -107,3 +107,27 @@ Two consequences:
 `--take-idle 0`, `--take-lot-idle 0` and `--dry-run` keep their meaning; a
 per-agent cap (`CostBook.over`) and a host under pressure, on low battery or
 not ready still stop the pickup.
+
+# Amendment of 2026-10-15: a lot that waits on a prerequisite does not wait for an agent
+
+Lot #1625, framed by the pilot (mesh-design, 15/10 21:40). §3 and §6 counted
+every open lot without an assignee: one lot held back by its dependency or
+by a later planned start kept the whole mesh off the backlog, and kept
+`backlog_empty` quiet, although no agent could start it.
+
+## Amended rule (§3, §6)
+
+**Only startable lots close the gate.** A project lot is waiting for a taker
+when it has no planned wait (L368, `planned_waits.read`): no open explicit
+dependency, no open commitment whose `depends_on` names an open lot or
+package, no planned start in the future. A lot held by such a wait is waiting
+for its prerequisite; it does not stop the automatic pickup of an improvement,
+nor the `backlog_empty` alert.
+
+- A startable human lot keeps absolute priority: if one is waiting, nobody takes an
+  improvement, as before (`idle_capacity` reports it).
+- Fail-closed: if the waits cannot be read, every lot stays counted and
+  the gate stays closed.
+- Nothing else changes: agent, budget, capacity and host guards, the pickup
+  caps, and the lot pickup (L165) itself. A held lot stays in the queue,
+  and is never forced on anyone.
