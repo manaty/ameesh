@@ -494,10 +494,14 @@ def review_proposal_message(item: dict, agent: str, *, kind: str, family: str) -
 
 
 def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
-    return ("Automatic take (L165): %s, idle for %d min, took lot #%d of "
+    """L'avis aux orchestrateurs d'une prise L165. #1677 (b) : le motif est
+    « aucun lot actionnable », jamais le temps depuis le dernier tour (N9) —
+    `idle_for_s` reste en signature pour les appels existants, il ne décrit
+    plus la règle."""
+    return ("Automatic take (L165): %s, without an actionable lot, took lot #%d of "
             "team %s, which had no assignee: %s. To give it to someone else: "
             "ameesh work assign %d <agent>." % (
-                agent, int(idle_for_s // 60), int(item["id"]), item.get("lot_team"),
+                agent, int(item["id"]), item.get("lot_team"),
                 item["title"], int(item["id"])))
 
 
@@ -552,12 +556,21 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if teams[name] == team] or known)
 
 
-def _propose_reviews(db, st, listing, *, pool, room, dry_run=False) -> list:
+def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
+                     skip=(), within_budget=None, wakeable=None) -> list:
     """#1677 (c) : apparie les lots en attente de relecture — ou de correction —
     aux agents au repos. Une relecture va à l'autre famille de modèles que
     l'auteur (canon §2) ; une correction peut aller à n'importe quel agent au
     repos, du moment que l'auteur du lot est occupé (corps du lot #1677). Les
     relectures passent avant les corrections.
+
+    L'appariement suit les mêmes gardes qu'une prise (B4, N1) : `lot_fits`
+    (équipe résolue comme `unassigned_lots`, capacités, garde de classe #803)
+    pour une correction comme pour une relecture — le canon §2 ajoute la
+    famille, il n'en dispense pas —, `may_take` de l'auditeur, plafond de
+    budget, agent réveillable (#1021), jamais un orchestrateur. L'auteur du
+    lot est écarté (B3) et sa famille se lit sur sa session vivante
+    (`review_lot._author`, #1037).
 
     Rend les propositions dans la forme des prises (`item`, `agent`,
     `message_id`, `kind` valant `review` ou `correction`, `notified`). Le lot
@@ -566,7 +579,11 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False) -> list:
     from . import mail, registry, review_lot
     if room <= 0 or not pool:
         return []
-    rows = st.work.review_proposals(room, proposal_prefix=REVIEW_PROPOSAL_NOTE,
+    # N6 : lire plus large que la pièce demandée — l'appariement (famille,
+    # équipe, capacités) écarte en Python, un LIMIT trop court laisserait six
+    # lots non appariables bloquer tous les suivants.
+    rows = st.work.review_proposals(max(int(room) * 6, 24),
+                                    proposal_prefix=REVIEW_PROPOSAL_NOTE,
                                     window_s=REVIEW_PROPOSAL_WINDOW_S)
     if not rows:
         return []
@@ -579,39 +596,64 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False) -> list:
         if len(out) >= room:
             break
         name = row["name"]
+        if name in skip:
+            continue
+        if within_budget is not None and not within_budget(row):
+            continue
+        if wakeable is not None:
+            # N1 : la garde d'attribution (#1021, agent retenu) vaut aussi pour
+            # une proposition — un courrier à un agent sans tour bloquerait le
+            # lot jusqu'à la fenêtre suivante.
+            name = wakeable(name)
+            if not name:
+                continue
         reg = dict(row, **(registry.get(db, name) or {}))
         mine = registry.live_harness(reg).strip().lower()
         if not mine:
             continue
+        from . import auditor as auditor_mod
+        if not auditor_mod.may_take(reg, canons):
+            continue
+        auditors = auditor_mod.cards([reg], canons)
         for item in rows:
             lot = int(item["id"])
             if lot in used:
                 continue
             author = (item.get("assignee") or "").strip()
-            author_reg = by_name.get(author) or registry.get(db, author) or {}
-            want = review_lot.reviewer_family(registry.live_harness(author_reg))
+            if name == author:
+                continue                  # B3 : on ne relit pas son propre lot
+            # B4 : la prise d'un lot exige son équipe, ses capacités et la
+            # garde de classe (#803) ; une proposition suit la même règle.
+            if not lot_fits(item, reg, auditor=name in auditors,
+                            card=auditors.get(name), others=listing):
+                continue
             correction = (item.get("last_verdict") or "") == "blocked"
+            family = ""
             if correction:
                 author_row = by_name.get(author)
                 # auteur occupé : il a un autre lot actionnable que celui-ci
                 if author_row is not None and int(author_row.get("actionable_lots") or 0) <= 1:
                     continue
             else:
-                # relecture : l'autre famille que celle de l'auteur (canon §2) ;
-                # famille d'auteur inconnue, toute famille connue fait l'affaire
+                # relecture : l'autre famille que celle de l'auteur (canon §2),
+                # lue sur sa session vivante (#1037) ; famille d'auteur
+                # inconnue, toute famille connue fait l'affaire
+                author_info = review_lot._author(db, author)
+                want = review_lot.reviewer_family(author_info.get("harness"))
                 if want == review_lot.UNKNOWN_FAMILY:
                     ok = mine in ("codex", "claude")
                 else:
                     ok = mine == want
                 if not ok:
                     continue
+                family = want
             kind = "correction" if correction else "review"
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
             if not dry_run:
                 message_id = mail.send(
                     db, SENDER, name,
-                    review_proposal_message(item, name, kind=kind, family=want),
+                    review_proposal_message(item, name, kind=kind, family=family),
                     kind="event", work_item_id=str(lot), payload=payload)
                 st.work.note(lot, item.get("state") or "qa",
                              "%s: lot #%d to %s (%s)" % (REVIEW_PROPOSAL_NOTE, lot, name, kind),
@@ -722,13 +764,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             return False
 
     taken: list = []
+    # un orchestrateur répartit : il ne se sert pas lui-même, ni d'un lot ni
+    # d'une proposition de relecture (#1677)
+    if orchestras is None:
+        try:
+            orchestras = sous_utilisation.orchestrators(cfg, db, listing)
+        except Exception:
+            orchestras = []
     if lots:
-        # un orchestrateur répartit : il ne se sert pas lui-même
-        if orchestras is None:
-            try:
-                orchestras = sous_utilisation.orchestrators(cfg, db, listing)
-            except Exception:
-                orchestras = []
         # L165b : un agent dont tous les lots attendent un autre est libre
         pool = candidates(lot_idle_s, skip=set(orchestras), waiting_free=True)
         for row in pool:
@@ -788,15 +831,25 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                               "message_id": message_id, "kind": "lot", "notified": notified})
                 break
     # #1677 (c) : aucun lot n'a été pris — proposer aux agents au repos une
-    # relecture (lot en qa sans verdict, autre famille que l'auteur), puis une
-    # correction (verdict bloquant, auteur occupé). Ces propositions passent
-    # avant la file d'améliorations : du travail réel sur des lots en cours.
+    # relecture (lot en qa sans verdict courant, autre famille que l'auteur),
+    # puis une correction (verdict courant bloquant, auteur occupé). Ces
+    # propositions passent avant la file d'améliorations : du travail réel sur
+    # des lots en cours. Elles suivent les mêmes gardes qu'une prise (B4, N1).
     if not taken:
         proposal_room = max(0, REVIEW_PROPOSAL_MAX_PER_HOUR
                             - st.work.auto_takes_since(TAKE_WINDOW_S, REVIEW_PROPOSAL_NOTE))
+
+        def wakeable(name):
+            try:
+                return work.check_assignee(db, name, cfg=cfg)["assignee"]
+            except work.WorkError:
+                return None
+
         taken.extend(_propose_reviews(
-            db, st, listing, pool=candidates(idle_s, waiting_free=True),
-            room=proposal_room, dry_run=dry_run))
+            db, st, listing,
+            pool=candidates(idle_s, skip=set(orchestras), waiting_free=True),
+            room=proposal_room, dry_run=dry_run, canons=canons,
+            skip=set(orchestras), within_budget=within_budget, wakeable=wakeable))
     if not queue:
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe

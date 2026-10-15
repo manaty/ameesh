@@ -19,12 +19,14 @@ Quatre types d'alerte, levés par `ameesh alerts` et poussés par
   fenêtre si rien ne change (même définition que les « pertes à la remise à
   zéro » de L74, `Gauge.expiring`), et la projection au rythme actuel ;
 * `idle_capacity` : des agents réveillables (mode `execute`, exécuteur
-  vivant, au repos, sous leur budget, sans lot ni courrier) depuis plus du
-  seuil, alors que du travail attend (lots ouverts sans assigné, courrier en
+  vivant, au repos, sous leur budget, sans lot actionnable ni courrier)
+  alors que du travail attend (lots ouverts sans assigné, courrier en
   souffrance chez un agent occupé) ou que des agents payés au token
   travaillent pendant que des agents au forfait dorment (`forfait_au_repos`,
-  le cas aggravant). Le message propose l'action : répartir, ou réveiller
-  l'orchestrateur ;
+  le cas aggravant). #1677 : le repos se lit sur les lots actionnables
+  (`actionable_lots`), pas sur le temps depuis le dernier tour — le seuil ne
+  sert plus que de repli sans ce relevé. Le message propose l'action :
+  répartir, ou réveiller l'orchestrateur ;
 * `orchestrator_held` : un orchestrateur tenu par une session interactive
   (`ameesh attach`) depuis plus du seuil, avec du courrier non lu — il ne
   répartit plus (prolonge 0030) ;
@@ -76,7 +78,8 @@ PLAN_PACE_MIN_WINDOW_S = 86400.0
 PLAN_PACE_MIN_ELAPSED = 0.25
 #: âge maximal des relevés de jauge lus (une fenêtre de 7 jours + marge)
 PLAN_GAUGES_SINCE_S = 8 * 86400.0
-#: `idle_capacity` : au repos depuis 30 min
+#: `idle_capacity` : seuil (repli quand le relevé ne porte pas
+#: `actionable_lots` ; #1677)
 DEFAULT_IDLE_CAPACITY_S = 1800.0
 #: `orchestrator_held` : tenu par `attach` depuis 30 min
 DEFAULT_ORCHESTRATOR_HELD_S = 1800.0
@@ -583,8 +586,10 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if not (waiting_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
-    parts = ["%d wakeable agent(s) idle without a lot in progress for more than %s: %s"
-             % (len(names), _duration(idle_s), ", ".join(names))]
+    # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
+    # depuis le dernier tour (N9) — le texte ne promet plus une durée.
+    parts = ["%d wakeable agent(s) idle without an actionable lot: %s"
+             % (len(names), ", ".join(names))]
     if waiting_lots:
         parts.append("%d open lot(s) without an assignee (%s)" % (
             len(waiting_lots), ", ".join("#%d" % int(l["id"]) for l in waiting_lots[:8])
@@ -658,8 +663,8 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             not team or ((by_name.get(n) or {}).get("team") or "").strip() == team)]
         if not names:
             continue
-        parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
-                 "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
+        parts = ["Idle capacity: %d wakeable agent(s) without an actionable lot: %s."
+                 % (len(names), ", ".join(names))]
         if lots:
             parts.append("Open lots without an agent: %s." % ", ".join(
                 "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")
@@ -865,10 +870,10 @@ def backlog_empty(db, listing: list, now: float, *,
     names = sorted(row["name"] for row in idle)
     return [_alert(
         "backlog_empty", None, None, len(names), idle_s,
-        "%d wakeable agent(s) idle without a lot for more than %s (%s) and the improvement "
+        "%d wakeable agent(s) idle without an actionable lot (%s) and the improvement "
         "backlog is empty. Action: add items with expected value "
         "(ameesh work backlog add), or assign a lot (ameesh work assign)"
-        % (len(names), _duration(idle_s), ", ".join(names)),
+        % (len(names), ", ".join(names)),
         agents=names, responsible=_common_responsible(idle))]
 
 
