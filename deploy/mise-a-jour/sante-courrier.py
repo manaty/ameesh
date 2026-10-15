@@ -8,10 +8,13 @@ Read-only checks, then one real delivery probe:
   past ``--souffrance`` while its recipient is idle on the host -> KO;
 * probe: a system message is dropped to one DRIVEN persona of the host (live
   lease); within ``--attente`` the persona must answer it with a tool call
-  (``agent-mail send <self> --ack <token>``) -> KO otherwise. Delivery alone is
-  recorded when the harness starts, before a refused harness exits 127
-  (#1460): only the answer proves a real turn with working tools, and a
-  failed or blocked turn after delivery is KO at once;
+  (``agent-mail send <self> --ack <token>``) AND the turn that received it must
+  end -> KO otherwise. Delivery alone is recorded when the harness starts,
+  before a refused harness exits 127 (#1460): only the answer proves a real
+  turn with working tools, and a failed or blocked turn after delivery is KO at
+  once. The answer alone is not enough either: a blocked harness can answer the
+  tool and then stay alive until its timeout, so the turn's end
+  (``last_turn_ts``) is required too;
 * dead letters (recipient stopped or unknown) are reported, never blocking.
 
 Run it on the workstation with the workstation venv, where the mesh
@@ -121,8 +124,14 @@ def failed_turn(db, name: str, delivered: float) -> str:
     return ""
 
 
+def turn_finished(db, name: str, delivered: float) -> bool:
+    """The turn that received the probe ended (same DB clock, #1460)."""
+    row = registry.get(db, name) or {}
+    return float(row.get("last_turn_ts") or 0) >= delivered
+
+
 def probe(db, row: dict, sha: str, attente: float) -> dict:
-    """Drop one system message and wait (bounded) for the persona's answer."""
+    """Drop one system message and wait (bounded) for the answered, ended turn."""
     jeton = "sonde-staging-%s" % secrets.token_hex(6)
     corps = PROBE_TEMPLATE.format(hote=row.get("host") or "", sha=(sha or "")[:9],
                                   nom=row["name"], jeton=jeton)
@@ -132,16 +141,23 @@ def probe(db, row: dict, sha: str, attente: float) -> dict:
     out = {"message": message_id, "destinataire": row["name"], "delai_s": None,
            "tour": "non remis"}
     fin = debut + attente
+    repondu = False
     while time.monotonic() < fin:
         message = mail.get(db, message_id)
         livre = float((message or {}).get("delivered_ts") or 0)
         if livre:
-            out["tour"] = "remis, sans reponse de l'outil"
-            if answered(db, row["name"], jeton):
-                return dict(out, delai_s=round(time.monotonic() - debut, 1), tour="ok")
+            repondu = repondu or answered(db, row["name"], jeton)
             echec = failed_turn(db, row["name"], livre)
             if echec:
                 return dict(out, tour="tour en echec : %s" % echec[:200])
+            if not repondu:
+                out["tour"] = "remis, sans reponse de l'outil"
+            elif turn_finished(db, row["name"], livre):
+                # the answer proves the tool ran, the end of the turn proves the
+                # harness finished it (dev4/47164: ack then alive until timeout)
+                return dict(out, delai_s=round(time.monotonic() - debut, 1), tour="ok")
+            else:
+                out["tour"] = "reponse vue, tour non termine"
         time.sleep(2.0)
     return out
 

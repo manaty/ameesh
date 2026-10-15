@@ -704,10 +704,27 @@ class SanteCourrierTest(unittest.TestCase):
         self.assertIsNone(out['delai_s'])
         self.assertEqual(out['tour'], "remis, sans reponse de l'outil")
 
-    def test_probe_ok_only_with_the_persona_answer(self):
-        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True)
+    def test_probe_ok_only_with_the_answer_and_a_finished_turn(self):
+        out = self.sonde({'last_turn_ts': 100.5, 'status': 'idle'}, repond=True)
         self.assertEqual(out['tour'], 'ok')
         self.assertIsNotNone(out['delai_s'])
+
+    def test_probe_ko_when_the_answer_is_seen_but_the_turn_never_ends(self):
+        """#1460 : l'outil repond, puis le harnais reste bloque jusqu'au timeout."""
+        out = self.sonde({'last_turn_ts': 99.0, 'status': 'running'}, repond=True)
+        self.assertIsNone(out['delai_s'])
+        self.assertEqual(out['tour'], 'reponse vue, tour non termine')
+
+    def test_probe_ko_when_the_turn_ends_in_error_after_the_answer(self):
+        out = self.sonde({'last_turn_ts': 101.0, 'status': 'running',
+                          'last_error': 'timeout (124)'}, repond=True)
+        self.assertIsNone(out['delai_s'])
+        self.assertIn('timeout (124)', out['tour'])
+
+    def test_probe_ko_when_a_clean_turn_never_answered(self):
+        out = self.sonde({'last_turn_ts': 101.0, 'status': 'idle'})
+        self.assertIsNone(out['delai_s'])
+        self.assertEqual(out['tour'], "remis, sans reponse de l'outil")
 
     def test_probe_ok_when_the_ack_was_already_delivered(self):
         out = self.sonde({'last_turn_ts': 103.0, 'status': 'idle'},
