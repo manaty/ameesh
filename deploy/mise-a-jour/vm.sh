@@ -16,7 +16,8 @@
 #   installer    code REF dans /opt/ameesh/src (détaché), installé dans
 #                /opt/ameesh/venv (dépendance psycopg comprise) ; refuse tant
 #                que la base du mesh n'a pas toutes les migrations de REF
-#   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour ;
+#   redemarrer   ameesh-runner@<persona>, une par une, arrêt prouvé
+#                (SIGTERM, drainage borné) avant chaque démarrage ;
 #                refuse tant que les migrations du code installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
 #   retour       réinstalle le commit d'avant et redémarre
@@ -72,7 +73,6 @@ SRC=/opt/ameesh/src
 VENV=/opt/ameesh/venv
 PRECEDENT=/opt/ameesh/precedent
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
-ATTENTE_MAX=${ATTENTE_MAX:-7200}
 mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
@@ -212,6 +212,34 @@ proprietaire_de() {
     echo ":$pid"
   fi
 }
+# #1152 : systemctl sur une unité, sur le bon bus — bus utilisateur d'ameesh
+# (mode agents) ou VM (mode serveur). Les mots de commande sont fixes et un nom
+# d'unité n'a pas d'espace : la chaîne ssh est sûre.
+unite_systemctl() {  # unité commande [arguments]
+  local u=$1; shift
+  if [ "$MODE" = agents ]; then utilisateur_agents systemctl --user "$@" "$u"
+  else ssh_vm "systemctl $* $u"; fi
+}
+# #1152 : arrêt PROUVÉ avant tout démarrage. Le SIGTERM de `stop` ferme
+# l'admission : le tour en cours se termine (drainage borné par
+# `drain_seconds`, sous `TimeoutStopSec`), plus aucun nouveau tour ne part. On
+# ne décide pas d'arrêter sur une lecture de statut — un tour peut partir juste
+# après elle — et on ne relance jamais au-dessus d'un processus vivant.
+# Seul `inactive` avec MainPID=0 prouve le point sûr ; `failed` est refusé :
+# après un stop il signifie que le drainage n'a pas abouti proprement (délai
+# dépassé puis SIGKILL, sortie en erreur) — on ne recouvre pas ça en silence.
+redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unité démarrée
+  local u=$1 etat pid
+  unite_systemctl "$u" stop \
+    || { echo "$u : l'arrêt échoue" >&2; return 1; }
+  etat=$(unite_systemctl "$u" show -p ActiveState --value) || return 1
+  pid=$(unite_systemctl "$u" show -p MainPID --value) || return 1
+  if [ "$etat" != inactive ] || [ "$pid" != 0 ]; then
+    echo "$u : arrêt non prouvé (ActiveState=$etat, MainPID=$pid) — aucun démarrage" >&2
+    return 1
+  fi
+  unite_systemctl "$u" start || { echo "$u : le démarrage échoue" >&2; return 1; }
+}
 # Lecture sur l'hôte, jamais depuis PERSONAS_VM ni les unités déjà actives :
 # une unité manquante doit être contrôlée elle aussi. Ignorer et nommer les
 # noms invalides ; ne pas transformer un registre vide en succès.
@@ -241,46 +269,38 @@ echec_agent() {
   echo "$1 : $2 — journalctl --user -u $(unite_agents "$1") -n 50 (utilisateur ameesh sur $AGENTS_SSH)" >&2
 }
 redemarrer_agents() {
-  local noms p st avant ligne heure attendu tenu restantes suivantes debut=$SECONDS
-  local non_verifiees=()
-  noms=$(agents_du_registre) || return 1
-  mapfile -t restantes <<<"$noms"
-  etape "exécuteurs de $HOTE_AGENTS (${#restantes[@]}), un par un hors tour"
-  while [ "${#restantes[@]}" -gt 0 ]; do
-    suivantes=()
-    for p in "${restantes[@]}"; do
-      # Le placement peut changer pendant l'attente d'un tour : relire avant
-      # de toucher une unité que cet hôte ne doit plus mener.
-      st=$(ameesh_agents show "$p" --json | python3 -c 'import json,sys
+  local liste p st avant ligne heure attendu tenu
+  local non_verifiees=() unites=()
+  liste=$(agents_du_registre) || return 1
+  mapfile -t unites <<<"$liste"
+  etape "exécuteurs de $HOTE_AGENTS (${#unites[@]}), arrêt prouvé avant chaque démarrage"
+  for p in "${unites[@]}"; do
+    # Le placement peut changer pendant la mise à jour : relire avant de
+    # toucher une unité que cet hôte ne doit plus mener.
+    st=$(ameesh_agents show "$p" --json | python3 -c 'import json,sys
 r=json.load(sys.stdin)
 if r.get("host") != sys.argv[1] or (r.get("mode") or "execute") != "execute" or r.get("status") == "stopped":
     print("skip")
 else: print(r.get("status") or "")' "$HOTE_AGENTS") || return 1
-      if [ "$st" = skip ]; then echo "$p : placement modifié ou arrêté, ignoré"; continue; fi
-      if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
-      ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
-        || { echec_agent "$p" "registre, heure de base ou ExecStart illisible, aucun restart"; return 1; }
-      avant=$(bail_epoque <<<"$ligne")
-      tenu=0
-      bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
-      utilisateur_agents systemctl --user restart "$(unite_agents "$p")" \
-        && utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
-        || { echec_agent "$p" "ne redémarre pas"; return 1; }
-      if [ "$tenu" = 0 ]; then
-        echo "WARNING $p: not checked: no lease before the restart, no sign of life"
-        non_verifiees+=("$p")
-      elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
-        echec_agent "$p" "active, mais bail non repris"; return 1
-      fi
-      echo "$p : redémarré (était $st)"
-    done
-    restantes=("${suivantes[@]}")
-    if [ "${#restantes[@]}" -gt 0 ]; then
-      if [ $((SECONDS - debut)) -ge "$ATTENTE_MAX" ]; then
-        echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]}" >&2; return 1
-      fi
-      sleep 15
+    if [ "$st" = skip ]; then echo "$p : placement modifié ou arrêté, ignoré"; continue; fi
+    ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+      || { echec_agent "$p" "registre, heure de base ou ExecStart illisible, aucun restart"; return 1; }
+    avant=$(bail_epoque <<<"$ligne")
+    tenu=0
+    bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
+    # #1152 : arrêt PROUVÉ (SIGTERM, drainage) avant le démarrage ; plus
+    # d'attente d'un créneau « idle » (starvation impl07, #1152/R1) — le
+    # statut `running` n'empêche plus l'arrêt, il draine.
+    redemarrer_hors_tour "$(unite_agents "$p")" \
+      && unite_systemctl "$(unite_agents "$p")" is-active --quiet \
+      || { echec_agent "$p" "arrêt non prouvé ou ne redémarre pas"; return 1; }
+    if [ "$tenu" = 0 ]; then
+      echo "WARNING $p: not checked: no lease before the restart, no sign of life"
+      non_verifiees+=("$p")
+    elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
+      echec_agent "$p" "active, mais bail non repris"; return 1
     fi
+    echo "$p : redémarré (était $st)"
   done
   if [ "${#non_verifiees[@]}" -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
@@ -789,50 +809,42 @@ installer() {
 redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
-  local restantes suivantes debut=$SECONDS st avant ligne heure tenu attendu
-  non_verifiees=()
+  local p st avant ligne heure tenu attendu
+  local non_verifiees=() unites=()
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
   exiger_migrations "$(ssh_vm "git -C $SRC rev-parse HEAD")" redemarrer
   # shellcheck disable=SC2206
-  restantes=($PERSONAS_VM)
-  etape "exécuteurs du serveur (${#restantes[@]}), un par un hors tour"
-  while [ ${#restantes[@]} -gt 0 ]; do
-    suivantes=()
-    for p in "${restantes[@]}"; do
-      st=$(statut "$p")
-      # #1131 : persona arrêtée par le propriétaire — son unité active n'est
-      # pas réactivée (le mode agents filtre déjà `stopped`).
-      if [ "$st" = stopped ]; then
-        echo "$p : arrêté dans le registre — unité ameesh-runner@$p ignorée, pas de redémarrage"
-        continue
-      fi
-      if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
-      # #502: only a runner that held its lease must take it again (bail.sh)
-      ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
-        || { echo "$p: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
-      avant=$(bail_epoque <<<"$ligne")
-      tenu=0
-      bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
-      ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
-        || { echo "$p : ne redémarre pas — journalctl -u ameesh-runner@$p -n 50 ; puis « $0 retour »" >&2; exit 1; }
-      if [ "$tenu" = 0 ]; then
-        echo "WARNING $p: not checked: no lease before the restart, no sign of life"
-        non_verifiees+=("$p")
-      elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
-        echo "$p: active, but did not take its lease again — journalctl -u ameesh-runner@$p -n 50; then « $0 retour »" >&2
-        exit 1
-      fi
-      echo "$p : redémarré (était $st)"
-    done
-    restantes=("${suivantes[@]+"${suivantes[@]}"}")
-    if [ ${#restantes[@]} -gt 0 ]; then
-      if [ $((SECONDS - debut)) -gt "$ATTENTE_MAX" ]; then
-        echo "toujours en tour après ${ATTENTE_MAX}s : ${restantes[*]} — à redémarrer à la main" >&2
-        exit 1
-      fi
-      sleep 15
+  unites=($PERSONAS_VM)
+  etape "exécuteurs du serveur (${#unites[@]}), arrêt prouvé avant chaque démarrage"
+  for p in "${unites[@]}"; do
+    st=$(statut "$p")
+    # #1131 : persona arrêtée par le propriétaire — son unité active n'est
+    # pas réactivée (le mode agents filtre déjà `stopped`).
+    if [ "$st" = stopped ]; then
+      echo "$p : arrêté dans le registre — unité ameesh-runner@$p ignorée, pas de redémarrage"
+      continue
     fi
+    # #502: only a runner that held its lease must take it again (bail.sh)
+    ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+      || { echo "$p: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
+    avant=$(bail_epoque <<<"$ligne")
+    tenu=0
+    bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
+    # #1152 : arrêt PROUVÉ (SIGTERM, drainage) avant le démarrage ; plus
+    # d'attente d'un créneau « idle » (starvation impl07, #1152/R1) — le
+    # statut `running` n'empêche plus l'arrêt, il draine.
+    redemarrer_hors_tour "ameesh-runner@$p" && sleep 10 \
+      && unite_systemctl "ameesh-runner@$p" is-active --quiet \
+      || { echo "$p : ne redémarre pas — journalctl -u ameesh-runner@$p -n 50 ; puis « $0 retour »" >&2; exit 1; }
+    if [ "$tenu" = 0 ]; then
+      echo "WARNING $p: not checked: no lease before the restart, no sign of life"
+      non_verifiees+=("$p")
+    elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
+      echo "$p: active, but did not take its lease again — journalctl -u ameesh-runner@$p -n 50; then « $0 retour »" >&2
+      exit 1
+    fi
+    echo "$p : redémarré (était $st)"
   done
   if [ ${#non_verifiees[@]} -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
@@ -863,7 +875,6 @@ retour() {
 }
 
 if [ "$MODE" = agents ]; then
-  [[ $ATTENTE_MAX =~ ^[0-9]+$ ]] || { echo "ATTENTE_MAX invalide" >&2; exit 2; }
   case "$ACTION" in
     redemarrer) redemarrer_agents ;;
     verifier|controler) controler_agents ;;
