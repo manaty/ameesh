@@ -456,7 +456,7 @@ class Port(Protocol):
 
 
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
-          authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
+          freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
           unknown_authors: Iterable = (), families=KNOWN_FAMILIES) -> dict:
     """Désigne les relecteurs du dernier gel du lot, ou dit pourquoi il attend.
@@ -479,6 +479,11 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     la nouvelle tête avec les chemins ou les auteurs de l'ancienne serait une
     admission implicite. L'appelant recollecte les entrées du nouveau gel,
     puis rejoue.
+
+    `freeze_sha` nomme le gel dont l'appelant a tiré ces entrées : s'il n'est
+    plus le dernier gel au moment de la lecture, `apply` lève aussi
+    `FreezeMoved` sans rien écrire — un gel arrivé entre la collecte et
+    l'appel ne reçoit jamais les entrées de l'ancien.
     """
     item = dict(lot_item or {})
     lot = int(item.get("id") or 0)
@@ -499,6 +504,15 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         raise DesignationError(
             "the freeze of lot #%d names %r, not a commit id" % (lot, freeze["sha"]))
     freeze = {"id": int(freeze["id"]), "sha": sha}
+    expected = str(freeze_sha or "").strip().lower()
+    if not _SHA.fullmatch(expected):
+        raise DesignationError(
+            "the inputs of lot #%d name freeze %r, not a commit id" % (lot, freeze_sha))
+    if expected != sha:
+        raise FreezeMoved(
+            "the inputs of lot #%d were collected for freeze %s, the last freeze is %s:"
+            " nothing written; recollect the paths, authors and class of the new"
+            " freeze, then retry" % (lot, expected[:12], sha[:12]))
     required = required_count(rules, paths)
     if risk != "light" and required == 0:
         raise DesignationError(

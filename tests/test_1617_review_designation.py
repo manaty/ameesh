@@ -299,6 +299,10 @@ class ApplyTest(unittest.TestCase):
                     authors=self.authors, candidates=self.pool, risk="sensitive",
                     base=SHA_C, policy_ref="canon@deadbeef", notify="mesh-design")
         args.update(kw)
+        if "freeze_sha" not in args:
+            # l'appelant collecte ses entrées sur le dernier gel qu'il voit
+            latest = self.port.latest_freeze(LOT["id"]) or {}
+            args["freeze_sha"] = latest.get("sha") or SHA_A
         return rd.apply(LOT, **args)
 
     def test_designates_two_reviewers_and_hands_them_the_frozen_head(self):
@@ -348,6 +352,21 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(self.port.commits, [])
         self.assertEqual(self.port.messages, [])
         self.assertEqual(self.port.records, {})
+
+    def test_inputs_collected_for_an_older_freeze_are_refused_without_writing(self):
+        # un gel arrive entre la collecte des entrées (sur A) et l'appel :
+        # apply ne désigne pas B avec les chemins/auteurs de A (B1 cx2)
+        self.port = FakePort({1617: [{"id": 1, "sha": SHA_A}, {"id": 2, "sha": SHA_B}]})
+        with self.assertRaises(rd.FreezeMoved):
+            # reproducteur cx2 : entrées de A (un chemin à un avis, auteur
+            # DeepSeek) alors que B est déjà le dernier gel
+            self.apply(freeze_sha=SHA_A, paths=["src/ameesh/work.py"],
+                       authors=[{"name": "mty-amh-impl-02", "family": "deepseek"}])
+        self.assertEqual(self.port.commits, [])
+        self.assertEqual(self.port.messages, [])
+        with self.assertRaises(rd.DesignationError):
+            self.apply(freeze_sha="")
+        self.assertEqual(self.apply(freeze_sha=SHA_B.upper())["freeze"], {"id": 2, "sha": SHA_B})
 
     def test_the_new_head_is_designated_only_on_a_fresh_call(self):
         self.port = MovingPort({1617: [{"id": 1, "sha": SHA_A}]},
