@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import functools
 import json
 import os
 import pty
@@ -902,6 +903,17 @@ class _PsqlListener:
 # pilote psycopg
 # --------------------------------------------------------------------------
 
+def _serial(method):
+    """#1469 : une instruction hors `transaction()` attend la fin du bloc
+    ouvert par un autre fil sur la même connexion (`_tx_lock`) ; sans cela
+    elle entrait dans cette transaction et disparaissait à son ROLLBACK."""
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        with self._tx_lock:
+            return method(self, *args, **kwargs)
+    return run
+
+
 class PsycopgDriver:
     """Pilote psycopg 3 : connexion directe, LISTEN/NOTIFY natif.
 
@@ -1070,6 +1082,7 @@ class PsycopgDriver:
         return True
 
     # -- interface ---------------------------------------------------------
+    @_serial
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
         self._live()
         if self._deferred(sql):
@@ -1085,6 +1098,7 @@ class PsycopgDriver:
         except Exception as exc:
             raise _map_error(exc) from exc
 
+    @_serial
     def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
         """Plusieurs SELECT indépendants en UN aller-retour (pipeline psycopg).
 
@@ -1113,6 +1127,7 @@ class PsycopgDriver:
             return [self.query(sql, params) for sql, params in items]
         return self._run_batch(items, probe=probe, fetch=True)
 
+    @_serial
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._live()
         if self._deferred(sql):
@@ -1128,6 +1143,7 @@ class PsycopgDriver:
         except Exception as exc:
             raise _map_error(exc) from exc
 
+    @_serial
     def script(self, sql: str) -> None:
         self._live()
         if self._schema_missing:
