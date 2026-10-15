@@ -1,0 +1,241 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#1617 — le port Postgres de la désignation au gel.
+
+Base réelle : la marque idempotente du journal, le verrou du lot, les
+courriers déposés dans la même transaction, le gel périmé refusé sans rien
+écrire, le fil externe vidé après le commit seulement, et l'attente
+réessayable qui devient une désignation quand la capacité revient. Le moteur
+de sélection est celui de `review_designation` (déjà couvert sans base par
+`tests/test_1617_review_designation.py`) : ici c'est le raccord qui est
+éprouvé.
+"""
+from __future__ import annotations
+
+import unittest
+
+from ameesh import review_designation as rd
+from ameesh import review_designation_pg as pg
+from ameesh import storage, work
+
+from .support import PgTestCase
+
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+RULES = (rd.Rule(paths=("**/*.sql", "src/ameesh/db.py"), reviews=2),)
+ITEM = {"app": "ameesh", "title": "Désigner les relecteurs au gel"}
+
+
+class Test1617ReviewDesignationPgMark(unittest.TestCase):
+    """Le format de la marque : préfixe exact, JSON refusé s'il est illisible."""
+
+    def test_prefix_separates_lots_and_freezes(self):
+        self.assertTrue(pg.mark_prefix(3, 12).startswith(pg.MARK_PREFIX))
+        self.assertNotEqual(pg.mark_prefix(3, 1), pg.mark_prefix(3, 12))
+        self.assertNotEqual(pg.mark_prefix(3, 12), pg.mark_prefix(13, 12))
+
+    def test_a_foreign_note_is_not_a_mark(self):
+        self.assertIsNone(pg.designation_of("gel 1617 : tête gelée"))
+        self.assertIsNone(pg.designation_of(""))
+
+    def test_an_unreadable_mark_is_refused_not_interpreted(self):
+        for note in (pg.MARK_PREFIX + "3:12: pas du json",
+                     pg.MARK_PREFIX + "3:12:",
+                     pg.MARK_PREFIX + '3:12: {"state": "designated"}'):
+            with self.assertRaises(rd.DesignationError):
+                pg.designation_of(note)
+
+    def test_a_read_mark_renders_itself(self):
+        note = pg._mark_note(3, 12, state=rd.DESIGNATED, required=2,
+                             reviewers=[{"name": "r1", "family": "claude"}],
+                             missing=0, why="ok",
+                             authors=[{"name": "a1", "family": "deepseek"}],
+                             policy_ref="canon@deadbeef", sha=SHA_A)
+        found = pg.designation_of(note)
+        self.assertEqual(found["state"], rd.DESIGNATED)
+        self.assertEqual(found["freeze"], {"id": 12, "sha": SHA_A})
+        self.assertEqual(found["reviewers"], [{"name": "r1", "family": "claude"}])
+
+
+class Test1617ReviewDesignationPg(PgTestCase):
+    """Le port sur la base : marque, courriers, verrou, transaction."""
+
+    def setUp(self):
+        super().setUp()
+        self.item = work.add(self.db, title=ITEM["title"], app=ITEM["app"])
+        self.lot = int(self.item["id"])
+
+    # -- helpers ----------------------------------------------------------
+    def freeze(self, sha=SHA_A):
+        return storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha=sha, actor="mty-amh-impl-02", verdict=None, note="")
+
+    def mailbox(self, db=None):
+        return (db or self.db).query(
+            "SELECT id, recipient, body, payload FROM agent_mailbox ORDER BY id")
+
+    def marks(self):
+        return [row["note"] for row in self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s ORDER BY id",
+            (self.lot,)) if str(row["note"]).startswith(pg.MARK_PREFIX)]
+
+    def run_apply(self, port, *, candidates, authors=None, unknown=(),
+                  policy=RULES, paths=("src/ameesh/db.py",), notify="pilot",
+                  risk="sensitive"):
+        return rd.apply(dict(self.item, state="build"), policy=policy, paths=list(paths),
+                        port=port, authors=authors or [{"name": "author", "family": "deepseek"}],
+                        candidates=candidates, risk=risk, base="c" * 40,
+                        policy_ref="canon@deadbeef", notify=notify,
+                        unknown_authors=unknown)
+
+    def two_families(self):
+        return [rd.Candidate("r1", "claude"), rd.Candidate("r2", "codex")]
+
+    # -- tests ------------------------------------------------------------
+    def test_designated_records_and_mails_once(self):
+        freeze = self.freeze()
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["required"], 2)
+        self.assertEqual(out["freeze"], {"id": int(freeze["id"]), "sha": SHA_A})
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1", "r2"])
+        sent = self.mailbox()
+        self.assertEqual([m["recipient"] for m in sent], ["r1", "r2"])
+        for row in sent:
+            self.assertIn(SHA_A, row["body"])
+            self.assertIn("jalon frozen #%d" % int(freeze["id"]), row["body"])
+        marks = self.marks()
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(pg.designation_of(marks[0])["freeze"],
+                         {"id": int(freeze["id"]), "sha": SHA_A})
+        # rejoué : la désignation enregistrée, aucun second courrier
+        again = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertTrue(again.get("replayed"))
+        self.assertEqual(len(self.mailbox()), 2)
+        self.assertEqual(len(self.marks()), 1)
+
+    def test_a_moved_freeze_writes_nothing(self):
+        first = self.freeze(SHA_A)
+        self.freeze(SHA_B)  # un nouveau gel arrive avant l'écriture
+        with self.assertRaises(rd.StaleFreeze):
+            pg.PgPort(self.db).commit(
+                self.lot, freeze={"id": int(first["id"]), "sha": SHA_A}, required=1,
+                state=rd.DESIGNATED, reviewers=[{"name": "r1", "family": "claude"}],
+                missing=0, why="", messages=[{"to": "r1", "body": "à relire"}])
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(self.marks(), [])
+
+    def test_the_engine_restarts_on_the_new_head(self):
+        first = self.freeze(SHA_A)
+        port = pg.PgPort(self.db)
+        # le gel bouge entre la lecture du moteur et son écriture
+        original = port.recorded
+
+        def moved(lot, freeze_id):
+            if int(freeze_id) == int(first["id"]):
+                self.freeze(SHA_B)
+            return original(lot, freeze_id)
+
+        port.recorded = moved
+        out = self.run_apply(port, candidates=self.two_families())
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual(out["freeze"]["sha"], SHA_B)
+        self.assertIn(SHA_B, self.mailbox()[0]["body"])
+        self.assertNotIn(SHA_A, self.mailbox()[0]["body"])
+        self.assertEqual(len(self.marks()), 1)
+        self.assertIn(SHA_B, self.marks()[0])
+
+    def test_waiting_notifies_once_then_capacity_returns(self):
+        freeze = self.freeze()
+        out = self.run_apply(pg.PgPort(self.db),
+                             candidates=[rd.Candidate("r1", "deepseek")])
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertEqual(out["missing"], 2)
+        sent = self.mailbox()
+        self.assertEqual([m["recipient"] for m in sent], ["pilot"])
+        self.assertIn("Aucune admission implicite", sent[0]["body"])
+        self.assertIn("jalon frozen #%d" % int(freeze["id"]), sent[0]["body"])
+        # rejoué sans capacité nouvelle : une seule notification
+        again = self.run_apply(pg.PgPort(self.db),
+                               candidates=[rd.Candidate("r1", "deepseek")])
+        self.assertTrue(again.get("replayed"))
+        self.assertEqual(len(self.mailbox()), 1)
+        self.assertEqual(len(self.marks()), 1)
+        self.assertEqual(pg.designation_of(self.marks()[0])["state"], rd.WAITING)
+        # la capacité revient : la désignation remplace l'attente pour le même gel
+        out3 = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual(out3["state"], rd.DESIGNATED)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r1", "r2"])
+        self.assertEqual(len(self.marks()), 2)
+        self.assertEqual(pg.designation_of(self.marks()[-1])["state"], rd.DESIGNATED)
+
+    def test_a_waiting_designation_needs_a_recipient(self):
+        self.freeze()
+        with self.assertRaises(rd.DesignationError):
+            self.run_apply(pg.PgPort(self.db), candidates=[], notify="")
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(self.marks(), [])
+
+    def test_unknown_author_provenance_waits_for_its_evidence(self):
+        self.freeze()
+        out = self.run_apply(pg.PgPort(self.db), candidates=self.two_families(),
+                             unknown=["deadbeef"])
+        self.assertEqual(out["state"], rd.WAITING)
+        self.assertIn("provenance", out["why"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        # la preuve arrive : désignation sur le même gel, courriers une seule fois
+        out2 = self.run_apply(pg.PgPort(self.db), candidates=self.two_families())
+        self.assertEqual(out2["state"], rd.DESIGNATED)
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         ["pilot", "r1", "r2"])
+
+    def test_a_new_freeze_is_a_new_designation_without_forgetting_the_old(self):
+        first = self.freeze(SHA_A)
+        light_rule = (rd.Rule(paths=("**/*.sql",), reviews=1),)
+        out = self.run_apply(pg.PgPort(self.db),
+                             candidates=[rd.Candidate("r1", "claude")],
+                             policy=light_rule, paths=("src/x.sql",))
+        self.assertEqual(out["freeze"]["sha"], SHA_A)
+        second = self.freeze(SHA_B)
+        out2 = self.run_apply(pg.PgPort(self.db),
+                              candidates=[rd.Candidate("r1", "claude")],
+                              policy=light_rule, paths=("src/x.sql",))
+        self.assertEqual(out2["freeze"]["sha"], SHA_B)
+        self.assertNotEqual(int(first["id"]), int(second["id"]))
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r1"])
+        self.assertIn(SHA_B, self.mailbox()[-1]["body"])
+        # la désignation du premier gel reste attachée à son gel (portée des verdicts)
+        old = pg.PgPort(self.db).recorded(self.lot, int(first["id"]))
+        self.assertEqual(old["freeze"]["sha"], SHA_A)
+        self.assertEqual(len(self.marks()), 2)
+
+    def test_the_hook_transaction_defers_only_the_thread(self):
+        freeze = self.freeze()
+        threads: list = []
+        with self.db.transaction() as tx:
+            out = pg.PgPort(tx, after_commit=threads).commit(
+                self.lot, freeze={"id": int(freeze["id"]), "sha": SHA_A}, required=1,
+                state=rd.DESIGNATED, reviewers=[{"name": "r1", "family": "claude"}],
+                missing=0, why="", messages=[{"to": "r1", "body": "à relire %s" % SHA_A}])
+            self.assertEqual(len(self.mailbox(tx)), 1)  # visible dans la transaction
+            self.assertEqual(len(threads), 1)           # le fil attend le commit
+        self.assertEqual(out["freeze"]["sha"], SHA_A)
+        self.assertEqual(len(self.mailbox()), 1)
+        self.assertEqual(len(self.marks()), 1)
+        for record in threads:  # ce que fait l'appelant après son commit
+            record(self.db.cfg, self.db)
+
+    def test_a_rollback_leaves_no_mail_and_no_mark(self):
+        self.freeze()
+        threads: list = []
+        with self.assertRaises(RuntimeError):
+            with self.db.transaction() as tx:
+                last = pg.PgPort(tx).latest_freeze(self.lot)
+                pg.PgPort(tx, after_commit=threads).commit(
+                    self.lot, freeze=last, required=1, state=rd.DESIGNATED,
+                    reviewers=[{"name": "r1", "family": "claude"}], missing=0, why="",
+                    messages=[{"to": "r1", "body": "à relire"}])
+                self.assertEqual(len(self.mailbox(tx)), 1)
+                raise RuntimeError("boom")
+        self.assertEqual(self.mailbox(), [])
+        self.assertEqual(self.marks(), [])
+        self.assertTrue(threads)  # jamais vidé : c'est l'appelant qui décide, après commit
