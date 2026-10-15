@@ -1823,8 +1823,10 @@ class LotBranchTest(unittest.TestCase):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
                                 for m in self.mods}}
         self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
+        # 235 modules × 2 s = 470 s -> deux parts ; la tranche fixe garde le
+        # test indépendant du nombre de modules du dépôt (314 au 15/10, et
+        # chaque lot qui ajoute un module de test le faisait basculer à 3)
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:235], card(2.0)), 2)
         self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):

@@ -283,9 +283,10 @@ jobs:
           key: carte-${{ github.sha }}
       # Quota d'artefacts de l'organisation, plein le 15/10 (2,4 Go de mesures
       # gardées un jour) : les mesures ne servent qu'à ce job, on les supprime
-      # dès la carte faite. Seule la carte (30 jours) reste. Jamais bloquant.
+      # dès la carte faite. Seule la carte (30 jours) reste. Jamais bloquant ;
+      # pas de condition « toujours » (#1341 : rien ne tourne sur échec de la fusion,
+      # les mesures d'un échec expirent seules en un jour).
       - name: supprimer les mesures intermédiaires
-        if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
