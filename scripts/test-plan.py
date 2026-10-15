@@ -823,7 +823,8 @@ def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
         impact.hit(card.get("tables", {}).get(table, ()), f"{path} (table {table})")
 
 
-def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path) -> None:
+def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path,
+          *, own: bool = True) -> None:
     readers = set(card.get("donnees", {}).get(path, ()))
     impact.hit(readers, path)
     listers: set[str] = set()
@@ -832,7 +833,15 @@ def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path
         impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
     # a removal outside documentation is already a doubt, raised by `judge`:
     # only a removed document stays quiet here (the docs lane)
-    if not readers and not listers and not is_doc(path) and status != "D":
+    #
+    # #1314/#1476 : une donnée non Python que la branche ne change pas
+    # (`own=False`) vient de la cible, qui l'a déjà passée en suite complète :
+    # elle ne force plus le repli de la branche. C'est le cas mesuré d'un
+    # fichier sans lecteur mesuré (par exemple un `.cjs` ou un `.json` que la
+    # carte ne connaît pas encore) changé sur main entre la carte et la tête
+    # testée : le 15/10, deux lots sans rapport ont ainsi basculé en suite
+    # complète. Une donnée que la branche change elle-même reste un doute.
+    if not readers and not listers and not is_doc(path) and status != "D" and own:
         impact.doubt(f"{path}: read by no measured test", path)
 
 
@@ -844,12 +853,13 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
     `own` is the set of paths the branch itself changes — `own_base` (the base
     it merges, `HEAD^1` of a pull request's merge commit) to `head` — and
     `None` when that range cannot be read or is not trustworthy. A file of the
-    CI foundation (`is_foundation`) that the target already changed since the
-    map commit, and that this branch does not change, raises no doubt: the
-    target's own full suite validated it, and a late map must not send every
-    lot branch back to the full suite (#1314). The version-only exemption of
-    `pyproject.toml` (L157) is judged on that same own range, so a target
-    change to the file no longer breaks it.
+    CI foundation (`is_foundation`), or a data file read by no measured test
+    (`_data`), that the target already changed since the map commit, and that
+    this branch does not change, raises no doubt: the target's own full suite
+    validated it, and a late map must not send every lot branch back to the
+    full suite (#1314, #1476). The version-only exemption of `pyproject.toml`
+    (L157) is judged on that same own range, so a target change to the file no
+    longer breaks it.
     """
     impact = Impact()
     known_modules = set(card.get("modules", {}))
@@ -900,7 +910,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         elif path.startswith(MIGRATIONS_DIR) and path.endswith(".sql"):
             _migration(card, impact, status, path, head, repo)
         else:
-            _data(card, impact, status, path, repo)
+            # #1476 : `own` inconnu (range illisible) reste conservateur : la
+            # donnée est jugée comme changée par la branche, donc le doute tient.
+            _data(card, impact, status, path, repo,
+                  own=own is None or path in own)
     #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
     #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
     #: exécuté au niveau module (relecture Codex, B2 résiduel).
