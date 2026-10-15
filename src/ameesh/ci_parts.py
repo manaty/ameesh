@@ -148,6 +148,10 @@ def extract(repo: str, commit: str, dest: str) -> None:
                 with open(path, "wb") as out:
                     shutil.copyfileobj(source, out)
                 os.chmod(path, member.mode & 0o777)
+        # le lecteur d'archive s'arrête à la fin d'archive : vider le reste du
+        # flux avant de fermer, sinon git peut mourir sur SIGPIPE et un
+        # archivage pourtant complet se lit comme un échec (témoin instable)
+        proc.stdout.read()
     except (tarfile.TarError, OSError) as exc:
         raise PartsError("git archive %s: unreadable archive (%s)" % (commit[:12], exc)) from exc
     finally:
@@ -158,6 +162,19 @@ def extract(repo: str, commit: str, dest: str) -> None:
     if code != 0:
         raise PartsError("git archive %s: %s" % (commit[:12],
                                                  err.decode("utf-8", "replace").strip()[-300:]))
+
+
+def selector_env(root: str, home: str) -> dict:
+    """L'environnement du sélecteur : minimal, jamais celui de l'hôte.
+
+    Le sélecteur vient de l'arbre du dépôt (commit épinglé de la cible), pas
+    de la configuration de l'hôte : il ne voit ni les jetons, ni les DSN, ni
+    les variables d'outillage de la session qui l'exécute. `PATH` (lancer
+    `node`), `HOME` et `TMPDIR` (un répertoire temporaire supprimé avec
+    l'arbre) et `GITHUB_WORKSPACE` (la racine extraite, comme le job de plan)
+    suffisent au contrat."""
+    return {"PATH": os.environ.get("PATH") or os.defpath, "HOME": home,
+            "TMPDIR": home, "GITHUB_WORKSPACE": root, "LC_ALL": "C"}
 
 
 def _plan_file(path: str, plan) -> tuple:
@@ -236,7 +253,7 @@ def due(project, sha: str, base_sha: str, repo: str) -> dict:
             argv = [part.format(**values) for part in plan.argv]
         except (KeyError, IndexError, ValueError) as exc:
             raise PartsError("the ci_parts command uses an unknown placeholder: %s" % exc) from exc
-        env = dict(os.environ, GITHUB_WORKSPACE=root)
+        env = selector_env(root, tmp)
         try:
             proc = subprocess.run(argv, cwd=root, capture_output=True, timeout=PARTS_TIMEOUT,
                                   check=False, env=env)
