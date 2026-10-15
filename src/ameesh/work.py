@@ -378,9 +378,9 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
     analysis = deep_analysis.on_lot_created(db, item, actor=actor, cfg=cfg)
     if analysis is not None:
         item["deep_analysis"] = analysis
-    # canon §2 (15/10/2026) : une suite de relecture (N, P2, P3) ne crée pas de
-    # lot, elle va au backlog. L'avertissement est rendu par la création
-    # elle-même (tous les points d'entrée l'obtiennent) ; rien n'est refusé.
+    # canon §2 (15/10/2026): a review follow-up (N, P2, P3) does not create a
+    # lot, it goes to the backlog. The warning is produced by the creation
+    # itself (every entry point gets it); nothing is refused.
     from . import backlog
     hint = backlog.followup_hint(title=item.get("title") or title, source=source,
                                  issue_ref=issue_ref or "", app=app or "")
