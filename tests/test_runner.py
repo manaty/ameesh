@@ -712,8 +712,14 @@ class RunnerTest(PgTestCase):
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
         # Le témoin mesure la clôture au bail perdu, pas la porte d'hôte réelle
         # de la machine (en CI, l'hôte se retire : draining, user_active).
+        # Garde factice : un hôte prêté exige `file`, mais l'état lu est celui
+        # du banc (disponible), pas le fichier réel de l'hôte.
+        gate_state = os.path.join(self.tmp, "gate-available.json")
+        with open(gate_state, "w", encoding="utf-8") as fh:
+            fh.write('{"schema": "ameesh-host-state/1", "state": "available", "seq": 1}\n')
         env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
-                       AMEESH_HOST_GATE="none")
+                       AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
+                       AMEESH_HOST_GATE_FALLBACK="available")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
