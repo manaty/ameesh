@@ -1202,7 +1202,8 @@ class WorkItems(Domain):
         """L160e2 (0058): takes (or, with its `epoch`, renews) the merge lease
         of `key` (project and target) for `owner`; returns its epoch, None if
         another owner holds a lease that has not expired. Its own owner takes it
-        again at a new epoch (an executor restarted mid-landing)."""
+        again at a new epoch (an executor restarted mid-landing). Renewal with
+        an epoch never revives an expired lease (#1680)."""
 
     @abc.abstractmethod
     def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
