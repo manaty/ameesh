@@ -358,6 +358,7 @@ class PriseDeLotTest(_Lots):
         out = self.take()
         self.assertEqual([(t["agent"], t["item"]["id"], t.get("fallback")) for t in out],
                          [("orchestrateur", lot["id"], True)])
+        self.assertNotIn("orchestrateur", out[0]["notified"])
         note = self.db.query(
             "SELECT note FROM work_item_events WHERE work_item_id = %s"
             " ORDER BY id DESC LIMIT 1", (lot["id"],))[0]["note"]

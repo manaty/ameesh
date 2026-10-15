@@ -634,8 +634,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
                                 card=auditors.get(row["name"]), others=listing):
                     continue
-                notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
-                                               orchestras)
+                # un orchestrateur qui se sert ne se prévient pas lui-même
+                notified = [name for name in _team_orchestrators(
+                    cfg, db, listing, item["lot_team"], orchestras) if name != row["name"]]
                 if dry_run:
                     taken.append({"item": item, "agent": row["name"], "message_id": None,
                                   "kind": "lot", "notified": notified,
