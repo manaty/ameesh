@@ -470,6 +470,10 @@ class AgentWorker(threading.Thread):
         #: attente — un entretien de session résidente ne le précède pas de
         #: moins de `resident_runner.QUIET_S`, sauf dépassement dur
         self._dernier_humain = 0.0
+        #: L81 (étude §6.1) : relu cumulé par session — il appartient à la
+        #: session, pas au processus : un résident endormi puis réveillé sur
+        #: le même id reprend son cumul (sinon 240+240 élude le seuil)
+        self._resident_reread: dict[str, int] = {}
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -1498,11 +1502,36 @@ class AgentWorker(threading.Thread):
             rp = self.resident
         if rp is None:
             return ""
+        # L81 (étude §6.3) : l'entretien se décide AVANT le `pick` — un message
+        # humain en attente, ou remis par le hook pendant le tour qui vient de
+        # finir, doit tenir la fenêtre de calme dès cette décision.
+        self._humain_observe()
         rotate = self.session_policy() != "jamais"
         return rp.maintenance_due(
             cap=self.context_max_tokens() if rotate else 0,
             reread_max=resident_runner.reread_max(
                 self._state_read(resident_runner.REREAD_MAX_SETTING)) if rotate else 0)
+
+    def _humain_observe(self) -> None:
+        """L81 (étude §6.3) : rafraîchit la fenêtre de calme avant la décision
+        d'entretien. Deux sources : le courrier humain NON ENCORE REMIS (le
+        `_mail_spec` ne le voit qu'au `pick`, après l'entretien), et celui
+        remis par le hook PENDANT le tour — déjà lu, mais daté dans l'état du
+        tour (`cli.tour_lu`)."""
+        try:
+            rows = mail.unread_active(self.db, self.name)
+        except db_mod.DbError:
+            rows = []           # la décision d'entretien a ses propres gardes
+        if any(self._from_human(m) for m in rows):
+            self._dernier_humain = time.monotonic()
+            return
+        from . import cli as cli_mod
+        ts = float(cli_mod.tour_lu(self.cfg, self.name).get("humain") or 0.0)
+        if not ts:
+            return
+        marque = time.monotonic() - max(0.0, time.time() - ts)
+        if marque > 0:
+            self._dernier_humain = max(self._dernier_humain, marque)
 
     def _humain_recent(self, quiet: float | None = None) -> bool:
         """L81 (étude §6.3) : un message humain en attente depuis moins de
@@ -1512,6 +1541,17 @@ class AgentWorker(threading.Thread):
         delai = resident_runner.QUIET_S if quiet is None else quiet
         return bool(self._dernier_humain) and \
             time.monotonic() - self._dernier_humain < delai
+
+    def _resident_reread_load(self, session: str | None) -> int:
+        """L81 (étude §6.1) : relu cumulé déjà mesuré pour cette session."""
+        return int(self._resident_reread.get(session or "", 0))
+
+    def _resident_reread_keep(self, rp) -> None:
+        """L81 (étude §6.1) : enregistre le cumul de la session du processus
+        après chaque tour mesuré, pour celui qui la reprendra."""
+        session = rp.session or ""
+        if session:
+            self._resident_reread[session] = rp.session_reread
 
     def _resident_maintain(self, decision: str) -> bool:
         """L81 (étude §6.2/§6.3) : exécute la décision d'entretien d'une
@@ -1677,6 +1717,9 @@ class AgentWorker(threading.Thread):
         self.last_turn_reread = 0
         self.last_turn_reread_session = None
         self.last_turn_context = self.last_turn_context_session = None
+        # L81 (étude §6.1) : l'ancienne session ne sera plus reprise, son cumul
+        # de relu n'a plus à être gardé.
+        self._resident_reread.pop(ancienne or "", None)
         self._fil_note(
             "Session rotation (%s): the old id (%s) is kept in "
             "`session-history.jsonl`; the new session starts from the summary below.\n\n%s"
@@ -3878,6 +3921,10 @@ class AgentWorker(threading.Thread):
             adapter, cwd=cwd, session=session, model=model or None, effort=effort or None,
             tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident)
         rp = resident_runner.ResidentProcess(driver, key=key, life_id=life_id, stderr=stderr)
+        # L81 (étude §6.1) : le cumul de relu appartient à la session — un
+        # processus relancé sur le même id (réveil après sommeil, réglages
+        # changés) reprend le cumul du précédent.
+        rp.session_reread = self._resident_reread_load(driver.session_id or session)
         driver.on_event = rp.on_event
         try:
             driver.start()
@@ -3950,6 +3997,7 @@ class AgentWorker(threading.Thread):
         # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
         # courant, fenêtre, relu du tour et relu cumulé de la session.
         rp.record_turn(fin)
+        self._resident_reread_keep(rp)
         if fin.status == resident.COMPLETED:
             return 0, None
         if fin.status == resident.INTERRUPTED:

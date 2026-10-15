@@ -15,7 +15,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import adapters, conversation, harnesses, registry, resident_runner
+from ameesh import adapters, cli, conversation, harnesses, mail, registry, resident_runner
 from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
@@ -334,6 +334,74 @@ class ResidentRotationTest(PgTestCase):
             worker._dernier_humain = time.monotonic() - resident_runner.QUIET_S - 1
             self.assertTrue(worker.maybe_rotate())
             self.assertEqual(worker.resident.compactions, 1)
+
+    def test_a_waiting_human_message_holds_the_compaction(self):
+        """B1 (#289) : l'entretien se décide avant le `pick` — un message
+        humain en attente dans la boîte doit tenir la fenêtre de calme."""
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_CONTEXT": "600",
+                                          "FAKE_CLAUDE_WINDOW": "1000"}):
+            _runner, worker = self._worker(resident_reread_max="0")
+            self.assertTrue(self._turn(worker, "premier"))
+            mid = mail.send(self.db, "proprio", worker.name, "fais le point",
+                            payload={"human": True})
+            self.assertFalse(worker._humain_recent())
+            self.assertEqual(worker._resident_maintenance(), resident_runner.COMPACT)
+            self.assertTrue(worker._humain_recent())      # l'attente est observée
+            self.assertFalse(worker.maybe_rotate())       # ... et tient l'entretien
+            self.assertNotIn("/compact", self._prompts())
+            # remis, puis la fenêtre de calme passée : la compaction repart
+            mail.mark_delivered(self.db, [mid])
+            worker._dernier_humain = time.monotonic() - resident_runner.QUIET_S - 1
+            self.assertEqual(worker._resident_maintenance(), resident_runner.COMPACT)
+            self.assertTrue(worker.maybe_rotate())
+            self.assertEqual(worker.resident.compactions, 1)
+
+    def test_a_human_message_served_during_the_turn_holds_the_compaction(self):
+        """B1 (#289) : un message humain remis par le hook PENDANT le tour
+        n'est plus non-lu — c'est son instant, daté dans l'état du tour, qui
+        tient la fenêtre de calme."""
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_CONTEXT": "600",
+                                          "FAKE_CLAUDE_WINDOW": "1000"}):
+            _runner, worker = self._worker(resident_reread_max="0")
+            self.assertTrue(self._turn(worker, "premier"))
+            cli._tour_remis(worker.cfg, worker.name, {"turn": "tour-1", "remis": 0},
+                            [{"sender": "proprio", "payload": {"human": True}}])
+            self.assertFalse(worker._humain_recent())
+            self.assertEqual(worker._resident_maintenance(), resident_runner.COMPACT)
+            self.assertTrue(worker._humain_recent())      # la remise datée est lue
+            self.assertFalse(worker.maybe_rotate())
+            self.assertNotIn("/compact", self._prompts())
+            # la fenêtre de calme passée : l'entretien repart
+            etat = cli.tour_lu(worker.cfg, worker.name)
+            etat["humain"] = time.time() - resident_runner.QUIET_S - 1
+            cli._tour_ecrit(worker.cfg, worker.name, etat)
+            worker._dernier_humain = time.monotonic() - resident_runner.QUIET_S - 1
+            self.assertFalse(worker._humain_recent())
+            self.assertTrue(worker.maybe_rotate())
+            self.assertEqual(worker.resident.compactions, 1)
+
+    def test_the_session_cumulative_survives_a_sleep_wake(self):
+        """B2 (#289) : le relu cumulé appartient à la session — endormi puis
+        réveillé sur le même id, le résident reprend son cumul (240+240, et
+        non 240 : le seuil de 400 ne s'élude pas)."""
+        _runner, worker = self._worker(resident_reread_max="400")
+        self.assertTrue(self._turn(worker, "premier"))
+        premier = worker.resident
+        self.assertIsNotNone(premier)
+        self.assertEqual(premier.session_reread, 240)
+        self.assertEqual(worker._resident_maintenance(), "")   # 240 < 400
+        session = worker.current_session()
+        self.assertIsNotNone(session)
+        # L76 : le résident s'endort, la session est gardée pour le réveil
+        worker._close_resident("asleep after 0s without a turn")
+        self.assertIsNone(worker.resident)
+        self.assertTrue(self._turn(worker, "deux"))
+        rp = worker.resident
+        self.assertIsNotNone(rp)
+        self.assertIsNot(rp, premier)
+        self.assertEqual(rp.session, session)        # la même session, reprise
+        self.assertEqual(rp.session_reread, 480)     # 240 + 240, pas 240
+        self.assertEqual(worker._resident_maintenance(), resident_runner.ALERT)
 
 
 if __name__ == "__main__":
