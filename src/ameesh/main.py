@@ -168,6 +168,9 @@ MESH_COMMANDS = (
     # dans mesh_cli, mais aucune liste de routage ne le servait : code 2 avant
     # même de regarder la base.
     "ci",
+    # L750/L756 (#561/#566) : le périmètre d'une release et sa porte
+    # (`ameesh release open|check|reason`).
+    "release",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
