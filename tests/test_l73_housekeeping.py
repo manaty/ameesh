@@ -324,6 +324,48 @@ class WorktreeEtatTest(_Tmp):
         self.assertIsNone(menage.cited_lot("agent/nx-compute-runner-n-n"))
         self.assertIsNone(menage.cited_lot(""))
 
+    def test_cited_lots_are_tried_in_order(self):
+        """#1694: a branch citing several numeric groups lists its candidates
+        in trial order — last group first under agent/review, first group
+        first under lot/work."""
+        self.assertEqual(menage.cited_lots("review/claude2-t3-unit-459-460-r2"),
+                         [460, 459])
+        self.assertEqual(menage.cited_lots("agent/mty-nxl-impl-04-1229-x"), [1229, 4])
+        self.assertEqual(menage.cited_lots("lot/1665-menage-worktrees"), [1665])
+        self.assertEqual(menage.cited_lots("main"), [])
+        # cited_lot keeps its single-candidate role: the first candidate.
+        self.assertEqual(menage.cited_lot("review/claude2-t3-unit-459-460-r2"), 460)
+
+    def test_the_right_lot_wins_among_the_candidates(self):
+        """#1694: the first candidate owned by the agent wins; a candidate
+        owned by another agent proves nothing, and the folder name is only
+        read when the branch cites no number (#1665)."""
+        class _Registre:
+            ROWS = {460: {"assignee": "a2"}, 459: {"assignee": "a1"},
+                    12: {"assignee": "a1"}, 999: {"assignee": "a2"}}
+
+            def get(self, ident):
+                return self.ROWS.get(ident)
+
+        class _Base:
+            work = _Registre()
+
+        branche = "review/claude2-t3-unit-459-460-r2"
+        with mock.patch.object(menage.storage, "of", return_value=_Base()):
+            self.assertEqual(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", branche), "459")
+            # both candidates are the agent's: the trial order decides (460).
+            _Registre.ROWS[460] = {"assignee": "a1"}
+            self.assertEqual(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", branche), "460")
+            # a cited lot of another agent does not fall back to the folder.
+            self.assertIsNone(
+                menage.lot_of_worktree(None, "a1", "/tmp/a1-459", "lot/999-x"))
+            # no number cited: the folder names the lot, as in #1665.
+            self.assertEqual(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""), "12")
+            self.assertEqual(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", "main"),
+                             "12")
+
     def test_registre_illisible_ne_prouve_rien(self):
         """#1665 : un registre des lots illisible ne rattache rien (None),
         sans faire échouer le ménage."""
