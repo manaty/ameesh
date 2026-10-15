@@ -612,7 +612,8 @@ def _ci_priority(row: dict) -> bool:
     """#1468 : le pool prioritaire de runners couvre `integration/**` et
     `release/**` (source ou cible d'une PR) ; une poussée sur `main` suit la
     fusion d'un paquet déjà validé sur sa branche d'intégration et n'est pas
-    le chemin critique de la cible."""
+    le chemin critique de la cible ; une exécution manuelle sur `main` non
+    plus (elle ne prend pas le pool prioritaire)."""
     return any((row.get(ref) or "").startswith(("release/", "integration/"))
                for ref in ("branch", "base"))
 
