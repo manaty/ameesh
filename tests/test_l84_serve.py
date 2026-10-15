@@ -244,10 +244,7 @@ class OpenApiTest(unittest.TestCase):
             operation = doc["paths"][route.path]["get"]
             if route.auth:
                 self.assertNotIn("security", operation)  # the global Bearer
-                content = operation["responses"]["200"]["content"]
-                # L85: the event stream documents the `data` of its messages
-                ref = content["text/event-stream"]["x-ameesh-data"] if route.stream \
-                    else content["application/json"]["schema"]
+                ref = operation["responses"]["200"]["content"]["application/json"]["schema"]
                 self.assertEqual(ref["$ref"].rsplit("/", 1)[1],
                                  route.schema.replace("/", "-"))
             else:
@@ -312,7 +309,6 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/threads/{project}": "/api/v1/threads/demo",
             "/api/v1/threads/{project}/{lot}": "/api/v1/threads/demo/" + lot,
             "/api/v1/openapi.json": "/api/v1/openapi.json",
-            "/api/v1/events": None,   # L85: a stream, tested in test_l85_events
         }
 
     def test_every_route_answers_in_line_with_its_schema(self):
@@ -320,8 +316,6 @@ class ServePgTest(ServerMixin, PgTestCase):
         self.assertEqual(set(paths), {route.path for route in serve.ROUTES})
         components = json.loads(OPENAPI_FILE.read_text(encoding="utf-8"))["components"]
         for route in serve.ROUTES:
-            if route.stream:
-                continue
             status, data = self.get_json(paths[route.path])
             self.assertEqual(status, 200, (route.path, data))
             if route.schema == "openapi":

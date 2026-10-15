@@ -477,14 +477,6 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'billing_account', 'agent', 'usd', 'period', 'state', 'spend_key',
         'created_at', 'closed_at', 'closed_by'
     ]),
-    -- L85 (0396): the event log, identifiers and states only, never free text
-    ('ameesh_events', ARRAY[
-        'id', 'type', 'object', 'project', 'data', 'tx', 'created_at'
-    ]),
-    -- the retention's watermark: the greatest position (tx, id) it deleted
-    ('ameesh_events_pruned', ARRAY[
-        'one', 'tx', 'id', 'at'
-    ]),
     -- L121 (0362): the watches ameesh manages (agent, period, host, when)
     ('agent_watches', ARRAY[
         'agent', 'every_s', 'host', 'enabled_by', 'enabled_at', 'last_sent_at'

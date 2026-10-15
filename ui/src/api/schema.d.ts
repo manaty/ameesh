@@ -189,23 +189,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Event stream (Server-Sent Events): lots, turns, costs, threads, decisions, alerts */
-        get: operations["events"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/hosts": {
         parameters: {
             query?: never;
@@ -478,15 +461,6 @@ export interface components {
             message: string;
             /** @constant */
             schema: "ameesh-error/1";
-        };
-        "ameesh-event-1": {
-            data: Record<string, never>;
-            id: number;
-            object: string;
-            project: string | null;
-            ts: number;
-            /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "agent.updated" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];
@@ -1392,56 +1366,6 @@ export interface operations {
                 };
             };
             /** @description database unavailable */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ameesh-error-1"];
-                };
-            };
-        };
-    };
-    events: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description resume strictly after this position (the last `id:` received, "tx-id-cluster"); without it, the new events only */
-                "Last-Event-ID"?: string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description text/event-stream: `id: <tx-id-cluster>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/event-stream": string;
-                };
-            };
-            /** @description bad request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ameesh-error-1"];
-                };
-            };
-            /** @description token missing or refused */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ameesh-error-1"];
-                };
-            };
-            /** @description database unavailable, or too many streams (Retry-After) */
             503: {
                 headers: {
                     [name: string]: unknown;

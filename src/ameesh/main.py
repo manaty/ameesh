@@ -53,10 +53,7 @@
         --serve: the page served locally, read-only, with a Refresh button (L304);
   ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
         the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
-        docs/api/openapi-v1.json); GET /api/v1/events streams the event log (L85);
-  ameesh events [--after ID] [--limit N] [--json] | prune [--days N] [--dry-run]
-        the event log (lot transitions, turns, costs, threads, decisions, alerts) and
-        its retention (365 days by default, L85);
+        docs/api/openapi-v1.json);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -266,10 +263,6 @@ def _dispatch(argv: list[str] | None) -> int:
         # L84: read API, local mode
         from . import serve
         return serve.main(rest)
-    if command == "events":
-        # L85: the event log of `GET /api/v1/events`
-        from . import events
-        return events.main(rest)
     if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
