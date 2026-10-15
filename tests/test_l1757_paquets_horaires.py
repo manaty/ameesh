@@ -10,6 +10,7 @@ remplace le bloc entier. Le calendrier suit Europe/Paris : heure absente sautée
 (25 occurrences), sans doublon d'epoch."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import tempfile
@@ -195,6 +196,15 @@ class TestCalendar(_Base):
         after = _paris(2026, 10, 25, 2, 30, fold=1)
         self.assertEqual(rules.last_packet(after), _paris(2026, 10, 25, 2, fold=1))
         self.assertEqual(rules.next_packet(after), _paris(2026, 10, 25, 3))
+
+    def test_single_skipped_hour_cadence_crosses_the_missing_day(self):
+        # une cadence valide dont la seule heure est 02:00 n'a aucun paquet le
+        # 29/03 : last/next doivent enjamber ce jour, pas refuser
+        rules = dataclasses.replace(self.loaded(), packet_cutoffs=("02:00",))
+        self.assertEqual(rules.next_packet(_paris(2026, 3, 28, 3)),
+                         _paris(2026, 3, 30, 2))
+        self.assertEqual(rules.last_packet(_paris(2026, 3, 30, 1)),
+                         _paris(2026, 3, 28, 2))
 
     def test_absent_block_is_an_explicit_empty_cadence(self):
         rules = self.loaded(mechanics_text=MECHANICS.replace(PACKETS_BLOCK, ""))

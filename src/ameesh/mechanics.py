@@ -254,7 +254,9 @@ class Mechanics:
         if not self.packet_cutoffs:
             raise MechanicsError("no packet cadence declared")
         local = datetime.fromtimestamp(now, self.zone())
-        for offset in (0, -1):
+        # deux jours en arrière : une cadence dont la seule heure est sautée
+        # (02:00 au passage à l'heure d'été) n'a aucun paquet ce jour-là
+        for offset in (0, -1, -2):
             before = [stamp for stamp, _ in self.packets_on(local.date() + timedelta(days=offset))
                       if stamp <= now]
             if before:
@@ -266,7 +268,7 @@ class Mechanics:
         if not self.packet_cutoffs:
             raise MechanicsError("no packet cadence declared")
         local = datetime.fromtimestamp(now, self.zone())
-        for offset in (0, 1):
+        for offset in (0, 1, 2):  # même raison que `last_packet`
             after = [stamp for stamp, _ in self.packets_on(local.date() + timedelta(days=offset))
                      if stamp > now]
             if after:
