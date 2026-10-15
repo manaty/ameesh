@@ -16,10 +16,14 @@ lot rendu à la file sinon.
 """
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from unittest import mock
 
-from ameesh import incident
+import ameesh
+
+from ameesh import incident, runner
 
 
 def commit(sha: str, lot, files, author: str = "deepseek4", summary: str = "travail"):
@@ -821,6 +825,73 @@ class TestConsommateur(unittest.TestCase):
                                    diagnoses=lambda repo, sha: called.append((repo, sha)))
         self.assertEqual(called, [])
         self.assertEqual(out[0]["diagnosis"], "absent")
+
+
+class TestRaccordTrain(unittest.TestCase):
+    """`Runner.incident_once` : les faits du train #1467 quand ils sont là,
+    le relevé direct de #1681 sinon — un incident n'est jamais perdu."""
+
+    def _fake(self, lines=(), error=None):
+        consume = mock.Mock(side_effect=error) if error is not None \
+            else mock.Mock(return_value=list(lines))
+        return types.SimpleNamespace(consume=consume)
+
+    def _patch_train(self, fake):
+        """Le module du train : `from . import` lit d'abord l'attribut du
+        paquet dès qu'un import réel a eu lieu dans le processus."""
+        return mock.patch.object(ameesh, "train_incidents", fake, create=True)
+
+    def test_les_passages_du_train_sont_remis_au_consommateur(self):
+        db = object()
+        fake = self._fake([{"repo": "manaty/nexlink", "branch": "develop", "run_id": 501,
+                            "created": True, "id": 9100, "assigned": False,
+                            "status": "unique"}])
+        with mock.patch.dict(sys.modules, {"ameesh.train_incidents": fake}), \
+                self._patch_train(fake), \
+                mock.patch.object(incident, "consume") as direct, \
+                mock.patch.object(runner, "log_async") as log:
+            runner.Runner.incident_once(types.SimpleNamespace(train_passages=("p",)), db)
+        fake.consume.assert_called_once_with(db, ("p",), consumer=incident)
+        direct.assert_not_called()
+        self.assertTrue(any("lot #9100 ouvert" in call.args[0]
+                            for call in log.call_args_list))
+
+    def test_sans_passage_remis_vides(self):
+        db = object()
+        fake = self._fake()
+        with mock.patch.dict(sys.modules, {"ameesh.train_incidents": fake}), \
+                self._patch_train(fake), \
+                mock.patch.object(incident, "consume") as direct, \
+                mock.patch.object(runner, "log_async"):
+            runner.Runner.incident_once(types.SimpleNamespace(), db)
+        fake.consume.assert_called_once_with(db, (), consumer=incident)
+        direct.assert_not_called()
+
+    def test_sans_module_ni_passage_le_releve_direct_fait_foi(self):
+        db = object()
+        with mock.patch.object(incident, "consume", return_value=[]) as direct, \
+                mock.patch.object(runner, "log_async"):
+            runner.Runner.incident_once(types.SimpleNamespace(), db)
+        direct.assert_called_once_with(db)
+
+    def test_faits_du_train_illisibles_releve_direct_sans_perte(self):
+        db = object()
+        fake = self._fake(error=RuntimeError("manifeste absent"))
+        stub = types.SimpleNamespace(train_passages=("p",))
+        opened = {"repo": "manaty/nexlink", "branch": "develop", "run_id": 501,
+                  "created": True, "id": 9200, "assigned": True, "author": "deepseek4",
+                  "status": "unique"}
+        with mock.patch.dict(sys.modules, {"ameesh.train_incidents": fake}), \
+                self._patch_train(fake), \
+                mock.patch.object(incident, "consume", return_value=[opened]) as direct, \
+                mock.patch.object(runner, "log_async") as log:
+            runner.Runner.incident_once(stub, db)
+            runner.Runner.incident_once(stub, db)
+        self.assertEqual(fake.consume.call_count, 2)
+        self.assertEqual(direct.call_count, 2)
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(sum("train facts unreadable" in m for m in messages), 1)
+        self.assertTrue(any("lot #9200 ouvert" in m for m in messages))
 
 
 if __name__ == "__main__":
