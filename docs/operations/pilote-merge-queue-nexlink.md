@@ -644,6 +644,7 @@ test -x "$AMEESH_PY" || { echo "interpréteur du lanceur illisible : $AMEESH_PY"
 | ameesh (radar) | range la file, rejoue empilé, éjecte ce qui ne passe pas, prévient |
 | ameesh (`land: pr`) | fusionne le rang 1 : cible + résolutions, régénère, portes, pousse sur la branche du lot, puis `gh pr merge --match-head-commit` au vert de la CI |
 | orchestrateur Nexlink | `ameesh work queue show` (rangs et raisons), exceptions ; `main`/tags/releases/déploiements restent ses gestes |
+| bureau (repli `ameesh-cx2`) | applique le runbook §4 sur le feu distinct de `mesh-design` ; créneau du 16/10 : préavis `11:15` Paris, repli `11:25` sans réponse (§7.9) |
 
 Surveillance : `ameesh work show <lot>` (« file : queued vers develop, rang n »),
 `ameesh conflicts`, l'alerte `merge_blocked` (une tête de file qui n'avance
@@ -746,3 +747,24 @@ Tranché le 13/10 :
    (19:40Z) : créneau accepté côté pilote Nexlink, liste initiale composée à la
    coupure de 09:00Z et envoyée avec sa confirmation et son point sûr avant
    09:30Z.
+9. **Créneau du 16/10 11:30–12:00 Paris — accord bureau du 15/10 22:08 Paris
+   (20:08Z), opérateur et pièces du build final (consigné 20:15Z)** —
+   l'opérateur est le **bureau s'il est actif** au créneau ; préavis bureau à
+   **`11:15` Paris**, sans réponse à **`11:25`** `ameesh-cx2` opère, accepté par
+   le bureau et par l'orchestrateur Nexlink (événement `28075`), dans le
+   **mandat borné** : runbook §4 seul, unité `orchestrateur` seule, profil
+   courant + seule carte §2 `land: "pr"`, `zz`/`accounts`/autres unités
+   préservés, §4.5 refait du socle au geste. **Pièces à réunir sur le build
+   final** (déployé après la coupure de 21:00Z), aucune ne vaut activation :
+   (a) pré-vol §4.0 **rejoué** sur ce build déployé (version, outillage, clone,
+   unité, état `zz`/drop-ins) ;
+   (b) **§4.5 `True`/`True`** avec le profil rafraîchi (socle courant + seule
+   carte §2, candidat SHA `311ebc66…` préparé hors configuration par
+   `mesh-design`, à poser en `$CFG` avant le geste) ;
+   (c) **point sûr** de fin de tour de l'unité `orchestrateur` ;
+   (d) **feu distinct** `mesh-design` ;
+   (e) préavis bureau `11:15` (repli `cx2` `11:25`), orchestrateur Nexlink
+   prévenu la veille (accusé 19:40Z).
+   **Aucune activation ce soir** et **aucune extension à `#608`**.
+   (source : courrier bureau → `mesh-design` du 15/10 22:08 Paris, consigné au
+   journal #183 le 15/10 20:15Z)
