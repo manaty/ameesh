@@ -171,13 +171,15 @@ class SelectedTurnRefusedTest(unittest.TestCase):
     def test_run_turn_remet_la_consigne_et_refuse(self):
         runner = types.SimpleNamespace(
             draining=threading.Event(), restart_for_stale=True, runner_id="runner-1")
-        # #290 : `run_turn` refuse la pièce jointe et prend le verrou de session
+        # #290 : `run_turn` refuse l'attach et prend le verrou de session
         # avant le tour ; la doublure les satisfait sans E/S (le refus périmé
         # testé reste dans `_run_guarded_turn`).
+        state_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(state_dir.cleanup)
         worker = types.SimpleNamespace(
             runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
             _attach_pending=lambda: False, _session_lock=mock.Mock(),
-            resident=object(), state_dir=tempfile.mkdtemp())
+            resident=object(), state_dir=state_dir.name)
         # #290 a séparé l'enveloppe (`run_turn`) du tour (`_run_guarded_turn`) :
         # la doublure porte la vraie logique de tour et une enveloppe inerte.
         worker._run_guarded_turn = types.MethodType(
