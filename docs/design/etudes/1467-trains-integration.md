@@ -82,12 +82,31 @@ vertes provoque une pause avec ses preuves. Le plafond d'échecs borne le coût.
 La nouvelle union devient le périmètre des diagnostics suivants : un membre
 déjà exclu ne peut réapparaître comme contexte de prérequis.
 
-## Qualification et feu : raccord restant avant gel
+## Qualification et autorité de fusion
 
 Les ports `qualify` et `authorize` sont obligatoires. Il n'existe aucun
 fournisseur de GO implicite, aucun raccord au runner et aucune activation de
 configuration dans cette préparation. Le dernier verdict `ok` de la file
 actuelle n'est pas un contrat d'admission suffisant.
+
+Le contrat #1616 corrigé est maintenant consommé : home
+`430e65921f4421831ab87b4c1160d631221fc317`, fournisseur Python
+`53cf2e01c90fbc07233f865a68c4d44fab5c096c` (impl07, courrier du 15 octobre
+à 15:52, précédence §11 bis qualifiée par mesh-design à 15:49).
+Le même objet compilé sélectionne `Fires` si `merge.named_fire` vaut vrai,
+ou `Automatic` si faux. Dans ce dernier cas, aucune commande de feu ni
+identité pilote n'est demandée : le moteur persiste son intention de promotion
+avec le plan et le commit de politique sous le bail commun, puis Runtime
+revalide admissions et CI complète avant le push. La reprise réconcilie la
+cible exacte ; elle ne rejoue jamais une promotion incertaine. Aucun nouveau
+stockage, moteur ou paramètre local de processus n'est ajouté. Un contrat
+de fusion absent ou incompatible refuse avant réservation.
+
+Les descriptions nominatives ci-dessous documentent le port conservé pour
+les seuls contrats qui l'exigent. Les champs de diagnostic
+`ci.environment_red` et `ci.faulty_lot` attendent encore un fournisseur
+qualifié de preuve locale et d'isolation ; un rouge global ne désigne aucun
+lot et ne prouve pas une dépendance à l'environnement.
 
 Le fournisseur doit vérifier les familles réelles à la date des commits et
 verdicts, pour chaque auteur, à partir des sessions/tours historiques. Le nom

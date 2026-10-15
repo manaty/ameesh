@@ -13,7 +13,7 @@ from datetime import datetime
 from unittest import mock
 
 from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_policy, train_runner, work)
+                    train_git, train_policy, train_runner, work)
 
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -23,6 +23,12 @@ class FixtureMechanics(train_policy.Versioned):
     """Explicit #1616 boundary fixture; integration probes use the real loader."""
     schema = "ameesh-mechanics/1"
     ci_packet = "full"
+    # This fixture explicitly exercises the older named-fire policy too.
+    # The new canon and automatic path are tested with both policy values.
+    merge_named_fire = True
+    merge_repeat_freeze = False
+    merge_on_green_packet = True
+    merge_post_merge_red = "forward_or_revert"
     families = ("codex", "claude", "deepseek")
     exclude_author_family = distinct_families = True
     cutoff = staticmethod(train.cutoff)
@@ -258,4 +264,90 @@ class TrainRunnerTest(PgTestCase):
         result = self.passage().step(self.db, self.now)
         self.assertEqual(result["result"], "refused", result)
         self.assertIn("missing independent", result["error"])
+        self.assertEqual(self.api_calls, [])
+
+    def automatic_passage(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.merge_named_fire = False
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        return self.passage()
+
+    def test_compiled_automatic_policy_lands_green_packet_without_pilot_across_connections(self):
+        passage = self.automatic_passage()
+        plan = passage.step(self.db, self.now)["plan"]
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+        with mock.patch.object(work, "corrector", side_effect=AssertionError("no named fire")):
+            result = passage.step(other_db, self.now + 1)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
+        self.assertIsNone(self.ops.train_fire_read(self.key, plan["id"]))
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["fire"]["policy_commit"], self.base)
+        self.assertFalse(state["fire"]["merge"]["named_fire"])
+        self.assertIsNone(passage.epoch)
+
+    def test_automatic_claim_before_effect_crash_is_never_replayed(self):
+        passage = self.automatic_passage()
+        plan = passage.step(self.db, self.now)["plan"]
+        with mock.patch.object(train_fire.Automatic, "promote", side_effect=train.TrainError("crash")):
+            self.assertEqual(passage.step(self.db, self.now + 1)["result"], "refused")
+        self.assertEqual(self.ops.train_read(self.key)["phase"], "promoting")
+        restarted = self.automatic_passage()
+        with mock.patch.object(train_git.Repository, "promote", side_effect=AssertionError("no replay")):
+            result = restarted.step(self.db, self.now + 2)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), self.base)
+        self.assertEqual(self.ops.train_read(self.key)["plan"]["id"], plan["id"])
+
+    def test_automatic_lost_push_response_reconciles_without_second_push(self):
+        passage = self.automatic_passage()
+        plan = passage.step(self.db, self.now)["plan"]
+        promote = train_git.Repository.promote
+        def lost_response(repository, *args, **kwargs):
+            promote(repository, *args, **kwargs)
+            raise train.TrainError("response lost")
+        with mock.patch.object(train_git.Repository, "promote", new=lost_response):
+            self.assertEqual(passage.step(self.db, self.now + 1)["result"], "refused")
+        self.assertEqual(self.ops.train_read(self.key)["phase"], "promoting")
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
+        with mock.patch.object(train_git.Repository, "promote", side_effect=AssertionError("no replay")):
+            result = self.automatic_passage().step(self.db, self.now + 2)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.ops.train_read(self.key)["phase"], "landed")
+
+    def assert_automatic_recheck(self, invalidate):
+        passage = self.automatic_passage()
+        passage.step(self.db, self.now)
+        authorize, api = train_fire.Automatic.authorize, self.api
+        def changed(authority, plan):
+            receipt = authorize(authority, plan)
+            if invalidate == "review":
+                self.receipts.clear()
+            else:
+                train_ci.GitHub._api.side_effect = lambda path: (
+                    [dict(workflow_runs=[])] if "/runs?" in path else api(path))
+            return receipt
+        with mock.patch.object(train_fire.Automatic, "authorize", new=changed), \
+                mock.patch.object(train_git.Repository, "promote") as effect:
+            result = passage.step(self.db, self.now + 1)
+        self.assertEqual(result["result"], "refused", result)
+        self.assertEqual(self.ops.train_read(self.key)["phase"], "promoting")
+        effect.assert_not_called()
+
+    def test_automatic_rechecks_reviews_after_persisted_claim(self):
+        self.assert_automatic_recheck("review")
+
+    def test_automatic_rechecks_ci_after_persisted_claim(self):
+        self.assert_automatic_recheck("ci")
+
+    def test_missing_merge_contract_never_falls_back_to_named_fire(self):
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        fields = dict(vars(rules), schema=rules.schema, ci_packet=rules.ci_packet)
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = types.SimpleNamespace(**fields)
+        with self.assertRaisesRegex(train.TrainError, "explicit compiled packet merge policy"):
+            self.passage().step(self.db, self.now)
+        self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
         self.assertEqual(self.api_calls, [])

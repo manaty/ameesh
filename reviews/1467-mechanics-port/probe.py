@@ -2,7 +2,7 @@
 """Cross-branch #1467/#1616 probe; SQL/Git real, CI/provenance fixtures.
 
 PYTHONPATH=src ameesh heavy -- .venv/bin/python reviews/1467-mechanics-port/probe.py \
-    --supplier . --commit 488681e0dbb00f53a39f8244819b3faf362b74c1
+    --supplier . --commit 53cf2e01c90fbc07233f865a68c4d44fab5c096c
 
 Only the supplier's exact mechanics.py object is loaded. No branch merge,
 canon checkout, production connection, runner installation or remote API.
@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from datetime import datetime
 
-from ameesh import train
+from ameesh import train, train_policy
 from tests.test_1467_train_runner import TrainRunnerTest
 
 MECHANICS = """schema: ameesh-mechanics/1
@@ -28,6 +28,13 @@ build:
 ci:
   packet: full
   incident_label: ci-full
+  environment_red: does_not_block
+  faulty_lot: removed_without_new_review
+merge:
+  named_fire: true
+  repeat_freeze: false
+  on_green_packet: true
+  post_merge_red: forward_or_revert
 reviews:
   families: [claude, codex, deepseek]
   exclude_author_family: true
@@ -41,6 +48,28 @@ def stamp(hour):
 
 
 class RealMechanicsTest(TrainRunnerTest):
+    def test_real_canon_merge_flag_lands_without_a_named_fire(self):
+        commit = self.revise(MECHANICS.replace("named_fire: true", "named_fire: false"))
+        passage = self.passage(policy_commit=commit)
+        first = passage.step(self.db, self.now)
+        self.assertEqual(first["result"], "ci", first)
+        result = passage.step(self.db, self.now + 1)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), first["plan"]["head"])
+        self.assertIsNone(self.ops.train_fire_read(self.key, first["plan"]["id"]))
+        receipt = self.ops.train_read(self.key)["fire"]
+        self.assertEqual(receipt["policy_commit"], commit)
+        self.assertFalse(receipt["merge"]["named_fire"])
+
+    def test_absent_merge_clause_is_not_an_implicit_named_fire(self):
+        start = MECHANICS.index("merge:\n")
+        end = MECHANICS.index("reviews:\n", start)
+        commit = self.revise(MECHANICS[:start] + MECHANICS[end:])
+        with self.assertRaises(train.TrainError):
+            self.passage(policy_commit=commit).step(self.db, self.now)
+        self.assertEqual(self.db.query("SELECT target FROM merge_locks"), [])
+        self.assertEqual(self.api_calls, [])
+
     def test_real_next_cutoff_and_engine_use_the_changed_canon(self):
         self.queued_at_ten()
         commit = self.revise(MECHANICS.replace('"11:00"', '"12:00"'))
@@ -122,6 +151,8 @@ if __name__ == "__main__":
     parser.add_argument("--supplier", required=True)
     parser.add_argument("--commit", required=True)
     parser.add_argument("--test", action="append", help="Run only the named consumer witness")
+    parser.add_argument("--canon", help="Also read the candidate canon objects, never its checkout")
+    parser.add_argument("--canon-commit", help="Full exact candidate canon commit")
     args = parser.parse_args()
     resolved = subprocess.check_output(["git", "-C", args.supplier, "rev-parse", "--verify",
                                         args.commit + "^{commit}"], text=True).strip()
@@ -137,6 +168,29 @@ if __name__ == "__main__":
         supplier = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = supplier
         spec.loader.exec_module(supplier)
+        if bool(args.canon) != bool(args.canon_commit):
+            parser.error("--canon and --canon-commit must be supplied together")
+        if args.canon:
+            examples = {
+                "ameesh": {".github/workflows/tests.yml": 1, "src/ameesh/identity.py": 2,
+                           "src/ameesh/migrations/0001.sql": 2},
+                "nexlink": {".github/workflows/backend-suite.yml": 1,
+                            "infra/compute-build/Dockerfile": 1,
+                            "scripts/deploy-staging.sh": 1, "scripts/deploy-prod.sh": 2,
+                            "supabase/migrations/0001.sql": 2,
+                            "backend/src/modules/payments/payments.service.ts": 2,
+                            "backend/src/modules/messaging/messaging.service.ts": 1},
+            }
+            for project, paths in examples.items():
+                rules = supplier.load(args.canon, args.canon_commit, project)
+                compiled = train_policy.Compiled(rules)
+                actual = {path: compiled._need([path])[1] for path in paths}
+                if actual != paths or rules.merge_named_fire is not False \
+                        or rules.merge_repeat_freeze is not False \
+                        or rules.merge_on_green_packet is not True:
+                    raise AssertionError((project, actual, rules.to_dict()))
+                print(json.dumps(dict(project=project, commit=rules.commit, reviews=actual,
+                                      merge=rules.to_dict()["merge"])))
         names = [name for name in RealMechanicsTest.__dict__ if name.startswith("test_")]
         names += ["test_new_clone_reads_real_history_then_lands_exact_ci_head_across_connections",
                   "test_competing_runner_cannot_touch_the_reserved_train_or_share_its_clone",

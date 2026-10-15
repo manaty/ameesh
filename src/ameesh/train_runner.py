@@ -57,6 +57,17 @@ class Passage:
             raise train.TrainError("compiled mechanics belongs to another commit or project")
         if rules.ci_packet != "full":
             raise train.TrainError("train requires full packet CI in the compiled canon")
+        # Missing fields never resurrect the old named-fire requirement.
+        # Unsupported process changes require an explicit adapter first.
+        try:
+            if type(rules.merge_named_fire) is not bool \
+                    or rules.merge_repeat_freeze is not False \
+                    or rules.merge_on_green_packet is not True \
+                    or rules.merge_post_merge_red not in ("forward_or_revert", "freeze"):
+                raise train.TrainError("unsupported compiled packet merge policy")
+            fires = (train_fire.Fires if rules.merge_named_fire else train_fire.Automatic)
+        except AttributeError as exc:
+            raise train.TrainError("explicit compiled packet merge policy required") from exc
         policy = replace(self.policy, schedule=rules)
         requirement = train_policy.Compiled(rules)
         ci = train_ci.GitHub(radar.github_slug(self.project), self.workflows)
@@ -68,10 +79,11 @@ class Passage:
         clone = resolutions.Replayer(self.project.repo, directory, script=None)
         repository = train_git.Repository(self.project, clone)
         ledger = train_store.Ledger(db, self.project, target, self.owner)
+        authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)
         history = train_history.Recorded(db, clone.path, provider=self.provider, review_rules=rules)
         admissions = train_admissions.Admissions(db, self.project, history, policy=requirement)
         return train_runtime.Runtime(ledger=ledger, repository=repository, ci=ci,
-            fires=train_fire.Fires(self.cfg, ledger), admissions=admissions,
+            fires=authority, admissions=admissions,
             target=target, policy=policy, notify=self.notify)
 
     def step(self, db, now):

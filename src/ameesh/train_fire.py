@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Exact, revocable pilot fire for #1467; deliberately outside the runner.
+"""Exact promotion authority for #1467, selected by the compiled canon.
 
 A fire covers the complete persisted plan, including admission proofs and
 ordered member generations. It is a database receipt, never a journal note.
@@ -146,3 +146,66 @@ class Fires:
         if completed is None:
             raise TrainError("target observed but receipt lease/intent changed; reconcile again")
         return completed
+
+
+class Automatic:
+    """No named fire when the pinned canon authorizes a green packet.
+
+    Engine's existing ``promoting`` intent is the durable claim. This uses
+    the same target lease, validation and reconciliation ports as named fires;
+    it creates neither a pilot receipt nor another promotion state machine.
+    """
+
+    def __init__(self, ledger, rules):
+        if storage.is_remote(ledger.db):
+            raise TrainError("automatic train promotion requires local serialized storage")
+        if rules.merge_named_fire is not False or rules.merge_repeat_freeze is not False \
+                or rules.merge_on_green_packet is not True \
+                or not SHA.fullmatch(rules.commit):
+            raise TrainError("unsupported compiled automatic packet merge policy")
+        self.ledger, self.rules = ledger, rules
+
+    def authorize(self, plan):
+        document = dict(schema="ameesh-train-automatic/1", plan=plan,
+                        binding=binding(plan), policy_commit=self.rules.commit,
+                        merge=dict(named_fire=self.rules.merge_named_fire,
+                                   repeat_freeze=self.rules.merge_repeat_freeze,
+                                   on_green_packet=self.rules.merge_on_green_packet,
+                                   post_merge_red=self.rules.merge_post_merge_red))
+        return dict(document, id=digest(document))
+
+    def _intent(self, plan, receipt):
+        current = self.ledger.load()
+        expected = self.authorize(plan)
+        if not current or current.get("phase") not in ("promoting", "landed") \
+                or digest(current.get("plan")) != digest(plan) \
+                or digest(current.get("fire")) != digest(expected) \
+                or digest(receipt) != digest(expected):
+            raise TrainError("no matching persisted automatic promotion intent")
+        return current
+
+    def promote(self, plan, receipt, epoch, *, validate, effect):
+        if self._intent(plan, receipt)["phase"] != "promoting":
+            raise TrainError("automatic promotion already completed")
+        # Engine persisted this exact claim under the shared target lease.
+        # Any exception leaves it uncertain; a new pass observes the target
+        # instead of issuing the push again.
+        validate()
+        if self.ledger.acquire(epoch) != epoch:
+            raise TrainError("target reservation lost before automatic promotion")
+        self._intent(plan, receipt)
+        effect()
+
+    def reconcile(self, plan, receipt_id, epoch, *, target):
+        receipt = self.authorize(plan)
+        if receipt_id != receipt["id"]:
+            raise TrainError("automatic promotion belongs to another compiled policy or plan")
+        self._intent(plan, receipt)
+        if self.ledger.acquire(epoch) != epoch:
+            raise TrainError("target reservation lost before automatic reconciliation")
+        observed = target()
+        if observed != plan["head"]:
+            if observed != plan["base"]:
+                raise TrainError("target diverged from uncertain automatic promotion")
+            return None
+        return dict(receipt, state="landed")

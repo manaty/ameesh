@@ -2,8 +2,8 @@
 """Event-driven integration trains (#1467).
 
 This module is deliberately not installed in the executor yet. Ports must
-qualify historical authors/reviewers and the pilot's exact-head fire before
-an enabled train can run. No text in a lot journal is an authorization.
+qualify historical authors/reviewers and use the pinned canon's promotion
+authority before an enabled train can run. No lot note grants authority.
 
 One call does bounded work, never waits for CI. The persisted state precedes
 each external effect; a restart reconciles the same immutable plan. Every
@@ -125,8 +125,9 @@ class Ports(Protocol):
     unresolved B/P2-sensitive, delta reviews, protected/release targets, fire
     (including withdrawal) and targeted CI only in that policy mode. It
     returns JSON evidence, not a boolean inferred from the latest verdict.
-    `authorize` validates a structured pilot fire on (source,target,base,
-    head,tree,members,proof); it serializes withdrawal with `promote`.
+    `authorize` binds (source,target,base,head,tree,members,proof) to the
+    compiled merge policy, or to a named pilot fire when that policy requires
+    one. Named-fire withdrawal is serialized with `promote`.
     """
     def acquire(self, epoch: int | None) -> int | None: ...
     def release(self, epoch: int) -> None: ...
@@ -192,7 +193,7 @@ class Engine:
     def _current(self, state):
         plan = state["plan"]
         if self.ports.target() != plan["base"]:
-            raise TrainError("target changed during reserved CI: recompose and fire again")
+            raise TrainError("target changed during reserved CI: recompose and qualify again")
         current = {r["work_item_id"]: r for r in self.ports.entries()}
         for row in plan["members"]:
             other = current.get(row["work_item_id"])
@@ -200,7 +201,7 @@ class Engine:
                 raise TrainError("member withdrawn, refrozen or requeued")
         proof = self.ports.qualify(plan["members"], plan["base"], self.policy.ci_mode)
         if digest(proof) != digest(plan["proof"]):
-            raise TrainError("admission evidence changed: recompose and fire again")
+            raise TrainError("admission evidence changed: recompose and qualify again")
 
     def _ci(self, state):
         ci = self.ports.ci(state["plan"])
