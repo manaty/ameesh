@@ -7,6 +7,14 @@ retenir un runner pendant des heures. » Le plafond retenu ici est 60 minutes :
 la règle interdit des heures, pas une valeur précise, et le maximum en place à
 l'ouverture du lot est 40 (`carte.yml`, job `mesure`).
 
+#1410 : GitHub refuse `timeout-minutes` sur un job qui appelle un workflow
+réutilisable (`uses:`) — la clé n'existe que pour un job à étapes. Ces jobs
+portent donc leur borne dans le workflow appelé : celui-ci doit être local et
+chacun de ses jobs doit déclarer son `timeout-minutes`, ce que ce module
+vérifie (`caller_jobs`). Le même relevé strict sert aux deux lectures : un job
+n'est jamais à la fois absent du relevé des timeouts et présent dans celui des
+appels.
+
 PyYAML n'est pas une dépendance du projet : le venv de la CI n'installe que
 psycopg, cryptography et psutil, et les tests qui lisent du YAML se sautent
 quand il manque (`tests/test_cluster.py`). Ce module lit donc le sous-ensemble
@@ -49,6 +57,10 @@ _TIMEOUT = re.compile(r"""^timeout-minutes\s*:\s*(.*)$""")
 _TIMEOUT_VALUE = re.compile(r"""^["']?(\d+)["']?$""")
 #: Une paire `clé: valeur` d'un mapping compact ; la valeur reste scalaire.
 _FLOW_PAIR = re.compile(r"""^([A-Za-z0-9_.-]+)\s*:\s*([^{}\[\]]*)$""")
+#: `uses:` du corps d'un job : l'appel d'un workflow réutilisable (#1410).
+_USES = re.compile(r"""^uses\s*:\s*(.*)$""")
+#: La cible d'un `uses:` : un seul mot, nu ou entre guillemets.
+_USES_VALUE = re.compile(r"""^["']?([^"'\s]+)["']?$""")
 
 
 class UnsupportedWorkflow(ValueError):
@@ -84,12 +96,21 @@ def _timeout_value(value: str, where: str) -> int | None:
     return int(match.group(1))
 
 
-def _flow_timeout(rest: str, where: str) -> int | None:
-    """`timeout-minutes` d'un job en mapping compact, `None` s'il manque."""
+def _uses_value(value: str, where: str) -> str:
+    """Cible d'un `uses:` : un seul mot (chemin ou action), sinon refus."""
+    match = _USES_VALUE.match(value)
+    if match is None:
+        raise UnsupportedWorkflow("%s : `uses:` illisible %r" % (where, value))
+    return match.group(1)
+
+
+def _flow_job(rest: str, where: str) -> tuple[int | None, str | None]:
+    """`timeout-minutes` et `uses:` d'un job compact, `None` s'ils manquent."""
     if not rest.startswith("{") or not rest.endswith("}"):
         raise UnsupportedWorkflow(
             "%s : mapping compact illisible %r" % (where, rest))
     timeout: int | None = None
+    uses: str | None = None
     inner = rest[1:-1].strip()
     if inner:
         for pair in inner.split(","):
@@ -100,7 +121,9 @@ def _flow_timeout(rest: str, where: str) -> int | None:
             key, value = match.group(1), match.group(2).strip()
             if key == "timeout-minutes":
                 timeout = _timeout_value(value, where)
-    return timeout
+            elif key == "uses":
+                uses = _uses_value(value, where)
+    return timeout, uses
 
 
 def workflow_files(directory: Path) -> list[Path]:
@@ -109,13 +132,15 @@ def workflow_files(directory: Path) -> list[Path]:
                   if path.is_file() and path.suffix in WORKFLOW_SUFFIXES)
 
 
-def job_timeouts(text: str) -> dict[str, int | None]:
-    """`timeout-minutes` de chaque job du workflow, `None` quand il manque.
+def _read_jobs(text: str) -> dict[str, tuple[int | None, str | None]]:
+    """Relevé des jobs : `timeout-minutes` et cible `uses:`, par job.
 
-    `UnsupportedWorkflow` est levée dès qu'une forme sort du sous-ensemble lu :
-    un job ne doit jamais être absent du relevé sans que ce soit dit.
+    Une seule marche, stricte (#1279) : `UnsupportedWorkflow` est levée dès
+    qu'une forme sort du sous-ensemble lu, si bien qu'un job ne peut pas être
+    absent du relevé des timeouts et présent dans celui des appels (#1410).
+    Le relevé couvre la forme en bloc comme le mapping compact.
     """
-    timeouts: dict[str, int | None] = {}
+    jobs: dict[str, tuple[int | None, str | None]] = {}
     current: str | None = None
     in_jobs = False
     job_indent: int | None = None
@@ -152,20 +177,47 @@ def job_timeouts(text: str) -> dict[str, int | None]:
                     "%s : clé de job illisible %r" % (where, line.strip()))
             current = next((name for name in match.groups()[:3] if name), None)
             rest = match.group(4).strip()
-            timeouts[current] = _flow_timeout(rest, where) if rest else None
+            jobs[current] = _flow_job(rest, where) if rest else (None, None)
             continue
         if indent == job_indent + 2:
             if current is None:
                 continue
-            match = _TIMEOUT.match(line.strip())
+            body = line.strip()
+            timeout, uses = jobs[current]
+            match = _TIMEOUT.match(body)
             if match:
-                timeouts[current] = _timeout_value(match.group(1).strip(), where)
+                jobs[current] = (
+                    _timeout_value(match.group(1).strip(), where), uses)
+                continue
+            match = _USES.match(body)
+            if match:
+                jobs[current] = (
+                    timeout, _uses_value(match.group(1).strip(), where))
             continue
         if indent > job_indent + 2:
             continue  # corps d'étape : son timeout est plus profond
         raise UnsupportedWorkflow(
             "%s : indentation %d incohérente sous `jobs:`" % (where, indent))
-    return timeouts
+    return jobs
+
+
+def job_timeouts(text: str) -> dict[str, int | None]:
+    """`timeout-minutes` de chaque job du workflow, `None` quand il manque.
+
+    `UnsupportedWorkflow` est levée dès qu'une forme sort du sous-ensemble lu :
+    un job ne doit jamais être absent du relevé sans que ce soit dit.
+    """
+    return {job: timeout for job, (timeout, _) in _read_jobs(text).items()}
+
+
+def caller_jobs(text: str) -> dict[str, str]:
+    """Les jobs qui appellent un workflow réutilisable : job → cible `uses:`.
+
+    GitHub refuse `timeout-minutes` sur ces jobs (#1410) ; leur borne est
+    portée par les jobs du workflow appelé, que `WorkflowTimeoutsTest` vérifie.
+    """
+    return {job: uses
+            for job, (_, uses) in _read_jobs(text).items() if uses is not None}
 
 
 class WorkflowTimeoutsTest(unittest.TestCase):
@@ -176,13 +228,35 @@ class WorkflowTimeoutsTest(unittest.TestCase):
 
     def test_chaque_job_declare_son_timeout(self):
         for path in self.workflows():
-            timeouts = job_timeouts(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            appeles = caller_jobs(text)
+            timeouts = job_timeouts(text)
             with self.subTest(workflow=path.name):
                 self.assertTrue(timeouts, "aucun job lu dans %s" % path.name)
             for job, value in timeouts.items():
+                if job in appeles:
+                    continue  # #1410 : `uses:` refuse timeout-minutes ; voir le test voisin
                 with self.subTest(workflow=path.name, job=job):
                     self.assertIsNotNone(
                         value, "%s/%s : timeout-minutes manquant" % (path.name, job))
+
+    def test_un_job_appele_est_borne_par_les_jobs_de_l_appele(self):
+        # #1410 : la borne d'un job `uses:` est celle des jobs du workflow
+        # appelé ; l'appel doit rester local et chaque job appelé être borné.
+        for path in self.workflows():
+            for job, cible in caller_jobs(path.read_text(encoding="utf-8")).items():
+                with self.subTest(workflow=path.name, job=job):
+                    self.assertTrue(cible.startswith("./.github/workflows/"),
+                                    "%s/%s : appel non local (%s)" % (path.name, job, cible))
+                    appele = ROOT / cible[2:]
+                    self.assertTrue(appele.exists(),
+                                    "%s/%s : workflow appelé absent (%s)" % (path.name, job, cible))
+                    timeouts = job_timeouts(appele.read_text(encoding="utf-8"))
+                    self.assertTrue(timeouts, "aucun job lu dans %s" % appele.name)
+                    for nom, valeur in timeouts.items():
+                        self.assertIsNotNone(
+                            valeur, "%s (appelé par %s/%s) : timeout-minutes manquant"
+                            % (nom, path.name, job))
 
     def test_le_plafond_est_respecte(self):
         for path in self.workflows():
@@ -259,6 +333,30 @@ class WorkflowTimeoutsTest(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(UnsupportedWorkflow):
                     job_timeouts(text)
+
+
+    def test_le_parseur_reconnait_un_appel_de_workflow(self):
+        text = (
+            "name: ci\n"
+            "on:\n"
+            "  push:\n"
+            "jobs:\n"
+            "  a:\n"
+            "    uses: ./.github/workflows/appele.yml\n"
+            "  b:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    timeout-minutes: 5\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+        )
+        self.assertEqual(caller_jobs(text), {"a": "./.github/workflows/appele.yml"})
+        self.assertEqual(job_timeouts(text), {"a": None, "b": 5})
+
+    def test_un_job_compact_qui_appelle_est_releve(self):
+        # Composition #1279 × #1410 : le même relevé strict lit l'appel compact.
+        text = "jobs:\n  a: {uses: ./.github/workflows/x.yml}\n"
+        self.assertEqual(caller_jobs(text), {"a": "./.github/workflows/x.yml"})
+        self.assertEqual(job_timeouts(text), {"a": None})
 
 
 if __name__ == "__main__":  # pragma: no cover
