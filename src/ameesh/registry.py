@@ -120,8 +120,10 @@ def live_harness(row: dict | None) -> str:
     lequel la session tourne (L242b : harnais emprunté). Sans session ouverte
     — origine inconnue — le harnais déclaré reste le seul connu.
 
-    C'est ce que lit la porte §2 « autre famille de modèle » : la famille de
-    celui qui a réellement produit le travail, pas l'étiquette déclarée."""
+    C'est le harnais de la session courante. La porte §2 « autre famille de
+    modèle » ne l'utilise plus telle quelle : #1053/#1777 relit les tours du
+    gel (`review_lot._author_at_freeze`), qui seuls prouvent une famille
+    historique ; ce lecteur reste l'API du registre pour l'état courant."""
     row = row or {}
     return str(row.get("session_harness") or row.get("harness") or "")
 
