@@ -88,8 +88,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    grants          register reserve release live_reservations candidates
                    revoke get
    placements      recorded
-   progress        lots lot_events lot_milestones lot_actions actions agents costs
-                   packages package_items lot_messages
+   progress        lots lot_events lot_transitions lot_event_last lot_milestones
+                   lot_actions actions agents costs packages package_items
+                   lot_messages
    projects        board
    decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
@@ -2131,6 +2132,39 @@ class Progress(Domain):
     def lot_events(self, item_ids: Sequence[int]) -> list[dict]:
         """Journal COMPLET des transitions de ces lots (id, work_item_id,
         state, note, actor, created_ts), dans l'ordre d'écriture."""
+
+    def lot_transitions(self, item_ids: Sequence[int]) -> list[dict]:
+        """Transitions SEULES de ces lots (id, work_item_id, state, actor,
+        created_ts), dans l'ordre d'écriture : les lignes qui répètent l'état
+        précédent (notes) sont écartées, et leur texte n'est jamais lu. C'est
+        ce que demandent les vues groupées (`work list`, `progress`,
+        `roadmap`) : le journal complet ne sert qu'au détail d'un lot.
+
+        Lecture DÉRIVÉE (pas une opération du contrat médié) : le stockage
+        peut l'optimiser — agrégation SQL — sans changer ce que reçoit
+        l'appelant ; le repli ci-dessous lit `lot_events`."""
+        out: list[dict] = []
+        previous: dict[int, str] = {}
+        for ev in self.lot_events(item_ids):
+            lot = int(ev["work_item_id"])
+            state = ev.get("state")
+            if lot not in previous or previous[lot] != state:
+                out.append({key: value for key, value in ev.items() if key != "note"})
+            previous[lot] = state
+        return out
+
+    def lot_event_last(self, item_ids: Sequence[int]) -> list[dict]:
+        """Dernier instant d'événement de chacun de ces lots (work_item_id,
+        last_ts) : l'activité du journal sans en lire les lignes — la borne
+        que `stagnation.last_activity` ajoute aux transitions. Lecture
+        DÉRIVÉE, repli sur `lot_events`."""
+        last: dict[int, float] = {}
+        for ev in self.lot_events(item_ids):
+            lot = int(ev["work_item_id"])
+            ts = ev.get("created_ts")
+            if ts is not None:
+                last[lot] = max(last.get(lot, float("-inf")), float(ts))
+        return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
 
     @abc.abstractmethod
     def lot_milestones(self, item_ids: Sequence[int]) -> list[dict]:
