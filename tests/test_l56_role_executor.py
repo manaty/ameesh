@@ -131,8 +131,9 @@ class RoleExecutorTest(PgTestCase):
                 db.close()
 
         own = storage.of(self.db).events.bounds()["cluster"]
-        # #928 : la position porte aussi l'identité propre du journal (j + 16 hexa)
-        self.assertRegex(own, "^[0-9a-f]{1,16}t[0-9a-f]{8}(j[0-9a-f]{16})?$")
+        # 0448 (F5) : l'identité nomme le journal lui-même — le cluster et sa
+        # timeline ne suffisent pas (deux schémas du même cluster se confondent).
+        self.assertRegex(own, "^[0-9a-f]{1,16}t[0-9a-f]{8}j[0-9a-f]{16}$")
         self.assertEqual(cluster(), own)
         functions = ("pg_control_system(), pg_control_checkpoint(),"
                      " pg_current_wal_lsn(), pg_walfile_name(pg_lsn)")
