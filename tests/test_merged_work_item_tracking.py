@@ -1045,6 +1045,68 @@ class ContentDeliveryTest(_Base):
         self.assertIn("closed by content", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    def retirer(self):
+        """Retire la composition du paquet (revert du commit de fusion) et
+        publie la cible : le gel reste ancêtre, son contenu n'y est plus."""
+        compose = _git(self.repo, "rev-parse", "develop")
+        _git(self.repo, "revert", "-m", "1", "--no-edit", compose)
+        self.publish_develop()
+
+    def test_1638_ancetre_reverte_ne_ferme_pas_par_contenu(self):
+        # #498 (qa-01) : une composition retirée du paquet laisse le gel
+        # ancêtre de la cible ; l'ascendance ne prouve plus le contenu
+        sha = self.livrer("agent/498", "Merge pull request #7 from manaty/agent/498")
+        self.retirer()
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertFalse(found["merged"])
+        self.assertIn("revert", found["detail"])
+
+    def test_1638_ancetre_reverte_modification_seule(self):
+        # pas de fichier ajouté : le diff du gel se réapplique sur l'arbre,
+        # c'est le contenu qui manque, pas les chemins
+        _git(self.repo, "checkout", "-q", "-b", "agent/498", "develop")
+        with open(os.path.join(self.repo, "socle"), "a") as fh:
+            fh.write("modifie\n")
+        _git(self.repo, "commit", "-q", "-am", "modifie socle")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge pull request #8 from manaty/agent/498", "agent/498")
+        self.retirer()
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual(entry["result"], "open")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        found = plan_git.probe(self.repo, sha, "origin/develop")
+        self.assertFalse(found["merged"])
+        self.assertIn("revert", found["detail"])
+
+    def test_1638_branch_probe_reverte_reste_ouverte(self):
+        # le relevé automatique des branches (sync) concluait de même
+        self.livrer("agent/498", "Merge pull request #7 from manaty/agent/498")
+        self.retirer()
+        found = plan_git.branch_probe(self.repo, "agent/498", "origin/develop")
+        self.assertFalse(found["merged"])
+        self.assertIn("revert", found["detail"])
+
+    def test_1638_ancetre_evolue_reste_fusionne(self):
+        # un lot suivant touche le même fichier : le contenu du gel est
+        # toujours là, l'arbre a évolué ; l'ascendance reste admise (doute
+        # qui ne conclut pas au retrait)
+        sha = self.livrer("agent/libre", "Merge pull request #7 from manaty/agent/libre")
+        with open(os.path.join(self.repo, "agent-libre"), "a") as fh:
+            fh.write("suite\n")
+        _git(self.repo, "commit", "-q", "-am", "suite sur le meme fichier")
+        self.publish_develop()
+        lot = self.lot(sha)
+        entry = plan_git.sync_merges(self.db, self.repo)["results"][0]
+        self.assertEqual((entry["result"], entry["how"]), ("merged", "ancestor"))
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
 
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""
