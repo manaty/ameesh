@@ -282,6 +282,8 @@ class FauxApi:
         #: #845 : runners du dépôt, jobs par exécution, liste d'exécutions
         #: tronquée, panne de l'API des runners
         self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
+        #: #846/#901 B1 : jobs d'une tentative — (run_id, attempt) -> jobs
+        self.attempt_jobs: dict[tuple[int, int], list[dict]] = {}
         #: #845 : chemins appelés, pour compter les appels de la garde
         self.paths: list[str] = []
 
@@ -290,6 +292,9 @@ class FauxApi:
         if "/actions/runs/" in path and "/jobs" in path:
             run_id = int(path.split("/actions/runs/")[1].split("/")[0])
             jobs = self.jobs.get(run_id, [])
+            if "/attempts/" in path:  # jobs d'une tentative (#846/#901 B1)
+                attempt = int(path.split("/attempts/")[1].split("/")[0])
+                jobs = self.attempt_jobs.get((run_id, attempt), [])
             return {"total_count": len(jobs), "jobs": list(jobs)}
         if "/actions/runners" in path:
             if self.runners_fail:
@@ -336,8 +341,11 @@ def runner_view(runner_id, name, *, busy=True, status="online"):
     return {"id": runner_id, "name": name, "status": status, "busy": busy}
 
 
-def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None):
+def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None,
+             conclusion=None):
     job = {"name": name, "status": status, "runner_name": runner}
+    if conclusion is not None:
+        job["conclusion"] = conclusion
     if job_id is not None:
         job["id"] = job_id
     if created_at is not None:
@@ -889,20 +897,35 @@ class WatcherTest(PgTestCase):
                       if a["type"] == "ci_main_red"]
         self.assertEqual(exploitation.alert_key(alerte2), cle)
 
+    def job_failures(self, run_id, repo=DEPOT):
+        """#846/#901 : les échecs natifs relevés, avec leur tentative."""
+        return [(int(r["run_attempt"]), r["test"]) for r in self.db.query(
+            "SELECT run_attempt, test FROM ci_test_failures"
+            " WHERE repo = %s AND run_id = %s AND part = %s"
+            " ORDER BY test, run_attempt", (repo, int(run_id), ci.JOB_PART))]
+
     def test_main_rouge_sur_un_job_sans_evenement(self):
         # #846 : un job en échec sans événement de test publié (installation,
         # délai dépassé) est un main rouge ; il est relevé, alerte, et ne
-        # produit aucun courrier de test (les jobs d'une autre exécution du
-        # même commit sont écartés)
+        # produit aucun courrier de test. #901 B1 : la provenance est la
+        # tentative (`attempts/<n>/jobs`), donc les check runs de la tête
+        # (ceux d'une autre exécution ou d'une autre tentative) sont écartés.
         sha = "a9" * 20
         self.api.live = [run_view(802, sha, "main",
                                   message="L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"])]
+        self.api.attempt_jobs[(802, 1)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure"),
+            job_view("plan", status="completed", conclusion="success"),
+            job_view("psql 1/1", status="completed", conclusion="cancelled")]
+        # la tête porte encore le check run natif d'une autre exécution et
+        # celui du job en échec : seul le job de la tentative compte
         self.api.checks[sha] = [check_job("psycopg 2/4", 802),
                                 check_job("plan", 802, conclusion="success"),
                                 check_job("psycopg 3/4", 999),
                                 check_job("psql 1/1", 802, conclusion="cancelled")]
         self.assertEqual(self.watcher.tick(self.db), [])
         self.assertEqual(self.mails("dev-b"), [])
+        self.assertEqual(self.job_failures(802), [(1, "psycopg 2/4")])
         (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
                      if a["type"] == "ci_main_red"]
         self.assertEqual((alerte["agent"], alerte["lot"]), ("dev-b", self.lot_main["id"]))
@@ -910,8 +933,61 @@ class WatcherTest(PgTestCase):
         self.assertNotIn("psycopg 3/4", alerte["detail"])
         # le relevé suivant ne double ni le relevé ni l'alerte
         self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.job_failures(802), [(1, "psycopg 2/4")])
         self.assertEqual(len([a for a in exploitation.alerts(self.cfg, self.db)
                               if a["type"] == "ci_main_red"]), 1)
+
+    def test_relance_ne_reporte_pas_un_echec_natif_de_l_attempt_precedent(self):
+        # #901 B1 (R2 dev1/Claude, sonde auditeur) : un job en échec de
+        # l'attempt 1, encore publié pendant la relance, garde sa provenance ;
+        # le suivi de l'attempt 2 ne l'inscrit pas sous le sien. Le job réussit
+        # à la relance : la ligne de l'attempt 1 n'est plus imputée, aucun faux
+        # rouge ne subsiste.
+        sha = "b9" * 20
+        message = "L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"]
+        self.api.live = [run_view(803, sha, "main", message=message, attempt=1)]
+        self.api.attempt_jobs[(803, 1)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(803), [(1, "psycopg 2/4")])
+        # la relance démarre : le job de l'attempt 2 tourne, et le check run de
+        # l'attempt 1 est encore le dernier publié pour ce nom
+        self.api.live = [run_view(803, sha, "main", message=message, attempt=2)]
+        self.api.checks[sha] = [check_job("psycopg 2/4", 803)]
+        self.api.attempt_jobs[(803, 2)] = [job_view("psycopg 2/4", status="in_progress")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(803), [(1, "psycopg 2/4")])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_main_red"], [])
+        # il réussit à la relance : plus aucun échec imputé à l'exécution
+        self.api.live = []
+        self.api.done[803] = completed(".github/workflows/tests.yml", "success", attempt=2)
+        self.watcher.tick(self.db)
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 803)["status"], "success")
+        self.assertEqual(storage.of(self.db).ci.failures(DEPOT, 803), [])
+        self.assertEqual(self.job_failures(803), [(1, "psycopg 2/4")])
+
+    def test_echec_natif_de_l_attempt_courant_conserve(self):
+        # #901 B1 : un vrai échec natif de l'attempt 2 est relevé sous 2 et
+        # garde l'alerte #846 — la correction ne supprime pas le rouge d'une
+        # relance.
+        sha = "c9" * 20
+        message = "L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"]
+        self.api.live = [run_view(804, sha, "main", message=message, attempt=1)]
+        self.api.attempt_jobs[(804, 1)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(804), [(1, "psycopg 2/4")])
+        # la relance échoue aussi : la ligne passe à l'attempt 2, l'alerte tient
+        self.api.live = [run_view(804, sha, "main", message=message, attempt=2)]
+        self.api.attempt_jobs[(804, 2)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(804), [(2, "psycopg 2/4")])
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                     if a["type"] == "ci_main_red"]
+        self.assertEqual((alerte["agent"], alerte["lot"]), ("dev-b", self.lot_main["id"]))
+        self.assertIn("psycopg 2/4", alerte["detail"])
 
     def test_attente_d_un_runner_separee_sans_double_alerte(self):
         # #747 : 1 h 24 d'attente lue comme « psql bloqué 2 h 20 »
@@ -1518,10 +1594,13 @@ class WatcherTest(PgTestCase):
     def est_appel_garde(path: str) -> bool:
         """#845 : un appel de la garde (listes 100, jobs, runners).
 
-        La liste de suivi des échecs (`watch`, `per_page=50`) et les check
-        runs (`/commits/.../check-runs?per_page=100`) ne comptent pas dans le
-        budget de la garde."""
+        La liste de suivi des échecs (`watch`, `per_page=50`), les check
+        runs (`/commits/.../check-runs?per_page=100`) et les jobs d'une
+        tentative (`/actions/runs/<id>/attempts/<n>/jobs`, #846/#901 B1) ne
+        comptent pas dans le budget de la garde."""
         if "per_page=100" not in path:
+            return False
+        if "/attempts/" in path:
             return False
         return ("/actions/runs?" in path or "/jobs" in path or "/actions/runners" in path)
 

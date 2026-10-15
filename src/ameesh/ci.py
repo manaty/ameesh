@@ -237,21 +237,19 @@ def events_of(check_runs, run_id: int, attempt: int | None = None) -> list[dict]
     return out
 
 
-def failed_jobs_of(check_runs, run_id: int) -> list[str]:
-    """#846 : les jobs de l'exécution `run_id` déjà en échec, d'après les check
-    runs natifs de GitHub — les seuls publiés même quand aucun événement de
-    test ne l'est (panne d'installation, délai dépassé). Un check run d'un
-    autre workflow, ou d'une autre exécution du même commit, est écarté par le
-    lien vers son job (`/actions/runs/<run_id>/job/<job_id>`)."""
+def failed_jobs_of(jobs) -> list[str]:
+    """#846 : les jobs déjà en échec d'une **tentative** d'exécution, d'après
+    la liste des jobs de cette tentative (`actions/runs/<id>/attempts/<n>/jobs`)
+    — les seuls publiés même quand aucun événement de test ne l'est (panne
+    d'installation, délai dépassé). La tentative est explicite (#901 B1) : les
+    check runs d'une tête ne portent que le `run_id`, celui d'une tentative
+    antérieure encore publié serait imputé à la relance."""
     out = set()
-    for check in check_runs or ():
-        name = str(check.get("name") or "").strip()
-        if not name or name.startswith(CHECK_PREFIX):
+    for job in jobs or ():
+        name = str(job.get("name") or "").strip()
+        if not name:
             continue
-        if (check.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
-            continue
-        link = str(check.get("details_url") or check.get("url") or "")
-        if "/actions/runs/%d/job/" % int(run_id) not in link:
+        if (job.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
             continue
         out.add(name)
     return sorted(out)
@@ -872,7 +870,7 @@ class Watcher:
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
-        self._record_failed_jobs(st, repo, row, checks.get("check_runs"))
+        self._record_failed_jobs(st, repo, row)
         if not events:
             return []
         reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
@@ -930,17 +928,23 @@ class Watcher:
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
-    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs) -> None:
+    def _record_failed_jobs(self, st, repo: str, row: dict) -> None:
         """#846 : sur une branche de base, un job déjà en échec est un main
         rouge, même sans événement de test publié (panne d'installation, délai
         dépassé). Relevé ici pour que `ci.main_red` alerte sans attendre la
         conclusion de l'exécution. Aucun courrier n'en part : `_failures` ne
-        signale que les événements de test (part `job` mise à part)."""
+        signale que les événements de test (part `job` mise à part).
+        #901 B1 : les jobs sont ceux de l'attempt suivi, pas ceux de la tête —
+        un échec de l'attempt précédent encore publié n'est jamais inscrit sous
+        la relance, un vrai échec de l'attempt courant l'est."""
         if row.get("branch") not in BASE_BRANCHES:
             return
-        for job in failed_jobs_of(check_runs, int(row["run_id"])):
-            st.ci.add_failure(repo, int(row["run_id"]),
-                              run_attempt=int(row.get("run_attempt") or 1),
+        run_id = int(row["run_id"])
+        attempt = int(row.get("run_attempt") or 1)
+        jobs = self.api("repos/%s/actions/runs/%s/attempts/%s/jobs?per_page=100"
+                        % (repo, run_id, attempt)) or {}
+        for job in failed_jobs_of(jobs.get("jobs")):
+            st.ci.add_failure(repo, run_id, run_attempt=attempt,
                               part=JOB_PART, test=job,
                               module="", status="echec", inherited=False,
                               excerpt="", replay="", duration_s=None, failed_at=None)
