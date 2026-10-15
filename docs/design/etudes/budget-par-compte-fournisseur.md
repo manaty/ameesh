@@ -2,7 +2,7 @@
 type: Study
 title: "Study — a shared daily USD budget per provider billing account (OpenAI 100 $/day, DeepSeek 100 $/day)"
 description: "Billing account identity independent of key, agent, harness and host; calendar-day envelope in Europe/Paris; atomic admission by dollar reservation in the central database; conservative settlement; coverage boundary; migration and CLI. Design note for owner review before implementation (lot #1469, issue #1101)."
-status: draft
+status: decided
 tags: [budget, cout, compte, fournisseur, openai, deepseek, admission, reservation, tpk]
 generated: { by: "ameesh-dev7/claude-opus-5-5", at: "2026-10-15T04:00:00+02:00" }
 sources:
@@ -16,6 +16,17 @@ sources:
 Lot #1469, issue #1101. Required for 1.11.0 (TPK). Sensitive class (money,
 concurrency, SQL): two review families. This note is for the owner to decide
 before any code is written.
+
+**Owner decision (decision #45732, 15/10/2026 around 03:40): approved, minimal
+version.** What was implemented differs from the proposal below in three
+ways:
+
+- the billing account is declared only in the profiles (`billing_account`),
+  with no `billing_accounts` table;
+- the bound R is `reserve_usd` per profile, 2 $ by default, with no p95;
+- the relay and mediated executors stay outside the envelope.
+
+Reference: `site/docs/concepts/budgets.md`.
 
 ## 1. What exists, and what is missing
 

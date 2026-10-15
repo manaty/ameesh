@@ -41,7 +41,7 @@ import threading
 import time
 import uuid
 
-from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
+from . import account_budget, account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import persona_memory as memory_mod
@@ -2433,6 +2433,10 @@ class AgentWorker(threading.Thread):
             self._compta_repare()
             raison = ("turn accounting unavailable" if self._compta_en_echec
                       else self.budget_reason())
+        if not raison:
+            # #1469 : l'enveloppe du compte de facturation retenu (y compris
+            # le repli d'un critique) — aucune exception ne la dépasse
+            raison = account_budget.reason(self.db, self._account)
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
@@ -2542,7 +2546,7 @@ class AgentWorker(threading.Thread):
                       % (self.name, " ".join(str(exc).split())[:160]))
             return False
 
-    def _compta_ecrit(self, travail: dict) -> bool:
+    def _compta_ecrit(self, travail: dict, *, incertain: bool = True) -> bool:
         """Écrit une ligne du grand livre, puis efface le marqueur en base.
 
         Rejouable après panne : le marqueur n'est effacé qu'après une écriture
@@ -2588,6 +2592,9 @@ class AgentWorker(threading.Thread):
             # Mesure du plafond de contexte (L60), lue sur la ligne écrite.
             self.last_turn_reread = usage.reread_tokens
             self.last_turn_reread_session = usage.session
+            # #1469 : la ligne écrite prend la place de la réservation ; une
+            # réparation (tour interrompu, `incertain` par défaut) la garde
+            self._account_settle("kept" if incertain else "settled")
             registry.pending_spend_clear(self.db, self.name)
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -2660,7 +2667,19 @@ class AgentWorker(threading.Thread):
             log_async("[%s] announced model not persisted (%s): turns suspended"
                       % (self.name, " ".join(str(exc).split())[:120]))
 
-    def _compta_termine(self, model_annonce: str | None = None) -> None:
+    def _account_settle(self, state: str) -> None:
+        """#1469 : clôt la réservation ouverte de l'agent (aucune : rien).
+
+        Un échec laisse la réservation ouverte — comptée, jamais perdue ; la
+        réservation suivante de l'agent la garde (`kept`)."""
+        try:
+            account_budget.settle(self.db, self.name, state=state)
+        except db_mod.DbError as exc:
+            log_async("[%s] account reservation not closed (%s): kept counted"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+
+    def _compta_termine(self, model_annonce: str | None = None, *,
+                        incertain: bool = False) -> None:
         """Après un tour : écrit la ligne du grand livre.
 
         Le modèle **annoncé par le flux** du harnais prime sur celui figé au
@@ -2672,7 +2691,7 @@ class AgentWorker(threading.Thread):
         if travail:
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
-            self._compta_ecrit(travail)
+            self._compta_ecrit(travail, incertain=incertain)
         elif travail is not None:
             self._compta_en_echec = True
 
@@ -3844,7 +3863,14 @@ class AgentWorker(threading.Thread):
                 or self._state_read("turn_harness") != harness:
             self.fail_turn("accounting unavailable", "turn harness not written")
             return False
+        # #1469 : réservation atomique du tour sur l'enveloppe du compte de
+        # facturation, avant le marqueur ; refusée, le tour ne part pas
+        refus = account_budget.reserve(self.db, self.name, self._account)
+        if refus:
+            self.fail_turn(budget_mod.PAUSE_PREFIX + refus, refus)
+            return False
         if not self._compta_marque(events_start, label, model):
+            self._account_settle("released")  # rien n'est parti
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
             return False
@@ -4156,7 +4182,10 @@ class AgentWorker(threading.Thread):
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
-        self._compta_termine(modele_annonce)
+        # #1469 : issue incertaine (erreur, bail perdu, préemption, arrêt
+        # par plafond) : la réservation du compte reste comptée en entier
+        self._compta_termine(modele_annonce, incertain=bool(
+            error or result_code or lost or preempte or clos))
         if clos and not lost and not preempte and not self.restarting.is_set():
             # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
             # le code de sortie est celui de l'arrêt demandé.
