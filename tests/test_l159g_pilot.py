@@ -925,6 +925,11 @@ class InstallPilotTest(unittest.TestCase):
         # codex #383 r1 P1, P2: one record per directory the script creates,
         # written before it; a directory that is there is not recorded
         with tempfile.TemporaryDirectory() as tmp:
+            # #1587: the script compares --root and the records as resolved
+            # paths; without this, a TMPDIR reached through a symbolic link
+            # (/tmp, /var on some systems) makes the fixture fail on the
+            # machine instead of testing the script.
+            tmp = os.path.realpath(tmp)
             root = os.path.join(tmp, "guest")
             os.makedirs(os.path.join(root, "home"))
             res = self.dry("--allow-rootfs", "--root", root)
@@ -945,6 +950,7 @@ class InstallPilotTest(unittest.TestCase):
         # /work nor the --root of the command line; the last created first
         with tempfile.TemporaryDirectory() as tmp:
             made = os.path.join(tmp, "guest")
+            made = os.path.realpath(made)   # records are compared resolved (#1587)
             for d in ("work", "tmp", "home"):
                 os.makedirs(os.path.join(made, d))
             state = os.path.join(tmp, "pilot-install.state")
@@ -974,6 +980,7 @@ class InstallPilotTest(unittest.TestCase):
         # codex #383 r2 P1: a file where a directory goes is refused before
         # any record (a purge would delete it)
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)   # --root is compared resolved (#1587)
             root = os.path.join(tmp, "guest")
             os.makedirs(root)
             with open(os.path.join(root, "work"), "w") as fh:
