@@ -1283,7 +1283,7 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
-                          floor: int, *, note: str, actor: str,
+                          floor: int, *, note: str, actor: str, issue_ref: str | None,
                           release: bool = False) -> dict | None:
         """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
         ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
@@ -1291,9 +1291,11 @@ class WorkItems(Domain):
         l'index unique : deux réservations simultanées ne prennent jamais le
         même numéro ; la perdante réessaie avec une attente aléatoire croissante,
         dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert ; DbError si `number` est pris par un autre
-        lot ; `ReservationContention` si le budget du prochain libre est
-        épuisé. `release` libère la réservation."""
+        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
+        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
+        confondus) ; DbError si `number` est pris par un autre lot ;
+        `ReservationContention` si le budget du prochain libre est épuisé.
+        `release` libère la réservation, sans condition sur la référence."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
