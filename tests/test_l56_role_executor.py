@@ -21,6 +21,14 @@ from .test_cluster import TEST_DSN, _dsn_for
 
 ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
 
+#: Les rôles du contrat module (`role-module-writers.sql`) ont des noms fixes
+#: et vivent dans le CLUSTER, pas dans la base du run : sur le banc partagé,
+#: deux runs simultanés du module se marchaient dessus (DROP ROLE 2BP01, ACL
+#: laissée par l'autre run). Les verrous consultatifs étant pris par base, on
+#: sérialise la séquence création/usage/destruction dans une transaction
+#: persistante sur la base du banc, commune aux runs (y compris en psql).
+MODULE_WRITERS_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('ameesh-role-module-writers', 0))"
+
 
 class RoleExecutorTest(PgTestCase):
     @classmethod
@@ -151,48 +159,52 @@ class RoleExecutorTest(PgTestCase):
     def test_module_writer_role_contract_and_executor_separation(self):
         q = db_mod.quote_ident
         names = ("ameesh_canon_sync", "ameesh_it_proof", "ameesh_it_qa")
-        placeholders = ", ".join(["%s"] * len(names))
-        existing = {r["rolname"] for r in self.db.query(
-            "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
-        script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
-        try:
-            for _ in range(2):
-                proc = subprocess.run(["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                                       "-f", script], capture_output=True, text=True, timeout=60,
-                                      env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-            # This class has a private database: never mutate shared bench ACLs.
-            for grantee in (*names, "PUBLIC"):
-                with self.subTest(temp_grantee=grantee):
-                    target = "PUBLIC" if grantee == "PUBLIC" else q(grantee)
-                    self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
-                                    (q(self.database), target))
-                    try:
-                        proc = subprocess.run(
-                            ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
-                             "-f", script], capture_output=True, text=True, timeout=60,
-                            env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
-                        self.assertNotEqual(proc.returncode, 0)
-                        self.assertIn("must not create temporary objects", proc.stderr, attendu(proc.stderr))
-                    finally:
-                        self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+        # noms fixes du contrat, partagés par le cluster : sérialiser les runs
+        # concurrents du banc (cf. MODULE_WRITERS_LOCK).
+        with self.admin_db.transaction() as lock_db:
+            lock_db.execute(MODULE_WRITERS_LOCK)
+            placeholders = ", ".join(["%s"] * len(names))
+            existing = {r["rolname"] for r in self.db.query(
+                "SELECT rolname FROM pg_roles WHERE rolname IN (%s)" % placeholders, names)}
+            script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+            try:
+                for _ in range(2):
+                    proc = subprocess.run(["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                                           "-f", script], capture_output=True, text=True, timeout=60,
+                                          env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                # This class has a private database: never mutate shared bench ACLs.
+                for grantee in (*names, "PUBLIC"):
+                    with self.subTest(temp_grantee=grantee):
+                        target = "PUBLIC" if grantee == "PUBLIC" else q(grantee)
+                        self.db.execute("GRANT TEMP ON DATABASE %s TO %s" %
                                         (q(self.database), target))
-            self.assertEqual(self.run_script(self.role).returncode, 0)
-            for name in names:
-                self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
-            with self.db.transaction() as tx:
-                tx.execute("SET LOCAL ROLE ameesh_canon_sync")
-                ModuleStore(tx).replace("", modules.declarations(federation()))
-            # Neither executor nor proof/QA writer is a policy writer.
-            for writer in ("ameesh_it_proof", "ameesh_it_qa"):
-                with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
-                    tx.execute("SET LOCAL ROLE %s" % writer)
-                    ModuleStore(tx).replace("", [])
-        finally:
-            for name in names:
-                self.db.execute("DROP OWNED BY %s" % q(name))
-                if name not in existing:
-                    self.db.execute("DROP ROLE %s" % q(name))
+                        try:
+                            proc = subprocess.run(
+                                ["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                                 "-f", script], capture_output=True, text=True, timeout=60,
+                                env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                            self.assertNotEqual(proc.returncode, 0)
+                            self.assertIn("must not create temporary objects", proc.stderr, attendu(proc.stderr))
+                        finally:
+                            self.db.execute("REVOKE TEMP ON DATABASE %s FROM %s" %
+                                            (q(self.database), target))
+                self.assertEqual(self.run_script(self.role).returncode, 0)
+                for name in names:
+                    self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
+                with self.db.transaction() as tx:
+                    tx.execute("SET LOCAL ROLE ameesh_canon_sync")
+                    ModuleStore(tx).replace("", modules.declarations(federation()))
+                # Neither executor nor proof/QA writer is a policy writer.
+                for writer in ("ameesh_it_proof", "ameesh_it_qa"):
+                    with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
+                        tx.execute("SET LOCAL ROLE %s" % writer)
+                        ModuleStore(tx).replace("", [])
+            finally:
+                for name in names:
+                    self.db.execute("DROP OWNED BY %s" % q(name))
+                    if name not in existing:
+                        self.db.execute("DROP ROLE %s" % q(name))
 
     def test_isolated_writer_records_observed_execution_without_policy_rights(self):
         import sys
