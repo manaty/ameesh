@@ -2056,11 +2056,35 @@ def _branch_ref_escapes(text: str) -> list[str]:
         if k in structural and _left_open(line[col:]):
             escapes.append(line)
         elif _BRANCH_REF.search(line) and not (
-                k in structural and _dash_column(line) is None
-                and _BRANCH_REF_ENV.match(line[col:])
-                and _under_env(lines, k, structural)):
+                k in structural and _branch_ref_allowed(lines, k, structural)):
             escapes.append(line)
     return escapes
+
+
+_RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
+_BRANCH_REF_COMPARED = re.compile(
+    r"startsWith\(github\.(?:base|head)_ref,\s*'[^']*'\)")
+
+
+def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
+    """May line `k` name a branch instead of interpolating it?
+
+    An `env:` value (#1237/#1247), or a job-level `runs-on:` expression: GitHub
+    reads the runner label itself, never a shell, and every reference must be
+    compared to a literal (`startsWith`) — a bare `${{ github.head_ref }}`
+    stays an escape. (#1468: the priority pool reads the source and target
+    branches of a PR; a PR author can name a branch `integration/...` and pick
+    the pool, so the comparison is a priority choice, not a gate bypass.)
+    """
+    line = lines[k]
+    col = _key_column(line)
+    if _dash_column(line) is not None:
+        return False
+    if _BRANCH_REF_ENV.match(line[col:]) and _under_env(lines, k, structural):
+        return True
+    if _RUNNER_SELECTION.match(line[col:]) is None:
+        return False
+    return not _BRANCH_REF.search(_BRANCH_REF_COMPARED.sub("", line[col:]))
 
 
 class RunBodiesTest(unittest.TestCase):
@@ -2158,6 +2182,21 @@ class RunBodiesTest(unittest.TestCase):
         self.assertEqual([], _branch_ref_escapes(
             "env:\n  BASE_REF: ${{ github.base_ref }}\n"
             "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
+
+    def test_runner_selection_may_compare_the_branch(self):
+        # #1247 x #1468: le pool prioritaire lit les branches source et cible ;
+        # dans un `runs-on:`, GitHub évalue l'étiquette lui-même (aucun shell),
+        # mais une interpolation nue y reste une évasion.
+        compared = ("jobs:\n  a:\n    runs-on: ${{ startsWith(github.head_ref, "
+                    "'refs/heads/integration/') && 'pool' || 'ci' }}\n")
+        self.assertEqual([], _branch_ref_escapes(compared))
+        for bare in ("    runs-on: ${{ github.head_ref }}\n",
+                     "    runs-on: ${{ format('{0}', github.base_ref) }}\n",
+                     "    runs-on: ${{ startsWith(github.head_ref, vars.X) }}\n",
+                     "    runs-on: \"${{ github.head_ref }}"
+                     "\n      run: echo ok\"\n"):
+            with self.subTest(bare=bare):
+                self.assertNotEqual([], _branch_ref_escapes("jobs:\n  a:\n" + bare))
 
     def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
         # YAML ignores indentation inside quotes, even after an anchor/tag.
