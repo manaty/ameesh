@@ -653,8 +653,11 @@ class GithubTest(_PlanDb):
         # relevé revoit les deux PR ; la première (`pr_ref` porte la seconde)
         # doit être retenue par le critère d'instant. Les instants des
         # corrections sont posés pour que chaque fusion tombe entre deux.
+        # La création précède ces instants fixes, quelle que soit l'horloge.
         a = work.add(self.db, title="deux corrections")
         n = a["id"]
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(1000000000)"
+                        " WHERE id = %s", (n,))
         work.set_branch(self.db, n, "lot/%d-etape" % n, actor="orch", source="test")
         self.merged_pr(91, "lot/%d-etape" % n, body="Étape.\n\nameesh-work: %d" % n,
                        merged_at="2030-01-01T00:00:00Z")
