@@ -531,6 +531,55 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertTrue(all("deleted by cleanup once unchanged" in a["detail"]
                             for a in alertes))
 
+    def test_allow_des_processus_illisibles_debloque_la_suppression(self):
+        """L230/L162 : sur un poste à processus non dumpable (gpg-agent,
+        ssh-agent), `platform.holders` lève NotAvailable et l'entrée restait
+        gardée ; nommer le processus dans `unreadable_ok` lève le doute, la
+        suppression part. Liste vide : le refus garde l'entrée (fail-closed)."""
+        entree = os.path.join(self.sys, "clone-relecture")
+
+        def creer():
+            _write(os.path.join(entree, "f"), 5000)
+
+        self._tour(creer, impute="a1")
+        refus = menage.platform.NotAvailable(
+            "file holders", "open files of process(es) of this user unreadable: "
+            "4242 gpg-agent")
+
+        def holders(path, needle=None, allow=()):
+            if "gpg-agent" in allow:
+                return []
+            raise refus
+
+        with mock.patch.object(menage.platform, "holders", side_effect=holders):
+            garde = self._passage(3 * HEURE)
+            self.assertTrue(os.path.exists(entree))
+            self.assertEqual(garde["orphans"][0]["status"], "attend")
+            self.assertIn("holders unreadable", garde["orphans"][0]["detail"])
+            permis = menage.Policy(orphan_min_size=1, unreadable_ok=("gpg-agent",))
+            fait = self._passage(3 * HEURE, policy=permis)
+        self.assertFalse(os.path.exists(entree))
+        self.assertEqual(fait["orphans"], [])
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600, kind="orphan")
+        self.assertEqual([r["path"] for r in journal if r["action"] == "deleted"],
+                         [entree])
+
+    def test_le_temoin_du_detenteur_a_un_argument_reste_lu(self):
+        """#1357 : le témoin d'herméticité de #1523 fixe la réponse du
+        détenteur par un lambda à UN argument (l'hôte n'a pas d'allow) ; sans
+        allow, la question posée doit rester celle-là. Sinon le TypeError est
+        avalé par le passage (« jamais fatal ») et la liste des orphelins se
+        vide en silence."""
+        entree = os.path.join(self.sys, "clone-temoin")
+        self._tour(lambda: _write(os.path.join(entree, "f"), 5000), impute="a1")
+        with mock.patch.object(menage, "tmp_holder",
+                               side_effect=lambda p: "held by process 4242 (test)"):
+            rapport = self._passage(3 * HEURE)
+        self.assertTrue(os.path.exists(entree))
+        sorts = {o["path"]: (o["status"], o["detail"]) for o in rapport["orphans"]}
+        self.assertEqual(sorts[entree][0], "attend")
+        self.assertIn("held by process 4242", sorts[entree][1])
+
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
