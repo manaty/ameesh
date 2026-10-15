@@ -497,11 +497,37 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('ci_runs', ARRAY[
         'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
         'status', 'superseded_by', 'url', 'workflow', 'first_seen_at', 'concluded_at',
-        'urgent_message_id', 'verdict_message_id'
+        'urgent_message_id', 'verdict_message_id',
+        -- #747 (0424) : de l'ÉTAT, l'attente et l'exécution séparées ;
+        -- created_at = création GitHub du run, started_at = premier relevé
+        -- `in_progress` (l'extrait de sortie reste un contenu, ailleurs)
+        'created_at', 'started_at'
     ]),
     ('ci_test_failures', ARRAY[
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
         'duration_s', 'failed_at', 'message_id', 'recorded_at'
+    ]),
+    -- #845 (0426) : garde de la CI par l'API — état des runners et de la file
+    -- (même nature que ci_runs : identifiants, noms, horodatages, comptages,
+    -- aucun contenu)
+    ('ci_runner_state', ARRAY[
+        'repo', 'runner_id', 'name', 'busy', 'job', 'busy_since', 'stuck_since',
+        'seen_at'
+    ]),
+    ('ci_queue_state', ARRAY[
+        'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
+    ]),
+    -- #845 (0426, revue N/P2 2328) : la fenêtre du relevé de la garde, son
+    -- coût réel et sa couverture (même nature : horodatages, comptages,
+    -- codes) — l'état qui dit si la garde est aveugle, sans contenu
+    ('ci_guard_scan', ARRAY[
+        'repo', 'started_at', 'finished_at', 'calls', 'runs', 'covered',
+        'complete', 'reason'
+    ]),
+    -- #845 : le relevé par exécution non conclue (cache du relevé borné)
+    ('ci_guard_run', ARRAY[
+        'repo', 'run_id', 'attempt', 'status', 'queued', 'oldest_id',
+        'oldest_at', 'runners', 'seen_at'
     ]),
     -- Session history (L52, 0032 §2): which sessions, when and where;
     -- no content (transcripts stay in harness storage).

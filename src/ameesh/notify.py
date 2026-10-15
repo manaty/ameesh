@@ -91,6 +91,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
                  "ci_main_red",
+                 # #845 : la garde de la CI — runner busy sans job (panne) et
+                 # file au-delà du SLO de 15 min (capacité)
+                 "ci_runner_stuck", "ci_queue_saturated",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
                  # L225 : des tours sans tarif au barème échappent à la dépense
@@ -185,6 +188,8 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "estimate bias",
     "ci_main_red": "CI red on main",
+    "ci_runner_stuck": "CI runner busy with no job running",
+    "ci_queue_saturated": "CI queue beyond its SLO",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",

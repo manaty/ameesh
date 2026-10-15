@@ -3005,9 +3005,20 @@ class CiResults(Domain):
     @abc.abstractmethod
     def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
                  base: str, work_item_id: int | None, url: str | None,
-                 workflow: str = "") -> dict:
+                 workflow: str = "", created_at: str | None = None) -> dict:
         """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend.
-        `workflow` : le fichier de workflow qui l'a produite (#1110)."""
+        `workflow` : le fichier de workflow qui l'a produite (#1110).
+        `created_at` : la création de l'exécution chez GitHub (0422)."""
+
+    @abc.abstractmethod
+    def mark_started(self, repo: str, run_ids: Sequence[int]) -> None:
+        """#747 : ces exécutions sont vues `in_progress` ; la première fois,
+        `started_at` prend l'heure du relevé (la fin de l'attente d'un runner)."""
+
+    @abc.abstractmethod
+    def queued(self) -> list[dict]:
+        """#747 : les exécutions `running` jamais vues démarrées, de la plus
+        ancienne à la plus récente, tous dépôts."""
 
     @abc.abstractmethod
     def running(self, repo: str) -> list[dict]:
@@ -3074,6 +3085,68 @@ class CiResults(Domain):
         """Vrai si une autre tête de cette branche a été vue après cette
         exécution (une exécution de `run_id` supérieur) : son verdict serait
         périmé."""
+
+    # -- #845 : garde de la CI (runners et file), relevée par l'API ---------
+    @abc.abstractmethod
+    def observe_runners(self, repo: str, runners: Sequence[dict]) -> None:
+        """Enregistre l'état des runners du dépôt (relevé `ci.Watcher`) :
+        `[{id, name, busy, job, stuck}]`. `stuck_since` garde le début de
+        l'épisode « busy sans job in_progress » et redevient NULL dès qu'il
+        finit ; `busy_since` suit l'état busy, pour le diagnostic. Les runners
+        absents du relevé (retirés du dépôt) sont supprimés : pas d'alerte
+        fantôme. Un relevé partiel n'est jamais écrit (l'appelant le saute)."""
+
+    @abc.abstractmethod
+    def stuck_runners(self) -> list[dict]:
+        """Les runners dont l'épisode « busy sans job in_progress » est encore
+        ouvert : `{repo, runner_id, name, job, since_ts, busy_ts, seen_ts}`
+        (`since_ts` : début de l'épisode)."""
+
+    @abc.abstractmethod
+    def observe_queue(self, repo: str, *, oldest_id: int | None, oldest_at: str | None,
+                      queued: int) -> None:
+        """Enregistre la file vue du dépôt : le plus vieux **job** `queued`
+        (`oldest_id` : identifiant GitHub du job ; `oldest_at` : son
+        `created_at`) et le nombre de jobs `queued` vus, toutes exécutions non
+        conclues. Un run peut être ancien (reprise) ou `in_progress` et porter
+        un job en file : la date du run ne date pas ses jobs. `queued=0` efface
+        le relevé précédent."""
+
+    @abc.abstractmethod
+    def queued_oldest(self) -> list[dict]:
+        """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
+        queued, seen_ts}` (les dépôts sans job `queued` ont `oldest_ts` NULL)."""
+
+    # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
+    @abc.abstractmethod
+    def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:
+        """Revendique la fenêtre du relevé de `repo`, atomiquement, à
+        l'horloge `now` : vrai si aucun relevé ne l'a prise depuis `window_s`.
+        L'écriture précède tout appel HTTP, donc deux relevés concurrents ne
+        peuvent pas doubler le coût et un relevé tué en vol expire."""
+
+    @abc.abstractmethod
+    def finish_guard_scan(self, repo: str, *, now: float, calls: int, runs: int,
+                          covered: int, complete: bool, reason: str | None = None) -> None:
+        """Clôt le relevé : appels réellement consommés, exécutions listées et
+        couvertes, et raison d'un relevé incomplet (qui n'a rien publié)."""
+
+    @abc.abstractmethod
+    def guard_runs(self, repo: str) -> dict:
+        """Le cache des relevés par exécution, clé `(run_id, attempt)` :
+        `{run_id, attempt, status, queued, oldest_id, oldest_at, runners}`."""
+
+    @abc.abstractmethod
+    def observe_guard_run(self, repo: str, *, run_id: int, attempt: int, status: str,
+                          queued: int, oldest_id: int | None, oldest_at: str | None,
+                          runners: dict) -> None:
+        """Écrit le relevé d'une exécution : jobs `queued` (compte et plus
+        vieux) et runners tenant un job `in_progress` (`{nom: job}`)."""
+
+    @abc.abstractmethod
+    def prune_guard_runs(self, repo: str, keep) -> None:
+        """Retire du cache les exécutions absentes de `keep`
+        (`(run_id, attempt)`), qui ne sont plus non conclues."""
 
 
 class Handoffs(Domain):
