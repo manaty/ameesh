@@ -4,8 +4,14 @@
 
   agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
                [--dry-run] [--max-turns N] [--migrate]
+               [--take-idle S] [--take-max-per-hour N]
+               [--take-lot-idle S] [--take-lot-max-per-hour N] [--take-interval S]
         claims this host's agents, renews their leases, starts a turn
         when a message arrives (LISTEN/NOTIFY) or after inactivity.
+        Every --take-interval seconds, takes for its own idle agents the
+        best-ranked lot that fits them (L119/L165, #804) — the same guarded
+        `backlog.auto_take` that `ameesh notify` calls, so distribution no
+        longer depends on a central notifier.
   agent-runner register <name> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXT]
                [--session ID] [--chantier C] [--model M] [--budget USD]
         registers an agent (the v1 equivalent of "nexlink-agent start").
@@ -179,6 +185,43 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
 LIVE_REVIEW_START_SLACK_S = 300.0
+
+#: #804 : cadence de la prise automatique déclenchée par l'exécuteur pour ses
+#: propres agents au repos (secondes ; 0 coupe la prise de l'exécuteur). Le
+#: débit horaire, lui, est compté en base pour tout le mesh (L119, 0037).
+TAKE_INTERVAL_S = 60.0
+
+
+def local_take(db, cfg, agents, settings, *, dry_run: bool = False, alerts=None,
+               **kw) -> list:
+    """#804 : prise automatique pour un ensemble d'agents (ceux de cet
+    exécuteur), avec les garde-fous de `backlog.auto_take` (repos réel,
+    budget, hôtes en pause, plafonds horaires comptés en base) ; l'appelant
+    passe aussi l'alerte `balance_low` du moment (#754, owner 13/10).
+
+    `settings` porte `idle_s`/`max_per_hour`/`lot_idle_s`/`lot_max_per_hour` ;
+    `kw` surcharge les autres réglages d'`auto_take` (tests, diagnostic). Rend
+    les prises faites ; l'appelant isole la panne éventuelle.
+    """
+    from . import backlog
+    names = {str(name) for name in (agents or ()) if name}
+    if not names:
+        return []
+    options = dict(settings)
+    options.update(kw)
+    return backlog.auto_take(cfg, db, agents=names, dry_run=dry_run, alerts=alerts,
+                             **options)
+
+
+def local_balance_alerts(db, thresholds, now: float) -> list:
+    """#754 (owner, 13/10) : l'alerte `balance_low` du moment, avec les mêmes
+    seuils qu'`ameesh alerts` et `ameesh notify` — un agent au token ne prend
+    jamais sous cette alerte. `notify` ne publie pas d'état d'alerte : on
+    relit le solde au moment de la passe, une seule implémentation
+    (`sous_utilisation.balance_low`)."""
+    from . import sous_utilisation
+    listing = storage.of(db).operations.listing()
+    return sous_utilisation.balance_low(db, listing, now, **(thresholds or {}))
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -5208,6 +5251,9 @@ class Runner:
         wait: float = 0.0,
         dry_run: bool = False,
         max_turns: int | None = None,
+        take: dict | None = None,
+        take_interval: float = TAKE_INTERVAL_S,
+        take_balance: dict | None = None,
     ):
         from .host_gate import gate_choice
         try:
@@ -5223,6 +5269,18 @@ class Runner:
         self.wait = wait
         self.dry_run = dry_run
         self.max_turns = max_turns
+        #: #804 : réglages de la prise automatique que CET exécuteur déclenche
+        #: pour ses propres agents (`None` : pas de prise) et sa cadence ; les
+        #: seuils viennent des options et variables d'`ameesh notify`
+        #: (`--take-*`, `AMEESH_TAKE_*`), lus dans `main`.
+        self.take = take or None
+        self.take_interval = (max(0.0, float(take_interval))
+                              if self.take and take_interval else 0.0)
+        #: #754 (owner, 13/10) : seuils de l'alerte `balance_low` lus des
+        #: options `--balance-*` / `AMEESH_ALERT_BALANCE_*`, partagés avec
+        #: `ameesh alerts` et `ameesh notify` (`exploitation.balance_thresholds`).
+        self.take_balance = dict(take_balance or {})
+        self._take_next = 0.0
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
@@ -5665,6 +5723,45 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    def take_pass(self) -> list:
+        """#804 : l'exécuteur déclenche la prise pour ses propres agents.
+
+        `backlog.auto_take` n'est plus appelée seulement par `ameesh notify` :
+        ici, sur l'hôte où ces agents tournent, avec les mêmes garde-fous
+        (repos réel, budget, hôtes en pause, `balance_low`, plafonds horaires
+        comptés en base). Seuls les agents servis par cet exécuteur — leurs
+        workers vivants — sont preneurs ; la liste du mesh reste entière pour
+        les gardes et l'avertissement des orchestrateurs. Un hôte sous pression
+        est écarté comme par `ameesh notify` (alerte `host_pressure` locale).
+        """
+        if self.once or self.mediated or not self.take:
+            return []
+        with self.lock:
+            names = {name for name, worker in self.workers.items() if worker.is_alive()}
+        if not names:
+            return []
+        alerts = []
+        try:
+            if self.host_pressure().get("blocked"):
+                alerts.append({"type": "host_pressure", "host": self.host})
+        except Exception:
+            pass  # relevé illisible : on ne devine pas la pression
+        try:
+            alerts += local_balance_alerts(self.db, self.take_balance, time.time())
+        except Exception as exc:
+            # Solde illisible : on ne devine pas. Un agent au token pourrait
+            # être sous le seuil, on le retient ; un forfait, lui, ne dépense
+            # pas ce solde et reste preneur.
+            alerts.append({"type": "balance_low", "unreadable": True})
+            log_async("auto-take: balance unreadable (%s); token agents held"
+                      % type(exc).__name__)
+        taken = local_take(self.db, self.cfg, names, self.take,
+                           dry_run=self.dry_run, alerts=alerts)
+        for take in taken:
+            log_async("auto-take: %s takes lot #%s (%s)" % (
+                take.get("agent"), (take.get("item") or {}).get("id"), take.get("kind")))
+        return taken
+
     def sweep(self) -> None:
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
@@ -5701,6 +5798,17 @@ class Runner:
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
             return  # host gate closed: registry diagnosis without taking a lease
+        # #804 : la prise au repos est déclenchée ici, par l'exécuteur de
+        # l'hôte, et non par un `ameesh notify` central (mêmes garde-fous).
+        # Avant la réclamation : le lot pris et son courrier partent dans la
+        # même passe ; une panne de prise ne fait pas tomber l'exécuteur.
+        if self.take_interval > 0 and time.monotonic() >= self._take_next:
+            self._take_next = time.monotonic() + self.take_interval
+            try:
+                self.take_pass()
+            except Exception as exc:
+                log_async("auto-take pass failed (%s): runner continues"
+                          % type(exc).__name__)
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -7540,6 +7648,40 @@ def build_parser() -> argparse.ArgumentParser:
                         help="fallback polling interval in seconds (default 5)")
     parser.add_argument("--idle-nudge", type=float, default=None,
                         help="nudge after N seconds of inactivity (default 1200)")
+    # #804 : prise automatique déclenchée par l'exécuteur pour ses propres
+    # agents — mêmes options et variables d'environnement qu'`ameesh notify`
+    # (`AMEESH_TAKE_*`) ; les réglages sont lus par `notify.take_settings`,
+    # une seule implémentation.
+    from . import backlog, exploitation
+    parser.add_argument("--take-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_IDLE",
+                                                        backlog.DEFAULT_TAKE_IDLE_S),
+                        help="take an item from the improvement backlog for an idle agent "
+                             "after S seconds without a lot (default 1800; 0 turns it off)")
+    parser.add_argument("--take-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
+                        help="maximum backlog takes per rolling hour, for the whole mesh "
+                             "(default 2)")
+    parser.add_argument("--take-lot-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
+                                                        backlog.DEFAULT_LOT_IDLE_S),
+                        help="take the best unassigned lot of an idle agent's team after S "
+                             "seconds (default 900; 0 turns it off)")
+    parser.add_argument("--take-lot-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
+                        help="maximum team lots taken per rolling hour, for the whole mesh "
+                             "(default 6)")
+    parser.add_argument("--take-interval", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_INTERVAL",
+                                                        TAKE_INTERVAL_S),
+                        help="seconds between two takes by this runner (default 60; 0 turns "
+                             "the runner's take off)")
+    # #754 (owner, 13/10) : la prise refuse tant qu'une alerte `balance_low`
+    # est vive ; les seuils de cette alerte sont ceux d'`ameesh alerts` et
+    # d'`ameesh notify` (une seule déclaration, dans `exploitation`).
+    exploitation.add_balance_arguments(parser)
     parser.add_argument("--migrate", action="store_true", help="apply migrations before starting")
     return parser
 
@@ -8125,6 +8267,27 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
             signal.signal(sig, ancien)
 
 
+def _take_settings(args) -> dict | None:
+    """#804 : réglages de la prise de l'exécuteur, lus des options et
+    variables d'environnement d'`ameesh notify` (une seule implémentation).
+    `None` quand les deux prises (file d'amélioration, lots de l'équipe)
+    sont coupées."""
+    from . import notify
+    settings = notify.take_settings(args)
+    if settings is not None:
+        # #754 : la prise par un agent au token est acquise ; l'ancien
+        # `allow_paid` n'a plus d'objet.
+        settings.pop("allow_paid", None)
+    return settings
+
+
+def _take_balance(args) -> dict:
+    """#754 : seuils de l'alerte `balance_low` de la prise de l'exécuteur,
+    lus des mêmes options que celles d'`ameesh alerts` et `ameesh notify`."""
+    from . import exploitation
+    return exploitation.balance_thresholds(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     # `register --help` / `stop --help` affichent l'aide, jamais d'écriture en base
@@ -8210,6 +8373,8 @@ def main(argv: list[str] | None = None) -> int:
             runner = Runner(
                 cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
+                take=_take_settings(parsed), take_interval=parsed.take_interval,
+                take_balance=_take_balance(parsed),
             )
         except db_mod.DbError as exc:
             if not mediated:
