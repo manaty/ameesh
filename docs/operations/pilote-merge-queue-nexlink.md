@@ -478,6 +478,25 @@ Attention à la coupure : si `pc-smichea` est redéployé à la coupure 23:00 Pa
 il portera toujours `#1333` (présent dans `main` depuis `3df9a1ee`, et `main`
 est en avant) mais son SHA changera.
 
+**Mise à jour 15/10 19:35Z — pré-vol §4.0 exécuté par `mesh-design`** (lecture
+seule `pc-smichea`, build 1.11.1) :
+
+| point | état constaté |
+|---|---|
+| outillage | Node `v26.8.1`, `gh auth` OK, clone non-bare, `remote`/`fetch origin` OK, imports et parse §2 OK ; `develop` `febe26e7b` |
+| unité | `ameesh-runner-agent@orchestrateur.service` active (PID 1137685) ; `AMEESH_CONFIG` réel = `critiques-2` ; drop-in `zz-compte-owner-1013.conf` présent, **aucun** `zzz-radar-nexlink.conf` |
+| profil dédié | `radar-nexlink.json` **inactif** `land: "off"`, SHA256 `aabd2245…` |
+| **§4.5** | **`accounts=False`, `rest=False`** : l'ancien profil a gardé des `accounts.claude`/`accounts.codex` antérieurs au socle courant → **le profil doit être rafraîchi depuis le socle courant avant le geste** |
+| candidat | `/home/smichea/.local/state/ameesh/.menage/tmp/mesh-design~aeca9888/183-radar-nexlink-land-pr-candidat.json`, SHA256 `311ebc66f7e53ab95435f03eb5209d482d172b2839cccafce922ed3eb3a70183` : copie du socle courant + seule carte §2 (`land: "pr"`), `accounts`/`rest` True |
+| preuve pré-vol | `/home/smichea/.local/state/ameesh/.menage/tmp/mesh-design~aeca9888/183-prevol-20261015-avant-coupure.json` (citée par `mesh-design`) |
+
+**Créneau réservé** : **16/10 11:30–12:00 Paris (09:30–10:00Z)**, après la
+coupure de 09:00Z, conditionné à : opérateur disponible (bureau §7.4, ou
+remplaçant nommé avec les deux pilotes), profil rafraîchi + §4.5 `True/True`,
+pré-vol rejoué sur le build final déployé après la coupure 21:00Z, point sûr de
+fin de tour de l'unité, puis **feu distinct** `mesh-design`. Le pré-vol actuel ne
+vaut pas activation.
+
 ## 4. Runbook d'application (sur décision du bureau)
 
 **Profil dédié** (§3, §3bis) — pas le `critiques-2.json` partagé. `SRC` est le
@@ -717,3 +736,13 @@ Tranché le 13/10 :
    (19:27Z) et `ameesh-cx2` (19:29Z), recoupés depuis `ameesh-agents-1`
    (§3septies). Le gate « build doit porter `#1333` » est levé ; restent le
    pré-vol §4 étape 0 sur l'hôte, le **créneau** et le **feu distinct**.
+   **Mise à jour 15/10 19:35Z** : pré-vol §4.0 exécuté par `mesh-design` —
+   outillage/clone/parse/unité OK, mais **§4.5 `accounts=False`/`rest=False`**
+   (profil dédié à rafraîchir depuis le socle courant ; candidat SHA
+   `311ebc66…` préparé hors configuration). **Créneau réservé : 16/10
+   11:30–12:00 Paris (09:30–10:00Z)**, après la coupure de 09:00Z, sous les
+   conditions du §3septies ; préavis formel transmis à l'orchestrateur Nexlink
+   le 15/10 19:4xZ (cc bureau, `mesh-design`). Accusé de l'orchestrateur
+   (19:40Z) : créneau accepté côté pilote Nexlink, liste initiale composée à la
+   coupure de 09:00Z et envoyée avec sa confirmation et son point sûr avant
+   09:30Z.
