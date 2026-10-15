@@ -167,6 +167,8 @@ class GuardTest(unittest.TestCase):
         cases = {
             "api error": dict(fetch=boom),
             "unreadable row": dict(fetch=api([{"number": 1}])),
+            "null head": dict(fetch=api([{"number": 1, "head": {"sha": None}}])),
+            "invalid number": dict(fetch=api([{"number": True, "head": {"sha": SHA}}])),
             "not a list": dict(fetch=lambda u, t: (_ for _ in ()).throw(
                 guard.GuardError("unexpected answer"))),
             "no token": dict(fetch=api([]), token=""),

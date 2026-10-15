@@ -70,7 +70,11 @@ def open_pr_heads(repo: str, token: str,
         rows = fetch(f"{API}/repos/{repo}/pulls?state=open&per_page=100&page={page}", token)
         for row in rows:
             try:
-                yield int(row["number"]), str(row["head"]["sha"])
+                number, head = row["number"], row["head"]["sha"]
+                if (type(number) is not int or number <= 0 or not isinstance(head, str)
+                        or not re.fullmatch(r"[0-9a-f]{40}", head)):
+                    raise GuardError("unreadable pull request number or head SHA")
+                yield number, head
             except (KeyError, TypeError, ValueError) as exc:
                 raise GuardError(f"unreadable pull request: {exc}") from None
         if len(rows) < 100:
