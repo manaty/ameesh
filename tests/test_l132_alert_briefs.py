@@ -42,6 +42,19 @@ class BriefsTest(unittest.TestCase):
         self.assertIn('ameesh mail send dev1 "…" --lot 42', text)
         self.assertIn("ameesh work merged 42 --sha", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
+        self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+
+    def test_stale_lot_offre_le_hold_de_dependance(self):
+        """#1642 : le brief doit offrir la dépendance déclarée (planned_wait),
+        qui supprime déjà l'alerte et sa relance quand la porte réelle est un
+        parent ouvert — sinon un lot empilé est trié en vain toutes les 6 h."""
+        text = alert_briefs.briefs(STALE, self.listing)["orch"]
+        self.assertIn("declare the dependency that stops the reminders", text)
+        self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        sans_assigne = alert_briefs.briefs(dict(STALE, agent=None), self.listing)
+        self.assertTrue(sans_assigne)
+        for body in sans_assigne.values():
+            self.assertIn("ameesh work dependencies 42 --add <blocker>", body)
 
     def test_stale_lot_ne_reveille_pas_l_auditeur(self):
         """L713 : lu à la passe de l'auditeur, pas poussé ; les autres alertes si."""
