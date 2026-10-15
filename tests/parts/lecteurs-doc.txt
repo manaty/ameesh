@@ -7,6 +7,7 @@
 #
 # Un module par ligne, dans l'ordre alphabétique, sa raison en commentaire.
 
+test_doc_links  # docs/ (liens internes et ancres, vérificateur scripts/doc-links.py, #775)
 test_l159a_capacity_guard  # docs/schemas (JSON schemas of the capacity guard, L159a)
 test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
 test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
