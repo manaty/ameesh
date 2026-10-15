@@ -538,14 +538,31 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
 def _still_free(st, item_id) -> bool:
     """Le lot est-il encore prenable (sans assigné, dans un état de prise) ?
 
-    `assign_capped` rend None pour deux refus distincts — le plafond §4 atteint
-    (le lot n'a pas bougé : le garder pour un autre preneur) ou une prise
-    concurrente (le lot a bougé : le retirer) : cette relecture les distingue."""
+    `assign_capped` rend None pour des refus distincts — le plafond §4 atteint
+    (le lot n'a pas bougé : le garder pour un autre preneur), une prise
+    concurrente (le lot a bougé : le retirer) ou un refus sous verrou (une
+    dépendance est apparue depuis la sélection, L165 : le lot reste prenable
+    mais plus pour cette passe) : cette relecture et `_cap_reached` les
+    distinguent."""
     item = st.work.get(int(item_id))
     if item is None:
         return False
     return (not (item.get("assignee") or "").strip()
             and item.get("state") in ("intake", "build"))
+
+
+def _cap_reached(st, agent: str) -> bool:
+    """§4 : l'agent est-il au plafond d'en-cours ?
+
+    Distingue, après un refus `None` de `assign_capped` sur un lot encore
+    prenable, le plafond (arrêter cet agent : il ne peut plus rien prendre) du
+    refus sous verrou — dépendance apparue (L165) : passer au lot suivant.
+    Relecture hors du verrou de la prise : un agent redescendu entre-temps fait
+    seulement retenter la prise, un agent remonté au plafond est refusé de
+    nouveau par `assign_capped`."""
+    from . import work
+
+    return st.work.count_builds(agent) >= work.BUILD_LIMIT
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
@@ -696,12 +713,16 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 if done is None:
-                    # plafond §4 atteint (rien n'a bougé : le lot reste à
-                    # prendre par un autre agent) ou pris entre-temps
-                    if _still_free(st, item["id"]):
+                    # refus sous le verrou de l'agent : plafond §4 (rien n'a
+                    # bougé : le lot reste à prendre par un autre agent), lot
+                    # devenu non prenable (dépendance apparue, L165) ou pris
+                    # entre-temps
+                    if not _still_free(st, item["id"]):
+                        lots.remove(item)
+                        continue        # pris entre-temps : lot suivant
+                    if _cap_reached(st, check["assignee"]):
                         break           # agent au plafond : au suivant
-                    lots.remove(item)
-                    continue            # pris entre-temps : lot suivant
+                    continue            # refus sous verrou : lot suivant
                 lots.remove(item)
                 done = dict(done, lot_team=item["lot_team"])
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
@@ -763,11 +784,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
             if done is None:
-                # idem lots d'équipe : plafond (garder) ou prise concurrente
-                if _still_free(st, item["id"]):
+                # idem lots d'équipe : plafond (garder), élément devenu non
+                # prenable (dépendance apparue) ou pris entre-temps
+                if not _still_free(st, item["id"]):
+                    queue.remove(item)
+                    continue                # pris entre-temps : élément suivant
+                if _cap_reached(st, check["assignee"]):
                     break                   # agent au plafond : au suivant
-                queue.remove(item)
-                continue                    # pris entre-temps : élément suivant
+                continue                    # refus sous verrou : élément suivant
             queue.remove(item)
             message_id = mail.send(db, SENDER, check["assignee"], take_message(done),
                                    kind="event", work_item_id=str(done["id"]),
