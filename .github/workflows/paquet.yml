@@ -70,11 +70,14 @@ jobs:
           --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
 
   # aucune PR ne couvre la tête : la suite complète tourne ici (push sans PR).
-  # `always()` : si le portier échoue, sa sortie est vide (covered ≠ true) et
-  # la suite part quand même — un portier en panne ne supprime jamais une
-  # validation.
+  # `!cancelled()` (#1429) : si le portier échoue, le run n'est pas annulé et
+  # sa sortie est vide (covered ≠ true) — la suite part quand même, un portier
+  # en panne ne supprime jamais une validation. Si le run est annulé (une
+  # poussée plus récente a remplacé ce portier), la suite ne part pas : une
+  # tête dépassée n'a plus de décision à porter et ne doit pas consommer un
+  # runner.
   suite:
     name: suite complète du paquet
     needs: couverture
-    if: always() && needs.couverture.outputs.covered != 'true'
+    if: ${{ !cancelled() && needs.couverture.outputs.covered != 'true' }}
     uses: ./.github/workflows/tests.yml
