@@ -214,6 +214,15 @@ class Agents(Domain):
         """La ligne de l'agent, ou None."""
 
     @abc.abstractmethod
+    def operator_pause(self, name: str, *, paused: bool, reason: str,
+                       actor: str, principal: str) -> dict | None:
+        """Native human hold: row lock, state and audit in one atomic statement.
+
+        No status/prompt/lease changes; repeated state has no new event.
+        External agents are returned unchanged. Not exposed to executors.
+        """
+
+    @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
         """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
 

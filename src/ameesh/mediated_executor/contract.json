@@ -4034,7 +4034,8 @@
     "set_mode",
     "upsert_unleased",
     "wake_check",
-    "note_unleased"
+    "note_unleased",
+    "operator_pause"
    ],
    "api_requests": [
     "complete",
