@@ -125,8 +125,9 @@ env:
 # push (or the package gate's workflow_call) on integration/** or release/**,
 # a PR whose source or target is one of those branches, or a PR listed in
 # `vars.AMEESH_CI_PRIO_PRS` (JSON array of PR numbers: a repository variable,
-# admin only and in GitHub's audit log, set by the pilot for an unblock or
-# incident lot; setting it triggers no run). Switch off or unset: every job
+# writable with repository write access, set by the pilot for an unblock or
+# incident lot and recorded with its before/after value; setting it triggers
+# no run). Switch off or unset: every job
 # asks for `ameesh-ci`, as before. The routing only picks the runner: no
 # `if:`, no part, no required check depends on it, and no hosted runner is
 # ever added (a fork PR keeps ubuntu-latest, as before). The job-level
