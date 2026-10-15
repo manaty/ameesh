@@ -252,7 +252,8 @@ def _lower_cap(ctx, db, params, body) -> dict:
     """Lower a cap of the mesh or of an agent; raising one is refused (it
     commits the organisation: a PR to the canon or the CLI's holder)."""
     from . import budget
-    window = _WINDOWS.get(body.get("window"))
+    name = body.get("window")
+    window = _WINDOWS.get(name) if isinstance(name, str) else None
     if window is None:
         raise ActionError(400, "bad_body", "window: hour or day")
     usd = body.get("usd")
