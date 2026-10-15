@@ -35,6 +35,7 @@ READING_ROW = dict(READING, id=77, sampled_ts=TS)
 
 ARGS = {  # op: (args, kwargs, résultat)
  "agents.claimable": ([HOST, [AG]], {"require_responsible": False}, [{**ROW, "status": "queued"}]),
+ "agents.runner_seen": ([HOST, OWN, [AG]], {}, None),
  "agents.get": ([AG], {}, ROW),
  "agents.resolve_name": ([AG], {}, AG),
  "agents.cwd_used": (["/var/lib/ameesh-exec/work/inge-front/42", AG], {}, False),

@@ -220,6 +220,12 @@ class Agents(Domain):
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
 
     @abc.abstractmethod
+    def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
+        """Une écriture groupée, à l'heure de la base, pour les personas execute
+        placées sur host, limitées par names si fourni. Aucun test de bail ou
+        d'éligibilité. Ne modifie ni placement, ni statut, ni last_seen."""
+
+    @abc.abstractmethod
     def note_unleased(self, name: str, host: str, error: str) -> bool:
         """Native runner's lease_not_taken diagnostic, only on its host and
         without a live lease, after taking the row lock. Keeps agent status.
