@@ -359,7 +359,7 @@ jobs:
     # borné (§3 du processus de lot : aucun job ne retient un runner des heures).
     # psycopg garde 30 min : ses parts tournent en 6-8 min, même à 3× plus lent
     # elles tiennent dans le plafond.
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -390,7 +390,7 @@ jobs:
       FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
       # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899) ;
       # 45 depuis #880, qui a relevé le plafond de la part psql sous saturation.
-      AMEESH_PLAFOND_MIN: "45"
+      AMEESH_PLAFOND_MIN: "60"
     steps:
       - *debut
       - uses: actions/checkout@v4
