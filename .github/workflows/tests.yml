@@ -20,7 +20,8 @@
 #               une PR de release (sans liste pilote) et à la main
 #               (workflow_dispatch, sur main, release/**, integration/** ou
 #               validation/** et hors tête de PR ouverte, #1635).
-# Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+# Le job final « tests » agrège les parts : c'est le nom de vérification stable
+# hors lancement manuel, qui publie « tests (dispatch) » (#1635).
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
 # toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
@@ -505,7 +506,9 @@ jobs:
   # L161f : une part que le plan n'a pas prévue est sautée ;
   # L158: on a PR, the version number check must pass)
   tests:
-    name: tests
+    # Une PR peut être ouverte sur ce SHA après la garde ou la fin du run :
+    # un dispatch ne doit jamais publier le contexte requis de cette PR.
+    name: ${{ github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests' }}
     if: always()
     needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
