@@ -1269,10 +1269,8 @@ class Notifier:
             entry = {"alert": {"type": "auto_take", "agent": take["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
                      "human": None,
-                     "source": {"lot": "lot de l'équipe",
-                                "review": "relecture proposée",
-                                "correction": "correction proposée"}.get(
-                                    take.get("kind"), "file d'amélioration")}
+                     "source": "lot de l'équipe" if take.get("kind") == "lot"
+                     else "file d'amélioration"}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
 
     def _budget_handoff(self, db, now: float) -> None:
