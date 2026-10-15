@@ -25,6 +25,7 @@ test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte
 test_1467_train_admissions  # stockage : admissions courantes, prérequis et exclusion CAS sous bail (#1467)
 test_1467_train_fire  # stockage : feu exact, retrait/réservation sérialisés et reprise SQL (#1467)
 test_1467_train_history  # stockage : historique de jalons sans troncature, ancien blocage conservé (#1467)
+test_1467_train_runner  # stockage : passage, clone privé, provenance et promotion Git réels (#1467)
 test_1467_train_runtime  # stockage : raccord train/feu SQL et gardes finales avant effet (#1467)
 test_1467_train_storage  # stockage : intentions CAS et bail cible partagé (#1467)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)

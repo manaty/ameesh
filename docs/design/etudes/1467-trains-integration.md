@@ -181,6 +181,17 @@ et n'active aucun train. Quatorze témoins Git passent ; le raccord complet
 politique/lecteur historique/file SQL passe avec psql et psycopg, avec refus
 du regel sur le même SHA. Aucun run distant n'a été lancé.
 
+Le candidat canon `c61e6a9736d368829b9664dc765eea11f5679ca3`
+([home PR85](https://github.com/manaty/home/pull/85), mesh-design, 15 octobre
+11:50) est consommable par ce lecteur sur les deux diffs réels : #1467
+`e4e4c85c..0905f9cd` et #1470 `344c052b..6553d3ae` demandent chacun deux
+avis. Ce témoin de raccord ne qualifie pas la politique. Orchestrateur a
+ensuite ajouté les deux portes `scripts/migration-landing.mjs` et
+`scripts/lib/migration-landing.mjs` ; mesh-design annonce à 11:57 la tête
+`35e773e510d32dd05df1172536222e240a0c2ddc`, encore candidate dans l'attente
+de l'avis DeepSeek sur cette correction. Aucun commit candidat n'est
+sélectionné dans un profil actif.
+
 Interface de raccord proposée à impl07 le 15 octobre à 03:54 : un `Receipt`
 porte `subject` (`commit:<sha>` ou `milestone:<id>`), `commit` résolu, `actor`,
 `session`, `turn`, `harness` et `record` de provenance exacte. Un reçu de
@@ -244,6 +255,27 @@ il doit livrer les faits complets de la file, les dépendances, les preuves
 historiques et les exclusions sous bail. Le constructeur exige le même bail
 dans tous les adaptateurs et le même dépôt dans le contrat CI ; il ne fournit
 aucune politique de qualification implicite.
+
+`train_runner.Passage` assemble ces ports pour un passage borné du runner.
+Le pilote doit fournir explicitement propriétaire, politique, objet Git du
+canon, contrat CI complet, fournisseur exact de provenance et callback de
+diagnostic. Le mode éteint ne lit ni Git ni SQL. Chaque appel reçoit sa
+connexion courante et ne conserve que l'époque du bail ; aucune connexion
+fermée ne peut être réutilisée au passage suivant. Le clone privé est distinct
+pour chaque source, cible et propriétaire, et séparé du clone du radar. La
+qualification récupère d'abord les branches exactes dans ce clone : un dépôt
+ne connaissant que la cible peut ainsi lire l'historique des lots. Aucun
+profil ni point d'appel du runner actif n'est installé par ce module.
+
+Cinq témoins de ce passage passent avec psql et psycopg ; la passe psycopg
+inclut aussi les treize gardes du runtime (18 tests verts). Git et SQL sont
+réels et jetables, CI et fournisseur de reçus sont simulés explicitement.
+Le clone initial ne connaît que la cible ; le témoin suit récupération du
+lot, politique versionnée, deux avis, publication, attente du feu, changement
+de connexion et promotion du commit testé. Un second propriétaire reste
+exclu par le bail sans créer son clone ; l'absence de provenance refuse la
+publication. Ces témoins ne qualifient pas le fournisseur externe ni les
+workflows distants.
 
 Après réservation du feu, Runtime relit la cible distante, les générations
 de la file, les prérequis ouverts et leur ordre, les branches sources

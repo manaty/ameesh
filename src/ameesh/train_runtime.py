@@ -55,6 +55,9 @@ class Runtime:
     def qualify(self, rows, base, mode):
         if mode != self.policy.ci_mode:
             raise TrainError("runtime and engine CI policy differ")
+        # A new runner clone may know only the target. Fetch the exact lot
+        # branches before the historical reader traverses their commits.
+        self.repository.check_members(self.target_branch, rows)
         proof = self.admissions.qualify(rows, base, mode)
         if not isinstance(proof, dict) or not proof:
             raise TrainError("missing structured historical admission evidence")
