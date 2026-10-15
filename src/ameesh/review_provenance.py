@@ -136,16 +136,23 @@ def capture(environ=None, *, actor: str = "") -> dict:
 
     Refuse hors tour (`AMEESH_TURN_ID` absent) ou sur un harnais inconnu : une
     preuve sans tour ou sans famille n'est pas une preuve. Le harnais du tour
-    est celui du runner (`AMEESH_HARNESS`), jamais un nom choisi par le
-    dépôt."""
+    est celui du runner (`AMEESH_HARNESS`), jamais un nom choisi par le dépôt.
+
+    `actor` n'est qu'une **attente** : quand il est fourni, il doit être celui
+    du tour (`AGENT_MAIL_NAME`, posé par le runner) — un tour ne signe pas la
+    preuve d'un autre agent (écart relevé par la relecture cx3, 15/10 04:27)."""
     env = os.environ if environ is None else environ
-    who = str(actor or env.get("AGENT_MAIL_NAME") or "").strip()
+    turn_actor = str(env.get("AGENT_MAIL_NAME") or "").strip()
+    who = str(actor or turn_actor).strip()
     turn = str(env.get("AMEESH_TURN_ID") or "").strip()
     harness = str(env.get("AMEESH_HARNESS") or "").strip().lower()
     if not who:
         raise ProvenanceError("no agent identity (AGENT_MAIL_NAME)")
     if not turn:
         raise ProvenanceError("no managed turn (AMEESH_TURN_ID): outside a turn")
+    if turn_actor and who != turn_actor:
+        raise ProvenanceError(
+            "actor %r is not the agent of this turn (%r)" % (who, turn_actor))
     if harness not in FAMILIES:
         raise ProvenanceError("unknown harness %r (expected %s)"
                               % (harness, ", ".join(sorted(FAMILIES))))
@@ -218,17 +225,39 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
     return ident
 
 
-def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None) -> dict:
+def record_commit(db, sha, *, identity: dict, work_item_id: int | None = None,
+                  cwd: str | None = None) -> dict:
     """Écrit la preuve exacte d'un commit, ou refuse une divergence.
 
     C'est le point d'écriture du hook `post-commit` : l'identité vient du tour
-    courant (jamais de l'appelant), le commit doit être complet ou résoluble.
+    courant (jamais de l'appelant). Le contrat est **borné** (relecture cx3,
+    15/10 04:27) : seul le commit qui est **HEAD du dépôt sous la main** peut
+    être enregistré, et son committer doit être l'acteur du tour
+    (`<acteur>@ameesh.invalid`, posé par le runner). Un ancien commit ne peut
+    donc pas être attribué au tour courant, et l'historique antérieur reste
+    inconnu.
+
     Une preuve déjà écrite pour ce commit n'est pas réécrite : une identité
     différente est une erreur."""
     full = full_sha(sha) if FULL_SHA.fullmatch(str(sha or "").strip().lower()) \
-        else resolve_commit(sha)
+        else resolve_commit(sha, cwd=cwd)
     if full is None:
         raise ProvenanceError("commit %r does not resolve to a full commit" % (sha,))
+    head = resolve_commit("HEAD", cwd=cwd)
+    if head is None or head != full:
+        raise ProvenanceError(
+            "only the current worktree HEAD can be recorded (HEAD is %s, not %s)"
+            % ((head or "?")[:12], full[:12]))
+    from .identity import GIT_EMAIL_DOMAIN
+    committer = subprocess.run(
+        ["git", "log", "-1", "--format=%ce", full], capture_output=True, text=True,
+        cwd=cwd or os.getcwd(), timeout=20)
+    email = (committer.stdout or "").strip().lower()
+    expected = ("%s@%s" % (identity["actor"], GIT_EMAIL_DOMAIN)).lower()
+    if committer.returncode != 0 or email != expected:
+        raise ProvenanceError(
+            "commit %s was not committed by %s (committer %r)"
+            % (full[:12], identity["actor"], email or "?"))
     subject = subject_of_commit(full)
     row = storage.of(db).provenance.add(
         subject, full, identity["actor"], identity["session"], identity["turn"],

@@ -63,15 +63,23 @@ Règles de refus :
 - la première écriture fait foi : une seconde écriture du même sujet ne réécrit
   rien, et une identité divergente est signalée à l'appelant.
 
-Écriture, à l'instant du fait :
+Écriture, à l'instant du fait, et **bornée** (frontières fixées après les
+témoins isolés de cx3, 15/10 04:27–04:29) :
 
 - **jalon** : la même transaction que `work_item_milestones` (le fait et sa
   preuve naissent ensemble) ;
-- **commit** : `ameesh provenance record --commit <sha>` appelé par le hook
+- **commit** : `ameesh provenance record --commit HEAD` appelé par le hook
   `post-commit` du dépôt de l'agent, donc pour chaque commit, dans le tour qui
-  le crée. Le tour (`AMEESH_TURN_ID`) et le harnais (`AMEESH_HARNESS`) viennent
-  de l'environnement du runner ; la session, du registre vivant de l'acteur
-  (`registry.live_harness`, #1037), recontrôlée contre l'étiquette du tour.
+  le crée. Seul le commit qui est **HEAD du dépôt sous la main** est
+  enregistré, et son committer doit être l'acteur du tour
+  (`<acteur>@ameesh.invalid`, posé par le runner) : un ancien commit ne peut pas
+  être attribué au tour courant ;
+- le tour (`AMEESH_TURN_ID`) et le harnais (`AMEESH_HARNESS`) viennent de
+  l'environnement du runner ; la session, du registre vivant de l'acteur
+  (`registry.live_harness`, #1037), recontrôlée contre l'étiquette du tour ;
+- un tour ne signe que pour **son** agent : `capture` refuse un acteur qui
+  n'est pas `AGENT_MAIL_NAME`, et un jalon déclaré pour un autre acteur
+  s'écrit sans preuve (origine inconnue).
 
 ## 4. État et suite
 
@@ -79,10 +87,11 @@ Livré dans les points réversibles de `lot/1465-preuves-par-commit` : migration
 0445, contrat de stockage, fournisseur (`receipt_for_commit`,
 `receipt_for_milestone`), écriture (`ameesh provenance record --commit`,
 `ameesh provenance install`, jalon gel/verdict et sa preuve dans la même
-transaction que `work_item_milestones`) et témoins
+transaction que `work_item_milestones`), pose du hook à l'ouverture de session
+par le runner (jamais en mode relayé) et témoins
 (`tests/test_1465_provenance.py`).
 
-Reste avant gel : poser le hook au démarrage de session (runner), faire relire
+Reste avant gel : faire relire
 les deux familles requises (SQL sensible, canon §2). L'historique **antérieur**
 à la migration restera `unknown` : c'est le prix d'une preuve honnête, et le
 train #1467 devra qualifier des commits enregistrés.

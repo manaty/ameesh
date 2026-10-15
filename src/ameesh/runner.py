@@ -1865,6 +1865,25 @@ class AgentWorker(threading.Thread):
         log_async("[%s] session %s recorded in the registry (delayed by an outage)"
                   % (self.name, session))
 
+    def _installe_hook_preuve(self, cwd: str) -> None:
+        """#1465 : pose le hook `post-commit` dans le dépôt de la session.
+
+        Une seule fois par session OUVERTE, et jamais en mode relayé : la base
+        n'est pas joignable depuis une VM médiée, le hook n'y servirait à rien.
+        Le hook ne bloque jamais un commit ; un échec ici ne touche pas le tour
+        (l'origine des commits restera inconnue, jamais devinée)."""
+        if getattr(self.runner, "mediated", False):
+            return
+        try:
+            from . import review_provenance
+            out = review_provenance.install_hook(cwd)
+        except Exception as exc:  # noqa: BLE001 - la preuve ne casse pas le tour
+            log_async("[%s] post-commit hook install failed: %s" % (self.name, exc))
+            return
+        if not out["installed"] and out.get("path"):
+            log_async("[%s] post-commit hook not installed: %s"
+                      % (self.name, out["reason"]))
+
     def _ecarte_session_fille(self, refusee: str) -> None:
         """L166 : le harnais refuse de reprendre `refusee`, session fille
         (sous-agent, fourche) retenue à tort comme session de l'agent."""
@@ -3995,6 +4014,8 @@ class AgentWorker(threading.Thread):
                         if self.agent is not None:
                             self.agent["session_account"] = (
                                 compte.name if compte is not None else None)
+                        if ouverte:
+                            self._installe_hook_preuve(cwd)
                     if parsed.get("model") and parsed["model"] != modele_annonce:
                         modele_annonce = parsed["model"]  # source du tour (L13 B4)
                         self._compta_annonce(modele_annonce)  # persisté tout de suite

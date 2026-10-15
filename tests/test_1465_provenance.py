@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -47,6 +48,9 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(prov.capture(env),
                          {"actor": "mty-amh-impl-07", "turn": "t" * 32,
                           "harness": "deepseek"})
+        # un tour ne signe pas la preuve d'un autre agent (relecture cx3)
+        with self.assertRaises(prov.ProvenanceError):
+            prov.capture(env, actor="autre-agent")
         env["AMEESH_HARNESS"] = "autre"
         with self.assertRaises(prov.ProvenanceError):
             prov.capture(env)  # famille inconnue
@@ -177,21 +181,55 @@ class PgProvenanceTest(PgTestCase):
                                   sha=SHA1, actor="mty-amh-impl-07", verdict="ok")
         self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))
 
-    def test_record_commit_is_exact_and_never_rewritten(self):
+    def _repo(self, *, actor="mty-amh-impl-07", name="ameesh-1465-repo-"):
+        """Un dépôt git jetable et son premier commit, sous l'identité donnée."""
+        repo = tempfile.mkdtemp(prefix=name, dir=self.tmp)
+        subprocess.run(["git", "init", "-q", repo], check=True, capture_output=True)
+        env = dict(os.environ,
+                   GIT_AUTHOR_NAME=actor, GIT_AUTHOR_EMAIL="%s@ameesh.invalid" % actor,
+                   GIT_COMMITTER_NAME=actor, GIT_COMMITTER_EMAIL="%s@ameesh.invalid" % actor)
+        self._commit(repo, env, "un")
+        return repo, env
+
+    def _commit(self, repo, env, message):
+        with open(os.path.join(repo, "f.txt"), "a", encoding="utf-8") as fh:
+            fh.write(message + "\n")
+        subprocess.run(["git", "add", "f.txt"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True,
+                       capture_output=True, env=env)
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
+                                       text=True).strip()
+
+    def test_record_commit_accepts_only_head_by_its_committer(self):
         ident = {"actor": "mty-amh-impl-07", "session": "s-1", "turn": "t" * 32,
                  "harness": "deepseek"}
-        row = prov.record_commit(self.db, SHA1, identity=ident,
+        repo, env = self._repo()
+        old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo,
+                                      text=True).strip()
+        head = self._commit(repo, env, "deux")
+        # un ancien commit, même complet et présent, n'est pas le HEAD courant
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, old, identity=ident, cwd=repo)
+        row = prov.record_commit(self.db, head, identity=ident, cwd=repo,
                                  work_item_id=int(self.lot["id"]))
         self.assertTrue(row["recorded"])
-        self.assertEqual(prov.receipt_for_commit(self.db, SHA1)["session"], "s-1")
+        self.assertEqual(prov.receipt_for_commit(self.db, head)["session"], "s-1")
         # rejouer la MÊME identité ne réécrit rien et ne lève pas
-        again = prov.record_commit(self.db, SHA1, identity=ident)
+        again = prov.record_commit(self.db, head, identity=ident, cwd=repo)
         self.assertFalse(again["recorded"])
         # une autre identité pour le même commit est refusée
         with self.assertRaises(prov.ProvenanceError):
-            prov.record_commit(self.db, SHA1, identity=dict(ident, actor="autre"))
+            prov.record_commit(self.db, head, identity=dict(ident, actor="autre"),
+                               cwd=repo)
         with self.assertRaises(prov.ProvenanceError):
-            prov.record_commit(self.db, "pas-un-sha", identity=ident)
+            prov.record_commit(self.db, "pas-un-sha", identity=ident, cwd=repo)
+        # un commit dont le committer est un autre agent est refusé
+        other, _ = self._repo(actor="autre-agent", name="ameesh-1465-autre-")
+        other_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=other,
+                                             text=True).strip()
+        with self.assertRaises(prov.ProvenanceError):
+            prov.record_commit(self.db, other_head, identity=ident, cwd=other)
+        self.assertIsNone(prov.receipt_for_commit(self.db, other_head))
 
 
 class HookInstallTest(unittest.TestCase):
@@ -221,6 +259,18 @@ class HookInstallTest(unittest.TestCase):
         self.assertIn("foreign", refused["reason"])
         with open(out["path"], encoding="utf-8") as fh:
             self.assertEqual(fh.read(), foreign)
+
+    def test_runner_installs_the_hook_and_skips_mediated_sessions(self):
+        from ameesh import runner as runner_mod
+        fake = types.SimpleNamespace(
+            runner=types.SimpleNamespace(mediated=False), name="mty-amh-impl-07")
+        runner_mod.AgentWorker._installe_hook_preuve(fake, self.tmp)
+        hook = os.path.join(self.tmp, ".git", "hooks", "post-commit")
+        self.assertTrue(os.path.exists(hook))
+        os.unlink(hook)
+        fake.runner.mediated = True
+        runner_mod.AgentWorker._installe_hook_preuve(fake, self.tmp)
+        self.assertFalse(os.path.exists(hook), "pas de hook sur une VM médiée")
 
 
 if __name__ == "__main__":
