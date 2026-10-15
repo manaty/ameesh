@@ -37,8 +37,9 @@ paquets et celui des releases doivent être distingués par le contrat
 mécanique. `home#94` ne contient pas `processus/mecanique.yaml` ; #1757 livre
 ce bloc avec la prose horaire dans home#96 au commit exact
 `21d6653922bac554d2d6cd0570e7f6497b215c37`, avec le fournisseur
-`735651aa7e88184cd09e5fe9e5104f49ada2045a` (impl07, courrier du 15 octobre
-à 21:09), sans intervalle local. Mesh-design qualifie le port le
+`7ccf16d8c46cb827bb6db435fdf751b7b8d22803` (livraison initiale impl07 du
+15 octobre à 21:09, correction dev2 à 21:22, regard borné mesh-design à
+21:24 et gel impl07 à 21:25), sans intervalle local. Mesh-design qualifie le port le
 15 octobre à 20:04 : `packets.cutoffs` fournit `packet_cutoffs`, `packets_on`,
 `last_packet(now)` (borne incluse) et `next_packet(now)` (strictement future).
 Le consommateur exige ces ports, sans repli sur `cutoff`/`next_cutoff` des

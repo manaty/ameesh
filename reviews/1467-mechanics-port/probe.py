@@ -129,6 +129,37 @@ class RealMechanicsTest(TrainRunnerTest):
         self.assertEqual(self.git(self.origin, "rev-parse", "main"), plan["head"])
         self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
 
+    def test_sparse_calendar_resumes_after_a_day_without_a_packet(self):
+        commit = self.revise(MECHANICS.replace('  cutoffs: ["11:00", "23:00"]',
+                                              '  cutoffs: ["02:00"]')
+                             .replace("named_fire: true", "named_fire: false"))
+        queued, before, due = [datetime.fromisoformat(value).timestamp() for value in (
+            "2026-03-28T03:00:00+01:00", "2026-03-30T01:59:59+02:00",
+            "2026-03-30T02:00:00+02:00")]
+        self.db.execute("UPDATE merge_queue SET queued_at=to_timestamp(%s)", [queued])
+        passage = self.passage(policy_commit=commit)
+        result, deadline = passage.scheduled_step(self.db, queued)
+        self.assertEqual(result["result"], "idle", result)
+        self.assertEqual(deadline, due)
+        other_db = db_mod.connect(self.__class__.cfg)
+        self.addCleanup(other_db.close)
+        resumed = self.passage(policy_commit=commit)
+        rules = resumed.runtime(other_db).policy.schedule
+        previous = datetime.fromisoformat("2026-03-28T02:00:00+01:00").timestamp()
+        self.assertEqual(train.Policy(schedule=rules).cutoff(before), previous)
+        result, deadline = resumed.scheduled_step(other_db, before)
+        self.assertEqual(result["result"], "idle", result)
+        self.assertEqual(deadline, due)
+        self.assertEqual(self.api_calls, [])
+        first, deadline = resumed.scheduled_step(other_db, due)
+        self.assertEqual(first["result"], "ci", first)
+        self.assertEqual(deadline,
+                         datetime.fromisoformat("2026-03-31T02:00:00+02:00").timestamp())
+        result, _ = self.passage(policy_commit=commit).scheduled_step(self.db, due + 1)
+        self.assertEqual(result["result"], "landed", result)
+        self.assertEqual(self.git(self.origin, "rev-parse", "main"), first["plan"]["head"])
+        self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
+
     def test_real_withdrawal_keeps_ci_barrier_on_fresh_connection(self):
         commit = self.hourly_canon()
         passage = self.passage(policy_commit=commit)

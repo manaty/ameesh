@@ -1,7 +1,8 @@
 # Raccord #1467 / #1616 / #1757
 
-Contrat fournisseur livré par impl07 le 15 octobre 2026 à 21:09 : code
-[`735651aa7e88184cd09e5fe9e5104f49ada2045a`](https://github.com/manaty/ameesh/commit/735651aa7e88184cd09e5fe9e5104f49ada2045a),
+Contrat fournisseur livré par impl07 le 15 octobre 2026 à 21:09, corrigé par
+dev2 à 21:22 puis gelé à 21:25 après le regard borné de mesh-design : code
+[`7ccf16d8c46cb827bb6db435fdf751b7b8d22803`](https://github.com/manaty/ameesh/commit/7ccf16d8c46cb827bb6db435fdf751b7b8d22803),
 canon [home#96](https://github.com/manaty/home/pull/96) au commit exact
 `21d6653922bac554d2d6cd0570e7f6497b215c37`. Le module est injecté
 explicitement dans `Passage` ; aucune copie n'est ajoutée au produit.
@@ -56,9 +57,19 @@ La CI distante et la provenance #1465 sont simulées. Aucun calendrier simulé
 n'est utilisé dans ce probe ; les tests unitaires du runner gardent leurs
 epochs explicites.
 
-Qualification ciblée sur les deux révisions ci-dessus : 16/16 scénarios verts
+Qualification initiale sur le code `735651aa` et le même canon : 16/16 scénarios verts
 avec psycopg (156,2 s) et 16/16 avec psql (174,6 s), sous `ameesh heavy`,
 avec les contrôles du canon réel pour les deux projets dans chaque exécution.
+
+Le delta `735651aa..7ccf16d8` étend la recherche à deux jours pour traverser
+le jour sans 02:00. Un témoin consommateur supplémentaire choisit cette
+cadence dans un canon de fixture, reprend sur connexion fraîche avant le
+créneau du 30 mars et vérifie l'absence de publication prématurée, puis une
+seule tentative CI simulée et la promotion Git exacte. Il échoue sur
+`735651aa` à `next_packet` ; il passe sur `7ccf16d8` avec psycopg (4,7 s)
+et psql (13,2 s). Les contrôles du canon réel 24/23/25 sont également verts
+sur `7ccf16d8`. Les seize scénarios initiaux et la suite fournisseur ne sont
+pas rejoués pour ce delta.
 
 ## Reproduction
 
@@ -68,7 +79,7 @@ indiqués, puis exécuter depuis la branche consommateur #1467 :
 ```sh
 ameesh heavy -- env PYTHONPATH=src:. AMEESH_DRIVER=psycopg .venv/bin/python \
   reviews/1467-mechanics-port/probe.py --supplier . \
-  --commit 735651aa7e88184cd09e5fe9e5104f49ada2045a \
+  --commit 7ccf16d8c46cb827bb6db435fdf751b7b8d22803 \
   --canon "$DEPOT_CANON" \
   --canon-commit 21d6653922bac554d2d6cd0570e7f6497b215c37
 # Même commande avec AMEESH_DRIVER=psql pour le second pilote.
@@ -79,6 +90,12 @@ Pour limiter l'exécution aux deux reprises DST, ajouter :
 ```sh
 --test test_pending_packet_survives_repeated_hour_on_fresh_connection \
 --test test_pending_packet_survives_spring_gap_on_fresh_connection
+```
+
+Pour le seul témoin de la cadence réduite à 02:00, utiliser :
+
+```sh
+--test test_sparse_calendar_resumes_after_a_day_without_a_packet
 ```
 
 Pas de suite du fournisseur rejouée, ni CI distante lancée. Cette preuve de
