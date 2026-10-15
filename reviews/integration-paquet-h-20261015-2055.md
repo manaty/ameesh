@@ -5,7 +5,6 @@ Base : origin/integration/paquet-h-20261015-1955 `13ae8c461`. Tête : `661367502
 ## Inclus
 
 - #1411 Pression hôte : des ressources de tests abandonnées retiennent les relecteurs pa — ameesh-dev5, tête gelée `cb6dd6e20`, verdict ok de ameesh-dev4
-- #794 Une session neuve par lot, contexte minimal (étude harnais, constat 1) — mty-amh-impl-04, tête gelée `e915f0fcb`, verdict ok de ameesh-dev1
 - #1190 #762 N1 (suite) : le dry-run credite deux fois un inode lie entre deux dossiers  — ameesh-cx1, tête gelée `a11665fe0`, verdict ok de ameesh-dev3
 - #1227 Suite #1176 (N1-N4, relecture Claude bureau R1) : heure until sous relèvement, p — ameesh-dev3, tête gelée `d9a1d8018`, verdict ok de mesh-design
 - #1245 poste.sh migrer ignore son argument REF (l'en-tête, BASCULE.md et le message d'e — mty-amh-impl-06, tête gelée `b3544e5db`, verdict ok de bureau
@@ -169,3 +168,14 @@ Base : origin/integration/paquet-h-20261015-1955 `13ae8c461`. Tête : `661367502
 - #1718 land : désarmement raté + gh pr list illisible ne doit pas rendre l'éjection sil — ameesh-dev7 : plafond du paquet atteint
 - #1720 Jauges Claude : read_at d'un flux sans marqueur = mtime du journal, surestime la — mty-amh-impl-03 : plafond du paquet atteint
 - #1756 Paquet horaire : un lot qa sans jalon frozen est invisible au composeur (deriver — mty-amh-impl-08 : plafond du paquet atteint
+
+## Retiré après CI (bureau, 15/10 22:00)
+
+- #794 — revert de sa fusion : test_l165c (session sans lot adoptée par un lot) rouge dans l'union du paquet, vert sur la tête seule ; à rebaser sur main puis paquet suivant.
+
+## Adaptations (bureau)
+
+- carte.yml : étape de suppression des mesures (PR #1300) sans condition « toujours » (garde #1341).
+- test_l161f_plan : tranche fixe de 235 modules (#1266 ajoutait un module et faisait basculer à 3 parts).
+- test_l56_role_executor : position SSE avec identité du journal (#928).
+- ui/src/api/schema.d.ts régénéré (npm run gen).
