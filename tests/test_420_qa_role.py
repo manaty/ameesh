@@ -497,6 +497,30 @@ class QaEvidenceTest(PgTestCase):
 
     # -- audit ------------------------------------------------------------
 
+    def test_temp_registry_cannot_forge_qa_role_or_runner_binding(self):
+        role = self.isolated_qa_role()
+        entries = modules.declarations(federation(require_qa=["promoted"]))
+        entries[0]["schemas"]["qa"]["writer_role"] = role
+        ModuleStore(self.db).replace("", entries)
+        self.deliver()
+        delivery = self.current_delivery()
+        with self.assertRaisesRegex(db_mod.DbError, "qa-role-required"), self.db.transaction() as tx:
+            # Keep all statements on one connection, including with psql.
+            # Model a caller with TEMP despite the deployment audit.
+            tx.execute("CREATE TEMP TABLE agent_registry (name text, roles text[], "
+                       "projects text[], team text, lease_owner text, lease_epoch bigint)")
+            tx.execute("INSERT INTO pg_temp.agent_registry VALUES "
+                       "('reviewer-1', ARRAY['qa'], ARRAY['acme'], '', 'forged-runner', 999)")
+            tx.execute("GRANT ALL ON pg_temp.agent_registry TO %s" % db_mod.quote_ident(role))
+            tx.execute("SET LOCAL ROLE %s" % db_mod.quote_ident(role))
+            row = tx.query("SELECT * FROM ameesh_module_agent('reviewer-1')")[0]
+            self.assertEqual(row["roles"], ["relecture"])
+            self.assertEqual(row["lease_owner"], "runner-reviewer-1")
+            self.assertEqual(row["lease_epoch"], 2)
+            it.record_qa(tx, self.lot, sha256=delivery["subject"], verdict="ok",
+                         scope=["install"], report="https://qa.test/forged",
+                         actor="reviewer-1")
+
     def test_audit_reports_missing_then_stale_qa(self):
         # Le projet est promu avant l'activation de la règle : le constat suit
         # l'état courant, pas la date de la promotion.

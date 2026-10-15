@@ -65,6 +65,43 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   mesh). La file d'amélioration (L119) ne passe qu'ensuite, quand aucun lot du
   projet n'attend.
 
+## Au plus un lot non démarré par agent (#540)
+
+Un agent ne garde qu'**un seul lot non démarré en attente** : un lot ouvert,
+assigné, sans début mesuré (aucun tour de son assigné dessus, jamais passé en
+`build` ou `qa`). Attribuer un autre lot non démarré à un agent qui en a déjà
+un ne le lui donne pas : **le lot va dans la file d'équipe** (sans assigné, en
+`intake`), où un agent au repos de l'équipe le prendra (L165 ci-dessus).
+
+* Concerne `ameesh work add --assignee`, `ameesh work assign`, `--lot` ou
+  `--new-lot` d'`agent-mail send`, et la prise automatique (L119, L165) : un
+  agent choisi au repos qui a reçu un lot non démarré entre-temps ne prend
+  rien, le lot reste en file pour le suivant. Le contrôle et l'écriture se font dans la
+  même transaction, sous un verrou par agent : deux attributions simultanées
+  ne donnent pas deux lots non démarrés au même agent.
+* `work add` et `work assign` réussissent, avec l'avertissement « lot #N put
+  in the team queue: X already has lot #M not started ». Un lot sans équipe
+  connue n'est pris par personne : il attend l'orchestrateur, qui le
+  réattribue une fois #M démarré.
+* `agent-mail send --lot` ou `--new-lot` : le lot va dans la file et **le
+  message n'est pas déposé** (code 2), pour qu'un agent ne travaille pas un
+  lot que L165 peut confier à un autre. Renvoyer le message sans `--lot`, ou
+  après le début de #M.
+* Forcer, pour tout appelant : `--force "<raison>"` (sur `work add`, `work
+  assign` et `agent-mail send`) donne le lot malgré tout. La raison et son
+  auteur sont écrits au journal du lot ; une raison vide ne force rien (même
+  sortie que sans `--force`). L'auteur est l'identité liée de la session :
+  un `--actor` ou un `--from` qui en nomme un autre est refusé ; une session
+  sans identité dit qui force, et seulement par une identité humaine
+  explicite (`--actor human:<id>`) : un nom d'agent y est refusé, un agent ne
+  force que depuis sa session liée (bail du runner ou `ameesh mail bind`).
+* Hors de la règle : un lot déjà démarré (réassigner un travail en cours reste
+  permis), un humain (`human:…`) ou un agent externe (`--externe`), le lot
+  d'une demande de décision (`ameesh decide ask --new-lot`, que son auteur
+  attend ; seul ce chemin en dispose, ce n'est pas un paramètre de
+  `work.add`), la délégation à échéance (L40) et son retour, la reprise sur pause
+  budget (L233b, dont le preneur n'a déjà aucun lot).
+
 ## Toute demande d'un humain devient un lot (L130)
 
 Constat du 2026-10-11 : depuis le 07/10, le propriétaire a fait 46 demandes ;
@@ -282,6 +319,21 @@ après un échec de `gh`, il n'en lit plus d'autre dans ce dépôt, et la PR en
 échec n'est relue qu'après un délai (1 min, doublé à chaque échec, 1 h au
 plus). `ameesh work sync-github` suit les mêmes règles et ne retient que
 les PR dont la branche est dans le dépôt même, pas dans un fork.
+
+Un lot peut demander plusieurs PR, l'une après l'autre : une PR fusionnée ne
+le ferme plus si une autre PR ouverte, ou la branche déclarée du lot (autre
+que la sienne), y reste liée — le relevé écrit alors « stage merged » au
+journal du lot, qui reste ouvert (#759). La dernière étape lève cette retenue
+en se déclarant :
+
+```
+ameesh-work: <numéro du lot> final
+```
+
+`ameesh-work-partial:` l'emporte : une PR partielle ne ferme jamais, même
+avec `final`. Un lot fermé trop tôt par une PR d'étape se corrige
+(`ameesh work move <id> build --correct "raison"`), réservé aux humains,
+orchestrateurs et agents de conception.
 
 ## Fusion sans PR ni branche déclarée
 
@@ -551,7 +603,9 @@ restée 4 h fusionnée sans être déployée :
    secrets restent des décisions du propriétaire.
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
-   carries these rules and changes only through a reviewed commit.
+   carries these rules and the working rules of the canon — integration by
+   packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
+   12) — and changes only through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :

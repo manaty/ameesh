@@ -182,6 +182,60 @@ class WorkTest(PgTestCase):
         finally:
             listener.close()
 
+    def test_close_delivered_hors_cible(self):
+        """#988 : livré hors cible — la tête relue est exigée et le jalon
+        `delivered` la porte ; le lot reste fermé, jamais rouvert."""
+        item = self._add("rapport hors cible")
+        work.move(self.db, item["id"], "build", actor="dev1")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, item["id"], delivered=True)
+        self.assertIn("--sha", str(ctx.exception))
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, item["id"], delivered=True, sha="pas-un-sha")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, item["id"], sha="abcdef1")       # sans --delivered
+        self.assertIn("--delivered", str(ctx.exception))
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, item["id"])                       # aucune porte
+        with self.assertRaises(work.WorkError):
+            work.close(self.db, item["id"], abandoned=True, delivered=True,
+                       sha="abcdef1")                             # deux portes
+        row = work.close(self.db, item["id"], delivered=True, sha="ABCdef1234567",
+                         note="rapport remis", actor="dev1")
+        self.assertEqual((row["state"], row["close_reason"]), ("closed", "delivered"))
+        self.assertIsNone(row["superseded_by"])
+        marks = {m["kind"]: m for m in work.milestones(self.db, item["id"])}
+        self.assertEqual(marks["delivered"]["sha"], "abcdef1234567")
+        self.assertEqual(marks["delivered"]["actor"], "dev1")
+        self.assertIn("rapport remis", marks["delivered"]["note"])
+        self.assertIn("closed", marks)
+        self.assertEqual(work.close_label(row), "delivered outside the target")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.close(self.db, item["id"], abandoned=True)
+        self.assertIn("already closed", str(ctx.exception))
+        with self.assertRaises(work.WorkError) as ctx:
+            work.merged(self.db, item["id"], sha="abcdef1")       # jamais rouvert
+        self.assertIn("delivered outside the target", str(ctx.exception))
+
+    def test_close_delivered_par_la_cli(self):
+        """#988 : la porte `--delivered --sha` est exposée par la CLI."""
+        item = self._add("rapport cli")
+        proc = self.mesh("work", "close", str(item["id"]), "--delivered",
+                         "--sha", "abcdef1234567")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("closed: delivered outside the target", proc.stdout)
+        closed = work.get(self.db, item["id"])
+        self.assertEqual(closed["close_reason"], "delivered")
+        proc = self.mesh("work", "close", str(item["id"]), "--delivered",
+                         "--sha", "abcdef1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("already closed", proc.stderr)
+        other = self._add("sans tête")
+        proc = self.mesh("work", "close", str(other["id"]), "--delivered")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("--sha", proc.stderr)
+        self.assertEqual(work.get(self.db, other["id"])["state"], "intake")
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -286,3 +340,16 @@ class DelaysTest(PgTestCase):
         deux = {row["work_item_id"]
                 for row in work.delays(self.db, ids=[second["id"], first["id"]])}
         self.assertEqual(deux, {first["id"], second["id"]})
+
+    def test_jalon_delivered_et_delais(self):
+        """#988 : `delivered_ts` date la livraison hors cible, `merged_ts` reste
+        nul et `total` court jusqu'à elle."""
+        item = self._add("Rapport livré")
+        work.move(self.db, item["id"], "build")
+        work.close(self.db, item["id"], delivered=True, sha="a" * 40, actor="dev1")
+        row = work.timeline(self.db, item["id"])
+        self.assertIsNotNone(row["delivered_ts"])
+        self.assertIsNone(row["merged_ts"])
+        self.assertIsNotNone(row["total_s"])
+        self.assertGreaterEqual(row["total_s"], 0.0)
+        self.assertEqual(work.last_milestone(row)[0], "delivered")

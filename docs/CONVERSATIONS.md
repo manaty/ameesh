@@ -163,20 +163,24 @@ Shared threads keep **one year** of entries by default (0033 §9):
   Between two entries with the same timestamp, the later one is the most
   recent.
 * **Mediated executor host** (L109): no transaction or lock holds from one
-  remote request to the next, so the executor contract admits neither
-  `threads.lock` nor `threads.expired`. Indexing there works as before
-  L361 (no lock, no recount, every entry counted: `threads.index` with
-  `count` left at its default, true). Such a host does not expire its
-  threads yet, whether its connection to the server works or not
-  (`backend: mediated` is enough, and so is `host_mediated`, whose threads
-  stay local whatever its backend): `fil expire` answers with an error and
-  changes nothing; `--dry-run` lists the entries past retention, says that
-  expiry is not available and fails too. The runner, which has no local
-  housekeeping there, logs it at start and then once a day (a day of the
-  monotonic clock; an error of the notice is logged, the next one still
-  comes).
-  The server-side operation that does lock, recount and expiry in a single
-  transaction is the follow-up of #421.
+  remote request to the next, so `threads.lock` and `threads.expired` stay
+  out of the executor contract. Expiry there goes through a single
+  server-side operation, `threads.recount` (L361b): the host rewrites its
+  thread file under the file's own lock, then the op locks the index row,
+  takes the census the host computed from the rewritten file (`kept`, the
+  most recent entry, the file's logical `end`) and writes it in the same
+  transaction. A census older than the row's `counted_until` is not applied;
+  at equal `end` it is applied, since at a constant logical end only an
+  expiry changes the thread. An index left behind by a lost recount
+  (failure, crash after the rename) is repaired by the next expiry from the
+  file as it is. Without a connection there is no index, so nothing expires:
+  `fil expire` answers with an error and changes nothing, and `--dry-run`
+  lists the entries past retention and succeeds. The runner, which has no
+  local housekeeping there, expires through its executor connection (or
+  opens one) and, when the index is missing, says so at most once a day (a
+  day of the monotonic clock; an error of the notice is logged, the next one
+  still comes). Indexing an entry there works as before L361 (`threads.index`,
+  every entry counted).
 * **R12 outbox**: an undelivered copy older than thread retention is
   deleted by `Log.prune` (its thread entry would expire on arrival);
   younger ones still wait for delivery, past detail retention.

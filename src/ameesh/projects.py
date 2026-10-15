@@ -91,10 +91,14 @@ def agent_project(row: dict) -> str | None:
             or _text(row.get("chantier")) or None)
 
 
-def lot_project(lot: dict, agent_projects: dict[str, str | None] | None = None) -> str | None:
-    """Le projet d'un lot : `app`, `workstream`, équipe de la fiche, projet de l'assigné."""
+def lot_project(lot: dict, agent_projects: dict[str, str | None] | None = None,
+                package_team: str | None = None) -> str | None:
+    """Le projet d'un lot : `app`, `workstream`, équipe de la fiche, projet de l'assigné.
+
+    `package_team` (#705) : l'équipe de la fiche WorkPackage lue à part, quand
+    l'appelant ne l'a pas recopiée dans `lot`."""
     return (_text(lot.get("app")) or _text(lot.get("workstream"))
-            or _text(lot.get("package_team"))
+            or _text(lot.get("package_team")) or _text(package_team)
             or (agent_projects or {}).get(lot.get("assignee") or "") or None)
 
 

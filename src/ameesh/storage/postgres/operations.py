@@ -18,6 +18,7 @@ from typing import Any
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
+from .work import has_reviewer
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -331,9 +332,13 @@ class Operations(interface.Operations):
             " ORDER BY updated_at DESC, id DESC", (name,))
 
     def open_lots_activity(self, limit) -> list[dict]:
-        return self.db.query(
-            """
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
+        sql = ("""
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   w.priority, w.app, w.workstream, __REVIEWER__,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
@@ -350,14 +355,16 @@ class Operations(interface.Operations):
              WHERE w.state NOT IN """ + _CLOSED + """
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
-            """,
-            (int(limit) if limit is not None else None,))
+            """).replace("__REVIEWER__", reviewer)
+        return self.db.query(
+            sql, (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
-               " input_tokens, cached_input_tokens, output_tokens,"
-               " extract(epoch from recorded_at)::float8 AS recorded_ts"
+               " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " extract(epoch from recorded_at)::float8 AS recorded_ts,"
+               " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
                " AND void_reason IS NULL")
         params: list = [float(since_s)]

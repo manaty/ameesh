@@ -10,6 +10,7 @@ from typing import Any
 
 from .. import interface
 from .action_source import ActionSource
+from .api_requests import ApiRequests
 from .accounts import Accounts
 from .actions import Actions
 from .budgets import Budgets
@@ -58,6 +59,7 @@ class PostgresStorage(interface.Storage):
         self.accounts = Accounts(db)
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
+        self.api_requests = ApiRequests(db)
         self.watches = Watches(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)

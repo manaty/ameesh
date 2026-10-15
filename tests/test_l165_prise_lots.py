@@ -4,10 +4,12 @@ prioritaire de son équipe (extension de la prise automatique de L119)."""
 from __future__ import annotations
 
 import json
+import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from ameesh import backlog, notify, storage, work
+from ameesh import backlog, db as db_mod, notify, storage, work
 
 from .support import hold_for_owner
 from .test_l119_backlog import HEURE, _Base, _seuils
@@ -31,6 +33,107 @@ class _Lots(_Base):
 
 
 class PriseDeLotTest(_Lots):
+    def test_dependance_ouverte_laisse_prendre_le_lot_pret_puis_se_libere(self):
+        self.agent("claude1", team="nexlink")
+        amont = self.lot("amont", assignee="human:proprio")
+        bloque = self.lot("prioritaire mais bloque", priority=1)
+        pret = self.lot("pret", priority=2)
+        storage.of(self.db).work_dependencies.add(bloque["id"], amont["id"], actor="test")
+
+        # Le filtre précède LIMIT : le premier lot prêt reste visible.
+        self.assertEqual([i["id"] for i in storage.of(self.db).work.unassigned_lots(1)],
+                         [pret["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+
+        work.close(self.db, amont["id"], abandoned=True)
+        self.agent("claude2", team="nexlink")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [bloque["id"]])
+
+    def test_toutes_les_dependances_doivent_etre_satisfaites(self):
+        self.agent("claude1", team="nexlink")
+        amonts = [self.lot("amont%d" % i, assignee="human:proprio") for i in range(2)]
+        lot = self.lot("deux dependances")
+        for amont in amonts:
+            storage.of(self.db).work_dependencies.add(lot["id"], amont["id"], actor="test")
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (amonts[0]["id"],))
+        self.assertEqual(self.take(), [])
+        self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s",
+                        (amonts[1]["id"],))
+        self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
+
+    def test_dependance_ajoutee_apres_selection_refuse_la_prise(self):
+        self.agent("claude1", team="nexlink")
+        amont = self.lot("amont", assignee="human:proprio")
+        bloque = self.lot("devient bloque", priority=1)
+        pret = self.lot("reste pret", priority=2)
+        check = work.check_assignee
+        added = False
+
+        def add_dependency(*args, **kwargs):
+            nonlocal added
+            if not added:
+                storage.of(self.db).work_dependencies.add(
+                    bloque["id"], amont["id"], actor="test")
+                added = True
+            return check(*args, **kwargs)
+
+        with patch.object(work, "check_assignee", side_effect=add_dependency):
+            out = self.take()
+        self.assertEqual([t["item"]["id"] for t in out], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+        self.assertFalse(any(m["work_item_id"] == str(bloque["id"])
+                             for m in self.courriers()))
+        self.assertFalse(any(e["note"].startswith(backlog.LOT_TAKE_NOTE)
+                             for e in work.events(self.db, bloque["id"])))
+        # Une réservation manuelle reste possible, même avant l'amont.
+        work.assign(self.db, bloque["id"], "human:proprio")
+        self.assertEqual(work.get(self.db, bloque["id"])["assignee"], "human:proprio")
+
+    def test_dependance_en_cours_de_commit_refuse_la_prise_concurrente(self):
+        self.agent("claude1", team="nexlink")
+        amont = self.lot("amont", assignee="human:proprio")
+        bloque = self.lot("devient bloque", priority=1)
+        pret = self.lot("reste pret", priority=2)
+        selected = threading.Event()
+        result, errors = [], []
+        check = work.check_assignee
+
+        def selected_candidate(*args, **kwargs):
+            selected.set()
+            return check(*args, **kwargs)
+
+        def take_concurrently():
+            connection = None
+            try:
+                connection = db_mod.connect(self.cfg)
+                with patch.object(work, "check_assignee", side_effect=selected_candidate):
+                    result.extend(backlog.auto_take(
+                        self.cfg, connection, now=self.now, paid=("deepseek",),
+                        budget_check=lambda _: "", orchestras=[]))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                if connection is not None:
+                    connection.close()
+
+        worker = threading.Thread(target=take_concurrently, daemon=True)
+        # La sélection voit encore le lot prêt (arête non commitée). La
+        # transaction de prise doit attendre l'édition, puis lire son résultat.
+        try:
+            with self.db.transaction() as tx:
+                storage.of(tx).work_dependencies.add(bloque["id"], amont["id"], actor="test")
+                worker.start()
+                self.assertTrue(selected.wait(15), "la sélection concurrente n'a pas abouti")
+        finally:
+            if worker.ident is not None:
+                worker.join(15)
+        self.assertFalse(worker.is_alive(), "la prise concurrente n'a pas terminé")
+        self.assertEqual(errors, [])
+        self.assertEqual([t["item"]["id"] for t in result], [pret["id"]])
+        self.assertIsNone(work.get(self.db, bloque["id"])["assignee"])
+
     def test_auditeur_ne_prend_que_les_bugs_hors_instructions_protegees(self):
         self.agent("auditeur", team="ameesh")
         evolution = self.lot("Évolution de la surveillance", app="ameesh", type="evolution")

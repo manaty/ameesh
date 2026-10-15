@@ -239,10 +239,23 @@ def _fmt_usd(value) -> str:
 
 
 def change(cfg: Config, db, *, agent: str | None, window: int, usd: float | None,
-           actor: str) -> tuple[bool, float | None]:
-    """Pose (`usd`) ou retire (None) un plafond ; journalise base + fil."""
+           actor: str, lower_only: bool = False) -> tuple[bool, float | None]:
+    """Pose (`usd`) ou retire (None) un plafond ; journalise base + fil.
+
+    `lower_only` (L87, API) : BudgetError sauf si `usd` est sous le plafond en
+    vigueur, comparé sous le verrou de la ligne ; sans ligne, le plafond du
+    mesh est celui de la configuration (0 : aucun), et un agent sans plafond
+    propre n'en a aucun."""
     scope = agent or ""
-    changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor)
+    ceiling = None
+    if lower_only and not agent:
+        configured = resolve(cfg, [])
+        ceiling = (configured.per_hour if window == 3600 else configured.per_day) or None
+    try:
+        changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor,
+                                                  lower_only=lower_only, ceiling=ceiling)
+    except ValueError as exc:
+        raise BudgetError("refused: %s" % exc) from exc
     if changed:
         portee = "of agent %s" % agent if agent else "of the mesh"
         suite = "" if usd is not None else (
@@ -274,6 +287,8 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         spend["1h_counted_usd"] = round(book.paid_hour(paid), 6)
         spend["noncritical_hourly_share"] = getattr(cfg, "noncritical_hourly_share", 1.0)
         spend["24h_usd"] = round(book.spent("all", 86400, harnesses=paid), 6)
+        # #513 : idem contre le plafond par jour glissant
+        spend["24h_counted_usd"] = round(book.paid_spent(paid, 86400), 6)
         for agent in sorted(limits.agents):
             spend["agents"][agent] = {
                 "1h_usd": round(book.spent(agent, 3600, harnesses=paid), 6),
@@ -288,8 +303,11 @@ def status(cfg: Config, db, *, last: int = 5) -> dict:
         events = storage.of(db).budgets.events(max(0, last))
     except db_mod.DbError:
         events = []
+    from . import account_budget
     return {"schema": "ameesh-budget/1", "limits": limits.as_dict(),
-            "rows": list(limits.rows), "spend": spend, "paused": paused, "events": events}
+            "rows": list(limits.rows), "spend": spend, "paused": paused, "events": events,
+            # #1469 : enveloppes par compte de facturation (jour calendaire)
+            "accounts": account_budget.usage(db)}
 
 
 def _moment(epoch) -> str:
@@ -342,6 +360,18 @@ def format_status(data: dict) -> str:
                            _fmt_usd(sp["1h_counted_usd"]),
                            "; non-critical agents stop at %.0f%% of it" % (share * 100)
                            if share is not None and share < 1 else ""))
+        if sp.get("24h_counted_usd") is not None:
+            out.append("daily cap counts %s (same rule)" % _fmt_usd(sp["24h_counted_usd"]))
+    if data.get("accounts"):
+        from . import account_budget
+        out.append("billing account envelopes (calendar day, shared by all agents and hosts):")
+        for a in data["accounts"]:
+            out.append("  %-18s limit %s · spent %s · reserved %s · kept %s · remaining %s"
+                       "   day %s %s, reset %s" % (
+                           a["billing_account"], _fmt_usd(a["usd"]), _fmt_usd(a["settled"]),
+                           _fmt_usd(a["reserved"]), _fmt_usd(a["kept"]),
+                           _fmt_usd(a["remaining"]), a["period"], a["tz"],
+                           account_budget.moment(a.get("reset_ts"), a["tz"])))
     if data["paused"]:
         out.append("paused for budget:")
         for p in data["paused"]:
@@ -353,7 +383,7 @@ def format_status(data: dict) -> str:
         for ev in data["events"]:
             out.append("  %s  %-14s %-9s %s → %s  %s" % (
                 _moment(ev.get("at_ts")), ev["scope"] or "mesh", LABELS.get(
-                    int(ev["window_s"]), ev["window_s"]),
+                    int(ev["window_s"]), "per calendar day"),
                 _fmt_usd(ev.get("old_usd")), _fmt_usd(ev.get("new_usd")), ev["actor"]))
     return "\n".join(out)
 
@@ -372,10 +402,18 @@ def add_parsers(sub) -> None:
     ps.add_argument("--per-hour", type=float, default=None, metavar="USD")
     ps.add_argument("--per-day", type=float, default=None, metavar="USD")
     ps.add_argument("--agent", default=None)
+    ps.add_argument("--account", default=None, metavar="BILLING_ACCOUNT",
+                    help="#1469: daily envelope of a billing account (calendar day, --per-day)")
+    ps.add_argument("--tz", default=None, help="zone of the account's calendar day "
+                    "(default Europe/Paris)")
     pu = bsub.add_parser("unset", help="remove a cap set in the database")
     pu.add_argument("--per-hour", action="store_true")
     pu.add_argument("--per-day", action="store_true")
     pu.add_argument("--agent", default=None)
+    pu.add_argument("--account", default=None, metavar="BILLING_ACCOUNT")
+    pr = bsub.add_parser("release", help="#1469: release a kept account reservation "
+                         "(uncertain turn checked by a human)")
+    pr.add_argument("reservation", type=int)
     pshow = bsub.add_parser("show", help="caps in force (default)")
     pshow.add_argument("--json", action="store_true")
     pshow.add_argument("--last", type=int, default=5)
@@ -394,6 +432,8 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 print(format_status(data))
             return 0
+        if what == "release" or getattr(args, "account", None):
+            return _cmd_account(cfg, db, args, what)
         if what == "set":
             demandes = {w: v for w, v in ((3600, args.per_hour), (86400, args.per_day))
                         if v is not None}
@@ -435,6 +475,66 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _cmd_account(cfg: Config, db, args: argparse.Namespace, what: str) -> int:
+    """#1469 : enveloppe quotidienne d'un compte de facturation, et libération
+    d'une réservation gardée — humains habilités seulement, journalisé."""
+    from . import accounts as accounts_mod
+    try:
+        actor = authorize(cfg, db)
+    except BudgetError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    api = storage.of(db).budgets
+    if what == "release":
+        row = api.account_release(args.reservation, actor=actor)
+        if row is None:
+            print("no kept or open reservation #%d" % args.reservation, file=sys.stderr)
+            return 1
+        texte = ("Account reservation #%d released (%s, agent %s, %s, day %s), by %s."
+                 % (row["id"], row["billing_account"], row["agent"], _fmt_usd(row["usd"]),
+                    row["period"], actor))
+        fil.record(cfg, db, sender=actor, recipients=[], text=texte,
+                   meta={"action": "budget", "audit": "budget",
+                         "scope": "account:%s" % row["billing_account"],
+                         "reservation": row["id"], "released_usd": row["usd"]})
+        print(texte)
+        return 0
+    account = args.account
+    if not accounts_mod.BILLING_RE.match(account or ""):
+        print("invalid billing account: %r" % account, file=sys.stderr)
+        return 2
+    if what == "set":
+        value = args.per_day
+        if args.per_hour is not None or value is None:
+            print("usage: ameesh budget set --account ID --per-day USD [--tz ZONE]",
+                  file=sys.stderr)
+            return 2
+        if not value > 0 or value != value or value == float("inf"):
+            print("invalid per-day cap: %r" % value, file=sys.stderr)
+            return 2
+        if args.tz:
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(args.tz)
+            except Exception:  # noqa: BLE001 - zone inconnue
+                print("unknown time zone: %s" % args.tz, file=sys.stderr)
+                return 2
+    else:
+        value = None
+    changed, old = api.account_put(account, value, actor=actor,
+                                   tz=getattr(args, "tz", None))
+    if changed:
+        texte = "Budget of billing account %s per calendar day: %s → %s, by %s." % (
+            account, _fmt_usd(old), _fmt_usd(value), actor)
+        fil.record(cfg, db, sender=actor, recipients=[], text=texte,
+                   meta={"action": "budget", "audit": "budget", "scope": "account:%s" % account,
+                         "window_s": 0, "old_usd": old, "new_usd": value})
+        print("%s (effective immediately on all runners)" % texte)
+    else:
+        print("budget of billing account %s: unchanged (%s)" % (account, _fmt_usd(old)))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

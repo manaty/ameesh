@@ -3,14 +3,20 @@
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
   agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"
-                 [--estimate 2h] [--app PROJECT]] [--queue]
+                 [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
                                                  project or work item (ameesh fil show <project> [<lot>]);
-                                                 from an orchestrator, --lot assigns the work item
-                                                 to the recipient and --new-lot creates it (L118),
+                                                 from a declared orchestrator, --lot hands an
+                                                 unassigned work item (or one held by a human)
+                                                 to the recipient — an item already held by an
+                                                 agent is never reassigned by mail, whoever
+                                                 holds it (#1066) — and --new-lot creates it (L118),
                                                  with its estimated duration --estimate (L157:
                                                  required when an agent creates the work item);
+                                                 #540: a recipient who already has a work item
+                                                 not started does not get it (team queue, the
+                                                 message is not dropped) unless --force "reason";
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
@@ -26,6 +32,11 @@
                                                  re-delivers the pending mail of a stopped
                                                  agent (or one missing from the registry) to a
                                                  live agent: sender and date kept
+  agent-mail sweep [--days N] [--dry-run] [--json]
+                                                 L976: re-delivers the dead mail of a stopped
+                                                 agent to its successor, expires the rest past
+                                                 `mail_dead_letter_days` (7; 0 = never), with
+                                                 a thread trace; run daily by the runner
   agent-mail list                                agents, host, lease, unread
   agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
@@ -213,6 +224,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     expires = None
     lot = None
     new_lot = None
+    parent_lot = None
     app = None
     kind = "notify"
     urgent = False
@@ -235,7 +247,9 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--new-project"]
     explicit_sender = "--from" in args
     estimate = None
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate", "--app"):
+    force = None
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--parent-lot",
+                 "--kind", "--estimate", "--app", "--force"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -250,10 +264,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 lot = value
             elif flag == "--new-lot":
                 new_lot = value if value is not None else ""
+            elif flag == "--parent-lot":
+                parent_lot = value if value is not None else ""
             elif flag == "--estimate":
                 estimate = value if value is not None else ""
             elif flag == "--app":
                 app = value if value is not None else ""
+            elif flag == "--force":
+                # #540 : forcer la file d'équipe, avec sa raison (journal du lot)
+                force = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -284,7 +303,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] "
-              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]]] "
+              "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
+              "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] "
               "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] [--queue]",
@@ -313,6 +333,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--estimate goes with --new-lot (the estimated duration of the created work item; for an "
               "existing one: ameesh work plan <id> --estimate 2h)", file=sys.stderr)
         return 2
+    if parent_lot is not None and new_lot is None:
+        print("--parent-lot goes with --new-lot (the parent of the created suite; for an "
+              "existing lot: ameesh work dependencies <id> --add <parent>)", file=sys.stderr)
+        return 2
+    if parent_lot is not None:
+        number = str(parent_lot).strip().lstrip("#")
+        if not number.isdigit() or int(number) <= 0:
+            print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
+            return 2
+        parent_lot = int(number)
     dest, text = args[0], " ".join(args[1:]).strip()
     binding = None
     if not sender:
@@ -429,13 +459,17 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # Contract 1.1 permits a thread label, but not assignment or work creation.
     # The server remains responsible for linking and assigning work items.
     if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
-        from . import assignments, plan_git
+        from . import assignments, plan_git, work
         try:
+            if (force or "").strip():
+                # #540 : l'auteur du forçage est l'identité de la session
+                sender = work.forcer(cfg, bk.db, sender)
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
                 branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
-                estimate=estimate, app=app, new_project=new_project)
-        except assignments.AssignmentError as exc:
+                estimate=estimate, app=app, new_project=new_project, force=force,
+                parent_lot=parent_lot)
+        except (assignments.AssignmentError, work.WorkError) as exc:
             print("message not delivered — %s" % exc, file=sys.stderr)
             return 2
         lot = linked["work_item_id"]
@@ -445,9 +479,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             thread_meta = {"avertissement": "; ".join(linked["warnings"])}
         item = linked["lot"]
         if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
+            # #858 : un lot créé pour un destinataire non attribuable à
+            # l'instant est créé sans assigné (l'avertissement dit pourquoi).
+            if linked["created"]:
+                quoi = ("created and assigned to %s" % dest if linked["assigned"]
+                        else "created for %s without assignee" % dest)
+            else:
+                quoi = "assigned to %s" % dest if linked["assigned"] else "linked"
             print("lot #%d %s%s%s" % (
-                int(item["id"]), "created and assigned to %s" % dest if linked["created"]
-                else "assigned to %s" % dest if linked["assigned"] else "linked",
+                int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
         if payload.get("ack") and (linked["created"] or linked["assigned"]):
@@ -957,7 +997,10 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # conclure son tour — jamais tant qu'un travail lancé pendant le tour
         # tourne encore (processus de fond, conteneurs du tour) : il le saura,
         # et l'invitation viendra après.
-        tour = os.environ.get("AMEESH_TURN_ID") or ""
+        # L76 : un processus résident garde son environnement d'un tour à
+        # l'autre — le tour en cours est nommé dans un fichier
+        from . import resident_runner
+        tour = resident_runner.current_turn()
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
         etat = tour_lit(cfg, name, tour) if borne else None
         if etat is not None and etat["remis"] >= borne:
@@ -1230,6 +1273,75 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     print("senders: %s; original sender and date kept, forward noted in the thread"
           % ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
                                                        key=lambda kv: (-kv[1], kv[0]))))
+    return 0
+
+
+_SWEEP_USAGE = "usage: agent-mail sweep [--days N] [--dry-run] [--json]"
+
+
+def _sweep_line(action, kind) -> str:
+    """Une ligne du compte rendu de `ameesh mail sweep`."""
+    ids = action.get("messages") or []
+    suffix = " (#%s)" % ", #".join(str(i) for i in ids) if ids else ""
+    if kind == "forwarded":
+        return ("%s (stopped): %d message(s) %s re-delivered to %s%s"
+                % (action["old"], action["count"],
+                   "would be" if action.get("dry_run") else "were", action["new"], suffix))
+    return ("%s (%s): %d message(s) %s expired%s"
+            % (action["recipient"], "unknown" if action.get("unknown") else "stopped",
+               action["count"], "would be" if action.get("dry_run") else "were", suffix))
+
+
+def cmd_sweep(bk, cfg: Config, rest: list[str]) -> int:
+    """L976 : re-livre au successeur, ou expire après la rétention, le courrier
+    en souffrance (`undeliverable.sweep`) — le même passage que le ménage de
+    l'exécuteur, à la main."""
+    from . import undeliverable
+    try:
+        opts, positional = _options(rest, ("--days",), ("--dry-run", "--json"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
+        return 2
+    if positional:
+        print(_SWEEP_USAGE, file=sys.stderr)
+        return 2
+    days = opts.get("--days")
+    if days is not None:
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            print("--days expects a whole number of days\n%s" % _SWEEP_USAGE, file=sys.stderr)
+            return 2
+        if days < 0:
+            print("--days must be >= 0\n%s" % _SWEEP_USAGE, file=sys.stderr)
+            return 2
+    try:
+        result = undeliverable.sweep(cfg, bk.db, days=days, actor=_actor(),
+                                     dry_run=bool(opts.get("--dry-run")))
+    except ValueError as exc:
+        print("sweep refused — %s\n%s" % (exc, _SWEEP_USAGE), file=sys.stderr)
+        return 1
+    if opts.get("--json"):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    actions = result["forwarded"] + result["expired"]
+    if not actions:
+        print("no dead letter to sweep (retention %d day(s), 0 = never)"
+              % result["days"])
+        return 0
+    if result["dry_run"]:
+        print("dry run: retention %d day(s); %d recipient(s) to sweep:"
+              % (result["days"], len(actions)))
+    for action in result["forwarded"]:
+        print("  " + _sweep_line(action, "forwarded"))
+    for action in result["expired"]:
+        print("  " + _sweep_line(action, "expired"))
+    for action in result["refused"]:
+        print("  %s: re-delivery to %s refused — %s" % (
+            action["old"], action["new"], action["reason"].splitlines()[0]), file=sys.stderr)
+    if not result["dry_run"]:
+        print("retention %d day(s); dead mail stays in the mailbox, marked expired"
+              % result["days"])
     return 0
 
 
@@ -1568,6 +1680,12 @@ def main(argv: list[str] | None = None) -> int:
                       "registry", file=sys.stderr)
                 return 1
             return cmd_forward(bk, cfg, rest)
+        if command == "sweep":
+            if bk.kind != "pg":
+                print("the dead-letter sweep requires the database (AMEESH_DSN): the file "
+                      "fallback has no registry", file=sys.stderr)
+                return 1
+            return cmd_sweep(bk, cfg, rest)
         if command in ("bind", "unbind", "bindings"):
             if bk.kind != "pg":
                 print("session bindings require the database (AMEESH_DSN): "

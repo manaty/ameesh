@@ -15,6 +15,13 @@ from ameesh.runner import AgentWorker, Runner
 from .support import PgTestCase
 
 
+def secondes(attentes):
+    """#1270 : l'attente est découpée au temps **restant**, mesuré à l'instant
+    de l'appel — la valeur porte donc les microsecondes écoulées. On compare à
+    la milliseconde : l'assertion ne dépend plus de l'ordonnanceur."""
+    return [round(t, 3) for t in attentes]
+
+
 class EchecsRapidesTest(PgTestCase):
     def _worker(self, name="rapide", **cfg):
         os.makedirs(os.path.join(self.tmp, "work", name), exist_ok=True)
@@ -62,7 +69,7 @@ class EchecsRapidesTest(PgTestCase):
     def test_serie_d_echecs_rapides_arrete_l_agent(self):
         worker = self._worker(max_fast_failures=3)
         attentes = self._boucle(worker, [False, False, False, False])
-        self.assertEqual(attentes, [5.0, 10.0])  # pas d'attente après l'arrêt
+        self.assertEqual(secondes(attentes), [5.0, 10.0])  # pas d'attente après l'arrêt
         row = registry.get(self.db, "rapide")
         self.assertEqual(row["status"], "stopped")
         self.assertEqual(row["stop_reason"], "erreur")
@@ -72,7 +79,7 @@ class EchecsRapidesTest(PgTestCase):
     def test_un_succes_remet_la_serie_a_zero(self):
         worker = self._worker(max_fast_failures=3)
         attentes = self._boucle(worker, [False, False, True, False, False, True])
-        self.assertEqual(attentes, [5.0, 10.0, 5.0, 10.0])
+        self.assertEqual(secondes(attentes), [5.0, 10.0, 5.0, 10.0])
         self.assertNotEqual(registry.get(self.db, "rapide")["status"], "stopped")
 
     def test_echec_lent_ne_compte_pas(self):
