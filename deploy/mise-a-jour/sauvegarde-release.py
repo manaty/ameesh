@@ -12,13 +12,14 @@
   never claims a completed backup for an incomplete artifact;
 - `pin` registers that exact set in the private retention catalog with the
   release's rollback deadline and the enrolled retention window, before any
-  migration. An unaccepted set is never expired. A receipt that is missing,
-  stale, unreadable or from another manifest is not a reason to hold: the set
-  is recreated from the live source before registration, under the current
+  migration. An unaccepted set is never expired. A missing or stale receipt,
+  one from another manifest or one no longer matching its files does not hold
+  `pin`: the set is recreated from the live source before registration, under the current
   approval (the step still runs before any fence or migration). A new approval
   never inscribes a dump made under an earlier one, the controller's resume
   cannot wedge on a refusal that time only makes truer, and a failure or crash
-  during the recreation leaves no receipt: the next `pin` recreates again;
+  during the recreation leaves no receipt: the next `pin` recreates again.
+  An unreadable, invalid or unsafe receipt remains a protective refusal;
 - `accept` records release acceptance for retention, drops the transient
   receipt, then expires previously accepted sets whose policy window has
   passed. Expiry is best-effort: a set whose remote members have no enrolled
@@ -486,7 +487,8 @@ class RecoverySet:
         # K3: the receipt is evidence of the pre-migration state only inside the
         # bounded reuse window, and it is bound to the operation, not to the
         # approval that asked for it. A `pin` that finds it missing, stale,
-        # unreadable or from another manifest must not hold on that: the
+        # from another manifest or no longer matching its files recreates the
+        # set: the
         # controller replays `pin`, and time never repairs a refusal — a release
         # held across days and resumed under a new approval would stay wedged.
         # Recreate the set from the live source instead: `pin` still runs before
