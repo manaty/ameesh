@@ -9,6 +9,8 @@
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
     scripts/test-plan.py tally leaks.json [leaks.json…]
+    scripts/test-plan.py couverture [--repo OWNER/REPO] [--ref REFS] [--sha SHA]
+                                    [--api URL] [--github-output F] [--summary F]
 
 `plan` runs once per CI run (job `plan` of .github/workflows/tests.yml) and
 decides, for every test module, its class and the parts it runs in; every
@@ -114,6 +116,22 @@ P3). `leaks` reads the plan and the part streams of a run and writes one
 record (`ameesh-test-leaks/1`), kept as the `leaks` artifact; `tally`
 aggregates records for the two-week review (L161i): phase 2 requires fewer
 than 1 leak per 50 PRs.
+
+**Coverage of a package push** (`couverture`, canon §12). A package
+integration branch pushed while its PR is open used to launch two full
+suites — the `push integration/**` run and the `pull_request` run of
+tests.yml — both carrying the required `tests` check on the same head; the
+cancelled one left its aggregate red (incident #1342, PR #1050). tests.yml
+no longer triggers on `push integration/**`; the gate
+`.github/workflows/paquet.yml` reads the branch's open pull requests (GitHub
+API, read-only) and asks this command whether one carries exactly the pushed
+head (`head.sha == github.sha`, base `main`, `release/**` or
+`integration/**`). If so, the suite is already carried by that PR's
+`pull_request` run and the gate calls nothing; otherwise — no PR, another
+head, a base outside tests.yml's scope, unreadable API, incomplete context —
+it calls tests.yml (`workflow_call`) so a push without a PR keeps its full
+suite. The decision never reads a run: no success is inferred from another
+run's existence, and the fallback is always "the suite runs".
 """
 from __future__ import annotations
 
@@ -130,6 +148,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
@@ -1199,6 +1219,138 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     return out
 
 
+# -- paquet : une seule suite par tête (canon §12) --------------------------
+#
+# Une poussée sur la branche d'intégration d'un paquet et la PR ouverte sur
+# cette branche déclenchaient deux suites complètes, deux runs portant le même
+# check requis `tests` sur la même tête : annuler l'un laissait l'agrégat rouge
+# de l'autre (incident #1342, PR #1050 bloquée par le `tests` du run push
+# annulé). tests.yml ne se déclenche plus sur `push integration/**` ; le
+# portier .github/workflows/paquet.yml lit les PR ouvertes et n'appelle la
+# suite que si aucune ne couvre la tête exacte. La décision ne regarde jamais
+# un run : aucune réussite n'est déduite de l'existence d'un autre run.
+
+#: préfixe des branches d'intégration de paquet (canon §12)
+PACKAGE_PREFIX = "integration/"
+#: la base d'une PR de paquet (canon §12)
+PR_BASE = "main"
+#: une PR dont la source ou la cible est sous ces préfixes est une PR de
+#: release : elle déclenche tests.yml (canon §3)
+PR_BASE_PREFIXES = ("release/", "integration/")
+
+
+def pr_base_covered(base: str | None) -> bool:
+    """True si une PR sur cette base déclenche tests.yml (canon §3, §12)."""
+    base = (base or "").strip()
+    return base == PR_BASE or base.startswith(PR_BASE_PREFIXES)
+
+
+def couverture_decision(pulls, sha: str) -> dict:
+    """La PR ouverte qui couvre exactement la tête `sha`, sinon rien.
+
+    Ne lit que des PR ouvertes : aucune lecture de run, donc aucune réussite
+    déduite d'un autre run. Une PR dont la tête n'est pas ce commit exact ne
+    couvre pas la poussée (une nouvelle tête reprend sa décision), et une PR
+    dont la base ne déclenche pas tests.yml ne couvre rien : dans tous les
+    autres cas la suite tourne (repli sûr).
+    """
+    sha = (sha or "").strip()
+    same_head = []
+    for pr in pulls or []:
+        if (pr.get("state") or "open") != "open":
+            continue
+        head = ((pr.get("head") or {}).get("sha") or "").strip()
+        if head != sha:
+            continue
+        same_head.append(pr)
+        base = (pr.get("base") or {}).get("ref") or ""
+        if not pr_base_covered(base):
+            continue
+        number = pr.get("number")
+        return {"covered": True, "pr": number,
+                "why": f"PR #{number} (base {base}) couvre la tête {sha[:12]}"}
+    if same_head:
+        pr = same_head[0]
+        base = (pr.get("base") or {}).get("ref") or "?"
+        return {"covered": False, "pr": None,
+                "why": (f"PR #{pr.get('number')} est sur cette tête mais sa base "
+                        f"{base} ne déclenche pas tests.yml : la suite tourne")}
+    if pulls:
+        return {"covered": False, "pr": None,
+                "why": "PR ouvertes mais aucune sur cette tête exacte : la suite tourne"}
+    return {"covered": False, "pr": None,
+            "why": "aucune PR ouverte sur cette branche : la suite tourne"}
+
+
+def pulls_open(repo: str, branch: str, api: str, token: str, opener=None) -> list:
+    """Les PR ouvertes dont la tête est `branch` (API GitHub, lecture seule).
+
+    `head=owner:branch` filtre côté serveur ; 100 par page suffit pour une
+    branche d'intégration, et une lecture incomplète fait tourner la suite
+    (jamais l'inverse). Une erreur d'API ou de réseau remonte à l'appelant,
+    qui la traduit en repli sûr.
+    """
+    owner = repo.split("/", 1)[0]
+    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}",
+                                    "per_page": "100"})
+    url = f"{api.rstrip('/')}/repos/{repo}/pulls?{query}"
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ameesh-tests-plan",
+    })
+    lire = opener or urllib.request.urlopen
+    with lire(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"payload inattendu ({type(data).__name__})")
+    return data
+
+
+def couverture_texte(out: dict, ref: str) -> str:
+    """Le résumé lisible de la décision, pour le journal du portier."""
+    etat = "couverte" if out["covered"] else "non couverte"
+    suite = ("la suite complète est portée par le run `pull_request` de tests.yml"
+             if out["covered"] else
+             "la suite complète tourne dans ce run (`paquet.yml`)")
+    return f"poussée {ref} : {etat} — {out['why']}\n{suite}\n"
+
+
+def couverture(args) -> int:
+    """Le portier `paquet.yml` : la poussée est-elle couverte par une PR ?
+
+    Repli sûr : contexte incomplet, ref hors `integration/**`, API illisible
+    ou non listée — la suite tourne, jamais l'inverse. Sortie toujours 0 :
+    l'échec du portier ne doit pas supprimer la validation de la branche.
+    """
+    out = {"covered": False, "pr": None, "why": ""}
+    branch = (args.ref or "").removeprefix("refs/heads/")
+    if not (args.repo and branch and args.sha):
+        out["why"] = "contexte incomplet (repo, ref ou sha) : la suite tourne"
+    elif not branch.startswith(PACKAGE_PREFIX):
+        out["why"] = f"poussée hors {PACKAGE_PREFIX}** : rien à dédupliquer"
+    else:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        try:
+            pulls = pulls_open(args.repo, branch, args.api, token)
+            out = couverture_decision(pulls, args.sha)
+        except Exception as exc:  # noqa: BLE001 - repli sûr : la suite tourne
+            out = {"covered": False, "pr": None,
+                   "why": (f"PR illisibles ({type(exc).__name__}: {exc}) : "
+                           "la suite tourne")}
+    text = couverture_texte(out, args.ref or branch)
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as fh:
+            fh.write(f"covered={'true' if out['covered'] else 'false'}\n")
+            fh.write(f"covered_pr={out['pr'] if out['pr'] is not None else ''}\n")
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### Couverture de la poussée\n\n{text}")
+    print(text, end="")
+    return 0
+
+
 def doc_readers(classes: dict, card: dict,
                 modules: list[str]) -> tuple[list[str], list[str]]:
     """Readers of a documentation-only change, judged with a usable map: the
@@ -1557,8 +1709,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--summary")
     p = sub.add_parser("tally", help="leaks over many runs")
     p.add_argument("records", nargs="+")
+    p = sub.add_parser("couverture",
+                       help="cette poussée de paquet est-elle couverte par une PR ouverte ?")
+    p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
+                   help="owner/repo (défaut : $GITHUB_REPOSITORY)")
+    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                   help="github.ref de la poussée (défaut : $GITHUB_REF)")
+    p.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""),
+                   help="tête poussée (défaut : $GITHUB_SHA)")
+    p.add_argument("--api", default=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+                   help="racine de l'API GitHub (défaut : $GITHUB_API_URL)")
+    p.add_argument("--github-output", help="appends the job outputs to this file")
+    p.add_argument("--summary", help="appends the Markdown summary to this file")
     args = ap.parse_args(argv)
 
+    if args.command == "couverture":
+        return couverture(args)
     if args.command == "plan":
         card, why = _load_map(args.map)
         if card is None and args.map:
