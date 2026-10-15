@@ -13,10 +13,10 @@
 - `pin` registers that exact set in the private retention catalog with the
   release's rollback deadline and the enrolled retention window, before any
   migration. An unaccepted set is never expired. A receipt outside the bounded
-  reuse window is refused before any registration: a new approval never
-  inscribes a dump made under an earlier one. The controller holds; recovery is
-  a new `backup` step, which recreates the set from the live source, or a new
-  operation;
+  reuse window is recreated from the live source before registration, under the
+  current approval (the step still runs before any fence or migration): a new
+  approval never inscribes a dump made under an earlier one, and the controller's
+  resume cannot wedge on a refusal that time only makes truer;
 - `accept` records release acceptance for retention, drops the transient
   receipt, then expires previously accepted sets whose policy window has
   passed. Expiry is best-effort: a set whose remote members have no enrolled
@@ -489,14 +489,21 @@ class RecoverySet:
         # bounded reuse window, and it is bound to the operation, not to the
         # approval that asked for it. A later `pin` — typically a release held
         # across days and resumed under a new approval — must not inscribe the
-        # earlier attempt's dump as the current rollback set: refuse BEFORE any
-        # registration (the retry that reuses this receipt would raise with an
-        # empty catalog, so nothing durable to roll back). Recovery is explicit:
-        # a new `backup` step recreates the set from the live source (the stale
-        # members are discarded, never re-stamped), or the operator starts a new
-        # operation with its own receipt. The refusal writes nothing.
+        # earlier attempt's dump as the current rollback set. Recreate it from
+        # the live source instead: `pin` still runs before any fence or migration
+        # and the current approval was checked for THIS step, so the fresh dump
+        # has the same standing as one taken by a `backup` step. Returning False
+        # would wedge the controller's resume, which replays `pin` and can only
+        # see a receipt that time makes older (dev7/4971 R2).
         if self._stale(pending['files']):
-            return False
+            self._discard(artifact)
+            if not self._backup(request):
+                return False
+            pending = self._pending(artifact)
+            if pending is None or pending['manifest_digest'] != request['manifest_digest']:
+                return False
+            if not self._pending_files(pending):
+                return False
         if self.config['remote'] is not None and pending['remote_verified'] is not True:
             return False
         try:

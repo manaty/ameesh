@@ -356,23 +356,78 @@ class RecoverySetTest(unittest.TestCase):
         self.assertEqual(dump.call_count, 1)
         self.assertEqual(restore.call_count, 1)
 
-    def test_stale_receipt_is_refused_at_pin_before_any_registration(self):
-        """K3: a receipt made under an earlier approval is not inscribed as the
-        current rollback set; a new `backup` recreates it from the live source."""
-        self.assertTrue(self.backup())
-        stale = self.stale_stamp()
-        for name in self.value._pending('release-fixture')['files']:
-            os.utime(Path(self.retention) / name, (stale, stale))
-        self.assertFalse(self.perform('pin'))                    # refus, aucune écriture
-        self.assertEqual(self.catalog(), {})
-        self.assertIsNone(self.value._record('release-fixture'))
-        with mock.patch.object(recovery.backup, 'snapshot_dump', side_effect=self.fake_dump) as dump, \
-                mock.patch.object(recovery.backup, 'verify_restore', side_effect=self.fake_restore) as restore:
-            self.assertTrue(self.perform('backup'))
-        self.assertEqual(dump.call_count, 1)                     # recréé, pas re-stampé
-        self.assertEqual(restore.call_count, 1)
-        self.assertTrue(self.perform('pin'))
-        self.assertIsNotNone(self.value._record('release-fixture'))
+    def controller(self, *, stop=None):
+        """Contrôleur réel autour du jeu : `backup`/`pin`/`accept` délégués,
+        autres étapes simulées ; `stop` interrompt la reprise avant une étape
+        (processus arrêté entre deux reçus, comme une release tenue)."""
+        class Authority:
+            def validate(self, operation, digest, step):
+                return True
+
+        value, release = self.value, self.release
+
+        class Adapter:
+            def __init__(self):
+                self.steps = []
+
+            def perform(self, step, request):
+                self.steps.append(step)
+                if step == stop:
+                    raise RuntimeError('interrupted before %s' % step)
+                ok = (value.perform(step, request, release)
+                      if step in ('backup', 'pin', 'accept') else True)
+                return dict(request, ok=ok)
+
+            def fenced(self, request):
+                return True
+
+        return Authority(), Adapter()
+
+    def test_stale_receipt_is_recreated_at_pin_through_the_controller(self):
+        """K3 (dev7/4971 R2) : après un `backup` reçu puis une longue attente,
+        la reprise du contrôleur sur `pin` recrée le jeu depuis la source vive
+        et l'inscrit — elle ne se cale pas sur un refus que le temps aggrave."""
+        autorite, premier = self.controller(stop='pin')
+        appels = []
+
+        def dump_once(config, output, inventory):
+            appels.append(1)
+            source = self.fake_dump if len(appels) == 1 else self.fresh_dump
+            return source(config, output, inventory)
+
+        with mock.patch.object(recovery.backup, 'snapshot_dump',
+                               side_effect=dump_once) as dump, \
+                mock.patch.object(recovery.backup, 'verify_restore',
+                                  side_effect=self.fake_restore) as restore:
+            with self.assertRaises(recovery.protocol.ControllerError):
+                recovery.protocol.run(self.root, 'release-fixture', self.manifest,
+                                      authority=autorite, adapter=premier)
+            self.assertEqual(premier.steps[:2], ['prepare', 'backup'])
+            avant = dict(self.value._pending('release-fixture')['files'])
+            # La release attend : des jours passent entre le reçu et le pin.
+            stale = self.stale_stamp()
+            for name in avant:
+                os.utime(Path(self.retention) / name, (stale, stale))
+            autorite, second = self.controller()
+            status = recovery.protocol.run(self.root, 'release-fixture', self.manifest,
+                                           authority=autorite, adapter=second)
+        self.assertEqual(status, 'accepted')                     # reprise non calée
+        self.assertEqual(dump.call_count, 2)                     # reçu initial + recréation au pin
+        self.assertEqual(restore.call_count, 2)
+        self.assertIn('pin', second.steps)
+        record = self.value._record('release-fixture')
+        self.assertEqual(record['state'], 'retained')
+        self.assertNotEqual(record['files'], avant)              # recréé, pas re-stampé
+        self.assertEqual(record['files']['release-fixture.dump'],
+                         hashlib.sha256(b'fresh-archive').hexdigest())
+        for name, digest in record['files'].items():
+            self.assertEqual(digest, recovery.backup.digest(Path(self.retention) / name))
+
+    def fresh_dump(self, config, output, inventory):
+        Path(output).write_bytes(b'fresh-archive')
+        Path(output).chmod(0o600)
+        document = self.write_inventory(output, inventory=inventory)
+        return {'artifact_sha256': document['artifact_sha256'], 'inventory': str(inventory)}
 
     def test_stale_remote_attempt_reuploads_instead_of_colliding(self):
         upload_credentials, restore_credentials = self.credential_files()

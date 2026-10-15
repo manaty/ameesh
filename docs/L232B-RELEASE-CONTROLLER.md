@@ -535,11 +535,11 @@ whose remote members have no enrolled deletion adapter, stays protected and
 the expiry is retried at the next acceptance. An interrupted publication is
 recreated from the live source; an artifact left by an interrupted attempt is
 only reused while it is inside the bounded reuse window. Outside it, `pin`
-refuses before any registration — a new approval never inscribes a dump made
-under an earlier one — and the controller holds: the next `backup` recreates
-the set from the live source rather than re-stamping the receipt, or the
-operator starts a new operation. A verified receipt survives a lost reply
-without a second dump, restore or upload.
+recreates the set from the live source before registering it — the step still
+runs before any fence or migration, under the current approval — so a new
+approval never inscribes a dump made under an earlier one and the resume cannot
+wedge on a refusal that time only makes truer. A verified receipt survives a
+lost reply without a second dump, restore or upload.
 
 `HealthProbe` rederives the active release's own completed receipt, checks the
 versioned pointer (`health`: the activated release; `recovery_health`: the prior
