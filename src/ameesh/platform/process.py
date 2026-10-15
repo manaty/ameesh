@@ -566,12 +566,14 @@ def reap(pid: int) -> int | None:
 # détenteurs d'un fichier
 # --------------------------------------------------------------------------
 
-def _inside(target: str, real: str, is_dir: bool) -> bool:
+def _inside(target: str, real: str | None, is_dir: bool) -> bool:
+    if real is None:  # L63b: command line only, no file to look for
+        return False
     return target == real or (is_dir and target.startswith(real.rstrip(os.sep) + os.sep))
 
 
-def holders(path: str, needle: str | None = None, exclude=(), *,
-            mapped: bool = False) -> list[dict]:
+def holders(path: str | None, needle: str | None = None, exclude=(), *,
+            mapped: bool = False, doubt: bool = False) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
@@ -582,17 +584,174 @@ def holders(path: str, needle: str | None = None, exclude=(), *,
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, ou si l'OS
     n'offre aucun moyen de les lire, `NotAvailable` : une liste vide voudrait
-    dire « personne ne tient la session », ce qui n'aurait pas été vérifié."""
-    real = os.path.realpath(path)
-    is_dir = os.path.isdir(real)
+    dire « personne ne tient la session », ce qui n'aurait pas été vérifié.
+
+    `doubt` (L63b ; portée corrigée #388, constat auditeur 16:46) : avec
+    True, un processus du même utilisateur qui refuse la lecture de ses
+    fichiers ouverts (non dumpable) et n'est pas le gestionnaire de services
+    est lui aussi un doute, et `NotAvailable` est levée. C'est le contrôle
+    strict d'`adopt`/`resume`, qui doit refuser plutôt que de croire à une
+    session fermée. Faux par défaut : un voisin illisible de l'hôte
+    (ssh-agent, processus d'un autre agent) ne rend plus fail-closed le
+    ménage /tmp, les worktrees, deps ou build_artifacts, qui restent au
+    meilleur effort comme avant L63b.
+    `path` None : `needle` seul, l'OS toujours exigé (L63b)."""
+    real = os.path.realpath(path) if path else None
+    is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped, doubt)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude, mapped)
+        return _holders_proc(real, is_dir, needle, exclude, mapped, doubt)
     raise NotAvailable("file holders",
                        "neither psutil nor /proc to list open files")
+
+
+#: L63b: a doubt (open files denied) is read again this many times, this far
+#: apart: a process that is only exiting (its files already closed, /proc
+#: denies its `fd` until it is a zombie) is gone or a zombie by then; a live
+#: holder that is not dumpable stays a doubt
+DOUBT_RETRIES = 5
+DOUBT_RETRY_S = 0.1
+
+#: L63b, off Linux: system executables no user can write (SIP), e.g. macOS's
+#: ContextStoreAgent, which runs as the user and denies its open files. Not
+#: /usr/bin: a harness can run under Apple's python.
+SYSTEM_EXE_ROOTS = ("/System/", "/usr/libexec/")
+
+
+def _proc_status(pid) -> dict | None:
+    """The fields of /proc/<pid>/status (`{"Uid": [...], ...}`), readable
+    even when the process is not dumpable; None when it is gone. Any other
+    read error is raised: unknown is not "another user" (review #377 r2)."""
+    try:
+        with open(os.path.join(PROC, str(pid), "status"), encoding="utf-8",
+                  errors="replace") as fh:
+            text = fh.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    out = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            out[key] = value.split()
+    return out
+
+
+def service_managers(uid: int | None = None) -> frozenset:
+    """L63b: the PIDs of the user's service manager and of its `(sd-pam)`,
+    whose open files are never readable. Told by PID and credentials, never
+    by name, command line or start time, which a process can borrow (review
+    #377 r2-r4): the MainPID of user@<uid>.service, asked of PID 1
+    (`systemctl`), and its direct children whose supplementary groups are
+    EMPTY while the manager's are not. `(sd-pam)` is forked as root and
+    takes the uid without initgroups; a user process cannot empty its groups
+    (setgroups needs CAP_SETGID; denied in an unprivileged user namespace).
+    A manager without groups exempts no child. Empty without systemd or
+    /proc."""
+    import subprocess
+    uid = os.getuid() if uid is None else uid
+    if not _proc_ok():
+        return frozenset()
+    try:
+        done = subprocess.run(["systemctl", "show", "--property=MainPID", "--value",
+                               "user@%d.service" % uid],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    main = done.stdout.strip()
+    if done.returncode != 0 or not main.isdigit() or int(main) <= 1:
+        return frozenset()
+    main = int(main)
+    out = {main}
+    try:
+        status = _proc_status(main)
+    except OSError:
+        status = None
+    if not status or not status.get("Groups"):
+        return frozenset(out)
+    try:
+        pids = [p for p in os.listdir(PROC) if p.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        try:
+            fields = _stat_fields(int(pid))
+            child = _proc_status(pid) if len(fields) > 1 and fields[1] == str(main) else None
+        except (OSError, ValueError):
+            continue
+        if child is not None and "Groups" in child and not child["Groups"]:
+            out.add(int(pid))
+    return frozenset(out)
+
+
+def _doubt_proc(pid, uid: int, managers) -> str | None:
+    """L63b: why a process whose open files were denied leaves the answer
+    unknown, read on /proc; None when it cannot hold anything of the user's:
+    gone, a zombie (no files left), running as another user (effective uid:
+    a setuid helper such as sudo is root's), or the user's service manager
+    (`managers()`, by PID). An unreadable status is a doubt."""
+    try:
+        status = _proc_status(pid)
+    except OSError as exc:
+        return "%s (status unreadable: %s)" % (pid, exc.strerror or type(exc).__name__)
+    if status is None or (status.get("State") or ["?"])[0] in ("Z", "X"):
+        return None
+    uids = status.get("Uid") or []
+    if len(uids) < 2 or not uids[1].isdigit():
+        return "%s (uid unreadable)" % pid
+    if int(uids[1]) != uid or int(pid) in managers():
+        return None
+    return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
+
+
+def _doubt_psutil(ps, pid: int, user) -> str | None:
+    """`_doubt_proc` off Linux, by psutil: gone or zombie, another user
+    (effective uid, or user name on Windows), or a system executable
+    (`SYSTEM_EXE_ROOTS`) is not a doubt; an unreadable answer is."""
+    try:
+        proc = ps.Process(pid)
+        if proc.status() == ps.STATUS_ZOMBIE or _owner(proc) != user:
+            return None
+        name = proc.name()
+        try:
+            exe = proc.exe() or ""
+        except ps.AccessDenied:
+            exe = ""
+    except ps.NoSuchProcess:   # ZombieProcess too
+        return None
+    except Exception as exc:
+        return "%d (%s)" % (pid, type(exc).__name__)
+    if exe.startswith(SYSTEM_EXE_ROOTS):
+        return None
+    return "%d %s" % (pid, name)
+
+
+def _owner(proc):
+    """Who a psutil process runs as: its effective uid (a setuid helper is
+    root's), its user name where the OS has no uids (Windows)."""
+    try:
+        uids = proc.uids()
+    except AttributeError:   # Windows
+        return proc.username()
+    return uids.effective
+
+
+def _settle(doubts: dict, again) -> None:
+    """L63b: `doubts` (pid -> who) read again by `again(pid)` (who, or None)
+    until none is left or `DOUBT_RETRIES` is spent; what is left is
+    `NotAvailable`: an empty list would say "nobody holds it" unchecked."""
+    import time
+    for _ in range(DOUBT_RETRIES):
+        if not doubts:
+            return
+        time.sleep(DOUBT_RETRY_S)
+        doubts = {pid: who for pid in doubts for who in [again(pid)] if who}
+    if doubts:
+        raise NotAvailable("file holders",
+                           "open files of process(es) of this user unreadable: %s"
+                           % ", ".join(list(doubts.values())[:5]))
 
 
 def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | None:
@@ -603,26 +762,40 @@ def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | Non
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
+                    doubt=False) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
+        user = _owner(ps.Process(me))
     except Exception as exc:
         raise NotAvailable("file holders",
                            "open files unreadable even for this process (%s)"
                            % type(exc).__name__) from None
+    if _proc_ok():   # Linux: the same reading of a doubt as the /proc way
+        uid, managers = os.getuid(), _once(service_managers)
+
+        def why(pid):
+            return _doubt_proc(pid, uid, managers)
+    else:
+        def why(pid):
+            return _doubt_psutil(ps, pid, user)
     found = []
+    doubts: dict = {}
     for proc in ps.process_iter():
         pid = proc.pid
         hit = ""
         try:
             with proc.oneshot():
+                refused = False
                 try:
                     for item in proc.open_files():
                         if _inside(os.path.realpath(item.path), real, is_dir):
                             hit = "open file"
                             break
-                except (ps.AccessDenied, ps.ZombieProcess, OSError):
+                except ps.AccessDenied:
+                    refused = True
+                except (ps.ZombieProcess, OSError):
                     pass
                 if not hit and is_dir:
                     try:
@@ -646,7 +819,25 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dic
         row = _verdict(pid, hit, argv, needle, exclude)
         if row:
             found.append(row)
+        elif refused and doubt:
+            who = why(pid)
+            if who:
+                doubts[pid] = who
+    if doubt:
+        _settle(doubts, why)
     return found
+
+
+def _once(fn):
+    """`fn()` computed on the first call only (the service manager is
+    asked of systemd only when a doubt needs it)."""
+    memo: list = []
+
+    def get():
+        if not memo:
+            memo.append(fn())
+        return memo[0]
+    return get
 
 
 def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
@@ -670,7 +861,8 @@ def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
     return ""
 
 
-def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
+def _holders_proc(real, is_dir, needle, exclude, mapped=False,
+                  doubt=False) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -681,19 +873,29 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
         raise NotAvailable("file holders",
                            "open files unreadable even for this process (%s)"
                            % exc) from None
+    uid, managers = os.getuid(), _once(service_managers)
     found = []
+    doubts: dict = {}
     for pid in pids:
         hit = ""
         fd_dir = os.path.join(PROC, pid, "fd")
+        # L63b: a refusal, on the listing or on a link (the process can stop
+        # being dumpable in between), is a doubt, never an empty answer
+        refused = False
         try:
             fds = os.listdir(fd_dir)
+        except (FileNotFoundError, ProcessLookupError):
+            continue   # gone
         except OSError:
-            fds = []
+            fds, refused = [], True
         for fd in fds:
             try:
                 target = os.readlink(os.path.join(fd_dir, fd))
+            except FileNotFoundError:
+                continue   # closed meanwhile
             except OSError:
-                continue
+                refused = True
+                break
             if _inside(target, real, is_dir):
                 hit = "open file"
                 break
@@ -713,6 +915,12 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
         row = _verdict(int(pid), hit, argv, needle, exclude)
         if row:
             found.append(row)
+        elif refused and doubt:
+            who = _doubt_proc(pid, uid, managers)
+            if who:
+                doubts[pid] = who
+    if doubt:
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers))
     return found
 
 

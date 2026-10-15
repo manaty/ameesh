@@ -8,6 +8,8 @@ installé) et par le repli /proc (psutil retiré).
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -185,6 +187,209 @@ class PlatformTest(unittest.TestCase):
             with self.assertRaises(platform.NotAvailable):
                 platform.holders(__file__, "x")
 
+    def _faux_proc(self, comm: str, uids: str, *, state: str = "S",
+                   lien_refuse: bool = False, status_illisible: bool = False) -> str:
+        """Un /proc minimal : ce processus-ci (lisible) et le pid 4242
+        (`uids` : réel effectif …), dont `fd` refuse la lecture (non
+        dumpable) ou, avec `lien_refuse`, se liste mais pas ses liens."""
+        import tempfile
+        racine = tempfile.mkdtemp()
+        autre = os.path.join(racine, "4242")
+        self.addCleanup(lambda: (subprocess.run(["chmod", "-R", "u+rwx", racine]),
+                                 subprocess.run(["rm", "-rf", racine])))
+        moi = os.path.join(racine, str(os.getpid()))
+        os.makedirs(os.path.join(moi, "fd"))
+        os.symlink(moi, os.path.join(racine, "self"))
+        os.makedirs(os.path.join(autre, "fd"))
+        with open(os.path.join(autre, "comm"), "w") as fh:
+            fh.write(comm + "\n")
+        with open(os.path.join(autre, "status"), "w") as fh:
+            fh.write("Name:\t%s\nState:\t%s (x)\nUid:\t%s\n" % (comm, state, uids))
+        with open(os.path.join(autre, "cmdline"), "w") as fh:
+            fh.write(comm + "\0")
+        if status_illisible:
+            os.chmod(os.path.join(autre, "status"), 0)
+        if lien_refuse:   # readlink d'un fichier ordinaire : EINVAL, pas de cible
+            open(os.path.join(autre, "fd", "3"), "w").close()
+        else:
+            os.chmod(os.path.join(autre, "fd"), 0)
+        return racine
+
+    def test_detenteur_du_meme_utilisateur_illisible(self):
+        """L63b : un processus de l'utilisateur dont les fichiers ouverts se
+        refusent n'est pas une observation vide : NotAvailable (repli /proc,
+        psutil retiré). Revue #377 r2 : le gestionnaire de services se
+        reconnaît à son PID, pas à son nom ; un refus sur un lien compte ; un
+        status illisible vaut « inconnu ». CI : un processus qui se termine
+        (zombie) ou une aide setuid (sudo) ne compte pas."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = "%d %d %d %d" % ((os.getuid(),) * 4)
+        cas = (("harnais muet", "node", moi, {}, (), True),
+               ("nom emprunté au gestionnaire", "systemd", moi, {}, (), True),
+               ("gestionnaire, par son PID", "systemd", moi, {}, {4242}, False),
+               ("refus sur un lien", "node", moi, {"lien_refuse": True}, (), True),
+               ("status illisible", "node", moi, {"status_illisible": True}, (), True),
+               ("zombie", "git", moi, {"state": "Z"}, (), False),
+               ("aide setuid (sudo)", "sudo", "%d 0 0 0" % os.getuid(), {}, (), False),
+               ("autre utilisateur", "node", "0 0 0 0", {}, (), False))
+        for nom, comm, uids, options, gestionnaires, refus in cas:
+            with self.subTest(nom):
+                racine = self._faux_proc(comm, uids, **options)
+                with mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC", racine), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                        mock.patch.object(platform.process, "service_managers",
+                                          return_value=frozenset(gestionnaires)), \
+                        mock.patch.object(platform, "SYSTEM", "linux"):
+                    if refus:
+                        with self.assertRaises(platform.NotAvailable) as ctx:
+                            platform.holders(__file__, "x", doubt=True)
+                        self.assertIn("4242", str(ctx.exception))
+                    else:
+                        self.assertEqual(platform.holders(__file__, "x", doubt=True), [])
+
+    def test_le_doute_ne_ferme_que_le_controle_strict(self):
+        """#388, défaut B (auditeur, 16:46) : le doute d'un voisin illisible de
+        l'hôte ne doit pas rendre fail-closed le ménage /tmp, les worktrees,
+        deps ou build_artifacts ; seul adopt/resume demande le contrôle strict."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = "%d %d %d %d" % ((os.getuid(),) * 4)
+        racine = self._faux_proc("node", moi)
+        with mock.patch.object(platform, "psutil", None), \
+                mock.patch.object(platform.process, "PROC", racine), \
+                mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                mock.patch.object(platform.process, "service_managers",
+                                  return_value=frozenset()), \
+                mock.patch.object(platform, "SYSTEM", "linux"):
+            # meilleur effort (défaut) : liste vide, aucune exception
+            self.assertEqual(platform.holders(__file__, "x"), [])
+            # strict (adopt/resume) : le doute refuse
+            with self.assertRaises(platform.NotAvailable):
+                platform.holders(__file__, "x", doubt=True)
+
+    def test_un_processus_qui_se_termine_n_est_pas_un_doute(self):
+        """CI #377 r2 : un `git` en fin de vie refuse son `fd` avant d'être
+        zombie ; relu, il est zombie ou parti. Un détenteur vivant, lui,
+        reste un doute à chaque relecture."""
+        uid = str(os.getuid())
+        vivant = {"Name": ["git"], "State": ["R"], "Uid": [uid, uid]}
+        process = platform.process
+        for nom, suite, refus in (("se termine", [vivant, dict(vivant, State=["Z"])], False),
+                                  ("disparaît", [vivant, None], False),
+                                  ("reste vivant", [vivant] * 10, True)):
+            with self.subTest(nom), \
+                    mock.patch.object(process, "_proc_status", side_effect=suite), \
+                    mock.patch.object(process, "DOUBT_RETRY_S", 0):
+                doutes = {"4242": process._doubt_proc("4242", os.getuid(), lambda: ())}
+                again = lambda pid: process._doubt_proc(pid, os.getuid(), lambda: ())
+                if refus:
+                    with self.assertRaises(platform.NotAvailable):
+                        process._settle(doutes, again)
+                else:
+                    process._settle(doutes, again)
+
+    def test_gestionnaire_de_services_par_pid(self):
+        """Le MainPID de user@<uid>.service (demandé à systemd) et ses
+        enfants directs aux groupes supplémentaires VIDES quand ceux du
+        gestionnaire ne le sont pas ((sd-pam), forké root). Ni le nom ni
+        l'heure de démarrage ne comptent (revue #377 r2-r4)."""
+        import shutil
+        import tempfile
+        racine = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, racine)
+
+        def proc(pid, comm, ppid, groupes):
+            os.makedirs(os.path.join(racine, str(pid)))
+            champs = ["S", str(ppid)] + ["0"] * 28
+            with open(os.path.join(racine, str(pid), "stat"), "w") as fh:
+                fh.write("%d (%s) %s\n" % (pid, comm, " ".join(champs)))
+            with open(os.path.join(racine, str(pid), "status"), "w") as fh:
+                fh.write("Name:\t%s\nGroups:\t%s\n" % (comm, groupes))
+
+        os.makedirs(os.path.join(racine, "self"))
+        proc(100, "systemd", 1, "966 1000 ")
+        proc(102, "(sd-pam)", 100, "966 1000 ")    # nom emprunté, groupes du gestionnaire
+        proc(103, "node", 7, "")                    # groupes vides, pas son enfant
+        fait = subprocess.CompletedProcess([], 0, stdout="100\n", stderr="")
+        process = platform.process
+        with mock.patch.object(process, "PROC", racine), \
+                mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch("subprocess.run", return_value=fait):
+            self.assertEqual(process.service_managers(1000), frozenset({100}))
+            proc(101, "(sd-pam)", 100, "")
+            self.assertEqual(process.service_managers(1000), frozenset({100, 101}))
+            # un gestionnaire sans groupe n'exempte aucun enfant
+            with open(os.path.join(racine, "100", "status"), "w") as fh:
+                fh.write("Name:\tsystemd\nGroups:\t\n")
+            self.assertEqual(process.service_managers(1000), frozenset({100}))
+        sans = subprocess.CompletedProcess([], 1, stdout="", stderr="")
+        with mock.patch.object(process, "PROC", racine), \
+                mock.patch.object(platform, "SYSTEM", "linux"), \
+                mock.patch("subprocess.run", return_value=sans):
+            self.assertEqual(process.service_managers(1000), frozenset())
+
+    def test_detenteur_du_meme_utilisateur_refuse_psutil(self):
+        """L63b, voie psutil hors Linux : AccessDenied sur un processus de
+        l'utilisateur (uid effectif) est un doute ; sur une aide setuid, un
+        zombie ou un exécutable système (macOS : ContextStoreAgent sous
+        /System, CI #377 r2), non."""
+        class AccessDenied(Exception):
+            pass
+
+        class NoSuchProcess(Exception):
+            pass
+
+        class Proc:
+            def __init__(self, pid, effective, exe="/opt/node", status="sleeping"):
+                self.pid, self._eff, self._exe, self._status = pid, effective, exe, status
+
+            def oneshot(self):
+                return contextlib.nullcontext()
+
+            def open_files(self):
+                if self.pid == os.getpid():
+                    return []
+                raise AccessDenied()
+
+            def cmdline(self):
+                raise AccessDenied()
+
+            def name(self):
+                return "x"
+
+            def exe(self):
+                return self._exe
+
+            def status(self):
+                return self._status
+
+            def uids(self):
+                return mock.Mock(real=os.getuid(), effective=self._eff)
+
+        cas = (("harnais", Proc(4242, os.getuid()), True),
+               ("setuid", Proc(4242, 0), False),
+               ("zombie", Proc(4242, os.getuid(), status="zombie"), False),
+               ("système", Proc(4242, os.getuid(),
+                                exe="/System/Library/PrivateFrameworks/X/ContextStoreAgent"),
+                False))
+        for nom, autre, refus in cas:
+            with self.subTest(nom):
+                faux = mock.MagicMock(AccessDenied=AccessDenied, NoSuchProcess=NoSuchProcess,
+                                      ZombieProcess=NoSuchProcess, STATUS_ZOMBIE="zombie")
+                faux.Process.side_effect = lambda pid, autre=autre: (
+                    autre if pid == autre.pid else Proc(pid, os.getuid()))
+                faux.process_iter.return_value = [autre]
+                with mock.patch.object(platform, "psutil", faux), \
+                        mock.patch.object(platform.process, "_proc_ok", return_value=False), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0):
+                    if refus:
+                        with self.assertRaises(platform.NotAvailable):
+                            platform.holders(__file__, "x", doubt=True)
+                    else:
+                        self.assertEqual(platform.holders(__file__, "x", doubt=True), [])
+
     def test_mesures_de_l_hote(self):
         for nom, ctx in self.variants:
             with self.subTest(nom), ctx():
@@ -233,12 +438,13 @@ class PlatformTest(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 class AdoptFailClosedTest(PgTestCase):
-    """Sans moyen de vérifier qu'une session est fermée, `adopt` refuse ;
-    `--force` passe, mais l'avertissement va au fil (journalisé)."""
+    """Sans moyen de vérifier qu'une session est fermée, `adopt` refuse, même
+    avec `--force` (L63b, décision du propriétaire #9413 b). `--force` sur une
+    session que l'hôte voit ouverte reste possible, journalisé."""
 
-    def test_adopt_refuse_puis_force_journalise(self):
+    def _session(self):
         import dataclasses
-        from ameesh import registry, reprise
+        from ameesh import registry
         from .test_l39_adoption_reprise import SID, _rollout
         comptes_dir = os.path.join(self.tmp, "comptes", "codex-1")
         os.makedirs(comptes_dir, mode=0o700)
@@ -250,25 +456,94 @@ class AdoptFailClosedTest(PgTestCase):
         cfg = dataclasses.replace(
             self.cfg, accounts={"codex": [{"name": "primaire", "path": comptes_dir}]})
         registry.upsert(self.db, "coord", harness="codex", host=cfg.host, mode="externe")
-        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
-        with mock.patch.object(platform, "holders", side_effect=muet):
-            with self.assertRaises(reprise.RepriseError) as ctx:
-                reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex")
-            self.assertIn("cannot check", str(ctx.exception))
-            self.assertEqual(registry.get(self.db, "coord")["mode"], "externe")
-            avert: list[str] = []
-            out = reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex",
-                                force=True, warn=avert.append)
-        self.assertTrue(out["forced"])
-        self.assertTrue(any("without checking" in a for a in avert))
-        self.assertTrue(any("without checking" in n for n in out["notes"]))
+        return cfg, SID
+
+    def _fil(self) -> str:
         texte = []
         for racine, _d, fichiers in os.walk(self.cfg.threads_root):
             for nom in fichiers:
                 with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as fh:
                     texte.append(fh.read())
-        self.assertIn("without checking that it is closed", "\n".join(texte))
+        return "\n".join(texte)
+
+    def test_adopt_refuse_meme_avec_force(self):
+        from ameesh import registry, reprise
+        cfg, sid = self._session()
+        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
+        for force in (False, True):
+            with self.subTest(force=force):
+                avert: list[str] = []
+                with mock.patch.object(platform, "holders", side_effect=muet):
+                    with self.assertRaises(reprise.RepriseError) as ctx:
+                        reprise.adopt(cfg, self.db, "coord", session_id=sid,
+                                      harness="codex", force=force, warn=avert.append)
+                self.assertIn("cannot check", str(ctx.exception))
+                self.assertIn("with or without --force", str(ctx.exception))
+                self.assertEqual(avert, [])
+                row = registry.get(self.db, "coord")
+                self.assertEqual(row["mode"], "externe")
+                self.assertNotEqual(row.get("session_id"), sid)
+        self.assertNotIn("without checking", self._fil())
+
+    def test_le_controle_d_adopt_demande_le_doute_strict(self):
+        """#388 : adopt/resume reste le seul appelant du doute strict ; la
+        plateforme garde le meilleur effort pour les autres couches."""
+        from ameesh import reprise
+        with mock.patch.object(platform, "holders", return_value=[]) as appel:
+            reprise.holders(__file__, "sid-x")
+        self.assertIs(appel.call_args.kwargs.get("doubt"), True)
+
+    def test_force_sur_une_session_vue_ouverte_reste_journalise(self):
+        from ameesh import registry, reprise
+        cfg, sid = self._session()
+        tenant = [{"pid": 4242, "why": "open file", "cmd": "codex"}]
+        with mock.patch.object(platform, "holders", return_value=tenant):
+            with self.assertRaises(reprise.RepriseError) as ctx:
+                reprise.adopt(cfg, self.db, "coord", session_id=sid, harness="codex")
+            self.assertIn("still open", str(ctx.exception))
+            avert: list[str] = []
+            out = reprise.adopt(cfg, self.db, "coord", session_id=sid, harness="codex",
+                                force=True, warn=avert.append)
+        self.assertTrue(out["forced"])
+        self.assertTrue(any("while it is still open" in a for a in avert))
+        self.assertIn("while it is still open", self._fil())
         self.assertEqual(registry.get(self.db, "coord")["mode"], "execute")
+
+    def test_os_muet_sans_mock_de_holders(self):
+        """Ni psutil ni /proc (l'OS réellement muet, `holders` non simulé) :
+        refus avec ou sans --force — Codex avec son journal, et DeepSeek sans
+        dossier de sessions (DSH_HOME vers un magasin absent), qui sautait le
+        contrôle (revue #377 P1)."""
+        import dataclasses
+        from ameesh import registry, reprise
+        cfg, sid = self._session()
+        absent = os.path.join(self.tmp, "dsh-absent")
+        cfg_dsh = dataclasses.replace(cfg, accounts={"deepseek": [{"name": "d", "path": absent}]})
+        registry.upsert(self.db, "dsh", harness="deepseek", host=cfg.host, mode="externe")
+        for agent, harness, conf in (("coord", "codex", cfg), ("dsh", "deepseek", cfg_dsh)):
+            for force in (False, True):
+                with self.subTest(harness=harness, force=force), \
+                        mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC",
+                                          os.path.join(self.tmp, "pas-de-proc")), \
+                        mock.patch.dict(os.environ, {"DSH_HOME": absent}):
+                    with self.assertRaises(reprise.RepriseError) as ctx:
+                        reprise.adopt(conf, self.db, agent, session_id=sid,
+                                      harness=harness, force=force, warn=lambda _m: None)
+                    self.assertIn("cannot check", str(ctx.exception))
+                    self.assertEqual(registry.get(self.db, agent)["mode"], "externe")
+
+    def test_cli_force_ne_contourne_pas(self):
+        from ameesh import reprise
+        cfg, sid = self._session()
+        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
+        sortie = io.StringIO()
+        with mock.patch.object(platform, "holders", side_effect=muet), \
+                mock.patch("sys.stderr", sortie):
+            code = reprise.cmd_adopt(cfg, reprise.build_parser().parse_args(
+                ["adopt", "coord", "--session", sid, "--harness", "codex", "--force"]))
+        self.assertNotEqual(code, 0)
+        self.assertIn("with or without --force", sortie.getvalue())
 
 
 # --------------------------------------------------------------------------
