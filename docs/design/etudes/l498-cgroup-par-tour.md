@@ -234,10 +234,25 @@ Not fixed, or deliberately out of the first slice:
 3. **First slice — confirmed**: user runners on ameesh-agents-1 only; the
    mesh server and the guest come later, on measurement results and a new
    owner agreement.
+4. **mesh-design — measurement protocol approved (15/10 00:35, within
+   decision #21611 option b, owner proof re-read as VALID)**: canary
+   `ameesh-agents-1`, **user runners only** (server and guest unchanged);
+   the window runs **48 h AND ≥200 turns AND one restart outside a turn**,
+   against a 48 h reference-noise run with the same definitions and the same
+   timestamp origins; four metrics — orphan rate, cleanup latency, lease
+   jitter, memory per turn; a missing READY or a harness that was never
+   launched counts as a launch failure; pre-existing orphans are
+   distinguished from new ones; cleanup bounds and the kill/`cgroup.events`
+   result stay observable. Order: code, then the required reviews, then the
+   package/CI and the exact fire, **then** the drop-in; the measurement
+   report comes before any extension, and an extension needs a new owner
+   decision. This protocol is not a fire on a head that does not exist yet.
+   (source: mesh-design registry note on #498, 2026-10-15 00:35)
 
-The blocker #490 merged on 2026-10-15 (PR #470, commit `748efffd0768`), so
-implementation starts now, on this branch. Order kept from the route
-decision: code and witness tests first (inert wherever delegation is
-unavailable), then the measurement window is framed with mesh-design, then
-the canary unit settings are applied, then the measurements; any extension
-beyond the canary needs the owner again.
+The blocker #490 merged on 2026-10-15 with package 1 (#1342, PR #1050, merge
+commit `60ceed02b1dd`; #490's composed commit in the package is
+`748efffd0768`), so implementation starts now, on this branch. Order kept
+from the route decision: code and witness tests first (inert wherever
+delegation is unavailable), then the measurement window is framed with
+mesh-design (decision 4), then the canary unit settings are applied, then the
+measurements; any extension beyond the canary needs the owner again.

@@ -45,6 +45,12 @@ AGENTS_SLICE = "ameesh-agents.slice"
 #: écart toléré entre `MemoryMax` de l'unité et le plafond du canon (arrondis)
 CAP_TOLERANCE = 0.02
 
+#: L498 : monture de la hiérarchie cgroup v2 unifiée
+CGROUP_ROOT = "/sys/fs/cgroup"
+#: L498 : sous-groupe de l'exécuteur dans son unité déléguée
+#: (`DelegateSubgroup=`), la racine déléguée restant libre de processus
+TURN_CGROUP_SUBGROUP = "runner"
+
 #: `systemctl` à utiliser ; VIDE, les unités ne sont pas vérifiées (tests)
 SYSTEMCTL_ENV = "AMEESH_SYSTEMCTL"
 
@@ -268,6 +274,78 @@ def memory_cap_lines(cfg, db, canons=None, run=_systemctl,
     if ok and not lines:
         lines.append("memory caps: %d agent unit(s) in %s, MemoryMax matches the canon"
                      % (ok, AGENTS_SLICE))
+    return lines
+
+
+def turn_cgroup_lines(cfg, db, run=_systemctl) -> list[str]:
+    """L498 : lignes de `ameesh doctor` sur le cgroup délégué par tour.
+
+    Lecture seule : pour chaque unité d'agent menée par l'hôte, l'unité
+    délègue-t-elle (`Delegate=yes` + `DelegateSubgroup=runner`), et sa racine
+    déléguée est-elle utilisable — `cgroup.kill` et `cgroup.events` présents,
+    répertoire inscriptible, **aucun processus** dedans (contrainte
+    « no internal process » : sans elle, les enfants du tour ne peuvent pas
+    être créés proprement) ? Là où ce n'est pas posé, le repli PID/PGID reste
+    en vigueur : signalé, sans changer le verdict."""
+    if not platform.is_linux():
+        return []
+    agents = served_agents(cfg, db)
+    if not agents:
+        return []
+    lines, ok, pending = [], 0, 0
+    for name in sorted(row["name"] for row in agents):
+        unit = RUNNER_TEMPLATE % name
+        shown = run("show", unit, "-p", "LoadState", "-p", "Delegate",
+                    "-p", "DelegateSubgroup", "-p", "ControlGroup")
+        if shown is None:
+            return ["turn cgroups: user systemd unavailable — not checked"]
+        props = dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
+        if props.get("LoadState") != "loaded":
+            continue  # pas d'unité du modèle : signalé par missing_runner_lines
+        delegated = (props.get("Delegate") == "yes"
+                     and props.get("DelegateSubgroup") == TURN_CGROUP_SUBGROUP)
+        if not delegated:
+            pending += 1
+            continue
+        problems = []
+        control = (props.get("ControlGroup") or "").rstrip("/")
+        if not control:
+            problems.append("unit not running (no ControlGroup)")
+        else:
+            root = CGROUP_ROOT + control
+            if not os.path.isdir(root):
+                problems.append("delegated root %s missing" % root)
+            else:
+                for name_file in ("cgroup.kill", "cgroup.events"):
+                    if not os.path.exists(os.path.join(root, name_file)):
+                        problems.append("%s missing in %s" % (name_file, root))
+                if not os.access(root, os.W_OK | os.X_OK):
+                    problems.append("delegated root not writable (uid %d)" % os.getuid())
+                try:
+                    with open(os.path.join(root, "cgroup.procs"), encoding="utf-8") as fh:
+                        members = fh.read().split()
+                except OSError:
+                    members = None
+                if members is None:
+                    problems.append("%s/cgroup.procs unreadable" % root)
+                elif members:
+                    problems.append("%d own process(es) in the delegated root "
+                                    "(DelegateSubgroup=%s not effective)"
+                                    % (len(members), TURN_CGROUP_SUBGROUP))
+        if not problems:
+            ok += 1
+            continue
+        lines.append("warning    : %s: per-turn cgroup unusable (%s); keeps "
+                     "PID/PGID ownership (L498)" % (unit, "; ".join(problems)))
+    if ok and not lines:
+        lines.append("turn cgroups: %d runner unit(s) delegated, root free and "
+                     "writable (L498)" % ok)
+    if pending and not lines:
+        lines.append("turn cgroups: %d runner unit(s) not delegated — PID/PGID "
+                     "ownership (L498 canary pending)" % pending)
+    elif pending and lines:
+        lines.append("turn cgroups: %d further unit(s) not delegated — PID/PGID "
+                     "ownership (L498 canary pending)" % pending)
     return lines
 
 
