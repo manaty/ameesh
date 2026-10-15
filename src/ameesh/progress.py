@@ -154,14 +154,15 @@ def parse_since(text: str | None, now: float) -> float:
 
 def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[dict],
                           declared: Iterable[dict] | None = None) -> dict:
-    """Les jalons d'un lot : requested / frozen / verdict / merged.
+    """Les jalons d'un lot : requested / frozen / verdict / merged / delivered.
 
     SEUL point de lecture des jalons de lot. Deux sources, même résultat :
 
     * `declared` — les lignes de la table des jalons de lot (L10,
       `work_item_milestones` : `kind`, `at_ts`, `actor`, `verdict`) ; quand
       le lot y a au moins un gel ou un verdict DÉCLARÉ, gels et verdicts
-      viennent de là ; `requested` et `merged` en viennent dès qu'ils y sont ;
+      viennent de là ; `requested`, `merged` et `delivered` (#988) en viennent
+      dès qu'ils y sont ;
     * sinon, déduction depuis le journal des transitions (`work_item_events`,
       dans l'ordre d'écriture) : gel = entrée en `qa`, verdict = sortie de
       `qa` vers `merged` (ok) ou vers `build` (blocked).
@@ -173,7 +174,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     Rend :
 
     * `requested`, `frozen` (PREMIER gel), `verdict` (verdict retenu = le
-      plus récent), `merged` : instants ou None ;
+      plus récent), `merged`, `delivered` : instants ou None ;
     * `last_frozen` : le DERNIER gel (un lot regelé repasse en revue) ;
     * `verdict_kind` : `ok` | `blocked` | None, et `reviewer` : l'auteur du
       verdict courant, sinon le relecteur désigné du lot (`work_items.reviewer`,
@@ -231,7 +232,8 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     # déclarations, sinon le journal, la table ne comblant que ses trous.
     auto = {}
     for r in rows:
-        if r.get("kind") in ("requested", "merged") and r.get("kind") not in auto:
+        if (r.get("kind") in ("requested", "merged", "delivered")
+                and r.get("kind") not in auto):
             auto[r["kind"]] = r["at_ts"]          # lignes en ordre chronologique
     if source == "milestones":
         requested = auto.get("requested", requested)
@@ -239,6 +241,13 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
     else:
         requested = requested if requested is not None else auto.get("requested")
         merged = merged if merged is not None else auto.get("merged")
+    # #988 : un lot livré hors cible est clos par `close --delivered` ; le jalon
+    # `delivered` (sinon l'instant de fermeture) date la livraison, que `merged`
+    # ne porte pas.
+    delivered = auto.get("delivered")
+    if delivered is None and item.get("state") == "closed" \
+            and item.get("close_reason") == "delivered":
+        delivered = item.get("closed_ts")
 
     for act in actions:
         if act.get("connector") != MERGE_CONNECTOR:
@@ -272,6 +281,7 @@ def _work_item_milestones(item: dict, events: Iterable[dict], actions: Iterable[
         "reviewer": reviewer,
         "verdict_current": verdict_current,
         "merged": merged,
+        "delivered": delivered,
         "blocked_verdicts": sum(1 for v in verdicts if v["kind"] == "blocked"),
         "blocks": blocks,
         "source": source,
@@ -370,7 +380,7 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "assignee": item.get("assignee") or None,
         "reviewer": jalons["reviewer"],
         "milestones": {k: _round(jalons[k])
-                       for k in ("requested", "frozen", "verdict", "merged")},
+                       for k in ("requested", "frozen", "verdict", "merged", "delivered")},
         "last_frozen_ts": _round(jalons["last_frozen"]),
         "verdict": jalons["verdict_kind"],
         "milestones_source": jalons["source"],
@@ -400,8 +410,10 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "dependencies": dependencies or [],
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
-        # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
-        "estimate": estimates_mod.view(item, merged_ts=jalons.get("merged"), now=now),
+        # L157 : durée estimée, réel mesuré (début → fusion ou livraison hors
+        # cible, #988), écart (champ ajouté)
+        "estimate": estimates_mod.view(
+            item, merged_ts=jalons.get("merged") or jalons.get("delivered"), now=now),
     }
 
 
@@ -926,13 +938,15 @@ def format_text(snap: dict, width: int | None = None) -> str:
             state = "STALE %s (%s)" % (_duration(stale["idle_s"]), state)
         closed = lot.get("closed")
         if closed:
-            state = ("abandoned" if closed.get("reason") == "abandoned"
+            state = ("delivered outside the target" if closed.get("reason") == "delivered"
+                     else "abandoned" if closed.get("reason") == "abandoned"
                      else "superseded by #%s" % closed.get("superseded_by"))
         line("#%s %s — %s%s" % (lot["id"], state, lot["title"],
                                 " [%s]" % lot["epic"] if lot.get("epic") else ""), "  ")
-        line("requested %s · frozen %s · verdict %s%s · merged %s" % (
+        line("requested %s · frozen %s · verdict %s%s · merged %s%s" % (
             _hm(m["requested"], now), _hm(m["frozen"], now), _hm(m["verdict"], now),
-            " (%s)" % lot["verdict"] if lot["verdict"] else "", _hm(m["merged"], now)),
+            " (%s)" % lot["verdict"] if lot["verdict"] else "", _hm(m["merged"], now),
+            " · delivered %s" % _hm(m["delivered"], now) if m.get("delivered") else ""),
             "    ")
         extra = []
         if lot["assignee"]:

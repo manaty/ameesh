@@ -4,8 +4,9 @@ tickets existant (spec §5 point 4).
 
     intake → build → qa → merged → promoted
 
-plus `blocked` et `waiting_human`, et l'état terminal `closed` (abandonné ou
-remplacé par un autre lot : `close`, L29). La boucle `qa → build` est bornée à deux
+plus `blocked` et `waiting_human`, et l'état terminal `closed` (abandonné,
+remplacé par un autre lot, ou livré hors cible : `close`, L29 et #988). La
+boucle `qa → build` est bornée à deux
 allers-retours (comme dans le design d'origine) : au-delà, il faut bloquer le
 lot ou attendre une décision humaine, sinon la boucle coûte des tokens sans fin.
 
@@ -45,8 +46,9 @@ STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_hum
 TERMINAL = ("promoted", "closed")
 #: déjà fusionnés : une fusion constatée n'y change rien
 MERGED_STATES = ("merged", "promoted")
-#: raisons d'une fermeture explicite (`ameesh work close`)
-CLOSE_REASONS = ("abandoned", "superseded")
+#: raisons d'une fermeture explicite (`ameesh work close`) : abandonné,
+#: remplacé par un autre lot, ou livré hors cible avec sa tête relue (#988)
+CLOSE_REASONS = ("abandoned", "superseded", "delivered")
 MAX_QA_LOOPS = 2
 FORWARD = {
     "intake": ("build",),
@@ -1206,17 +1208,38 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -
         if item["state"] != "closed":
             raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
-                        % (item_id, "abandoned" if item.get("close_reason") == "abandoned"
-                           else "superseded by #%s" % item.get("superseded_by"), item_id))
+                        % (item_id, close_label(item), item_id))
     return done
 
 
+def close_label(item: dict) -> str:
+    """Le libellé d'une fermeture (`closed`), pour les messages : abandonné,
+    remplacé par #N, ou livré hors cible (#988)."""
+    reason = item.get("close_reason")
+    if reason == "superseded":
+        return "superseded by #%s" % item.get("superseded_by")
+    return {"delivered": "delivered outside the target"}.get(reason, reason or "closed")
+
+
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
-          note: str = "", actor: str = "") -> dict:
-    """Ferme un lot qui ne sera pas fusionné : abandonné, ou remplacé par un
-    autre lot. Jalon `closed` ; rien ne reste ouvert par oubli."""
-    if bool(abandoned) == (superseded_by is not None):
-        raise WorkError("pass --abandoned OR --superseded-by <id>")
+          delivered: bool = False, sha: str = "", note: str = "", actor: str = "") -> dict:
+    """Ferme un lot qui ne sera pas fusionné : abandonné, remplacé par un autre
+    lot, ou **livré hors cible** (#988 : un rapport, une note, un livrable dont
+    la tête relue reste sur sa branche, sans fusion dans la cible).
+
+    Les trois portes sont exclusives. `--delivered` exige `--sha <tête relue>`
+    (7 à 64 caractères hexadécimaux) : le jalon `delivered` porte ce SHA et
+    compte comme livraison dans `estimates`. Un jalon `closed` est écrit dans
+    tous les cas ; rien ne reste ouvert par oubli."""
+    if sum((bool(abandoned), superseded_by is not None, bool(delivered))) != 1:
+        raise WorkError("pass one of --abandoned, --superseded-by <id>, "
+                        "--delivered --sha <reviewed head>")
+    head = (sha or "").strip().lower()
+    if delivered and not _SHA_RE.match(head):
+        raise WorkError("--delivered: the reviewed head (--sha, 7 to 64 hex characters), "
+                        "not %r" % (sha,))
+    if not delivered and head:
+        raise WorkError("--sha only makes sense with --delivered")
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1228,13 +1251,17 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     state = item["state"]
     if state in MERGED_STATES or state == "closed":
         raise WorkError("lot %s already %s: nothing to close" % (item_id, state))
-    reason = "abandoned" if abandoned else "superseded"
-    text = ("abandoned" if abandoned else "superseded by #%s" % superseded_by) + (
-        " — %s" % note.strip() if note and note.strip() else "")
+    if abandoned:
+        reason, base = "abandoned", "abandoned"
+    elif superseded_by is not None:
+        reason, base = "superseded", "superseded by #%s" % superseded_by
+    else:
+        reason, base = "delivered", "delivered (head %s)" % head[:12]
+    text = base + (" — %s" % note.strip() if note and note.strip() else "")
     row = storage.of(db).work.close(
         item_id, current=state, reason=reason,
         superseded_by=int(superseded_by) if superseded_by is not None else None,
-        actor=actor, note=text)
+        sha=head, actor=actor, note=text)
     if row is None:
         raise WorkError("lot %s moved in the meantime: retry" % item_id)
     return row
@@ -1270,7 +1297,7 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
         raise WorkError("to close a lot: ameesh work close <id> --abandoned | "
-                        "--superseded-by <id>")
+                        "--superseded-by <id> | --delivered --sha <reviewed head>")
     reviewer = (reviewer or "").strip() or None
     if reviewer is not None:
         if state != "qa":
@@ -1371,14 +1398,17 @@ def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
 
 
 #: les jalons d'un lot : `requested` et `merged` sont automatiques (0013),
-#: `frozen` et `verdict` se déclarent par la CLI.
-MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed")
+#: `closed` et `delivered` le sont aussi (fermeture, #988), `frozen` et
+#: `verdict` se déclarent par la CLI.
+MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed", "delivered")
 MANUAL_KINDS = ("frozen", "verdict")
 VERDICTS = ("ok", "blocked")
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
-#: colonne de durée) — l'ordre est celui de la frise lue à l'envers.
+#: colonne de durée) — l'ordre est celui de la frise lue à l'envers. `delivered`
+#: (#988) est la fin d'un lot livré hors cible : il remplace la fusion.
 MILESTONES = (
+    ("delivered", "delivered_ts", None),
     ("merge", "merged_ts", "review_to_merge_s"),
     ("review", "reviewed_ts", "freeze_to_review_s"),
     ("freeze", "frozen_ts", "request_to_freeze_s"),
@@ -1412,9 +1442,10 @@ def milestone(
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
     `frozen` (la branche est gelée pour la revue) et `verdict` (`ok` ou
-    `blocked`, avec le `sha` relu) sont les deux seuls : `requested` et `merged`
-    sont écrits automatiquement depuis les transitions (0013), les déclarer à la
-    main serait un mensonge sur la frise.
+    `blocked`, avec le `sha` relu) sont les deux seuls : `requested`, `merged`,
+    `closed` et `delivered` sont écrits automatiquement (transitions et
+    fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
+    frise.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))

@@ -2,7 +2,8 @@
 """Sous-commandes `ameesh work` du plan de travail (lot L29).
 
   ameesh work link <id> <fiche>|--none
-  ameesh work close <id> --abandoned | --superseded-by <id> [--note …]
+  ameesh work close <id> --abandoned | --superseded-by <id>
+                          | --delivered --sha <reviewed head> [--note …]  (#988)
   ameesh work sync-merges --git-dir D [--target T] [--repo R] [--dry-run] [--json]
                           (cible : celle du lot, sinon `ameesh.target` du dépôt,
                            sinon sa branche par défaut, puis les refs
@@ -43,12 +44,19 @@ def add_parsers(work_sub, func) -> None:
     p_link.set_defaults(func=func)
 
     p_close = work_sub.add_parser(
-        "close", help="close an abandoned or superseded work item (closed milestone, L29)")
+        "close", help="close an abandoned, superseded or delivered-outside-target work item "
+                      "(closed milestone, L29; delivered: #988)")
     p_close.add_argument("id", type=int)
     how = p_close.add_mutually_exclusive_group(required=True)
     how.add_argument("--abandoned", action="store_true", help="the work item will not be done")
     how.add_argument("--superseded-by", type=int, default=None, metavar="ID",
                      help="the work item is superseded by this one")
+    how.add_argument("--delivered", action="store_true",
+                     help="delivered outside the target (report, note): the reviewed head "
+                          "stays on its branch, without a merge; counts as delivered in "
+                          "estimates (#988)")
+    p_close.add_argument("--sha", default="",
+                         help="the reviewed head of --delivered (7 to 64 hex characters)")
     p_close.add_argument("--note", default="")
     p_close.add_argument("--actor", default="")
     p_close.set_defaults(func=func)
@@ -239,10 +247,9 @@ def run(db, args: argparse.Namespace) -> int:
         return 0
     if command == "close":
         row = work.close(db, args.id, abandoned=args.abandoned,
-                         superseded_by=args.superseded_by, note=args.note, actor=args.actor)
-        print("work item #%d closed: %s" % (row["id"], "abandoned"
-                                           if row["close_reason"] == "abandoned"
-                                           else "superseded by #%s" % row["superseded_by"]))
+                         superseded_by=args.superseded_by, delivered=args.delivered,
+                         sha=args.sha, note=args.note, actor=args.actor)
+        print("work item #%d closed: %s" % (row["id"], work.close_label(row)))
         return 0
     if command == "sync-merges":
         return _sync_merges(db, args)

@@ -65,11 +65,17 @@ ameesh work list [--stale-after 6h] [--json]       EPIC column, waiting, stagnat
 ameesh work show <id> [--json]                     card, epic, PR, waiting
 ameesh work close <id> --abandoned                 lot that will not be done
 ameesh work close <id> --superseded-by <id2>       lot replaced or absorbed by another
+ameesh work close <id> --delivered --sha <head>    lot delivered outside the target (#988)
 ```
 
 `close` moves the lot to the terminal state `closed` and records a `closed` milestone:
 nothing stays open by oversight. A closed lot is **never reopened** by a
 merge observed later (the observation is reported).
+
+`--delivered --sha <reviewed head>` closes a lot whose deliverable (report, note,
+rehearsal) lives on a reviewed branch, without a merge into the target: the
+`delivered` milestone carries the reviewed head and the closing actor, and it
+counts as a delivery in `ameesh work estimates` (#988).
 
 For each unmerged lot, ameesh says **what it is waiting for and from whom**
 (`waiting_for`: `{what, who, label}`), derived from the state, the milestones (L10) and
@@ -167,7 +173,9 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
 
    any open state → `merged`, in one step, `merged` milestone with the commit.
 
-A lot absorbed by another is closed with `--superseded-by`.
+A lot absorbed by another is closed with `--superseded-by`; a lot delivered
+outside the target (its reviewed head stays on its branch) with
+`--delivered --sha <reviewed head>` (#988).
 
 ## GitHub projection
 

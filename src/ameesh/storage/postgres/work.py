@@ -173,11 +173,12 @@ _DELAYS_SELECT = """
            extract(epoch FROM rev.at)::float8 AS reviewed_ts,
            rev.verdict AS reviewed_verdict,
            extract(epoch FROM fus.at)::float8 AS merged_ts,
+           extract(epoch FROM liv.at)::float8 AS delivered_ts,
            extract(epoch FROM (gel.at - req.at))::float8 AS request_to_freeze_s,
            extract(epoch FROM (rev.at - gel.at))::float8 AS freeze_to_review_s,
            extract(epoch FROM (fus.at - gel.at))::float8 AS freeze_to_merge_s,
            extract(epoch FROM (fus.at - rev.at))::float8 AS review_to_merge_s,
-           extract(epoch FROM (fus.at - req.at))::float8 AS total_s,
+           extract(epoch FROM (coalesce(fus.at, liv.at) - req.at))::float8 AS total_s,
            coalesce(allv.n, 0)::int AS verdicts,
            coalesce(blk.n, 0)::int AS blocked_verdicts
       FROM work_items w
@@ -194,6 +195,9 @@ _DELAYS_SELECT = """
       LEFT JOIN LATERAL (
             SELECT min(m.at) AS at FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'merged') fus ON true
+      LEFT JOIN LATERAL (
+            SELECT min(m.at) AS at FROM work_item_milestones m
+             WHERE m.work_item_id = w.id AND m.kind = 'delivered') liv ON true
       LEFT JOIN LATERAL (
             SELECT count(*) AS n FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'verdict') allv ON true
@@ -1217,9 +1221,11 @@ class WorkItems(interface.WorkItems):
         except _Refrozen:
             return None
 
-    def close(self, item_id, *, current, reason, superseded_by, actor, note) -> dict | None:
-        """`current` → `closed` (abandon ou remplacement) si le lot y est encore ;
-        journal et jalon `closed` dans la même transaction."""
+    def close(self, item_id, *, current, reason, superseded_by, sha="", actor, note) -> dict | None:
+        """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
+        si le lot y est encore ; journal et jalon `closed` dans la même
+        transaction. `delivered` (#988) écrit en plus le jalon `delivered`, qui
+        porte le `sha` de la tête relue."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
@@ -1237,6 +1243,12 @@ class WorkItems(interface.WorkItems):
                 "INSERT INTO work_item_milestones (work_item_id, kind, actor, note)"
                 " VALUES (%s, 'closed', %s, %s) ON CONFLICT DO NOTHING RETURNING id",
                 (int(item_id), actor or "", note or ""))
+            if reason == "delivered":
+                tx.query(
+                    "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note)"
+                    " VALUES (%s, 'delivered', %s, %s, %s)"
+                    " ON CONFLICT DO NOTHING RETURNING id",
+                    (int(item_id), sha or "", actor or "", note or ""))
             return rows[0]
 
     def refresh_package_parents(self) -> int:
@@ -1462,9 +1474,10 @@ class WorkItems(interface.WorkItems):
             return sorted(int(r["id"]) for r in rows)
 
     def estimate_history(self, *, app, limit) -> list[dict]:
-        """Les lots livrés (jalon `merged`), les plus récents d'abord : début
-        mesuré, fusion, estimation en vigueur au début (sinon la première
-        posée après, `late`), nombre d'estimations posées."""
+        """Les lots livrés (jalon `merged` ou `delivered`, #988), les plus
+        récents d'abord : début mesuré, fin (fusion ou livraison), estimation en
+        vigueur au début (sinon la première posée après, `late`), nombre
+        d'estimations posées."""
         sql = (
             "SELECT w.id, w.type, w.app, w.workstream, w.title, w.state, w.assignee,"
             "       w.change_size,"
@@ -1478,7 +1491,8 @@ class WorkItems(interface.WorkItems):
             "       coalesce(n.n, 0)::int AS revisions"
             "  FROM work_items w"
             "  JOIN LATERAL (SELECT min(m.at) AS at FROM work_item_milestones m"
-            "                 WHERE m.work_item_id = w.id AND m.kind = 'merged') fus"
+            "                 WHERE m.work_item_id = w.id"
+            "                   AND m.kind IN ('merged', 'delivered')) fus"
             "    ON fus.at IS NOT NULL"
             "  LEFT JOIN LATERAL (SELECT e.minutes, e.estimated_by, e.source"
             "                       FROM work_item_estimates e"
@@ -1490,7 +1504,7 @@ class WorkItems(interface.WorkItems):
             "                      ORDER BY e.at, e.id LIMIT 1) f ON true"
             "  LEFT JOIN LATERAL (SELECT count(*) AS n FROM work_item_estimates e"
             "                      WHERE e.work_item_id = w.id) n ON true"
-            " WHERE w.state <> 'closed'")
+            " WHERE (w.state <> 'closed' OR w.close_reason = 'delivered')")
         params: list = []
         if app:
             sql += " AND (w.app = %s OR w.workstream = %s)"

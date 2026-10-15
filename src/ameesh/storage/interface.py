@@ -1486,6 +1486,8 @@ class WorkItems(Domain):
         `merged_ts`, `request_to_freeze_s`, `freeze_to_review_s`,
         `freeze_to_merge_s`, `review_to_merge_s`, `total_s`, `verdicts`,
         `blocked_verdicts`. Une étape absente est NULL, jamais zéro.
+        `delivered_ts` (#988) s'y ajoute : la fin d'un lot livré hors cible,
+        quand `merged_ts` reste NULL (`total_s` compte alors jusqu'à elle).
         """
 
     @abc.abstractmethod
@@ -1512,10 +1514,11 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def close(self, item_id: int, *, current: str, reason: str, superseded_by: int | None,
-              actor: str, note: str) -> dict | None:
-        """Fermeture explicite (L29) : `current` → `closed` (`abandoned` |
-        `superseded`) si le lot y est encore, journal et jalon `closed` dans la
-        même transaction ; None sinon."""
+              sha: str = "", actor: str, note: str) -> dict | None:
+        """Fermeture explicite (L29, #988) : `current` → `closed` (`abandoned` |
+        `superseded` | `delivered`) si le lot y est encore, journal et jalon
+        `closed` dans la même transaction ; `delivered` écrit en plus le jalon
+        `delivered` (le `sha` de la tête relue, l'auteur) ; None sinon."""
 
     @abc.abstractmethod
     def refresh_package_parents(self) -> int:
