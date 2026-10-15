@@ -16,7 +16,9 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from . import merge_queue
 
@@ -31,6 +33,9 @@ class TrainError(RuntimeError):
 @dataclass(frozen=True)
 class Policy:
     enabled: bool = False
+    # Canon §11 bis (15/10/2026): one packet at 11:00 and 23:00 Paris
+    # during build/beta. The old interval policy is retained for later use.
+    build_beta: bool = True
     interval_s: int = 3600
     threshold: int = 5
     # No implicit extra CI for the packet-replaces-lot-CI rule (canon §12).
@@ -40,6 +45,8 @@ class Policy:
     def __post_init__(self):
         if self.ci_mode not in ("packet", "targeted"):
             raise ValueError("ci_mode: packet | targeted expected")
+        if self.build_beta and self.ci_mode != "packet":
+            raise ValueError("build/beta requires packet CI without per-lot CI")
         if self.interval_s <= 0 or self.threshold <= 0 or self.max_failures <= 0:
             raise ValueError("positive train limits expected")
 
@@ -81,9 +88,24 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
     return result
 
 
+def cutoff(now: float) -> float:
+    """Latest 11:00/23:00 Europe/Paris cutoff, including across DST."""
+    local = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
+    if local.hour >= 23:
+        slot = local.replace(hour=23, minute=0, second=0, microsecond=0)
+    elif local.hour >= 11:
+        slot = local.replace(hour=11, minute=0, second=0, microsecond=0)
+    else:
+        slot = (local - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
+    return slot.timestamp()
+
+
 def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0) -> bool:
     if not rows:
         return False
+    if policy.build_beta:
+        slot = cutoff(now)
+        return last_started < slot and any(float(r["queued_ts"]) <= slot for r in rows)
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
     since = max(last_started, min(float(r["queued_ts"]) for r in rows))
@@ -200,6 +222,11 @@ class Engine:
                 return {"result": "paused"}
             if state is None or state["phase"] in TERMINAL:
                 rows = self.ports.entries()
+                if self.policy.build_beta:
+                    # A late admission belongs to the next packet, even if
+                    # this cutoff was empty or the executor has restarted.
+                    slot = cutoff(now)
+                    rows = [r for r in rows if float(r["queued_ts"]) <= slot]
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
                            last_started=float((state or {}).get("started_ts", 0))):
@@ -213,6 +240,8 @@ class Engine:
                 state = self._save(state)
             if (state["source"], state["target"]) != (self.source, self.target):
                 raise TrainError("persisted train belongs to another repository or target")
+            if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
+                raise TrainError("diagnostic CI is disabled during build/beta")
             if state["phase"] == "composing":
                 state = self._plan(state, state["members"], now)
             if state["phase"] == "publishing":
@@ -311,6 +340,15 @@ class Engine:
     def _red(self, state, now):
         state["failures"] += 1
         members = state["plan"]["suspects"]
+        if self.policy.build_beta:
+            # One complete CI per cutoff. A multi-lot failure alone proves
+            # no culprit; leave isolation to the pilot without dispatching
+            # diagnostic halves or silently transferring a green result.
+            state["phase"] = "paused"
+            state = self._save(state)
+            self.ports.notify("build/beta packet CI red: pilot diagnosis required; "
+                              "no automatic diagnostic CI", state)
+            return {"result": "paused"}
         if state["failures"] >= self.policy.max_failures:
             state["phase"] = "paused"
             state = self._save(state)

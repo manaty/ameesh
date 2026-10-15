@@ -19,9 +19,14 @@ du lot ; les correctifs prioritaires précèdent l'activation de ce train.
 ## Socle implémenté
 
 `train.Engine` avance par événements ou passages du runner, sans attente
-active de CI. Un train part à cinq lots admissibles ou une heure après la
-première admission / le départ précédent. Les dépendances ouvertes viennent
-avant les priorités ; un prérequis absent ou un cycle empêche l'admission.
+active de CI. En construction/bêta, sa politique par défaut suit les coupures
+de 11:00 et 23:00 Europe/Paris (canon Process §11 bis, instruction owner du
+15 octobre vers 06:05). Seules les admissions présentes à la coupure entrent
+dans le paquet ; une admission tardive attend la suivante. Un redémarrage
+ne compose pas un second paquet pour une coupure déjà commencée. L'ancienne
+cadence horaire/seuil reste disponible hors du mode construction/bêta,
+sans configuration active. Les dépendances ouvertes viennent avant les
+priorités ; un prérequis absent ou un cycle empêche l'admission.
 
 L'intention est conservée en base, dans `integration_trains` (migration
 additive réservée 0442), avec une révision comparée à chaque écriture. La clé
@@ -63,7 +68,13 @@ vert. Un échec d'agrégat avec toutes les parts vertes ne désigne aucun lot.
 Une nouvelle tentative CI pendant l'attente du feu remplace la preuve verte
 antérieure ; le moteur la relit avant de promouvoir.
 
-Après un rouge, la bissection teste ses moitiés avec leurs prérequis. Un
+En construction/bêta, un rouge conserve les preuves et sollicite le pilote,
+sans lancer de CI diagnostique supplémentaire ni accuser un lot sans preuve.
+L'isolation permettant de livrer le reste du paquet demande encore un
+raccord de diagnostic qualifié avant activation. La bissection automatique
+ci-dessous reste réservée à la politique hors construction/bêta.
+
+Après un rouge, cette bissection teste ses moitiés avec leurs prérequis. Un
 prérequis fautif reporte ses dépendants sans les désigner comme fautifs. Les
 moitiés vertes ne suffisent jamais à qualifier leur union : le reste est
 recomposé et passe sa propre CI complète. Une interaction entre deux moitiés
@@ -121,8 +132,9 @@ plus proche demeure donc refusé ; le fournisseur exact reste chez #1465.
 
 Les deux modes de CI sont explicites : `packet` préserve le remplacement
 de la CI de lot par celle du paquet (§12), `targeted` exige en plus la CI
-ciblée du lot. Le choix de déploiement attend l'arbitrage demandé au bureau ;
-aucun run supplémentaire n'est imposé implicitement.
+ciblée du lot. En construction/bêta, §11 bis impose `packet`, sans CI par lot
+hors incident ou déblocage de CI. Aucun run supplémentaire n'est imposé
+implicitement et aucun branchement de déploiement n'est activé.
 
 Le feu de #1374 à `979f2e2b` porte un lot et son gel. Il ne constitue pas un
 feu machine complet de ce nouveau manifeste. `train_fire.Fires` implémente
@@ -208,6 +220,14 @@ acteur : `record_commit` accepte cette attribution. Aucun changement de SHA
 ni checkout n'est nécessaire. Le scénario a été transmis directement à
 impl07, copie dev4 et mesh-design ; aucun SQL du fournisseur n'a été exécuté
 ici. Le port de lecture reste explicite et aucun fournisseur n'est activé.
+
+Le correctif fournisseur `1acc269d` exige désormais une attestation pre-commit
+propre au tour, stockée dans le répertoire Git du worktree puis consommée par
+l'écriture du reçu. Trois témoins de raccord Git réel/stockage simulé
+confirment le refus du HEAD hérité, le refus d'une attestation écrite après
+ce commit et l'acceptation d'une nouvelle création attestée avec consommation.
+L'écart précis est clos sur cette tête ; aucun SQL ni suite du fournisseur
+n'est rejoué ici et ses deux revues indépendantes restent requises.
 
 Source du travail indépendant : mesh-design, message #45970 du 15 octobre
 à 04:06 et note du registre #1467 à 04:06, précisant que le hold ne concerne

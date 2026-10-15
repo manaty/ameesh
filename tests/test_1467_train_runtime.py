@@ -31,7 +31,7 @@ class TrainRuntimeTest(PgTestCase):
         self.admissions.entries.side_effect = self.memory.entries
         self.admissions.qualify.side_effect = self.memory.qualify
         self.admissions.dependencies.side_effect = self.memory.dependencies
-        self.policy = train.Policy(enabled=True)
+        self.policy = train.Policy(enabled=True, build_beta=False)
         self.role = mock.patch.object(train_fire.Fires, "_still_pilot", return_value=True)
         self.role.start()
         self.addCleanup(self.role.stop)

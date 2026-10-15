@@ -114,7 +114,7 @@ class TrainTest(unittest.TestCase):
     def make(self, rows=None, **kw):
         self.ports = MemoryPorts(rows or [row(1)])
         self.engine = train.Engine(self.ports, source="github.com/o/r", target="main",
-                                   policy=train.Policy(enabled=True, **kw))
+                                   policy=train.Policy(enabled=True, build_beta=False, **kw))
         return self.engine
 
     def test_disabled_has_no_storage_or_external_effect(self):
