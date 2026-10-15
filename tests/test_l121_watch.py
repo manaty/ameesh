@@ -39,9 +39,10 @@ class TextTest(unittest.TestCase):
         # every deployment, the owner keeps production
         for words in ("Merge first", "PREPARED in full", "rollback", "owner's decisions"):
             self.assertIn(words, text)
-        # the working rules of the canon (home#71, §§3/6/12): integration by
-        # packages, review before CI, sober proofs — carried by the injected
-        # text because the Process card is truncated in the brief
+        # the working rules of the canon (home#71, §§3/6/11 bis/12): integration
+        # by packages, review before CI and no CI per lot between cuts, sober
+        # proofs — carried by the injected text because the Process card is
+        # truncated in the brief
         for words in ("packages", "30 min at most", "Review before CI",
                       "frozen head", "cancelled", "Sober proofs",
                       "a proof is a link", "sha256", "merge-tree", "3 lines"):
