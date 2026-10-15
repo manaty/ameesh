@@ -123,10 +123,10 @@ Chaque événement est écrit en JSONL (`date`, `hôte`, `étape`, `verdict`,
 `sha`, `precedent`, `detail`) dans
 `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`. Le `detail` de
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
-verdict, et pour une remise réelle le message de sonde, son destinataire et
-son délai) : c’est la preuve structurée que le signal ci-dessous exige. Un
-verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou `auto` sans persona menée —
-ne prouve aucune remise.
+verdict, et pour une remise réelle le message de sonde, son destinataire,
+l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
+signal ci-dessous exige. Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, ou
+`auto` sans persona menée — ne prouve aucune remise.
 
 ## Signal « staging actif » (#1323)
 
@@ -148,6 +148,18 @@ fenêtre doit porter le commit visé, et le message de sonde est relu en base
 (expéditeur système, destinataire, hôte, commit, remise effective). Aucune
 clôture de lot n’est automatique : le rapporteur reprend lui-même sa
 vérification après déploiement.
+
+Un hôte **sans exécutant** (mode serveur, comme `manaty-mesh-1`) ne peut pas
+prouver sa chaîne par une remise locale : sa preuve est le `controler` vert
+plus une **sonde croisée**, remise à une persona menée d’un autre hôte
+canonique **après son redémarrage** — la remise traverse alors sa base, le
+message étant déposé dans la base du serveur et relevé par l’exécuteur de
+l’autre hôte. `sante-courrier.py --serveur` produit cette sonde et nomme
+l’hôte destinataire (`hote_destinataire`) ; `actif.py` relit la remise en base
+et exige qu’elle soit postérieure au `redemarrer` de l’hôte mesuré. Un serveur
+qui porte des exécutants garde la règle locale : une santé `sans-sonde`
+(aucune persona menée) n’atteste rien, et une sonde croisée n’est acceptée que
+pour un hôte à zéro persona.
 
 L’émission est bornée et **idempotente** : un seul courrier par rapporteur et
 par commit, même si la séquence est relancée. La clé d’émission est écrite

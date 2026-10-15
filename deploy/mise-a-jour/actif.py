@@ -11,10 +11,17 @@ le signal que si l'ACTIVATION est prouvee, hote par hote :
   commit vise (un journal d'une autre execution ne prouve rien) ;
 * aucun `retour` (rollback) dans cette fenetre ;
 * le detail de `sante` est le rapport JSON de `sante-courrier.py` : verdict
-  `ok` et sonde reellement remise (message, destinataire, delai), du bon hote
-  et du bon commit — un detail absent, textuel ou `sans-sonde` ne prouve rien ;
+  `ok` et sonde reellement remise (message, destinataire, hote destinataire,
+  delai), du bon hote et du bon commit — un detail absent, textuel ou
+  `sans-sonde` ne prouve rien ;
+* un hote en mode `serveur` sans executant (0 persona locale, comme
+  manaty-mesh-1) ne peut pas etre prouve par une remise locale : sa preuve est
+  une sonde CROISEE remise a une persona d'un autre hote canonique, dont la
+  remise en base est posterieure a son `redemarrer` — elle traverse donc sa
+  base (`--mode nom=serveur` ; avis R2 B1). Un hote a executants garde la
+  remise locale, et une sante `sans-sonde` ne prouve rien ;
 * le message de sonde existe en base, a bien ete remis, par le systeme, a
-  cette persona, pour cet hote et ce commit ;
+  cette persona, pour cet hote, ce commit et l'hote destinataire annonce ;
 * le commit relu sur l'hote apres la sequence est le commit vise (`--hote
   nom=sha_actif`, comparaison par prefixe : le poste publie un nom court).
 
@@ -42,15 +49,23 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ameesh import config, db as db_mod, mail, work
 
 SCHEMA = "ameesh-staging-actif/1"
+#: instants du journal, tel que produits par `date -u +%Y-%m-%dT%H:%M:%SZ`
+ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 #: instant ISO UTC, tel que produit par `date -u +%Y-%m-%dT%H:%M:%SZ`
 DEPUIS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 #: hôtes du staging complet (canon §14) : un sous-ensemble n'atteste rien
 HOTES_CANON = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
+#: modes d'hote connus : `serveur` (sans executant) prouve son activation par
+#: une sonde croisee, tout autre mode exige une remise locale.
+MODES = ("agents", "poste", "serveur")
+#: mode par defaut, ferme : sans `--mode`, la remise locale est exigee.
+MODE_DEFAUT = "agents"
 #: etapes qui, par hote, prouvent l'activation et pas seulement l'installation
 ETAPES_REQUISES = ("installer", "redemarrer", "controler", "sante")
 #: etat par defaut des attestations (meme arbre que le journal de staging)
@@ -107,11 +122,15 @@ def lire_journal(chemin: Path, depuis: str) -> list[dict]:
     return evenements
 
 
-def preuve_sonde(hote: str, detail: object, sha: str) -> dict:
+def preuve_sonde(hote: str, detail: object, sha: str,
+                 mode: str = MODE_DEFAUT) -> dict:
     """Preuve structuree de la sonde, extraite du detail de l'etape `sante`.
 
     Le detail est le rapport JSON de `sante-courrier.py` : un texte libre, un
     detail absent ou un verdict `sans-sonde` ne prouvent pas la remise reelle.
+    Un hote en mode `serveur` a 0 persona locale est prouve par une sonde
+    croisee vers un autre hote canonique ; partout ailleurs la remise doit
+    etre locale (avis R2 B1).
     """
     if not isinstance(detail, str) or not detail.strip():
         raise PreuveManquante(
@@ -136,21 +155,57 @@ def preuve_sonde(hote: str, detail: object, sha: str) -> dict:
     message = sonde.get("message")
     destinataire = sonde.get("destinataire")
     delai = sonde.get("delai_s")
+    destinataire_hote = sonde.get("hote_destinataire")
     if not isinstance(message, int) or isinstance(message, bool) or message <= 0:
         raise PreuveManquante("%s : message de sonde illisible" % hote)
     if not isinstance(destinataire, str) or not destinataire.strip():
         raise PreuveManquante("%s : destinataire de sonde illisible" % hote)
     if not isinstance(delai, (int, float)) or isinstance(delai, bool) or delai < 0:
         raise PreuveManquante("%s : delai de sonde illisible" % hote)
-    return {"message": message, "destinataire": destinataire, "delai_s": float(delai)}
+    if not isinstance(destinataire_hote, str) or not destinataire_hote.strip():
+        raise PreuveManquante("%s : hote du destinataire de sonde illisible" % hote)
+    personas = rapport.get("personas")
+    if not isinstance(personas, int) or isinstance(personas, bool) or personas < 0:
+        raise PreuveManquante("%s : nombre de personas illisible" % hote)
+    # un serveur sans executant n'a aucune persona locale : la preuve doit
+    # alors traverser un autre hote canonique. Un hote a executants garde la
+    # remise locale, meme si le rapport se declare a 0 persona (porte fermee).
+    croisee = mode == "serveur" and personas == 0
+    if croisee:
+        if destinataire_hote == hote:
+            raise PreuveManquante(
+                "%s : aucune persona locale, sonde non croisee" % hote)
+        if destinataire_hote not in HOTES_CANON:
+            raise PreuveManquante(
+                "%s : sonde croisee vers un hote hors staging (%s)"
+                % (hote, destinataire_hote))
+    elif destinataire_hote != hote:
+        raise PreuveManquante("%s : sonde remise a un autre hote (%s)"
+                              % (hote, destinataire_hote))
+    return {"message": message, "destinataire": destinataire,
+            "delai_s": float(delai), "hote_destinataire": destinataire_hote}
 
 
-def preuves(evenements: list[dict], sha: str, actifs: dict[str, str]) -> dict:
+def horodatage(ts: object) -> float | None:
+    """Instant ISO UTC du journal en epoch, ou None s'il est illisible."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.strptime(ts, ISO_UTC).replace(
+            tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
+            modes: dict[str, str] | None = None) -> dict:
     """{hote: preuves} pour la sequence attestee, ou PreuveManquante.
 
     La comparaison du commit actif est un prefixe dans les deux sens : le
-    poste publie un nom court (`src-<7>`), les VM un SHA complet.
+    poste publie un nom court (`src-<7>`), les VM un SHA complet. `modes`
+    (nom -> mode, defaut `agents`) decide quelle remise prouve chaque hote.
     """
+    modes = modes or {}
     if sorted(actifs) != sorted(HOTES_CANON):
         raise PreuveManquante(
             "sequence partielle (%s) : un staging complet des quatre hotes est requis"
@@ -194,13 +249,28 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str]) -> dict:
                                   % (hote, ", ".join(manquantes)))
         detail = next((e.get("detail") for e in reversed(apres)
                        if e.get("etape") == "sante"), None)
-        resultat[hote] = {"actif": actif, "etapes": {e: etapes[e] for e in ETAPES_REQUISES},
-                          "sante": detail, "sonde": preuve_sonde(hote, detail, sha)}
+        sonde = preuve_sonde(hote, detail, sha, modes.get(hote, MODE_DEFAUT))
+        redemarrages = [e for e in apres
+                        if e.get("etape") == "redemarrer" and e.get("verdict") == "ok"]
+        redemarrage_ts = redemarrages[-1].get("ts") if redemarrages else None
+        if sonde["hote_destinataire"] != hote and not redemarrage_ts:
+            raise PreuveManquante(
+                "%s : redemarrage non horodate, remise croisee non datable" % hote)
+        resultat[hote] = {"actif": actif,
+                          "etapes": {e: etapes[e] for e in ETAPES_REQUISES},
+                          "sante": detail, "sonde": sonde,
+                          "redemarrage_ts": redemarrage_ts}
     return resultat
 
 
-def controle_message(row: object, hote: str, sonde: dict, sha: str) -> dict:
-    """Le message de sonde existe, a ete remis, pour cet hote et ce commit."""
+def controle_message(row: object, hote: str, sonde: dict, sha: str,
+                     apres_ts: object = None) -> dict:
+    """Le message de sonde existe, a ete remis, pour cet hote et ce commit.
+
+    Pour une sonde croisee (`hote_destinataire` different de l'hote mesure),
+    la remise doit etre posterieure au redemarrage `apres_ts` : c'est elle qui
+    prouve que la chaine de l'hote fonctionne apres son activation.
+    """
     message = sonde["message"]
     if not row:
         raise PreuveManquante("sonde %s introuvable dans le courrier" % message)
@@ -216,12 +286,27 @@ def controle_message(row: object, hote: str, sonde: dict, sha: str) -> dict:
         raise PreuveManquante("sonde %s : message d'un autre hote" % message)
     if not prefixe_du_commit(sha, str(charge.get("sha") or "")):
         raise PreuveManquante("sonde %s : message d'un autre commit" % message)
+    if (charge.get("destinataire_hote") or "") != sonde["hote_destinataire"]:
+        raise PreuveManquante("sonde %s : hote destinataire inattendu (%r)"
+                              % (message, charge.get("destinataire_hote")))
+    if sonde["hote_destinataire"] != hote:
+        seuil = horodatage(apres_ts)
+        if seuil is None:
+            raise PreuveManquante("sonde %s : redemarrage de %s non horodate"
+                                  % (message, hote))
+        livre = row.get("delivered_ts")
+        if not isinstance(livre, (int, float)) or isinstance(livre, bool) or livre < seuil:
+            raise PreuveManquante(
+                "sonde %s : remise a %s anterieure au redemarrage de %s"
+                % (message, sonde["hote_destinataire"], hote))
     return sonde
 
 
-def verifier_remise(conn, hote: str, sonde: dict, sha: str) -> dict:
+def verifier_remise(conn, hote: str, sonde: dict, sha: str,
+                    apres_ts: object = None) -> dict:
     """Relit le message de sonde en base : sans lui, aucune preuve de remise."""
-    return controle_message(mail.get(conn, sonde["message"]), hote, sonde, sha)
+    return controle_message(mail.get(conn, sonde["message"]), hote, sonde, sha,
+                            apres_ts)
 
 
 def verifier_remises(preuve: dict, sha: str) -> None:
@@ -229,7 +314,10 @@ def verifier_remises(preuve: dict, sha: str) -> None:
     conn = db_mod.connect(config.load())
     try:
         for hote in HOTES_CANON:
-            verifier_remise(conn, hote, preuve[hote]["sonde"], sha)
+            sonde = preuve[hote]["sonde"]
+            apres_ts = (preuve[hote].get("redemarrage_ts")
+                        if sonde["hote_destinataire"] != hote else None)
+            verifier_remise(conn, hote, sonde, sha, apres_ts)
     finally:
         conn.close()
 
@@ -316,8 +404,12 @@ def corps_courrier(attestation: dict, chemin: Path) -> str:
         sonde = preuve.get("sonde") or {}
         detail = ""
         if sonde:
-            detail = " — sonde %s remise a %s en %ss" % (
-                sonde.get("message"), sonde.get("destinataire"), sonde.get("delai_s"))
+            via = ""
+            if sonde.get("hote_destinataire") != hote:
+                via = " (via %s)" % sonde.get("hote_destinataire")
+            detail = " — sonde %s remise a %s en %ss%s" % (
+                sonde.get("message"), sonde.get("destinataire"),
+                sonde.get("delai_s"), via)
         lignes.append("- %s : actif %s (%s)%s"
                       % (hote, preuve["actif"][:9],
                          ", ".join("%s ok" % e for e in ETAPES_REQUISES), detail))
@@ -341,6 +433,9 @@ def analyseur() -> argparse.ArgumentParser:
                         help="debut de l'execution (ISO UTC, AAAA-MM-JJTHH:MM:SSZ)")
     parser.add_argument("--hote", action="append", default=[], metavar="NOM=SHA_ACTIF",
                         help="commit relu actif sur l'hote apres la sequence")
+    parser.add_argument("--mode", action="append", default=[], metavar="NOM=MODE",
+                        help="mode de l'hote (%s ; defaut %s)"
+                             % (", ".join(MODES), MODE_DEFAUT))
     parser.add_argument("--lot", action="append", default=[], help="lot concerne")
     parser.add_argument("--rapporteur", action="append", default=[],
                         help="agent a reveiller (repete)")
@@ -361,6 +456,15 @@ def main(argv: list[str] | None = None) -> int:
         if not nom or not valeur:
             parser.error("--hote attend NOM=SHA_ACTIF (recu : %s)" % entree)
         actifs[nom] = valeur
+    modes = {}
+    for entree in args.mode:
+        nom, _, valeur = entree.partition("=")
+        if not nom or valeur not in MODES:
+            parser.error("--mode attend NOM=%s (recu : %s)"
+                         % ("|".join(MODES), entree))
+        if nom not in actifs:
+            parser.error("--mode : hote inconnu « %s » (declarer --hote)" % nom)
+        modes[nom] = valeur
     sha = args.sha.strip().lower()
     if not sha:
         parser.error("--sha vide")
@@ -373,7 +477,7 @@ def main(argv: list[str] | None = None) -> int:
             raise PreuveManquante(
                 "sante sans sonde de remise reelle : activation non prouvee")
         evenements = lire_journal(journal, args.depuis)
-        preuve = preuves(evenements, sha, actifs)
+        preuve = preuves(evenements, sha, actifs, modes)
         try:
             verifier_remises(preuve, sha)
         except PreuveManquante:

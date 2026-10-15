@@ -45,6 +45,13 @@
 # signal de reussite ; un sous-ensemble n'atteste rien ; aucun lot n'est clos
 # automatiquement.
 #
+# La preuve d'activation d'un hote en mode serveur (sans executant, comme
+# manaty-mesh-1) est specifique : son `controler` vert et une sonde croisee
+# remise a une persona menee d'un AUTRE hote canonique, posterieure a son
+# redemarrage — la remise traverse alors sa base (actif.py ; avis R2 B1 #1323).
+# Un hote a executants garde la regle locale : une sante `sans-sonde` (aucune
+# persona menee) n'atteste rien, et une remise croisee n'y est pas acceptee.
+#
 # Etapes : verifier chaque hote (lecture seule) ; sauvegarder puis migrer REF
 # (additif seulement, base partagee) ; puis, hote par hote dans l'ordre
 # ci-dessus : installer, [poste] role, redemarrer, controler, sante (unites,
@@ -303,7 +310,7 @@ precedent_retour() {  # commit que « retour » reinstalle reellement
   esac || true
 }
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
-  local nom=$1 sans=${2:-} cible_sonde var sortie
+  local nom=$1 sans=${2:-} cible_sonde var sortie args_hote=()
   SANTE_DETAIL=""
   var=$(var_sonde_de "$nom")
   cible_sonde=${!var:-}
@@ -311,17 +318,25 @@ sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
     etape "doctor --harness (harnais servis par le poste)"
     "$AMEESH" doctor --harness || return 1
   fi
+  # un hote en mode serveur n'a pas d'executant : sante-courrier.py sonde
+  # alors une persona menee d'un autre hote, remise a travers sa base
+  # (actif.py, avis R2 B1 #1323).
+  if [ "$(mode_de "$nom")" = serveur ]; then
+    args_hote=(--serveur)
+  fi
   if [ "$SONDE" = 1 ] && [ "$sans" != jamais ]; then
     etape "courrier de $nom (sonde de remise reelle)"
     sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde "${cible_sonde:-auto}" \
-      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json) \
+      --attente "$ATTENTE_COURRIER" --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
+      ${args_hote[@]+"${args_hote[@]}"}) \
       || { printf '%s\n' "$sortie"; return 1; }
     printf '%s\n' "$sortie"
     SANTE_DETAIL=$sortie
   else
     etape "courrier de $nom (lecture seule, sonde desactivee)"
     sortie=$("$VENV/bin/python" "$SONDE_PY" --hote "$nom" --sonde jamais \
-      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json) \
+      --souffrance "$SOUFFRANCE_COURRIER" --sha "$SHA" --json \
+      ${args_hote[@]+"${args_hote[@]}"}) \
       || { printf '%s\n' "$sortie"; return 1; }
     printf '%s\n' "$sortie"
     SANTE_DETAIL=$sortie
@@ -451,7 +466,7 @@ else
   [ "$SONDE" = 1 ] || ARGS_ACTIF+=(--sans-sonde)
   for nom in "${HOTES[@]}"; do
     actif_sha=$(sha_installe "$nom" || true)
-    ARGS_ACTIF+=(--hote "$nom=${actif_sha,,}")
+    ARGS_ACTIF+=(--hote "$nom=${actif_sha,,}" --mode "$nom=$(mode_de "$nom")")
   done
   for lot in ${VERIF_LOTS[@]+"${VERIF_LOTS[@]}"}; do
     ARGS_ACTIF+=(--lot "$lot")

@@ -63,14 +63,16 @@ def charger_actif():
 
 
 def detail_sonde(hote, sha=SHA, verdict='ok', message=MESSAGE,
-                 destinataire=DESTINATAIRE, delai=2.0, pourquoi=None):
+                 destinataire=DESTINATAIRE, delai=2.0, pourquoi=None,
+                 personas=2, hote_destinataire=None):
     """Rapport JSON de sante-courrier.py, tel que staging.sh le journalise."""
     sonde = None
     if verdict == 'ok':
-        sonde = {'message': message, 'destinataire': destinataire, 'delai_s': delai}
-    return json.dumps({'hote': hote, 'verdict': verdict, 'personas': 2, 'sha': sha,
-                       'souffrance': [], 'boites_mortes': [], 'sonde': sonde,
-                       'pourquoi': pourquoi})
+        sonde = {'message': message, 'destinataire': destinataire, 'delai_s': delai,
+                 'hote_destinataire': hote_destinataire or hote}
+    return json.dumps({'hote': hote, 'verdict': verdict, 'personas': personas,
+                       'sha': sha, 'souffrance': [], 'boites_mortes': [],
+                       'sonde': sonde, 'pourquoi': pourquoi})
 
 
 def evenement(hote, etape, verdict='ok', detail=None, ts=TS, sha=SHA):
@@ -86,6 +88,28 @@ def journal_complet():
         out.append(evenement(hote, 'redemarrer'))
         out.append(evenement(hote, 'controler'))
         out.append(evenement(hote, 'sante', detail=detail_sonde(hote)))
+    out.append(evenement(None, 'sequence'))
+    return out
+
+
+def journal_serveur(hote_destinataire='ameesh-agents-1', personas=0,
+                    verdict='ok'):
+    """Topologie reelle : manaty-mesh-1 (serveur) ne porte aucune persona.
+
+    Sa preuve est une sonde croisee, remise a une persona menee d'un autre
+    hote canonique (avis R2 B1).
+    """
+    out = []
+    for hote in HOTES:
+        out.append(evenement(hote, 'installer', detail='installe %s' % SHA[:9]))
+        out.append(evenement(hote, 'redemarrer'))
+        out.append(evenement(hote, 'controler'))
+        if hote == 'manaty-mesh-1':
+            detail = detail_sonde(hote, personas=personas, verdict=verdict,
+                                  hote_destinataire=hote_destinataire)
+        else:
+            detail = detail_sonde(hote)
+        out.append(evenement(hote, 'sante', detail=detail))
     out.append(evenement(None, 'sequence'))
     return out
 
@@ -136,11 +160,13 @@ class ActifTest(unittest.TestCase):
             code = self.actif.main(argv)
         return code, sortie.getvalue(), erreur.getvalue()
 
-    def hotes(self, actifs=None):
+    def hotes(self, actifs=None, modes=None):
         valeurs = actifs or {h: SHA for h in HOTES}
         out = []
         for hote in HOTES:
             out += ['--hote', '%s=%s' % (hote, valeurs[hote])]
+            if modes and hote in modes:
+                out += ['--mode', '%s=%s' % (hote, modes[hote])]
         return out
 
     def attestations(self):
@@ -203,7 +229,7 @@ class ActifTest(unittest.TestCase):
                              {e: 'ok' for e in ('installer', 'redemarrer', 'controler', 'sante')})
             self.assertEqual(attestation['hotes'][hote]['sonde'],
                              {'message': MESSAGE, 'destinataire': DESTINATAIRE,
-                              'delai_s': 2.0})
+                              'delai_s': 2.0, 'hote_destinataire': hote})
         self.assertEqual(attestation['emissions'], {})
         self.assertEqual(attestation['notifies']['docs01']['message'], 4242)
         self.assertEqual(len(self.envois), 1)
@@ -261,6 +287,94 @@ class ActifTest(unittest.TestCase):
         code, _, erreur = self.lancer(*self.hotes(actifs), '--rapporteur', 'docs01')
         self.assertEqual(code, 0, erreur)
         self.assertEqual(len(self.attestations()), 1)
+
+    # --- mode serveur sans executant (avis R2 B1) -------------------------
+
+    def test_serveur_sans_persona_sonde_croisee_acceptee(self):
+        """Topologie reelle : manaty-mesh-1 sans persona, prouve par une sonde
+        croisee remise a une persona d'un autre hote canonique."""
+        self.ecrire(journal_serveur())
+        code, _, erreur = self.lancer(*self.hotes(modes={'manaty-mesh-1': 'serveur'}),
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        attestation = json.loads(self.attestations()[0].read_text())
+        preuve = attestation['hotes']['manaty-mesh-1']
+        self.assertEqual(preuve['redemarrage_ts'], TS)
+        self.assertEqual(preuve['sonde'],
+                         {'message': MESSAGE, 'destinataire': DESTINATAIRE,
+                          'delai_s': 2.0, 'hote_destinataire': 'ameesh-agents-1'})
+        self.assertIn('via ameesh-agents-1', self.envois[0]['corps'])
+
+    def test_serveur_sans_mode_declare_refuse(self):
+        """Porte fermee par defaut : sans `--mode serveur`, la remise croisee
+        de la topologie reelle n'est pas acceptee."""
+        self.ecrire(journal_serveur())
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('autre hote', erreur)
+
+    def test_serveur_sans_persona_sonde_locale_refusee(self):
+        self.ecrire(journal_serveur(hote_destinataire='manaty-mesh-1'))
+        code, _, erreur = self.lancer(*self.hotes(modes={'manaty-mesh-1': 'serveur'}),
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('non croisee', erreur)
+        self.assertEqual(self.attestations(), [])
+
+    def test_serveur_sonde_croisee_hors_canon_refusee(self):
+        self.ecrire(journal_serveur(hote_destinataire='ailleurs'))
+        code, _, erreur = self.lancer(*self.hotes(modes={'manaty-mesh-1': 'serveur'}),
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('hors staging', erreur)
+
+    def test_serveur_avec_personas_non_menee_refusee(self):
+        """Porte fermee : un serveur qui porte des executants sans persona
+        menee reste un `sans-sonde`, jamais une sonde croisee."""
+        self.ecrire(journal_serveur(personas=2, verdict='sans-sonde'))
+        code, _, erreur = self.lancer(*self.hotes(modes={'manaty-mesh-1': 'serveur'}),
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('sonde non remise', erreur)
+
+    def test_serveur_avec_personas_sonde_croisee_refusee(self):
+        """Une sonde croisee n'est acceptee que pour un serveur a 0 persona."""
+        self.ecrire(journal_serveur(personas=2, hote_destinataire='ameesh-agents-1'))
+        code, _, erreur = self.lancer(*self.hotes(modes={'manaty-mesh-1': 'serveur'}),
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('autre hote', erreur)
+
+    def test_agents_sans_persona_sonde_croisee_refusee(self):
+        """Porte fermee hors serveur : un hote a agents ne se prouve pas par
+        une remise sur un autre hote, meme declare a 0 persona."""
+        evenements = journal_serveur()
+        for e in evenements:
+            if e['hote'] == 'ameesh-agents-1' and e['etape'] == 'sante':
+                e['detail'] = detail_sonde('ameesh-agents-1', personas=0,
+                                           hote_destinataire='ameesh-agents-2')
+        self.ecrire(evenements)
+        code, _, erreur = self.lancer(*self.hotes(), '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('autre hote', erreur)
+
+    def test_serveur_remise_croisee_sans_horodatage_refusee(self):
+        evenements = journal_serveur()
+        for e in evenements:
+            if e['hote'] == 'manaty-mesh-1' and e['etape'] == 'redemarrer':
+                e['ts'] = None
+        actifs = {h: SHA for h in HOTES}
+        with self.assertRaises(self.actif.PreuveManquante) as ctx:
+            self.actif.preuves(evenements, SHA, actifs, {'manaty-mesh-1': 'serveur'})
+        self.assertIn('non horodate', str(ctx.exception))
+
+    def test_mode_inconnu_refuse(self):
+        self.ecrire(journal_complet())
+        argv = ['--journal', str(self.journal), '--sha', SHA, '--depuis', DEPUIS,
+                '--etat-dir', str(self.etat)] + self.hotes(modes={'manaty-mesh-1': 'srv'})
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            self.actif.main(argv)
+        self.assertEqual(ctx.exception.code, 2)
 
     def test_sequence_partielle_refusee(self):
         self.ecrire(journal_complet())
@@ -526,7 +640,8 @@ class PreuveSondeTest(unittest.TestCase):
         preuve = self.mod.preuve_sonde('ameesh-agents-1',
                                        detail_sonde('ameesh-agents-1'), SHA)
         self.assertEqual(preuve, {'message': MESSAGE, 'destinataire': DESTINATAIRE,
-                                  'delai_s': 2.0})
+                                  'delai_s': 2.0,
+                                  'hote_destinataire': 'ameesh-agents-1'})
 
     def test_details_refuses(self):
         cas = {
@@ -550,6 +665,17 @@ class PreuveSondeTest(unittest.TestCase):
                                   'destinataire'),
             'delai absent': (detail_sonde('ameesh-agents-1', delai=None), 'delai'),
             'delai negatif': (detail_sonde('ameesh-agents-1', delai=-1), 'delai'),
+            'hote destinataire absent': (json.dumps({
+                'hote': 'ameesh-agents-1', 'verdict': 'ok', 'personas': 2, 'sha': SHA,
+                'sonde': {'message': MESSAGE, 'destinataire': DESTINATAIRE,
+                          'delai_s': 2.0}}),
+                'hote du destinataire'),
+            'personas illisible': (json.dumps({
+                'hote': 'ameesh-agents-1', 'verdict': 'ok', 'personas': 'deux',
+                'sha': SHA, 'sonde': {'message': MESSAGE, 'destinataire': DESTINATAIRE,
+                                      'delai_s': 2.0,
+                                      'hote_destinataire': 'ameesh-agents-1'}}),
+                'nombre de personas'),
         }
         for nom, (detail, attendu) in cas.items():
             with self.subTest(cas=nom):
@@ -557,20 +683,91 @@ class PreuveSondeTest(unittest.TestCase):
                     self.mod.preuve_sonde('ameesh-agents-1', detail, SHA)
                 self.assertIn(attendu, str(ctx.exception))
 
+    def test_detail_serveur_sans_persona(self):
+        """0 persona + mode serveur : la sonde croisee est la seule preuve."""
+        detail = detail_sonde('manaty-mesh-1', personas=0,
+                              hote_destinataire='ameesh-agents-1')
+        preuve = self.mod.preuve_sonde('manaty-mesh-1', detail, SHA, 'serveur')
+        self.assertEqual(preuve['hote_destinataire'], 'ameesh-agents-1')
+
+    def test_details_serveur_refuses(self):
+        cas = {
+            'sonde locale a 0 persona': (
+                detail_sonde('manaty-mesh-1', personas=0), 'serveur', 'non croisee'),
+            'destinataire hors canon': (
+                detail_sonde('manaty-mesh-1', personas=0, hote_destinataire='ailleurs'),
+                'serveur', 'hors staging'),
+            'croisee avec executants': (
+                detail_sonde('manaty-mesh-1', personas=2,
+                             hote_destinataire='ameesh-agents-1'),
+                'serveur', 'autre hote'),
+            'croisee hors mode serveur': (
+                detail_sonde('manaty-mesh-1', personas=0,
+                             hote_destinataire='ameesh-agents-1'),
+                'agents', 'autre hote'),
+        }
+        for nom, (detail, mode, attendu) in cas.items():
+            with self.subTest(cas=nom):
+                with self.assertRaises(self.mod.PreuveManquante) as ctx:
+                    self.mod.preuve_sonde('manaty-mesh-1', detail, SHA, mode)
+                self.assertIn(attendu, str(ctx.exception))
+
     def message(self, **kw):
         row = {'id': MESSAGE, 'sender': self.mod.work.SYSTEM_SENDER,
                'recipient': DESTINATAIRE, 'delivered_ts': 1.0,
-               'payload': {'staging': {'hote': 'ameesh-agents-1', 'sha': SHA}}}
+               'payload': {'staging': {'hote': 'ameesh-agents-1', 'sha': SHA,
+                                       'destinataire_hote': 'ameesh-agents-1'}}}
         row.update(kw)
         return row
 
-    def sonde(self):
-        return {'message': MESSAGE, 'destinataire': DESTINATAIRE, 'delai_s': 2.0}
+    def sonde(self, hote_destinataire='ameesh-agents-1'):
+        return {'message': MESSAGE, 'destinataire': DESTINATAIRE, 'delai_s': 2.0,
+                'hote_destinataire': hote_destinataire}
+
+    def message_croise(self, **kw):
+        row = self.message(payload={'staging': {
+            'hote': 'manaty-mesh-1', 'sha': SHA,
+            'destinataire_hote': 'ameesh-agents-1'}})
+        row.update(kw)
+        return row
 
     def test_message_remis_valide(self):
         self.assertEqual(
             self.mod.controle_message(self.message(), 'ameesh-agents-1', self.sonde(), SHA),
             self.sonde())
+
+    def test_message_croise_valide(self):
+        """Une remise croisee posterieure au redemarrage est une preuve."""
+        sonde = self.sonde()
+        self.assertEqual(
+            self.mod.controle_message(self.message_croise(delivered_ts=200.0),
+                                      'manaty-mesh-1', sonde, SHA,
+                                      apres_ts='1970-01-01T00:02:00Z'),
+            sonde)
+
+    def test_message_croise_refuse(self):
+        sonde = self.sonde()
+        cas = {
+            'remise anterieure au redemarrage': (
+                self.message_croise(delivered_ts=100.0), '1970-01-01T00:02:00Z',
+                'anterieure au redemarrage'),
+            'redemarrage non horodate': (
+                self.message_croise(delivered_ts=200.0), 'zzz', 'non horodate'),
+            'redemarrage absent': (
+                self.message_croise(delivered_ts=200.0), None, 'non horodate'),
+            'hote destinataire incoherent': (
+                self.message_croise(delivered_ts=200.0,
+                                    payload={'staging': {'hote': 'manaty-mesh-1',
+                                                         'sha': SHA,
+                                                         'destinataire_hote': 'autre'}}),
+                '1970-01-01T00:02:00Z', 'hote destinataire inattendu'),
+        }
+        for nom, (row, apres, attendu) in cas.items():
+            with self.subTest(cas=nom):
+                with self.assertRaises(self.mod.PreuveManquante) as ctx:
+                    self.mod.controle_message(row, 'manaty-mesh-1', sonde, SHA,
+                                              apres_ts=apres)
+                self.assertIn(attendu, str(ctx.exception))
 
     def test_messages_refuses(self):
         cas = {
@@ -584,6 +781,13 @@ class PreuveSondeTest(unittest.TestCase):
                                                                'sha': AUTRE_SHA}}),
                              'autre commit'),
             'sans charge staging': (self.message(payload={}), 'autre hote'),
+            'destinataire hote absent': (
+                self.message(payload={'staging': {'hote': 'ameesh-agents-1', 'sha': SHA}}),
+                'hote destinataire inattendu'),
+            'destinataire hote different': (
+                self.message(payload={'staging': {'hote': 'ameesh-agents-1', 'sha': SHA,
+                                                  'destinataire_hote': 'ameesh-agents-2'}}),
+                'hote destinataire inattendu'),
         }
         for nom, (row, attendu) in cas.items():
             with self.subTest(cas=nom):
@@ -786,6 +990,9 @@ class StagingSignalTest(unittest.TestCase):
         self.assertIn('--lot 917', ligne)
         self.assertIn('--lot 988', ligne)
         self.assertIn('--rapporteur docs01', ligne)
+        self.assertIn('--mode ameesh-agents-1=agents', ligne)
+        self.assertIn('--mode manaty-mesh-1=serveur', ligne)
+        self.assertIn('--mode pc-smichea=poste', ligne)
         self.assertNotIn('--sans-sonde', ligne)
 
     def test_journal_porte_la_preuve_de_sonde_en_json(self):
@@ -802,6 +1009,13 @@ class StagingSignalTest(unittest.TestCase):
             self.assertEqual(rapport['verdict'], 'ok')
             self.assertEqual(rapport['sonde']['message'], MESSAGE)
             self.assertEqual(rapport['sonde']['destinataire'], DESTINATAIRE)
+            attendu = ('ameesh-agents-1' if trace['hote'] == 'manaty-mesh-1'
+                       else trace['hote'])
+            self.assertEqual(rapport['sonde']['hote_destinataire'], attendu)
+        mesh = json.loads(next(t for t in sante
+                               if t['hote'] == 'manaty-mesh-1')['detail'])
+        self.assertEqual(mesh['personas'], 0)
+        self.assertEqual(mesh['sonde']['hote_destinataire'], 'ameesh-agents-1')
 
     def test_sonde_appelee_en_json_avec_le_commit(self):
         self.creer_poste_installe()
@@ -812,6 +1026,13 @@ class StagingSignalTest(unittest.TestCase):
         for ligne in appels:
             self.assertIn('--json', ligne)
             self.assertIn('--sha %s' % self.sha, ligne)
+            if '--hote manaty-mesh-1 ' in ligne:
+                self.assertIn('--serveur', ligne)
+            else:
+                self.assertNotIn('--serveur', ligne)
+        serveur = [l for l in appels if '--serveur' in l]
+        self.assertEqual(len(serveur), 1, appels)
+        self.assertIn('--hote manaty-mesh-1 ', serveur[0])
 
     def test_echec_et_retour_n_emettent_aucun_signal(self):
         (self.state / 'scenario').write_text('ko=manaty-mesh-1:controler\n')
@@ -892,7 +1113,9 @@ exit 0
 '''
 
 #: venv du poste : distingue la notification, le signal actif et la sonde ;
-#: la sonde rend le rapport JSON que staging.sh journalise (preuve #1323)
+#: la sonde rend le rapport JSON que staging.sh journalise (preuve #1323) et
+#: reproduit la topologie reelle : manaty-mesh-1 (serveur) est a 0 persona et
+#: sa sonde est croisee vers une VM, les autres hotes remettent localement.
 VENV_PYTHON = r'''#!/usr/bin/env bash
 set -euo pipefail
 state=${FAKE_STATE:?}
@@ -926,7 +1149,11 @@ if [ "$cible" = jamais ]; then
   printf '{"hote": "%s", "verdict": "sans-sonde", "sha": "%s", "sonde": null, "pourquoi": "sonde desactivee"}\n' "$hote" "$sha"
   exit 0
 fi
-printf '{"hote": "%s", "verdict": "ok", "sha": "%s", "personas": 2, "souffrance": [], "boites_mortes": [], "sonde": {"message": %s, "destinataire": "%s", "delai_s": 2.0}, "pourquoi": null}\n' "$hote" "$sha" 7 quidu
+if [ "$hote" = manaty-mesh-1 ]; then
+  printf '{"hote": "%s", "verdict": "ok", "sha": "%s", "personas": 0, "souffrance": [], "boites_mortes": [], "sonde": {"message": %s, "destinataire": "%s", "delai_s": 2.0, "hote_destinataire": "ameesh-agents-1"}, "pourquoi": null}\n' "$hote" "$sha" 7 quidu
+  exit 0
+fi
+printf '{"hote": "%s", "verdict": "ok", "sha": "%s", "personas": 2, "souffrance": [], "boites_mortes": [], "sonde": {"message": %s, "destinataire": "%s", "delai_s": 2.0, "hote_destinataire": "%s"}, "pourquoi": null}\n' "$hote" "$sha" 7 quidu "$hote"
 '''
 
 VENV_AMEESH = r'''#!/usr/bin/env bash
