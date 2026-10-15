@@ -735,17 +735,19 @@ class _Remise:
             if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
                 break
             lus = len(ids)
-            # Tous les candidats lus sont passés : une réservation active est
-            # écartée par le SQL avant sa borne, elle ne mange pas la place (#811 R3).
+            # Les réservations actives (y compris celles de notre jeton) sont
+            # écartées avant la LIMIT SQL. Compléter depuis une page plus large
+            # si elles occupaient le préfixe lu, même en mono-projet (#811 R3).
             rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
                                 ids=ids, porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
                                 limit=borne - len(self.msgs))
             self.msgs.extend(mail.normalize(row) for row in rows)
+            self.ouverte = bool(self.msgs)
             besoin = max(mail.UNREAD_LIMIT, besoin * 2, lus * 2)
-        self.ouverte = bool(self.msgs)
         # une réservation pleine peut cacher des non-lus : on le dit (au pire
         # pour rien, le prochain hook reviendra par le chemin complet).
         self.reste = 1 if len(self.msgs) >= borne else 0
+        return self.msgs
         return self.msgs
 
     def _deliverable(self, borne: int) -> list[int]:
