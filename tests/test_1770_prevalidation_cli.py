@@ -25,8 +25,9 @@ def plan_canon(head: str = A) -> dict:
     return {
         "schema": pv.PLAN_SCHEMA, "head": head,
         "map": {"commit": B, "used": True, "problem": None, "age_h": 1.0},
-        "selection": {"mode": "impacted", "why": "",
-                      "modules": ["test_a", "test_cluster"]},
+        # forme réelle : les comptes dans `selection`, les listes dans `parts`
+        "selection": {"mode": "impacted", "why": "", "modules": 2, "impacted": 2,
+                      "contract": 1, "selected": 2, "skipped": 0},
         "sure": True, "phase2_safe": True, "unsure": [], "phase2_why": "",
         "contract": ["test_cluster"],
         "classes": {"test_a": ["P0", "modifié"], "test_cluster": ["P1", "contrat"],
@@ -75,14 +76,16 @@ class MeetsCanonTest(unittest.TestCase):
 
     def test_module_hors_classes_refuse(self):
         plan = plan_canon()
-        plan["selection"]["modules"].append("test_autre")
+        plan["parts"]["psycopg"][0]["modules"].append("test_autre")
+        plan["selection"]["selected"] = 3
         ok, why = pv.meets_canon(plan, params())
         self.assertFalse(ok)
         self.assertIn("hors des classes", why)
 
     def test_contrat_absent_de_la_selection_refuse(self):
         plan = plan_canon()
-        plan["selection"]["modules"] = ["test_a"]
+        plan["parts"]["psycopg"][0]["modules"] = ["test_a"]
+        plan["selection"]["selected"] = 1
         ok, why = pv.meets_canon(plan, params())
         self.assertFalse(ok)
         self.assertIn("absents", why)

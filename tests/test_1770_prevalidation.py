@@ -20,8 +20,11 @@ def plan_sain() -> dict:
     return {
         "schema": pv.PLAN_SCHEMA, "head": A,
         "map": {"commit": B, "used": True, "problem": None, "age_h": 1.0},
-        "selection": {"mode": "impacted", "why": "",
-                      "modules": ["test_a", "test_cluster", "test_b"]},
+        # forme réelle du plan L161f : `selection` ne porte que des comptes,
+        # les listes de modules sont dans les parts (#1770, défaut trouvé en
+        # relisant un vrai plan : le compte lu comme une liste faisait échouer)
+        "selection": {"mode": "impacted", "why": "", "modules": 3, "impacted": 3,
+                      "contract": 1, "selected": 3, "skipped": 0},
         "sure": True, "phase2_safe": True, "unsure": [], "phase2_why": "",
         "contract": ["test_cluster"],
         "parts": {"psycopg": [{"part": 1, "of": 2, "modules": ["test_a"], "estimate_s": 10},
@@ -50,6 +53,8 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(sel.card_commit, B)
         self.assertEqual(len(sel.parts), 2)
         self.assertIn("test_cluster", sel.modules)
+        # les modules viennent des parts, pas du compte `selection.modules`
+        self.assertEqual(sel.modules, ("test_a", "test_cluster", "test_b"))
 
     def test_carte_absente_refusee(self):
         plan = plan_sain()
@@ -65,7 +70,8 @@ class SelectionTest(unittest.TestCase):
 
     def test_repli_suite_complete_refuse(self):
         plan = plan_sain()
-        plan["selection"] = {"mode": "full", "why": "fondation modifiée", "modules": []}
+        plan["selection"] = {"mode": "full", "why": "fondation modifiée",
+                             "modules": 0, "selected": 0}
         sel = pv.selection(plan, head=A)
         self.assertIn("selection-full", sel.causes)
 
@@ -103,11 +109,12 @@ class SelectionTest(unittest.TestCase):
         sel = pv.selection(plan, head=A)
         self.assertIn("selection-unsafe", sel.causes)
 
-    def test_module_hors_parts_refuse(self):
+    def test_compte_de_modules_incoherent_refuse(self):
         plan = plan_sain()
-        plan["parts"]["psycopg"] = [{"part": 1, "of": 1, "modules": ["test_a"]}]
+        plan["selection"]["selected"] = 5
         sel = pv.selection(plan, head=A)
         self.assertIn("selection-unsafe", sel.causes)
+        self.assertIn("incohérent", sel.why)
 
 
 class ProofTest(unittest.TestCase):
