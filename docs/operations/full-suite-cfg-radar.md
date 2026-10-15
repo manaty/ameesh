@@ -10,10 +10,26 @@ le code d'avant refuse la clé inconnue `full_suite` (`radar.parse_settings`
 lève « `radar.projects.<p>`: unknown key(s) full_suite »), et la configuration
 de l'hôte deviendrait illisible pour l'exécuteur.
 
-**État au 2026-10-15 :** #756 est **fusionné** (`main` `313d73458`, paquet 19:55
-fusionné à 19:37Z) ; le **déploiement** du build qui le porte reste à faire
-(le build installé ici, `ameesh 1.11.1`, ne connaît pas encore `full_suite`).
-Tant que ce déploiement n'a pas eu lieu : **ne rien appliquer sur les hôtes**.
+**État au 2026-10-15 21:5xZ :**
+
+* #756 est **fusionné** (`main` `313d73458`, paquet 19:55 fusionné à 19:37Z) et
+  la release **1.11.2** le porte (`b63e0bae`).
+* **Déploiement du build** : **fait sur `ameesh-agents-1`** — relevé de première
+  main de `mty-amh-qa-01` à 21:41Z, avec l'interpréteur de l'exécuteur
+  (`/home/ameesh/.local/share/ameesh/venv/bin/python3`) :
+  `'full_suite' in radar.PROJECT_KEYS` → `True` (`site-packages/ameesh` mtime
+  2026-10-15 21:37:38Z). **Pas encore fait sur `pc-smichea`** : relevé du pilote
+  à 21:5xZ, `ameesh 1.11.1`, `full_suite` absent.
+* **Décision pilote du 15/10 21:47Z** : l'activation #916 est **retenue sur
+  `pc-smichea` seul**, hôte des contrôles de release ; **pas de `radar` ni de
+  clones supplémentaires sur les VM** tant que ces contrôles ne leur sont pas
+  confiés. Opérateur pc désigné : `ameesh-dev1` ; vérification : `mty-amh-qa-01`.
+  Le §3.2 (VM) est donc **hors périmètre de cette activation** : ne rien y
+  appliquer ; il reste la procédure à suivre si un contrôle de release y est un
+  jour confié.
+* **Ne rien appliquer sur `pc-smichea`** avant un déploiement sain de
+  1.11.2/#756, vérifié sur l'hôte avec l'interpréteur de l'exécuteur (§4.1) :
+  la configuration deviendrait illisible pour l'exécuteur (§7).
 
 Objet : la porte de release L756 lit `radar.projects.<projet>.full_suite` sur
 l'hôte ; aucune déclaration n'existe aujourd'hui, donc toute release qui exige
@@ -103,23 +119,37 @@ Preuve d'un vert complet sur la suite : exécution **38350245246** (`push`,
   dispatch SQL. À trancher par l'orchestrateur Nexlink si la procédure de
   release l'exige.
 
-## 3. Carte — les hôtes
+## 3. Carte — l'hôte retenu : pc-smichea
 
-| Hôte | `repo` ameesh | `repo` nexlink |
-|---|---|---|
-| pc-smichea | `~/development/manaty/ameesh` | `~/development/manaty/nexlink` |
-| ameesh-agents-1 | `~/work/ameesh-release` | `~/work/nexlink-release` |
-| ameesh-agents-2 | `~/work/ameesh-release` | `~/work/nexlink-release` |
+| Hôte | `repo` ameesh | `repo` nexlink | Périmètre #916 |
+|---|---|---|---|
+| pc-smichea | clone de l'acteur qui lance la porte (voir ci-dessous) | idem | **retenu** (décision pilote 15/10 21:47Z) |
+| ameesh-agents-1 | `~/work/ameesh-release` | `~/work/nexlink-release` | hors périmètre (§3.2) |
+| ameesh-agents-2 | `~/work/ameesh-release` | `~/work/nexlink-release` | hors périmètre (§3.2) |
 
-Les chemins de pc-smichea sont ceux cités par `BASCULE.md` et les cartes
-d'hôte : **à confirmer sur l'hôte** (`ls -d ~/development/manaty/ameesh
-~/development/manaty/nexlink`) avant d'écrire. Sur les VM, il n'existe pas de
-clone partagé ameesh : créer un clone dédié (voir §5). `repo` est un chemin
-**de l'hôte**, lu par l'exécuteur et par `ameesh release check`, quel que soit
-l'agent qui agit ; il doit contenir la branche de release et les refs de la
-cible, et être **fetché** avant un contrôle (la porte ne fetche pas).
+`repo` est un chemin **de l'hôte**, lu par l'exécuteur et par
+`ameesh release check`, quel que soit l'agent qui agit ; il doit contenir la
+branche de release et les refs de la cible, et être **fetché** avant un contrôle
+(la porte ne fetche pas).
+
+Sur `pc-smichea`, il n'y a **pas de clone partagé unique** : la fiche Host
+(`canon/hotes/pc-smichea.md`) donne des dossiers **par agent** —
+`policy.work_roots` : `ameesh: ~/development/manaty/{agent}`,
+`nexlink: ~/development/manaty/nexlink-{agent}` — avec les exceptions
+`work_dirs` : `mesh-design` → `~/development/manaty/ameesh-claude3`,
+`orchestrateur` → `~/development/manaty`, `auditeur` →
+`~/development/manaty/auditeur`, `bureau` → `~/Work`. Avant d'écrire, relever le
+clone **réellement lu** par l'acteur qui lance les contrôles de release
+(candidats ci-dessus ; `~/development/manaty/ameesh` est le chemin cité par
+`BASCULE.md` pour le `pip install -e` de l'orchestrateur) et le confirmer au
+pilote en cas d'ambiguïté.
 
 ### 3.1 pc-smichea
+
+**Périmètre et acteurs** : seul hôte retenu par la décision pilote du 15/10
+21:47Z ; opérateur désigné `ameesh-dev1` (pc-smichea), vérification
+`mty-amh-qa-01`. Aucune clôture de #916 avant le contrôle à blanc réussi (§5.5)
+et sa trace (§5.6).
 
 **Quel fichier ?** La déclaration doit être dans le fichier **réellement lu par
 le processus qui exécute la porte** (land/`release check`) : `AMEESH_CONFIG`
@@ -140,7 +170,7 @@ conflits) : **ajouter** `github` et `full_suite` aux projets existants, sans
 "radar": {
   "projects": {
     "ameesh": {
-      "repo": "~/development/manaty/ameesh",
+      "repo": "<clone relevé en §3>",
       "github": "manaty/ameesh",
       "full_suite": [
         {"path": ".github/workflows/tests.yml",
@@ -149,7 +179,7 @@ conflits) : **ajouter** `github` et `full_suite` aux projets existants, sans
       ]
     },
     "nexlink": {
-      "repo": "~/development/manaty/nexlink",
+      "repo": "<clone relevé en §3>",
       "github": "manaty/nexlink",
       "full_suite": [
         {"path": ".github/workflows/backend-suite.yml", "jobs": ["backend"]},
@@ -163,22 +193,30 @@ conflits) : **ajouter** `github` et `full_suite` aux projets existants, sans
 }
 ```
 
-### 3.2 ameesh-agents-1 et ameesh-agents-2
+### 3.2 ameesh-agents-1 et ameesh-agents-2 — **hors périmètre de l'activation #916**
+
+**Ne rien appliquer sur les VM** (décision pilote du 15/10 21:47Z : pas de
+`radar` ni de clones supplémentaires tant que les contrôles de release ne leur
+sont pas confiés). Ce bloc est conservé pour mémoire, à n'activer que si un
+`ameesh release check` y est réellement attendu et que le pilote le décide.
 
 Même bloc, avec `"repo": "~/work/ameesh-release"` et
 `"repo": "~/work/nexlink-release"`. Sur ces VM, aucune unité d'exécuteur ne
 pose `AMEESH_CONFIG` (relevé du 2026-10-15 sur `ameesh-agents-1` :
 `systemctl --user show 'ameesh-runner-agent@*' -p Environment -p DropInPaths`,
 aucun drop-in ne le déclare) : le fichier lu est
-`~/.config/ameesh/config.json`.
+`~/.config/ameesh/config.json`. Sur `ameesh-agents-1`, le déploiement de
+1.11.2/#756 est fait (relevé 21:41Z, `full_suite` connu de l'interpréteur de
+l'exécuteur) ; il n'y a en revanche **pas** de clone `~/work/ameesh-release` ni
+`~/work/nexlink-release` — les créer seulement si le périmètre s'ouvre.
 
 **Effet de bord** : la clé `radar` désigne l'hôte pour le **radar de conflits**
 (L160b). La déclarer sur une VM y lance un passage après chaque relevé de
 branches (toutes les ~300 s), avec courrier aux assignés sur conflit nouveau —
-le premier passage signale tous les conflits courants. Si ce bruit n'est pas
-voulu, ne déclarer que sur l'hôte qui exécute la file de fusion et les
-contrôles de release (pc-smichea), et n'ajouter une VM que si un
-`ameesh release check` y est réellement attendu.
+le premier passage signale tous les conflits courants. C'est précisément ce que
+la décision du 15/10 écarte : garder `radar` sur le seul hôte qui exécute la
+file de fusion et les contrôles de release (pc-smichea), et n'ajouter une VM que
+si un `ameesh release check` y est réellement attendu.
 
 ## 4. Prérequis d'application (ordre imposé)
 
@@ -190,7 +228,19 @@ contrôles de release (pc-smichea), et n'ajouter une VM que si un
    # attendu : True
    ```
 
-2. Le clone de chaque projet existe et est à jour. Sur une VM :
+   État au 15/10 21:5xZ : **True sur `ameesh-agents-1`** (relevé 21:41Z) ;
+   **encore False sur `pc-smichea`** (1.11.1) — c'est le prérequis ouvert de
+   l'activation, à re-vérifier sur pc avant toute écriture.
+
+2. Le clone de chaque projet existe et est à jour. Sur pc-smichea, c'est le
+   clone de l'acteur qui lance la porte (relevé en §3) ; le fetch précède le
+   contrôle :
+
+   ```bash
+   git -C <clone relevé> fetch --prune origin
+   ```
+
+   Sur une VM (hors périmètre, §3.2) :
 
    ```bash
    git clone --filter=blob:none https://github.com/manaty/ameesh.git ~/work/ameesh-release
@@ -202,12 +252,16 @@ contrôles de release (pc-smichea), et n'ajouter une VM que si un
 3. `gh` authentifié sur l'hôte (la porte lit l'API : workflows, exécutions,
    jobs).
 
-## 5. Runbook (après #756 seulement)
+## 5. Runbook d'application — pc-smichea seulement (prérequis §4 satisfaits)
+
+Opérateur : `ameesh-dev1` (pc-smichea) ; vérification : `mty-amh-qa-01`. Aucune
+clôture de #916 avant le contrôle à blanc (§5.5) réussi et sa trace (§5.6).
+Aucun geste sur les VM (§3.2).
 
 1. **Sauvegarde** du fichier retenu en §3.1 :
 
    ```bash
-   F=~/.config/ameesh/config.json   # pc-smichea : le profil AMEESH_CONFIG de l'unité
+   F=~/.config/ameesh/config.json   # pc-smichea : le profil AMEESH_CONFIG de l'unité s'il est posé
    cp -a "$F" "$F.bak-$(date +%F-%H%M)"
    ```
 
@@ -257,8 +311,10 @@ contrôles de release (pc-smichea), et n'ajouter une VM que si un
    Quand un lot de release gelé est disponible, le contrôle complet est
    `ameesh release check <lot> --json` (périmètre, base, gel, suite).
 
-6. **Trace** : noter dans #916 l'hôte, la date, le sha de configuration et la
-   sortie du contrôle à blanc.
+6. **Trace** : noter dans #916 l'hôte, la date, le **fichier** modifié, le sha
+   ou l'empreinte de la configuration avant/après, et la sortie du contrôle à
+   blanc. Le vérificateur (`mty-amh-qa-01`) rejoue la validation §5.3 et le
+   contrôle §5.5 sur l'hôte avant clôture.
 
 ## 6. Retour arrière
 
@@ -300,5 +356,17 @@ dépôt, aucun geste GitHub.
   encore appliqué** : le build installé (`ameesh 1.11.1`) ne connaît pas
   `full_suite` (`'full_suite' in radar.PROJECT_KEYS` → `False`) — la porte
   restante est le déploiement du build qui porte #756.
+* **Relevés du 2026-10-15 (périmètre et prérequis)** : décision pilote 21:47Z —
+  activation **retenue sur pc-smichea seul**, opérateur `ameesh-dev1`,
+  vérification `mty-amh-qa-01`, §3.2 (VM) hors périmètre ; déploiement
+  **fait sur `ameesh-agents-1`** (relevé 21:41Z, `'full_suite' in
+  radar.PROJECT_KEYS` → `True` avec l'interpréteur de l'exécuteur) ; **encore
+  à faire sur `pc-smichea`** (relevé 21:5xZ, `ameesh 1.11.1`). Chemins de
+  pc-smichea : pas de clone partagé unique, `repo` = clone de l'acteur qui
+  lance la porte, à relever (§3).
+* **Mise à jour du 2026-10-15 22:0xZ** (qa-01) : runbook aligné sur ce
+  périmètre (pc seul, §3.2 hors périmètre, chemins/acteurs, prérequis pc
+  ouvert) ; branche rebasée sur `main` `b63e0bae` ; **aucune CI** (docs seuls),
+  aucun geste de production.
 * **Aucune écriture** : pas de configuration modifiée, pas de run CI créé,
   pas de PR ouverte.
