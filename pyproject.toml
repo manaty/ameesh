@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ameesh"
-version = "1.10.0"
+version = "1.11.1"
 description = "Coordination d'équipes mixtes humains et agents IA : exécuteur multi-harnais, canon OKF, fil lisible, actions sous porte et approbations signées."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -53,6 +53,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json",
-          "consignes/*.md", "ui/static/*"]
+          "consignes/*.md", "deepseek_cgroup.cjs", "ui/static/*"]
 "ameesh.mediated_executor" = ["contract.json"]
 "ameesh.approve" = ["static/*.js", "static/*.css"]

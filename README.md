@@ -138,7 +138,8 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
                [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
                                                # (90 s), --urgent sans délai, --ack et --cc sans réveil
-                                               # --lot n'assigne que sur --assign ou orchestrateur déclaré (#964)
+                                               # --lot : étiquette de fil ; confie un lot libre (historique
+                                               # L94, ou --assign #964), jamais un lot tenu par un agent (#1066)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,

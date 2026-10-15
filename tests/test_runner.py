@@ -541,6 +541,49 @@ class RunnerTest(PgTestCase):
                                capture_output=True, text=True, check=True)
         self.assertEqual(garde.stdout.strip(), autre)
 
+    def test_config_partagee_signalee_jamais_utilisee(self):
+        """#896 : un `user.name` laissé dans le `.git/config` partagé est signalé.
+
+        Le tour ne s'en sert jamais (#834) ; le signalement couvre ce qui
+        partirait hors harnais depuis ce dossier (incident du 13/10/2026).
+        """
+        autre, nom = "autre-agent", "gitident-garde"
+        commun = os.path.join(self.tmp, "commun-garde")
+        w = self._cwd(nom)
+        base = dict(os.environ, GIT_AUTHOR_NAME="essai",
+                    GIT_AUTHOR_EMAIL="essai@ameesh.invalid",
+                    GIT_COMMITTER_NAME="essai",
+                    GIT_COMMITTER_EMAIL="essai@ameesh.invalid")
+        subprocess.run(["git", "init", "-q", commun], check=True)
+        subprocess.run(["git", "-C", commun, "commit", "-q", "--allow-empty",
+                        "-m", "base"], check=True, env=base)
+        subprocess.run(["git", "-C", commun, "config", "user.name", autre], check=True)
+        subprocess.run(["git", "-C", commun, "config", "user.email",
+                        "%s@ameesh.invalid" % autre], check=True)
+        subprocess.run(["git", "-C", commun, "worktree", "add", "-q", "-b", "garde", w],
+                       check=True)
+        env = self.env(AMEESH_TEST_RUN="true")
+        for var in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME",
+                    "GIT_COMMITTER_EMAIL"):
+            env.pop(var, None)  # le lanceur des tests ne prête pas son identité
+        self.register(nom, "claude", cwd=w, prompt="tour avec configuration partagée")
+        proc = self.runner("--once", "--agents", nom, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("shared git identity", proc.stdout)
+        self.assertIn(autre, proc.stdout)
+        # l'identité du tour reste celle du bail, pas celle du dépôt
+        env_tour = [t for t in self.turns() if "env" in t][-1]["env"]
+        self.assertEqual(env_tour["GIT_AUTHOR_NAME"], nom)
+
+        # même dépôt, un agent qui porte le nom de la configuration : rien à signaler
+        chez_lui = self._cwd(autre)
+        subprocess.run(["git", "-C", commun, "worktree", "add", "-q",
+                        "-b", "accord", chez_lui], check=True)
+        self.register(autre, "claude", cwd=chez_lui, prompt="tour de l'agent nommé")
+        proc = self.runner("--once", "--agents", autre, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("shared git identity", proc.stdout)
+
     def test_echeance_atteinte_arrete_sans_appeler_la_base(self):
         """Verdict codex3 B5a : plus de budget plancher après l'échéance.
 
@@ -667,7 +710,17 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
-        env = self.env(AMEESH_TEST_SLEEP="12", AMEESH_LEASE_TTL="3")
+        # Le témoin mesure la clôture au bail perdu, pas la porte d'hôte réelle
+        # de la machine (en CI, l'hôte se retire : draining, user_active).
+        # Garde factice : un hôte prêté exige `file`, mais l'état lu est celui
+        # du banc (disponible), pas le fichier réel de l'hôte.
+        gate_state = os.path.join(self.tmp, "gate-available.json")
+        with open(gate_state, "w", encoding="utf-8") as fh:
+            fh.write('{"schema": "ameesh-host-state/1", "state": "available", "seq": 1}\n')
+        env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
+                       AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
+                       AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
+                       AMEESH_HOST_GATE_FALLBACK="available")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
@@ -675,7 +728,7 @@ class RunnerTest(PgTestCase):
                 "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
                 "WHERE name = 'perdu'")
             self.wait_for(
-                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=15)
+                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=60)
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=10)

@@ -36,6 +36,7 @@ READING_ROW = dict(READING, id=77, sampled_ts=TS)
 ARGS = {  # op: (args, kwargs, résultat)
  "agents.claimable": ([HOST, [AG]], {"require_responsible": False}, [{**ROW, "status": "queued"}]),
  "agents.get": ([AG], {}, ROW),
+ "agents.resolve_name": ([AG], {}, AG),
  "agents.cwd_used": (["/var/lib/ameesh-exec/work/inge-front/42", AG], {}, False),
  "agents.harnesses": ([], {}, {AG: "dsh"}),
  "agents.set_status": ([AG, "idle", "en attente", None], {}, None),
@@ -98,6 +99,11 @@ ARGS = {  # op: (args, kwargs, résultat)
                                   "resets_at": None, "window_s": 3600}]], {}, 1),
  "turn_resources.open_turn": (["turn-77", AG, HOST], {"pgid": 4188, "label": "dsh"}, None),
  "turn_resources.close_turn": (["turn-77"], {"orphan": False}, None),
+ "turn_resources.running_started_before": ([HOST, 1791640000.0], {"after_id": 0, "limit": 200}, []),
+ # Subscription is rendered below as GET /events, never as an /op case.
+ # The entry is kept for completeness of the table (one row per contract
+ # op): the loop below skips the "events" transport and never consumes it.
+ "wakeups.subscribe": ([list(E.CHANNELS)], {}, None),
  "hosts.record": ([READING], {}, dict(READING_ROW)),
  "hosts.latest": ([HOST], {}, dict(READING_ROW)),
  "hosts.current": ([HOST], {}, [dict(READING_ROW)]),
@@ -107,6 +113,12 @@ ARGS = {  # op: (args, kwargs, résultat)
  "threads.index": ([], {"project": "site", "lot": "812", "transport": "github", "host": HOST,
                          "location": "owner/repo#812", "entry_id": "c-1001", "mailbox_ids": [812],
                          "author": "agent:" + AG, "excerpt": "PR relue.", "ts": TS, "trace": {"comment_id": 1001}}, None),
+ # L361b : le census d'un fil d'hôte médié, verrou + recomptage + expiration en une opération
+ "threads.recount": ([], {"project": "site", "lot": "812", "transport": "github", "host": HOST,
+                          "location": "owner/repo#812", "kept": 7,
+                          "last": {"entry_id": "site/812#3800", "mailbox_id": 812,
+                                   "author": "agent:" + AG, "excerpt": "PR relue.", "ts": TS},
+                          "end": 4096}, 4096),
  "work.mark_delegate_turn": ([AG, [812], "délégation : tour de inge-front sur le lot"], {}, [812]),
  # session
  "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True}),
@@ -162,6 +174,14 @@ for name, op in c.operations.items():
     cases = families.setdefault(op.domain, [])
     cases.append(case(name + "/ok", name, req.to_json(), 200,
                       C.OpResult(value, TS).to_json(), route=route, token=token, key=key))
+    if name == "threads.index":
+        uncounted = C.OpRequest(name, tuple(args), {**kwargs, "count": False}, fence)
+        # Historical literal Idempotency-Key of threads.index/not-counted,
+        # already frozen in threads.json: kept verbatim, never recomputed,
+        # so the golden JSON does not change.
+        cases.append(case(name + "/not-counted", name, uncounted.to_json(), 200,
+                          C.OpResult(value, TS).to_json(), route=route, token=token,
+                          key="1e3e18c3-da1e-5396-8b24-aa2548f1dc06"))
     if name in ("leases.begin_turn", "agents.set_status", "mailbox.reserve", "leases.set_marked_block"):
         cases.append(case(name + "/bail-perdu", name, req.to_json(), 200,
                           C.OpResult(op.refusal, TS, fenced=True).to_json(), route=route,

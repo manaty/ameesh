@@ -9,6 +9,8 @@
     scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
                                [--summary F]
     scripts/test-plan.py tally leaks.json [leaks.json…]
+    scripts/test-plan.py couverture [--repo OWNER/REPO] [--ref REFS] [--sha SHA]
+                                    [--api URL] [--github-output F] [--summary F]
 
 `plan` runs once per CI run (job `plan` of .github/workflows/tests.yml) and
 decides, for every test module, its class and the parts it runs in; every
@@ -75,6 +77,29 @@ foundation still marks the plan unsure, and the version-only exemption of
 A file removed outside documentation marks it unsure as well: the map knows
 the readers it measured, never the ones it cannot see (an import by a
 computed name, a config read by the code).
+
+**A block without a measure does not force the full suite** (#1339). A new
+block (a file the map does not know, a function or a class it has never
+seen) and a changed block no test executes are covered as soon as a test is
+*proven* to load their file: the modules the map measured on it, or — when
+none has executed it — the tests the *guaranteed* import graph reaches
+(`src/ameesh/**` and `tests/**` at HEAD; a test that imports a changed
+module which imports the new file counts, through that module's measured
+importers; only the imports the module body executes itself count). Every
+test that *may* load the file joins the selection too, the complete import
+graph's lazy and conditional imports included: a new block has no measured
+caller, and a test can reach it by a computed name (`dir()` then `getattr`)
+as soon as it has loaded the file. The selection falls back to the full
+suite when no test is proven to load such a file: a dynamic import
+(`importlib.import_module`) leaves no static edge, an import under `if
+TYPE_CHECKING:` never runs at runtime, a lazy, conditional or `with`-guarded
+import is only a candidate, and a from-import proves the module it names,
+never a member as a file (`from ameesh import new_feature` loads nothing
+when the package `__init__` binds `new_feature = object()`; `import
+ameesh.new_feature` and `from ameesh.new_feature import x` keep the proof) —
+none of them certifies that a test loads the file, so the full suite stays
+(`phase2_why` names it).
+
 Any error while reading the map gives the fallback plan, never a failure.
 
 **Changed lines without a test**: an existing block whose fingerprint
@@ -91,6 +116,22 @@ P3). `leaks` reads the plan and the part streams of a run and writes one
 record (`ameesh-test-leaks/1`), kept as the `leaks` artifact; `tally`
 aggregates records for the two-week review (L161i): phase 2 requires fewer
 than 1 leak per 50 PRs.
+
+**Coverage of a package push** (`couverture`, canon §12). A package
+integration branch pushed while its PR is open used to launch two full
+suites — the `push integration/**` run and the `pull_request` run of
+tests.yml — both carrying the required `tests` check on the same head; the
+cancelled one left its aggregate red (incident #1342, PR #1050). tests.yml
+no longer triggers on `push integration/**`; the gate
+`.github/workflows/paquet.yml` reads the branch's open pull requests (GitHub
+API, read-only) and asks this command whether one carries exactly the pushed
+head (`head.sha == github.sha`, base `main`, `release/**` or
+`integration/**`). If so, the suite is already carried by that PR's
+`pull_request` run and the gate calls nothing; otherwise — no PR, another
+head, a base outside tests.yml's scope, unreadable API, incomplete context —
+it calls tests.yml (`workflow_call`) so a push without a PR keeps its full
+suite. The decision never reads a run: no success is inferred from another
+run's existence, and the fallback is always "the suite runs".
 """
 from __future__ import annotations
 
@@ -107,6 +148,8 @@ import pathlib
 import re
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
@@ -247,6 +290,259 @@ def existed(path: str, rev: str, repo: pathlib.Path = REPO) -> bool:
     return True
 
 
+# -- static imports (#1339) -----------------------------------------------
+
+def _dotted(path: str) -> str:
+    """Dotted module name of a repository Python file, `""` outside the two
+    measured packages: `src/ameesh/x/y.py` → `ameesh.x.y`, `tests/test_a.py` →
+    `tests.test_a`; an `__init__.py` names its package."""
+    p = pathlib.PurePosixPath(path)
+    if p.suffix != ".py":
+        return ""
+    parts = list(p.parts)
+    if parts[:2] == ["src", "ameesh"]:
+        parts = parts[1:]
+    elif parts[:1] != ["tests"]:
+        return ""
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    else:
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def _module_files(name: str, known: set[str]) -> set[str]:
+    """The repository files a dotted name may designate: the module itself, its
+    package `__init__` and every parent package (importing a submodule runs
+    each of them). `known` limits the result to the files of this tree."""
+    if not name:
+        return set()
+    parts = name.split(".")
+    root = "src" if parts[0] == "ameesh" else ""
+    found: set[str] = set()
+    for i in range(1, len(parts) + 1):
+        base = "/".join(([root] if root else []) + parts[:i])
+        for candidate in (f"{base}.py", f"{base}/__init__.py"):
+            if candidate in known:
+                found.add(candidate)
+    return found
+
+
+def _type_checking_names(tree: ast.AST) -> set[str]:
+    """Names bound to `typing.TYPE_CHECKING`: the plain one and any alias
+    (`from typing import TYPE_CHECKING as TC`)."""
+    names = {"TYPE_CHECKING"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "typing":
+            for alias in node.names:
+                if alias.name == "TYPE_CHECKING":
+                    names.add(alias.asname or alias.name)
+    return names
+
+
+def _never_runs(test: ast.expr, names: set[str]) -> bool:
+    """Whether an `if` guard is false when the code runs: `TYPE_CHECKING`
+    (always false at runtime, whatever `typing` calls it) or a false constant.
+    `not TYPE_CHECKING` is true, so it is not caught here."""
+    if isinstance(test, ast.Constant):
+        return not test.value
+    if isinstance(test, ast.Name):
+        return test.id in names
+    if isinstance(test, ast.Attribute):
+        return test.attr == "TYPE_CHECKING"
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return any(_never_runs(value, names) for value in test.values)
+    return False
+
+
+class _RuntimeImports(ast.NodeVisitor):
+    """The import statements that may run, and those the module certainly runs
+    when it is imported.
+
+    The body of `if TYPE_CHECKING:` — and of any other guard that never runs,
+    `if False:` — loads nothing and is left out; everything else stays, lazy
+    imports included: they may run. `guaranteed` keeps only the imports the
+    module body executes itself: at the top level (a class body runs at
+    import, a function body does not), outside any condition, loop, `try` or
+    `with` — a `with` body may never run (its `__enter__` may fail, or an
+    earlier statement may raise and be suppressed), so it is no proof.
+    A lazy or conditional import alone is a possible load, never a proof
+    (relecture Codex, B2 résiduel)."""
+
+    def __init__(self, names: set[str]) -> None:
+        self.names = names
+        self.imports: list[ast.stmt] = []
+        self.guaranteed: list[ast.stmt] = []
+        self._deferred = 0  # inside a function or lambda body: not run at import
+        self._guarded = 0   # inside a condition, a loop or a try: may not run
+
+    def _visit_function(self, node: ast.AST) -> None:
+        self._deferred += 1
+        self.generic_visit(node)
+        self._deferred -= 1
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+    visit_Lambda = _visit_function
+
+    def _visit_guarded(self, node: ast.AST) -> None:
+        self._guarded += 1
+        self.generic_visit(node)
+        self._guarded -= 1
+
+    visit_For = _visit_guarded
+    visit_AsyncFor = _visit_guarded
+    visit_While = _visit_guarded
+    visit_Try = _visit_guarded
+    visit_TryStar = _visit_guarded
+    visit_Match = _visit_guarded
+    visit_With = _visit_guarded
+    visit_AsyncWith = _visit_guarded
+
+    def visit_If(self, node: ast.If) -> None:
+        if _never_runs(node.test, self.names):
+            # the guard never runs: only its `else` does (at module level)
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self._visit_guarded(node)
+
+    def _record(self, node: ast.stmt) -> None:
+        self.imports.append(node)
+        if not self._deferred and not self._guarded:
+            self.guaranteed.append(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self._record(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self._record(node)
+
+
+def _imported_files(source: str, path: str, known: set[str], *,
+                    guaranteed: bool = False) -> set[str]:
+    """The repository files `source` may load at runtime: any depth, a lazy
+    import included (it may run). An import under `if TYPE_CHECKING:` runs
+    never — the flag is false at runtime — so it leaves no edge and never
+    certifies that a test loads a new file (relecture Codex, B2). With
+    `guaranteed`, only the imports executed by the module body itself are
+    kept: a lazy, conditional or `with`-guarded import may load the file, it
+    does not prove that importing `source` loads it (B2 résiduel). A
+    from-import (`from ameesh import db`) proves its resolved module (the
+    package `ameesh`, whose `__init__` runs), never the member as a file:
+    the package may already bind the name (`db = object()`), and then the
+    submodule is not imported at all (B2 résiduel) — `import ameesh.db` and
+    `from ameesh.db import x` name the module itself and keep the proof.
+    Only `ameesh.*` and `tests.*` names are resolved; a syntax error leaves
+    no edge."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return set()
+    dotted = _dotted(path)
+    if pathlib.PurePosixPath(path).name == "__init__.py":
+        package = dotted
+    else:
+        package = dotted.rsplit(".", 1)[0] if "." in dotted else ""
+    names: set[str] = set()
+    collector = _RuntimeImports(_type_checking_names(tree))
+    collector.visit(tree)
+    for node in (collector.guaranteed if guaranteed else collector.imports):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                base = package
+                for _ in range(node.level - 1):
+                    base = base.rsplit(".", 1)[0] if "." in base else ""
+                module = f"{base}.{module}" if module else base
+            if module:
+                names.add(module)
+                # Un from-import charge son module ; un membre peut déjà être
+                # un objet du module (`from ameesh import db` avec
+                # `db = object()` dans `__init__`), donc un fichier enfant
+                # n'est qu'une cible possible, jamais une preuve.
+                if not guaranteed:
+                    names.update(f"{module}.{alias.name}" for alias in node.names
+                                 if alias.name != "*")
+    return {f for name in names if name.split(".")[0] in ("ameesh", "tests")
+            for f in _module_files(name, known)}
+
+
+def _tree_python_files(head: str, repo: pathlib.Path) -> list[str]:
+    """Python files of the measured packages at `head` (git, not the working
+    tree: a documentation plan judges its base as well)."""
+    try:
+        out = _git(repo, "ls-tree", "-r", "--name-only", head)
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return sorted(p for p in out.splitlines()
+                  if p.endswith(".py")
+                  and (p.startswith("src/ameesh/") or p.startswith("tests/")))
+
+
+def _tree_sources(head: str, paths: list[str], repo: pathlib.Path) -> dict[str, str]:
+    """Content of `paths` at `head`, in one `git cat-file --batch` call."""
+    if not paths:
+        return {}
+    try:
+        proc = subprocess.run(["git", "cat-file", "--batch"], cwd=repo, check=True,
+                              input="".join(f"{head}:{p}\n" for p in paths).encode(),
+                              capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    out, pos, sources = proc.stdout, 0, {}
+    for path in paths:
+        end = out.find(b"\n", pos)
+        if end < 0:
+            break
+        header = out[pos:end].split()
+        pos = end + 1
+        if len(header) == 2 and header[1] == b"missing":
+            continue  # a missing object: `--batch` prints `<name> missing`
+        if len(header) != 3:
+            break
+        try:
+            size = int(header[2])
+        except ValueError:
+            break
+        chunk = out[pos:pos + size]
+        if header[1] == b"blob":
+            sources[path] = chunk.decode("utf-8", "replace")
+        pos += size + 1
+    return sources
+
+
+def _import_graph(head: str, repo: pathlib.Path, *,
+                  guaranteed: bool = False) -> dict[str, set[str]]:
+    """Reverse static import graph at `head`: for each file, the files whose
+    source imports it. A dynamic import (`importlib.import_module`) leaves no
+    edge: a new file no test imports keeps the full suite (#1339). With
+    `guaranteed`, only the edges the importing module executes itself are
+    kept: importing that module certainly loads the target, while a lazy or
+    conditional import only may."""
+    files = _tree_python_files(head, repo)
+    known = set(files)
+    reverse: dict[str, set[str]] = {}
+    for path, source in _tree_sources(head, files, repo).items():
+        for target in _imported_files(source, path, known, guaranteed=guaranteed):
+            if target != path:
+                reverse.setdefault(target, set()).add(path)
+    return reverse
+
+
+def _reverse_closure(reverse: dict[str, set[str]], path: str) -> set[str]:
+    """`path` and every file that imports it, directly or not."""
+    seen, stack = {path}, [path]
+    while stack:
+        for source in reverse.get(stack.pop(), ()):
+            if source not in seen:
+                seen.add(source)
+                stack.append(source)
+    return seen
+
+
 # -- the map --------------------------------------------------------------
 
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
@@ -297,6 +593,14 @@ class Impact:
         self.textual: list[str] = []         # files left to the L161b heuristic
         self.foundation: list[str] = []
         self.removed: list[str] = []         # files removed outside documentation
+        #: #1339 : blocs sans mesure couverts par les tests qui importent leur
+        #: fichier (fichier → modules), et fichiers qu'aucun test n'importe
+        self.importers: dict[str, list[str]] = {}
+        #: #1339 : sous-ensemble des importateurs qui *prouvent* le chargement
+        #: (mesure, ou import exécuté au niveau module) ; les autres ne sont que
+        #: des candidats de sélection (relecture Codex, B2 résiduel)
+        self.certified: dict[str, list[str]] = {}
+        self.uncovered: list[str] = []
 
     def hit(self, modules, reason: str) -> None:
         for m in modules:
@@ -307,6 +611,82 @@ class Impact:
             self.unsure.append(reason)
         if path and path not in self.textual:
             self.textual.append(path)
+
+
+def _measured_importers(card: dict, path: str, modules: list[str]) -> set[str]:
+    """Test modules the map saw load `path`: any block of the file executed by
+    a test means that test imported it (a subprocess run included)."""
+    found: set[str] = set()
+    for info in card.get("blocs", {}).get(path, {}).values():
+        found |= set(info.get("modules", ()))
+    return found & set(modules)
+
+
+def _reaching_tests(card: dict, path: str, modules: list[str],
+                    reverse: dict[str, set[str]]) -> set[str]:
+    """Tests that load `path` at HEAD: those that reach it through the static
+    import graph, plus, for every file of that closure, the tests the map
+    measured on it — a test that imports a changed module which imports the
+    new one (#1339). The graph given decides the strength: the complete one
+    selects every possible importer, the guaranteed one proves the load."""
+    reached = _reverse_closure(reverse, path)
+    found = {m for m in modules if f"tests/{m}.py" in reached}
+    for source in reached:
+        found |= _measured_importers(card, source, modules)
+    return found
+
+
+def _resolve_unmeasured(card: dict, impact: Impact, modules: list[str],
+                        head: str, repo: pathlib.Path) -> None:
+    """#1339 : un bloc nouveau ou modifié sans couverture mesurée ne force plus
+    la suite complète dès qu'un test charge son fichier.
+
+    Deux ensembles se séparent (relecture Codex, B2 résiduel) :
+
+    - la **sélection** : tous les tests qui peuvent charger le fichier — les
+      modules mesurés dessus, et ceux du graphe d'import complet (imports
+      paresseux et conditionnels compris) — rejoignent les impactés. Un bloc
+      nouveau n'a par définition aucun appelant mesuré, et un test peut
+      l'atteindre par un nom calculé (`dir()` puis `getattr`), donc chaque
+      test qui a chargé le fichier peut l'exécuter (B1) ; élargir ne nuit pas.
+    - la **preuve** : la mesure, ou un chargement garanti au niveau module (le
+      graphe des imports que le corps du fichier exécute à l'import). Un test
+      n'est certifié que par une preuve : un import paresseux, conditionnel ou
+      sous `with` seul ne lève pas le doute, et un from-import ne prouve que
+      son module résolu — pas le membre, que le paquet peut lier à un objet
+      (`from ameesh import new_feature` avec `new_feature = object()` dans
+      `__init__`). `uncovered` porte le fichier et la suite complète reste —
+      au lieu de certifier une couverture qu'un test dynamique (`importlib`)
+      assurerait sans être sélectionné (B2).
+    """
+    unknown_files = {b.split("::", 1)[0] for b in impact.unknown_blocks}
+    untested_files = {u["file"] for u in impact.untested}
+    targets = sorted(unknown_files | untested_files)
+    if not targets:
+        return
+    reverse: dict[str, set[str]] | None = None
+    proven_reverse: dict[str, set[str]] | None = None
+    for path in targets:
+        measured = _measured_importers(card, path, modules)
+        if reverse is None:
+            reverse = _import_graph(head, repo)
+        #: sélection : les importateurs mesurés, plus tous ceux qui *peuvent*
+        #: charger le fichier (le graphe complet : paresseux et conditionnels)
+        potential = measured | _reaching_tests(card, path, modules, reverse)
+        if measured:
+            proven = measured
+        else:
+            if proven_reverse is None:
+                proven_reverse = _import_graph(head, repo, guaranteed=True)
+            proven = _reaching_tests(card, path, modules, proven_reverse)
+        if potential:
+            for m in sorted(potential):
+                impact.p1.setdefault(m, f"{path} (imported)")
+            impact.importers[path] = sorted(potential)
+        if not proven:
+            impact.uncovered.append(path)
+            continue
+        impact.certified[path] = sorted(proven)
 
 
 def _db_modules(card: dict) -> set[str]:
@@ -513,6 +893,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
             _migration(card, impact, status, path, head, repo)
         else:
             _data(card, impact, status, path, repo)
+    #: #1339 : les blocs sans mesure sont couverts par les tests qui importent
+    #: leur fichier (sélection élargie), la preuve étant la mesure ou un import
+    #: exécuté au niveau module (relecture Codex, B2 résiduel).
+    _resolve_unmeasured(card, impact, modules, head, repo)
     return impact
 
 
@@ -583,12 +967,14 @@ def phase2_why(out: dict, impact: "Impact | None", age: float | None) -> str:
         return f"map older than {PHASE2_MAX_AGE_H} h ({age:.0f} h)"
     if impact is None:
         return "selection unsure"
-    if impact.unknown_blocks:
-        return f"{len(impact.unknown_blocks)} new block(s) unknown to the map"
+    if impact.uncovered:
+        # #1339 : le bloc sans mesure ne force plus la suite complète dès
+        # qu'un test charge son fichier ; sans importateur *prouvé*, si — un
+        # import paresseux ou conditionnel ne prouve rien (Codex, B2 résiduel).
+        return (f"{len(impact.uncovered)} file(s) with unmeasured blocks no test "
+                f"is guaranteed to load: {impact.uncovered[0]}")
     if impact.foundation:
         return f"test infrastructure changed: {impact.foundation[0]}"
-    if impact.untested:
-        return f"{len(impact.untested)} changed block(s) without a test"
     return "selection unsafe"
 
 
@@ -601,7 +987,7 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
            "unsure": [], "contract": list(always),
            "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
-           "changed": 0}
+           "importers": {}, "certified": {}, "uncovered": [], "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
@@ -665,10 +1051,12 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                 classes[m] = ("P1", p1[m])
         out.update(unsure=impact.unsure, untested=impact.untested,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
-                   removed=impact.removed, sure=not impact.unsure)
+                   removed=impact.removed, importers=impact.importers,
+                   certified=impact.certified, uncovered=impact.uncovered,
+                   sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
-                              and not impact.unknown_blocks and not impact.foundation
-                              and not impact.untested and not impact.removed)
+                              and not impact.uncovered and not impact.foundation
+                              and not impact.removed)
     changes = changes or []
     out["changed"] = len(changes)
     out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
@@ -751,8 +1139,9 @@ def lot_selection(event: str, state: dict, modules: list[str],
     `None` means the full suite: an event other than a pull request, a
     release pull request (`release`, `release_pr`), or any doubt the plan
     cannot decide through — no usable map, a selection that is not safe
-    (stale map, a new block, test infrastructure, changed lines without a
-    test), an empty contract list. The reason goes to the summary.
+    (stale map, unmeasured blocks no test is guaranteed to load, test
+    infrastructure, a removed file), an empty contract list. The reason goes
+    to the summary.
     """
     if event != "pull_request":
         return None, "main, release/** and the integration branch run the full suite"
@@ -828,6 +1217,138 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     out["why"] = version_why if out["version_only"] else doc_why
     out["files"] = names
     return out
+
+
+# -- paquet : une seule suite par tête (canon §12) --------------------------
+#
+# Une poussée sur la branche d'intégration d'un paquet et la PR ouverte sur
+# cette branche déclenchaient deux suites complètes, deux runs portant le même
+# check requis `tests` sur la même tête : annuler l'un laissait l'agrégat rouge
+# de l'autre (incident #1342, PR #1050 bloquée par le `tests` du run push
+# annulé). tests.yml ne se déclenche plus sur `push integration/**` ; le
+# portier .github/workflows/paquet.yml lit les PR ouvertes et n'appelle la
+# suite que si aucune ne couvre la tête exacte. La décision ne regarde jamais
+# un run : aucune réussite n'est déduite de l'existence d'un autre run.
+
+#: préfixe des branches d'intégration de paquet (canon §12)
+PACKAGE_PREFIX = "integration/"
+#: la base d'une PR de paquet (canon §12)
+PR_BASE = "main"
+#: une PR dont la source ou la cible est sous ces préfixes est une PR de
+#: release : elle déclenche tests.yml (canon §3)
+PR_BASE_PREFIXES = ("release/", "integration/")
+
+
+def pr_base_covered(base: str | None) -> bool:
+    """True si une PR sur cette base déclenche tests.yml (canon §3, §12)."""
+    base = (base or "").strip()
+    return base == PR_BASE or base.startswith(PR_BASE_PREFIXES)
+
+
+def couverture_decision(pulls, sha: str) -> dict:
+    """La PR ouverte qui couvre exactement la tête `sha`, sinon rien.
+
+    Ne lit que des PR ouvertes : aucune lecture de run, donc aucune réussite
+    déduite d'un autre run. Une PR dont la tête n'est pas ce commit exact ne
+    couvre pas la poussée (une nouvelle tête reprend sa décision), et une PR
+    dont la base ne déclenche pas tests.yml ne couvre rien : dans tous les
+    autres cas la suite tourne (repli sûr).
+    """
+    sha = (sha or "").strip()
+    same_head = []
+    for pr in pulls or []:
+        if (pr.get("state") or "open") != "open":
+            continue
+        head = ((pr.get("head") or {}).get("sha") or "").strip()
+        if head != sha:
+            continue
+        same_head.append(pr)
+        base = (pr.get("base") or {}).get("ref") or ""
+        if not pr_base_covered(base):
+            continue
+        number = pr.get("number")
+        return {"covered": True, "pr": number,
+                "why": f"PR #{number} (base {base}) couvre la tête {sha[:12]}"}
+    if same_head:
+        pr = same_head[0]
+        base = (pr.get("base") or {}).get("ref") or "?"
+        return {"covered": False, "pr": None,
+                "why": (f"PR #{pr.get('number')} est sur cette tête mais sa base "
+                        f"{base} ne déclenche pas tests.yml : la suite tourne")}
+    if pulls:
+        return {"covered": False, "pr": None,
+                "why": "PR ouvertes mais aucune sur cette tête exacte : la suite tourne"}
+    return {"covered": False, "pr": None,
+            "why": "aucune PR ouverte sur cette branche : la suite tourne"}
+
+
+def pulls_open(repo: str, branch: str, api: str, token: str, opener=None) -> list:
+    """Les PR ouvertes dont la tête est `branch` (API GitHub, lecture seule).
+
+    `head=owner:branch` filtre côté serveur ; 100 par page suffit pour une
+    branche d'intégration, et une lecture incomplète fait tourner la suite
+    (jamais l'inverse). Une erreur d'API ou de réseau remonte à l'appelant,
+    qui la traduit en repli sûr.
+    """
+    owner = repo.split("/", 1)[0]
+    query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{branch}",
+                                    "per_page": "100"})
+    url = f"{api.rstrip('/')}/repos/{repo}/pulls?{query}"
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ameesh-tests-plan",
+    })
+    lire = opener or urllib.request.urlopen
+    with lire(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError(f"payload inattendu ({type(data).__name__})")
+    return data
+
+
+def couverture_texte(out: dict, ref: str) -> str:
+    """Le résumé lisible de la décision, pour le journal du portier."""
+    etat = "couverte" if out["covered"] else "non couverte"
+    suite = ("la suite complète est portée par le run `pull_request` de tests.yml"
+             if out["covered"] else
+             "la suite complète tourne dans ce run (`paquet.yml`)")
+    return f"poussée {ref} : {etat} — {out['why']}\n{suite}\n"
+
+
+def couverture(args) -> int:
+    """Le portier `paquet.yml` : la poussée est-elle couverte par une PR ?
+
+    Repli sûr : contexte incomplet, ref hors `integration/**`, API illisible
+    ou non listée — la suite tourne, jamais l'inverse. Sortie toujours 0 :
+    l'échec du portier ne doit pas supprimer la validation de la branche.
+    """
+    out = {"covered": False, "pr": None, "why": ""}
+    branch = (args.ref or "").removeprefix("refs/heads/")
+    if not (args.repo and branch and args.sha):
+        out["why"] = "contexte incomplet (repo, ref ou sha) : la suite tourne"
+    elif not branch.startswith(PACKAGE_PREFIX):
+        out["why"] = f"poussée hors {PACKAGE_PREFIX}** : rien à dédupliquer"
+    else:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+        try:
+            pulls = pulls_open(args.repo, branch, args.api, token)
+            out = couverture_decision(pulls, args.sha)
+        except Exception as exc:  # noqa: BLE001 - repli sûr : la suite tourne
+            out = {"covered": False, "pr": None,
+                   "why": (f"PR illisibles ({type(exc).__name__}: {exc}) : "
+                           "la suite tourne")}
+    text = couverture_texte(out, args.ref or branch)
+    if args.github_output:
+        with open(args.github_output, "a", encoding="utf-8") as fh:
+            fh.write(f"covered={'true' if out['covered'] else 'false'}\n")
+            fh.write(f"covered_pr={out['pr'] if out['pr'] is not None else ''}\n")
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as fh:
+            fh.write(f"### Couverture de la poussée\n\n{text}")
+    print(text, end="")
+    return 0
 
 
 def doc_readers(classes: dict, card: dict,
@@ -952,6 +1473,7 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
             "unsure": [f"planning failed ({error}); full suite"], "untested": [],
             "unknown_blocks": [], "foundation": [], "removed": [], "changed": 0,
+            "importers": {}, "certified": {}, "uncovered": [],
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
@@ -1036,6 +1558,17 @@ def summary(plan: dict) -> str:
     if plan["unknown_blocks"]:
         lines.append("* new blocks, unknown to the map: " + _listing(
             [f"`{b}`" for b in plan["unknown_blocks"]]))
+    if plan.get("certified"):
+        lines.append("* unmeasured blocks covered by their importers: " + _listing(
+            [f"`{f}` ({len(ms)} module(s))" for f, ms in sorted(plan["certified"].items())]))
+    if plan.get("uncovered"):
+        files = []
+        for f in plan["uncovered"]:
+            candidates = plan.get("importers", {}).get(f, [])
+            files.append(f"`{f}`" + (f" (candidates: {', '.join(f'`{m}`' for m in candidates)})"
+                                     if candidates else ""))
+        lines.append("* **unmeasured blocks no test is guaranteed to load** (full suite): "
+                     + _listing(files))
     return "\n".join(lines) + "\n"
 
 
@@ -1176,8 +1709,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--summary")
     p = sub.add_parser("tally", help="leaks over many runs")
     p.add_argument("records", nargs="+")
+    p = sub.add_parser("couverture",
+                       help="cette poussée de paquet est-elle couverte par une PR ouverte ?")
+    p.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""),
+                   help="owner/repo (défaut : $GITHUB_REPOSITORY)")
+    p.add_argument("--ref", default=os.environ.get("GITHUB_REF", ""),
+                   help="github.ref de la poussée (défaut : $GITHUB_REF)")
+    p.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""),
+                   help="tête poussée (défaut : $GITHUB_SHA)")
+    p.add_argument("--api", default=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+                   help="racine de l'API GitHub (défaut : $GITHUB_API_URL)")
+    p.add_argument("--github-output", help="appends the job outputs to this file")
+    p.add_argument("--summary", help="appends the Markdown summary to this file")
     args = ap.parse_args(argv)
 
+    if args.command == "couverture":
+        return couverture(args)
     if args.command == "plan":
         card, why = _load_map(args.map)
         if card is None and args.map:

@@ -48,12 +48,17 @@ def milestone(generic: str) -> str:
     return CORRESPONDANCES["jalons"][generic]
 
 
-def delivered(state: str | None) -> bool:
-    return (state or "") in CORRESPONDANCES["etats_livres"]
+def delivered(state: str | None, close_reason: str | None = None) -> bool:
+    """Livrée : fusionnée, promue, ou livrée hors cible (#988 : `closed` +
+    `delivered`)."""
+    return ((state or "") in CORRESPONDANCES["etats_livres"]
+            or (state == "closed" and close_reason == "delivered"))
 
 
-def abandoned(state: str | None) -> bool:
-    return (state or "") in CORRESPONDANCES["etats_abandonnes"]
+def abandoned(state: str | None, close_reason: str | None = None) -> bool:
+    """Abandonnée : fermée sans livraison."""
+    return ((state or "") in CORRESPONDANCES["etats_abandonnes"]
+            and not delivered(state, close_reason))
 
 
 def in_progress(state: str | None) -> bool:

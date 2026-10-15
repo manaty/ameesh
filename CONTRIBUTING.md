@@ -70,6 +70,16 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Historique : git et les PR** (L160a) : la description de la PR dit ce
   qui change et pourquoi ; aucun journal tenu à la main. Les PR fusionnées
   sont liées depuis `docs/design/index.md`.
+- **Rebaser une branche de lot** : `git rebase --continue`, comme
+  `git commit --amend`, ouvre un éditeur dont le nettoyage par défaut retire
+  une ligne commençant par `#` — le sujet `#<lot> …` disparaît et le corps
+  devient le sujet (lot #1277). Rebasez avec
+  `scripts/rebase-lot.sh <arguments de git rebase>` : il passe
+  `core.commentChar=';'` à chaque invocation, `--continue` compris, et
+  signale un sujet perdu après coup. À défaut,
+  `git -c core.commentChar=';' rebase …` et
+  `git -c core.commentChar=';' commit --amend`. Après tout rebasage,
+  contrôlez `git log --format='%s' <base>..HEAD`.
 - **Ajouter plutôt que modifier** (L160a) : on ajoute des fichiers (un module,
   un test, une page, une décision par sujet) plutôt que de modifier un fichier
   commun, pour que deux PR ouvertes en même temps ne se gênent pas à la fusion.

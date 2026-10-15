@@ -8,9 +8,12 @@
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
-#   migrer       migrations de REF, lancées depuis son instantané AVANT de
+#   migrer [--additif-seulement] [REF]
+#                migrations de REF, lancées depuis son instantané AVANT de
 #                l'installer : base du mesh (UNE fois), puis ancienne base ;
-#                refusé si l'une n'est pas additive (voir MIGRER_APRES)
+#                refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#                --additif-seulement garde ce refus même quand REF est déjà
+#                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
 #                installé dans le venv (dépendance psycopg comprise) ; refusé
 #                tant qu'une base n'a pas les migrations de REF
@@ -212,9 +215,16 @@ installer() {
 # place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
 # fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
 migrer() {
-  local ref=${1:-HEAD} cible d garde=(--additive-only)
+  local ref=${1:-HEAD} cible d garde=(--additive-only) force=0
+  if [ "${1:-}" = "--additif-seulement" ]; then
+    force=1
+    ref=${2:-HEAD}
+  fi
   cible=$(instantane "$ref")
-  if installe "$cible"; then
+  # --additif-seulement : la garde tient meme quand l'instantane est deja
+  # src-current (reprise de staging, avis R1 B2) : des VM peuvent tourner un
+  # code precedent sur la base migree.
+  if [ "$force" != 1 ] && installe "$cible"; then
     garde=()
     etape "$(basename "$cible") déjà installé : toutes ses migrations passent"
   else
@@ -615,7 +625,7 @@ case "${1:-}" in
   verifier) verifier ;;
   sauvegarder) sauvegarder ;;
   installer) installer "${2:-HEAD}" ;;
-  migrer) migrer ;;
+  migrer) shift; migrer "$@" ;;
   role) role ;;
   redemarrer) redemarrer ;;
   controler) controler ;;

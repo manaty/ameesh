@@ -78,6 +78,20 @@ PROCESS_DIR = "processus"
 #: #538 : deux pages ≈ 6 000 caractères ; au-delà `canon check` signale un
 #: dépassement (avertissement, jamais bloquant) et le brief coupe le texte.
 PROCESS_BODY_MAX = 6000
+#: #1372 : une carte Process trop longue peut porter une PROJECTION COURTE,
+#: délimitée par ces deux marqueurs (chacun sur sa ligne). Le brief injecte la
+#: projection À LA PLACE du texte entier quand elle est valide : la fin du canon
+#: (§12, §14…) n'est plus mangée par le début. Les sections complètes restent la
+#: source ; la projection n'ajoute aucune règle (elle est approuvée avec la
+#: carte, par le même responsable).
+PROCESS_PROJECTION_START = "<!-- projection courte : début -->"
+PROCESS_PROJECTION_END = "<!-- projection courte : fin -->"
+#: #1372 : budget d'une projection (octets UTF-8). La part de règles d'un brief
+#: est GARANTIE à ≈ 11 900 octets (`BRIEF_MAX_BYTES` 16 000, moins la part texte
+#: réservée 4 000 et l'en-tête/le pied du bloc, 80) : 11 600 gardent la marge du
+#: bloc (diagnostics, autre fiche courte). Une projection au-delà est signalée
+#: et coupée à ce budget, jamais silencieusement.
+PROCESS_PROJECTION_MAX = 11600
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -709,6 +723,36 @@ def body_of(text: str) -> str:
     return ""
 
 
+def process_projection(body: str) -> tuple[str, str]:
+    """#1372 : la projection courte portée par le corps d'une carte Process.
+
+    Rend `(projection, code)`. Un marqueur est SEUL sur sa ligne (espaces
+    ignorés) : un marqueur suivi d'un texte n'en est pas un (R1 #1372, B1) ;
+    le texte entre les deux marqueurs est la projection. `code` vaut "" quand
+    il n'y a pas de marqueur ou que la projection est lue, sinon :
+    `unterminated` (début sans fin), `stray-end` (fin sans début, ou fin avant
+    le début), `multiple` (plus d'un marqueur), `empty` (aucun texte). Une
+    projection illisible n'est jamais injectée : l'appelant garde le texte
+    entier et le DIT (`process-projection-<code>`).
+    """
+    lignes = (body or "").splitlines()
+    debuts = [i for i, l in enumerate(lignes)
+              if l.strip() == PROCESS_PROJECTION_START]
+    fins = [i for i, l in enumerate(lignes)
+            if l.strip() == PROCESS_PROJECTION_END]
+    if not debuts and not fins:
+        return "", ""
+    if len(debuts) > 1 or len(fins) > 1:
+        return "", "multiple"
+    if not debuts or not fins:
+        return "", ("stray-end" if not debuts else "unterminated")
+    debut, fin = debuts[0], fins[0]
+    if fin < debut:
+        return "", "stray-end"
+    texte = "\n".join(lignes[debut + 1:fin]).strip()
+    return (texte, "") if texte else ("", "empty")
+
+
 _TYPED_RE = re.compile(r"^type:\s*[\"']?(%s)[\"']?\s*(#.*)?$" % "|".join(PROFILE_TYPES), re.M)
 
 
@@ -1058,6 +1102,11 @@ class Process:
 
     `valid` est faux quand une clé obligatoire manque ou est illisible : la
     fiche reste listée (`canon show`), jamais injectée dans un brief.
+
+    #1372 : `projection` est la projection courte portée par la carte (entre
+    les marqueurs), injectée à la place de `body` ; `projection_error` dit
+    pourquoi elle est inutilisable ("unterminated", "multiple", "stray-end",
+    "empty"), et vaut "" quand il n'y a pas de projection ou qu'elle est lue.
     """
 
     fiche: Fiche
@@ -1066,6 +1115,8 @@ class Process:
     updated: str = ""       # jour ISO (AAAA-MM-JJ), obligatoire
     expire: str = ""        # jour ISO, vide sans échéance
     body: str = ""
+    projection: str = ""
+    projection_error: str = ""
     valid: bool = True
 
     @property
@@ -1078,6 +1129,10 @@ class Process:
                "description": self.description, "responsible": self.responsible,
                "updated": self.updated, "expire": self.expire,
                "body_bytes": len(self.body.encode("utf-8")), "valid": self.valid}
+        if self.projection:
+            out["projection_bytes"] = len(self.projection.encode("utf-8"))
+        if self.projection_error:
+            out["projection_error"] = self.projection_error
         if self.fiche.untrusted:
             out["untrusted"] = True
         return out
@@ -1545,6 +1600,30 @@ def git_contains(repo: str, ancestor: str, descendant: str) -> bool:
     except GitError:
         return False
     return proc.returncode == 0
+
+
+def git_fast_forward(repo: str, commit: str) -> str:
+    """Avance le checkout de `repo` jusqu'à `commit` (fast-forward seulement).
+
+    Rend '' quand le checkout est déjà à `commit` ou qu'il a pu avancer, sinon
+    le diagnostic du refus (jamais d'exception git). Un checkout divergé, ou
+    des modifications locales que la fusion écraserait, laissent le dépôt
+    intact : git refuse lui-même, rien n'est forcé (L814)."""
+    target = git_commit(repo, commit)
+    if not target:
+        return "unknown commit %s in %s" % ((commit or "")[:12], repo)
+    head = git_commit(repo, "HEAD")
+    if head == target:
+        return ""
+    if head and not git_contains(repo, head, target):
+        return "checkout %s is not a fast-forward of %s" % (head[:12], target[:12])
+    try:
+        proc = _git(repo, "merge", "--ff-only", "--quiet", target)
+    except GitError as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return _git_message(proc).splitlines()[0][:200]
+    return ""
 
 
 def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
@@ -2939,11 +3018,17 @@ class _Loader:
         declared_expire = fiche.data.get("expire")
         valid = bool(responsible) and updated is not None \
             and (declared_expire in (None, "") or expire is not None)
+        # #1372 : la projection courte est lue ici (jamais inventée) ; ses
+        # défauts de forme sont des constats de `canon check`, pas une erreur
+        # bloquante : la carte reste lue, le brief garde le texte entier.
+        contenu = _utf8_safe(body)
+        projection, projection_error = process_projection(contenu)
         self.canon.processes.append(Process(
             fiche=fiche,
             description=_utf8_safe(_text(fiche.data.get("description")) or ""),
             responsible=responsible or "", updated=updated or "", expire=expire or "",
-            body=_utf8_safe(body), valid=valid))
+            body=contenu, projection=projection, projection_error=projection_error,
+            valid=valid))
 
     def _process_day(self, fiche: Fiche, key: str, where: dict, *, required: bool,
                      **subject) -> str | None:
@@ -3634,17 +3719,36 @@ def _validate_processes(canon: Canon, add) -> None:
     Un texte plus long que `PROCESS_BODY_MAX` (environ deux pages) et une
     échéance dépassée sont des avertissements : ils ne bloquent la réclamation
     d'aucun agent (voir `blocking`). Les clés obligatoires sont vérifiées à la
-    lecture (`_build_process`), qui marque la fiche invalide."""
+    lecture (`_build_process`), qui marque la fiche invalide.
+
+    #1372 : une carte longue qui porte une projection courte VALIDE n'est plus
+    signalée — c'est la projection qui ouvre les briefs, le texte entier reste
+    la source. Sans projection utilisable, `process-too-long` dit que le brief
+    ne garde que le début et comment y remédier ; une projection illisible ou
+    au-delà de son budget a son propre constat."""
     today = _dt.date.today().isoformat()
     for process in canon.processes:
         where = process.fiche
         subject = {"process": process.title}
         taille = len(process.body.encode("utf-8"))
-        if taille > PROCESS_BODY_MAX:
+        proj = len(process.projection.encode("utf-8"))
+        if process.projection_error:
+            add("process-projection-%s" % process.projection_error, WARNING,
+                "Process card %s: unusable short projection (%s) — the whole text "
+                "is injected and cut" % (process.title, process.projection_error),
+                where, **subject)
+        elif process.projection and proj > PROCESS_PROJECTION_MAX:
+            add("process-projection-too-long", WARNING,
+                "Process card %s: short projection of %d bytes (limit %s) — a "
+                "brief cuts its end" % (process.title, proj, PROCESS_PROJECTION_MAX),
+                where, **subject)
+        elif not process.projection and taille > PROCESS_BODY_MAX:
             add("process-too-long", WARNING,
                 "Process card %s: %d bytes of rules (limit %s, about two pages); "
-                "a brief keeps only the beginning" % (process.title, taille,
-                                                      PROCESS_BODY_MAX),
+                "a brief keeps only the beginning — add a short projection between "
+                "`%s` and `%s` to inject the whole rules"
+                % (process.title, taille, PROCESS_BODY_MAX,
+                   PROCESS_PROJECTION_START, PROCESS_PROJECTION_END),
                 where, **subject)
         if process.expire and process.expire < today:
             add("process-expired", WARNING,

@@ -222,30 +222,52 @@ def latest_account_gauges(db, now: float) -> dict:
     return out
 
 
+def pace_multipliers(cfg) -> dict:
+    """`{(harnais, compte): pace_multiplier}` des comptes déclarés (#1075).
+
+    Les comparaisons qui lisent l'historique des jauges sans passer par
+    `accounts.evaluate` (sous-utilisation) doivent suivre le rythme du profil
+    (#1028) ; un harnais sans compte déclaré garde 1.0, et une configuration
+    illisible ne fait jamais tomber l'alerte."""
+    from . import accounts as accounts_mod
+    try:
+        declared = accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+    except Exception:  # noqa: BLE001 - configuration invalide : rythme nominal
+        return {}
+    return {(harness, profile.name): profile.pace_multiplier
+            for harness, items in declared.items() for profile in items}
+
+
 def plan_underused(db, listing: list, now: float, *,
                    tail_s: float = DEFAULT_PLAN_TAIL_S,
                    used_pct: float = DEFAULT_PLAN_USED_PCT,
                    pace_gap_pct: float = DEFAULT_PLAN_PACE_GAP_PCT,
-                   paid=None, held=()) -> list:
+                   paid=None, held=(), multipliers: dict | None = None) -> list:
+    """`multipliers` (#1075/#1028) : `{(harnais, compte): pace_multiplier}` des
+    comptes déclarés — la comparaison au rythme perçu suit le profil, pas le
+    rythme nominal ; un compte absent garde 1.0."""
     used_max = max(0.0, float(used_pct)) / 100.0
     gap_min = max(0.0, float(pace_gap_pct)) / 100.0
     if (tail_s <= 0 or used_max <= 0) and gap_min <= 0:
         return []
+    multipliers = multipliers or {}
     out: list = []
     spend = None
     spend_read = False
     for (harness, account), gauges in sorted(latest_account_gauges(db, now).items(),
                                               key=lambda kv: (kv[0][0], kv[0][1] or "")):
+        rythme = float(multipliers.get((harness, account), 1.0))
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
         for gauge, seen in live:
-            if any(other.exceeded(now) for other, _ in live if other is not gauge):
+            if any(other.exceeded(now, multiplier=rythme)
+                   for other, _ in live if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
             elapsed = gauge.elapsed(now)
-            cap = gauge.pace_cap(now)
+            cap = gauge.pace_cap(now, rythme)
             used = float(gauge.used or 0.0)
             reason = None
             tail = min(float(tail_s), PLAN_TAIL_MAX_FRACTION * gauge.window_s)
@@ -462,23 +484,59 @@ def is_backlog_item(lot: dict) -> bool:
             and lot.get("state") == "intake")
 
 
-def waiting_project_lots(lots: list) -> list:
+def waiting_project_lots(lots: list, *, db=None) -> list:
     """Les lots du projet ouverts sans assigné (hors file d'amélioration) : du
     travail demandé qui attend qu'on le confie. Tant qu'il y en a, la prise
-    automatique s'abstient (0037) et `idle_capacity` le signale."""
-    return [lot for lot in lots
-            if not (lot.get("assignee") or "").strip()
-            and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+    automatique s'abstient (0037) et `idle_capacity` le signale. Quand la base
+    est fournie, seuls les lots sans dependance explicite ouverte attendent
+    un preneur ; les autres attendent leurs amonts."""
+    waiting = [lot for lot in lots
+               if not (lot.get("assignee") or "").strip()
+               and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+    if not waiting or db is None:
+        return waiting
+    blocked = {int(edge["work_item_id"]) for edge in
+               storage.of(db).work_dependencies.for_items([lot["id"] for lot in waiting])
+               if edge["blocking"]}
+    return [lot for lot in waiting if int(lot["id"]) not in blocked]
+
+
+def _budget_held(cfg, db, rows: list) -> dict:
+    """#1021 : `{agent: raison}` des agents dont le prochain tour est tenu
+    (budget, rythme ou authentification), lu là où l'exécuteur le calcule
+    (`account_turn.turn_hold`). `cfg` None (appelant sans hôte) : rien n'est
+    jugé. Une tenue illisible laisse l'agent dans l'alerte : c'est
+    l'attribution qui tranche, fail-closed."""
+    if cfg is None:
+        return {}
+    from . import account_turn
+    from . import db as db_mod
+    held = {}
+    for row in rows:
+        try:
+            reason = account_turn.turn_hold(cfg, db, row["name"], row)
+        except db_mod.Unavailable:
+            raise
+        except Exception:  # noqa: BLE001 - une lecture en échec ne masque pas l'alerte
+            continue
+        if reason:
+            held[row["name"]] = reason
+    return held
 
 
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None, designers=(), held=(), held_hosts=(),
-                  pressured: dict | None = None) -> list:
+                  pressured: dict | None = None, cfg=None) -> list:
     """#254 : `held`, les agents d'un hôte en pause, ni comptés ni à
     réveiller ; `held_hosts` (hôtes en pause) et `pressured` ({hôte:
     verdict} des hôtes sous pression, relevé frais) ne sont jamais proposés :
-    leurs agents sont laissés de côté et nommés."""
+    leurs agents sont laissés de côté et nommés.
+
+    #1021 : `cfg` (l'hôte qui juge) — un agent encore `idle` dont les comptes
+    viennent de franchir le seuil n'est pas proposé non plus : la pause n'est
+    écrite qu'au sondage suivant de son exécuteur, et l'attribution le refuse
+    déjà (`work.check_assignee`)."""
     if idle_s <= 0:
         return []
     pressured = pressured or {}
@@ -491,11 +549,15 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     spared = sorted((row["name"], row.get("host")) for row in idle
                     if row.get("host") in pressured)
     idle = [row for row in idle if row.get("host") not in pressured]
+    # #1021 : la tenue budget/rythme, lue là où l'exécuteur la calcule
+    budget_held = _budget_held(cfg, db, idle)
+    if budget_held:
+        idle = [row for row in idle if row["name"] not in budget_held]
     if not idle:
         return []
     if lots is None:
         lots = storage.of(db).operations.open_lots_activity(500)
-    waiting_lots = waiting_project_lots(lots)
+    waiting_lots = waiting_project_lots(lots, db=db)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None
@@ -520,6 +582,9 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if on_hold:
         parts.append("left out, their host on hold: %s" % ", ".join(
             "%s on %s" % pair for pair in on_hold))
+    if budget_held:
+        parts.append("left out, next turn held: %s" % ", ".join(
+            "%s (%s)" % (name, reason) for name, reason in sorted(budget_held.items())))
     if spared:
         parts.append("left out, their host under pressure: %s" % "; ".join(
             "%s on %s (%s)" % (name, host, ", ".join(
@@ -782,7 +847,7 @@ def backlog_empty(db, listing: list, now: float, *,
     if storage.of(db).work.backlog(open_only=True, limit=1):
         return []
     # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
-    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500)):
+    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500), db=db):
         return []
     names = sorted(row["name"] for row in idle)
     return [_alert(
@@ -823,7 +888,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         canons = []
     paid = paid_harnesses(getattr(cfg, "host", None))
     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
-                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held)
+                         pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held,
+                         multipliers=pace_multipliers(cfg))
     orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
                                canons=canons)
     for alert in out:
@@ -838,7 +904,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         pressured = {}
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
                          designers=designers, held=held, held_hosts=held_hosts,
-                         pressured=pressured)
+                         pressured=pressured, cfg=cfg)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons)
