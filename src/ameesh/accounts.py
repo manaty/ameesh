@@ -63,6 +63,20 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    matin), puis l'ordre déclaré ;
 4. sinon pause : tous les comptes sont au seuil.
 
+**Fraîcheur du relevé** (#1561) : un relevé **périmé** — une fenêtre datée
+s'est remise à zéro depuis la lecture (typiquement la fenêtre de 5 h) alors
+qu'une autre court encore (les 7 jours) — n'est plus un instantané courant de
+l'état du compte : la fenêtre encore ouverte n'en est qu'une borne
+inférieure, le compte a pu servir depuis. Un tel compte est **non vérifié** :
+il ne passe jamais avant un compte à relevé courant, quel que soit l'ordre de
+bascule (étape 3, `rank`), et sa raison le dit (`explain`) au lieu d'annoncer
+un « 30 % utilisé » trompeur ; il reste utilisable, et sans compte vérifié il
+est essayé (L71, « essayé, pas écarté ») — son premier tour rapporte sa
+jauge. Un relevé **absent** garde la règle L117 : un compte jamais utilisé
+compte pour 0 % et passe en premier, pour ne pas laisser un forfait inutilisé.
+Le relevé porte son horodatage (`Gauge.read_at`) : marqueur de compte Claude,
+date du journal de session Codex.
+
 **Failover order and caps** (L226b, owner decision 2026-10-07, "primaries
 last, capped"): step 3 ranks by the account's `priority` first (the harness's
 default account last), the pace only breaking ties. Each window is held to
@@ -84,11 +98,11 @@ Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
 Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
 de compte qui précède chaque tour ; Codex : les journaux de session du
 `CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
-0 % (`Gauge.used_at`, L71) : un compte sans relevé récent est essayé, pas
+0 % (`Gauge.used_at`, L71) : un compte sans relevé courant est essayé, pas
 écarté — son premier tour rapporte sa jauge.
 
-Chaque choix porte sa raison (`Choice.why`, « sans relevé : 0 % utilisé, le
-plus en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
+Chaque choix porte sa raison (`Choice.why`, « no reading: unverified, le plus
+en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
 (rythme 55 %) »), journalisée par l'exécuteur (`account_turn.choose`).
 
 La ligne `account_active` garde le **dernier compte choisi** pour une
@@ -109,6 +123,7 @@ from typing import Callable
 
 from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
+from .cost import stale_reading
 
 #: #1469: a billing account id (`openai-manaty`), the same on every host
 BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -928,11 +943,25 @@ def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | N
 
 def explain(result: Evaluation, now: float) -> str:
     """Le retard d'un compte sur son rythme, lisible : « seven_day 35 %
-    utilisé (rythme 55 %) », « sans relevé : 0 % utilisé »."""
-    _ratio, gauge = lag(result.gauges, now, result.limits)
-    if gauge is None:
+    utilisé (rythme 55 %) », « sans relevé : non vérifié ».
+
+    #1561 : un relevé périmé (une fenêtre remise à zéro depuis, l'autre
+    encore ouverte) ne se lit plus comme une mesure courante — la raison dit
+    « non vérifié » et rappelle la dernière valeur connue. Un relevé absent
+    est « non vérifié » aussi : sa valeur n'est pas un 0 % mesuré (L117 le
+    fait passer premier, mais la raison ne ment pas)."""
+    gauges = result.gauges
+    if not gauges:
+        return "no reading: unverified"
+    if stale_reading(gauges, now):
+        last = lag(gauges, now, result.limits)[1]
+        suffix = (", last %s %.0f%%" % (last.key, last.used * 100)
+                  if last is not None else "")
+        return "stale reading (window reset since the reading): unverified" + suffix
+    _ratio, gauge = lag(gauges, now, result.limits)
+    if gauge is None:                       # jamais avec des jauges : ceinture
         return "no reading: 0% used"
-    if all(g.reset_passed(now) for g in result.gauges):
+    if all(g.reset_passed(now) for g in gauges):
         return "stale reading (window reset): 0% used"
     cap, label = result.limits.get(gauge.key) or (
         gauge.pace_cap(now, result.profile.pace_multiplier), "pace cap")
@@ -948,10 +977,21 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
     """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
-    Clé : L226b, the failover order first (`priority`: the default account
-    last, owner decision 2026-10-07), then le retard sur le rythme (`lag`, le
-    plus petit rapport d'abord), puis l'échéance de la capacité inutilisée (la
-    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré.
+    Clé (#1561) : d'abord un relevé **courant** — un compte dont le relevé est
+    périmé (une fenêtre remise à zéro depuis la lecture, une autre encore
+    ouverte) ne passe jamais avant un compte dont l'état est vérifié, quel que
+    soit l'ordre de bascule ; puis L226b, l'ordre de bascule (`priority` : le
+    compte par défaut en dernier, décision owner du 2026-10-07) ; puis le
+    retard sur le rythme (`lag`, le plus petit rapport d'abord) ; puis
+    l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
+    fenêtre en cours, après) ; puis l'ordre déclaré.
+
+    Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
+    un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
+    laisser un forfait inutilisé ; c'est le seul cas où l'absence passe avant
+    un relevé courant. Un compte non vérifié (relevé périmé) reste utilisable :
+    sans compte vérifié il est essayé (L71, « essayé, pas écarté »), et son
+    premier tour rapporte sa jauge.
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
@@ -961,7 +1001,10 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
         result = evaluations[profile.name]
         gauges = result.gauges
         found = expiry(gauges, now)
-        return (priority(profile), round(lag(gauges, now, result.limits)[0], 6),
+        # Absent : L117 (premier). Périmé : après tout relevé courant (#1561).
+        unverified = bool(gauges) and stale_reading(gauges, now)
+        return (1 if unverified else 0,
+                priority(profile), round(lag(gauges, now, result.limits)[0], 6),
                 found[0] if found is not None else float("inf"), index)
     usable = [(i, p) for i, p in enumerate(items)
               if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
@@ -970,10 +1013,20 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
-    « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
-    primaire seven_day 35 % utilisé (rythme 55 %) »."""
+    « no reading: unverified, tried first (L117) ; avant : primaire seven_day
+    35 % utilisé (rythme 55 %) »."""
     first = ranked[0]
-    if len(ranked) > 1 and priority(first) < priority(ranked[1]):
+    gauges = evaluations[first.name].gauges
+    if not gauges:
+        # L117 (amendement 0034 du 2026-10-10) : un compte jamais utilisé
+        # compte pour 0 % et passe en premier — la raison le dit, sans
+        # prétendre à un 0 % mesuré (#1561).
+        why = "no reading: unverified, tried first (L117)"
+    elif stale_reading(gauges, now):
+        # #1561 : aucun relevé courant n'est disponible ; il est essayé faute
+        # de mieux (L71), pas choisi sur un rythme qui n'est plus mesuré.
+        why = "%s, tried (no current reading)" % explain(evaluations[first.name], now)
+    elif len(ranked) > 1 and priority(first) < priority(ranked[1]):
         # L226b: the failover order decided, not the pace
         why = "%s, first in the failover order (priority %d)" % (
             explain(evaluations[first.name], now), priority(first))
@@ -1267,12 +1320,15 @@ def report(cfg, db, book, *, now: float | None = None,
                 "overage": _overage_row(profile, result.gauges, now),
                 "gauges": [
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
-                    # relevé reste lisible (`last_used`)
+                    # relevé reste lisible (`last_used`). #1561 : `read_at`
+                    # date le relevé, `stale` (posé par `_forecast`) dit qu'il
+                    # n'est plus un instantané courant.
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
                      "cap": (result.limits.get(g.key)
                              or (g.pace_cap(now, result.profile.pace_multiplier),))[0],
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
-                     "reset_passed": g.reset_passed(now)}
+                     "reset_passed": g.reset_passed(now),
+                     "read_at": getattr(g, "read_at", None)}
                     for g in result.gauges
                 ],
                 "_gauges": list(result.gauges),
@@ -1297,15 +1353,22 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
-    (`next`, avec sa raison `why`, la même que celle du choix — L117)."""
+    (`next`, avec sa raison `why`, la même que celle du choix — L117).
+
+    #1561 : un relevé périmé n'annonce ni perte ni échéance — la capacité
+    inutilisée qu'il décrit (30 % d'une fenêtre de 7 j encore ouverte) n'est
+    qu'une borne inférieure, et l'annonce « 70 % perdus à la remise à zéro »
+    était fausse. Le compte porte `stale` pour les affichages."""
     evaluations = {}
     for row, profile in zip(rows, items):
         result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"])
         evaluations[profile.name] = result
-        row["losses"] = [
+        stale = bool(row["_gauges"]) and stale_reading(row["_gauges"], now)
+        row["stale"] = stale
+        row["losses"] = [] if stale else [
             {"key": g.key, "resets_at": found[0], "in_s": found[0] - now, "lost": found[1]}
             for g in row["_gauges"] for found in [g.expiring(now)] if found is not None]
-        found = expiry(row["_gauges"], now)
+        found = None if stale else expiry(row["_gauges"], now)
         row["expires_in_s"] = (found[0] - now) if found is not None else None
         row["next"] = False
         row["why"] = ""
@@ -1335,6 +1398,13 @@ def format_rows(rows: list[dict]) -> str:
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))
+        if row.get("stale"):
+            # #1561 : le relevé n'est plus un instantané courant (une fenêtre
+            # remise à zéro, une autre encore ouverte) — la valeur lue n'est
+            # qu'une borne inférieure, pas un « 30 % utilisé » d'aujourd'hui.
+            lines.append("%-9s %-14s %-7s %-8s ↳ reading not current: "
+                         "window reset since the reading (unverified)"
+                         % ("", "", "", ""))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
         if row.get("losses"):
