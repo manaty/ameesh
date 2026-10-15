@@ -2407,8 +2407,9 @@ class WorkflowTest(unittest.TestCase):
         fs_class = self.text[self.text.index("\n  fs-class:\n"):
                              self.text.index("\n  platform-macos:\n")]
         self.assertIn("needs.plan.outputs.release == 'true'", fs_class)
-        self.assertNotIn("github.head_ref", fs_class)
-        self.assertNotIn("github.base_ref", fs_class)
+        condition = fs_class.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("github.head_ref", condition)
+        self.assertNotIn("github.base_ref", condition)
         self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', self.text)
         self.assertIn('case "$HEAD_REF" in release/*) release=true ;; esac', self.text)
 

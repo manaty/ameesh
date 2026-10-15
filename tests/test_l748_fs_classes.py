@@ -57,8 +57,9 @@ class WorkflowFsClassTest(unittest.TestCase):
         self.assertIn("github.event_name == 'workflow_dispatch'", self.job)
         self.assertIn("startsWith(github.ref_name, 'release/')", self.job)
         self.assertIn("needs.plan.outputs.release == 'true'", self.job)
-        self.assertNotIn("github.head_ref", self.job)
-        self.assertNotIn("github.base_ref", self.job)
+        condition = self.job.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("github.head_ref", condition)
+        self.assertNotIn("github.base_ref", condition)
         plan = _job(self.texte, "plan")
         self.assertIn("release: ${{ steps.release.outputs.release }}", plan)
         self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', plan)

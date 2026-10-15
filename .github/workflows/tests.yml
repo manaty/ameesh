@@ -456,7 +456,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'push' && startsWith(github.ref_name, 'release/')) ||
        needs.plan.outputs.release == 'true')
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
