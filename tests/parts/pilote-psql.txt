@@ -28,6 +28,7 @@ test_653_db_connections  # stockage : sessions périodiques libérées, transact
 test_705_reviewer_designated  # stockage : relecteur désigné (colonne 0421, lectures avant migration, alerte stale_lot) (#705)
 test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes planifiées et livraison Notifier (#789 t2)
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
+test_831_packages_lock_scope  # storage : un verrou de sync par schéma (tous canons), attente hors statement_timeout (#831)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
