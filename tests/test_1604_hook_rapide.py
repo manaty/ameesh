@@ -237,8 +237,10 @@ class HookRapideTest(PgTestCase):
         self.assertLess(cout_rapide, cout_lourd,
                         "le chemin rapide coûte %.3fs CPU, l'import complet %.3fs"
                         % (cout_rapide, cout_lourd))
-        # borne large (le chemin rapide mesuré tourne autour de 0,05 s) : elle
-        # attrape une régression qui réimporterait le paquet, sans dépendre de
-        # la charge de la machine — le CPU consommé, lui, ne dépend pas d'elle.
-        self.assertLess(cout_rapide, 0.20,
-                        "chemin rapide : %.3fs CPU (borne 0,20 s)" % cout_rapide)
+        # borne relative, jamais en secondes : le CPU d'un démarrage Python
+        # dépend de la machine (runner lent, cache .pyc froid), pas son rapport
+        # à l'import complet mesuré dans le même processus (mesuré : 0,05 contre
+        # 0,30 s). Une régression qui réimporterait le paquet atteint ce rapport.
+        self.assertLess(cout_rapide, cout_lourd / 2,
+                        "chemin rapide : %.3fs CPU, plus de la moitié d'un import "
+                        "complet (%.3fs)" % (cout_rapide, cout_lourd))
