@@ -602,3 +602,12 @@ sans suspendre les préparations indépendantes ; impl07, courrier du même jour
 décider par l'owner ; elle ne configure pas ce consommateur. La sélection du
 fournisseur et du champ qualifié, le protocole de transition des anciennes
 clés et les autres raccords d'activation demeurent externes à cette préparation.
+
+Le raccord événementiel est désormais borné par la qualification du pilote
+du 15 octobre à 18:53 : verdict et conclusion CI émettent leur signal dans
+la même transaction que leur état ; le runner ne réveille que le service,
+qui relit ensuite ses preuves sur connexion fraîche. Le contrat et les
+limites de couverture du veilleur existant figurent dans
+[`reviews/1467-events-contract/README.md`](../../../reviews/1467-events-contract/README.md).
+Ce raccord ne fournit pas encore les événements complets Nexlink et ne
+sélectionne aucun profil actif.

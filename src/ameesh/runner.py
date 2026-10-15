@@ -45,6 +45,7 @@ from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sy
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import persona_memory as memory_mod
+from . import train_events
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import load as load_config
@@ -5241,6 +5242,11 @@ class Runner:
         saturé retarder la préemption (verdict codex3 L11 B1) : tous les signaux
         partent d'abord, la journalisation passe par la file bornée.
         """
+        if item.get("channel") == train_events.CHANNEL:
+            service = getattr(self, "train_service", None)
+            if service is not None:
+                train_events.receive(service, item)
+            return
         if item.get("channel") == CHANNEL_BUDGET:
             # L70 : un plafond a changé en base ; le réveil n'est qu'un signal,
             # la garde relit la table au prochain sondage de chaque worker.
@@ -5303,8 +5309,11 @@ class Runner:
         reprise = Reprise(self.db_retry_max, minimum=1.0)
         annonce = False
         while not self.stop.is_set():
-            listener = storage.of(self.db).wakeups.subscribe(
-                [CHANNEL_MAIL, CHANNEL_LEASE, CHANNEL_BUDGET])
+            channels = [CHANNEL_MAIL, CHANNEL_LEASE, CHANNEL_BUDGET]
+            service = getattr(self, "train_service", None)
+            if service is not None:
+                channels.append(train_events.CHANNEL)
+            listener = storage.of(self.db).wakeups.subscribe(channels)
             if listener is None:
                 try:
                     self.db.ping()
@@ -5319,8 +5328,12 @@ class Runner:
                           % self.poll)
                 return
             self.listener = listener
+            if service is not None:
+                # LISTEN is established first: recover hints lost before startup
+                # or during disconnection once, never on a listener timeout.
+                service.wake()
             if not annonce:
-                log_async("LISTEN %s, %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE, CHANNEL_BUDGET))
+                log_async("LISTEN %s" % ", ".join(channels))
                 annonce = True
             debut = time.monotonic()
             # une écoute qui tient plus longtemps qu'une tentative de connexion

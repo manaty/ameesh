@@ -622,8 +622,8 @@ class WorkItems(interface.WorkItems):
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne
         s'insère jamais pendant qu'une fermeture sur fusion tient ce lot."""
         with self.db.transaction() as tx:
-            tx.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                     (int(item_id),))
+            items = tx.query("SELECT id, app, branch_target FROM work_items"
+                             " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
                 INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, verdict, note)
@@ -633,6 +633,17 @@ class WorkItems(interface.WorkItems):
                 """,
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
+            if kind == "verdict" and items:
+                from ... import merge_queue, train_events
+                item = items[0]
+                try:
+                    train_events.emit(tx, kind="verdict", project=item.get("app") or "",
+                        target=merge_queue._remote_branch(item.get("branch_target") or ""))
+                except ValueError:
+                    # An old/unscoped lot has no train routing subject. The
+                    # milestone remains valid; SQL/transport errors still roll
+                    # back its transaction, so a committed verdict loses no hint.
+                    pass
             return rows[0]
 
     def delays(self, limit, *, ids=None) -> list[dict]:
