@@ -124,6 +124,26 @@ ce lecteur ne classe pas les lots et n'active aucun fournisseur ni runner.
 Les modules SQL du train sont inscrits à la liste pilote psql, en complément
 de leur exécution complète dans le paquet.
 
+`train_admissions.Admissions` raccorde maintenant ce lecteur à la file réelle
+et aux dépendances complètes du stockage. Une admission retirée, réinscrite,
+regelée ou déplacée est refusée ; les lots en attente humaine ou bloqués
+restent hors du paquet. Une exclusion exige le bail cible vivant et la même
+génération de file, vérifiés par le CAS existant de `queue_update` ; elle ne
+peut écraser une réadmission concurrente. Les preuves structurées conservent
+le lot, la base, le gel, la classe, le nombre d'avis et le commit de politique.
+Le mode `packet` ne lit aucune CI de lot ; `targeted` exige un lecteur explicite
+et ses runs exacts.
+
+Le fournisseur de politique reste obligatoire : il reçoit le lot courant,
+l'admission, la base exacte et le dépôt d'historique. Il doit rendre un
+`Requirement` sur ce lot/base/tête, avec classe et nombre d'avis connus,
+lié à une source versionnée. Aucun tel fournisseur n'est activé. Le seul
+classement `review_policies.risk_classes` ne fournit pas les nombres d'avis
+par sous-domaine. Mesh-design confirme ce port obligatoire le 15 octobre à
+08:49, avec référence à `processus/lots.md` §2/§12 du canon manaty,
+commit `ea043e087fb0c80708ed35b18863da1da473fccb` ; aucune déduction depuis les
+notes ou le registre courant ne le remplace.
+
 Interface de raccord proposée à impl07 le 15 octobre à 03:54 : un `Receipt`
 porte `subject` (`commit:<sha>` ou `milestone:<id>`), `commit` résolu, `actor`,
 `session`, `turn`, `harness` et `record` de provenance exacte. Un reçu de
