@@ -95,6 +95,38 @@ class RelectureConfigTest(unittest.TestCase):
         self.assertEqual(runner.cfg.budget_usd_per_hour, 100.0)
         self.assertEqual(runner.cfg.config_path, self.profil)
 
+    def test_le_stockage_ne_se_relit_pas(self):
+        """Base, schéma et dossier d'état restent ceux du démarrage : la
+        connexion de l'exécuteur et les sessions des agents y sont ouvertes."""
+        runner = self._runner()
+        avant = runner.cfg
+        self._write(self.host, {"budget_usd_per_hour": 300,
+                                "dsn": "postgresql://ailleurs/db",
+                                "schema": "autre",
+                                "state_dir": os.path.join(self.tmp, "etat-2"),
+                                "accounts": {"deepseek": [{"name": "cle-a"}]}})
+        with mock.patch.dict(os.environ, {"HOME": self.home,
+                                          "AMEESH_CONFIG": self.profil}):
+            self.assertTrue(runner.reload_config())
+        self.assertEqual(runner.cfg.budget_usd_per_hour, 300.0)
+        for champ in ("dsn", "schema", "state_dir"):
+            self.assertEqual(getattr(runner.cfg, champ), getattr(avant, champ))
+
+    def test_un_fichier_disparu_ne_remplace_rien(self):
+        """Sans AMEESH_CONFIG, `load` rend les valeurs par défaut quand
+        config.json disparaît : la relecture doit le refuser."""
+        with mock.patch.dict(os.environ, {"HOME": self.home}):
+            cfg = config_mod.load(env={})
+            runner = Runner(cfg, None)
+        self.assertEqual(cfg.config_path, self.host)
+        os.remove(self.host)
+        with mock.patch.dict(os.environ, {"HOME": self.home}):
+            os.environ.pop("AMEESH_CONFIG", None)
+            os.environ.pop("AGENT_MESH_CONFIG", None)
+            self.assertFalse(runner.reload_config())
+        self.assertEqual(list(runner.cfg.accounts), ["deepseek"])
+        self.assertEqual(runner.cfg.budget_usd_per_hour, 100.0)
+
     def test_les_workers_suivent_la_relecture(self):
         runner = self._runner()
 

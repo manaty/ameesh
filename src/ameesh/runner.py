@@ -5881,14 +5881,28 @@ class Runner:
         if not force and stamp == self._config_stamp:
             return False
         self._config_stamp = stamp
+        # un fichier disparu ne remplace rien : sans AMEESH_CONFIG, `load`
+        # rendrait sinon les valeurs par défaut (aucun compte)
+        disparus = [path for path, mtime, _size in stamp if mtime is None]
+        if disparus:
+            log_async("config reload refused: %s missing" % ", ".join(disparus))
+            return False
         try:
             fresh = load_config()
         except SystemExit as exc:
             log_async("config reload refused: %s" % exc)
             return False
-        # l'identité de l'exécuteur (hôte, bail) et les options de ligne de
-        # commande ne se rechargent pas : elles ont décidé les baux en cours
-        gelés = {"host": self.cfg.host, "runner_id": self.cfg.runner_id}
+        if fresh.config_path != self.cfg.config_path:
+            log_async("config reload refused: now reads %s, started on %s"
+                      % (fresh.config_path or "defaults", self.cfg.config_path))
+            return False
+        # l'identité de l'exécuteur (hôte, bail), son stockage (base, schéma,
+        # serveur médié, dossier d'état : la connexion et les sessions ouvertes
+        # au démarrage) et les options de ligne de commande ne se rechargent
+        # pas : elles ont décidé les baux et les tours en cours
+        gelés = {name: getattr(self.cfg, name) for name in (
+            "host", "runner_id", "dsn", "schema", "driver", "backend",
+            "exec_url", "state_dir")}
         gelés.update(self._cfg_overrides)
         fresh = dataclasses.replace(fresh, **gelés)
         if fresh == self.cfg:
