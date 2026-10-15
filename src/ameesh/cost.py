@@ -879,8 +879,9 @@ class CostBook:
 
         Compare turn-marker timestamps across agents. Only a stream without
         any marker uses the `primary` account (the harness's default one,
-        L1078) and file modification time; with `primary` None, no account
-        claims them.
+        L1078), dated by the event itself or left undated, never by the file
+        modification time (#1720); with `primary` None, no account claims
+        them.
         """
         best = None
         for agent in self.agents():
@@ -1972,7 +1973,8 @@ def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
     """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
 
     `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
-    précède le tour, ou la date du flux pour un flux sans marqueur.
+    précède le tour, ou la date de l'événement pour un flux sans marqueur
+    (#1720, 0.0 = non daté).
     """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
