@@ -1512,7 +1512,11 @@ class WorkflowRoutingTest(unittest.TestCase):
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]
-        self.assertEqual(jobs[self.REQUIRED].get("name"), self.REQUIRED)
+        # #1635 : le nom est `tests` sur tout évènement sauf un lancement à la
+        # main, qui publie `tests (dispatch)` — jamais le contexte requis
+        self.assertIn(jobs[self.REQUIRED].get("name"), (
+            self.REQUIRED,
+            "${{ github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests' }}"))
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         self.assertEqual(closure, {"plan", "version", "psycopg", "psql",
                                    "platform-macos", "doc-readers", "fs-class", "tests"})
