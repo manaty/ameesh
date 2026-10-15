@@ -406,6 +406,39 @@ def stale_reading(gauges, now: float) -> bool:
     return now - min(stamps) > min(g.window_s for g in gauges)
 
 
+def reading_outdated(gauges, now: float) -> bool:
+    """#1672 : le relevé **partiel** est-il trop vieux pour engager un tour ?
+
+    `stale_reading` dit qu'un relevé partiel — une fenêtre datée remise à zéro,
+    une autre encore ouverte — n'est plus un instantané courant ; il reste
+    néanmoins informatif pour les fenêtres encore ouvertes tant que son âge
+    (`now - read_at`) ne dépasse pas ce qui leur reste (`resets_at - now`).
+    Au-delà, la remise à zéro qui rendra le relevé caduc est plus proche que le
+    trou d'observation : **prudence sur une information ancienne**, pas la
+    preuve d'un quota atteint. Le cas réel du 15/10 : relevé de 30 % vieux de
+    quatre jours, fenêtre 7 j à 9 h de sa remise à zéro — le choix automatique
+    y a envoyé un tour, refusé par la limite hebdomadaire.
+
+    Faux pour un relevé **courant** (aucune fenêtre datée remise à zéro) et
+    pour un relevé dont **toutes** les fenêtres datées sont échues (L71, la
+    suivante est vierge à 0 %). Faux sans âge connu (`read_at` absent : une
+    date manquante ne prouve aucune péremption de plus). Faux dès qu'**une**
+    fenêtre encore ouverte reste plus longue que l'âge : le relevé garde du
+    sens pour elle.
+    """
+    dated = [g for g in gauges if g.resets_at]
+    if not any(g.reset_passed(now) for g in dated):
+        return False
+    opened = [g for g in dated if not g.reset_passed(now)]
+    if not opened:
+        return False                    # L71 : toutes échues, la suivante est vierge
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    age = now - min(stamps)
+    return all(age > float(g.resets_at) - now for g in opened)
+
+
 @dataclass(frozen=True)
 class TurnUsage:
     """Ce qu'un tour a coûté : la matière d'une ligne `turn_costs`."""
