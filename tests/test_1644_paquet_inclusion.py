@@ -145,7 +145,7 @@ class PaquetInclusionTest(unittest.TestCase):
         )
 
     def namespace(self, expected=(), expected_file=(), excused=(),
-                  strict=False, head=None, manifest=None):
+                  strict=False, head=None, manifest=None, no_expected=False):
         return inclusion.argparse.Namespace(
             manifest=str(manifest or self.manifest),
             head=head or self.head,
@@ -156,6 +156,7 @@ class PaquetInclusionTest(unittest.TestCase):
             excused_file=[],
             json=False,
             strict=strict,
+            no_expected=no_expected,
         )
 
     def control(self, *extra: str):
@@ -257,21 +258,9 @@ class PaquetInclusionTest(unittest.TestCase):
         self.git("switch", "-q", "main")
         self.git("merge", "-q", "--no-ff", "-m", "#600: compose", "lot/600")
         head = self.rev("HEAD")
-        manifest = pathlib.Path(self.tmp.name) / "manifeste-600.md"
-        manifest.write_text(
-            textwrap.dedent(
-                """\
-                # Manifeste
-
-                | # | lot(s) | tête source | commit | note |
-                |---|---|---|---|---|
-                | 1 | #600 | `%s` | `%s` |  |
-                """
-            ) % (source[:12], head[:12]),
-            encoding="utf-8",
-        )
+        manifest = self.manifest_simple(600, source, head)
         code, payload = inclusion.run(
-            self.namespace(head=head, manifest=manifest)
+            self.namespace(expected=[600], head=head, manifest=manifest)
         )
         self.assertEqual(code, 0)
         entry = payload["entries"][0]
@@ -279,7 +268,168 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertTrue(all(check["verdict"] != "binaire"
                             for check in entry["paths"]))
 
-    def test_sans_liste_attendue_le_controle_le_dit(self) -> None:
+    def test_sans_liste_attendue_le_controle_est_refuse(self) -> None:
+        self.ecrire_manifeste_sans_admissions()
+        with self.assertRaises(inclusion.InputError):
+            inclusion.run(self.namespace())
+        proc = subprocess.run(
+            [sys.executable, str(REPO / "scripts" / "paquet-inclusion.py"),
+             "--manifest", str(self.manifest), "--head", self.head,
+             "--repo", str(self.repo)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("aucun lot attendu", proc.stderr)
+
+    def test_sans_liste_attendue_option_no_expected(self) -> None:
+        self.ecrire_manifeste_sans_admissions()
+        code, payload = inclusion.run(self.namespace(no_expected=True))
+        self.assertEqual(code, 0)
+        self.assertIsNone(payload["expected_source"])
+        rapport = inclusion.render(payload)
+        self.assertIn("NON effectué", rapport)
+        self.assertIn("--no-expected", rapport)
+
+    def test_admissions_en_table_ne_sont_pas_une_composition(self) -> None:
+        # Une section d'admissions en tableau est la liste attendue, même si
+        # ses colonnes s'appellent « lot » et « commit » : elle ne doit pas
+        # être lue comme une composition (#1655 N2).
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-admissions.md"
+        manifest.write_text(
+            textwrap.dedent(
+                """\
+                # Manifeste
+
+                ## 0. Admissions de la coupure
+
+                | Lot | Commit | Note |
+                |---|---|---|
+                | #100 | `{c100}` | admission pilote |
+                | #500 | — | routé, jamais composé |
+
+                ## 2. Composition
+
+                | # | lot(s) | tête source | commit | note |
+                |---|---|---|---|---|
+                | 1 | #100 | `{src100}` | `{c100}` |  |
+                """
+            ).format(src100=self.src100[:12], c100=self.c100[:12]),
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(self.namespace(manifest=manifest))
+        self.assertEqual(payload["expected"], [100, 500])
+        self.assertEqual(payload["expected_source"], "section du manifeste")
+        self.assertEqual(payload["composed"], [100])  # 500 n'est pas composée
+        self.assertEqual([item["lot"] for item in payload["omissions"]], [500])
+        self.assertEqual(code, 1)
+
+    def test_commit_sans_delta_est_vide(self) -> None:
+        # Remise fraîche sans delta : le paquet 11h réel en produit quatre.
+        self.git("switch", "-q", "-c", "lot/700", "main")
+        self.git("commit", "-q", "--allow-empty",
+                 "-m", "#700 : remise fraîche sans delta")
+        source = self.rev("HEAD")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "#700: compose", "lot/700")
+        head = self.rev("HEAD")
+        manifest = self.manifest_simple(700, source, source)
+        code, payload = inclusion.run(
+            self.namespace(expected=[700], head=head, manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["entries"][0]["verdict"], "vide")
+        self.assertTrue(any("#700" in warning and "vide" in warning
+                            for warning in payload["warnings"]))
+        code, payload = inclusion.run(
+            self.namespace(expected=[700], head=head, manifest=manifest,
+                           strict=True)
+        )
+        self.assertEqual(code, 1)
+        self.assertTrue(any("#700" in error and "vide" in error
+                            for error in payload["errors"]))
+
+    def test_changement_de_mode_seul_n_est_pas_binaire(self) -> None:
+        # Un commit qui ne change que le bit exécutable n'émet aucun hunk :
+        # ce n'est pas un binaire, et il ne doit pas faire un faux défaut
+        # sous --strict (#1655 N1).
+        self.git("switch", "-q", "-c", "lot/900", "main")
+        self.write("neuf.sh", "#!/bin/sh\necho ok\n")
+        self.commit("#900 : ajoute le script")
+        (self.repo / "neuf.sh").chmod(0o755)
+        source = self.commit("#900 : rend le script exécutable")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "#900: compose", "lot/900")
+        head = self.rev("HEAD")
+        manifest = self.manifest_simple(900, source, source)
+        code, payload = inclusion.run(
+            self.namespace(expected=[900], strict=True, head=head,
+                           manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["verdict"], "présent")
+        self.assertTrue(all(check["verdict"] != "binaire"
+                            for check in entry["paths"]))
+        self.assertEqual([check["added"] for check in entry["paths"]], [0])
+
+    def test_binaire_remplace_par_du_texte_reste_binaire(self) -> None:
+        # Le diff d'un binaire n'a ni hunk ni en-tête ---/+++ : le chemin est
+        # absent de parse_added. La comparaison des blobs le distingue d'un
+        # changement de mode seul, même quand le nouveau contenu est du texte
+        # (#1655 N1).
+        self.git("switch", "-q", "-c", "lot/960", "main")
+        (self.repo / "mix.dat").write_bytes(b"MIX\0\x01\n")
+        self.commit("#960 : ajoute un binaire")
+        self.write("mix.dat", "desormais du texte\n")
+        source = self.commit("#960 : remplace le binaire par du texte")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "#960: compose", "lot/960")
+        head = self.rev("HEAD")
+        manifest = self.manifest_simple(960, source, source)
+        code, payload = inclusion.run(
+            self.namespace(expected=[960], head=head, manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        entry = payload["entries"][0]
+        self.assertEqual(entry["verdict"], "partiel")
+        self.assertEqual([check["verdict"] for check in entry["paths"]],
+                         ["binaire"])
+
+    def test_ligne_ajoutee_commencant_par_deux_plus(self) -> None:
+        # Une ligne ajoutée « ++ … » produit une ligne de diff « +++ … » :
+        # elle ne doit pas être prise pour un en-tête de fichier (#1655 N3).
+        self.git("switch", "-q", "-c", "lot/800", "main")
+        self.write("huit.txt", "++ entete en apparence\nsimple\n")
+        source = self.commit("#800 : ajoute une ligne ++")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "#800: compose", "lot/800")
+        # la ligne « ++ » est retirée à la tête : elle doit être vue manquante
+        self.write("huit.txt", "simple\n")
+        head = self.commit("retrait de la ligne ++")
+        manifest = self.manifest_simple(800, source, source)
+        code, payload = inclusion.run(
+            self.namespace(expected=[800], head=head, manifest=manifest)
+        )
+        self.assertEqual(code, 0)
+        check = payload["entries"][0]["paths"][0]
+        self.assertEqual(check["added"], 2)
+        self.assertEqual(check["verdict"], "partiel")
+        self.assertEqual(check["missing_sample"], ["++ entete en apparence"])
+
+    def test_titre_qui_nie_les_admissions_est_exclu(self) -> None:
+        # « Pas d'admission » (élision sans espace) nie les admissions comme
+        # « aucune admission » : ses lots ne sont pas la liste attendue.
+        for titre in ("Pas d'admission à la coupure", "Pas d’admissions",
+                      "Aucune admission", "Sans section d'admissions"):
+            manifest = pathlib.Path(self.tmp.name) / "manifeste-negation.md"
+            manifest.write_text(
+                f"# Manifeste\n\n## {titre}\n\n- #900\n", encoding="utf-8"
+            )
+            self.assertEqual(inclusion.parse_manifest(manifest).admissions, [],
+                             titre)
+
+    # -- helpers de banc ---------------------------------------------------
+    def ecrire_manifeste_sans_admissions(self) -> None:
         self.manifest.write_text(
             textwrap.dedent(
                 """\
@@ -292,10 +442,23 @@ class PaquetInclusionTest(unittest.TestCase):
             ) % (self.src100[:12], self.c100[:12]),
             encoding="utf-8",
         )
-        code, payload = inclusion.run(self.namespace())
-        self.assertEqual(code, 0)
-        self.assertIsNone(payload["expected_source"])
-        self.assertIn("NON effectué", inclusion.render(payload))
+
+    def manifest_simple(self, lot: int, source: str, commit: str) -> pathlib.Path:
+        """Manifeste à une entrée de composition, sans liste d'admissions."""
+        manifest = pathlib.Path(self.tmp.name) / f"manifeste-{lot}.md"
+        manifest.write_text(
+            textwrap.dedent(
+                """\
+                # Manifeste
+
+                | # | lot(s) | tête source | commit | note |
+                |---|---|---|---|---|
+                | 1 | #%d | `%s` | `%s` |  |
+                """
+            ) % (lot, source[:12], commit[:12]),
+            encoding="utf-8",
+        )
+        return manifest
 
 
 if __name__ == "__main__":

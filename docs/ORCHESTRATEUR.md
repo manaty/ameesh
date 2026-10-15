@@ -423,9 +423,11 @@ scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
 
 Il sort `1` si un lot attendu manque au manifeste, ou si le contenu d'un lot
 composé a disparu de la tête (revert non consigné) — l'ascendance d'une tête
-ne suffit pas après un revert (#1638). Un contenu *partiel* est listé « à
-lire » (union, adaptation) ; `--strict` le rend bloquant. Détail, format de la
-liste attendue et validation sur le paquet 11h : `docs/PAQUET-INCLUSION.md`.
+ne suffit pas après un revert (#1638). Sans liste attendue, il sort `2`, sauf
+`--no-expected` qui assume le contrôle partiel. Un contenu *partiel* ou *vide*
+est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
+bloquant. Détail, format de la liste attendue et validation sur le paquet 11h :
+`docs/PAQUET-INCLUSION.md`.
 
 ## Le lot en cours
 

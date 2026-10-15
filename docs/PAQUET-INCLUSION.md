@@ -29,18 +29,27 @@ scripts/paquet-inclusion.py \
 scripts/paquet-inclusion.py --manifest … --head <sha> \
     --expected 1124,1056,388,795 --json
 
-# variante stricte : un contenu partiel compte comme un défaut bloquant
+# variante stricte : un contenu partiel ou vide compte comme un défaut bloquant
 scripts/paquet-inclusion.py … --strict
+
+# contrôle partiel assumé, sans liste attendue (admissions non vérifiées)
+scripts/paquet-inclusion.py … --no-expected
 ```
 
 - `--expected` / `--expected-file` : les lots attendus à la coupure (un id par
   ligne, `1124`, `#1124` ou `1124 admission pilote 05:17` ; les commentaires
   après `#` isolé sont ignorés). À défaut, une section du manifeste dont le
-  titre contient « admissions » fournit la liste : le manifeste devient
-  auto-porteur, c'est la forme recommandée.
+  titre contient « admissions » fournit la liste, en liste à puces **ou en
+  tableau** : le manifeste devient auto-porteur, c'est la forme recommandée.
+  Sans aucune de ces sources, le contrôle s'arrête en `2` : une sortie `0`
+  laisserait croire que le contrôle « admissions × manifeste » a eu lieu.
+- `--no-expected` : assume explicitement un contrôle sans liste attendue ; le
+  rapport dit alors « admissions × manifeste NON effectué » et seuls les
+  contrôles « manifeste × arbre » et « cohérence » sont rendus.
 - `--excused` / `--excused-file` : les lots dont le report ou le retrait a été
   décidé hors manifeste (par exemple un `REPORT 23h` du pilote).
-- `--repo` (défaut `.`), `--head` (SHA ou réf), `--json`, `--strict`.
+- `--repo` (défaut `.`), `--head` (SHA ou réf), `--json`, `--strict`,
+  `--no-expected`.
 
 Le script est en **lecture seule** : aucun réseau, aucune écriture dans le
 dépôt. Il lit le manifeste et l'historique git ; les commits cités par le
@@ -61,24 +70,32 @@ manifeste doivent être présents localement (sinon `git fetch` d'abord).
    (`commit^..commit`, premier parent) doit encore être présent à la tête,
    vérifié **ligne par ligne**, pas par ascendance : toutes les lignes ajoutées
    significatives sont là (`présent`, ou `adapté` quand le blob a changé),
-   une partie (`partiel`), aucune (`absent`). Une ligne de retrait est
-   consignée comme telle ; si le contenu d'un lot pourtant retiré réapparaît,
-   un avertissement le dit.
+   une partie (`partiel`), aucune (`absent`), ou le commit ne change aucun
+   fichier (`vide` : remise fraîche déjà portée par une autre entrée, à lire
+   avant le feu). Un changement de **mode seul** (bit exécutable) n'émet aucun
+   hunk : c'est un contenu identique, jamais un binaire. Une ligne de retrait
+   est consignée comme telle ; si le contenu d'un lot pourtant retiré
+   réapparaît, un avertissement le dit.
 3. **Cohérence de la liste.** Les lots composés hors liste attendue sont
    affichés (la liste peut être incomplète), ainsi que les lots attendus et
    expliqués.
 
 Sortie : un rapport lisible ou `--json` (schéma `ameesh-paquet-inclusion/1`).
-Codes de retour : `0` aucun défaut, `1` au moins une inclusion manquante ou un
-contenu absent non expliqué, `2` entrée invalide (manifeste ou tête
-introuvable).
+Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un contenu
+absent non expliqué ou un commit introuvable, ou bien, sous `--strict`, un
+contenu partiel ou vide non expliqué ; `2` entrée invalide (manifeste ou tête
+introuvable, ou aucune liste attendue sans `--no-expected`).
 
 ## Ce qu'il ne prouve pas
 
 - Un contenu **partiel** n'est pas une omission : c'est le plus souvent une
   union ou une adaptation relue (les compositions suivantes réécrivent des
-  lignes). Il est listé « à lire avant le feu » ; `--strict` le rend bloquant.
-- Les fichiers **binaires** sont signalés sans comparaison de contenu.
+  lignes). Un contenu **vide** (aucun delta au commit) n'est pas une omission
+  non plus, mais il ne prouve rien : la remise est peut-être portée par une
+  autre entrée. Les deux sont listés « à lire avant le feu » ; `--strict` les
+  rend bloquants.
+- Les fichiers **binaires** sont signalés sans comparaison de contenu ; un
+  changement de mode seul n'est pas un binaire et ne crée pas de faux signal.
 - Le contrôle ne juge ni les avis, ni les familles de relecture, ni les
   dépendances : il ne remplace pas la qualification du pilote (§12), il évite
   qu'une omission passe inaperçue.
