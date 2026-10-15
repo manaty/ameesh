@@ -416,6 +416,18 @@ class PaquetInclusionTest(unittest.TestCase):
         self.assertEqual(check["verdict"], "partiel")
         self.assertEqual(check["missing_sample"], ["++ entete en apparence"])
 
+    def test_titre_qui_nie_les_admissions_est_exclu(self) -> None:
+        # « Pas d'admission » (élision sans espace) nie les admissions comme
+        # « aucune admission » : ses lots ne sont pas la liste attendue.
+        for titre in ("Pas d'admission à la coupure", "Pas d’admissions",
+                      "Aucune admission", "Sans section d'admissions"):
+            manifest = pathlib.Path(self.tmp.name) / "manifeste-negation.md"
+            manifest.write_text(
+                f"# Manifeste\n\n## {titre}\n\n- #900\n", encoding="utf-8"
+            )
+            self.assertEqual(inclusion.parse_manifest(manifest).admissions, [],
+                             titre)
+
     # -- helpers de banc ---------------------------------------------------
     def ecrire_manifeste_sans_admissions(self) -> None:
         self.manifest.write_text(

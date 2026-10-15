@@ -68,7 +68,7 @@ NEGATIVE_RE = re.compile(
 EXCLUSION_ROW_RE = re.compile(r"retrait|retir[ée]e?s?|revert|report", re.IGNORECASE)
 ADMISSION_HEADING_RE = re.compile(r"admission", re.IGNORECASE)
 NO_ADMISSION_HEADING_RE = re.compile(
-    r"(sans|aucun|aucune|pas de|pas d['’])\s+(section\s+)?(d['’]\s*)?admissions?",
+    r"(sans|aucun|aucune|pas de|pas d['’])\s*(section\s+)?(d['’]\s*)?admissions?",
     re.IGNORECASE,
 )
 RETRAIT_HEADING_RE = re.compile(r"retrait|report|exclusion", re.IGNORECASE)
