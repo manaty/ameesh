@@ -566,8 +566,10 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
                     if parent is None:
                         raise DecisionError("parent work item %s not found" % parent_ref)
                 project = work_projects.creation_project(cfg, db, requester, parent=parent)
-            item = work.add(db, title=title, assignee=requester, actor=requester,
-                            source="decision", app=project, cfg=cfg)
+            # #540 : le lot de sa propre question reste au demandeur, qui
+            # attend la réponse (jamais dans la file d'équipe)
+            item = work._decision_lot(db, title=title, requester=requester, app=project,
+                                      cfg=cfg)
         except work.WorkError as exc:
             raise DecisionError("work item not created — %s" % exc) from exc
         except assignments.AssignmentError as exc:
