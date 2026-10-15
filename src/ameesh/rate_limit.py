@@ -101,11 +101,7 @@ TRANSIENT_PATTERNS = (
     # ancré (`dsh: <CODE>:`) : un simple mot « MALFORMED_RESPONSE » dans un
     # texte ne classe pas (même exigence que le 429).
     re.compile(r"DeepSeek Messages SSE event type mismatch", re.I),
-    re.compile(r"\bSSE\b[^\n]{0,40}\b(?:error|mismatch|failed|closed|reset)\b", re.I),
     re.compile(r"\bservice is too busy\b", re.I),
-    # une passerelle nommée sans numéro reste une signature fournisseur
-    re.compile(r"\b(?:internal server error|bad gateway|service unavailable|"
-               r"gateway time-?out)\b", re.I),
     # DeepSeek (dsh) : ligne d'erreur `dsh: <CODE>: …` d'une panne passagère —
     # débit, serveur, flux SSE malformé, coupé ou vide, attente, transport
     # (bureau 15/10 : « dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event

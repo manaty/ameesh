@@ -142,7 +142,6 @@ class ClassifyTest(unittest.TestCase):
         # switch to alternative LLM API service providers. ».
         for texte in ("dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type mismatch",
                       "DeepSeek Messages SSE event type mismatch",
-                      "SSE error: stream closed unexpectedly",
                       "Service is too busy. We advise users to temporarily switch to "
                       "alternative LLM API service providers.",
                       "HTTP 502 Bad Gateway",
@@ -200,7 +199,13 @@ class ClassifyTest(unittest.TestCase):
                       "assert response.status_code == 500",
                       "MALFORMED_RESPONSE dans mes notes",
                       "dsh: AUTH: invalid credential",
-                      "dsh: CONTEXT_WINDOW_EXCEEDED: prompt too long"):
+                      "dsh: CONTEXT_WINDOW_EXCEEDED: prompt too long",
+                      # transport MCP (SDK) et serveurs tiers : ni débit ni
+                      # panne passagère du fournisseur (R1 dev2 du 15/10)
+                      "SSE error: Non-200 status code (401)",
+                      'MCP server "figma": SSE connection closed',
+                      "remote: Internal Server Error",
+                      "MCP server x: Service Unavailable"):
             with self.subTest(texte=texte):
                 self.assertIsNone(rate_limit.classify(error=texte))
                 self.assertIsNone(rate_limit.classify(stderr_tail=texte))
