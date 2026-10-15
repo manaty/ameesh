@@ -195,7 +195,26 @@ class TestDiagnosticFactuel(unittest.TestCase):
     def test_tete_exacte_exigee(self):
         autre = diagnosis_report("x" * 40)
         self.assertIsNone(incident.diagnosis_of(autre, head_sha=self.HEAD))
-        self.assertEqual(incident.diagnosis_of(autre)["packet"]["head"], "x" * 40)
+        self.assertIsNone(incident.diagnosis_of(autre))
+        self.assertIsNone(incident.diagnosis_of(diagnosis_report(""), head_sha=""))
+
+    def test_champs_de_liste_mal_formes_ignores(self):
+        for field in ("ci", "missing"):
+            for value in (1, "illisible", {}):
+                with self.subTest(field=field, value=value):
+                    report = diagnosis_report(self.HEAD, **{field: value})
+                    self.assertIsNone(incident.diagnosis_of(report, head_sha=self.HEAD))
+        for section, field in (("environment", "receipts"),
+                               ("attribution", "candidates"),
+                               ("attribution", "proven_lots")):
+            for value in (1, "illisible", {}, ["reçu libre"]):
+                with self.subTest(section=section, field=field, value=value):
+                    report = diagnosis_report(self.HEAD)
+                    report[section][field] = value
+                    self.assertIsNone(incident.diagnosis_of(report, head_sha=self.HEAD))
+        report = diagnosis_report(self.HEAD)
+        report["ci"][0]["failed_jobs"] = 1
+        self.assertIsNone(incident.diagnosis_of(report, head_sha=self.HEAD))
 
     def test_rapport_unknown_rend_les_faits_et_les_manques(self):
         out = incident.diagnosis_of(diagnosis_report(self.HEAD), head_sha=self.HEAD)
@@ -218,7 +237,11 @@ class TestDiagnosticFactuel(unittest.TestCase):
                 "proven_lots": [{"work_item_id": 1598}]}), head_sha=self.HEAD)
         self.assertEqual(out["attribution"]["proven_lots"], [])
         self.assertEqual(out["attribution"]["candidates"], [{"work_item_id": 1598}])
+        self.assertEqual(out["attribution"]["status"], "unknown")
         self.assertTrue(any("reçu" in phrase for phrase in out["missing"]))
+        body = incident.body_of(repo="manaty/nexlink", branch="develop", run_id=501,
+                                diagnosis=out)
+        self.assertNotIn("**proven**", body)
 
     def test_prouve_avec_recu_conserve(self):
         out = incident.diagnosis_of(
@@ -591,6 +614,25 @@ class TestConsommateur(unittest.TestCase):
                 mock.patch.object(incident.work, "assign"):
             out = incident.consume(object(), lands=lambda *a: [], diagnoses=broken)
         self.assertEqual(out[0]["diagnosis"], "illisible : RuntimeError")
+        self.assertTrue(out[0]["created"])
+
+    def test_rapport_mal_forme_n_empeche_aucun_incident(self):
+        rows = [self._run(), self._run(repo="manaty/ameesh", branch="main", run_id=502)]
+        with self._db(_CiStore(rows), _Store()), \
+                mock.patch.object(incident.work, "add", side_effect=[{"id": 9115}, {"id": 9116}]):
+            out = incident.consume(object(), lands=lambda *a: [],
+                                   diagnoses=lambda repo, sha: diagnosis_report(sha, ci=1))
+        self.assertEqual(len(out), 2)
+        self.assertTrue(all(line["created"] for line in out))
+        self.assertTrue(all(line["diagnosis"] != "lu (tête exacte)" for line in out))
+
+    def test_exception_de_decodage_n_empeche_pas_l_incident(self):
+        with self._db(_CiStore([self._run()]), _Store()), \
+                mock.patch.object(incident, "diagnosis_of", side_effect=ValueError("illisible")), \
+                mock.patch.object(incident.work, "add", return_value={"id": 9117}):
+            out = incident.consume(object(), lands=lambda *a: [],
+                                   diagnoses=lambda repo, sha: diagnosis_report(sha))
+        self.assertEqual(out[0]["diagnosis"], "illisible : ValueError")
         self.assertTrue(out[0]["created"])
 
     def test_sans_lecteur_le_releve_local_fait_foi(self):

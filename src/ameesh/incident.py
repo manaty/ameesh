@@ -256,8 +256,8 @@ def _declared(entry: dict) -> str:
 def diagnosis_of(report, *, head_sha: str = "") -> Optional[dict]:
     """Le rapport factuel commun `ameesh-train-diagnosis/1` (#1467), lu comme donnée.
 
-    N'accepte que le schéma connu et, quand `head_sha` est donné, la **tête
-    exacte** (`packet.head`) : un rapport d'une autre tête, d'un autre schéma
+    N'accepte que le schéma connu et une **tête attendue non vide** égale à
+    `packet.head` : un rapport d'une autre tête, d'un autre schéma
     ou illisible rend `None`, et l'appelant garde son propre relevé.
 
     Le rapport n'autorise rien par lui-même : ni exemption d'environnement, ni
@@ -271,19 +271,35 @@ def diagnosis_of(report, *, head_sha: str = "") -> Optional[dict]:
         return None
     packet = report.get("packet") if isinstance(report.get("packet"), dict) else {}
     head = str(packet.get("head") or "")
-    if head_sha and head != str(head_sha):
+    if not head_sha or head != str(head_sha):
         return None
     environment = report.get("environment") \
         if isinstance(report.get("environment"), dict) else {}
-    receipts = [receipt for receipt in (environment.get("receipts") or ()) if receipt]
     attribution = report.get("attribution") \
         if isinstance(report.get("attribution"), dict) else {}
+    # Une liste illisible n'est pas une liste vide ni un reçu : rejeter le
+    # rapport entier conserve le relevé local sans inventer de fait.
+    dict_lists = [report.get("ci"), environment.get("receipts"),
+                  attribution.get("candidates"), attribution.get("proven_lots")]
+    if any(not isinstance(value, list) or
+           any(not isinstance(entry, dict) for entry in value) for value in dict_lists):
+        return None
+    if any(not isinstance(run.get("failed_jobs"), list) or
+           any(not isinstance(job, dict) for job in run["failed_jobs"])
+           for run in report["ci"]):
+        return None
+    if not isinstance(report.get("missing"), list) or \
+            any(not isinstance(phrase, str) for phrase in report["missing"]):
+        return None
+    receipts = [receipt for receipt in environment["receipts"] if receipt]
     candidates = _dicts(attribution.get("candidates"))
     proven = _dicts(attribution.get("proven_lots"))
     missing = _texts(report.get("missing"))
+    attribution_status = str(attribution.get("status") or "unknown")
     if proven and not receipts:
         candidates = candidates + proven
         proven = []
+        attribution_status = "unknown"
         missing.append("reçu d'exécution local absent : les lots cités prouvés "
                        "retombent en candidats")
     runs = [{"workflow": str(run.get("workflow") or ""),
@@ -297,7 +313,7 @@ def diagnosis_of(report, *, head_sha: str = "") -> Optional[dict]:
                    for field in ("source", "target", "base", "head", "tree")},
         "environment": {"status": str(environment.get("status") or "unknown"),
                         "receipts": len(receipts)},
-        "attribution": {"status": str(attribution.get("status") or "unknown"),
+        "attribution": {"status": attribution_status,
                         "candidates": candidates, "proven_lots": proven},
         "ci": runs,
         "missing": missing,
@@ -565,11 +581,11 @@ def consume(db, *, integration=None, lands=None, links=None, diagnoses=None,
             if diagnoses is not None and head_sha:
                 try:
                     report = diagnoses(repo, head_sha)
+                    diagnosis = diagnosis_of(report, head_sha=head_sha)
                 except Exception as exc:  # noqa: BLE001 - un lecteur muet n'empêche pas l'incident
-                    report = None
+                    diagnosis = None
                     line["diagnosis"] = "illisible : %s" % type(exc).__name__
                 else:
-                    diagnosis = diagnosis_of(report, head_sha=head_sha)
                     line["diagnosis"] = ("lu (tête exacte)" if diagnosis
                                          else ("ignoré : schéma ou tête étrangers"
                                                if report is not None else "absent"))
