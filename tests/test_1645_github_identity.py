@@ -371,5 +371,21 @@ class ExecuteurTest(Base):
         self.assertEqual(env["AGENT_MAIL_NAME"], "dev-x")
 
 
+class RoutageTest(unittest.TestCase):
+    """`ameesh github` sert deux modules : gestes/identity (#1645) et read
+    (#860, veilles de CI) ; l'un ne doit jamais avaler l'autre."""
+
+    def test_sous_commandes_routees(self):
+        from unittest import mock
+        from ameesh import github_cli, github_identity, main as main_mod
+        with mock.patch.object(github_identity, "main", return_value=11) as ident, \
+                mock.patch.object(github_cli, "main", return_value=22) as cli:
+            self.assertEqual(main_mod._dispatch(["github", "gestes", "--json"]), 11)
+            self.assertEqual(main_mod._dispatch(["github", "identity", "dev-x"]), 11)
+            self.assertEqual(main_mod._dispatch(["github", "read", "/repos/o/r"]), 22)
+        self.assertEqual(ident.call_count, 2)
+        cli.assert_called_once_with(["read", "/repos/o/r"])
+
+
 if __name__ == "__main__":
     unittest.main()
