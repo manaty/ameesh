@@ -1808,9 +1808,10 @@ def handoff_settings(args) -> dict | None:
 
 
 def take_settings(args) -> dict | None:
-    """Réglages de `backlog.auto_take` lus des options ; None si les trois
-    prises (file d'amélioration, lots de l'équipe, propositions de
-    relecture/correction #1677) sont coupées."""
+    """Réglages de `backlog.auto_take` lus des options ; None si les deux
+    prises (file d'amélioration, lots de l'équipe) sont coupées — les
+    propositions #1677 n'existent qu'avec une prise active, et
+    `review_max_per_hour` à 0 les coupe en plus."""
     from . import backlog
     idle = float(getattr(args, "take_idle", 0) or 0)
     most = int(getattr(args, "take_max_per_hour", 0) or 0)
@@ -1824,7 +1825,9 @@ def take_settings(args) -> dict | None:
         idle, most = 0.0, 0
     if lot_idle <= 0 or lot_most <= 0:
         lot_idle, lot_most = 0.0, 0
-    if not most and not lot_most and review_most <= 0:
+    # #1738 R1 (B2) : les propositions suivent une prise active — les deux
+    # prises à 0 coupent toujours toute la prise automatique (comme avant).
+    if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
             "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most,

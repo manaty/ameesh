@@ -1590,7 +1590,10 @@ class WorkItems(Domain):
         et la note tiennent ensemble. Rend False sans rien écrire si un autre
         passage a déjà proposé le lot, si le lot n'est plus en `qa`, ou si
         l'agent en est l'assigné — deux passages (hôtes distincts) ne
-        proposent jamais le même lot deux fois."""
+        proposent jamais le même lot deux fois. #1738 R1 (B1) : sous le
+        verrou, le lot est revalidé avec le prédicat de `review_proposals`
+        (relecteur vide, verdict courant, gel) et `kind` doit y correspondre ;
+        le relecteur n'est posé que s'il est encore vide (compare-and-set)."""
 
     @abc.abstractmethod
     def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:

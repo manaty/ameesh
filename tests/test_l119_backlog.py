@@ -352,15 +352,13 @@ class AlerteEtNotifyTest(_Base):
         self.assertEqual([(r["agent"], r["lot"]) for r in prises], [("claude1", item["id"])])
         self.assertIn("auto-take", notify._format(prises[0]))
         self.assertEqual(work.get(self.db, item["id"])["assignee"], "claude1")
-        # #1738 (N3) : les deux prises historiques coupées laissent les
-        # propositions de relecture/correction (#1677) ; il faut leur
-        # interrupteur à 0 pour couper toute la prise automatique.
         args = notify.build_parser().parse_args(["--take-idle", "0", "--take-lot-idle", "0"])
-        self.assertEqual(notify.take_settings(args)["review_max_per_hour"],
-                         backlog.REVIEW_PROPOSAL_MAX_PER_HOUR)
-        args = notify.build_parser().parse_args(
-            ["--take-idle", "0", "--take-lot-idle", "0", "--take-review-max-per-hour", "0"])
         self.assertIsNone(notify.take_settings(args))
+        # #1738 R1 (B2) : les propositions suivent une prise active ; leur
+        # interrupteur à 0 les coupe en plus, la prise restant active.
+        args = notify.build_parser().parse_args(["--take-review-max-per-hour", "0"])
+        self.assertEqual(notify.take_settings(args)["review_max_per_hour"], 0)
+        self.assertTrue(notify.take_settings(args)["max_per_hour"])
 
 
 if __name__ == "__main__":

@@ -421,16 +421,20 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor)
 
-    def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
+    def _designate_reviewer(self, item_id, reviewer, actor, *,
+                            vacant=False) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
-        avant, un `assign` a pu la changer entre-temps."""
+        avant, un `assign` a pu la changer entre-temps. #1738 R1 (B1) :
+        `vacant` en fait un compare-and-set — un relecteur posé entre-temps
+        (par le pilote, hors verrou) n'est pas écrasé."""
         rows = self.db.query(
             "UPDATE work_items SET reviewer = %%s, updated_at = now()"
             " WHERE id = %%s AND state = 'qa'"
-            "   AND assignee IS DISTINCT FROM %%s"
-            " RETURNING %s" % item_columns(self.db),
+            "   AND assignee IS DISTINCT FROM %%s%s"
+            " RETURNING %s" % (" AND coalesce(reviewer, '') = ''" if vacant else "",
+                               item_columns(self.db)),
             (reviewer, int(item_id), reviewer))
         if not rows:
             return None
@@ -1441,6 +1445,12 @@ class WorkItems(interface.WorkItems):
         pas le même lot deux fois. B1 : le verdict lu est le verdict courant —
         un `ok` portant sur une tête regelée depuis ne dispense plus de la
         relecture."""
+        return self._proposal_rows(limit, proposal_prefix, window_s)
+
+    def _proposal_rows(self, limit, proposal_prefix, window_s, item_id=None):
+        """`review_proposals`, restreint à un lot si `item_id` (#1738 R1 B1 :
+        la prise revalide le même prédicat sous son verrou)."""
+        only = "   AND w.id = %d" % int(item_id) if item_id is not None else ""
         reviewer_guard = "   AND coalesce(w.reviewer, '') = ''" if has_reviewer(self.db) else ""
         frozen_sha = _last_freeze_sha("w")
         current = _current_verdict("w")
@@ -1453,7 +1463,7 @@ class WorkItems(interface.WorkItems):
             "  FROM work_items w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
-            " WHERE w.state = 'qa'"
+            " WHERE w.state = 'qa'" + only +
             "   AND w.assignee IS NOT NULL AND btrim(w.assignee) <> ''"
             "   AND left(w.assignee, 6) <> 'human:'"
             "   AND " + frozen_sha + " IS NOT NULL"
@@ -1476,23 +1486,21 @@ class WorkItems(interface.WorkItems):
             # sérialisent ici, et le second relit la fenêtre APRÈS le premier.
             tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                      ("review proposal:%d" % item,))
-            rows = tx.query("SELECT state, assignee FROM work_items WHERE id = %s",
-                            (item,))
-            if not rows or (rows[0].get("state") or "") != "qa":
-                return False
-            if (rows[0].get("assignee") or "").strip() == agent:
-                return False
-            if tx.query("SELECT 1 FROM work_item_events"
-                        " WHERE work_item_id = %s AND starts_with(note, %s)"
-                        "   AND created_at > now() - make_interval(secs => %s)"
-                        " LIMIT 1",
-                        (item, str(proposal_prefix), float(window_s))):
-                return False
+            # #1738 R1 (B1) : sous le verrou, le lot est relu avec le prédicat
+            # de `review_proposals` (qa, gel, relecteur vide, verdict courant,
+            # fenêtre) et le `kind` doit être celui qu'il donne aujourd'hui.
             me = WorkItems(tx)
+            rows = me._proposal_rows(1, proposal_prefix, window_s, item_id=item)
+            if not rows or (rows[0].get("assignee") or "").strip() == agent:
+                return False
+            if kind != ("correction" if rows[0].get("last_verdict") == "blocked"
+                        else "review"):
+                return False
             if kind == "review" and has_reviewer(tx):
                 # N7 : une relecture désigne son relecteur (#705) — le lot sort
                 # des propositions suivantes et `stale_lot` s'adresse à lui.
-                if me._designate_reviewer(item, agent, actor) is None:
+                # B1 : compare-and-set, le pilote ne prend pas ce verrou.
+                if me._designate_reviewer(item, agent, actor, vacant=True) is None:
                     return False
             me._event(item, "qa",
                       "%s: lot #%d to %s (%s)" % (proposal_prefix, item, agent, kind),

@@ -507,6 +507,32 @@ class PropositionTest(_Empile):
             proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE,
             window_s=backlog.REVIEW_PROPOSAL_WINDOW_S, actor="ameesh"))
 
+    def claim(self, lot, agent="codex1", kind="review"):
+        return storage.of(self.db).work.claim_review_proposal(
+            lot["id"], agent=agent, kind=kind,
+            proposal_prefix=backlog.REVIEW_PROPOSAL_NOTE,
+            window_s=backlog.REVIEW_PROPOSAL_WINDOW_S, actor="ameesh")
+
+    def test_un_relecteur_designe_par_le_pilote_n_est_pas_ecrase(self):
+        """#1738 R1 (B1) : le pilote désigne dev7 (hors verrou) entre la
+        lecture des propositions et la prise — la prise ne l'écrase pas."""
+        self.auteur()
+        lot = self.qa("relire", branch="lot/a-relire")
+        storage.of(self.db).work.designate_reviewer(lot["id"], "dev7", actor="pilote")
+        self.assertFalse(self.claim(lot))
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "dev7")
+
+    def test_un_lot_juge_entre_temps_n_est_pas_propose(self):
+        """#1738 R1 (B1) : un verdict courant `ok` (ou un `kind` périmé) arrivé
+        entre la lecture et la prise : rien n'est proposé ni écrit."""
+        self.auteur()
+        ok = self.qa("juge ok", verdict="ok", branch="lot/ok")
+        self.assertFalse(self.claim(ok))
+        self.assertFalse((work.get(self.db, ok["id"])["reviewer"] or "").strip())
+        bloque = self.qa("juge bloque", verdict="blocked", branch="lot/bloque")
+        self.assertFalse(self.claim(bloque, kind="review"), "kind périmé")
+        self.assertTrue(self.claim(bloque, kind="correction"))
+
     def test_on_coupe_les_propositions_et_la_file_reprend(self):
         """#1738 (N3) : `review_max_per_hour=0` coupe les propositions ; la
         file d'amélioration, elle, est servie dans le même passage."""
