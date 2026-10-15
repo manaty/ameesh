@@ -33,7 +33,10 @@ deploy/mise-a-jour/vm.sh agents controler
 
 Le redémarrage attend la fin des tours, pendant au plus `ATTENTE_MAX`
 secondes (7200 par défaut). Il relit le placement avant chaque redémarrage :
-un agent déplacé, arrêté ou passé en observation est ignoré. Le compte
+un agent déplacé ou passé en observation est ignoré ; un agent arrêté n’est
+pas réactivé (aucun bail, aucun tour — #1131), mais son unité encore active
+est rechargée sur le nouveau code (#1633), sans quoi elle servirait la
+reprise de l’owner avec la version d’avant le déploiement. Le compte
 `ameesh` doit avoir un gestionnaire systemd utilisateur ; le script pose
 `HOME`, `XDG_RUNTIME_DIR` et `DBUS_SESSION_BUS_ADDRESS` pour joindre son bus.
 Le CLI distant est celui de l’unité :
