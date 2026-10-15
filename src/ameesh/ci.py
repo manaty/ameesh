@@ -355,7 +355,9 @@ class Watcher:
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; une exécution
-        déjà connue que GitHub dit de nouveau en cours est une **relance**
+        connue sans lot rattaché l'est dès que la branche du lot est posée
+        (#1321), tant que sa tête est encore celle de la branche ; une
+        exécution connue que GitHub dit de nouveau en cours est une **relance**
         (#901 : `run_id` inchangé, `run_attempt` suivant) : sa ligne est
         rouverte et suivie, sauf si une tête plus récente de la branche l'a
         remplacée ou si l'attempt n'a pas augmenté (liste en retard, #828).
@@ -368,6 +370,33 @@ class Watcher:
         if known is not None:
             if known["status"] == "superseded":
                 return []  # la tête de la branche a bougé : la relance est sans objet
+            if known.get("work_item_id") is None:
+                # #1321 : la branche du lot peut être posée après la première
+                # vue du run ; sans ce rattachement, `_conclude` lit
+                # `recipient_of(None)` et le verdict part à personne.
+                # `open_run` est idempotent (coalesce côté stockage) : il ne
+                # remplit que le lien encore vide.
+                lot = lot_of_run(run, lots)
+                row = None
+                if lot is not None:
+                    row = next((l for l in lots if int(l["id"]) == lot), None)
+                head = run.get("head_sha") or ""
+                # une tête plus récente connue de la branche (`branch_head`,
+                # posé par le relevé des branches) rend ce run périmé : le
+                # rattacher enverrait un verdict d'une tête remplacée — et
+                # l'exécution de remplacement peut être `pending`, invisible
+                # au veilleur (#1161). Le silence vaut mieux qu'un faux vert.
+                known_head = (row or {}).get("branch_head") or ""
+                if lot is not None and (not known_head or head == known_head):
+                    st.ci.open_run(repo, run_id, head_sha=head,
+                                   branch=run.get("head_branch") or "",
+                                   event=run.get("event") or "", base=base_of(run),
+                                   work_item_id=lot, url=run.get("html_url"))
+                    self.log("CI %s run %s: lot #%s linked (branch set later)"
+                             % (repo, run_id, lot))
+                elif lot is not None:
+                    self.log("CI %s run %s: obsolete head %s (branch head %s), not linked"
+                             % (repo, run_id, _short(head), _short(known_head)))
             known_attempt = int(known.get("run_attempt") or 1)
             if attempt <= known_attempt:
                 # même attempt : soit la ligne est déjà suivie, soit une liste
