@@ -2170,9 +2170,10 @@ class Progress(Domain):
 
     @abc.abstractmethod
     def agents(self, project: str | None) -> list[dict]:
-        """État d'exécution de chaque agent (de `chantier` ou `team` =
-        `project` si donné) : statut, bail vivant (`lease_live`), consigne en
-        cours, marqueur du tour (`turn_started_ts`, `turn_label`), non-lus."""
+        """État d'exécution de chaque agent (L243 : `project` est membre de ses
+        `projects`, sinon son `team`, sinon son `workstream`) : statut, bail
+        vivant (`lease_live`), consigne en cours, marqueur du tour
+        (`turn_started_ts`, `turn_label`), non-lus."""
 
     @abc.abstractmethod
     def costs(self, *, since_ts: float, agents: Sequence[str] | None) -> list[dict]:

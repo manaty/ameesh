@@ -160,7 +160,26 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
         'session_account',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- #810 (0428) : la vue est recréée avec `r.*` et expose donc les
+        -- colonnes de `agent_registry` apparues depuis 0033 ; accordées ici à
+        -- l'identique de la table (mêmes données, mêmes refus de contenu).
+        -- L60 (0041) : plafond de contexte (un nombre)
+        'context_max_tokens',
+        -- L105 (0046) : plafonds du tour (des nombres)
+        'turn_max_seconds', 'turn_mail_max',
+        -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
+        'turn_grace_seconds',
+        -- L232a (0371) : clôture de passage entre hôtes
+        'handoff_fenced',
+        -- L165b (0384) : réveil sur lot actionnable et session (mêmes réglages)
+        'lot_wake', 'session_harness', 'session_cwd', 'session_origin',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects',
+        -- 0403 : attente de bail depuis (un instant)
+        'lease_wait_since',
+        -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
+        'workstream'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
