@@ -60,10 +60,10 @@ ENV_ROLE = "AMEESH_GH_ROLE"
 #: la valeur d'une option d'identifiant (`--repo`, `--match-head-commit`…) et,
 #: pour les seules commandes dont les positions sont des identifiants (`pr`,
 #: `run`, `api`…), leurs arguments de forme identifiant. Tout le reste devient
-#: `[valeur]`, un jeton reconnaissable `[jeton]`. Une option qui attend une
-#: valeur prend l'argument suivant quel qu'il soit, même commençant par un
-#: tiret, comme gh ; après une option inconnue (booléen ou non, on ne sait
-#: pas), plus rien n'est consigné. Rien n'est tronqué.
+#: `[valeur]`, un jeton reconnaissable `[jeton]`. Dès que l'alignement des
+#: options et de leurs valeurs n'est plus certain — option inconnue, option
+#: courte à valeur collée, ou option à valeur suivie d'un argument qui
+#: commence par un tiret — plus rien n'est consigné. Rien n'est tronqué.
 SANITIZE = r"""
 _JETON = re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}")
 _IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#:@+-]{0,99}")
@@ -166,6 +166,14 @@ def sanitize_argv(argv):
 
     for i, a in enumerate(argv):
         if attente is not None:
+            if a.startswith("-") and a != "-":
+                # la « valeur » ressemble à une option : si gh tient l'option
+                # pour un booléen (`pr review -a`), c'est elle qu'il lit comme
+                # option (`--body`), et l'argument d'après est un corps libre
+                # qu'on prendrait pour une option sûre. L'alignement est
+                # perdu : plus rien n'est consigné.
+                out.extend("[valeur]" for _ in argv[i:])
+                break
             out.append(_valeur(a) if sure(attente) else "[valeur]")
             attente = None
             continue
@@ -176,7 +184,11 @@ def sanitize_argv(argv):
         if a.startswith("-") and a != "-":
             option_vue = True
             nom, v = _option(a)
-            if nom is None:
+            if nom is None or (v is not None and not a.startswith("--")):
+                # inconnue, ou courte à valeur collée (`-ab` est aussi un
+                # groupe de booléens pour gh, dont le dernier peut prendre
+                # l'argument suivant) : booléen ou non, on ne sait pas, plus
+                # rien n'est consigné
                 # booléen ou non, on ne sait pas : plus rien n'est consigné
                 out.append("[option]")
                 out.extend("[valeur]" for _ in argv[i + 1:])
