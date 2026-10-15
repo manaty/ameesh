@@ -635,8 +635,18 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
                          % (row["target"], project.land), actor=work.SYSTEM_SENDER):
         return landing.busy("lease on %s lost before landing" % landing.key)
     if project.land == "pr":
+        found = None
         status = pr_status(slug, row["branch"], gh=gh) if slug else None
         if status is None:
+            # #1682: an armed auto-merge can merge the PR between two passes,
+            # at the exact frozen head. That merge is a fact like any other:
+            # found here, it is recorded instead of ejecting the queue entry.
+            # A merge at any other head (the #1162 rewrite) finds no match and
+            # keeps the ejection below.
+            found = pr_merged(slug, row["branch"], row["frozen_sha"], gh=gh) if slug else None
+            if found is not None:
+                return _after_merge(landing, found["number"], found["base"], None,
+                                    sha=row["frozen_sha"])
             return landing.eject("no open PR for %s" % row["branch"],
                                  "Open the PR, then ameesh work queue add %d." % lot)
         # #1656: never leave an active auto-merge on a PR the queue manages. It
@@ -649,6 +659,14 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
         if status.get("auto"):
             error = pr_disable_auto(slug, status["number"], gh=gh)
             if error is not None:
+                # #1682: the auto-merge may have fired between the read and
+                # the disarm — the disarm then fails on an already merged PR.
+                # A merge at the frozen head into its target is constated;
+                # anything else keeps the fail-closed ejection.
+                found = pr_merged(slug, row["branch"], row["frozen_sha"], gh=gh)
+                if found is not None:
+                    return _after_merge(landing, found["number"], found["base"], None,
+                                        sha=row["frozen_sha"])
                 return landing.eject(
                     "PR #%s: auto-merge armed and not disarmed (%s)" % (status["number"], error),
                     "Disarm it by hand (gh pr merge --disable-auto %s), then ameesh work "
@@ -813,6 +831,12 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     if status.get("auto"):
         error = pr_disable_auto(slug, status["number"], gh=gh)
         if error is not None:
+            # #1682: the auto-merge may have fired between the read and the
+            # disarm (the disarm then fails on a merged PR): a merge at the
+            # landing head is constated, like the "merged since" path above.
+            merged = pr_merged(slug, row["branch"], row["landing_sha"], gh=gh)
+            if merged is not None:
+                return _after_merge(landing, merged["number"], merged["base"], None)
             return landing.eject(
                 "PR #%s: auto-merge armed and not disarmed (%s) — it could merge a head "
                 "the queue has not qualified" % (status["number"], error),
@@ -885,13 +909,16 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     return _after_merge(landing, status["number"], after, unread)
 
 
-def _after_merge(landing: _Landing, pr, after, unread) -> dict:
+def _after_merge(landing: _Landing, pr, after, unread, *, sha: str | None = None) -> dict:
     """#194 r8: PR `pr` is merged (by this call or found merged): landed if
-    into its target, otherwise reported."""
+    into its target, otherwise reported. `sha` names the merged head when the
+    caller knows it (#1682: a merge found before the queue pushed its own
+    merge commit; the default is the `landing_sha` the queue recorded)."""
+    if sha is None:
+        sha = landing.row["landing_sha"]
     if after != _branch_of(landing.row["target"]):
         return _merged_in_doubt(landing, pr, after, unread)
-    return landing.landed({"sha": landing.row["landing_sha"], "state": "pr", "files": []},
-                          None, pr=pr)
+    return landing.landed({"sha": sha, "state": "pr", "files": []}, None, pr=pr)
 
 
 def _merged_sha(db, lot: int) -> str:
