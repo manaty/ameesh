@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -905,6 +907,61 @@ class InstallPilotTest(unittest.TestCase):
         os.rmdir(self.host + root + "/work")
         out = self.run_script("--check", "--host", "vm-test").stdout
         self.assertIn("FAIL missing %s/work" % root, out)
+        # the root may be a hand-made layout (2710 here); a world-writable
+        # one is a defect, not a layout (dev2 R2 N1)
+        os.chmod(self.host + root, 0o777)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL %s is 777 " % root, out)
+        self.assertIn("world-writable", out)
+
+    def test_check_accepts_the_job_users_home(self):
+        # L159b2 through deploy/guest/install.sh: $ROOT/home is the job user's
+        # passwd home (--job-user, a name --check does not know), so its owner
+        # is accepted there; tmp and work stay the guest's alone.
+        root = "/srv/ameesh-guest"
+        with open(os.path.join(self.host, "etc", "passwd"), "a", encoding="utf-8") as fh:
+            fh.write("ameesh-guest:x:998:998::%s/home:/bin/bash\n" % root)
+            fh.write("ameesh-job:x:%d:%d::%s/home:/bin/bash\n"
+                     % (os.getuid(), os.getgid(), root))
+        for d in ("", "/home", "/tmp", "/work"):
+            os.chmod(self.on_host(root + d), 0o700 if d else 0o2710)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        # the tree is the test's uid: not the guest's (998), but the job
+        # user's, whose passwd home is exactly $ROOT/home
+        self.assertIn("ok   %s/home (700 " % root, out)
+        self.assertIn("the job user's home, L159b2", out)
+        for d in ("tmp", "work"):
+            self.assertIn("FAIL %s/%s is 700 " % (root, d), out)
+        self.assertIn("not owned by ameesh-guest (uid 998)", out)
+
+    def test_a_fresh_tree_under_a_setgid_root_is_created_700(self):
+        # R1 #1586: step 1's own command, replayed for real under a 2710 root
+        # (no chmod by hand: install -d -m 0700 leaves 2700 there, which
+        # --check refuses). The witness reads the modes back, then --check
+        # accepts what the install just made.
+        self.guest_user()
+        root = "/srv/ameesh-guest"
+        self.on_host(root)
+        os.chmod(self.host + root, 0o2710)
+        res = self.dry()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        for d in ("home", "tmp", "work"):
+            line = next(l for l in out.splitlines()
+                        if l.startswith("+ install -d -m ")
+                        and l.endswith(" %s/%s" % (root, d)))
+            # the guest exists in the test's passwd only, mapped to the test's
+            # uid/gid; the command is replayed with those, nothing else changed
+            cmd = line[2:].replace("-o ameesh-guest -g ameesh-guest",
+                                   "-o %d -g %d" % (os.getuid(), os.getgid()))
+            subprocess.run(shlex.split(cmd.replace(root, self.host + root)),
+                           check=True, capture_output=True)
+        for d in ("home", "tmp", "work"):
+            made = self.host + root + "/" + d
+            self.assertEqual(stat.S_IMODE(os.stat(made).st_mode), 0o700, made)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        for d in ("home", "tmp", "work"):
+            self.assertIn("ok   %s/%s (700 " % (root, d), out)
 
     def test_uninstall_removes_the_helper(self):
         res = self.dry("--uninstall")
@@ -955,7 +1012,7 @@ class InstallPilotTest(unittest.TestCase):
             self.assertNotIn("guest-tree %s/home'" % root, out)
             for d in ("tmp", "work"):
                 rec = out.index("record 'guest-tree %s/%s'" % (root, d))
-                self.assertLess(rec, out.index("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/%s"
+                self.assertLess(rec, out.index("install -d -m 00700 -o ameesh-guest -g ameesh-guest %s/%s"
                                                % (root, d)))
             # the test's host has no /opt/ameesh/venv
             self.assertLess(out.index("record 'venv-tree /opt/ameesh/venv'"),
@@ -975,12 +1032,14 @@ class InstallPilotTest(unittest.TestCase):
             out = res.stdout
             self.assertNotIn("install -d -m 0755 %s\n" % root, out)
             for d in ("home", "tmp"):
-                self.assertNotIn("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/%s\n"
+                self.assertNotIn("install -d -m 00700 -o ameesh-guest -g ameesh-guest %s/%s\n"
                                  % (root, d), out)
                 self.assertNotIn("guest-tree %s/%s'" % (root, d), out)
+                # what a reinstall keeps is said at step 1, not only at --check
+                self.assertIn("%s/%s exists: kept as is (" % (root, d), out)
             # only the missing one is created, and recorded before it
             self.assertIn("record 'guest-tree %s/work'" % root, out)
-            self.assertIn("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/work\n" % root,
+            self.assertIn("install -d -m 00700 -o ameesh-guest -g ameesh-guest %s/work\n" % root,
                           out)
 
     def test_purge_removes_only_the_recorded_paths(self):

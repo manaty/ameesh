@@ -140,7 +140,10 @@ sudo deploy/guest/install-pilot.sh --host ameesh-agents-1 \
 Re-running the install never reopens an existing volume: the mode and owner
 of a tree that is already there are kept (L1586), and `--check` reports them.
 A layout given by hand on `/srv/ameesh-guest`, or the `2710` of L159b, thus
-survives a later reinstall instead of being reset to `0755`.
+survives a later reinstall instead of being reset to `0755`; a world-writable
+root is the one thing it refuses. With L159b2's job user, `install.sh` gives
+`/srv/ameesh-guest/home` to it — the account whose passwd home it is — and
+`--check` accepts that owner there (`tmp` and `work` stay the guest's).
 
 Then the secrets (files created empty, `0640 root:ameesh-guest`, never
 overwritten by the script):
