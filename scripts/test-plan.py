@@ -433,8 +433,15 @@ class _RuntimeImports(ast.NodeVisitor):
         self._os_names = {"os"}              # `os._exit`, alias compris
 
     def _visit_function(self, node: ast.AST) -> None:
+        # Décorateurs, valeurs par défaut et annotations s'évaluent à la
+        # définition, donc à l'import : seul le corps est différé (#1474).
+        body = node.body if isinstance(node.body, list) else [node.body]
+        for child in ast.iter_child_nodes(node):
+            if not any(child is statement for statement in body):
+                self.visit(child)
         self._deferred += 1
-        self.generic_visit(node)
+        for child in body:
+            self.visit(child)
         self._deferred -= 1
 
     visit_FunctionDef = _visit_function

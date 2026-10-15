@@ -1035,6 +1035,31 @@ class ImportGraphTest(unittest.TestCase):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                  known)
 
+    def test_exit_expressions_stop_proofs_in_function_definitions(self):
+        # #1474 : décorateurs, valeurs par défaut et annotations d'une fonction
+        # ou d'un lambda s'évaluent à la définition ; seul le corps est différé.
+        known = {"src/ameesh/db.py"}
+        sources = (
+            "@exit()\ndef f():\n    pass\nimport ameesh.db\n",
+            "@exit()\nasync def f():\n    pass\nimport ameesh.db\n",
+            "import sys\ndef f(x=sys.exit(1)):\n    pass\nimport ameesh.db\n",
+            "import os as o\ndef f(*, x=o._exit(1)):\n    pass\nimport ameesh.db\n",
+            "def f(x: quit()):\n    pass\nimport ameesh.db\n",
+            "g = lambda a=quit(): 0\nimport ameesh.db\n",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        for source in ("def f():\n    exit()\nimport ameesh.db\n",
+                       "f = lambda: exit()\nimport ameesh.db\n",
+                       "@staticmethod\ndef f(x=1):\n    import os\nimport ameesh.db\n"):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
+
     def test_exit_expressions_keep_prior_dead_and_deferred_proofs(self):
         known = {"src/ameesh/db.py"}
         sources = (
