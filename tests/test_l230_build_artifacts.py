@@ -578,7 +578,7 @@ class MergedKeptTest(_Repo):
         with mock.patch.object(menage.storage, "of", return_value=store), \
                 mock.patch.object(menage, "worktree_in_use", return_value=False):
             entries, plan = menage._worktree_pass(
-                None, "pc", dry_run=dry_run, include_lotless=False, protected=set(),
+                None, "pc", dry_run=dry_run, protected=set(),
                 now=time.time(), allow=allow,
                 lock_path=os.path.join(self.base, "state", "artifacts.lock"),
                 journal_path=self.journal_path)

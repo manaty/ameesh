@@ -15,12 +15,25 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import canon, containers, exploitation, menage, registry, resources, storage, work
+from ameesh import (canon, containers, exploitation, menage, platform, registry,
+                    resources, storage, work)
 
 from .support import PgTestCase
 from .test_l43_perimetre_hote import HOST, _Canons, codes, host
 
 GIB = 1024 ** 3
+
+
+def _sans_processus(test: unittest.TestCase) -> None:
+    """#1665 : neutralise la table des processus de l'hôte pour un test de
+    retrait. Un démon non « dumpable » (gpg-agent, `ameesh-offload`) ou un
+    zombie laisse un doute qui retient tout retrait : la décision testée ici
+    est celle des garde-fous git (propre, poussé, âge), pas celle des
+    processus — `worktree_in_use` et `platform.user_paths` ont leurs propres
+    tests."""
+    patcher = mock.patch.object(platform, "user_paths", lambda *a, **k: platform.UserPaths())
+    patcher.start()
+    test.addCleanup(patcher.stop)
 
 
 class _Cfg:
@@ -289,6 +302,19 @@ class WorktreeEtatTest(_Tmp):
         self.assertTrue(menage.owns_worktree(sous, a1, [a2, os.path.join(self.base, "b")]))
         self.assertFalse(menage.owns_worktree(sous, None, []))
 
+    def test_lot_nomme_par_la_branche_ou_le_dossier(self):
+        """#1665 : les noms qui rattachent un worktree frère à son lot."""
+        self.assertEqual(menage.cited_lot("lot/1665-menage-worktrees"), 1665)
+        self.assertEqual(menage.cited_lot("agent/deepseek3-1201-bench"), 1201)
+        self.assertEqual(menage.cited_lot("review/mty-nxl-rel-01-571-ota"), 571)
+        self.assertEqual(menage.cited_lot("lot/750"), 750)
+        self.assertIsNone(menage.cited_lot("main"))
+        self.assertIsNone(menage.cited_lot("relecture"))
+        self.assertEqual(menage.named_lot("ameesh-dev1-131", "ameesh-dev1"), 131)
+        self.assertEqual(menage.named_lot("deepseek3-1665", "deepseek3"), 1665)
+        self.assertIsNone(menage.named_lot("deepseek3-tmp", "deepseek3"))
+        self.assertIsNone(menage.named_lot("nexlink-ds3-431", "deepseek3"))
+
     def test_processus_dans_le_worktree(self):
         wt = os.path.join(self.base, "wt")
         os.makedirs(wt)
@@ -498,10 +524,15 @@ class MenageDbTest(PgTestCase):
         self.assertEqual([a["path"] for a in alertes], [sale])
         self.assertIn("untracked", alertes[0]["detail"])
 
-    def test_worktree_d_un_autre_agent_survit_a_la_fin_du_lot_du_tour(self):
-        """L73b, cas réel : un agent crée un worktree de relecture PENDANT le
-        tour d'un autre agent sur le même dépôt ; le lot de ce tour est
-        fusionné ; le worktree de relecture n'est pas retiré."""
+    def test_worktree_d_un_autre_agent_orphelin_garde_puis_retire(self):
+        """L73b/#1665, cas réel : un agent crée un worktree de relecture
+        PENDANT le tour d'un autre agent sur le même dépôt ; rien ne le
+        rattache à l'agent du tour ni à son lot : il est suivi « non
+        attribué ». Il survit tant qu'il est récent ou qu'un tour de l'agent
+        qui l'a vu apparaître est en cours, puis part une fois orphelin
+        (propre, poussé, inactif depuis 24 h, aucun processus dedans, table
+        des processus lisible) ; sa branche reste."""
+        _sans_processus(self)
         main = _repo(self.tmp)
         a1 = os.path.join(self.tmp, "a1")
         _git("worktree", "add", "-q", a1, "-b", "a1", cwd=main)
@@ -516,15 +547,130 @@ class MenageDbTest(PgTestCase):
         tour.end(lot=str(lot), turn_id="t" * 32, db=self.db, host="pc")
         rows = storage.of(self.db).housekeeping.worktrees("pc")
         self.assertEqual([(r["path"], r["lot"]) for r in rows], [(relecture, None)])
+        self.assertTrue(rows[0]["detail"].startswith(menage.UNATTRIBUTED))
         work.close(self.db, lot, abandoned=True)
+        # moins de 24 h d'inactivité : attend
+        jeune = time.time() + 2 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                  actor="t", now=jeune)
+        self.assertTrue(os.path.isdir(relecture))
+        self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        # un tour de l'agent qui le suit : attend, même après 24 h
+        # (le worktree n'est rattaché à personne : seul le tour de l'agent
+        # qui l'a vu apparaître est connu, pas celui qui l'a créé)
         loin = time.time() + 30 * 24 * 3600
-        for lotless in (False, True):
-            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
-                                      actor="t", include_lotless=lotless, now=loin)
-            self.assertTrue(os.path.isdir(relecture))
-            self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                  actor="t", agents_in_turn={"a1"}, now=loin)
+        self.assertTrue(os.path.isdir(relecture))
+        self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        # orphelin : propre, poussé, inactif depuis 24 h, aucun agent dessus
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                  actor="t", now=loin)
+        self.assertFalse(os.path.exists(relecture))
+        self.assertIn("relecture", _git("branch", "--list", "relecture", cwd=main))
         self.assertEqual([r["status"] for r in storage.of(self.db).housekeeping.worktrees("pc")],
-                         ["active"])
+                         ["removed"])
+
+    def _orphelin(self, main: str, nom: str, branche: str = "") -> str:
+        """Un worktree suivi « non attribué », comme ceux d'avant #1665."""
+        wt = os.path.join(self.tmp, nom)
+        branche = branche or nom
+        _git("worktree", "add", "-q", wt, "-b", branche, cwd=main)
+        row = storage.of(self.db).housekeeping.register_worktree(
+            host="pc", path=wt, repo=menage.common_dir(main), agent="a1",
+            lot=None, turn_id="t", branch=branche, head="")
+        storage.of(self.db).housekeeping.set_worktree_status(
+            row["id"], "active",
+            "%s: apparu pendant un tour, hors du dossier de l'agent" % menage.UNATTRIBUTED)
+        return wt
+
+    def test_worktree_hors_dossier_attribue_par_la_branche_ou_le_dossier(self):
+        """#1665 : hors du dossier de l'agent, la branche (`lot/<id>`) ou le
+        dossier (`<agent>-<id>`) nomme le lot ; s'il est assigné à cet agent,
+        le worktree lui est attribué. Un lot d'un autre agent ne prouve rien."""
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        lot, autre = self._lot("lot frère"), self._lot("lot d'un autre")
+        work.assign(self.db, lot, "a1")
+        work.assign(self.db, autre, "a2")
+        tour = menage.Turn.begin(self.cfgl, menage.Policy(), "a1", main, new_session=False,
+                                 base_env={})
+        par_branche = os.path.join(self.tmp, "frere-branche")
+        _git("worktree", "add", "-q", par_branche, "-b", "lot/%d-frere" % lot, cwd=main)
+        par_dossier = os.path.join(self.tmp, "a1-%d" % lot)
+        _git("worktree", "add", "-q", "--detach", par_dossier, cwd=main)
+        etranger = os.path.join(self.tmp, "frere-etranger")
+        _git("worktree", "add", "-q", etranger, "-b", "lot/%d-x" % autre, cwd=main)
+        tour.end(lot="999", turn_id="t" * 32, db=self.db, host="pc")
+        rows = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
+        self.assertEqual(rows[par_branche]["lot"], str(lot))
+        self.assertFalse(rows[par_branche]["detail"].startswith(menage.UNATTRIBUTED))
+        self.assertEqual(rows[par_dossier]["lot"], str(lot))
+        self.assertIsNone(rows[etranger]["lot"])
+        self.assertTrue(rows[etranger]["detail"].startswith(menage.UNATTRIBUTED))
+
+    def test_worktree_non_attribue_rattache_a_son_lot_fini(self):
+        """#1665 : un worktree déjà suivi « non attribué » dont la branche
+        nomme un lot assigné à l'agent suit la fin de ce lot (il est retiré
+        s'il est propre et intégré), et le journal porte le lot."""
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        fini = self._lot("fini")
+        work.assign(self.db, fini, "a1")
+        # la branche enregistrée nomme le lot fini, mais le suivi est resté
+        # « non attribué » (comme les 329 worktrees frères d'avant #1665)
+        wt = self._orphelin(main, "orphelin-rattache", "lot/%d-frere" % fini)
+        work.close(self.db, fini, abandoned=True)
+        plus_tard = time.time() + 2 * 3600
+        essai = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                                dry_run=True, now=plus_tard)
+        plan = {p["path"]: p for p in essai["plan"] if p.get("kind") == "worktree"}
+        self.assertEqual(plan[wt]["action"], "retrait")
+        self.assertEqual(plan[wt]["lot"], str(fini))
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        now=plus_tard)
+        self.assertFalse(os.path.exists(wt))
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual(rows[0]["status"], "removed")
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600)
+        self.assertIn(str(fini), [str(r.get("lot")) for r in journal])
+
+    def test_orphelin_propre_pousse_inactif_24h_puis_retire(self):
+        """#1665 : propre, poussé et inactif depuis 24 h, un orphelin part ;
+        sale, non poussé ou tenu par un agent, il reste et il est signalé."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        propre = self._orphelin(main, "orphelin-propre")
+        sale = self._orphelin(main, "orphelin-sale")
+        _write(os.path.join(sale, "wip.txt"), 3)
+        non_pousse = self._orphelin(main, "orphelin-non-pousse")
+        _write(os.path.join(non_pousse, "f.txt"), 3)
+        _git("add", ".", cwd=non_pousse)
+        _git("commit", "-q", "-m", "travail", cwd=non_pousse)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        jeune = time.time() + 2 * 3600
+        self.assertEqual(plan(now=jeune)[propre]["action"], "attend")
+        loin = time.time() + 30 * 24 * 3600
+        self.assertEqual(plan(now=loin, agents_in_turn={"a1"})[propre]["action"], "attend")
+        p = plan(now=loin)
+        self.assertEqual(p[propre]["action"], "retrait")
+        self.assertIn("orphan", p[propre]["detail"])
+        self.assertEqual(p[sale]["action"], "garde")
+        self.assertEqual(p[non_pousse]["action"], "garde")
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(propre))
+        self.assertTrue(os.path.isdir(sale))
+        self.assertTrue(os.path.isdir(non_pousse))
+        self.assertIn("orphelin-propre", _git("branch", "--list", "orphelin-propre", cwd=main))
 
     def test_garde_fous_age_tour_en_cours_verrou_et_integration(self):
         main = _repo(self.tmp)
