@@ -218,6 +218,12 @@ class ReservationTest(PgTestCase):
         with self.assertRaises(work.WorkError) as ctx:
             self._nx(lot, 454, skip_branches=("integration/paquet-5",))
         self.assertIn("lot #%d" % holder["id"], str(ctx.exception))
+        # le tronc ne s'ignore jamais : il porte les migrations fusionnées
+        for trunk in ("develop", "main"):
+            with self.assertRaises(work.WorkError) as ctx:
+                self._nx(other, 376, skip_branches=(trunk,))
+            self.assertIn("trunk branch", str(ctx.exception))
+        self.assertEqual(work.get(self.db, other["id"])["migration"], 454)
 
     def test_lot_nexlink_dossier_et_numerotation_de_nexlink(self):
         lot = self._lot("nx", "manaty/nexlink", 169)
@@ -506,6 +512,24 @@ class CorrectionIssueRefTest(PgTestCase):
                          "--actor", "human:owner")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("--none", proc.stderr)
+
+    def test_reservation_dans_l_ancien_depot_a_liberer_d_abord(self):
+        """Une réservation prise sous l'ancienne référence ne suit pas la
+        correction : refus tant qu'elle n'est pas libérée (sinon `work
+        migration` rendrait en silence le numéro de l'autre dépôt)."""
+        lot = self._lot()
+        nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
+                         NEXLINK.directory, ["376_b.sql"])
+        work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
+        with self.assertRaises(work.WorkError) as ctx:
+            work.set_issue_ref(self.db, lot["id"], "manaty/ameesh#1603", actor="human:owner")
+        self.assertIn("--release", str(ctx.exception))
+        self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], "manaty/nexlink#1567")
+        # même dépôt : la réservation reste juste, la correction passe
+        work.set_issue_ref(self.db, lot["id"], "manaty/nexlink#1600", actor="human:owner")
+        work.reserve_migration(self.db, lot["id"], release=True)
+        got = work.set_issue_ref(self.db, lot["id"], "manaty/ameesh#1603", actor="human:owner")
+        self.assertEqual(got["issue_ref"], "manaty/ameesh#1603")
 
     def test_agent_lie_ne_corrige_pas_a_la_place_d_un_humain(self):
         lot = self._lot()

@@ -645,10 +645,13 @@ restée 4 h fusionnée sans être déployée :
    branche au scan ignoré, en plus de celle du lot : à la composition d'un
    paquet, la branche d'intégration porte déjà les fichiers renumérotés et
    ferait refuser le numéro ; l'option ne dispense pas de la réservation (un
-   numéro retenu par un autre lot reste refusé). Un lot dont l'`issue_ref`
+   numéro retenu par un autre lot reste refusé), et une branche de tronc
+   (`main`, `master`, `develop`, la branche par défaut d'`origin`) ne s'ignore
+   jamais. Un lot dont l'`issue_ref`
    désigne un autre dépôt se corrige avant de réserver :
    `ameesh work issue-ref <lot> owner/repo#N` (ou `--none` pour effacer),
-   réservé aux correcteurs comme `work set-app` et journalisé. La réservation
+   réservé aux correcteurs comme `work set-app` et journalisé ; refusé tant
+   qu'une réservation est tenue dans l'ancien dépôt (`--release` d'abord). La réservation
    se lit dans `ameesh work show <lot>`
    (ligne `migration`) et au journal du lot ; la description de la PR
    l'annonce.

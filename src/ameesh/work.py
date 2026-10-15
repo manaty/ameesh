@@ -510,6 +510,10 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                         "configuration: radar.projects.<project> with github %s and "
                         "migrations <dir>)" % (slug, slug))
     checkout = _checkout(slug, repo, cfg)
+    trunks = sorted(set(skip_branches) & migrations.trunk_branches(checkout))
+    if trunks:
+        # ignorer le tronc cacherait les migrations déjà fusionnées (#1603)
+        raise WorkError("--skip-branch %s: a trunk branch is always scanned" % trunks[0])
     present = migrations.repo_numbers(checkout, layout, skip_branch=item.get("branch"),
                                       also_skip=tuple(skip_branches))
     if number is None:
@@ -584,6 +588,8 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
     comme `work set-app` : c'est `issue_ref` qui décide du dépôt où
     `work migration` réserve (`lot_repository`), un lot créé sur l'issue d'un
     autre dépôt ne peut donc pas réserver chez lui sans cette correction.
+    Refusée tant que le lot garde une réservation de migration dans un autre
+    dépôt que celui de la nouvelle référence (la libérer d'abord).
     L'écriture passe par le compare-and-set du storage (aucune correction
     concurrente n'est écrasée) puis laisse une ligne de journal."""
     item = get(db, item_id)
@@ -596,6 +602,20 @@ def set_issue_ref(db: Db, item_id: int, ref: str | None, *, actor: str = "", cfg
     current = (item.get("issue_ref") or "").strip() or None
     if current == clean:
         return item
+    if item.get("migration") is not None:
+        # la réservation reste dans le dépôt où elle a été prise : la garder
+        # sous une issue d'un autre dépôt la rendrait fausse en silence
+        # (`work migration` est idempotent sur une réservation existante)
+        try:
+            target = lot_repository(dict(item, issue_ref=clean), cfg)
+        except WorkError:
+            target = None
+        if target != item.get("migration_repo"):
+            raise WorkError("lot %s holds migration %s in %s: release it first "
+                            "(`ameesh work migration %s --release`), then correct the "
+                            "issue reference and reserve again" % (
+                                item_id, migration_layout(item, cfg).label(item["migration"]),
+                                item.get("migration_repo"), item_id))
     if not storage.of(db).work.set_issue_ref(item_id, clean, current=item.get("issue_ref")):
         raise WorkError("lot %s: issue reference changed meanwhile, retry" % item_id)
     note(db, item_id, "issue_ref %s → %s" % (current or "—", clean or "—"), actor=actor)

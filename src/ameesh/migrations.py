@@ -190,6 +190,21 @@ def origin_repo(checkout: str) -> str | None:
     return github_repo(_git(checkout, "remote", "get-url", "origin"))
 
 
+#: branches de tronc qu'un scan ne peut jamais ignorer (#1603), en plus de
+#: celle que désigne `origin/HEAD`
+TRUNK_BRANCHES = ("main", "master", "develop")
+
+
+def trunk_branches(checkout: str) -> set[str]:
+    """Les branches de tronc d'un clone : `TRUNK_BRANCHES` et la branche par
+    défaut de son `origin` (`refs/remotes/origin/HEAD`) quand elle est connue."""
+    default = _git(checkout, "symbolic-ref", "-q", "refs/remotes/origin/HEAD").strip()
+    names = set(TRUNK_BRANCHES)
+    if default.startswith("refs/remotes/origin/"):
+        names.add(default[len("refs/remotes/origin/"):])
+    return names
+
+
 def toplevel(path: str) -> str:
     return _git(path, "rev-parse", "--show-toplevel").strip()
 
