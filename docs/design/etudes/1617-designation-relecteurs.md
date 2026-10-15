@@ -89,7 +89,9 @@ rejoué ne renvoie pas de second courrier, une attente ne se renotifie pas,
 mais elle **cède** la place à la désignation quand la capacité revient, sur le
 même gel. Une marque illisible est refusée, jamais interprétée. Les courriers
 partent dans la même transaction (`mail.send(..., after_commit=…)`, motif
-#315) : un envoi annulé ne laisse ni marque, ni message, ni trace de fil.
+#315) : un envoi annulé ne laisse ni marque, ni message, ni trace de fil. Un
+destinataire hors du registre est refusé avant toute écriture : un courrier
+qui ne réveillerait personne ne vaut pas une désignation.
 
 
 Une désignation est **finale** pour son gel ; une attente est un **marqueur
@@ -145,11 +147,12 @@ l'ancienne tête ; gel qui bouge pendant l'écriture = reprise sur la nouvelle
 tête, trois mouvements = échec sans boucle ; tête invalide ou non gelée
 refusée.
 
-`tests/test_1617_review_designation_pg.py` — 13 tests sur base réelle (psql) :
+`tests/test_1617_review_designation_pg.py` — 14 tests sur base réelle (psql) :
 désignation écrite et courriers partis une fois, rejeu sans second courrier ;
 gel périmé refusé sans rien écrire (ni marque ni message) ; reprise du moteur
 sur la nouvelle tête ; attente notifiée une seule fois puis désignation sur le
-même gel ; attente sans destinataire refusée ; provenance d'auteur inconnue =
+même gel ; attente sans destinataire refusée ; destinataire inconnu du registre
+refusé (un courrier qui ne réveille personne) ; provenance d'auteur inconnue =
 attente, désignation quand la preuve arrive ; nouveau gel = nouvelle
 désignation, la marque de l'ancien gel reste attachée à sa tête ; transaction
 du hook (fil vidé après commit seulement) ; annulation = ni courrier ni marque.

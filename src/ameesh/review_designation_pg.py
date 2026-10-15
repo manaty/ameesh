@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from typing import Mapping, Optional, Sequence
 
-from . import mail, plan_git, storage
+from . import mail, plan_git, registry, storage
 from .review_designation import DESIGNATED, WAITING, DesignationError, StaleFreeze
 
 #: préfixe des marques au journal : `<préfixe><lot>:<jalon>: <json>`
@@ -226,6 +226,12 @@ class PgPort:
                 raise DesignationError(
                     "no recipient for the %s of lot #%d: name the pilot (notify)"
                     % (state, lot))
+            if registry.get(db, recipient) is None:
+                # un courrier à un nom inconnu ne réveille personne : le refus
+                # vaut mieux qu'une désignation qui ne parvient jamais
+                raise DesignationError(
+                    "unknown recipient %r for the %s of lot #%d: nothing written"
+                    % (recipient, state, lot))
             mail.send(db, self.sender, recipient, str(row.get("body") or ""),
                       work_item_id=str(lot),
                       payload={"review_designation": {
