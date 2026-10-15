@@ -479,3 +479,72 @@ class InactiviteTest(_Empile):
         self.db.execute("UPDATE work_items SET state = 'build' WHERE id = %s", (lot["id"],))
         self.assertEqual(int(self.ligne("claude1")["actionable_lots"]), 1)
         self.assertEqual(self.repos(time.time()), [])
+
+
+class RelecteurOccupeTest(_Empile):
+    """#1726 : une relecture désignée (#705) sans verdict courant occupe son
+    relecteur — la prise ne lui donne ni lot ni autre relecture, et l'alerte de
+    sous-emploi ne le liste pas."""
+
+    def ligne(self, name):
+        return next(r for r in storage.of(self.db).operations.listing()
+                    if r["name"] == name)
+
+    def repos(self, now):
+        # #1677 : le repos de la prise et des alertes se lit sur les lots
+        # actionnables, pas sur le temps depuis le dernier tour (#1726).
+        return [r["name"] for r in sous_utilisation.idle_agents(
+            storage.of(self.db).operations.listing(), now, 900,
+            waiting_free=True, actionable_idle=True)]
+
+    def designe(self, item_id, reviewer):
+        self.db.execute("UPDATE work_items SET reviewer = %s WHERE id = %s",
+                        (reviewer, item_id))
+
+    def occupe(self, name="auteur"):
+        item = self.lot("en cours", assignee=name, priority=2)
+        self.db.execute("UPDATE work_items SET state = 'build', started_at = now()"
+                        " WHERE id = %s", (item["id"],))
+        return item
+
+    def test_une_relecture_designee_occupe_son_relecteur(self):
+        self.agent("claude1", team="nexlink", since_s=0)
+        lot = self.lot("a relire", assignee="human:proprio")
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot["id"],))
+        self.designe(lot["id"], "claude1")
+
+        self.assertEqual(int(self.ligne("claude1")["actionable_lots"]), 1,
+                         "relecture désignée sans verdict courant")
+        now = time.time()
+        self.assertEqual(self.repos(now), [])
+
+        # verdict rendu sur la tête gelée : plus rien à relire
+        work.milestone(self.db, lot["id"], "frozen", sha=SHA, actor="test")
+        work.milestone(self.db, lot["id"], "verdict", verdict="ok", sha=SHA, actor="test")
+        self.assertEqual(int(self.ligne("claude1")["actionable_lots"]), 0)
+        self.assertEqual(self.repos(now), ["claude1"])
+
+        # regel : la relecture est de nouveau due
+        work.milestone(self.db, lot["id"], "frozen", sha="b" * 40, actor="test")
+        self.assertEqual(int(self.ligne("claude1")["actionable_lots"]), 1)
+        self.assertEqual(self.repos(now), [])
+
+    def test_le_relecteur_designe_ne_prend_pas_de_lot(self):
+        self.agent("auteur", team="nexlink")
+        self.agent("codex1", harness="codex", team="nexlink")
+        self.occupe("auteur")
+        lot = self.lot("a relire", assignee="auteur")
+        self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot["id"],))
+        self.designe(lot["id"], "codex1")
+        prenable = self.lot("prenable", priority=1)
+
+        self.assertEqual(self.take(), [], "le relecteur doit sa relecture")
+        self.assertIsNone(work.get(self.db, prenable["id"])["assignee"],
+                          "le lot prenable n'a pas été donné au relecteur")
+
+        # verdict rendu : le relecteur redevient preneur
+        work.milestone(self.db, lot["id"], "frozen", sha=SHA, actor="test")
+        work.milestone(self.db, lot["id"], "verdict", verdict="ok", sha=SHA, actor="test")
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
+                         [("lot", "codex1", prenable["id"])])

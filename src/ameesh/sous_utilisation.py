@@ -482,13 +482,13 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
 
     #1677 : `actionable_idle` lit le repos sur les lots **actionnables**
     (`actionable_lots`, lu par `operations.listing` : rien qui l'occupe,
-    aucune correction attendue d'un verdict bloquant) au lieu du temps depuis
-    le dernier tour — un agent sans lot prend des tours de courrier toutes les
-    quelques minutes et ne serait donc jamais « au repos » (N9). La **prise**
-    de lots et les alertes de sous-utilisation s'en servent ; la remise
-    (`handoff.hand`, L233b) garde son contrat d'origine, « au repos depuis au
-    moins `idle_s` », qu'un relevé sans `actionable_lots` (bancs, appels
-    anciens) impose de toute façon."""
+    aucune correction attendue d'un verdict bloquant, aucune relecture
+    désignée due — #1726) au lieu du temps depuis le dernier tour — un agent
+    sans lot prend des tours de courrier toutes les quelques minutes et ne
+    serait donc jamais « au repos » (N9). La **prise** de lots et les alertes
+    de sous-utilisation s'en servent ; la remise (`handoff.hand`, L233b) garde
+    son contrat d'origine, « au repos depuis au moins `idle_s` », qu'un relevé
+    sans `actionable_lots` (bancs, appels anciens) impose de toute façon."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
