@@ -12,7 +12,9 @@ Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
 le groupe du tour, que le harnais n'attend pas) et AMEESH_TEST_BACKGROUND_PID
 (fichier où écrire son pid). L217b : AMEESH_TEST_CLAUDE_ON_TERM (JSON : un
 appel du fil principal émis à la réception de SIGTERM, donc lu après la
-clôture du tour, comme un appel encore en tampon).
+clôture du tour, comme un appel encore en tampon). #1270 :
+AMEESH_TEST_STDERR (texte écrit sur le stderr du harnais, canal fournisseur
+distinct du résultat libre).
 """
 import json
 import os
@@ -157,9 +159,20 @@ def main() -> int:
         reponse_texte = reponse  # vide compris : un tour sans réponse
     print(json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": reponse_texte}]}}), flush=True)
-    print(json.dumps({"type": "result", "subtype": "success", "result": reponse,
+    # #1397 : AMEESH_TEST_IS_ERROR marque le `result` comme erreur du CLI —
+    # le seul canal où Claude dit un quota ; son texte est alors fournisseur.
+    erreur = os.environ.get("AMEESH_TEST_IS_ERROR") == "1"
+    print(json.dumps({"type": "result",
+                      "subtype": "error_during_execution" if erreur else "success",
+                      "result": reponse, "is_error": erreur,
                       "total_cost_usd": 0.0125, "usage": tour, "session_id": session}),
           flush=True)
+    # #1270 : le stderr du fournisseur (429, trace d'erreur) — canal distinct
+    # du résultat libre, lu par `auth_failure`/`rate_limit`
+    bruit = os.environ.get("AMEESH_TEST_STDERR")
+    if bruit:
+        sys.stderr.write(bruit if bruit.endswith("\n") else bruit + "\n")
+        sys.stderr.flush()
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 

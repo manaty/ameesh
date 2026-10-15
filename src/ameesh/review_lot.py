@@ -55,10 +55,14 @@ UNKNOWN_FAMILY = "codex ou claude"
 #: apparaît APRÈS l'instant du gel ; 30 min = `turn_max_seconds` par défaut
 #: (config.Config), la durée maximale d'un tour qui peut encore porter ce gel.
 FREEZE_TURN_WINDOW_S = 1800.0
-#: la règle du canon §2, recopiée dans le corps du lot
+#: la règle du canon §2, recopiée dans le corps du lot (consigne injectée au
+#: relecteur, avec la route du défaut non bloquant — owner du 15/10/2026)
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
-            "correction, qui passe avant tout nouveau travail ; les autres deviennent des "
-            "lots de suite (canon §2)")
+            "correction, qui passe avant tout nouveau travail ; un défaut **non bloquant** "
+            "(N, P2, P3) ne crée pas de lot : il va au backlog "
+            "(`ameesh work backlog add --title … --value … --score …`), regroupé avec les "
+            "autres défauts mineurs du même chantier (canon §2, owner du 15/10/2026 ; sur "
+            "ameesh, un P2 de la classe sensible bloque encore)")
 
 
 def ref_of(lot: int) -> str:

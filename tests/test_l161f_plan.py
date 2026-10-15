@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -545,6 +546,26 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["classes"]["test_dynamic"][0], "P3")
         self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
 
+    def test_new_file_imported_after_terminal_statement_keeps_the_doubt(self):
+        self.repo.write("tests/test_static.py",
+                        "raise RuntimeError\nimport ameesh.new_feature\n")
+        self.repo.base = self.repo.commit()
+        card = self.repo.card()
+        card["modules"]["test_static"] = {"durees": {"psycopg": 1.0}, "echecs": []}
+        self.repo.write("src/ameesh/new_feature.py", "VALUE = -1\n")
+        self.repo.commit()
+        mods = ["test_a", "test_b", "test_c", "test_db", "test_static"]
+        impact = plan.judge(card, plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+                            mods, "HEAD", self.repo.path)
+        self.assertEqual(impact.uncovered, ["src/ameesh/new_feature.py"])
+        self.assertEqual(impact.certified, {})
+        out = self._classify_with(card, mods)
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("no test is guaranteed to load: src/ameesh/new_feature.py",
+                      out["phase2_why"])
+        self.assertEqual(out["classes"]["test_static"][0], "P1")
+        self.assertEqual(out["importers"], {"src/ameesh/new_feature.py": ["test_static"]})
+
     def test_new_file_reached_through_a_changed_importer(self):
         # #1339 : le graphe relie le fichier nouveau au module modifié qui
         # l'importe ; les tests que la carte a mesurés sur ce module (ici un
@@ -654,7 +675,7 @@ class MapTest(unittest.TestCase):
                     self.assertEqual(p["selection"]["mode"], "full")
                     self.assertIn("release/**", p["selection"]["why"])
                     self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                    self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                     self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                     self.assertEqual(
                         sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
@@ -682,7 +703,7 @@ class MapTest(unittest.TestCase):
         self.assertIn("release/**", release["selection"]["why"])
         self.assertNotEqual(release["parts"]["psycopg"], [])
         self.assertEqual(plan.outputs(release)["code"], "true")
-        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in release["parts"]["psql"]], [9] * 9)
 
     def test_test_module_read_as_data_selects_its_readers(self):
         # codex (4): the test-module branch skipped the readers of the file
@@ -754,6 +775,25 @@ class MapTest(unittest.TestCase):
         stranger = dict(card, commit="0" * 40)
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
+
+    def test_map_problem_partial_measure(self):
+        """#1257 R1 B3 : une carte dont la fusion a écarté des couvertures est
+        partielle ; elle ne juge plus la sélection, même fraîche et ancêtre."""
+        card = self.repo.card()  # carte ancienne : la clé n'existe pas
+        self.assertEqual(plan.ignored_coverages(card), [])
+        self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path)[0], "")
+        vide = dict(card, measure={"couverture_ignoree": []})  # carte neuve sans perte
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path)[0], "")
+        partielle = dict(card, measure={"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]})
+        probleme, age = plan.map_problem(partielle, NOW, "HEAD", self.repo.path)
+        self.assertIn("partial measure", probleme)
+        self.assertIsNone(age)  # le refus ne dépend ni de la date ni du dépôt
+        # la forme ancienne (clé française) est lue aussi
+        ancienne = dict(card, mesure={"couverture_ignoree": [{"part": "m"}]})
+        self.assertIn("partial measure",
+                      plan.map_problem(ancienne, NOW, "HEAD", self.repo.path)[0])
 
     def test_always_and_recent_failures(self):
         changes = [("M", "src/ameesh/work.py"), ("A", "src/ameesh/migrations/0099_x.sql")]
@@ -897,6 +937,34 @@ class ImportGraphTest(unittest.TestCase):
                 if why != "TYPE_CHECKING":  # mort : ni preuve ni candidat
                     self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                      {"src/ameesh/db.py"}, why)
+
+    def test_terminal_statement_prevents_later_import_proof(self):
+        known = {"src/ameesh/db.py"}
+        for terminal in ("raise RuntimeError", "import sys\nsys.exit(1)"):
+            with self.subTest(terminal=terminal):
+                source = terminal + "\nimport ameesh.db\n"
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set())
+                # Keep the possible edge for selection, even without proof.
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 known)
+        # Class bodies execute during the containing module's import too.
+        source = "class C:\n    raise RuntimeError\nimport ameesh.db\n"
+        self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                              guaranteed=True), set())
+
+    def test_terminal_statement_keeps_earlier_and_nonexecuted_proofs(self):
+        known = {"src/ameesh/db.py"}
+        for source in (
+            "import ameesh.db\nraise RuntimeError\n",
+            "import ameesh.db\nimport sys\nsys.exit(1)\n",
+            "def unused():\n    raise RuntimeError\nimport ameesh.db\n",
+            "def unused():\n    import sys\n    sys.exit(1)\nimport ameesh.db\n",
+            "if False:\n    raise RuntimeError\nimport ameesh.db\n",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known)
 
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
@@ -1102,6 +1170,21 @@ class DocsLaneTest(unittest.TestCase):
         self.assertFullSuite(self._plan(["docs/guide.md"]), "map not usable")
         self.assertFullSuite(self._plan_without_map(["docs/guide.md"]), "no map")
 
+    def test_partial_measure_card_runs_the_full_suite(self):
+        """#1257 R1 B3 : une couverture écartée à la fusion rend la carte
+        partielle ; le jugement de sélection est refusé et le repli suite
+        complète s'applique, même carte fraîche et ancêtre."""
+        self.card["measure"] = {"couverture_ignoree": [
+            {"part": "mesure-psycopg-1", "fichier": ".coverage.tronquee",
+             "raison": "tronqué (12 pages annoncées, 11 écrites)"}]}
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        p = self._plan(["docs/guide.md"])
+        self.assertFullSuite(p, "partial measure")
+        self.assertFalse(p["map"]["used"])
+        self.assertFalse(p["sure"])
+
     def _plan_without_map(self, files):
         self.card = None
         return self._plan(files)
@@ -1131,6 +1214,75 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
+def _coverage_disponible() -> bool:
+    try:
+        import coverage  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class PartialMeasureTest(unittest.TestCase):
+    """#1257 R1 B3 : de la collecte (`scripts/map.py`) à la décision de
+    sélection (`scripts/test-plan.py`)."""
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_partial_card(self):
+        """Une part dont un fichier de couverture est illisible donne une carte
+        partielle ; le plan refuse alors de juger la sélection (repli suite
+        complète) au lieu de croire la mesure complète."""
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage.tronquee").write_bytes(b"pas du sqlite")
+        # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
+        mesure = dict(card["mesure"], couverture_ignoree=[])
+        saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+
+    @unittest.skipUnless(_coverage_disponible(), "coverage requis")
+    def test_collection_to_plan_refuses_a_zero_byte_coverage(self):
+        """R1 B3 #1257 : un fichier de couverture de 0 octet est une perte
+        conservatrice ; la carte est partielle et le plan refuse de juger la
+        sélection (repli suite complète). Le contrôle sain (même part sans le
+        fichier vide) reste utilisable."""
+        from coverage import CoverageData
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-1"
+        (part / "cov").mkdir(parents=True)
+        vide = part / "cov" / ".coverage.vide"
+        vide.write_bytes(b"")
+        valide = CoverageData(basename=str(part / "cov" / ".coverage.valide"))
+        valide.set_context("tests.test_l1.T.test_a")
+        valide.add_lines({str(REPO / "src" / "ameesh" / "db.py"): {1}})
+        valide.write()
+        card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        ignorees = card["mesure"]["couverture_ignoree"]
+        self.assertEqual(len(ignorees), 1)
+        self.assertIn("vide (0 octet)", ignorees[0]["raison"])
+        probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
+        self.assertIn("partial measure", probleme)
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=REPO)
+        self.assertFalse(out["map"]["used"])
+        self.assertFalse(out["sure"])
+        self.assertFalse(out["phase2_safe"])
+        self.assertIn("partial measure", out["unsure"][0])
+        # témoin du témoin : sans le fichier vide, la même mesure est utilisable
+        vide.unlink()
+        saine = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
+        self.assertEqual(saine["mesure"]["couverture_ignoree"], [])
+        self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
 class InheritedFoundationTest(unittest.TestCase):
     """#1314 : le socle CI que la cible a déjà changé depuis la carte ne force
     plus la suite complète d'une branche de lot ; le changement du socle par
@@ -1310,10 +1462,10 @@ class PlanTest(unittest.TestCase):
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
         self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         out = plan.outputs(p)
         self.assertEqual(json.loads(out["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(out["psql_parts"], "6")
+        self.assertEqual(out["psql_parts"], "9")
         self.assertEqual(out["code"], "true")
 
     def test_pull_request_runs_the_pilot_modules_with_psql(self):
@@ -1336,7 +1488,9 @@ class PlanTest(unittest.TestCase):
         # (24/24 runners). Trois parts pèsent ~8 min chacune, ce qui tient au
         # ralentissement mesuré de 2,5-3x : ne pas redescendre à une part.
         self.assertGreaterEqual(plan.PARTS["psql"][0], 3)
-        self.assertEqual(plan.PARTS["psql"][1], 6)  # suite complète sur push : inchangée
+        # #1692 : la suite complète passe de 6 à 9 parts ; le pilote d'une PR
+        # de lot reste à trois (n_pr), inchangé.
+        self.assertEqual(plan.PARTS["psql"][1], 9)
 
     def test_pull_request_psql_runs_the_always_modules_when_triggered(self):
         # #749 : un diff qui touche migrations/, db.py, le SQL ou le runner
@@ -1412,8 +1566,8 @@ class PlanTest(unittest.TestCase):
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
         # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 6 parts), pas seulement la CI de release.
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+        # (psql en 9 parts depuis #1692), pas seulement la CI de release.
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
         for driver in ("psycopg", "psql"):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
@@ -1595,7 +1749,7 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
                 self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
                 self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [6] * 6)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
                 self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
@@ -1622,7 +1776,7 @@ class LotBranchTest(unittest.TestCase):
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]), list(range(1, 10)))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
@@ -1669,8 +1823,10 @@ class LotBranchTest(unittest.TestCase):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
                                 for m in self.mods}}
         self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods, card(2.0)), 2)
+        # 235 modules × 2 s = 470 s -> deux parts ; la tranche fixe garde le
+        # test indépendant du nombre de modules du dépôt (314 au 15/10, et
+        # chaque lot qui ajoute un module de test le faisait basculer à 3)
+        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:235], card(2.0)), 2)
         self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
@@ -1817,33 +1973,531 @@ class LeaksTest(unittest.TestCase):
         self.assertEqual(out["not_counted"], 1)
 
 
+def _key_column(line: str) -> int:
+    """Column of the YAML key: indentation, then an optional `- `."""
+    col = len(line) - len(line.lstrip(" "))
+    if line[col:].startswith("- "):
+        col += 2
+        while col < len(line) and line[col] == " ":
+            col += 1
+    return col
+
+
+def _block_header(token: str) -> bool:
+    """Does the token after `key:` open a block scalar?
+
+    `|`, `>`, their indentation and chomping indicators in either order
+    (`|2`, `>-2`, `|-2`) and a trailing comment (`| # ...`) are all headers,
+    never an inline body (#1247).
+    """
+    token = token.split("#", 1)[0].strip()
+    return bool(token) and token[0] in "|>" and all(
+        char.isdigit() or char in "+-" for char in token[1:])
+
+
+def _block_body(lines: list[str], i: int, key_col: int) -> tuple[str, int]:
+    """Body of the block scalar opened on line `i`, and the next line."""
+    body, j = [], i + 1
+    while j < len(lines):
+        nxt = lines[j]
+        if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= key_col:
+            break
+        body.append(nxt)
+        j += 1
+    return "\n".join(body), j
+
+
+def _node_properties(token: str) -> tuple[str | None, str]:
+    """Strip the node properties that may precede a `run:` value.
+
+    A plain scalar never starts with `&` or `!`: `&name` anchors the node and
+    `!tag` / `!!tag` types it, in either order. Both must be seen through, so
+    that the block header behind them opens the body and the anchor is
+    registered (#1247).
+    """
+    name = None
+    while token[:1] in ("&", "!"):
+        if token[0] == "&":
+            match = re.match(r"^&([A-Za-z0-9_.-]+)\s*", token)
+            if not match:
+                break
+            name = match.group(1)
+        else:
+            match = re.match(r"^![^\s]*\s*", token)
+            if not match:
+                break
+        token = token[match.end():]
+    return name, token
+
+
+def _declaration(lines: list[str], i: int) -> tuple[str | None, str, int]:
+    """Anchor declared on line `i`: `(name, value, next line)`.
+
+    `(None, "", next)` when the line declares none. A block body is skipped
+    whole, so that shell text inside a scalar is never read as structure and a
+    declaration only reaches the aliases that follow it.
+    """
+    col = _key_column(lines[i])
+    match = re.match(r"^[^\s:#][^:#]*:[ \t]*(?P<rest>.*)$", lines[i][col:])
+    if not match:
+        return None, "", i + 1
+    name, rest = _node_properties(match.group("rest").strip())
+    if _block_header(rest):
+        value, j = _block_body(lines, i, col)
+        return (name, value, j) if name else (None, "", j)
+    if not name:
+        return None, "", i + 1
+    # #1247 R2: a flow scalar may go on over the more indented lines, and an
+    # empty value is a node on the next lines; the anchor holds all that text,
+    # which is still read as structure.
+    more, _ = _block_body(lines, i, col)
+    return name, "\n".join(filter(None, (rest, more))), i + 1
+
+
 def _run_bodies(text: str) -> list[str]:
-    """Le texte de chaque bloc `run:` de tests.yml (inline ou littéral)."""
-    bodies: list[str] = []
+    """Text of every `run:` body in tests.yml.
+
+    Covers inline scalars, block scalars (`|`, `>`, `|2`, `>-2`, header
+    comment), the list form (`- run:`), node properties (`&anchor`, `!tag`)
+    and aliases (`run: *anchor`). An alias is resolved at its point of use:
+    a declaration that follows it never replaces the one it names (#1247).
+    No body may escape the gate witness that forbids `github.base_ref` /
+    `github.head_ref` inside a `run:` block.
+    """
     lines = text.splitlines()
+    anchors: dict[str, str] = {}
+    bodies: list[str] = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
+        col = _key_column(line)
+        stripped = line[col:]
         if not stripped.startswith("run:"):
+            name, value, i = _declaration(lines, i)
+            if name:
+                anchors[name] = value
+            continue
+        token = stripped[len("run:"):].strip()
+        name, token = _node_properties(token)
+        if token.startswith("*"):
+            alias = token[1:].split("#", 1)[0].strip()
+            if alias not in anchors:
+                # #1247 R2: an anchor the scanner cannot read (sequence item,
+                # flow node) fails the witness instead of dropping the body.
+                raise ValueError(f"run: *{alias}: anchor not readable by the witness")
+            bodies.append(anchors[alias])
             i += 1
             continue
-        inline = stripped[len("run:"):].strip()
-        if inline and inline not in ("|", ">", "|-", ">-", "|+", ">+"):
-            bodies.append(inline)
-            i += 1
+        if token and not _block_header(token):
+            # #1247 R2: a plain or quoted scalar may go on over the more
+            # indented lines.
+            more, j = _block_body(lines, i, col)
+            body = "\n".join(filter(None, (token, more)))
+            if name:
+                anchors[name] = body
+            bodies.append(body)
+            i = j
             continue
-        body, j = [], i + 1
-        while j < len(lines):
-            nxt = lines[j]
-            if nxt.strip() and len(nxt) - len(nxt.lstrip(" ")) <= indent:
-                break
-            body.append(nxt)
-            j += 1
-        bodies.append("\n".join(body))
+        body, j = _block_body(lines, i, col)
+        if name:
+            anchors[name] = body
+        bodies.append(body)
         i = j
     return bodies
+
+
+_BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+_BRANCH_REF_ENV = re.compile(
+    r"^[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}\s*(?:#.*)?$")
+_ANY_KEY = re.compile(
+    r"""^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s#'"{\[][^#]*?)\s*:(?:\s+|$)(?P<rest>.*)$""")
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_.-]+:(?:\s+&[A-Za-z0-9_.-]+)?\s*(?:#.*)?$")
+_ITEM = re.compile(r"^(?:&[A-Za-z0-9_.-]+\s*)?(?:#.*)?$|^[A-Za-z0-9_.-]+:(?:\s|$)")
+
+
+def _dash_column(line: str) -> int | None:
+    col = len(line) - len(line.lstrip(" "))
+    return col if line[col:].startswith("- ") or line[col:] == "-" else None
+
+
+def _left_open(content: str) -> bool:
+    """Does a quoted scalar or a flow collection go on past this line?"""
+    # Fail closed on an opening delimiter after whitespace or a YAML flow
+    # separator, whatever key, explicit value marker or property precedes it.
+    # A plain scalar with an unmatched delimiter may be refused; permitting it
+    # could hide a quoted/flow continuation whose indentation YAML ignores.
+    depth, quote, i = 0, None, 0
+    while i < len(content):
+        char = content[i]
+        start = i == 0 or content[i - 1].isspace() or content[i - 1] in "[{,:"
+        if quote == '"':
+            if char == "\\":
+                i += 1
+            elif char == '"':
+                quote = None
+        elif quote == "'":
+            if content[i:i + 2] == "''":
+                i += 1
+            elif char == "'":
+                quote = None
+        elif char == "#" and (i == 0 or content[i - 1] in " \t"):
+            break
+        elif char in "\"'" and (start or depth):
+            quote = char
+        elif char in "{[" and (start or depth):
+            depth += 1
+        elif char in "}]" and depth:
+            depth -= 1
+        i += 1
+    return quote is not None or depth > 0
+
+
+def _structural_lines(lines: list[str]) -> set[int]:
+    """Lines that are YAML structure, outside every block scalar body."""
+    keep, i = set(), 0
+    while i < len(lines):
+        keep.add(i)
+        dash, col = _dash_column(lines[i]), _key_column(lines[i])
+        content = lines[i][col:]
+        match = _ANY_KEY.match(content)
+        _, rest = _node_properties((match.group("rest") if match else content).strip())
+        if _block_header(rest):
+            _, i = _block_body(lines, i, col if match or dash is None else dash)
+        else:
+            i += 1
+    return keep
+
+
+def _under_env(lines: list[str], k: int, structural: set[int]) -> bool:
+    """Is line `k` a key of an `env:` mapping, itself under mapping keys only?
+
+    Every ancestor must be a bare block key (or a sequence item that opens a
+    mapping): a scalar on the way (block, quoted, flow, plain) would make the
+    line its text, not an environment variable.
+    """
+    col, first = _key_column(lines[k]), True
+    for j in range(k - 1, -1, -1):
+        line = lines[j]
+        if j not in structural or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        dash, key = _dash_column(line), _key_column(line)
+        if key < col:
+            if not _BARE_KEY.match(line[key:]) or (
+                    first and line[key:].split(":", 1)[0] != "env"):
+                return False
+        elif dash is not None and dash < col:
+            if first or not _ITEM.match(line[key:]):
+                return False
+        else:
+            continue
+        first, col = False, key if dash is None else dash
+    return not first
+
+
+def _branch_ref_escapes(text: str) -> list[str]:
+    """Lines where a branch name could reach something other than `env:`.
+
+    #1247 R2: `_run_bodies` does not parse every form (quoted key, `run :`,
+    flow mapping), so the witness also closes on the structure: a branch name
+    is only allowed as `NAME: ${{ github.<x>_ref }}` in a real `env:`
+    mapping, and no quoted scalar or flow collection may go on past its line
+    (a YAML loader ignores indentation inside them).
+    """
+    lines = text.splitlines()
+    structural = _structural_lines(lines)
+    escapes = []
+    for k, line in enumerate(lines):
+        col = _key_column(line)
+        if k in structural and _left_open(line[col:]):
+            escapes.append(line)
+        elif _BRANCH_REF.search(line) and not (
+                k in structural and _branch_ref_allowed(lines, k, structural)):
+            escapes.append(line)
+    return escapes
+
+
+_RUNNER_SELECTION = re.compile(r"^runs-on:[ \t]*\$\{\{.*\}\}[ \t]*(?:#.*)?$")
+_BRANCH_REF_COMPARED = re.compile(
+    r"startsWith\(github\.(?:base|head)_ref,\s*'[^',()]*'\)")
+
+
+def _branch_ref_allowed(lines: list[str], k: int, structural: set[int]) -> bool:
+    """May line `k` name a branch instead of interpolating it?
+
+    An `env:` value (#1237/#1247), or a job-level `runs-on:` expression: GitHub
+    reads the runner label itself, never a shell, and every reference must be
+    compared to a literal (`startsWith`) — a bare `${{ github.head_ref }}`
+    stays an escape. (#1468: the priority pool reads the source and target
+    branches of a PR; a PR author can name a branch `integration/...` and pick
+    the pool, so the comparison is a priority choice, not a gate bypass.)
+
+    The compared literal is a single argument: dev4's N, a quoted literal that
+    spans arguments of a `format()` (`'…startsWith(github.head_ref, ', …`)
+    must not absolve the interpolated reference that follows.
+    """
+    line = lines[k]
+    col = _key_column(line)
+    if _dash_column(line) is not None:
+        return False
+    if _BRANCH_REF_ENV.match(line[col:]) and _under_env(lines, k, structural):
+        return True
+    if _RUNNER_SELECTION.match(line[col:]) is None:
+        return False
+    return not _BRANCH_REF.search(_BRANCH_REF_COMPARED.sub("", line[col:]))
+
+
+class RunBodiesTest(unittest.TestCase):
+    """#1247: no exotic `run:` body escapes the merge-gate witness."""
+
+    def test_flow_scalar_continuation_lines_are_read(self):
+        # #1247 R2: plain and double-quoted scalars go on over the more
+        # indented lines; `X: ...` is legal inside the quoted one.
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: echo start
+                      "${{ github.base_ref }}"
+                  - run: "echo start
+                      HEAD: ${{ github.head_ref }}"
+                    name: next
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.head_ref", bodies[1])
+        self.assertNotIn("name:", bodies[1])
+
+    def test_anchor_whose_value_is_on_the_next_lines(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_unreadable_anchor_fails_the_witness(self):
+        # #1247 R2: an anchor on a sequence item is not read; its alias must
+        # not be dropped silently.
+        text = textwrap.dedent("""\
+            x-commands:
+              - &cmd |
+                echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        with self.assertRaises(ValueError):
+            _run_bodies(text)
+
+    def test_branch_ref_only_in_a_real_env_mapping(self):
+        # #1247 R2 (B1 mesh-design, qa01): the form of the line is not enough,
+        # it must be a key of a real `env:` mapping; and no quoted scalar or
+        # flow collection may go on past its line (a YAML loader reads it
+        # whatever the indentation of the next lines).
+        steps = "jobs:\n  a:\n    steps:\n"
+        escapes = {
+            "quoted run key": '      - "run": |\n'
+                              '          BASE_REF: ${{ github.base_ref }}\n',
+            "space before colon": '      - run : |\n'
+                                  '          HEAD_REF: ${{ github.head_ref }}\n',
+            "flow mapping": '      - {run: "echo start\n'
+                            '          BASE_REF: ${{ github.base_ref }}"}\n',
+            "quoted scalar over env": '      - name: s\n        run: "echo\n'
+                                      '        env:\n'
+                                      '          BASE_REF: ${{ github.base_ref }}"\n',
+            "flow mapping over env": '      - {name: s, run: "echo\n    env:\n'
+                                     '      BASE_REF: ${{ github.base_ref }}"}\n',
+            "env inside a block": '      - "run": |\n          env:\n'
+                                  '            BASE_REF: ${{ github.base_ref }}\n',
+            "block sequence item": '      - |\n        env:\n'
+                                   '          BASE_REF: ${{ github.base_ref }}\n',
+            "explicit key": '      - ? run\n        : |\n'
+                            '          BASE_REF: ${{ github.base_ref }}\n',
+            "inline mention": '      - {name: x, run: "echo ${{ github.base_ref }}"}\n',
+            "run value": '      - run: ${{ github.head_ref }}\n',
+        }
+        for name, step in escapes.items():
+            with self.subTest(name=name):
+                self.assertNotEqual([], _branch_ref_escapes(steps + step))
+        allowed = {
+            "step env, comments": '      - name: s\n        env:  # x\n'
+                                  '          BASE_REF: ${{ github.base_ref }}  # y\n'
+                                  '        run: echo "$BASE_REF"\n',
+            "anchored step": '      - &s\n        name: s\n        env:\n'
+                             '          HEAD_REF: ${{ github.head_ref }}\n',
+            "env first in the item": '      - env:\n'
+                                     '          BASE_REF: ${{ github.base_ref }}\n',
+        }
+        for name, step in allowed.items():
+            with self.subTest(name=name):
+                self.assertEqual([], _branch_ref_escapes(steps + step))
+        self.assertEqual([], _branch_ref_escapes(
+            "env:\n  BASE_REF: ${{ github.base_ref }}\n"
+            "jobs:\n  a:\n    env:\n      HEAD_REF: ${{ github.head_ref }}\n"))
+
+    def test_runner_selection_may_compare_the_branch(self):
+        # #1247 x #1468: le pool prioritaire lit les branches source et cible ;
+        # dans un `runs-on:`, GitHub évalue l'étiquette lui-même (aucun shell),
+        # mais une interpolation nue y reste une évasion.
+        compared = ("jobs:\n  a:\n    runs-on: ${{ startsWith(github.head_ref, "
+                    "'refs/heads/integration/') && 'pool' || 'ci' }}\n")
+        self.assertEqual([], _branch_ref_escapes(compared))
+        for bare in ("    runs-on: ${{ github.head_ref }}\n",
+                     "    runs-on: ${{ format('{0}', github.base_ref) }}\n",
+                     "    runs-on: ${{ startsWith(github.head_ref, vars.X) }}\n",
+                     "    runs-on: ${{ format('x{0}startsWith(github.head_ref, ',"
+                     " github.head_ref, ')') }}\n",
+                     "    runs-on: \"${{ github.head_ref }}"
+                     "\n      run: echo ok\"\n"):
+            with self.subTest(bare=bare):
+                self.assertNotEqual([], _branch_ref_escapes("jobs:\n  a:\n" + bare))
+
+    def test_properties_cannot_hide_a_multiline_scalar_over_env(self):
+        # YAML ignores indentation inside quotes, even after an anchor/tag.
+        # The apparent root env below is still text of the run scalar.
+        for key in ("run", '"run"', "run "):
+            for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
+                               "&cmd !!str"):
+                text = (f"jobs:\n  a:\n    steps:\n      - {key}: {properties} \"echo\n"
+                        "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
+                with self.subTest(key=key, properties=properties):
+                    self.assertNotEqual([], _branch_ref_escapes(text))
+
+    def test_explicit_mapping_value_properties_cannot_hide_a_scalar(self):
+        # The YAML value starts after `:`, independently of the explicit key.
+        # Quoted scalar continuation ignores the apparent root env's indent.
+        for key in ("run", '"run"'):
+            for properties in ("&cmd", "!!str", "!<tag:yaml.org,2002:str>",
+                               "&cmd !!str"):
+                text = (f"jobs:\n  a:\n    steps:\n      - ? {key}\n"
+                        f"        : {properties} \"echo\n"
+                        "env:\n  BASE_REF: ${{ github.base_ref }}\nend\"\n")
+                with self.subTest(key=key, properties=properties):
+                    self.assertNotEqual([], _branch_ref_escapes(text))
+
+    def test_block_headers_indicators_and_comment(self):
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: |2
+                      echo "${{ github.base_ref }}"
+                  - run: >-2
+                      echo "${{ github.head_ref }}"
+                  - run: |- # header comment
+                      echo ok
+                  - run: echo inline
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(4, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.head_ref", bodies[1])
+        self.assertEqual("echo ok", bodies[2].strip())
+        self.assertEqual("echo inline", bodies[3])
+
+    def test_list_form_does_not_swallow_the_next_key(self):
+        text = textwrap.dedent("""\
+            steps:
+              - run: |2
+                  echo "${{ github.base_ref }}"
+                name: suite
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertNotIn("name:", bodies[0])
+
+    def test_alias_resolves_the_anchored_block(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd |2
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+                  - run: echo inline
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertEqual("echo inline", bodies[1])
+
+    def test_alias_of_an_inline_anchor_keeps_the_quoted_hash(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd "echo # ${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_anchor_on_the_run_line_still_opens_the_block(self):
+        # #1247 R1 (P2): `- run: &cmd |` both declares the anchor and opens
+        # the block; the body must not be taken for the inline value `&cmd |`.
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: &cmd |
+                      echo "${{ github.base_ref }}"
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.base_ref", bodies[1])
+
+    def test_tag_before_the_block_header_still_opens_the_block(self):
+        # #1247: a tag is the same class as an anchor (`run: !!str |`).
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: !!str |
+                      echo "${{ github.base_ref }}"
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_alias_resolves_at_its_point_of_use(self):
+        # #1247 R1: an alias names the declaration that precedes it; the last
+        # declaration of the file must not replace it retroactively.
+        text = textwrap.dedent("""\
+            x-first: &cmd |
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            x-last: &cmd |
+              echo benign
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertNotIn("benign", bodies[0])
+
+    def test_only_run_keys_are_read(self):
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                runs-on: ubuntu-latest
+                run-name: build
+                steps:
+                  - run: echo hi
+            """)
+        self.assertEqual(["echo hi"], _run_bodies(text))
 
 
 class WorkflowTest(unittest.TestCase):
@@ -1896,14 +2550,36 @@ class WorkflowTest(unittest.TestCase):
         for body in _run_bodies(self.text):
             self.assertNotIn("github.base_ref", body)
             self.assertNotIn("github.head_ref", body)
+        self.assertEqual([], _branch_ref_escapes(self.text))
+
+    def test_fs_class_lane_follows_the_plan_release_output(self):
+        # #748 / #1247 R2 : le job « autre système de fichiers » ne rejoue la
+        # suite que pour une release (source ou cible `release/**`) ou à la
+        # main ; son `if:` lit l'output `release` du plan — posé par un step
+        # qui reçoit les branches par `env:` — et n'interpole aucun nom de
+        # branche dans une condition.
+        self.assertIn("release: ${{ steps.release.outputs.release }}", self.text)
+        fs_class = self.text[self.text.index("\n  fs-class:\n"):
+                             self.text.index("\n  platform-macos:\n")]
+        self.assertIn("needs.plan.outputs.release == 'true'", fs_class)
+        condition = fs_class.split("    if:", 1)[1].split("    runs-on:", 1)[0]
+        self.assertNotIn("github.head_ref", condition)
+        self.assertNotIn("github.base_ref", condition)
+        self.assertIn('case "$BASE_REF" in release/*) release=true ;; esac', self.text)
+        self.assertIn('case "$HEAD_REF" in release/*) release=true ;; esac', self.text)
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
-        # décide), le push vers la branche d'intégration du paquet, main et
-        # release/** porte la suite complète ; le check requis reste
-        # l'agrégat « tests ».
-        self.assertIn('branches: [main, "release/**", "integration/**"]', self.text)
+        # décide), main et release/** portent la suite complète ; le check
+        # requis reste l'agrégat « tests ». #1410 : une poussée sur la branche
+        # d'intégration du paquet ne déclenche plus ce workflow — une tête de
+        # paquet n'a qu'une suite, celle de sa PR ; le portier paquet.yml
+        # appelle la suite (workflow_call) quand aucune PR ouverte ne couvre
+        # la tête exacte.
+        self.assertIn('branches: [main, "release/**"]', self.text)
+        self.assertNotIn('"integration/**"]', self.text)
         self.assertIn("\n  pull_request:\n", self.text)
+        self.assertIn("\n  workflow_call:\n", self.text)
         self.assertIn("L1211", self.text)
         self.assertIn("tests/parts/toujours.txt", self.text)
         self.assertIn("une PR de release", self.text)

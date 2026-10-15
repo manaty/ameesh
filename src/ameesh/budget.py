@@ -239,19 +239,40 @@ def _fmt_usd(value) -> str:
 
 
 def change(cfg: Config, db, *, agent: str | None, window: int, usd: float | None,
-           actor: str) -> tuple[bool, float | None]:
-    """Pose (`usd`) ou retire (None) un plafond ; journalise base + fil."""
+           actor: str, lower_only: bool = False,
+           sender: str | None = None) -> tuple[bool, float | None]:
+    """Pose (`usd`) ou retire (None) un plafond ; journalise base + fil.
+
+    `sender` (#1497) : l'auteur de l'entrée du fil quand `actor` n'est pas un
+    nom de membre nu — le `human:X for human:Y` d'un suppléant (L86) est une
+    trace, posée alors en `meta.by`, pas un expéditeur.
+
+    `lower_only` (L87, API) : BudgetError sauf si `usd` est sous le plafond en
+    vigueur, comparé sous le verrou de la ligne ; sans ligne, le plafond du
+    mesh est celui de la configuration (0 : aucun), et un agent sans plafond
+    propre n'en a aucun."""
     scope = agent or ""
-    changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor)
+    ceiling = None
+    if lower_only and not agent:
+        configured = resolve(cfg, [])
+        ceiling = (configured.per_hour if window == 3600 else configured.per_day) or None
+    try:
+        changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor,
+                                                  lower_only=lower_only, ceiling=ceiling)
+    except ValueError as exc:
+        raise BudgetError("refused: %s" % exc) from exc
     if changed:
         portee = "of agent %s" % agent if agent else "of the mesh"
         suite = "" if usd is not None else (
             " (back to the host configuration)" if not agent else "")
         texte = ("Budget %s %s: %s → %s, by %s%s." % (
             portee, LABELS[window], _fmt_usd(old), _fmt_usd(usd), actor, suite))
-        fil.record(cfg, db, sender=actor, recipients=[agent] if agent else [], text=texte,
-                   meta={"action": "budget", "audit": "budget", "scope": scope or "mesh",
-                         "window_s": window, "old_usd": old, "new_usd": usd})
+        meta = {"action": "budget", "audit": "budget", "scope": scope or "mesh",
+                "window_s": window, "old_usd": old, "new_usd": usd}
+        if sender and sender != actor:
+            meta["by"] = actor
+        fil.record(cfg, db, sender=sender or actor, recipients=[agent] if agent else [],
+                   text=texte, meta=meta)
     return changed, old
 
 

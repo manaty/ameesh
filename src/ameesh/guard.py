@@ -58,7 +58,8 @@ Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
               "windows": ["mon-fri 18:00-14:00 UTC", "sat-sun"],
               "reclaim": {"memory_available_min": "6GiB", "cpu_pressure_max": "20%",
                           "memory_pressure_max": "2%", "io_pressure_max": "20%",
-                          "busy_units": ["actions.runner.*"], "busy_max": 4,
+                          "busy_units": ["actions.runner.*"],
+                          "busy_tasks": ["Runner.Worker"], "busy_max": 4,
                           "disk_free_min": "2GiB", "disk_paths": ["/"]},
               "drain_seconds": 90, "calm_seconds": 600, "restart_after_seconds": 600}}
 

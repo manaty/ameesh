@@ -8,30 +8,38 @@
 # propre Postgres :
 #   - psycopg : sur une PR de lot, les tests impactés et le contrat (L1211),
 #               en une à quatre parts selon l'estimation ; la suite complète,
-#               en 4 parts, sur push vers main, integration/** ou release/**,
-#               et sur une PR de release (source ou cible release/** ou
-#               integration/**) ;
+#               en 4 parts, sur push vers main ou release/**, sur une PR de
+#               release (source ou cible release/** ou integration/**) et sur
+#               l'appel du portier de paquet (workflow_call, §12) ;
 #   - psql    : sur une PR de lot, les modules « pilote » parmi les impactés
 #               et le contrat, plus la liste « always » déclenchée (#749), en
 #               une à trois parts (#947 : huit jobs se partagent chaque hôte
 #               auto-hébergé, une part unique de ~24 min au repos atteignait le
 #               plafond de 30 min sous saturation) ; la suite complète, en
-#               6 parts, sur push vers main, integration/** ou release/**, sur
-#               une PR de release (sans liste pilote) et à la main
-#               (workflow_dispatch).
+#               9 parts (#1692 : 6 → 9, parts de ~30 min sous saturation), sur
+#               push vers main ou release/**, sur une PR de
+#               release (sans liste pilote), à la main (workflow_dispatch) et
+#               sur l'appel du portier de paquet (workflow_call).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#
+# §12 — une tête de paquet ne lance qu'une seule suite complète. Le run
+# `pull_request` de sa PR porte le check requis `tests` ; le portier
+# `.github/workflows/paquet.yml`, déclenché par `push integration/**`, n'appelle
+# cette suite (`workflow_call`) que si aucune PR ouverte ne couvre la tête
+# exacte, et son check n'est jamais nommé `tests` (incident #1342 : deux suites
+# complètes, l'agrégat rouge du run push annulé bloquait la PR #1050).
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
 # toujours les tests de contrat (tests/parts/toujours.txt : droits, rôles,
 # migrations, objets globaux du cluster), avec repli sur la suite complète
 # quand la sélection ne peut pas décider (scripts/test-plan.py, lot_selection).
-# La suite complète tourne sur main, release/** et la branche d'intégration du
-# paquet (§12) : une PR de lot n'en déclenche plus, mais une PR de release
-# (source ou cible release/** ou integration/**), comme un push sur ces
-# branches, garde la suite complète, les deux pilotes, sans voie version/doc
-# ni liste pilote psql — y compris dans le plan de repli. Les règles de
-# refusion (a : delta de main disjoint, b : migrations seules) viendront
-# ensuite.
+# La suite complète tourne sur main, release/** et pour la branche d'intégration
+# du paquet (§12) par le run `pull_request` de sa PR ou, à défaut de PR couvrant
+# la tête, par le portier `paquet.yml` : une PR de lot n'en déclenche plus, mais
+# une PR de release (source ou cible release/** ou integration/**) garde la
+# suite complète, les deux pilotes, sans voie version/doc ni liste pilote psql —
+# y compris dans le plan de repli. Les règles de refusion (a : delta de main
+# disjoint, b : migrations seules) viendront ensuite.
 #
 # L157 — une PR de lot qui ne change QUE le numéro de version (pyproject.toml
 # seul, la seule ligne `version = "…"`) ne relance pas la suite : `main` l'a
@@ -82,12 +90,24 @@
 # qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
 # lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
 # fourche), rien n'est publié et la part n'en est pas affectée.
+#
+# #748 — à la release (branche `release/**`, ou PR dont la tête ou la base
+# l'est) et à la main, les parts psycopg sont rejouées une fois sur l'autre
+# classe de système de fichiers que celle du défaut du runner (tmpfs ↔ disque,
+# lue à l'exécution) : un test qui ne tient que sur la classe ordinaire
+# (horodatages, renommage entre périphériques, inodes, blocs) se révèle là. Le
+# job « autre système de fichiers » est alors exigé par le check agrégé.
 name: tests
 
 on:
+  # §12 : une poussée sur integration/** ne déclenche plus cette suite
+  # directement. Le portier .github/workflows/paquet.yml décide — une tête de
+  # paquet n'a qu'une suite, celle de sa PR — et rappelle cette suite
+  # (workflow_call) quand aucune PR ouverte ne couvre la tête poussée.
   push:
-    branches: [main, "release/**", "integration/**"]
+    branches: [main, "release/**"]
   pull_request:
+  workflow_call:
   workflow_dispatch:
 
 # Une PR dépassée est annulée. Les pushes de main partagent un groupe :
@@ -114,13 +134,33 @@ env:
 # organisation. A pull request from a fork never reaches that host (the
 # repository is public: its code would run on a shared, persistent machine);
 # it stays on ubuntu-latest, like the macOS job and the Pages deployment.
+#
+# #1468 — priority pool. A few runners (label `ameesh-ci-prio`) are kept for
+# package and release runs and for the lots marked unblock/incident: they do
+# NOT carry `ameesh-ci`, so an ordinary job (which asks for `ameesh-ci`) can
+# never take them — adding a label while keeping `ameesh-ci` would reserve
+# nothing. Every runner, general or reserved, carries `ameesh-ci-pool`; a
+# priority job asks for it, so it takes the first idle runner of either group.
+# A run is priority when the switch `vars.AMEESH_CI_PRIO` is `on` and it is a
+# push (or the package gate's workflow_call) on integration/** or release/**,
+# a PR whose source or target is one of those branches, or a PR listed in
+# `vars.AMEESH_CI_PRIO_PRS` (JSON array of PR numbers: a repository variable,
+# writable with repository write access, set by the pilot for an unblock or
+# incident lot and recorded with its before/after value; setting it triggers
+# no run). Switch off or unset: every job
+# asks for `ameesh-ci`, as before. The routing only picks the runner: no
+# `if:`, no part, no required check depends on it, and no hosted runner is
+# ever added (a fork PR keeps ubuntu-latest, as before). The job-level
+# expression is the same everywhere (tests/test_1468_ci_prio.py);
+# docs/EXPLOITATION.md, « Runners prioritaires », gives the activation and
+# rollback steps; scripts/ci-queue-wait.py measures the queue wait per class.
 jobs:
   # L157, L161a, L161f : nature of the change (version or documentation only,
   # lot PR only; merge commit against its target), the branch context
   # (release PRs keep the full suite) and the plan of the run, from the map
   plan:
     name: plan
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     env:
       # #833 : sur une poussée, le diff va du commit d'avant la poussée
@@ -138,6 +178,7 @@ jobs:
       psycopg_parts: ${{ steps.plan.outputs.psycopg_parts }}
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
+      release: ${{ steps.release.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -166,6 +207,20 @@ jobs:
             --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
             --github-output "$GITHUB_OUTPUT" \
             --summary "$GITHUB_STEP_SUMMARY" --annotations
+      - id: release
+        name: release lane of the run
+        # #748 : la suite sur l'autre classe de système de fichiers ne se rejoue
+        # que pour une release (source ou cible `release/**`) ou à la main ; le
+        # nom de branche voyage par l'environnement (L1237) et n'est jamais
+        # interpolé dans le script.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          release=false
+          case "$BASE_REF" in release/*) release=true ;; esac
+          case "$HEAD_REF" in release/*) release=true ;; esac
+          echo "release=$release" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: plan
@@ -176,7 +231,7 @@ jobs:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     needs: plan
     if: needs.plan.outputs.psycopg != '[]'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -234,21 +289,26 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-
+            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-
       # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
       # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
       # importer ses dépendances, sinon il est reconstruit (#932, #1293).
+      # `coverage` est la dépendance des témoins de `scripts/map.py` : sans elle,
+      # les cas qui lisent un vrai fichier de couverture seraient sautés (le
+      # pilote psql ne l'installe pas, d'où le saut là-bas). La clé de cache
+      # ci-dessus porte `-cov-` : un venv en cache sans coverage ne doit pas
+      # être réutilisé pour ces témoins (#1257).
       - id: deps
         name: dépendances (pilote psycopg)
         run: |
-          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil, coverage' >/dev/null 2>&1; then
             echo "venv restauré du cache : valide"
           else
             rm -rf .venv-ci
             python -m venv .venv-ci
-            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'coverage>=7.10'
             echo "reconstruit=1" >> "$GITHUB_OUTPUT"
           fi
       # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
@@ -260,7 +320,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
       - &base
         name: base jetable (sans fsync) et client psql
         run: |
@@ -319,15 +379,16 @@ jobs:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     needs: plan
     if: needs.plan.outputs.psql != '[]'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
     # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
     # elle était annulée par le plafond de 30 min sans échec de test (PR #640,
-    # run 38381239685). 45 min laisse la marge sous charge et reste un plafond
-    # borné (§3 du processus de lot : aucun job ne retient un runner des heures).
+    # run 38381239685). 60 min laisse la marge sous charge (#1251 : 45 → 60) et
+    # reste un plafond borné (§3 du processus de lot : aucun job ne retient un
+    # runner des heures).
     # psycopg garde 30 min : ses parts tournent en 6-8 min, même à 3× plus lent
     # elles tiennent dans le plafond.
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -335,8 +396,8 @@ jobs:
         # impactés et le contrat, plus la liste « always » déclenchée (#749) ;
         # une part, deux ou trois selon l'estimation (scripts/test-plan.py,
         # lot_part_count), trois au plus (#947 : sous saturation, une part
-        # unique atteignait le plafond de 30 min) ; suite complète en 6 parts
-        # sur push et sur une PR de release (sans liste pilote).
+        # unique atteignait le plafond de 30 min) ; suite complète en 9 parts
+        # (#1692) sur push et sur une PR de release (sans liste pilote).
         part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
@@ -358,7 +419,7 @@ jobs:
       FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
       # #899 : le plafond du job, tenu à timeout-minutes (contrat test_899) ;
       # 45 depuis #880, qui a relevé le plafond de la part psql sous saturation.
-      AMEESH_PLAFOND_MIN: "45"
+      AMEESH_PLAFOND_MIN: "60"
     steps:
       - *debut
       - uses: actions/checkout@v4
@@ -385,14 +446,164 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1  # read by bilan in the same run; 8 400 artifacts filled the org quota (13/10)
 
+  # #748 : la suite rejouée sur une AUTRE classe de système de fichiers que
+  # celle du défaut du runner (tmpfs ↔ disque), à la release seulement. Un test
+  # qui ne tient que sur la classe ordinaire (horodatages, renommage entre
+  # périphériques, inodes, blocs, montage) se révèle ici, là où la suite
+  # ordinaire ne le voit pas. La classe par défaut est lue à l'exécution
+  # (`stat -f`), donc le job reste vrai si l'hôte change de défaut ; la racine
+  # temporaire des tests (`TMPDIR`) est posée sur l'autre classe et vérifiée.
+  # Une release dont la suite n'est pas verte sur les deux classes ne fusionne
+  # pas (canon §3 : un test dépendant de l'environnement est bloquant).
+  fs-class:
+    name: autre système de fichiers ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+    needs: plan
+    if: >-
+      needs.plan.outputs.code == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && startsWith(github.ref_name, 'release/')) ||
+       needs.plan.outputs.release == 'true')
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.psycopg) }}
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ameesh
+          POSTGRES_PASSWORD: ameesh-ci
+          POSTGRES_DB: ameesh
+        ports: ["5432"]
+        options: >-
+          --tmpfs /var/lib/postgresql/data
+          --health-cmd "pg_isready -U ameesh"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c : check run « tests (flux) »
+    env:
+      AMEESH_DRIVER: psycopg
+      FLUX_NOM: tests (flux) autre-FS ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+      AMEESH_PLAFOND_MIN: "45"
+    steps:
+      - *debut
+      - uses: actions/checkout@v4
+      - *dsn
+      - id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - id: venv
+        uses: actions/cache/restore@v4
+        with:
+          path: .venv-ci
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-
+      # Le contrôle vaut aussi pour un cache de même runner devenu périmé (outil
+      # Python déplacé) : un venv restauré n'est utilisé que s'il sait encore
+      # importer ses dépendances, sinon il est reconstruit (#932, #1293).
+      - id: deps
+        name: dépendances (pilote psycopg)
+        run: |
+          if .venv-ci/bin/python -c 'import psycopg, cryptography, psutil' >/dev/null 2>&1; then
+            echo "venv restauré du cache : valide"
+          else
+            rm -rf .venv-ci
+            python -m venv .venv-ci
+            .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+            echo "reconstruit=1" >> "$GITHUB_OUTPUT"
+          fi
+      # #1293 : le venv reconstruit est sauvé sous la clé du run, que la
+      # prochaine exécution retrouve par `restore-keys`. Un sauvetage refusé
+      # (quota, course entre parts) ne fait pas rougir la part : la
+      # reconstruction reste correcte, seule la prochaine exécution repaie.
+      - if: steps.deps.outputs.reconstruit == '1'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .venv-ci
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+      - *base
+      - *git
+      - *plan
+      - name: racine temporaire sur l'autre classe de système de fichiers
+        run: |
+          set -eu
+          defaut=$(stat -f -c %T "${TMPDIR:-/tmp}")
+          mini=$((1024 * 1024))            # 1 GiB libres, en KiB : de quoi loger la part
+          racine=""; meilleur=0
+          for candidat in "/dev/shm/ameesh-autre-fs-${GITHUB_RUN_ID}-${{ matrix.part }}" \
+                          "${RUNNER_TEMP:?}/ameesh-autre-fs"; do
+            mkdir -p "$candidat" 2>/dev/null || continue
+            classe=$(stat -f -c %T "$candidat" 2>/dev/null || echo inconnu)
+            libre=$(df -Pk "$candidat" 2>/dev/null | awk 'NR==2 {print $4}')
+            [ "$classe" != "$defaut" ] && [ "$classe" != inconnu ] || continue
+            [ "${libre:-0}" -ge "$mini" ] || continue
+            if [ "$libre" -gt "$meilleur" ]; then racine="$candidat"; meilleur=$libre; fi
+          done
+          if [ -z "$racine" ]; then
+            echo "::error::aucune autre classe de système de fichiers utilisable (défaut=$defaut) : /dev/shm et RUNNER_TEMP sont le même système, absents, ou sous 1 GiB libres"
+            exit 1
+          fi
+          classe=$(stat -f -c %T "$racine")
+          df -h "$racine" | tail -1
+          echo "TMPDIR=$racine" >> "$GITHUB_ENV"
+          echo "AMEESH_AUTRE_FS=$classe" >> "$GITHUB_ENV"
+          echo "système de fichiers : défaut=$defaut, cette part=$classe ($racine)"
+          {
+            echo "### #748 — autre système de fichiers (part ${{ matrix.part }})"
+            echo "- défaut du runner : \`$defaut\`"
+            echo "- cette part : \`$classe\` (\`$racine\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - *publier
+      - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+        run: >-
+          .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --driver psycopg --flow "$RUNNER_TEMP/flux.jsonl"
+      - *fermer
+      - *resume
+      - name: flux en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # hors du motif `flux-*` : le bilan (L161f) agrège ces flux-là, une
+          # seconde part du même plan y fausserait le vert provisoire
+          name: autre-fs-${{ matrix.part }}
+          path: ${{ runner.temp }}/flux.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+      # en dernier : `TMPDIR` reste posé sur l'autre classe pour les étapes
+      # suivantes, et une action Node (artefact) écrirait dans une racine déjà
+      # supprimée
+      - name: ménage de la racine temporaire (hôte persistant)
+        if: always()
+        run: |
+          case "${TMPDIR:-}" in
+            /dev/shm/ameesh-autre-fs-*|*/ameesh-autre-fs) rm -rf -- "$TMPDIR" ;;
+          esac
+
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
   # parts psql (sans psutil) par le repli /proc.
+  # #987 : image x64 explicite (`macos-26-intel`), pas `macos-latest` (macOS 26
+  # arm64) — le 13/10/2026, la capacité arm64 a annulé ce job après ~15 min
+  # sans runner (« not acquired by Runner of type hosted »), ce qui rougissait
+  # le check requis sans défaut de code. L'image est un runner standard
+  # (gratuit), pas un runner « large » payant (canon §3) ; le job ne teste que
+  # psutil et la couche plateforme, indifférents à l'architecture. Défense en
+  # profondeur : .github/workflows/relance-hosted.yml rejoue les jobs annulés
+  # faute de runner.
   platform-macos:
     name: plateforme macOS
     needs: plan
     if: needs.plan.outputs.code == 'true'
-    runs-on: macos-latest
+    runs-on: macos-26-intel
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
@@ -403,15 +614,30 @@ jobs:
           python-version: "3.12"
       - name: psutil
         run: python -m pip install 'psutil>=5.9'
-      - name: couche plateforme et lint
-        run: python -m unittest -v tests.test_l63_platform.PlatformTest tests.test_l63_platform.LintTest
+      - name: couche plateforme, lint et notification de bureau (L66)
+        run: >-
+          python -m unittest -v tests.test_l63_platform.PlatformTest
+          tests.test_l63_platform.LintTest tests.test_l66_desktop.PlatformNotifyTest
+      - name: osascript réel sur le script produit (L66)
+        run: |
+          set -euo pipefail
+          script=$(python -c 'from ameesh.platform import notify; print(notify._applescript("ameesh CI", "test L66 — ’accent", "normal"))')
+          test -n "$script"
+          if osascript -e "$script"; then
+            echo "osascript: notification affichée"
+          elif osacompile -e "$script" -o "$RUNNER_TEMP/l66.scpt"; then
+            echo "osascript: pas de session GUI sur le runner; le script compile sans erreur"
+          else
+            echo "osascript: le script AppleScript produit ne compile pas" >&2
+            exit 1
+          fi
 
   # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
   doc-readers:
     name: lecteurs de la doc
     needs: plan
     if: needs.plan.outputs.docs_only == 'true'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
       AMEESH_REQUIRE_DB: "0"
@@ -429,7 +655,7 @@ jobs:
     name: bilan des impactés
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
     needs: [plan, psycopg, psql]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     continue-on-error: true
     steps:
@@ -460,7 +686,7 @@ jobs:
   version:
     name: version number
     if: github.event_name == 'pull_request'
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -473,12 +699,14 @@ jobs:
   # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
   # L161a : ou que de la documentation, et ses lecteurs sont verts ;
   # L161f : une part que le plan n'a pas prévue est sautée ;
-  # L158: on a PR, the version number check must pass)
+  # L158: on a PR, the version number check must pass;
+  # #748 : la part « autre système de fichiers », quand elle tourne — release
+  # ou exécution à la main — compte comme les autres)
   tests:
     name: tests
     if: always()
-    needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    needs: [plan, version, psycopg, psql, platform-macos, doc-readers, fs-class]
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: bilan des parts
@@ -488,6 +716,7 @@ jobs:
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
           echo "macOS   : ${{ needs.platform-macos.result }}"
+          echo "autre FS: ${{ needs.fs-class.result }}"
           echo "version : ${{ needs.version.result }}"
           test "${{ needs.plan.result }}" = success
           # L158: on a PR, the version number check passes (skipped elsewhere).
@@ -511,3 +740,6 @@ jobs:
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; } || exit 1
           test "${{ needs.platform-macos.result }}" = success
+          # #748 : la part sur l'autre système de fichiers n'existe que pour une
+          # release (ou à la main) ; quand elle a tourné, elle compte
+          test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped

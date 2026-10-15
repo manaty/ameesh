@@ -147,6 +147,24 @@ class FollowUpTest(unittest.TestCase):
         self.assertEqual(result["after"], 0)
         self.assertFalse(result["over_quota"])
         self.assertFalse(any(os.path.exists(p) for p in names))
+        # #762 (codex P3): the old code credited this first half too, so the
+        # test proved nothing about the rule. It is discriminating only with
+        # the converse: a name the walk does not see keeps the inode alive,
+        # the last name does not go, and NOTHING is credited.
+        other = os.path.join(self.root, "codex4")
+        os.makedirs(other)
+        inside = os.path.join(other, "c")
+        _write(inside, size=5)
+        keep = os.path.join(self.base, "keep")
+        os.link(inside, keep)                    # a name outside the eviction
+        result = menage.evict_lru([other], self.root, 0)
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(result["evicted"], 0)
+        self.assertEqual(result["after"], B)
+        self.assertEqual(result["unremovable"], B)
+        self.assertTrue(result["blocked"])
+        self.assertFalse(os.path.exists(inside))
+        self.assertTrue(os.path.exists(keep))
 
     def test_multi_link_inode_kept_alive_outside_the_root_credits_nothing(self):
         # #530: every name the walk saw is gone, but a link outside the managed
@@ -263,13 +281,17 @@ class EpisodeTest(PgTestCase):
         many = [os.path.join(tmp, "many", "f%d" % i) for i in range(6)]
         for path in many:
             _write(path)
+        # l'horloge est menée (`now`), pas attendue : la deuxième passe a un
+        # autre instant, donc si `since` était recalculé l'assertion le verrait
+        first_now = time.time()
         with mock.patch.object(menage, "WALK_LIMIT", 3):
-            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t",
+                            now=first_now)
         first = self._alerts("tmp_unscanned")
         self.assertEqual(len(first), 1)
-        time.sleep(1.1)                    # a later `at_ts`, the same episode
         with mock.patch.object(menage, "WALK_LIMIT", 3):
-            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+            menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t",
+                            now=first_now + 2.0)
         second = self._alerts("tmp_unscanned")
         self.assertEqual(len(second), 1)
         self.assertEqual(second[0]["since"], first[0]["since"])

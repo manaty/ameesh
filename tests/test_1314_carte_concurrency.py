@@ -36,12 +36,12 @@ class CarteConcurrencyTest(unittest.TestCase):
     def test_le_groupe_de_main_est_stable(self):
         # même groupe pour toutes les poussées de main : le run en cours
         # n'est pas remplacé, le suivant attend (un seul en attente, tests.yml).
+        # Le dispatch, lui, est isolé par une identité par run (#1316) : voir
+        # tests/test_1316_carte_dispatch.py.
         m = GROUP.search(WORKFLOW)
         self.assertIsNotNone(m, "groupe de concurrence introuvable")
         group = m.group(1)
         self.assertIn("|| 'main'", group)
-        self.assertNotIn("github.run_id", group)
-        self.assertNotIn("github.ref", group)
 
     def test_une_pr_garde_son_groupe_annulable(self):
         # une PR qui touche la mesure garde son groupe : une mesure dépassée

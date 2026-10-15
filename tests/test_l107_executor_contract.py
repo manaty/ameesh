@@ -12,6 +12,9 @@ import inspect
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import typing
 import unittest
 
@@ -52,6 +55,15 @@ def _schema(ann: str) -> dict:
             "dict": "object", "None": "null"}
     if ann in base:
         return {"type": base[ann]}
+    # #1482 : un TypedDict de l'interface déclare les champs de l'objet
+    cls = getattr(SI, ann, None)
+    if cls is not None and typing.is_typeddict(cls):
+        props = {}
+        for name, hint in cls.__annotations__.items():
+            if not isinstance(hint, str):        # TypedDict garde des ForwardRef
+                hint = getattr(hint, "__forward_arg__", None) or str(hint)
+            props[name] = _schema(hint)
+        return {"type": "object", "properties": props, "required": list(props)}
     m = re.fullmatch(r"(?:Sequence|list)\[(.+)\]", ann)
     if m:
         return {"type": "array", "items": _schema(m.group(1))}
@@ -89,16 +101,16 @@ class TableTest(unittest.TestCase):
 
     def test_comptes(self):
         ops = self.c.operations.values()
-        # contrat 1.1 : assigned lots and background ownership read (#476)
-        self.assertEqual(len(self.c.operations), 63)
-        self.assertEqual(sum(o.write for o in ops), 38)
+        # contrat 1.2 : expiration médiée des fils (#499, threads.recount)
+        self.assertEqual(len(self.c.operations), 64)
+        self.assertEqual(sum(o.write for o in ops), 39)
         self.assertEqual(sum(not o.write for o in ops), 25)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
         self.assertEqual(sorted(o.name for o in ops if o.session),
                          ["mailbox.deliver", "mailbox.release", "mailbox.reserve",
-                          "mailbox.unread", "threads.index"])
-        self.assertEqual(self.c.version, "1.1.0")
+                          "mailbox.unread", "threads.index", "threads.recount"])
+        self.assertEqual(self.c.version, "1.2.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 
@@ -131,6 +143,19 @@ class TableTest(unittest.TestCase):
         self.assertEqual(admitted | refused, _interface_ops())
         self.assertEqual(self.c.interface_total, len(_interface_ops()))
         self.assertEqual(set(self.c.refused_reasons), set(self.c.refused))
+
+    def test_les_compteurs_du_doc_suivent_le_contrat(self):
+        """#1019 : les compteurs cités par docs/EXECUTEUR-MEDIEE.md viennent de
+        contract.json ; ils doivent suivre chaque ajout à l'interface, sans
+        quoi les agents lisent des chiffres périmés."""
+        with open(os.path.join(REPO, "docs", "EXECUTEUR-MEDIEE.md"), encoding="utf-8") as fh:
+            doc = re.sub(r"\s+", " ", fh.read())
+        refuses = sum(len(methodes) for methodes in self.c.refused.values())
+        for attendu in ("la table fermée des %d opérations et la liste des %d refusées"
+                        % (len(self.c.operations), refuses),
+                        "l'interface entière (%d opérations)" % self.c.interface_total):
+            with self.subTest(fragment=attendu):
+                self.assertIn(attendu, doc)
 
     def test_jamais_d_autorite(self):
         for d in ("approvals", "nonces", "grants", "authenticators", "canon", "packages",
@@ -171,12 +196,41 @@ class EnveloppesTest(unittest.TestCase):
     def setUp(self):
         self.c = C.load()
 
+    def test_generateur_reproduit_les_dores(self):
+        """La régénération reste complète et conserve les cas ajoutés au contrat."""
+        with tempfile.TemporaryDirectory(prefix="executor-goldens-") as generated:
+            result = subprocess.run(
+                [sys.executable, os.path.join(REPO, "tests", "golden", "generate_executor.py"), generated],
+                cwd=REPO, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(set(os.listdir(generated)), set(os.listdir(GOLDEN_DIR)))
+            for name in sorted(os.listdir(GOLDEN_DIR)):
+                with self.subTest(family=name), open(os.path.join(generated, name), encoding="utf-8") as fh:
+                    self.assertEqual(json.load(fh), _golden(name))
+
     def test_dores_couvrent_chaque_operation(self):
         covered = {case["op"] for case in _op_cases()}
         expected = {n for n, o in self.c.operations.items() if o.transport != "events"}
         self.assertEqual(covered, expected)
         ev = _golden("events.json")
         self.assertTrue(ev["sse"]["events"])
+
+    def test_objet_declare_par_proprietes(self):
+        # #1482-N1 : le schéma de `last` déclare ses champs et les applique
+        op = self.c.get("threads.recount")
+        last = next(p for p in op.params if p.name == "last")
+        self.assertEqual(last.schema["properties"]["entry_id"], {"type": "string"})
+        self.assertEqual(last.schema["required"],
+                         ["entry_id", "author", "excerpt", "ts", "mailbox_id"])
+        good = {"entry_id": "a#1", "author": "agent:a", "excerpt": "x", "ts": 1.5,
+                "mailbox_id": None}
+        self.assertTrue(C.conforms(good, last.schema))
+        self.assertTrue(C.conforms(None, last.schema))
+        for bad in ({k: v for k, v in good.items() if k != "ts"},   # champ requis absent
+                    dict(good, ts="hier"),                          # type faux
+                    dict(good, mailbox_id="12")):                   # type faux
+            with self.subTest(bad=bad):
+                self.assertFalse(C.conforms(bad, last.schema))
 
     def test_dores_conformes(self):
         for case in _op_cases():

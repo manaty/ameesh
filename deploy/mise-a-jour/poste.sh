@@ -8,9 +8,12 @@
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
-#   migrer       migrations de REF, lancées depuis son instantané AVANT de
+#   migrer [--additif-seulement] [REF]
+#                migrations de REF, lancées depuis son instantané AVANT de
 #                l'installer : base du mesh (UNE fois), puis ancienne base ;
-#                refusé si l'une n'est pas additive (voir MIGRER_APRES)
+#                refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#                --additif-seulement garde ce refus même quand REF est déjà
+#                installé (staging : des VM tournent encore le code précédent)
 #   installer    instantané du code REF dans ~/.local/share/ameesh/src-<sha>,
 #                installé dans le venv (dépendance psycopg comprise) ; refusé
 #                tant qu'une base n'a pas les migrations de REF
@@ -212,9 +215,16 @@ installer() {
 # place, exécuteurs et commandes des agents, tourne sur la base migrée. Une
 # fois REF installé (ancien ordre, MIGRER_APRES=1), tout passe.
 migrer() {
-  local ref=${1:-HEAD} cible d garde=(--additive-only)
+  local ref=${1:-HEAD} cible d garde=(--additive-only) force=0
+  if [ "${1:-}" = "--additif-seulement" ]; then
+    force=1
+    ref=${2:-HEAD}
+  fi
   cible=$(instantane "$ref")
-  if installe "$cible"; then
+  # --additif-seulement : la garde tient meme quand l'instantane est deja
+  # src-current (reprise de staging, avis R1 B2) : des VM peuvent tourner un
+  # code precedent sur la base migree.
+  if [ "$force" != 1 ] && installe "$cible"; then
     garde=()
     etape "$(basename "$cible") déjà installé : toutes ses migrations passent"
   else
@@ -325,7 +335,9 @@ proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, e
 
 # Redémarre les unités $2… (base $1 : mesh | ancienne) une par une, chacune
 # au premier instant où sa persona n'est pas en tour. Une persona longue en
-# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout.
+# tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout. Une
+# persona arrêtée dans le registre (`stopped`, arrêt du propriétaire) est
+# laissée telle quelle : son unité active n'est pas réactivée (#1131).
 redemarrer_liste() {
   local base=$1; shift
   local restantes=("$@") suivantes debut=$SECONDS u p st avant ligne heure tenu attendu
@@ -335,6 +347,13 @@ redemarrer_liste() {
       p=$(persona_de "$u")
       [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
       st=$(statut "$base" "$p")
+      # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
+      # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
+      # actives malgré le registre `stopped`).
+      if [ "$st" = stopped ]; then
+        echo "$p : arrêté dans le registre — unité $u ignorée, pas de redémarrage (systemctl --user disable --now $u pour la retirer)"
+        continue
+      fi
       if [ "$st" = running ]; then suivantes+=("$u"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
       ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \
@@ -615,7 +634,7 @@ case "${1:-}" in
   verifier) verifier ;;
   sauvegarder) sauvegarder ;;
   installer) installer "${2:-HEAD}" ;;
-  migrer) migrer ;;
+  migrer) shift; migrer "$@" ;;
   role) role ;;
   redemarrer) redemarrer ;;
   controler) controler ;;

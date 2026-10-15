@@ -11,7 +11,7 @@ filtre absent n'est jamais un paramètre NULL typé par le serveur.
 from __future__ import annotations
 
 from .. import interface
-from .work import ITEM_COLUMNS
+from .work import item_columns
 
 #: états d'action qui attendent encore quelque chose (non terminaux)
 _OPEN_ACTION_STATES = ("proposed", "approved", "launched", "unknown")
@@ -35,9 +35,11 @@ def _marks(values) -> str:
 class Progress(interface.Progress):
 
     def lots(self, *, since_ts, project, limit) -> list[dict]:
+        # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
         sql = ("SELECT %s, count(*) OVER ()::bigint AS total FROM work_items"
                " WHERE (state NOT IN ('merged', 'promoted', 'closed')"
-               "        OR updated_at >= to_timestamp(%%s))" % ITEM_COLUMNS)
+               "        OR updated_at >= to_timestamp(%%s))"
+               % item_columns(self.db, "work_items"))
         params: list = [float(since_ts)]
         if project:
             sql += " AND (app = %s OR workstream = %s)"
@@ -57,6 +59,32 @@ class Progress(interface.Progress):
             "       extract(epoch from created_at)::float8 AS created_ts"
             "  FROM work_item_events WHERE work_item_id IN (%s)"
             " ORDER BY id" % _marks(ids), tuple(ids))
+
+    def lot_transitions(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        # Seules les lignes où l'état change sortent : le texte des notes
+        # (des mégaoctets sur une liste de lots) n'est ni lu ni transféré.
+        return self.db.query(
+            "SELECT id, work_item_id, state, actor,"
+            "       extract(epoch from created_at)::float8 AS created_ts"
+            "  FROM (SELECT id, work_item_id, state, actor, created_at,"
+            "               lag(state) OVER (PARTITION BY work_item_id"
+            "                               ORDER BY id) AS prev"
+            "          FROM work_item_events WHERE work_item_id IN (%s)) marked"
+            " WHERE prev IS DISTINCT FROM state"
+            " ORDER BY id" % _marks(ids), tuple(ids))
+
+    def lot_event_last(self, item_ids) -> list[dict]:
+        ids = [int(i) for i in item_ids]
+        if not ids:
+            return []
+        return self.db.query(
+            "SELECT work_item_id,"
+            "       extract(epoch from max(created_at))::float8 AS last_ts"
+            "  FROM work_item_events WHERE work_item_id IN (%s)"
+            " GROUP BY work_item_id" % _marks(ids), tuple(ids))
 
     def lot_milestones(self, item_ids) -> list[dict]:
         ids = [int(i) for i in item_ids]
@@ -139,8 +167,14 @@ class Progress(interface.Progress):
         """
         params: tuple = ()
         if project:
-            sql += " WHERE r.workstream = %s OR r.team = %s"
-            params = (project, project)
+            # L243 : l'agent appartient à tous ses projets — `projects` déclaré
+            # (0388), sinon son équipe, sinon son `workstream`
+            sql += (" WHERE %s = any(coalesce(r.projects,"
+                    " case when coalesce(btrim(r.team), '') <> '' then array[btrim(r.team)]"
+                    "      when coalesce(btrim(r.workstream), '') <> ''"
+                    "           then array[btrim(r.workstream)]"
+                    "      else array[]::text[] end))")
+            params = (project,)
         sql += " ORDER BY r.name"
         return self.db.query(sql, params)
 

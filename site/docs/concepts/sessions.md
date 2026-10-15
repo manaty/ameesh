@@ -49,7 +49,9 @@ brief at any time. See [Operate agents](../guides/operate-agents.md).
 ## Rotation with a resume summary
 
 Whatever the policy (except `jamais`), when a session exceeds `AMEESH_SESSION_MAX_TOKENS` (default 150 000) or a turn
-lasted more than `AMEESH_SESSION_MAX_TURN_SECONDS` (default 900 s), after at
+lasted more than `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3 600 s; the
+threshold is floored at twice the effective turn cap, `turn_max_seconds`
+included, and without a turn cap the configured threshold applies alone), after at
 least `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**:
 
 1. a summary turn is played in the current session;

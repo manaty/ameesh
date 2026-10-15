@@ -344,6 +344,26 @@ def registry_rows(db, names: list[str]) -> dict:
         return {name: directory.get(name) for name in names}
 
 
+def wake_note(cfg, db, name: str, row: dict) -> list[str]:
+    """#858 : avertissement d'un destinataire inscrit mais NON réveillable à
+    l'instant (profil divergé en attente du prochain canon sync, responsable
+    manquant, éphémère échu…). Le message est déposé quand même — c'est lui le
+    réveil durable : il ouvrira un tour dès que l'agent redeviendra réclamable
+    (la passe de l'exécuteur relit `claimable` en continu). Rend `[]` quand un
+    réveil est possible, ou quand aucun n'est attendu : une identité `externe`
+    (session humaine) est lue à son prochain tour, et un destinataire arrêté
+    est déjà refusé ou averti par l'appelant. Le répertoire réduit du contrat
+    1.1 (pas de `mode`) ne permet pas de juger : on n'avertit pas."""
+    if "mode" not in row or (row.get("mode") or "execute") == "externe":
+        return []
+    ok, why, _note = registry.wake_status(db, cfg, name)
+    if ok:
+        return []
+    return ["%s is not wakeable right now (%s): the message is stored, but no turn "
+            "opens until it is claimable again (next canon sync on its host); if the "
+            "request cannot wait, address another agent" % (name, why)]
+
+
 def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
                explicit: bool = False, binding=None, now: float | None = None) -> list[str]:
     """Contrôle d'un envoi `agent-mail send`, AVANT tout dépôt (base seulement).
@@ -351,9 +371,11 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     Lève `Refused` (rien n'est déposé, aucun agent créé) : identité
     d'expéditeur arrêtée ; destinataire absent du registre ; destinataire
     arrêté sans `queue`. Rend les avertissements à dire (destinataire arrêté
-    avec `queue`). `explicit` : l'expéditeur vient de `--from` ; `binding` :
-    l'identité déjà résolue de la session, s'il y en a une. « all » ne
-    contrôle que l'expéditeur (la diffusion écarte elle-même les arrêtés)."""
+    avec `queue` ; #858 : destinataire inscrit mais non réveillable à
+    l'instant — le message part quand même, le réveil attend). `explicit` :
+    l'expéditeur vient de `--from` ; `binding` : l'identité déjà résolue de la
+    session, s'il y en a une. « all » ne contrôle que l'expéditeur (la
+    diffusion écarte elle-même les arrêtés)."""
     names = [sender] if dest in ("all", sender) else [sender, dest]
     rows = registry_rows(db, names)
     row = rows.get(sender)
@@ -366,7 +388,7 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     if row is None:
         raise Refused(unknown_text(cfg, db, dest, sender=sender))
     if row.get("status") != "stopped":
-        return []
+        return wake_note(cfg, db, dest, row)
     if not queue:
         raise Refused(stopped_recipient_text(db, row, now))
     return ["%s is stopped (%s): message queued until it resumes (ameesh resume %s) "

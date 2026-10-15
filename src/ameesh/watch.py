@@ -18,15 +18,17 @@ the agent's thread. A timer whose watch was disabled, or moved to another
 host, sends nothing.
 
 A **wake** (`at`) is the one-shot of the same tooling: a systemd user timer
-`ameesh-watch-<agent>-<slug>.timer` that fires once and sends the agent its
-own message. Outside a turn nothing sets `AGENT_MAIL_NAME` (the runner sets
-it only for the session it launches), so the wake applies the identity by
-construction on its exec line (`env AGENT_MAIL_NAME=<agent> …`) and `watch
-fire` refuses to fire without it: seven hand-made watches lost their wake on
-2026-10-13 because their unit carried no identity (mesh-design, lot #1020).
-A wake lives in the user units directory of the host
-(`ameesh-watch-<agent>-<slug>.{service,timer,env,wake.json}`), is removed
-once it has fired, and needs no `agent_watches` row.
+`ameesh-wake-<len(agent)>-<agent>-<slug>.timer` that fires once and sends the
+agent its own message. Outside a turn nothing sets `AGENT_MAIL_NAME` (the
+runner sets it only for the session it launches), so the wake applies the
+identity by construction on its exec line (`env AGENT_MAIL_NAME=<agent> …`)
+and `watch fire` refuses to fire without it: seven hand-made watches lost
+their wake on 2026-10-13 because their unit carried no identity (mesh-design,
+lot #1020). A wake lives in the user units directory of the host
+(`ameesh-wake-<len(agent)>-<agent>-<slug>.{service,timer,env,wake.json}`), is
+removed once it has fired, and needs no `agent_watches` row. Its dedicated
+prefix and the length of the agent keep it away from the periodic watches and
+from the other wakes (lot #1039).
 """
 from __future__ import annotations
 
@@ -53,6 +55,12 @@ SENDER = "veille"
 DEFAULT_EVERY_S = 1800
 MIN_EVERY_S = 60
 UNIT_PREFIX = "ameesh-watch-"
+#: lot #1039: the one-shot wakes carry their own prefix. Named
+#: `ameesh-watch-<agent>-<slug>` they were exactly the units of the periodic
+#: watch of an agent called `<agent>-<slug>`: arming a wake stopped that
+#: watch's timer, overwrote its units and, after the firing, removed them —
+#: the watch was lost while its `agent_watches` row still showed it active.
+WAKE_PREFIX = "ameesh-wake-"
 #: the hand-written units L121 replaces (`ameesh-veille-<agent>.timer`)
 LEGACY_PREFIX = "ameesh-veille-"
 #: the directory of the user units (tests: a temporary one)
@@ -204,18 +212,24 @@ def units(agent: str, every_s: int, ameesh: str, path: str,
 
 
 def wake_name(agent: str, slug: str, suffix: str) -> str:
-    """The name of one of the files of the wake `<slug>` of `agent`."""
-    return "%s%s-%s.%s" % (UNIT_PREFIX, agent, slug, suffix)
+    """The name of one of the files of the wake `<slug>` of `agent`.
+
+    `ameesh-wake-<len(agent)>-<agent>-<slug>.<suffix>`: the dedicated prefix
+    keeps a wake away from the periodic watch units (`ameesh-watch-<agent>.…`),
+    and the length of the agent makes the pair (agent, slug) readable back, so
+    `a`/`b-c` and `a-b`/`c` — which flatten to the same text — never share a
+    file (lot #1039)."""
+    return "%s%d-%s-%s.%s" % (WAKE_PREFIX, len(agent), agent, slug, suffix)
 
 
 def wake_env_name(agent: str, slug: str) -> str:
     """The pinned environment file of a wake (its own: disabling the periodic
     watch of the agent must not take the configuration of an armed wake)."""
-    return "%s%s-%s.env" % (UNIT_PREFIX, agent, slug)
+    return "%s%d-%s-%s.env" % (WAKE_PREFIX, len(agent), agent, slug)
 
 
 def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
-               directory: str = "") -> dict[str, str]:
+               directory: str = "", *, deadline: float | None = None) -> dict[str, str]:
     """The service and the timer of the one-shot wake `<slug>` of `agent`.
 
     A wake runs outside a turn, where the runner's `AGENT_MAIL_NAME` is
@@ -226,6 +240,10 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
     if a host file names another agent. `Restart=on-failure` keeps a wake
     whose firing failed (database down): it retries until it is sent.
     """
+    if deadline is None:
+        deadline = time.time() + delay_s
+    calendar = datetime.datetime.fromtimestamp(deadline, datetime.timezone.utc) \
+        .strftime("%Y-%m-%d %H:%M:%S.%f UTC")
     service = (
         "[Unit]\n"
         "Description=ameesh one-shot wake of %(agent)s (%(slug)s)\n"
@@ -249,9 +267,11 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
         "[Unit]\n"
         "Description=ameesh one-shot wake of %(agent)s (%(slug)s), in %(delay)ds\n"
         "[Timer]\n"
-        "OnActiveSec=%(delay)d\n"
+        # #1737: a daemon-reload can rebase OnActiveSec. Keep the original
+        # wall-clock deadline instead, including for wakes requested with --in.
+        "OnCalendar=%(calendar)s\n"
         "AccuracySec=1s\n"
-        % {"agent": agent, "slug": slug, "delay": int(delay_s)})
+        % {"agent": agent, "slug": slug, "delay": int(delay_s), "calendar": calendar})
     return {wake_name(agent, slug, "service"): service,
             wake_name(agent, slug, "timer"): timer}
 
@@ -259,7 +279,15 @@ def wake_units(agent: str, slug: str, delay_s: int, ameesh: str, path: str,
 def parse_wake_delay(text: str | None, at: str | None, *, now: float | None = None) -> int:
     """The delay of a wake, from `--in 45m` or `--at 2026-10-13T20:00:00Z`
     (absolute, timezone required: the deadline of a wake is not read twice)."""
+    reference = time.time() if now is None else now
+    return int(round(parse_wake_deadline(text, at, now=reference) - reference))
+
+
+def parse_wake_deadline(text: str | None, at: str | None, *,
+                        now: float | None = None) -> float:
+    """Resolve either CLI form once, before connecting to the database."""
     from . import stagnation
+    reference = time.time() if now is None else now
     if bool(text) == bool(at):
         raise WatchError("give exactly one of --in DURATION or --at TIME")
     if text:
@@ -274,12 +302,10 @@ def parse_wake_delay(text: str | None, at: str | None, *, now: float | None = No
             raise WatchError("--at: unreadable time %r (%s)" % (at, exc)) from exc
         if when.tzinfo is None:
             raise WatchError("--at: %r has no timezone (use 2026-10-13T20:00:00Z)" % at)
-        reference = datetime.datetime.now(datetime.timezone.utc) \
-            if now is None else datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
-        delay = (when - reference).total_seconds()
+        delay = when.timestamp() - reference
     if delay < MIN_WAKE_S:
         raise WatchError("a wake fires at least %d s from now, got %gs" % (MIN_WAKE_S, delay))
-    return int(round(delay))
+    return reference + delay
 
 
 def _ameesh_binary() -> str:
@@ -555,7 +581,7 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
 
 def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
         run: Callable = subprocess.run, env: dict | None = None,
-        actor: str | None = None) -> str:
+        actor: str | None = None, deadline: float | None = None) -> str:
     """Arms (or re-arms) the one-shot wake `<slug>` of `agent` on this host.
 
     The unit declares the identity and applies it with `env` on its exec line
@@ -577,15 +603,22 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
     if not host:
         raise WatchError("this host has no name (host of the configuration)")
     actor = actor or authorize(cfg, db, agent)
+    armed_ts = time.time()
+    if deadline is None:
+        deadline = armed_ts + delay_s
+    if deadline <= armed_ts:
+        raise WatchError("wake deadline elapsed before arming: choose a future --at")
     directory = unit_dir(env)
     os.makedirs(directory, exist_ok=True)
     source = os.environ if env is None else env
     path = source.get("PATH") or "/usr/local/bin:/usr/bin:/bin"
-    files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory)
+    files = wake_units(agent, slug, delay_s, _ameesh_binary(), path, directory,
+                       deadline=deadline)
     files[wake_env_name(agent, slug)] = pinned_env(dict(source), host)
     files[wake_name(agent, slug, "wake.json")] = json.dumps(
         {"agent": agent, "slug": slug, "message": message, "host": host,
-         "armed_ts": time.time()}, ensure_ascii=False, sort_keys=True) + "\n"
+         "armed_ts": armed_ts, "deadline_ts": deadline},
+        ensure_ascii=False, sort_keys=True) + "\n"
     _systemctl_quiet(run, "stop", wake_name(agent, slug, "timer"))
     for name, text in files.items():
         tmp = os.path.join(directory, "." + name + ".tmp")
@@ -604,6 +637,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
                                   wake_name(agent, slug, "service"))
         state = _systemctl_show(run, "ActiveState",
                                 wake_name(agent, slug, "timer")).strip()
+        sub = _systemctl_show(run, "SubState", wake_name(agent, slug, "timer")).strip()
     except WatchError as exc:
         _disarm(directory, agent, slug, run)
         raise WatchError("wake %s of %s not armed: witness unreadable (%s)"
@@ -624,6 +658,12 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
             "(read back: %r); an environment file may override Environment=, and "
             "a wake without identity loses its message at the deadline (#1020)"
             % (slug, agent, wanted, (applied or "").strip()))
+    if sub == "elapsed":
+        # #1737: an OnCalendar= deadline passed before `start` leaves the
+        # timer active/elapsed; it never fires and the wake would be lost.
+        _disarm(directory, agent, slug, run)
+        raise WatchError("wake %s of %s not armed: its deadline passed before the "
+                         "timer started; choose a later --at" % (slug, agent))
     if state != "active":
         _disarm(directory, agent, slug, run)
         raise WatchError("wake %s of %s not armed: its timer is %r after start"
@@ -754,7 +794,10 @@ def main(argv: list[str] | None = None) -> int:
     cfg = config_mod.load()
     try:
         every = parse_every(args.every) if args.command == "enable" else None
-        delay = parse_wake_delay(args.in_, args.at) if args.command == "at" else None
+        now = time.time()
+        deadline = parse_wake_deadline(args.in_, args.at, now=now) \
+            if args.command == "at" else None
+        delay = int(round(deadline - now)) if deadline is not None else None
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db)
@@ -769,7 +812,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "send":
                 print(send(cfg, db, args.agent))
             elif args.command == "at":
-                print(arm(cfg, db, args.agent, args.wake, delay, args.message))
+                print(arm(cfg, db, args.agent, args.wake, delay, args.message,
+                          deadline=deadline))
             elif args.command == "cancel":
                 print(disarm(cfg, db, args.agent, args.wake))
             elif args.command == "fire":

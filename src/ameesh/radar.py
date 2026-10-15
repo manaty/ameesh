@@ -15,12 +15,23 @@ l'exécuteur fait un passage du radar juste après chaque relevé des branches
    `overlap`) ; chaque lot contre sa cible (`conflict` ou `clean`) ;
 3. la sonde des migrations (si le projet déclare `migrations`) : un même
    numéro `NNNN_` ajouté par deux lots, ou par un lot alors que la cible l'a
-   déjà sous un autre nom.
+   déjà sous un autre nom. Seules les migrations du **delta propre** du lot
+   comptent (celles que la cible ne porte pas déjà) : une migration de la
+   cible ramenée par une fusion dans la branche n'est à personne (#1333).
 
 Les fusions d'essai n'écrivent rien dans le dépôt des agents : leurs objets
 vont dans un dossier jetable (`GIT_OBJECT_DIRECTORY`, objets du dépôt en
 alternates), aucun worktree, aucun `fetch`. Une paire n'est recalculée que si
 l'une de ses deux pointes a bougé (cache en mémoire de l'exécuteur).
+
+Une cible qui nomme une branche — `develop`, `origin/develop`,
+`refs/remotes/origin/develop`, `refs/heads/develop`, `release/1.x`, ou
+`origin/HEAD` — est lue sur la ref publiée de son remote quand elle existe :
+dans un clone partagé, la branche locale reste figée alors que les agents
+poussent (#1333). Un SHA ou un tag est une cible figée, lue telle quelle. La
+sonde des migrations ne parle que d'une cible **certifiée** : `git ls-remote`
+(lecture seule, rien n'est écrit dans le dépôt) vérifie que la ref lue est
+bien la pointe publiée ; sinon la sonde se tait et le rapport dit pourquoi.
 
 Le résultat est un journal de l'hôte, pas une table : le dernier passage dans
 `<state_dir>/radar/<projet>.json` (lu par `ameesh conflicts`), et une ligne par
@@ -59,7 +70,7 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref", "generated", "ci_required", "protected")
+                "lease_ref", "generated", "ci_required", "protected", "full_suite")
 #: #194 r6: where the lease of a target lives on the remote (local mode)
 LEASE_REF_DEFAULT = "refs/ameesh/land/"
 #: #194 r8: the only namespaces a lease ref may live in — never a branch that
@@ -76,10 +87,15 @@ MIGRATION_RE = re.compile(r"^([0-9]{3,4})_[^/]+\.sql$")
 MAX_CACHE = 20000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _GITHUB_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+#: L756 (#566): where GitHub reads workflows — a declared full suite is a file
+#: of this directory, never a display name (which renames).
+WORKFLOW_DIR = ".github/workflows/"
 #: URL `origin` d'un dépôt GitHub (https ou ssh)
 _ORIGIN_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 #: conclusions de check qui ne bloquent pas une PR verte
 CI_OK = frozenset(("SUCCESS", "NEUTRAL", "SKIPPED"))
+#: #1333: lecture seule de la pointe publiée d'une cible (`git ls-remote`)
+LS_REMOTE_TIMEOUT = 30.0
 
 
 class SettingsError(ValueError):
@@ -128,11 +144,56 @@ class Project:
     path_gates: tuple = ()
     ci_required: bool = False
     protected: tuple = ()
+    #: L756 (#566): the workflow files that make up the project's **full
+    #: suite** (`.github/workflows/…`), declared by path — the file is the
+    #: identity; a display name is free text and renames. A release lot
+    #: certifies its head with a green run of each, jobs included.
+    full_suite: tuple = ()
+    #: L756 B3 (#566): per workflow, the **required jobs** — `((path, (job,
+    #: …)), …)`. A declared entry `{path = …, jobs = […]}` names them; a bare
+    #: path entry requires *all* the jobs of the run (fail-closed). A required
+    #: job must exist and be green (every matrix instance); the other jobs must
+    #: be `success` or `skipped` — a job skipped by design (`if:` on the event
+    #: or the paths) never blocks a declared suite. A name ends with " *" for a
+    #: matrix family (`psycopg *`), otherwise it matches exactly.
+    full_suite_required: tuple = ()
+    #: L756 B3 (#566): per workflow, the **tolerated jobs** — `((path, (job,
+    #: …)), …)`; their conclusion neither certifies nor blocks (the `bilan des
+    #: impactés` job is `continue-on-error: true` and "never required",
+    #: EXPLOITATION §L161). Only meaningful with a declared `jobs` list.
+    full_suite_tolerated: tuple = ()
 
 
 @dataclass
 class Settings:
     projects: dict = field(default_factory=dict)
+
+
+def _suite_jobs(declared, where: str, path, kind: str, empty_ok: bool = False) -> tuple:
+    """L756 B3 (#566): les jobs d'une entrée `full_suite` — un nom d'affichage,
+    ou « nom * » pour une famille de matrice (le préfixe est suivi d'un
+    espace : `psycopg *` couvre `psycopg 1/4`, et `tests` n'attrape pas les
+    check runs `tests (flux) …`). « * » seul ou un `*` non final est refusé."""
+    if declared is None:
+        declared = ()
+    if isinstance(declared, str):
+        declared = (declared,)
+    if not isinstance(declared, (list, tuple)) or (not declared and not empty_ok):
+        raise SettingsError("%s.full_suite: %r: a non-empty list of %s job names expected"
+                            % (where, path, kind))
+    out = []
+    for raw in declared:
+        if not isinstance(raw, str) or not raw.strip():
+            raise SettingsError("%s.full_suite: %r: %s job names expected" % (where, path, kind))
+        name = raw.strip()
+        if name == "*" or ("*" in name and not name.endswith(" *")):
+            raise SettingsError("%s.full_suite: %r: %s job %r: a name, or \"name *\" for a "
+                                "matrix family, expected" % (where, path, kind, name))
+        if name in out:
+            raise SettingsError("%s.full_suite: %r: duplicate %s job %s"
+                                % (where, path, kind, name))
+        out.append(name)
+    return tuple(out)
 
 
 def parse_settings(raw) -> Settings:
@@ -234,6 +295,47 @@ def parse_settings(raw) -> Settings:
         if not isinstance(protected, (list, tuple)) or not all(
                 isinstance(p, str) and p.strip() for p in protected):
             raise SettingsError("%s.protected: a list of target globs expected" % where)
+        declared_suite = value.get("full_suite") or ()
+        if isinstance(declared_suite, (str, dict)):
+            declared_suite = (declared_suite,)
+        if not isinstance(declared_suite, (list, tuple)):
+            raise SettingsError("%s.full_suite: a list of workflow files expected "
+                                "(e.g. .github/workflows/backend-suite.yml)" % where)
+        full_suite = []
+        required_jobs = []
+        tolerated_jobs = []
+        for item in declared_suite:
+            jobs = ()
+            tolerated = ()
+            if isinstance(item, str):
+                path = item
+            elif isinstance(item, dict) and not set(item) - {"path", "jobs", "tolerate"}:
+                path = item.get("path")
+                jobs = _suite_jobs(item.get("jobs"), where, path, "required")
+                tolerated = _suite_jobs(item.get("tolerate", ()), where, path, "tolerated",
+                                        empty_ok=True)
+                both = sorted(set(jobs) & set(tolerated))
+                if both:
+                    raise SettingsError("%s.full_suite: %r: %s is both required and tolerated"
+                                        % (where, path, both[0]))
+            else:
+                raise SettingsError("%s.full_suite: a workflow file, or "
+                                    "{\"path\": file, \"jobs\": [names], \"tolerate\": [names]} "
+                                    "expected" % where)
+            if not isinstance(path, str) or not path.strip():
+                raise SettingsError("%s.full_suite: a workflow file path expected" % where)
+            path = path.strip()
+            if (not path.startswith(WORKFLOW_DIR) or not path.endswith((".yml", ".yaml"))
+                    or any(part in ("", ".", "..") for part in path.split("/"))):
+                raise SettingsError("%s.full_suite: %r is not a %s*.yml workflow file"
+                                    % (where, path, WORKFLOW_DIR))
+            if path in full_suite:
+                raise SettingsError("%s.full_suite: duplicate workflow %s" % (where, path))
+            full_suite.append(path)
+            if jobs:
+                required_jobs.append((path, jobs))
+            if tolerated:
+                tolerated_jobs.append((path, tolerated))
         gates = always
         if land != "off" and not (gates or by_path):
             raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
@@ -263,7 +365,10 @@ def parse_settings(raw) -> Settings:
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
                                  ci_required=ci_required,
-                                 protected=tuple(p.strip() for p in protected))
+                                 protected=tuple(p.strip() for p in protected),
+                                 full_suite=tuple(full_suite),
+                                 full_suite_required=tuple(required_jobs),
+                                 full_suite_tolerated=tuple(tolerated_jobs))
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -376,6 +481,105 @@ def _numbers_in(repo: str, commit: str, directory: str) -> dict[str, str]:
     return out
 
 
+_REMOTE_REFS = "refs/remotes/"
+_HEADS_REFS = "refs/heads/"
+
+
+def _remotes(repo: str) -> tuple[str, ...]:
+    """Les remotes déclarés du dépôt (`git remote`), `origin` par défaut."""
+    names = tuple((plan_git._out(repo, "remote") or "").split())
+    return names or ("origin",)
+
+
+def _branch_target(target: str, remotes: tuple[str, ...]) -> tuple[str, str] | None:
+    """(remote, branche) d'une cible qui nomme une branche, None sinon.
+
+    Toutes les écritures d'une branche sont reconnues — `develop`,
+    `origin/develop`, `refs/remotes/origin/develop`, `refs/heads/develop` — y
+    compris un nom qui porte un slash (`release/1.x`, #1333) : le premier
+    segment n'est un remote que s'il est déclaré. Un SHA est un cas distinct
+    (cible figée) : None, lu tel quel."""
+    target = (target or "").strip()
+    if not target or plan_git._SHA_RE.match(target):
+        return None
+    if target == "HEAD":
+        return "origin", "HEAD"
+    if target.startswith(_REMOTE_REFS):
+        remote, _, branch = target[len(_REMOTE_REFS):].partition("/")
+        return (remote, branch) if remote and branch else None
+    if target.startswith(_HEADS_REFS):
+        branch = target[len(_HEADS_REFS):]
+        return ("origin", branch) if branch else None
+    if "/" in target:
+        head, _, branch = target.partition("/")
+        if branch and head in remotes:
+            return head, branch
+    return "origin", target
+
+
+def _symbolic_head(repo: str, remote: str) -> str | None:
+    """La branche que désigne `refs/remotes/<remote>/HEAD`, ou None."""
+    resolved = plan_git._out(repo, "symbolic-ref", "--quiet",
+                             _REMOTE_REFS + remote + "/HEAD")
+    prefix = _REMOTE_REFS + remote + "/"
+    if resolved and resolved.startswith(prefix) and len(resolved) > len(prefix):
+        return resolved[len(prefix):]
+    return None
+
+
+def target_commit(repo: str, target: str,
+                  remotes: tuple[str, ...] | None = None
+                  ) -> tuple[str | None, str, str | None, str | None]:
+    """(commit, ref lue, branche publiée, remote publié) de la cible.
+
+    Une cible qui nomme une branche — quelle qu'en soit l'écriture — est lue
+    sur `refs/remotes/<remote>/<branche>` quand cette ref existe : dans un
+    clone partagé, la branche locale reste figée pendant que les agents
+    poussent (#1333). La branche locale ne sert que de repli ; la branche et
+    le remote rendus permettent à l'appelant de certifier la pointe publiée
+    (`published_tip`). `origin/HEAD` est résolu sur la branche qu'il désigne.
+    Un SHA, un tag ou une ref qui n'est pas une branche sont rendus tels quels,
+    sans branche publiée : cas distinct, sans certification."""
+    remotes = _remotes(repo) if remotes is None else remotes
+    split = _branch_target(target, remotes)
+    if split is None:
+        return plan_git._commit(repo, target), target, None, None
+    remote, branch = split
+    if branch == "HEAD":
+        resolved = _symbolic_head(repo, remote)
+        if resolved:
+            branch = resolved
+        else:
+            return (plan_git._commit(repo, _REMOTE_REFS + remote + "/HEAD"),
+                    remote + "/HEAD", "HEAD", remote)
+    tracking = _REMOTE_REFS + remote + "/" + branch
+    found = plan_git._commit(repo, tracking)
+    if found:
+        return found, remote + "/" + branch, branch, remote
+    local = plan_git._commit(repo, _HEADS_REFS + branch)
+    if local:
+        return local, target, branch, remote
+    return plan_git._commit(repo, target), target, None, None
+
+
+def published_tip(repo: str, remote: str, branch: str) -> str | None:
+    """La pointe publiée de `branch` sur `remote`, lue par `git ls-remote` :
+    lecture seule, rien n'est écrit dans `.git`, aucun `fetch`. None si elle
+    est illisible (réseau, droits, branche absente) : la cible n'est alors pas
+    certifiée et la sonde des migrations se tait (#1333). `branch == "HEAD"`
+    certifie la pointe par défaut du remote."""
+    spec = "HEAD" if branch == "HEAD" else _HEADS_REFS + branch
+    try:
+        proc = _git(repo, "ls-remote", "--exit-code", remote, spec,
+                    timeout=LS_REMOTE_TIMEOUT)
+    except GitError:
+        return None
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.decode("utf-8", "replace").split()
+    return parts[0] if parts and plan_git._SHA_RE.match(parts[0]) else None
+
+
 # --------------------------------------------------------------------------
 # un passage
 # --------------------------------------------------------------------------
@@ -401,9 +605,25 @@ class Cache:
 
 
 def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
-         migrations: str = "", cache: Cache | None = None) -> dict:
+         migrations: str = "", cache: Cache | None = None,
+         verify=None, reservations=None) -> dict:
     """Le radar sur un dépôt. `lots` : `{id, branch, branch_target?, title?,
-    assignee?}`. Rend le rapport (sans horodatage ni durée)."""
+    assignee?}`. Rend le rapport (sans horodatage ni durée).
+
+    `verify` (facultatif) : `(dépôt, remote, branche) -> pointe publiée | None`,
+    appelée pour une cible qui nomme une branche afin de certifier la ref
+    lue avant la sonde des migrations (`run_pass` passe `published_tip`,
+    lecture seule). Une certification qui échoue ou constate une pointe non
+    récupérée laisse la cible non certifiée : la sonde se tait. Sans
+    `verify`, la ref de la branche est crue telle quelle.
+
+    Un dépôt superficiel suspend la sonde des migrations : `merge-base` peut
+    y rendre une frontière fausse, et le delta d'une branche contiendrait
+    alors les migrations de la cible (#1333).
+
+    `reservations` : `branches -> liste`, appelé sur les cibles certifiées
+    quand les entrées portent encore `added` (les migrations ajoutées par un lot) ; seul son résultat
+    entre au rapport, `added` ne sort jamais dans le journal (#1335)."""
     cache = cache if cache is not None else Cache()
     objects = plan_git._out(repo, "rev-parse", "--path-format=absolute",
                             "--git-path", "objects")
@@ -411,8 +631,14 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         raise GitError("%s is not a readable git repository" % repo)
     if default_target is None:
         default_target = plan_git.default_target(repo)
+    # #1333: dans un clone superficiel, `merge-base` peut rendre une frontière
+    # fausse (ou rien) : le delta d'une branche contiendrait alors les
+    # migrations de la cible. Conservateur : la sonde se tait.
+    shallow = plan_git._out(repo, "rev-parse", "--is-shallow-repository") == "true"
+    remotes = _remotes(repo)
     branches: list[dict] = []
     skipped: list[dict] = []
+    verified: dict = {}
     for row in lots:
         branch = row.get("branch")
         if not branch:
@@ -423,10 +649,38 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if tip is None:
             continue                      # branche d'un autre dépôt, ou pas encore poussée
         target = row.get("branch_target") or default_target
-        head = plan_git._commit(repo, target) if target else None
+        head, head_ref, published_branch, published_remote = (
+            target_commit(repo, target, remotes) if target
+            else (None, target or "", None, None))
         if head is None:
             skipped.append(dict(entry, reason="target %s not found" % (target or "—")))
             continue
+        certified, reason = True, ""
+        if migrations and shallow:
+            certified = False
+            reason = "shallow repository (history is incomplete)"
+        elif published_branch and verify is not None:
+            published_ref = "%s/%s" % (published_remote, published_branch)
+            key = (published_remote, published_branch)
+            if key not in verified:
+                try:
+                    verified[key] = verify(repo, published_remote, published_branch)
+                except Exception:  # noqa: BLE001 - une sonde ne fait jamais échouer le passage
+                    verified[key] = None
+            published = verified[key]
+            if not published:
+                certified = False
+                reason = "%s is unreadable (network, rights or no fetch)" \
+                    % published_ref
+            elif published != head:
+                found = plan_git._commit(repo, published)
+                if found is None:
+                    certified = False
+                    reason = ("%s is at %s, %s publishes %s (not fetched)"
+                              % (published_ref, head[:12], published_remote,
+                                 published[:12]))
+                else:
+                    head, head_ref = found, published
         base = plan_git._out(repo, "merge-base", tip, head)
         if not base:
             skipped.append(dict(entry, reason="no common base with %s" % target))
@@ -437,8 +691,12 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
         if key not in cache.diffs:
             cache.diffs[key] = _changed(repo, base, tip)
         touched, added = cache.diffs[key]
-        branches.append(dict(entry, target=target, target_head=head, tip=tip, base=base,
-                             files=touched, added=added))
+        one = dict(entry, target=target, target_head=head, target_ref=head_ref,
+                   target_certified=certified, tip=tip, base=base,
+                   files=touched, added=added)
+        if not certified:
+            one["target_reason"] = reason
+        branches.append(one)
 
     pairs: list[dict] = []
     against: list[dict] = []
@@ -477,19 +735,36 @@ def scan(repo: str, lots: list[dict], *, default_target: str | None = None,
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     cache.trim()
-    return {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
-                                       for b in branches],
-            "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
-            "against_target": against,
-            "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+    uncertified: dict = {}
+    for one in branches:
+        if not one.get("target_certified", True):
+            uncertified.setdefault((one["target"], one["target_ref"]),
+                                   one.get("target_reason") or "")
+    report = {"repo": repo, "branches": [{k: v for k, v in b.items() if k != "added"}
+                                         for b in branches],
+              "skipped": skipped, "pairs_checked": checked, "pairs": pairs,
+              "against_target": against,
+              "uncertified_targets": [{"target": target, "ref": ref, "reason": why}
+                                      for (target, ref), why in sorted(uncertified.items())],
+              "migrations": migration_probe(repo, branches, migrations) if migrations else []}
+    if migrations and shallow:
+        report["migration_probe"] = "suspended: shallow repository (history is incomplete)"
+    if reservations is not None:
+        report["unreserved_migrations"] = reservations(
+            [b for b in branches if b.get("target_certified", True)])
+    return report
 
 
 def migration_probe(repo: str, branches: list[dict], directory: str) -> list[dict]:
     """Numéros de migration en double : ajoutés par deux lots de même cible,
-    ou par un lot alors que sa cible a déjà ce numéro sous un autre nom."""
+    ou par un lot alors que sa cible a déjà ce numéro sous un autre nom. Un
+    lot dont la cible n'est pas certifiée est ignoré : son delta peut
+    contenir les migrations de la cible (#1333)."""
     by_target: dict = {}
     in_target: dict = {}
     for one in branches:
+        if not one.get("target_certified", True):
+            continue
         if one["target_head"] not in in_target:
             in_target[one["target_head"]] = _numbers_in(repo, one["target_head"], directory)
         for path in one.get("added") or ():
@@ -546,7 +821,8 @@ def summary(report: dict) -> dict:
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
             "migration_duplicates": len(report.get("migrations") or ()),
-            "unreserved_migrations": len(report.get("unreserved_migrations") or ())}
+            "unreserved_migrations": len(report.get("unreserved_migrations") or ()),
+            "uncertified_targets": len(report.get("uncertified_targets") or ())}
 
 
 def read_snapshot(cfg, project: str) -> dict | None:
@@ -590,13 +866,17 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
     for project in settings.projects.values():
         started = now()
         try:
-            report = scan(project.repo, lots, default_target=project.target or None,
-                          migrations=project.migrations, cache=cache)
             from .migration_reservations import probe
-            if project.migrations and not github_slug(project):
-                report["reservation_error"] = "migration reservations need a GitHub repository identity"
-            else:
-                report["unreserved_migrations"] = probe(db, project, report.get("branches") or [])
+            missing_repo = bool(project.migrations) and not github_slug(project)
+            report = scan(
+                project.repo, lots, default_target=project.target or None,
+                migrations=project.migrations, cache=cache,
+                verify=published_tip if project.migrations else None,
+                reservations=None if missing_repo
+                else (lambda raw: probe(db, project, raw)))
+            if missing_repo:
+                report["reservation_error"] = (
+                    "migration reservations need a GitHub repository identity")
             error = None
         except (GitError, plan_git.MergeProbeError, OSError) as exc:
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
@@ -838,6 +1118,221 @@ def commit_ci(project: Project, sha: str, gh=None) -> dict:
     count = len(latest) + len(external) + len(statuses["statuses"])
     return {"runs": count, "green": bool(count) and not pending and not failed,
             "pending": sorted(pending), "failed": sorted(failed)}
+
+
+#: L756 (#566): les déclencheurs d'une exécution de la suite **complète** —
+#: une poussée (main, release/**, selon le workflow du projet) ou un lancement
+#: manuel. Une PR, elle, peut n'avoir exécuté que le plan impacté, ou rien du
+#: tout quand elle ne change qu'une version : elle ne certifie jamais une
+#: release.
+FULL_SUITE_EVENTS = ("push", "workflow_dispatch")
+
+
+def _full_suite_ids(gh, slug: str, declared) -> dict:
+    """L756 (#566): les identités (`id` de workflow) de la suite déclarée.
+
+    Le dépôt est lu une fois (`repos/<slug>/actions/workflows`) : un chemin
+    déclaré absent, désactivé ou dupliqué lève `GithubError` — jamais « pas de
+    suite ». Un nom d'affichage n'est pas une identité (il se renomme) ; le
+    fichier l'est, résolu ici en identité stable."""
+    from . import plan_github
+    data = plan_github._json(gh, ["api", "repos/%s/actions/workflows?per_page=100" % slug])
+    if (not isinstance(data, dict) or type(data.get("total_count")) is not int
+            or not isinstance(data.get("workflows"), list)
+            or data["total_count"] != len(data["workflows"])
+            or data["total_count"] >= 100):
+        raise plan_github.GithubError("workflows: malformed or truncated response")
+    by_path: dict = {}
+    for workflow in data["workflows"]:
+        if (not isinstance(workflow, dict) or type(workflow.get("id")) is not int
+                or workflow["id"] <= 0 or not isinstance(workflow.get("path"), str)
+                or not workflow["path"]):
+            raise plan_github.GithubError("workflows: invalid workflow identity")
+        by_path[workflow["path"]] = workflow
+    out: dict = {}
+    for path in declared:
+        workflow = by_path.get(path)
+        if workflow is None:
+            raise plan_github.GithubError("workflows: the declared full suite %s is not a "
+                                          "workflow of %s" % (path, slug))
+        if (workflow.get("state") or "") != "active":
+            raise plan_github.GithubError("workflows: the declared full suite %s is %s"
+                                          % (path, workflow.get("state") or "unknown"))
+        out[path] = workflow["id"]
+    return out
+
+
+def _run_jobs(gh, run: dict, slug: str) -> list:
+    """L756 (#566): les jobs d'une exécution, pour refuser un vert sans tests.
+
+    Rend `[(nom, statut, conclusion)]`. Une lecture impossible, vide ou
+    tronquée lève `GithubError` : un job qu'on ne peut pas lire ne vaut jamais
+    vert. Le dépôt est nommé (`--repo`), jamais déduit du répertoire courant :
+    `Gh.run` ne fixe ni `cwd` ni `GH_REPO`, et `gh run view` sans `--repo`
+    échoue hors d'un clone (« failed to determine base repo ») — R2 de
+    mty-amh-qa-01 sur PR manaty/ameesh#633."""
+    from . import plan_github
+    run_id = run.get("databaseId")
+    if type(run_id) is not int or run_id <= 0:
+        raise plan_github.GithubError("gh run view: missing or invalid run id")
+    data = plan_github._json(gh, ["run", "view", str(run_id), "--repo", slug, "--json", "jobs"])
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list) or not data["jobs"]:
+        raise plan_github.GithubError("gh run view: no readable job for run %s" % run_id)
+    if len(data["jobs"]) >= 100:
+        raise plan_github.GithubError("gh run view: result may be truncated; cannot certify "
+                                      "the full suite")
+    out = []
+    for job in data["jobs"]:
+        if (not isinstance(job, dict) or not isinstance(job.get("name"), str)
+                or not job["name"] or not isinstance(job.get("status"), str)):
+            raise plan_github.GithubError("gh run view: invalid job")
+        out.append((job["name"], job["status"], (job.get("conclusion") or "").lower()))
+    return out
+
+
+def _job_matches(required: str, job_name: str) -> bool:
+    """L756 B3 (#566): a declared job name matches exactly; a trailing " *"
+    declares a matrix family — the name, a space, then the rendered values
+    (`psycopg *` covers `psycopg 1/4`). No other wildcard, so `tests` never
+    catches the flow check runs `tests (flux) …`."""
+    if required.endswith(" *"):
+        prefix = required[:-2]
+        return job_name == prefix or job_name.startswith(prefix + " ")
+    return job_name == required
+
+
+def _suite_jobs_of(project, path: str, attribute: str):
+    """The jobs a declared suite entry names for `path`, or `None` — a bare
+    path entry declares no required jobs (all of them are required) and none
+    tolerated."""
+    for declared_path, jobs in getattr(project, attribute, ()) or ():
+        if declared_path == path:
+            return tuple(jobs)
+    return None
+
+
+def full_suite_ci(project: Project, sha: str, gh=None) -> dict:
+    """L756 (#566): une exécution de la suite complète **déclarée** par le
+    projet, verte, sur `sha`, jobs compris.
+
+    La suite complète n'est pas « un workflow quelconque devenu vert » : le
+    projet la déclare par ses fichiers (`radar.projects.<p>.full_suite`),
+    résolus en identités de workflow. Chacune doit avoir, sur le commit exact,
+    une exécution `push` ou `workflow_dispatch` terminée, de conclusion
+    `success`. Une entrée `{path = …, jobs = […], tolerate = […]}` nomme les
+    **jobs requis** : chacun doit exister et être vert, toutes ses instances de
+    matrice comprises (`psycopg *` couvre `psycopg 1/4`, `psycopg 2/4`, … ;
+    sans `*` le nom est exact) ; les autres jobs doivent être `success` ou
+    `skipped` — un job sauté par conception (`if:` sur l'événement ou les
+    chemins) ne bloque jamais, et un job **toléré** (`tolerate`, le `bilan des
+    impactés` en `continue-on-error`) ne certifie ni ne bloque. Une entrée
+    réduite au chemin exige **tous** les jobs (`skipped`, `neutral` ou
+    illisible ne certifient rien). Une suite déclarée qui n'a pas tourné n'est
+    jamais verte
+    (le plan impacté d'une PR, lui, ne compte jamais). Rend `{runs, suites,
+    green, pending, failed, missing}` ; une lecture impossible lève
+    `plan_github.GithubError`, jamais « pas de suite complète »."""
+    from datetime import datetime
+    from . import plan_github
+    slug = github_slug(project)
+    if not slug:
+        raise plan_github.GithubError("project %s declares no GitHub repository" % project.name)
+    declared = tuple(getattr(project, "full_suite", ()) or ())
+    if not declared:
+        raise plan_github.GithubError("project %s declares no full suite "
+                                      "(radar.projects.%s.full_suite)"
+                                      % (project.name, project.name))
+    gh = gh or plan_github.Gh()
+    suites = _full_suite_ids(gh, slug, declared)
+    rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
+                                  "100", "--json",
+                                  "databaseId,workflowDatabaseId,workflowName,name,status,"
+                                  "conclusion,event,headSha,createdAt,startedAt,updatedAt"])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise plan_github.GithubError("gh run list: unexpected output")
+    if len(rows) >= 100:
+        raise plan_github.GithubError("gh run list: result may be truncated; cannot certify "
+                                      "the full suite")
+    latest: dict = {}
+    times: dict = {}
+    for run in rows:
+        if run.get("headSha") != sha:
+            raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
+        if run.get("event") not in FULL_SUITE_EVENTS:
+            continue
+        identity = run.get("workflowDatabaseId")
+        if type(identity) is not int or identity <= 0:
+            raise plan_github.GithubError("gh run list: missing or invalid workflow identity")
+        if identity not in suites.values():
+            continue  # une suite non déclarée ne certifie rien (dispatch docs-only)
+        try:
+            stamps = [datetime.fromisoformat(run[field].replace("Z", "+00:00"))
+                      for field in ("createdAt", "startedAt", "updatedAt")]
+            if any(t.utcoffset() is None for t in stamps):
+                raise ValueError("timestamp lacks timezone")
+            at = max(stamps)
+        except (KeyError, AttributeError, TypeError, ValueError) as exc:
+            raise plan_github.GithubError("gh run list: missing or invalid run timestamp") from exc
+        if identity in times and at == times[identity] and run != latest[identity]:
+            raise plan_github.GithubError("gh run list: ambiguous latest run for workflow %s"
+                                          % identity)
+        if identity not in times or at > times[identity]:
+            times[identity], latest[identity] = at, run
+
+    pending: list = []
+    failed: list = []
+    missing: list = []
+    for path, identity in suites.items():
+        run = latest.get(identity)
+        if run is None:
+            missing.append(path)
+            continue
+        name = run.get("workflowName") or run.get("name") or path
+        if (run.get("status") or "") != "completed":
+            pending.append(name)
+            continue
+        if (run.get("conclusion") or "").lower() != "success":
+            failed.append(name)
+            continue
+        required = _suite_jobs_of(project, path, "full_suite_required")
+        tolerated = () if required is None else (
+            _suite_jobs_of(project, path, "full_suite_tolerated") or ())
+        jobs = _run_jobs(gh, run, slug)
+        if required is None:
+            # entrée sans jobs déclarés : tous les jobs de l'exécution sont requis
+            for job_name, status, conclusion in jobs:
+                if status != "completed":
+                    pending.append("%s/%s" % (name, job_name))
+                elif conclusion != "success":
+                    failed.append("%s/%s" % (name, job_name))
+            continue
+        seen = dict.fromkeys(required, 0)
+        for job_name, status, conclusion in jobs:
+            hit = next((req for req in required if _job_matches(req, job_name)), None)
+            if hit is None:
+                if any(_job_matches(tol, job_name) for tol in tolerated):
+                    # toléré : sa conclusion ne certifie ni ne bloque
+                    if status != "completed":
+                        pending.append("%s/%s" % (name, job_name))
+                    continue
+                # job non requis : vert ou sauté par conception, jamais neutral
+                if status != "completed":
+                    pending.append("%s/%s" % (name, job_name))
+                elif conclusion not in ("success", "skipped"):
+                    failed.append("%s/%s" % (name, job_name))
+                continue
+            seen[hit] += 1
+            if status != "completed":
+                pending.append("%s/%s" % (name, job_name))
+            elif conclusion != "success":
+                failed.append("%s/%s" % (name, job_name))
+        for req, count in seen.items():
+            if count == 0:
+                failed.append("%s/%s (required job missing)" % (name, req))
+    return {"runs": len(latest), "suites": len(suites),
+            "green": bool(latest) and len(latest) == len(suites) and not pending
+            and not failed and not missing,
+            "pending": sorted(pending), "failed": sorted(failed), "missing": sorted(missing)}
 
 
 def gates_for(project, files) -> tuple:
@@ -1089,6 +1584,11 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
         out.append("  resolutions: %s" % report["resolution_error"])
     if report.get("reservation_error"):
         out.append("  reservations: %s" % report["reservation_error"])
+    if report.get("migration_probe"):
+        out.append("  sonde des migrations %s" % report["migration_probe"])
+    for one in report.get("uncertified_targets") or ():
+        out.append("  cible non certifiée %s (%s) : %s — sonde des migrations suspendue"
+                   % (one["target"], one["ref"], one["reason"]))
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue

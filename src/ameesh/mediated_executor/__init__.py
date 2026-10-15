@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Exécuteur médié : contrat de l'API d'exécuteur `/api/exec/v1` (L107).
 
-* `contract.json` : la table FERMÉE des 61 opérations admises (livrée dans la
+* `contract.json` : la table FERMÉE des 64 opérations admises (livrée dans la
   roue, lue par le serveur et par l'exécuteur de la VM) ;
 * `contract` : chargeur, enveloppes, idempotence, erreurs ;
 * `events` : flux SSE et attente longue ;

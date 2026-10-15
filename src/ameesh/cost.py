@@ -157,6 +157,10 @@ def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
 PACE_MARGIN = 0.10
+#: Plafond de rythme par défaut (0019 §2). Un compte peut régler le sien
+#: (`accounts.<harnais>[i].pace_ceiling`, #1176) et le relever dans les
+#: dernières heures de la fenêtre quand l'overage y est impossible
+#: (`pace_ceiling_end`).
 PACE_CEILING = 0.90
 #: L242b : plancher du rapport réel/estimé qui corrige l'estimation entre deux
 #: relevés de solde (`CostBook.paid_hour`) — jamais une dépense comptée nulle
@@ -253,6 +257,9 @@ class Gauge:
     used: float                     #: 0..1 (le harnais publie des pourcents)
     resets_at: float | None         #: epoch, ou None si le harnais ne le dit pas
     window_s: float
+    #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
+    #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
+    read_at: float | None = None
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -260,16 +267,22 @@ class Gauge:
             return 1.0
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
-    def pace_cap(self, now: float, multiplier: float = 1.0) -> float:
-        """Le plafond de rythme : min(90 %, part écoulée × `multiplier` + 10 points).
+    def pace_cap(self, now: float, multiplier: float = 1.0,
+                 ceiling: float = PACE_CEILING) -> float:
+        """Le plafond de rythme : min(`ceiling`, part écoulée × `multiplier` + 10 points).
 
         `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
         compte (`accounts`, `pace_multiplier`, défaut 1.0), posé à 2.0 sur le
         compte principal Codex pour consommer sa réserve de forfait sans
         remise à zéro. Il ne touche que la part écoulée : l'utilisation
         relevée, les remises à zéro et les plafonds fixes ne changent pas.
+
+        `ceiling` (#1176) : le plafond du compte (`accounts`, `pace_ceiling`,
+        défaut `PACE_CEILING`), ou son plafond de fin de fenêtre
+        (`pace_ceiling_end`) quand le relèvement s'applique. Les autres termes
+        — marge, part écoulée, utilisation relevée — sont inchangés.
         """
-        return min(PACE_CEILING, self.elapsed(now) * multiplier + PACE_MARGIN)
+        return min(ceiling, self.elapsed(now) * multiplier + PACE_MARGIN)
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
@@ -282,7 +295,7 @@ class Gauge:
         return 0.0 if self.reset_passed(now) else self.used
 
     def held_cap(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0) -> float:
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float:
         """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
         jamais sous `PACE_MARGIN` quand une réserve s'applique.
 
@@ -301,17 +314,21 @@ class Gauge:
         * **fin de fenêtre** : le seuil plafonne à `PACE_CEILING − reserve`
           (80 % avec la réserve de 10 points) et ne suit plus l'écoulé —
           l'énoncé `max(écoulé, marge)` n'y vaut plus (#1028 N1).
+
+        `ceiling` (#1176) est transmis à `pace_cap` : le plafond du compte ou
+        son plafond de fin de fenêtre.
         """
-        cap = max(0.0, self.pace_cap(now, multiplier) - reserve)
+        cap = max(0.0, self.pace_cap(now, multiplier, ceiling) - reserve)
         return max(cap, PACE_MARGIN) if reserve else cap
 
     def exceeded(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0) -> bool:
-        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant."""
-        return self.used_at(now) >= self.held_cap(now, reserve, multiplier)
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> bool:
+        """Au seuil effectif ; `reserve` (L242b) l'abaisse d'autant,
+        `ceiling` (#1176) est celui du compte."""
+        return self.used_at(now) >= self.held_cap(now, reserve, multiplier, ceiling)
 
     def free_at(self, now: float, reserve: float = 0.0,
-                multiplier: float = 1.0) -> float | None:
+                multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float | None:
         """L'heure où la fenêtre cesse de bloquer, ou None si elle ne la dit
         pas (`resets_at` absent).
 
@@ -328,11 +345,13 @@ class Gauge:
         `used ≥ held_cap ≥ PACE_MARGIN`, donc la part est déjà positive ; le
         plancher ne changeait rien pour `reserve ≥ PACE_MARGIN` et annonçait
         une libération trop tardive en dessous (le seuil, lui, garde le sien).
+
+        `ceiling` (#1176) est le plafond effectif du compte à `now`.
         """
         if not self.resets_at:
             return None
         used = self.used_at(now)
-        if used >= PACE_CEILING - reserve:
+        if used >= ceiling - reserve:
             return float(self.resets_at)
         share = (used + reserve - PACE_MARGIN) / multiplier
         share = min(max(share, 0.0), 1.0)
@@ -357,6 +376,67 @@ class Gauge:
         if not self.resets_at or self.reset_passed(now):
             return None
         return float(self.resets_at), max(0.0, 1.0 - float(self.used or 0.0))
+
+
+def stale_reading(gauges, now: float) -> bool:
+    """Le relevé n'est plus un instantané courant du compte (#1561).
+
+    * **absent** (aucune jauge) : rien ne dit l'état du compte ;
+    * **partiel** : une fenêtre datée s'est remise à zéro alors qu'une autre
+      court encore — la fenêtre ouverte n'est plus qu'une borne inférieure
+      (le compte a pu servir depuis, ici ou ailleurs) ;
+    * **non daté** : l'âge du relevé (`read_at`) dépasse sa plus courte
+      fenêtre.
+
+    Un relevé dont **toutes** les fenêtres datées sont remises à zéro n'est
+    pas périmé : la suivante est vierge, 0 % (L71). Un relevé sans âge connu
+    n'est pas présumé périmé : une source qui ne date pas garde son sens, et
+    le choix la traite comme avant.
+    """
+    gauges = list(gauges)
+    if not gauges:
+        return True
+    dated = [g for g in gauges if g.resets_at]
+    if dated:
+        passed = [g.reset_passed(now) for g in dated]
+        return any(passed) and not all(passed)
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    return now - min(stamps) > min(g.window_s for g in gauges)
+
+
+def reading_outdated(gauges, now: float) -> bool:
+    """#1672 : le relevé **partiel** est-il trop vieux pour engager un tour ?
+
+    `stale_reading` dit qu'un relevé partiel — une fenêtre datée remise à zéro,
+    une autre encore ouverte — n'est plus un instantané courant ; il reste
+    néanmoins informatif pour les fenêtres encore ouvertes tant que son âge
+    (`now - read_at`) ne dépasse pas ce qui leur reste (`resets_at - now`).
+    Au-delà, la remise à zéro qui rendra le relevé caduc est plus proche que le
+    trou d'observation : **prudence sur une information ancienne**, pas la
+    preuve d'un quota atteint. Le cas réel du 15/10 : relevé de 30 % vieux de
+    quatre jours, fenêtre 7 j à 9 h de sa remise à zéro — le choix automatique
+    y a envoyé un tour, refusé par la limite hebdomadaire.
+
+    Faux pour un relevé **courant** (aucune fenêtre datée remise à zéro) et
+    pour un relevé dont **toutes** les fenêtres datées sont échues (L71, la
+    suivante est vierge à 0 %). Faux sans âge connu (`read_at` absent : une
+    date manquante ne prouve aucune péremption de plus). Faux dès qu'**une**
+    fenêtre encore ouverte reste plus longue que l'âge : le relevé garde du
+    sens pour elle.
+    """
+    dated = [g for g in gauges if g.resets_at]
+    if not any(g.reset_passed(now) for g in dated):
+        return False
+    opened = [g for g in dated if not g.reset_passed(now)]
+    if not opened:
+        return False                    # L71 : toutes échues, la suivante est vierge
+    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
+    if not stamps:
+        return False
+    age = now - min(stamps)
+    return all(age > float(g.resets_at) - now for g in opened)
 
 
 @dataclass(frozen=True)
@@ -452,6 +532,27 @@ PRICE_FAMILY = {
     "codex": ("gpt-", "codex-"),
     "claude": ("claude-",),
 }
+
+
+def foreign_harness_model(harness: str, model: str | None) -> bool:
+    """Le modèle nommé appartient-il **positivement** à la famille d'un autre
+    harnais ? (#1268)
+
+    Garde de lancement : une ligne de registre héritée d'une bascule de harnais
+    (#1037) peut porter `model=claude-…` avec `harness=codex` ; passer ce modèle
+    au harnais du tour provoque un 400 côté fournisseur (incident orchestrateur
+    du 14/10). On ne refuse jamais sur une supposition : un identifiant dont
+    aucune famille n'est reconnue n'est pas étranger.
+    """
+    nom = str(model or "").strip().lower()
+    if not nom:
+        return False
+    for harnais, prefixes in PRICE_FAMILY.items():
+        if harnais == harness:
+            continue
+        if any(nom.startswith(prefixe) for prefixe in prefixes):
+            return True
+    return False
 
 
 #: suffixes qu'un harnais ajoute à l'identifiant d'un modèle sans en changer
@@ -739,11 +840,14 @@ class CostBook:
 
         With `account` (L30), use the marker preceding each turn, including
         markers outside the read tail. Only a stream with no account marker
-        belongs to `primary`. Leading readings before any established marker
-        in a marked stream stay unknown, never primary.
+        belongs to `primary` — the harness's default account (`accounts.
+        primary_of`), and only when one is declared: `primary=None` means no
+        account claims them (L1078), never "the account itself". Leading
+        readings before any established marker in a marked stream stay
+        unknown, never primary.
         """
         if account is not None:
-            return self._claude_gauges_of(account, primary or account)
+            return self._claude_gauges_of(account, primary)
         newest = None
         for agent in self.agents():
             if not self._claude_candidate(agent):
@@ -758,18 +862,20 @@ class CostBook:
             for line in reversed(self.events(agent, tail=True)):
                 if line.get("type") != "rate_limit_event":
                     continue
-                gauges = _claude_windows(line)
+                gauges = _claude_windows(line, mtime)
                 if gauges is None:
                     break
                 newest = (mtime, Gauges(gauges, _claude_overage(line)))
                 break
         return newest[1] if newest else []
 
-    def _claude_gauges_of(self, account: str, primary: str) -> list:
+    def _claude_gauges_of(self, account: str, primary: str | None) -> list:
         """Read the newest gauges for one Claude account (L30).
 
         Compare turn-marker timestamps across agents. Only a stream without
-        any marker uses the primary account and file modification time.
+        any marker uses the `primary` account (the harness's default one,
+        L1078) and file modification time; with `primary` None, no account
+        claims them.
         """
         best = None
         for agent in self.agents():
@@ -798,12 +904,15 @@ class CostBook:
                 self._claude_gauge_cache.pop(path, None)
                 continue
             found = readings.get(account)
-            if found is None and account == primary:
+            if found is None and primary is not None and account == primary:
                 found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
-        # A caller must not mutate the cached list seen by another CostBook.
-        return list(best[1]) if best else []
+        # A caller must not mutate the cached list seen by another CostBook;
+        # the copy keeps the reading's overage flags (L226b, #1649).
+        # No reading: an empty Gauges (overage None), the same type as a
+        # reading, so a direct `.overage` read never meets a bare list (N1 impl-04).
+        return Gauges(best[1], best[2]) if best else Gauges()
 
     def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
@@ -821,6 +930,10 @@ class CostBook:
             key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
         )[-CODEX_FILES:]
         for path in reversed(files):
+            try:
+                read_at = os.path.getmtime(path)
+            except OSError:
+                read_at = None
             limits = None
             for line in _read_tail(path, 2_000_000).splitlines():
                 line = line.strip()
@@ -847,6 +960,7 @@ class CostBook:
                     _fraction(value.get("used_percent"), percent=True),
                     _epoch(value.get("resets_at")),
                     minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
+                    read_at,
                 ))
             if gauges:
                 return Gauges(gauges, _codex_overage(limits, gauges))
@@ -1319,7 +1433,10 @@ class CostBook:
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
-               key: str | None = None, ended: float | None = None) -> TurnUsage:
+               key: str | None = None, ended: float | None = None,
+               work_item_id: int | None = None,
+               started_at: float | None = None,
+               turn_id: str | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -1332,6 +1449,14 @@ class CostBook:
         `key` (L60) : la clé du marqueur comptable du tour. Un marqueur rejoué
         après une écriture réussie mais pas effacée (exécuteur arrêté entre les
         deux) ne réécrit pas la ligne : avant L60, il la doublait.
+
+        `work_item_id` et `started_at` (#796) : le lot servi par le tour et son
+        instant de début (epoch, horloge de la base), lus sur le marqueur
+        comptable. Ils viennent du **marqueur**, jamais de la mémoire de
+        l'appelant : une réparation par un autre worker écrit la même
+        attribution, ou aucune si elle n'y était pas. `turn_id` (#796) :
+        l'identifiant du tour (`turn_resources.turn_id`), même provenance, pour
+        relier la ligne à ses ressources.
         """
         if self.db is None:
             raise CostError("record without a database: the cumulative baseline lives in turn_costs")
@@ -1368,7 +1493,12 @@ class CostBook:
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
             account=account, spend_key=key, void_reason=usage.void_reason,
             price_fallback=usage.price_fallback,
-            cache_write_tokens=usage.cache_write_tokens)
+            cache_write_tokens=usage.cache_write_tokens,
+            # #796 (0423) : le lot du tour et son début, portés par le marqueur
+            work_item_id=None if work_item_id is None else int(work_item_id),
+            started_at=None if started_at is None else float(started_at),
+            # #796 (0423) : l'identifiant du tour, pour le relier à ses ressources
+            turn_id=turn_id)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -1833,8 +1963,12 @@ def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
     return out
 
 
-def _claude_windows(event: dict) -> list | None:
-    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles."""
+def _claude_windows(event: dict, read_at: float | None = None) -> list | None:
+    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles.
+
+    `read_at` (#1561) : l'horodatage du relevé — le marqueur de compte qui
+    précède le tour, ou la date du flux pour un flux sans marqueur.
+    """
     info = event.get("rate_limit_info") or {}
     windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
     if not isinstance(windows, dict):
@@ -1842,7 +1976,8 @@ def _claude_windows(event: dict) -> list | None:
     return [
         Gauge("claude", key, _fraction(value.get("utilization")),
               _epoch(value.get("resetsAt")),
-              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
+              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])),
+              read_at)
         for key, value in windows.items() if isinstance(value, dict)
     ]
 
@@ -1860,12 +1995,26 @@ def _claude_overage(event: dict) -> Overage:
 
 def _codex_overage(limits: dict, gauges: list) -> Overage:
     """The overage flags of a Codex `rate_limits` object (L226b): credits
-    let the account go on, billed, once a window is at 100 %."""
+    let the account go on, billed, once a window is at 100 %.
+
+    #1176 (B1) : un objet `credits` vide, partiel, ou dont les champs ne sont
+    pas des booléens ne prouve RIEN — `capable` reste None (inconnu), et
+    aucun relèvement de fin de fenêtre ne s'appuie dessus. Seule une capacité
+    explicite (`has_credits` ou `unlimited` vrai) rend True ; une incapacité
+    n'est rendue False que si elle est explicite (`has_credits` faux) et non
+    contredite par `unlimited` vrai.
+    """
     credits = limits.get("credits")
     if not isinstance(credits, dict):
         return Overage()
-    capable = credits.get("has_credits") is True or credits.get("unlimited") is True
-    return Overage(capable, capable and any(g.used >= 1.0 for g in gauges))
+    has_credits, unlimited = credits.get("has_credits"), credits.get("unlimited")
+    if has_credits is True or unlimited is True:
+        capable: bool | None = True
+    elif has_credits is False:
+        capable = False
+    else:
+        capable = None
+    return Overage(capable, capable is True and any(g.used >= 1.0 for g in gauges))
 
 
 def _find_rate_limits(node, depth: int = 0):
@@ -2029,7 +2178,11 @@ def _racy(stat, now_ns: int) -> bool:
 
 
 def _claude_account_readings(events: list, mtime: float) -> dict:
-    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    """Attribute all accounts in one pass; None is a verified legacy stream.
+
+    Each reading is (stamp, gauges, overage): the overage flags stay beside
+    the gauges, so the shared cache keeps them too (L226b, #1649).
+    """
     marked = any(_is_claude_marker(e) for e in events)
     current, stamp = None, 0.0 if marked else mtime
     readings = {}
@@ -2041,9 +2194,9 @@ def _claude_account_readings(events: list, mtime: float) -> dict:
             except (TypeError, ValueError):
                 stamp = 0.0
         elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
-            gauges = _claude_windows(event)
+            gauges = _claude_windows(event, stamp)
             if gauges is not None:
-                readings[current] = (stamp, Gauges(gauges, _claude_overage(event)))
+                readings[current] = (stamp, gauges, _claude_overage(event))
     return readings
 
 

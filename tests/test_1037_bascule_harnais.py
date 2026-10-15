@@ -15,6 +15,9 @@ Claude. Trois temoins de contrat ici :
   `session_origin`) et efface modele, effort et tier quand le harnais declare
   change — en base comme dans l'etat local, que l'exécuteur relit avant les
   colonnes du registre ;
+* l'historique (`persona_sessions`) dit le harnais de la session vivante, pas
+  l'etiquette declaree, et garde la declaration quand l'origine est inconnue
+  (#1251, N2 de la R2) ;
 * la porte de relecture relit desormais les tours du GEL
   (`test_1053_famille_au_gel`, #1053/#1777) ; le lecteur de session vivante
   (`registry.live_harness`), qui servait a cette porte, garde son temoin
@@ -26,7 +29,7 @@ import dataclasses
 import os
 import unittest
 
-from ameesh import registry, reprise
+from ameesh import persona_sessions as ps, registry, reprise
 from ameesh.backend import PgBackend
 
 from .support import PgTestCase
@@ -114,6 +117,39 @@ class SessionVivanteTest(PgTestCase):
         row = registry.get(self.db, "auteur")
         self.assertEqual(row["harness"], "claude")             # etiquette declaree
         self.assertEqual(registry.live_harness(row), "codex")  # session vivante
+
+
+class HistoriqueSuitLeHarnaisDeLaSessionTest(PgTestCase):
+    """#1251 : `persona_sessions` dit le harnais de la SESSION vivante, pas
+    l'etiquette declaree ; sans origine connue, la declaration reste."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE persona_sessions RESTART IDENTITY")
+        registry.upsert(self.db, "bascule", harness="claude", host=self.cfg.host,
+                        cwd=self.tmp)
+
+    def _session(self, origin):
+        self.db.execute(
+            "UPDATE agent_registry SET session_id = %s, session_origin = %s, "
+            "session_harness = 'codex' WHERE name = 'bascule'", (SID, origin))
+
+    def test_session_ouverte_sous_un_autre_harnais(self):
+        # L242b : l'agent se declare claude, sa session tourne sous codex ;
+        # l'historique doit dire le harnais du travail, pas l'etiquette.
+        self._session(origin=SID)
+        ps.record_start(self.db, "bascule", SID)
+        self.assertEqual(ps.sessions(self.db, "bascule")[0]["harness"], "codex")
+
+    def test_sans_origine_le_harnais_declare_est_garde(self):
+        # 0384 : origine inconnue -> les trois colonnes de session sont NULL ;
+        # l'historique n'a que la declaration a dire.
+        self._session(origin="session-d-ailleurs")
+        ligne = registry.get(self.db, "bascule")
+        self.assertIsNone(ligne["session_origin"])
+        self.assertIsNone(ligne["session_harness"])
+        ps.record_start(self.db, "bascule", SID)
+        self.assertEqual(ps.sessions(self.db, "bascule")[0]["harness"], "claude")
 
 
 if __name__ == "__main__":

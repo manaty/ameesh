@@ -48,6 +48,12 @@ SIGNATURES = {
     "executor_assertion_jti": {"jti"},
     "executors": {"public_key", "device_attestation"},
     "exec_idempotency": {"response"},
+    # L87 (0440) : clés d'idempotence de l'API et réponses rejouables — même
+    # nature que `exec_idempotency` ; tout est fermé tant que la classification
+    # d'état n'est pas tranchée (correctif fermé 27665f633, décision pilote
+    # 15/10 : conservation des droits actuels, aucun GRANT modifié).
+    "api_idempotency": {"human", "key", "fingerprint", "status", "response",
+                        "created_at", "done_at"},
     # #210: fingerprint of a refresh token or key
     "credential_health": {"failing_fingerprint"},
 }
@@ -78,8 +84,14 @@ CONTENUS = {
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.
-EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set())
-           for rel in set(SIGNATURES) | set(CONTENUS)}
+#: colonnes fermées en attendant leur classement (aucun GRANT modifié)
+FERMEES = {
+    # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
+    # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
+    "agent_mesh_overview": {"roles"},
+}
+EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set()) | FERMEES.get(rel, set())
+           for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES)}
 
 
 def ecarts_de_classement(cols: dict[str, dict[str, bool]]) -> list[str]:

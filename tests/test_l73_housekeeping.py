@@ -15,12 +15,25 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import canon, containers, exploitation, menage, registry, resources, storage, work
+from ameesh import (canon, containers, exploitation, menage, platform, registry,
+                    resources, storage, work)
 
 from .support import PgTestCase
 from .test_l43_perimetre_hote import HOST, _Canons, codes, host
 
 GIB = 1024 ** 3
+
+
+def _sans_processus(test: unittest.TestCase) -> None:
+    """#1665 : neutralise la table des processus de l'hôte pour un test de
+    retrait. Un démon non « dumpable » (gpg-agent, `ameesh-offload`) ou un
+    zombie laisse un doute qui retient tout retrait : la décision testée ici
+    est celle des garde-fous git (propre, poussé, âge), pas celle des
+    processus — `worktree_in_use` et `platform.user_paths` ont leurs propres
+    tests."""
+    patcher = mock.patch.object(platform, "user_paths", lambda *a, **k: platform.UserPaths())
+    patcher.start()
+    test.addCleanup(patcher.stop)
 
 
 class _Cfg:
@@ -289,6 +302,36 @@ class WorktreeEtatTest(_Tmp):
         self.assertTrue(menage.owns_worktree(sous, a1, [a2, os.path.join(self.base, "b")]))
         self.assertFalse(menage.owns_worktree(sous, None, []))
 
+    def test_lot_nomme_par_la_branche_ou_le_dossier(self):
+        """#1665 : les noms qui rattachent un worktree frère à son lot."""
+        self.assertEqual(menage.cited_lot("lot/1665-menage-worktrees"), 1665)
+        self.assertEqual(menage.cited_lot("agent/deepseek3-1201-bench"), 1201)
+        self.assertEqual(menage.cited_lot("review/mty-nxl-rel-01-571-ota"), 571)
+        self.assertEqual(menage.cited_lot("lot/750"), 750)
+        self.assertIsNone(menage.cited_lot("main"))
+        self.assertIsNone(menage.cited_lot("relecture"))
+        self.assertEqual(menage.named_lot("ameesh-dev1-131", "ameesh-dev1"), 131)
+        self.assertEqual(menage.named_lot("deepseek3-1665", "deepseek3"), 1665)
+        self.assertIsNone(menage.named_lot("deepseek3-tmp", "deepseek3"))
+        self.assertIsNone(menage.named_lot("nexlink-ds3-431", "deepseek3"))
+        # le nom de l'agent porte un chiffre : c'est le dernier groupe qui
+        # compte sous agent/review (l'id du lot, pas le suffixe de l'agent)
+        self.assertEqual(menage.cited_lot("agent/mty-nxl-impl-04-1229-x"), 1229)
+        self.assertIsNone(menage.cited_lot("agent/nx-compute-runner-n-n"))
+        self.assertIsNone(menage.cited_lot(""))
+
+    def test_registre_illisible_ne_prouve_rien(self):
+        """#1665 : un registre des lots illisible ne rattache rien (None),
+        sans faire échouer le ménage."""
+        class _Cassee:
+            @property
+            def work(self):
+                raise RuntimeError("registre illisible")
+
+        with mock.patch.object(menage.storage, "of", return_value=_Cassee()):
+            self.assertIsNone(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", "lot/12-x"))
+            self.assertIsNone(menage.lot_of_worktree(None, "a1", "/tmp/a1-12", ""))
+
     def test_processus_dans_le_worktree(self):
         wt = os.path.join(self.base, "wt")
         os.makedirs(wt)
@@ -316,12 +359,17 @@ class WorktreeEtatTest(_Tmp):
 class _FauxMoteur:
     binary = "/usr/bin/docker"
 
-    def __init__(self, rows):
+    def __init__(self, rows, running=None):
         self.rows = rows
+        #: ids considérés EN COURS (`ps` sans `-a`) ; None : tous le sont
+        self.running = running
         self.removed: list[str] = []
 
-    def list_all(self):
-        return [dict(r) for r in self.rows if r["id"] not in self.removed]
+    def list_all(self, stopped=False):
+        out = [dict(r) for r in self.rows if r["id"] not in self.removed]
+        if not stopped and self.running is not None:
+            out = [r for r in out if r["id"] in self.running]
+        return out
 
     def remove(self, ident):
         self.removed.append(ident)
@@ -350,6 +398,24 @@ class ConteneursTest(_Tmp):
         self.assertEqual(rows[0]["name"], "pg-test")
         self.assertEqual(moteur.remove("abc"), (True, ""))
         self.assertEqual(appels[-1], ["docker", "rm", "-f", "-v", "abc"])
+
+    def test_ps_a_est_le_seul_releve_des_arretes(self):
+        """#1547 (N2a) : `stopped=True` ajoute `-a` à l'argv réel de `ps` —
+        un conteneur arrêté n'est vu que par ce relevé ; sans lui, la lecture
+        reste celle des conteneurs en cours."""
+        appels = []
+
+        def run(argv, **_kw):
+            appels.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        moteur = containers.Runtime(binary="docker", run=run)
+        self.assertEqual(moteur.list_all(stopped=True), [])
+        self.assertEqual(appels[0], ["docker", "ps", "--no-trunc", "-a",
+                                     "--format", "{{json .}}"])
+        moteur.list_all()
+        self.assertEqual(appels[1], ["docker", "ps", "--no-trunc",
+                                     "--format", "{{json .}}"])
 
     def test_le_script_etiquette_run_et_create_seulement(self):
         faux = os.path.join(self.base, "vrai-bin")
@@ -498,10 +564,15 @@ class MenageDbTest(PgTestCase):
         self.assertEqual([a["path"] for a in alertes], [sale])
         self.assertIn("untracked", alertes[0]["detail"])
 
-    def test_worktree_d_un_autre_agent_survit_a_la_fin_du_lot_du_tour(self):
-        """L73b, cas réel : un agent crée un worktree de relecture PENDANT le
-        tour d'un autre agent sur le même dépôt ; le lot de ce tour est
-        fusionné ; le worktree de relecture n'est pas retiré."""
+    def test_worktree_d_un_autre_agent_orphelin_garde_puis_retire(self):
+        """L73b/#1665, cas réel : un agent crée un worktree de relecture
+        PENDANT le tour d'un autre agent sur le même dépôt ; rien ne le
+        rattache à l'agent du tour ni à son lot : il est suivi « non
+        attribué ». Il survit tant qu'il est récent ou qu'un tour de l'agent
+        qui l'a vu apparaître est en cours, puis part une fois orphelin
+        (propre, poussé, inactif depuis 24 h, aucun processus dedans, table
+        des processus lisible) ; sa branche reste."""
+        _sans_processus(self)
         main = _repo(self.tmp)
         a1 = os.path.join(self.tmp, "a1")
         _git("worktree", "add", "-q", a1, "-b", "a1", cwd=main)
@@ -516,15 +587,165 @@ class MenageDbTest(PgTestCase):
         tour.end(lot=str(lot), turn_id="t" * 32, db=self.db, host="pc")
         rows = storage.of(self.db).housekeeping.worktrees("pc")
         self.assertEqual([(r["path"], r["lot"]) for r in rows], [(relecture, None)])
+        self.assertTrue(rows[0]["detail"].startswith(menage.UNATTRIBUTED))
         work.close(self.db, lot, abandoned=True)
+        # moins de 24 h d'inactivité : attend
+        jeune = time.time() + 2 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                  actor="t", now=jeune)
+        self.assertTrue(os.path.isdir(relecture))
+        self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        # un tour de l'agent qui le suit : attend, même après 24 h
+        # (le worktree n'est rattaché à personne : seul le tour de l'agent
+        # qui l'a vu apparaître est connu, pas celui qui l'a créé)
         loin = time.time() + 30 * 24 * 3600
-        for lotless in (False, True):
-            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
-                                      actor="t", include_lotless=lotless, now=loin)
-            self.assertTrue(os.path.isdir(relecture))
-            self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                  actor="t", agents_in_turn={"a1"}, now=loin)
+        self.assertTrue(os.path.isdir(relecture))
+        self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        # orphelin : propre, poussé, inactif depuis 24 h, aucun agent dessus
+        rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                  actor="t", now=loin)
+        self.assertFalse(os.path.exists(relecture))
+        self.assertIn("relecture", _git("branch", "--list", "relecture", cwd=main))
         self.assertEqual([r["status"] for r in storage.of(self.db).housekeeping.worktrees("pc")],
-                         ["active"])
+                         ["removed"])
+
+    def _orphelin(self, main: str, nom: str, branche: str = "") -> str:
+        """Un worktree suivi « non attribué », comme ceux d'avant #1665."""
+        wt = os.path.join(self.tmp, nom)
+        branche = branche or nom
+        _git("worktree", "add", "-q", wt, "-b", branche, cwd=main)
+        row = storage.of(self.db).housekeeping.register_worktree(
+            host="pc", path=wt, repo=menage.common_dir(main), agent="a1",
+            lot=None, turn_id="t", branch=branche, head="")
+        storage.of(self.db).housekeeping.set_worktree_status(
+            row["id"], "active",
+            "%s: apparu pendant un tour, hors du dossier de l'agent" % menage.UNATTRIBUTED)
+        return wt
+
+    def test_worktree_hors_dossier_attribue_par_la_branche_ou_le_dossier(self):
+        """#1665 : hors du dossier de l'agent, la branche (`lot/<id>`) ou le
+        dossier (`<agent>-<id>`) nomme le lot ; s'il est assigné à cet agent,
+        le worktree lui est attribué. Un lot d'un autre agent ne prouve rien."""
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        lot, autre = self._lot("lot frère"), self._lot("lot d'un autre")
+        work.assign(self.db, lot, "a1")
+        work.assign(self.db, autre, "a2")
+        tour = menage.Turn.begin(self.cfgl, menage.Policy(), "a1", main, new_session=False,
+                                 base_env={})
+        par_branche = os.path.join(self.tmp, "frere-branche")
+        _git("worktree", "add", "-q", par_branche, "-b", "lot/%d-frere" % lot, cwd=main)
+        par_dossier = os.path.join(self.tmp, "a1-%d" % lot)
+        _git("worktree", "add", "-q", "--detach", par_dossier, cwd=main)
+        etranger = os.path.join(self.tmp, "frere-etranger")
+        _git("worktree", "add", "-q", etranger, "-b", "lot/%d-x" % autre, cwd=main)
+        inconnu = os.path.join(self.tmp, "frere-inconnu")
+        _git("worktree", "add", "-q", inconnu, "-b", "lot/999999-x", cwd=main)
+        tour.end(lot="999", turn_id="t" * 32, db=self.db, host="pc")
+        rows = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
+        self.assertEqual(rows[par_branche]["lot"], str(lot))
+        self.assertFalse(rows[par_branche]["detail"].startswith(menage.UNATTRIBUTED))
+        self.assertEqual(rows[par_dossier]["lot"], str(lot))
+        self.assertIsNone(rows[etranger]["lot"])
+        self.assertTrue(rows[etranger]["detail"].startswith(menage.UNATTRIBUTED))
+        self.assertIsNone(rows[inconnu]["lot"])
+        self.assertTrue(rows[inconnu]["detail"].startswith(menage.UNATTRIBUTED))
+
+    def test_worktree_non_attribue_rattache_a_son_lot_fini(self):
+        """#1665 : un worktree déjà suivi « non attribué » dont la branche
+        nomme un lot assigné à l'agent suit la fin de ce lot (il est retiré
+        s'il est propre et intégré), et le journal porte le lot."""
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        fini = self._lot("fini")
+        work.assign(self.db, fini, "a1")
+        # la branche enregistrée nomme le lot fini, mais le suivi est resté
+        # « non attribué » (comme les 329 worktrees frères d'avant #1665)
+        wt = self._orphelin(main, "orphelin-rattache", "lot/%d-frere" % fini)
+        work.close(self.db, fini, abandoned=True)
+        plus_tard = time.time() + 2 * 3600
+        essai = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                                dry_run=True, now=plus_tard)
+        plan = {p["path"]: p for p in essai["plan"] if p.get("kind") == "worktree"}
+        self.assertEqual(plan[wt]["action"], "retrait")
+        self.assertEqual(plan[wt]["lot"], str(fini))
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        now=plus_tard)
+        self.assertFalse(os.path.exists(wt))
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual(rows[0]["status"], "removed")
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600)
+        self.assertIn(str(fini), [str(r.get("lot")) for r in journal])
+
+    def test_orphelin_propre_pousse_inactif_24h_puis_retire(self):
+        """#1665 : propre, poussé et inactif depuis 24 h, un orphelin part ;
+        sale, non poussé ou tenu par un agent, il reste et il est signalé."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        propre = self._orphelin(main, "orphelin-propre")
+        sale = self._orphelin(main, "orphelin-sale")
+        _write(os.path.join(sale, "wip.txt"), 3)
+        non_pousse = self._orphelin(main, "orphelin-non-pousse")
+        _write(os.path.join(non_pousse, "f.txt"), 3)
+        _git("add", ".", cwd=non_pousse)
+        _git("commit", "-q", "-m", "travail", cwd=non_pousse)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        jeune = time.time() + 2 * 3600
+        self.assertEqual(plan(now=jeune)[propre]["action"], "attend")
+        loin = time.time() + 30 * 24 * 3600
+        self.assertEqual(plan(now=loin, agents_in_turn={"a1"})[propre]["action"], "attend")
+        p = plan(now=loin)
+        self.assertEqual(p[propre]["action"], "retrait")
+        self.assertIn("orphan", p[propre]["detail"])
+        self.assertEqual(p[sale]["action"], "garde")
+        self.assertEqual(p[non_pousse]["action"], "garde")
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(propre))
+        self.assertTrue(os.path.isdir(sale))
+        self.assertTrue(os.path.isdir(non_pousse))
+        self.assertIn("orphelin-propre", _git("branch", "--list", "orphelin-propre", cwd=main))
+
+    def test_lot_fini_non_integre_retire_apres_24h(self):
+        """#1665 : un lot fini (clos) dont le worktree est propre et poussé
+        mais NON intégré n'était que gardé (L73b) ; il part après 24 h
+        d'inactivité, comme un orphelin, et sa branche reste."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        fini = self._lot("fini")
+        wt = self._suivi(main, "fini-non-integre", fini)
+        _write(os.path.join(wt, "travail.txt"), 3)
+        _git("add", ".", cwd=wt)
+        _git("commit", "-q", "-m", "travail", cwd=wt)
+        _git("push", "-q", "origin", "fini-non-integre", cwd=wt)
+        work.close(self.db, fini, abandoned=True)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        tot = time.time() + 2 * 3600
+        p = plan(now=tot)[wt]
+        self.assertEqual(p["action"], "garde")
+        self.assertIn("not integrated", p["detail"])
+        loin = time.time() + 30 * 24 * 3600
+        p = plan(now=loin)[wt]
+        self.assertEqual(p["action"], "retrait")
+        self.assertIn("idle for more than 24 h", p["detail"])
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t", now=loin)
+        self.assertFalse(os.path.exists(wt))
+        self.assertIn("fini-non-integre", _git("branch", "--list", "fini-non-integre", cwd=main))
 
     def test_garde_fous_age_tour_en_cours_verrou_et_integration(self):
         main = _repo(self.tmp)
@@ -641,6 +862,79 @@ class MenageDbTest(PgTestCase):
         seul = menage.reap_containers(moteur, self.db, "pc", only_turn="encours")
         self.assertEqual(seul["entries"], [])
         self.assertIsNone(seul["others"])
+
+    def test_conteneurs_arretes_visibles_et_base_de_lot_gardee(self):
+        """#1411 : `ps -a` rend visibles les conteneurs arrêtés (récoltés ou
+        signalés) ; une base de lot ENCORE OUVERT reste gardée jusqu'à sa fin.
+        Repli borné après la R1 : pas de destruction sur la photographie des
+        tours, faute d'exclusion commune avec le démarrage d'un tour."""
+        turns = storage.of(self.db).turn_resources
+        for tid in ("fini", "encours"):
+            turns.open_turn(tid, "a1", "pc", pgid=None, label=None)
+        turns.close_turn("fini", orphan=True)
+        ouvert, ferme = self._lot("ouvert"), self._lot("ferme")
+        work.close(self.db, ferme, abandoned=True)
+
+        def c(ident, status="Up", **labels):
+            return {"id": ident, "name": "c-" + ident, "image": "postgres",
+                    "status": status, "labels": labels}
+
+        moteur = _FauxMoteur([
+            # arrêté, tour fini, sans lot : récolté (invisible avant #1411)
+            c("8", status="Exited (137) 2 days ago",
+              **{"ameesh.turn": "fini", "ameesh.agent": "a1"}),
+            # arrêté, base d'un lot OUVERT : gardé jusqu'à la fin du lot
+            c("9", status="Created", **{"ameesh.turn": "fini", "ameesh.agent": "a1",
+                                        "ameesh.lot": str(ouvert)}),
+            # arrêté, hors tour : signalé, jamais supprimé
+            c("10", status="Exited (0) 3 h ago"),
+            # en cours, lot ouvert et tour vivant : attend
+            c("11", status="Up", **{"ameesh.turn": "encours", "ameesh.agent": "a1",
+                                    "ameesh.lot": str(ouvert)}),
+            # en cours, tour fini et lot fermé : récolté
+            c("12", status="Up", **{"ameesh.turn": "fini", "ameesh.agent": "a1",
+                                    "ameesh.lot": str(ferme)}),
+        ], running={"11", "12"})
+        essai = menage.reap_containers(moteur, self.db, "pc", dry_run=True)
+        self.assertEqual(moteur.removed, [])
+        self.assertEqual({p["path"] for p in essai["plan"] if p["action"] == "suppression"},
+                         {"c-8", "c-12"})
+        self.assertEqual({o["path"]: o["action"] for o in essai["ameesh"]},
+                         {"c-8": "suppression", "c-9": "attend",
+                          "c-11": "attend", "c-12": "suppression"})
+        # la base du lot ouvert attend sa fin, quoi qu'en dise la photographie
+        self.assertEqual("lot #%s intake" % ouvert,
+                         [o["detail"] for o in essai["ameesh"]
+                          if o["path"] == "c-9"][0])
+        # le conteneur arrêté hors tour est vu et signalé, avec sa commande
+        self.assertEqual([o["command"] for o in essai["others"]], ["docker rm -f c-10"])
+        self.assertEqual(essai["others"][0]["status"], "Exited (0) 3 h ago")
+        # réalisation : le tour fini sans lot et la base du lot fermé partent
+        menage.reap_containers(moteur, self.db, "pc")
+        self.assertEqual(sorted(moteur.removed), ["12", "8"])
+
+    def test_le_releve_des_conteneurs_hors_tour_est_borne(self):
+        """#1547 (N3) : le journal ne garde qu'`OTHERS_TOP` conteneurs hors
+        tour, et le compte total dans `others_total` — la liste n'est plus
+        non bornée sur un hôte qui en porte beaucoup."""
+        def c(i):
+            return {"id": str(i), "name": "c-%d" % i, "image": "redis",
+                    "status": "Up", "labels": {}}
+
+        moteur = _FauxMoteur([c(i) for i in range(5)])
+        with mock.patch.object(menage, "OTHERS_TOP", 2):
+            essai = menage.reap_containers(moteur, self.db, "pc", dry_run=True)
+            self.assertEqual([o["name"] for o in essai["others"]], ["c-0", "c-1"])
+            self.assertEqual(essai["others_total"], 5)
+            menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                            runtime=moteur)
+        dernier = storage.of(self.db).housekeeping.last_measure("pc")[0]["data"]
+        self.assertEqual(len(dernier["containers"]["others"]), 2)
+        self.assertEqual(dernier["containers"]["others_total"], 5)
+        # un tour précis ne regarde que les siens : ni liste, ni compte
+        seul = menage.reap_containers(moteur, self.db, "pc", only_turn="encours")
+        self.assertIsNone(seul["others"])
+        self.assertIsNone(seul["others_total"])
 
     def _lecture(self, used: float) -> None:
         storage.of(self.db).hosts.record({

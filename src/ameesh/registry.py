@@ -330,21 +330,35 @@ def release_hold(db: Db, name: str, owner: str, epoch: int, status_text: str,
 
 
 def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
-                      model: str | None = None) -> bool:
-    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""
-    return storage.of(db).pending_spend.put(name, start_index, turn, model)
+                      model: str | None = None,
+                      work_item_id: int | str | None = None,
+                      turn_id: str | None = None) -> bool:
+    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne.
+
+    `work_item_id` (#796) : le lot du tour, écrit avec le marqueur pour que la
+    ligne du grand livre — y compris réparée par un autre worker — porte la
+    même attribution. `turn_id` : l'identifiant du tour
+    (`turn_resources.turn_id`), pour la même raison."""
+    return storage.of(db).pending_spend.put(name, start_index, turn, model, work_item_id,
+                                            turn_id)
 
 
 def pending_spend_begin(db: Db, name: str, start_index: int, turn: str | None = None,
-                        model: str | None = None) -> dict | None:
+                        model: str | None = None,
+                        work_item_id: int | str | None = None,
+                        turn_id: str | None = None) -> dict | None:
     """Write and capture one marker atomically on PostgreSQL (#1469).
 
     The mediated backend keeps its fenced write; its operations are separate.
+    `work_item_id`/`turn_id` (#796) partent avec le marqueur, comme
+    `pending_spend_put`.
     """
     api = storage.of(db).pending_spend
     if hasattr(api, "put_get"):
-        return _pending_spend_row(api.put_get(name, start_index, turn, model))
-    if not api.put(name, start_index, turn, model):
+        return _pending_spend_row(api.put_get(name, start_index, turn, model,
+                                              work_item_id=work_item_id,
+                                              turn_id=turn_id))
+    if not api.put(name, start_index, turn, model, work_item_id, turn_id):
         return None
     return pending_spend_get(db, name)
 
@@ -374,6 +388,10 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         "turn": row.get("turn") or "",
         "model": row.get("model"),
         "created_ts": row.get("created_ts"),
+        # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
+        "work_item_id": row.get("work_item_id"),
+        # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
+        "turn_id": row.get("turn_id"),
     }
 
 
@@ -438,7 +456,14 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         return False, "%s has no human owner (required with a canon)" % name, ""
     if not row.get("placement_admitted"):
         if row.get("placement_ok") is True:
-            why = "profile diverged since evaluation (next canon sync)"
+            # #1219 : nommer la divergence (profils évalué et courant) — le même
+            # diagnostic que `ameesh list`/`canon check`, au lieu d'un texte
+            # court qui cache la cause et promet un canon sync qui ne corrige
+            # pas une inscription qui re-divergera.
+            from .placement import recorded as _recorded  # import tardif : pas de cycle
+            verdict = (_recorded(db, row.get("host")) or {}).get(name) or {}
+            why = verdict.get("placement_diagnostic") or (
+                "profile diverged since evaluation (next canon sync)")
         else:
             why = row.get("placement_diagnostic") or (
                 "placement not evaluated" if row.get("placement_ok") is None
@@ -468,6 +493,13 @@ def wakeable(db: Db, cfg, name: str) -> tuple[bool, str]:
     momentanément invalide ne doit pas bloquer une attribution ; la
     réclamation, elle, reste fermée tant qu'il n'est pas `ok` (`claim`).
     `wake_status` rend en plus la remarque correspondante.
+
+    #1021 : la tenue budget/rythme n'entre pas ici — elle se juge là où la
+    garde de l'exécuteur la calcule (`account_turn.turn_hold`, sur la ligne du
+    registre et les comptes de l'hôte) et `work.check_assignee` la refuse :
+    un agent réveillable peut être en pause budget, et un lot ne doit pas lui
+    être confié pour autant. `resume`, lui, reste permis (c'est le geste de
+    reprise, la pause se lèvera d'elle-même).
     """
     ok, why, _note = wake_status(db, cfg, name)
     return ok, why

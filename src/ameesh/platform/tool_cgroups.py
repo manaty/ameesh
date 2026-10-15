@@ -19,8 +19,14 @@ def check(runner_pid: int, proc: Path | None = None) -> dict:
     """Read-only snapshot of descendants, including dsh scopes named by PID.
 
     A reparented process in a scope is attributable through the harness PID in
-    its unit name. An escaped/reparented PGID process is not attributable here:
-    this is placement evidence, not an exhaustive per-turn cleanup proof.
+    its unit name, including the `dsh-subprocess-probe-<pid>-<hex>` form the
+    guard's `scopedBindings` refuses. An escaped/reparented PGID process is not
+    attributable here: this is placement evidence, not an exhaustive per-turn
+    cleanup proof.
+
+    An unreadable entry (`/proc` mounted with `hidepid=1`, another user's PID)
+    is skipped like one that exited during the snapshot: it is not
+    attributable, and one unreadable row must not abort the whole check.
     """
     if proc is None:
         if not is_linux():
@@ -36,8 +42,9 @@ def check(runner_pid: int, proc: Path | None = None) -> dict:
             fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             rows[int(entry.name)] = (
                 int(fields[1]), unified_cgroup((entry / "cgroup").read_text()))
-        except FileNotFoundError:
-            continue  # exited during the snapshot
+        except (FileNotFoundError, PermissionError):
+            # exited during the snapshot, or unreadable (hidepid=1)
+            continue
     owned = {runner_pid}
     while True:
         more = {pid for pid, (ppid, _) in rows.items() if ppid in owned} - owned
@@ -46,7 +53,7 @@ def check(runner_pid: int, proc: Path | None = None) -> dict:
         owned.update(more)
     outside = []
     for pid, (_, group) in sorted(rows.items()):
-        scope = re.search(r"/dsh-subprocess-(\d+)-[^/]+\.scope(?:/|$)", group)
+        scope = re.search(r"/dsh-subprocess-(?:probe-)?(\d+)-[^/]+\.scope(?:/|$)", group)
         if pid not in owned and not (scope and int(scope[1]) in owned):
             continue
         if root != "/" and group != root and not group.startswith(root + "/"):

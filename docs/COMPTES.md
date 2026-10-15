@@ -20,15 +20,43 @@ compte est choisi ainsi :
    instant de la fenêtre, colonne « rythme » de `ameesh accounts list`), pris
    sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte sans
    fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
-   premier**. À égalité, celui dont la capacité inutilisée expire le plus tôt,
-   puis l'ordre déclaré (amendement du 2026-10-10 à 0034, lot L117 : un compte
-   jamais utilisé ne doit pas rester inutilisé ; avant, le primaire, toujours
-   en fenêtre ouverte, gagnait toujours).
-4. Tous les comptes au seuil : pause.
+   premier**. Un **relevé partiel** (#1561 : une fenêtre datée remise à zéro
+   alors qu'une autre court encore, ou un relevé non daté plus vieux que sa
+   plus courte fenêtre) n'est plus un instantané courant : le compte est **non
+   vérifié**, sa raison le dit, et il passe après tout compte à relevé courant,
+   quel que soit son rythme lu — il reste **essayé** faute de mieux (L71,
+   « essayé, pas écarté »). #1672 **borne cet essai** : quand une fenêtre datée
+   s'est remise à zéro, un relevé plus vieux que ce qui reste de **chaque**
+   fenêtre encore ouverte est une information trop ancienne pour engager un
+   tour — prudence, pas preuve d'un quota atteint —, le compte est écarté du
+   placement et, sans compte plaçable, le choix pause ; la remise à zéro qui
+   motive la pause le rouvre (L71, 0 %). La continuité (règle 2) garde son
+   chemin : une session déjà sur le compte y reste, et c'est son tour qui
+   rapporte la jauge ; un forçage manuel (règle 1) reste souverain. À égalité,
+   celui dont la capacité inutilisée expire le plus tôt, puis l'ordre déclaré
+   (amendement du 2026-10-10 à 0034, lot L117 : un compte jamais utilisé ne
+   doit pas rester inutilisé ; avant, le primaire, toujours en fenêtre ouverte,
+   gagnait toujours).
+4. Tous les comptes au seuil, ou écartés faute d'un relevé assez récent pour
+   placer : pause — la raison dit lequel des deux cas s'applique.
 
 Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
 (même règle que L71) : un compte resté à 93 % sur une fenêtre close n'est plus
-écarté, il est essayé, et son premier tour rapporte sa jauge. Les jauges sont
+écarté, il est essayé, et son premier tour rapporte sa jauge. Un relevé
+**partiel** — une fenêtre datée remise à zéro depuis, une autre encore ouverte —
+n'est pas dans ce cas : la fenêtre ouverte n'est qu'une **borne inférieure**
+(le compte a pu servir depuis, ici ou ailleurs), donc le relevé n'est plus
+courant et le compte devient **non vérifié** (#1561) : sa raison le dit au lieu
+d'annoncer la valeur périmée comme courante, il n'annonce ni perte ni échéance,
+et il passe après tout relevé courant, **essayé** faute de mieux (L71). #1672
+borne cet essai : un relevé plus vieux que ce qui reste de chaque fenêtre
+encore ouverte est trop ancien pour engager un tour, le compte est écarté du
+placement et le choix pause jusqu'à la remise à zéro qui la motive. Le cas
+réel du 15/10/2026 : une jauge 7 j lue à 30 % (relevé vieux de quatre jours)
+alors qu'elle valait 100 %, la fenêtre de 5 h s'étant remise à zéro entre-temps
+— le choix automatique y a envoyé un tour, refusé par la limite hebdomadaire ;
+désormais il pause, la remise à zéro rouvrant le compte, et la continuité comme
+le forçage restent les chemins ouverts vers un relevé périmé. Les jauges sont
 relues à chaque choix. Jamais au milieu d'un tour. Étude :
 [docs/design/etudes/comptes-multiples.md](design/etudes/comptes-multiples.md).
 
@@ -100,14 +128,17 @@ dans le canon :
 ```
 
 * L'ordre départage les égalités de retard et d'échéance (par exemple deux
-  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
-  primaire.
-* `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
-  dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-  hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
-  sont lues au même endroit, par le mécanisme commun : argument >
-  `AMEESH_CODEX_SESSIONS` > `$CODEX_HOME/sessions` > `~/.codex/sessions` ; un
-  compte déclaré lit `<son CODEX_HOME>/sessions`.
+  comptes jamais utilisés, ou les clés d'API sans jauge), et le premier sert
+  de compte actif par défaut (`account_active`) tant qu'aucun choix n'est
+  écrit.
+* `config_dir` sans `path` : le **dossier par défaut du harnais** (`~/.claude`,
+  `~/.codex`, `~/.dsh`), jamais celui que l'environnement de l'exécuteur
+  désigne (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` hérités) : un compte déclaré
+  n'hérite pas du compte ambiant (L1078). Ses jauges Codex sont lues dans
+  `<dossier>/sessions` ; le primaire des relevés Claude — le seul compte à qui
+  appartiennent les flux sans marqueur, sessions d'avant L30 — est le profil
+  dont le dossier est le dossier par défaut du harnais, jamais le premier de
+  la liste : une liste réduite au seul secondaire ne lui prend pas ses relevés.
 * Contrôles : dossier à l'utilisateur, **0700**, identifiants présents
   (`.credentials.json` pour Claude, `auth.json` pour Codex : présence
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
@@ -153,7 +184,7 @@ harnais   compte         actif   état     jauges
 claude    primaire       oui     ok       five_hour 37% (rythme 83%), seven_day 35% (rythme 55%)
                                           ↳ perdu à la remise à zéro si rien ne change : five_hour 63 % dans 1 h 21, seven_day 65 % dans 3 j 20 h
 claude    secondaire             ok       —
-                                          ↳ prochain choix pour une nouvelle session : sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 % utilisé, primaire seven_day 35 % utilisé (rythme 55 %)
+                                          ↳ prochain choix pour une nouvelle session : sans relevé : non vérifié, premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire seven_day 35 % utilisé (rythme 55 %)
 claude    tertiaire              ok       —
 ```
 
@@ -168,11 +199,17 @@ passé) compte pour **0 %** : un compte inutilisé dont le dernier relevé date
 d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
 relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
 « codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
+Un relevé **partiel** (une fenêtre remise à zéro, une autre ouverte) est au
+contraire marqué `↳ reading not current: window reset since the reading
+(unverified)` : la valeur lue n'est qu'une borne, et les pertes annoncées
+sont tues tant que le relevé n'est pas rafraîchi (#1561). Chaque relevé porte
+son horodatage (`read_at` : marqueur de compte Claude, date du journal Codex),
+exposé par `accounts list --json` et l'instantané `progress`.
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
-l'exécuteur (`[agent] compte claude : secondaire — sans relevé : 0 % utilisé,
-le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 %
-utilisé, primaire seven_day 35 % utilisé (rythme 55 %)`, ou `— continuité :
+l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
+premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire
+seven_day 35 % utilisé (rythme 55 %)`, ou `— continuité :
 la session reste sur primaire, sous son seuil`), une fois par changement de choix et non à
 chaque sondage. Chaque changement du dernier choix est journalisé en base
 (`account_switches`, type `bascule`, avec la même raison) et dans le fil de
@@ -210,6 +247,9 @@ last resort. Each account takes these optional settings in the host's
 | `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
 | `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
 | `pace_multiplier` [1.0] | multiplies the **elapsed share** of the pace cap: `min(90 %, elapsed × m + 10 points)`. Set per account, no implicit value (#1075: `2.0` on the Codex primary to spend its plan reserve without a reset). The reserve, the fixed caps, the overage rules, the gauges and the reset dates are unchanged |
+| `pace_ceiling` [0.90] | the account's own pace ceiling, replacing the 90 % of the guard (0019): the pace cap is `min(pace_ceiling, elapsed × pace_multiplier + 10 points)` (#1176) |
+| `pace_ceiling_end` [none] | raised ceiling for the **end of the window**: within `pace_ceiling_end_hours` of `resets_at`, the ceiling rises to this value — only when the account's overage is *proven impossible* (see below). `none` (default): no raise, the base ceiling always holds |
+| `pace_ceiling_end_hours` [6] | hours before `resets_at` where `pace_ceiling_end` applies; declared alone (without `pace_ceiling_end`), it is a configuration error |
 
 A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
 on the short window), `cap`, and `overage_cap` when the account may be billed.
@@ -229,6 +269,43 @@ With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
 pauses, but these rules still hold: an account in overage or past `cap` /
 `overage_cap` is never chosen, and with no other account the agent is
 paused (`budget : …`) rather than launched on it.
+
+### End of window: the ceiling rises only when overage is impossible (#1176)
+
+A plan window that ends with unused capacity loses it. `pace_ceiling_end`
+lets the account spend that end of window, but only where no paid overage can
+result. The raise applies to a window when `resets_at` is at most
+`pace_ceiling_end_hours` away and the account's overage is **proven
+impossible by a fresh reading**: the gauge reading itself, with an explicit
+"not capable" flag (Claude `overageStatus` not allowed, Codex
+`credits.has_credits` false) and at least one window still running — a
+reading whose windows have all reset is stale (L71).
+
+An unknown, partial or non-boolean flag is **not** a proof: a Codex `credits`
+object with no `has_credits`/`unlimited`, or non-boolean values, leaves the
+capability unknown (B1, #1176).
+
+The account's `.claude.json` is **not** a source of proof (B2, #1176): its
+`cachedExtraUsageDisabledReason` can date from another window, and the mtime
+of the file dates the container, not the cached value — Claude Code rewrites
+that file for unrelated reasons (adding a single foreign key was enough to
+raise the ceiling while the overage capability stayed unknown). No fresh
+proof tied to the value being demonstrable, the fallback is removed: unknown
+stays unknown.
+
+Anything else — flag absent, unknown, possible overage, stale proof, undated
+window — keeps the base ceiling (`pace_ceiling`), and an account that may be
+billed keeps `overage_cap` (80 %). `overage_impossible` is the single place
+that decides this. The overage refusal (`isUsingOverage`) and the turn cut
+are unchanged: the raise never lets a turn run in overage. A configuration
+declaration (`overage: none`) is *not* a proof: only the harness's own fresh
+reading counts.
+
+`ameesh accounts list` shows the effective ceiling and its reason per gauge
+(`seven_day 91% (pace 88%, ceiling 98%, end of window, overage impossible)`),
+and the pause reason names it too. A pause held by the base ceiling but
+lifted earlier by the raise announces the raise's hour (`until`), not the
+reset.
 
 A session opened before L30 (no account recorded) ran on the harness's
 default folder: its health, gauges and caps are read under the declared
@@ -258,7 +335,8 @@ Bureau's local sprint patch of 2026-10-11 (`~/.config/ameesh/sprint.json`,
 `"short_window_cap": 0.75` on those accounts.
 
 `ameesh accounts list --json` shows `priority`, `overage` (setting, capable,
-in use) and, per gauge, the `cap` the window is held to.
+in use) and, per gauge, the `cap` the window is held to, the effective
+`pace_ceiling` and its `ceiling_reason` (empty for the base ceiling, #1176).
 
 ## 5. Authentication failure: `auth_blocked` (L226b)
 
@@ -455,21 +533,54 @@ update) leaves a helper that no longer exists. Every HTTPS GitHub operation
 then fails on the credential lookup while `gh auth status` stays healthy —
 the sentinel probes `gh`, not `git`, so it sees nothing (incident #1063).
 
-Repair on the host itself, after backing up the global file that carries the
-faulty entry (`~/.gitconfig` or `~/.config/git/config`, shown by the first
-command); the empty line is what clears a helper inherited from another scope:
+Repair on the host itself. `git config --global` reads and writes a single
+file: `GIT_CONFIG_GLOBAL` when it is set, otherwise the first existing of
+`~/.gitconfig` and the XDG file (`$XDG_CONFIG_HOME/git/config`, default
+`~/.config/git/config`), otherwise `~/.gitconfig`, which the first write
+creates. `--global` reads that file alone and does not follow `include.*`
+directives unless `--includes` is given, so the faulty entry can live in a
+file the repair never writes (the shadowed global file, an included file): the
+first command below lists every entry with its file and scope, and the repair
+saves the file it writes plus every global file that carries a credential
+entry. It runs in a subshell with `set -e`, so a failed copy stops it before
+the first modification; the empty value is what clears a helper inherited from
+another scope:
 
 ```sh
-# locate the scope and file holding the frozen helper (global, XDG, system)
+# locate every credential entry, with file and scope (global, XDG, included)
 git config --show-origin --show-scope --get-regexp '^credential\.'
-cfg=$(git config --global --show-origin --get-regexp '^credential\.' |
-      awk -F'\t' 'sub(/^file:/,"",$1) {print $1; exit}')
-[ -n "$cfg" ] && cp "$cfg" "$cfg.bak-$(date +%Y%m%d-%H%M)"
+
+# repair, in a subshell with `set -e`: a failed backup stops the procedure
+(
+set -e
+
+# file `git config --global` reads and writes, i.e. the file repaired
+if [ -n "${GIT_CONFIG_GLOBAL+x}" ]; then
+  target=$GIT_CONFIG_GLOBAL
+elif [ -f "$HOME/.gitconfig" ]; then
+  target=$HOME/.gitconfig
+elif [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/git/config" ]; then
+  target=${XDG_CONFIG_HOME:-$HOME/.config}/git/config
+else
+  target=$HOME/.gitconfig
+fi
+
+# save the repaired file and every global file carrying a credential entry
+stamp=$(date +%Y%m%d-%H%M%S)
+{ printf '%s\n' "$target"
+  git config --show-origin --show-scope --get-regexp '^credential\.' |
+    awk -F'\t' '$1 == "global" && $2 ~ /^file:/ {sub(/^file:/,"",$2); print $2}'
+} | sort -u | while IFS= read -r f; do
+  [ -e "$f" ] || continue
+  cp -p -- "$f" "$f.bak-$stamp"
+done
+
 for url in https://github.com https://gist.github.com; do
   git config --global --replace-all "credential.$url.helper" ""
   git config --global --add "credential.$url.helper" '!gh auth git-credential'
 done
 GIT_TERMINAL_PROMPT=0 git ls-remote https://github.com/<org>/<private-repo> HEAD >/dev/null && echo ok
+)
 ```
 
 The value is single-quoted on purpose: pasted into an interactive shell, a

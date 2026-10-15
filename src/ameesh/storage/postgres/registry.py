@@ -46,6 +46,7 @@ AGENT_COLUMNS = """
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
     extract(epoch from status_since)::float8         as status_since_ts,
+    extract(epoch from status_reason_since)::float8  as status_reason_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
@@ -303,7 +304,8 @@ class Agents(interface.Agents):
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
-                   responsible, team, provider, credential_mode, capabilities, canon_ref,
+                   responsible, team, projects, provider, credential_mode, capabilities,
+                   canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
                    __GOVERNED__ AS canon_governed,
@@ -938,24 +940,31 @@ class Leases(interface.Leases):
 
 class PendingSpend(interface.PendingSpend):
 
-    def put(self, name, start_index, turn, model) -> bool:
-        return self.put_get(name, start_index, turn, model) is not None
+    def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
+        return self.put_get(name, start_index, turn, model,
+                            work_item_id=work_item_id, turn_id=turn_id) is not None
 
-    def put_get(self, name, start_index, turn, model) -> dict | None:
+    def put_get(self, name, start_index, turn, model,
+                work_item_id=None, turn_id=None) -> dict | None:
         """Return THIS marker in its write, before any replacement can change it."""
         rows = self.db.query(
             """
-            INSERT INTO spend_pending (agent, start_index, turn, model, created_at)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
+                                       turn_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (agent) DO UPDATE SET
-                start_index = excluded.start_index,
-                turn        = excluded.turn,
-                model       = excluded.model,
-                created_at  = now()
-            RETURNING agent, start_index, turn, model,
+                start_index  = excluded.start_index,
+                turn         = excluded.turn,
+                model        = excluded.model,
+                work_item_id = excluded.work_item_id,
+                turn_id      = excluded.turn_id,
+                created_at   = now()
+            RETURNING agent, start_index, turn, model, work_item_id, turn_id,
                       extract(epoch from created_at)::float8 as created_ts
             """,
-            (name, int(start_index), turn, model),
+            (name, int(start_index), turn, model,
+             None if work_item_id is None else int(work_item_id),
+             turn_id or None),
         )
         return rows[0] if rows else None
 
@@ -969,7 +978,7 @@ class PendingSpend(interface.PendingSpend):
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT agent, start_index, turn, model,
+            SELECT agent, start_index, turn, model, work_item_id, turn_id,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,
