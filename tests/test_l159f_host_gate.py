@@ -879,6 +879,7 @@ class OnceTurnTest(PgTestCase):
             watchdog_stop=threading.Event(), lease_lost=threading.Event(),
             db=None, name="a1", epoch=7, runner=types.SimpleNamespace(runner_id="r1"),
             _depot_push=mock.Mock(),
+            _release_session_lock=mock.Mock(),  # L82: released with the lease
             _close_resident=mock.Mock())   # L76: nothing outlives the lease
         worker.lease_lost.set()
         with mock.patch.object(runner_mod.registry, "release",
@@ -886,6 +887,7 @@ class OnceTurnTest(PgTestCase):
             self.assertFalse(runner_mod.AgentWorker.release_lease(worker))
         release.assert_called_once_with(None, "a1", "r1", 7)
         worker._depot_push.assert_called_once_with(final=True)
+        worker._release_session_lock.assert_called_once_with()
         worker._close_resident.assert_called_once_with("lease released")
         with mock.patch.object(runner_mod.registry, "release", return_value=False):
             self.assertTrue(runner_mod.AgentWorker.release_lease(worker))  # not ours
