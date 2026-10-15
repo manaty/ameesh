@@ -1248,7 +1248,13 @@ def _declaration(lines: list[str], i: int) -> tuple[str | None, str, int]:
     if _block_header(rest):
         value, j = _block_body(lines, i, col)
         return (name, value, j) if name else (None, "", j)
-    return (name, rest, i + 1) if name else (None, "", i + 1)
+    if not name:
+        return None, "", i + 1
+    # #1247 R2: a flow scalar may go on over the more indented lines, and an
+    # empty value is a node on the next lines; the anchor holds all that text,
+    # which is still read as structure.
+    more, _ = _block_body(lines, i, col)
+    return name, "\n".join(filter(None, (rest, more))), i + 1
 
 
 def _run_bodies(text: str) -> list[str]:
@@ -1278,15 +1284,22 @@ def _run_bodies(text: str) -> list[str]:
         name, token = _node_properties(token)
         if token.startswith("*"):
             alias = token[1:].split("#", 1)[0].strip()
-            if alias in anchors:
-                bodies.append(anchors[alias])
+            if alias not in anchors:
+                # #1247 R2: an anchor the scanner cannot read (sequence item,
+                # flow node) fails the witness instead of dropping the body.
+                raise ValueError(f"run: *{alias}: anchor not readable by the witness")
+            bodies.append(anchors[alias])
             i += 1
             continue
         if token and not _block_header(token):
+            # #1247 R2: a plain or quoted scalar may go on over the more
+            # indented lines.
+            more, j = _block_body(lines, i, col)
+            body = "\n".join(filter(None, (token, more)))
             if name:
-                anchors[name] = token
-            bodies.append(token)
-            i += 1
+                anchors[name] = body
+            bodies.append(body)
+            i = j
             continue
         body, j = _block_body(lines, i, col)
         if name:
@@ -1296,8 +1309,87 @@ def _run_bodies(text: str) -> list[str]:
     return bodies
 
 
+_BRANCH_REF = re.compile(r"github\.(base|head)_ref")
+_BRANCH_REF_ENV = re.compile(r"^\s+[A-Z][A-Z0-9_]*: \$\{\{ github\.(base|head)_ref \}\}$")
+
+
+def _branch_ref_lines_outside_env(text: str) -> list[str]:
+    """Lines naming a branch other than as `NAME: ${{ github.<x>_ref }}`.
+
+    #1247 R2: the forms `_run_bodies` does not parse (flow mapping, quoted
+    key, `run :`) cannot hide a branch name either: outside the environment
+    variable that carries it, alone on its line, any mention fails.
+    """
+    return [line for line in text.splitlines()
+            if _BRANCH_REF.search(line) and not _BRANCH_REF_ENV.match(line)]
+
+
 class RunBodiesTest(unittest.TestCase):
     """#1247: no exotic `run:` body escapes the merge-gate witness."""
+
+    def test_flow_scalar_continuation_lines_are_read(self):
+        # #1247 R2: plain and double-quoted scalars go on over the more
+        # indented lines; `X: ...` is legal inside the quoted one.
+        text = textwrap.dedent("""\
+            jobs:
+              a:
+                steps:
+                  - run: echo start
+                      "${{ github.base_ref }}"
+                  - run: "echo start
+                      HEAD: ${{ github.head_ref }}"
+                    name: next
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(2, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+        self.assertIn("github.head_ref", bodies[1])
+        self.assertNotIn("name:", bodies[1])
+
+    def test_anchor_whose_value_is_on_the_next_lines(self):
+        text = textwrap.dedent("""\
+            x-command: &cmd
+              echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        bodies = _run_bodies(text)
+        self.assertEqual(1, len(bodies))
+        self.assertIn("github.base_ref", bodies[0])
+
+    def test_unreadable_anchor_fails_the_witness(self):
+        # #1247 R2: an anchor on a sequence item is not read; its alias must
+        # not be dropped silently.
+        text = textwrap.dedent("""\
+            x-commands:
+              - &cmd |
+                echo "${{ github.base_ref }}"
+            jobs:
+              a:
+                steps:
+                  - run: *cmd
+            """)
+        with self.assertRaises(ValueError):
+            _run_bodies(text)
+
+    def test_unparsed_forms_fail_the_branch_ref_lines(self):
+        for line in ('      - {name: x, run: "echo ${{ github.base_ref }}"}',
+                     '      - "run": echo ${{ github.head_ref }}',
+                     '      - run : echo ${{ github.base_ref }}',
+                     '      - &cmd |',
+                     '        echo "${{ github.base_ref }}"',
+                     '          BASE_REF: ${{ github.base_ref }} # x',
+                     '          run: ${{ github.head_ref }}'):
+            text = f"jobs:\n  a:\n    steps:\n{line}\n"
+            with self.subTest(line=line):
+                self.assertEqual(
+                    [line] if _BRANCH_REF.search(line) else [],
+                    _branch_ref_lines_outside_env(text))
+        self.assertEqual([], _branch_ref_lines_outside_env(
+            "    env:\n      BASE_REF: ${{ github.base_ref }}\n"
+            "      HEAD_REF: ${{ github.head_ref }}\n"))
 
     def test_block_headers_indicators_and_comment(self):
         text = textwrap.dedent("""\
@@ -1467,6 +1559,7 @@ class WorkflowTest(unittest.TestCase):
         for body in _run_bodies(self.text):
             self.assertNotIn("github.base_ref", body)
             self.assertNotIn("github.head_ref", body)
+        self.assertEqual([], _branch_ref_lines_outside_env(self.text))
 
     def test_lot_branch_triggers_and_full_suite_events(self):
         # L1211 : la PR de lot garde la CI (impactés + contrat, le sélecteur
