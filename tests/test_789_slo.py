@@ -182,6 +182,7 @@ class MesureTest(unittest.TestCase):
         item = _item(state="qa", assignee="executant", updated_ts=T0 + 1200)
         jalons = _jalons(item, events)
         jalons["verdict"], jalons["verdict_kind"] = T0 + 1800, "ok"
+        jalons["verdict_current"] = True  # GO postérieur au dernier gel
         rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1800)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["elapsed_s"], 1800)
