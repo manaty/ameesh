@@ -61,6 +61,21 @@ class _Base(PgTestCase):
             "SELECT body FROM agent_mailbox WHERE recipient = %s AND delivered_at IS NULL "
             "ORDER BY id", (name,))]
 
+    def _touched(self, name: str) -> int:
+        """#885 : les non-lus qu'une réservation a touchés (posée puis rendue,
+        ou soldée) — le témoin du churn : `consigne` ou `deja_consigne`."""
+        return self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox"
+            " WHERE recipient = %s AND delivered_at IS NULL"
+            "   AND (meta ? 'consigne' OR meta ? 'deja_consigne')", (name,))[0]["n"]
+
+    def _backlog(self, name: str, n: int) -> None:
+        """#885 : `n` non-lus ordinaires d'un coup (sans passer par `mail.send`)."""
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " SELECT 'bulk', %s, 'Ordinary backlog ' || i, 'notify', '{}'::jsonb"
+            "   FROM generate_series(1, %s) i", (name, n))
+
 
 class MidTurnHookTest(_Base):
     def _mail(self, name: str) -> None:
@@ -91,6 +106,37 @@ class MidTurnHookTest(_Base):
                 self.assertEqual(stop["decision"], "block")
                 self.assertIn("Ordinary progress note.", stop["reason"])
                 self.assertEqual(self._pending(name), [])
+
+    def test_verdict_behind_two_hundred_unread_is_seen_mid_turn(self):
+        """#885 : le verdict est derrière plus de `UNREAD_LIMIT` non-lus ; il
+        est vu au point sûr, et le retard ordinaire n'est pas touché (aucune
+        réservation, aucune libération : pas de churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "deep-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 250)
+                mail.send(self.db, "codex-review", name, "Verdict beyond 200.",
+                          payload={"verdict": True})
+                context = json.loads(self._hook(worker, harness, "PostToolUse")
+                                     )["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("Verdict beyond 200.", context)
+                self.assertNotIn("Ordinary backlog", context)
+                self.assertEqual(len(self._pending(name)), 250)
+                self.assertEqual(self._touched(name), 0)
+
+    def test_ordinary_mail_does_not_churn_the_reservation(self):
+        """#885 : deux points sûrs sans rien d'urgent n'écrivent RIEN — l'ancien
+        chemin réservait jusqu'à 200 non-lus puis les relâchait (le churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "churn-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 3)
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._touched(name), 0)
+                self.assertEqual(len(self._pending(name)), 3)
 
     def test_owner_mail_alone_interrupts_a_dsh_turn(self):
         for harness in ("deepseek", "codex"):

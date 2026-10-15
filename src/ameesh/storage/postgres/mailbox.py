@@ -148,6 +148,25 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def unread_mid_turn(self, recipient, limit) -> list[dict]:
+        """L514/#885 : le filtre de `mail.mid_turn` DANS la requête — un
+        verdict, un arbitrage, un message humain ou urgent, sans borne sur les
+        autres non-lus (les 200 premiers ne sont pas un plafond de lecture)."""
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox
+            WHERE recipient = %%s AND delivered_at IS NULL
+              AND (payload @> '{"urgent": true}'::jsonb
+                   OR payload @> '{"human": true}'::jsonb
+                   OR payload @> '{"verdict": true}'::jsonb
+                   OR payload @> '{"arbitration": true}'::jsonb)
+            ORDER BY id
+            LIMIT %%s
+            """ % MAIL_COLUMNS,
+            (recipient, int(limit)),
+        )
+
     def get(self, message_id) -> dict | None:
         rows = self.db.query("SELECT %s FROM agent_mailbox WHERE id = %%s" % MAIL_COLUMNS,
                              (int(message_id),))
