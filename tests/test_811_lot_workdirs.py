@@ -21,6 +21,10 @@ def card(policy):
                            host=lambda name: SimpleNamespace(policy=policy))
 
 
+#: #540 : plusieurs lots non démarrés au même agent, forcés (comme test_l165c)
+_FORCE = "test: several lots for one agent (#540)"
+
+
 class DestinationTest(unittest.TestCase):
     def setUp(self):
         self.agent = dict(name='worker', projects=['alpha', 'beta'], cwd='/primary', host='banc')
@@ -107,8 +111,12 @@ class RoutingTest(sessions._Base):
         patcher = mock.patch('ameesh.canon.load_configured', return_value=[card(self.policy)])
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.a = work.add(self.db, title='A', app='alpha', assignee='worker')['id']
-        self.b = work.add(self.db, title='B', app='beta', assignee='worker')['id']
+        # #540 : deux lots non démarrés au même agent — le second irait à la
+        # file d'équipe sans forçage motivé (même convention que test_l165c).
+        self.a = work.add(self.db, title='A', app='alpha', assignee='worker',
+                          force=_FORCE)['id']
+        self.b = work.add(self.db, title='B', app='beta', assignee='worker',
+                          force=_FORCE)['id']
 
     def test_switch_and_resume_use_destination_cwd(self):
         self.tour(self.worker, self.a, 'start A', session='session-A')
