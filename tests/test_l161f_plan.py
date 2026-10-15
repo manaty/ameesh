@@ -1819,15 +1819,19 @@ class LotBranchTest(unittest.TestCase):
         self.assertIn(f"candidates: `{self.mods[0]}`", text)
 
     def test_parts_shrink_to_the_estimate(self):
+        # Liste fixe (#1800) : le témoin porte sur la formule de découpage
+        # (235 modules × 2 s = 470 s -> deux parts), pas sur l'inventaire du
+        # dépôt, qui grandit à chaque paquet et ferait basculer l'attente.
+        # Noms synthétiques : test_count, qui lit un fichier réel, est neutralisé.
+        mods = [f"test_fixe_{i:03d}" for i in range(235)]
+
         def card(seconds):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
-                                for m in self.mods}}
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts ; la tranche fixe garde le
-        # test indépendant du nombre de modules du dépôt (314 au 15/10, et
-        # chaque lot qui ajoute un module de test le faisait basculer à 3)
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:235], card(2.0)), 2)
-        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
+                                for m in mods}}
+        with mock.patch.object(plan.parts, "test_count", lambda module, tests=None: 1):
+            self.assertEqual(plan.lot_part_count("psycopg", mods[:10], card(1.0)), 1)
+            self.assertEqual(plan.lot_part_count("psycopg", mods, card(2.0)), 2)
+            self.assertGreaterEqual(plan.lot_part_count("psycopg", mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
         # un lot très large (60 s par module) reste dans PARTS : quatre parts
