@@ -3080,6 +3080,7 @@
    },
    "rules": [
     "author = agent:<agent de l'enveloppe> (membre du fil, `fil.member`) ; le nom nu est aussi admis",
+    "count faux (L361c) : trace de la boîte et `location` seulement — ni `entries` ni `last_*`, que le census de `threads.recount` écrit seul",
     "session : l'enveloppe porte l'agent et l'epoch du jeton"
    ],
    "session": true
@@ -3174,8 +3175,8 @@
     "natural": true
    },
    "rules": [
-    "L361b : verrou de la ligne, recomptage et expiration de l'index en une seule transaction ; le fichier a déjà été réécrit par l'appelant, sous son propre verrou",
-    "le census de l'hôte (`kept`, `last`, `end`) fait foi : un `counted_until` au-delà de `end` (recomptage plus récent) n'est pas repris",
+    "L361b/L361c : verrou de la ligne, census du fichier et écriture de l'index en une seule transaction — expiration (fichier réécrit) comme indexation (entrée écrite, #877) ; le fichier a déjà été écrit par l'appelant, sous son propre verrou",
+    "le census de l'hôte (`kept`, `last`, `end`) fait foi : un `counted_until` au-delà de `end` (recomptage plus récent) n'est pas repris ; à `end` égal, un census qui rallonge la ligne (`kept > entries`) a été lu avant une expiration de même fin et n'est pas repris (L361c)",
     "portée H : l'hôte est celui de l'exécuteur ; l'opération ne touche pas aux autres hôtes"
    ],
    "session": true
