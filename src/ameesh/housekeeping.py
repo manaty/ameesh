@@ -2743,10 +2743,7 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
 
 
 def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
-                    only_turn: str | None = None,
-                    agents_in_turn: set | None = None,
-                    idle_s: float = DEFAULT_ORPHAN_IDLE_S,
-                    now: float | None = None) -> dict:
+                    only_turn: str | None = None) -> dict:
     """Conteneurs de l'hôte (L73) : ceux qu'un tour d'ameesh a lancés
     (étiquette `ameesh.turn`) sont supprimés une fois leur tour fini — ou,
     s'ils portent `ameesh.lot`, une fois le lot fini ; les autres sont
@@ -2755,12 +2752,11 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     #1411 : le relevé couvre aussi les conteneurs ARRÊTÉS (`ps -a`) — un
     conteneur étiqueté sorti ou jamais démarré ne consomme plus de
     processus, mais retient sa couche et ses volumes anonymes, et restait
-    invisible du ménage comme de la mesure. Une base de test d'un lot encore
-    ouvert (L73) n'est plus gardée sans fin quand plus rien ne l'utilise :
-    elle est retirée si son tour est fini, qu'aucun agent ne tourne sur cet
-    hôte (`agents_in_turn`, None : inconnu, on garde) et que son agent n'a
-    plus tourné depuis `idle_s` — preuves de fin de tour et d'absence
-    d'usage. Sans agent connu, ou sur un lot inconnu, elle attend.
+    invisible du ménage comme de la mesure. Une base de test d'un lot ENCORE
+    OUVERT reste gardée jusqu'à la fin du lot (L73) : une photographie de
+    l'état des tours ne prouve pas l'absence d'usage d'un hôte entier, et
+    rien ne l'exclut d'un démarrage de tour qui suivrait le constat (R1
+    #1411). On ne détruit donc pas sur cette photographie.
 
     Un conteneur étiqueté par un tour INCONNU de cette base, ou d'un autre
     hôte, n'est pas supprimé (signalé). Rend `{entries, plan, ameesh,
@@ -2771,39 +2767,9 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     rows = runtime.list_all(stopped=True)
     if rows is None:
         return out
-    if now is None:
-        now = time.time()
-    en_tour = None if agents_in_turn is None else set(agents_in_turn)
     binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
     ours, others = [], []
     turns = storage.of(db).turn_resources
-    busy: dict = {}
-
-    def usage(agent: str | None):
-        """#1411 : `(raison de garder, secondes depuis le dernier tour fini)`
-        — la raison est None quand l'absence d'usage est prouvée (aucun tour
-        en cours de l'agent sur cet hôte, dernier tour fini depuis au moins
-        `idle_s`). Sans agent connu, rien n'est prouvé."""
-        if not agent:
-            return "agent unknown", None
-        if agent in busy:
-            return busy[agent]
-        open_rows = turns.open_by_agent(agent)
-        if open_rows:
-            found = ("turn %s in progress"
-                     % str(open_rows[0].get("turn_id"))[:8], None)
-        else:
-            last = turns.last_ended(host, agent)
-            ended = (float(last["ended_ts"])
-                     if last and last.get("ended_ts") is not None else None)
-            if ended is None:
-                found = ("no finished turn known", None)
-            elif now - ended < idle_s:
-                found = ("last turn ended %s ago" % fmt_idle(now - ended), None)
-            else:
-                found = (None, now - ended)
-        busy[agent] = found
-        return found
     for c in rows:
         labels = c.get("labels") or {}
         turn = labels.get("ameesh.turn")
@@ -2830,26 +2796,11 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
         if lot:
             state = _lot_state(db, lot)
             if state not in LOT_ENDED:
-                if state is None:
-                    detail = "lot #%s unknown: flagged only" % lot
-                    ours.append(dict(base, action="signalé", detail=detail))
-                    out["plan"].append(dict(base, action="signalé", detail=detail))
-                    continue
-                owner = row.get("agent") or agent
-                held, quiet = usage(owner)
-                if held is None and en_tour is None:
-                    held = "turn state unknown"
-                if held is None and [n for n in en_tour if n != owner]:
-                    held = "another turn is in progress on this host"
-                if held is not None:
-                    detail = "lot #%s %s; %s" % (lot, state, held)
-                    ours.append(dict(base, action="attend", detail=detail))
-                    out["plan"].append(dict(base, action="attend", detail=detail))
-                    continue
-                why = ("lot #%s %s, no turn of %s for %s"
-                       % (lot, state, owner, fmt_idle(quiet)))
-            else:
-                why = "lot #%s %s" % (lot, state)
+                detail = "lot #%s %s" % (lot, state or "unknown")
+                ours.append(dict(base, action="attend", detail=detail))
+                out["plan"].append(dict(base, action="attend", detail=detail))
+                continue
+            why = "lot #%s %s" % (lot, state)
         else:
             why = "turn %s finished" % turn[:8]
         out["plan"].append(dict(base, action="suppression", detail=why))
@@ -2916,9 +2867,6 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
 
     `dry_run` : rien n'est supprimé ni écrit en base ; le plan est rendu."""
     now = time.time() if now is None else float(now)
-    # #1411 : None = on ne sait pas qui tourne (repli prudent pour les bases
-    # de lot) ; un ensemble, même vide, est une preuve d'absence de tour.
-    turn_state = None if agents_in_turn is None else set(agents_in_turn)
     agents_in_turn = set(agents_in_turn or ())
     entries: list[dict] = []
     plan: list[dict] = []
@@ -3114,9 +3062,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         plan += art["plan"]
         skipped += art["skipped"]
     # 4. conteneurs : ceux des tours d'ameesh finis supprimés, autres signalés
-    conteneurs = reap_containers(runtime, db, host, dry_run=dry_run,
-                                 agents_in_turn=turn_state,
-                                 idle_s=policy.orphan_idle, now=now)
+    conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
     # 5. /tmp entries signaled during a turn (L162): unattributed ones are

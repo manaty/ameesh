@@ -2619,13 +2619,6 @@ class TurnResources(Domain):
         """Les lignes encore `running` d'un agent, la plus récente d'abord."""
 
     @abc.abstractmethod
-    def last_ended(self, host: str, agent: str) -> dict | None:
-        """#1411 : la ligne du dernier tour FINI de cet agent sur cet hôte
-        (`ended_at` le plus récent, délai de grâce compris), ou None — preuve
-        d'absence d'usage d'une base de test rattachée à un lot encore
-        ouvert."""
-
-    @abc.abstractmethod
     def orphans(self, host: str | None = None, limit: int = 50) -> list[dict]:
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
 
