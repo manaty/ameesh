@@ -1,0 +1,247 @@
+diff --git a/src/ameesh/alert_briefs.py b/src/ameesh/alert_briefs.py
+index be690f3f..0f8550d8 100644
+--- a/src/ameesh/alert_briefs.py
++++ b/src/ameesh/alert_briefs.py
+@@ -55,7 +55,12 @@ def _workstream(row: dict) -> str:
+ 
+ def _of_teams(orchestras, by_name: dict, teams: set) -> list:
+     """Les orchestrateurs d'une des équipes (ou sans équipe) ; sans équipe
+-    connue, tous."""
++    connue, tous.
++
++    `orchestras` vient de `sous_utilisation.alert_orchestrators` (#1114) :
++    l'historique d'attribution ne confère pas le rôle, donc un agent sans
++    équipe n'est ici qu'un hub explicitement déclaré (rôle au canon ou
++    `AMEESH_ALERT_ORCHESTRATORS`), jamais un assigneur récent."""
+     if not teams:
+         return list(orchestras)
+     return [o for o in orchestras if not _team(by_name, o) or _team(by_name, o) in teams]
+diff --git a/src/ameesh/exploitation.py b/src/ameesh/exploitation.py
+index 0503b6eb..3a5200ec 100644
+--- a/src/ameesh/exploitation.py
++++ b/src/ameesh/exploitation.py
+@@ -315,7 +315,7 @@ def _estimate_bias(cfg, db, listing, orchestras, *, declared=()) -> list[dict]:
+     if ref is None or not ref["body"].get("bias"):
+         return []
+     if orchestras is None:
+-        orchestras = sous_utilisation.orchestrators(cfg, db, listing, declared=declared)
++        orchestras = sous_utilisation.alert_orchestrators(cfg, db, listing, declared=declared)
+     low, high = ref["body"].get("bias_range") or (estimates.BIAS_LOW, estimates.BIAS_HIGH)
+     out = []
+     for e in ref["body"]["bias"]:
+@@ -469,7 +469,7 @@ def alerts(cfg: Config, db, *, long_turn_s: float = DEFAULT_LONG_TURN_S,
+         action = stale_action(lot)
+         if orchestras is None:
+             # L132 : le lot stagnant part aussi aux orchestrateurs (alert_briefs)
+-            orchestras = sous_utilisation.orchestrators(
++            orchestras = sous_utilisation.alert_orchestrators(
+                 cfg, db, listing, declared=underuse.get("orchestrators_declared") or ())
+         out.append(_alert(
+             "stale_lot", lot["assignee"], lot["last_activity_ts"], lot["idle_s"], stale_lot_s,
+@@ -517,7 +517,7 @@ def alerts(cfg: Config, db, *, long_turn_s: float = DEFAULT_LONG_TURN_S,
+     if critical_paused:
+         # L242b (5) : le courrier part aussi aux orchestrateurs (alert_briefs)
+         if orchestras is None:
+-            orchestras = sous_utilisation.orchestrators(
++            orchestras = sous_utilisation.alert_orchestrators(
+                 cfg, db, listing, declared=underuse.get("orchestrators_declared") or ())
+         for alert in critical_paused:
+             alert["orchestrators"] = list(orchestras)
+@@ -559,7 +559,7 @@ def _module_deviations(cfg, db, listing, *, declared=()):
+     findings = modules.audit(db)
+     if not findings:
+         return []
+-    orchestras = sous_utilisation.orchestrators(cfg, db, listing, declared=declared)
++    orchestras = sous_utilisation.alert_orchestrators(cfg, db, listing, declared=declared)
+     by_name = {row["name"]: row for row in listing}
+     for finding in findings:
+         finding["schema"] = ALERT_SCHEMA
+@@ -1059,7 +1059,8 @@ def _waiting_without_question(cfg, db, listing, now: float, orchestras, *,
+     out: list[dict] = []
+     for item in unasked:
+         if orchestras is None:
+-            orchestras = sous_utilisation.orchestrators(cfg, db, listing, declared=declared)
++            orchestras = sous_utilisation.alert_orchestrators(
++                cfg, db, listing, declared=declared)
+         episode = episodes.get(int(item["id"])) or {}
+         since = episode.get("start_ts")
+         first = episode.get("first_ts") or since
+diff --git a/src/ameesh/sous_utilisation.py b/src/ameesh/sous_utilisation.py
+index 6c83803b..757f6cda 100644
+--- a/src/ameesh/sous_utilisation.py
++++ b/src/ameesh/sous_utilisation.py
+@@ -349,7 +349,12 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
+     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
+     `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
+     a confié des lots (délégation ou `work assign`) dans les 30 derniers
+-    jours, sauf avec `history=False` (#740). Seulement des agents du registre."""
++    jours, sauf avec `history=False` (#740). Seulement des agents du registre.
++
++    Modèle de rôle (autorité : correction, plan, analyse) : il inclut
++    l'historique. Pour les **destinataires d'alerte**, l'historique ne confère
++    pas le rôle : `alert_orchestrators` (#1114), qui exclut les assigneurs
++    récents non déclarés."""
+     names = {row["name"] for row in listing}
+     found = {_bare(n) for n in declared or () if n}
+     if canons is None:
+@@ -371,6 +376,22 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
+     return sorted(n for n in found if n in names and n not in chats)
+ 
+ 
++def alert_orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
++    """Les orchestrateurs qui peuvent recevoir une alerte : déclarés
++    (`--orchestrators`, `AMEESH_ALERT_ORCHESTRATORS`) ou rôle `orchestrateur`
++    d'une fiche Agent du canon. L'historique des lots confiés (30 jours) ne
++    confère pas ce rôle (#1114) : un agent qui a seulement assigné récemment
++    n'est pas un destinataire, et ne peut donc pas entrer dans la boucle
++    « recevoir l'alerte pousse à assigner, ce qui entretient la liste ».
++
++    Le repli « sans équipe » d'`alert_briefs._of_teams` ne s'applique plus
++    qu'aux agents présents ici : un hub sans équipe (bureau) est donc admis
++    seulement par déclaration explicite — rôle au canon ou
++    `AMEESH_ALERT_ORCHESTRATORS` —, jamais par le seul historique."""
++    return orchestrators(cfg, db, listing, declared=declared, canons=canons,
++                         history=False)
++
++
+ def orchestrator_held(listing: list, now: float, orchestras: list, *,
+                       held_s: float = DEFAULT_ORCHESTRATOR_HELD_S) -> list:
+     if held_s <= 0:
+@@ -824,8 +845,8 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
+     paid = paid_harnesses(getattr(cfg, "host", None))
+     out = plan_underused(db, listing, now, tail_s=plan_tail_s, used_pct=plan_used_pct,
+                          pace_gap_pct=plan_pace_gap_pct, paid=paid, held=held)
+-    orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
+-                               canons=canons)
++    orchestras = alert_orchestrators(cfg, db, listing, declared=orchestrators_declared,
++                                     canons=canons)
+     for alert in out:
+         # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
+         alert["orchestrators"] = list(orchestras)
+diff --git a/src/ameesh/undeliverable.py b/src/ameesh/undeliverable.py
+index a14e0958..bc1b4135 100644
+--- a/src/ameesh/undeliverable.py
++++ b/src/ameesh/undeliverable.py
+@@ -117,14 +117,15 @@ def declared_orchestrators() -> tuple:
+ 
+ 
+ def known_orchestrators(cfg, db, rows: list, *, declared=None, canons=None) -> list[str]:
+-    """Les orchestrateurs connus (`sous_utilisation.orchestrators` : déclarés,
+-    rôle `orchestrateur` au canon, ou agents qui ont confié des lots) parmi
+-    `rows` (lignes du registre)."""
++    """Les orchestrateurs destinataires d'alerte
++    (`sous_utilisation.alert_orchestrators` : déclarés ou rôle
++    `orchestrateur` au canon) parmi `rows` (lignes du registre). L'historique
++    des lots confiés ne confère pas ce rôle (#1114)."""
+     from . import sous_utilisation as su
+     if declared is None:
+         declared = declared_orchestrators()
+     try:
+-        return su.orchestrators(cfg, db, rows, declared=declared, canons=canons)
++        return su.alert_orchestrators(cfg, db, rows, declared=declared, canons=canons)
+     except db_mod.SchemaMissing:
+         raise
+     except Exception:  # un canon illisible ne fait pas tomber l'envoi ni l'alerte
+@@ -133,8 +134,9 @@ def known_orchestrators(cfg, db, rows: list, *, declared=None, canons=None) -> l
+ 
+ def team_orchestrators(rows: list, known: list[str], teams, *, exclude=()) -> list[str]:
+     """Parmi les orchestrateurs `known`, ceux qui servent l'une des `teams` :
+-    même équipe, ou sans équipe (ils servent tout le monde) ; `teams` vide :
+-    tous. Jamais un agent arrêté (il ne lit pas son courrier), ni `exclude`."""
++    même équipe, ou sans équipe (un hub explicitement déclaré, #1114) ;
++    `teams` vide : tous. Jamais un agent arrêté (il ne lit pas son courrier),
++    ni `exclude`."""
+     by_name = {row["name"]: row for row in rows}
+     wanted = {team for team in teams or () if team}
+     out = []
+diff --git a/tests/test_l26_exploitation.py b/tests/test_l26_exploitation.py
+index 0500364d..53b88356 100644
+--- a/tests/test_l26_exploitation.py
++++ b/tests/test_l26_exploitation.py
+@@ -18,7 +18,7 @@ import time
+ import unittest
+ from unittest import mock
+ 
+-from ameesh import adapters, balance, cost, exploitation, mail, registry, stagnation
++from ameesh import adapters, alert_briefs, balance, cost, exploitation, mail, registry, stagnation
+ from ameesh import storage, work
+ from ameesh.runner import AgentWorker, Runner
+ 
+@@ -650,6 +650,26 @@ class AlertesTest(_Base):
+         self.assertFalse([a for a in exploitation.alerts(self.cfg, self.db)
+                           if a["type"] == "stale_lot"])
+ 
++    def test_stale_lot_sans_role_par_historique(self):
++        # #1114 : l'historique d'attribution (30 j) ne confère pas le rôle de
++        # destinataire ; un hub sans équipe n'est admis que déclaré.
++        self._etat()
++        self.register("a-hub", "claude", cwd=self._cwd("a-hub"))
++        autre = work.add(self.db, title="Lot confié", app="p")
++        work.assign(self.db, autre["id"], "a-hub", actor="agent:a-hub")
++        stale = [a for a in exploitation.alerts(self.cfg, self.db)
++                 if a["type"] == "stale_lot"]
++        self.assertEqual(len(stale), 1)
++        self.assertNotIn("a-hub", stale[0]["orchestrators"])
++        listing = storage.of(self.db).operations.listing()
++        self.assertEqual(alert_briefs.briefs(stale[0], listing), {})
++        stale = [a for a in exploitation.alerts(self.cfg, self.db,
++                                                orchestrators_declared=("a-hub",))
++                 if a["type"] == "stale_lot"]
++        self.assertEqual(len(stale), 1)
++        self.assertIn("a-hub", stale[0]["orchestrators"])
++        self.assertEqual(sorted(alert_briefs.briefs(stale[0], listing)), ["a-hub"])
++
+     def test_cli_un_objet_json_par_ligne(self):
+         self._etat()
+         proc = self.mesh("alerts", "--json")
+diff --git a/tests/test_l94_underuse.py b/tests/test_l94_underuse.py
+index 7d0cc54b..b6829f86 100644
+--- a/tests/test_l94_underuse.py
++++ b/tests/test_l94_underuse.py
+@@ -254,6 +254,46 @@ class IdleCapacityTest(_Base):
+         self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing()),
+                          ["orch"])
+ 
++    def test_destinataires_d_alerte_sans_role_par_historique(self):
++        # #1114 : l'historique des lots confiés (30 j) ne confère pas le rôle
++        # de destinataire d'alerte ; le modèle de rôle (`orchestrators`) le
++        # garde pour l'autorité (correction, plan, analyse).
++        self.agent("claude1")
++        self.agent("autre")
++        self.agent("orch", status="running", owner="attach:proprio@poste", since_s=3 * HEURE)
++        lot = work.add(self.db, title="lot")
++        work.assign(self.db, lot["id"], "autre", actor="agent:orch")
++        work.add(self.db, title="à prendre")       # lot ouvert sans agent : idle_capacity
++
++        class Fiche:
++            def __init__(self, data):
++                self.data = data
++
++        class Agent:
++            def __init__(self, title, roles):
++                self.title, self.fiche = title, Fiche({"roles": roles})
++
++        class Canon:
++            agents = [Agent("orch", ["implementation"])]
++
++        class CanonOrch:
++            agents = [Agent("orch", ["orchestrateur"])]
++
++        self.assertEqual(sous_utilisation.orchestrators(self.cfg, self.db, self.listing(),
++                                                        canons=[Canon()]), ["orch"])
++        self.assertEqual(sous_utilisation.alert_orchestrators(
++            self.cfg, self.db, self.listing(), canons=[Canon()]), [])
++        # le rôle déclaré au canon, lui, reste admis
++        self.assertEqual(sous_utilisation.alert_orchestrators(
++            self.cfg, self.db, self.listing(), canons=[CanonOrch()]), ["orch"])
++        # claude1 est au repos sans lot : l'alerte ne prend pas l'assigneur
++        repos = _types(self.alertes(), "idle_capacity")
++        self.assertEqual(len(repos), 1)
++        self.assertEqual(repos[0]["orchestrators"], [])
++        # déclaré explicitement (hub sans équipe) : destinataire, et pas par historique
++        repos = _types(self.alertes(orchestrators_declared=("orch",)), "idle_capacity")
++        self.assertEqual(repos[0]["orchestrators"], ["orch"])
++
+ 
+ class HostUnderusedTest(_Base):
+     def releve(self, host, *, load, cpus=4, turns=0, ago_s=0, mem=8 * 1024 ** 3):
