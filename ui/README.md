@@ -30,9 +30,10 @@ is rendered literally. These screens do not expose write actions.
 Views using the same client share one `/api/v1/events` connection. Event bursts
 coalesce into at most one scheduled refresh per second per view; a change during
 a read schedules another read afterward. Reconnection and `reset` also reload
-the snapshot. Removing the last view aborts the stream. A missing SSE endpoint
+the snapshot. Replacing a view during navigation keeps the shared stream;
+removing the last view aborts it after the current DOM update. A missing SSE endpoint
 keeps the initial snapshot and manual Refresh button available with a visible
-status. L85 (#373) is required to validate this against the real event service.
+status. The live service is supplied by L85 (#373).
 
 Run `npm run typecheck`, `npm test`, `npm run build`, then `npm run check` in
 `ui/`. The build is committed in `src/ameesh/ui/static/` for Python packaging.

@@ -68,8 +68,26 @@ test("mounted views share a live stream, refresh after events and stop it on rem
   assert.ok(fetch.calls.length > before);
   assert.match(text(a), /Unread\s*8/);
   a.remove(); assert.equal(streams[0].signal.aborted, false);
-  b.remove(); assert.equal(streams[0].signal.aborted, true);
+  b.remove(); await Promise.resolve(); assert.equal(streams[0].signal.aborted, true);
   routes["/api/v1/projects"][1].projects[0].unread = 3;
+});
+
+test("replacing the last mounted view keeps its stream until navigation finishes", async () => {
+  const { client, streams } = fixture({}, { live: true });
+  const first = await mount("ameesh-projects", client);
+  first.remove();
+  const next = document.createElement("ameesh-alerts");
+  next.client = client;
+  document.querySelector("main").append(next);
+  await settle(next);
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0].signal.aborted, false);
+  streams[0].send("alert.raised");
+  await settle(next);
+  assert.match(text(next), /Live/);
+  next.remove();
+  await Promise.resolve();
+  assert.equal(streams[0].signal.aborted, true);
 });
 
 test("switching a selection aborts the old request and cannot display its late data", async () => {

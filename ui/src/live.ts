@@ -39,8 +39,15 @@ export function subscribe(client: Client, listener: Listener): () => void {
   return () => {
     current.listeners.delete(listener);
     if (!current.listeners.size) {
-      current.abort.abort();
-      hubs.delete(client);
+      // Lit replaces a view synchronously: let its successor join this
+      // stream before closing it, so navigation does not fill the server's
+      // stream slots with connections waiting for their next heartbeat.
+      queueMicrotask(() => {
+        if (!current.listeners.size && hubs.get(client) === current) {
+          current.abort.abort();
+          hubs.delete(client);
+        }
+      });
     }
   };
 }
