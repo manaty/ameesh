@@ -197,6 +197,23 @@ class IdleCapacityTest(_Base):
         return _types(exploitation.alerts(self.cfg, self.db, now=self.now, **_seuils(**kw)),
                       "idle_capacity", "orchestrator_held")
 
+    def test_lot_planifie_suit_l_horloge_de_l_alerte(self):
+        from ameesh import plan
+        self.agent("claude1")
+        lot = work.add(self.db, title="lot planifie")
+        jour = time.strftime("%Y-%m-%d", time.localtime(self.now + 3 * JOUR))
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        (jour, lot["id"]))
+        debut = plan.day_start_ts(jour)
+        listing = self.listing()
+        # L'horloge du passage franchit la date, celle du poste reste avant.
+        with mock.patch("ameesh.planned_waits.time.time", return_value=debut - JOUR):
+            self.assertEqual(sous_utilisation.idle_capacity(
+                self.db, listing, debut - JOUR, [], paid=("deepseek",)), [])
+            out = sous_utilisation.idle_capacity(
+                self.db, listing, debut, [], paid=("deepseek",))
+        self.assertEqual([a["lots"] for a in out], [[lot["id"]]])
+
     def test_lots_sans_assigne(self):
         self.agent("claude1")
         self.agent("codex2", "codex")

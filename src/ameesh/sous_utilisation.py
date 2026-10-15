@@ -567,7 +567,7 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     if lots is None:
         lots = storage.of(db).operations.open_lots_activity(500)
-    waiting_lots = waiting_project_lots(lots, db=db)
+    waiting_lots = waiting_project_lots(lots, db=db, now=now)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None
