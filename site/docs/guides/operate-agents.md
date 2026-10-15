@@ -88,6 +88,7 @@ Each agent row keeps the historical keys and adds:
 | `harness`, `model`, `effort`, `tier` | harness and settings, or `null` |
 | `session_policy`, `session_policy_set` | effective policy; the agent's own setting or `null` |
 | `state` | `working`, `idle`, `paused` or `stopped` (same rules as `ameesh progress`) |
+| `paused_on_budget` | `true` when the agent's turn is held by the budget/pace guard (status `blocked`, text `budget : …`, L242b); a `blocked` for another cause (host not ready, authentication) stays `false` (#1070) |
 | `state_since_ts`, `state_for_s` | since when |
 | `lot` | `{id, title, state, source}`: the session's lot (`"session"`) unless it is merged or closed, else the most recent open lot assigned (`"assigned"`), or `null` |
 | `title` | title of the current lot, else the status text |
@@ -99,7 +100,9 @@ Each agent row keeps the historical keys and adds:
 | `stop_reason` | `manuel`, `bail_expire`, `retire_du_canon` (`externe`, `erreur` reserved), or `null` while the agent runs (v1.4.0) |
 
 The text view of `ameesh list` counts the lots once at the bottom and shows,
-for each agent, a **LOTS** column with its open assigned lots.
+for each agent, a **LOTS** column with its open assigned lots. A budget-paused
+agent reads `paused/…` in the STATUS column (never the truncated
+`blocked/bud`); a `blocked` for another cause stays `blocked/…` (#1070).
 
 ## Cost per turn, plan gauges, provider balance
 
