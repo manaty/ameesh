@@ -140,8 +140,23 @@ dans le canon :
   seulement celles du compte choisi. Le profil est revalidé à chaque
   lancement, garde de budget active ou non : un profil invalide refuse le
   tour (consigne remise en attente, diagnostic dans `ameesh show`).
-* La bascule demande `ameesh migrate` (migration 0028) et un redémarrage de
-  l'exécuteur pour relire la configuration.
+* La bascule demande `ameesh migrate` (migration 0028). La configuration de
+  l'hôte est relue à chaud (#1466) : un compte ajouté, retiré ou corrigé dans
+  `config.json` prend effet au tour suivant, sans redémarrage de l'exécuteur.
+  Seuls les comptes, les plafonds, les rôles critiques et les binaires de
+  harnais suivent la relecture : la base, le schéma, le dossier d'état et les
+  cadences sont ceux du démarrage.
+* Profils (#1466) : un exécuteur peut être lancé sur un fichier nommé
+  (`AMEESH_CONFIG`) rangé sous `~/.config/ameesh/runner-profiles/`. Ce
+  **profil** est une superposition : les clés qu'il ne déclare pas — les
+  comptes, notamment — viennent de `config.json`. Une clé déclarée par le
+  profil l'emporte (une isolation voulue se déclare), et l'écart est affiché
+  par `ameesh doctor`, `ameesh accounts list` et le journal de l'exécuteur ;
+  un profil qui écrase `accounts` est signalé en clair. `"inherit": false`
+  rend un profil autonome ; `"inherit": true` force l'héritage ; une chaîne
+  nomme une autre base. Un fichier hors du dossier des profils reste autonome :
+  le banc de tests, et la configuration d'une autre base rangée à côté de
+  `config.json`, ne lisent jamais la configuration du poste.
 
 ## 3. Suivre et forcer
 
