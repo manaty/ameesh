@@ -10,6 +10,7 @@ Les gardes ne bougent pas : un compte au seuil reste hors du classement, et
 l'ordre déclaré (L226b « primaries last ») reste le départage à budget égal.
 """
 import unittest
+from types import SimpleNamespace
 
 from ameesh import accounts, cost
 
@@ -107,6 +108,35 @@ class OrdreDuChoixTest(unittest.TestCase):
         self.assertEqual([p.name for p in ranked], ["tertiaire", "secondaire", "primaire"])
         self.assertIn("first in the failover order",
                       accounts.reason_of(ranked, evs, self.NOW))
+
+    def test_forecast_uses_the_same_caps_as_the_choice(self):
+        """The primary's fixed cap reverses the order of the raw usage ratios."""
+        cfg = SimpleNamespace(host="test", accounts={"claude": [
+            {"name": "primaire", "cap": 0.50, "priority": 100},
+            {"name": "tertiaire", "cap": 0.90, "priority": 10},
+        ]})
+        gauges = {"primaire": [_gauge(0.20, 0.1 * WEEK)],
+                  "tertiaire": [_gauge(0.30, 0.1 * WEEK)]}
+        evaluations = {}
+
+        def evaluate(book, profile, items, now, **kwargs):
+            result = accounts.Evaluation(
+                profile, gauges=gauges[profile.name],
+                limits=accounts.limits(profile, gauges[profile.name], now))
+            evaluations[profile.name] = result
+            return result
+
+        rows = accounts.report(cfg, None, None, now=self.NOW, evaluate_fn=evaluate,
+                               record=False)
+        items = accounts.parse(cfg.accounts)["claude"]
+        ranked = accounts.rank(items, evaluations, self.NOW)
+        # Actual ratios: primary .20/.50=.40, tertiary .30/.90=.333.
+        # Without the fixed caps, the forecast incorrectly picks primary.
+        self.assertEqual(ranked[0].name, "tertiaire")
+        self.assertEqual([row["account"] for row in rows if row["next"]],
+                         [ranked[0].name])
+        self.assertEqual(next(row["why"] for row in rows if row["next"]),
+                         accounts.reason_of(ranked, evaluations, self.NOW))
 
     def test_un_compte_au_seuil_reste_hors_du_classement(self):
         """Aucun dépassement : le score ne ressuscite jamais un compte écarté
