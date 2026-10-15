@@ -265,7 +265,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .venv-ci
-          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
+          key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
       - &base
         name: base jetable (sans fsync) et client psql
         run: |
