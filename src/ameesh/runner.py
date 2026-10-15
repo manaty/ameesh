@@ -31,6 +31,7 @@ import argparse
 import dataclasses
 import getpass
 import json
+import math
 import os
 import queue
 import shutil
@@ -7511,7 +7512,8 @@ class Runner:
         étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
         Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
         réutilisé ; les zombies seuls ne comptent pas), processus à
-        l'environnement illisible lancé après la ligne, moteur muet, table
+        l'environnement illisible lancé pendant le tour (marges comprises ;
+        sans fin connue, tout lancement depuis son début), moteur muet, table
         des processus ou démarrage de l'hôte inconnus. Pas avant le feu vert
         du démarrage (`_boot_settle_ready` :
         un conteneur relancé par sa politique peut manquer encore). Une ligne
@@ -7561,16 +7563,29 @@ class Runner:
                     % (exc, int(LIVE_REVIEW_EVERY_S)))
                 return []
             unread = scan["unread"]
-            if None in unread:
+            if any(stamp is None or not math.isfinite(stamp) for stamp in unread):
                 log("turn resources not settled: a process with an unreadable "
                     "environment and no start time; next review in %ds"
                     % int(LIVE_REVIEW_EVERY_S))
                 return []
-            latest = max(unread, default=None)
+            def unread_may_belong(row: dict) -> bool:
+                if not unread:
+                    return False
+                start, end = row.get("started_ts"), row.get("ended_ts")
+                if start is None or not math.isfinite(start):
+                    return True  # no lower bound proves a process unrelated
+                if end is not None and (not math.isfinite(end) or end < start):
+                    return True
+                # #1266: inspect EVERY start, not just the latest: a process
+                # after the end must not hide a possible survivor born inside.
+                # An unfinished turn retains #339's unbounded upper interval.
+                return any(stamp >= start - LIVE_REVIEW_START_SLACK_S
+                           and (end is None or stamp <= end + LIVE_REVIEW_START_SLACK_S)
+                           for stamp in unread)
+
             candidates = [row for row in candidates
                           if row["turn_id"] not in scan["values"]
-                          and (latest is None or row.get("started_ts") is None
-                               or latest < float(row["started_ts"]) - LIVE_REVIEW_START_SLACK_S)]
+                          and not unread_may_belong(row)]
             if not candidates:
                 return []
             engines, silent = containers_mod.all_runtimes(self.cfg)
