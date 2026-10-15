@@ -3833,7 +3833,7 @@
   }
  ],
  "refused": {
-  "interface_total": 387,
+  "interface_total": 389,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4083,6 +4083,7 @@
     "request_restart",
     "resume",
     "set_settings",
+    "state_lots_activity",
     "turns"
    ],
    "packages": [
@@ -4209,6 +4210,7 @@
     "record_resolution",
     "reference",
     "refresh_package_parents",
+    "release_agent",
     "reserve_migration",
     "resolutions",
     "resolve_delegation",
