@@ -1385,8 +1385,9 @@ class WorkItems(Domain):
         `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
 
     @abc.abstractmethod
-    def milestones(self, item_id: int, limit: int) -> list[dict]:
-        """Les jalons d'un lot (0013), du plus récent au plus ancien."""
+    def milestones(self, item_id: int, limit: int | None) -> list[dict]:
+        """Les jalons d'un lot (0013), du plus récent au plus ancien.
+        `None` lit tout l'historique, notamment les anciens blocages du train."""
 
     @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,

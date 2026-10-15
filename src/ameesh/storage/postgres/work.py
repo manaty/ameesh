@@ -615,7 +615,7 @@ class WorkItems(interface.WorkItems):
              WHERE work_item_id = %s
              ORDER BY at DESC, id DESC LIMIT %s
             """,
-            (int(item_id), int(limit)),
+            (int(item_id), None if limit is None else int(limit)),
         )
 
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note) -> dict:

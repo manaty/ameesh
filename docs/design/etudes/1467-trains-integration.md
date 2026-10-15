@@ -114,6 +114,16 @@ frontière d'écriture du fournisseur : celle-ci doit encore prouver que le
 commit a été créé dans le tour enregistré et que l'acteur du jalon est celui
 du tour. Aucun appel du runner n'est ajouté.
 
+`train_history.Recorded` prépare la lecture réelle utilisée par les futures
+admissions : plage complète `base..gel` depuis les objets Git fetchés et tous
+les jalons du lot (`milestones(..., None)`, sans limite de page). La génération
+de file doit toujours désigner le dernier gel, même si le SHA est inchangé.
+Un dépôt shallow, une base absente, un gel déplacé ou un auteur inconnu refuse
+la qualification. Le besoin d'avis et le fournisseur exact restent explicites ;
+ce lecteur ne classe pas les lots et n'active aucun fournisseur ni runner.
+Les modules SQL du train sont inscrits à la liste pilote psql, en complément
+de leur exécution complète dans le paquet.
+
 Interface de raccord proposée à impl07 le 15 octobre à 03:54 : un `Receipt`
 porte `subject` (`commit:<sha>` ou `milestone:<id>`), `commit` résolu, `actor`,
 `session`, `turn`, `harness` et `record` de provenance exacte. Un reçu de
