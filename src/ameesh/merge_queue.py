@@ -86,6 +86,234 @@ def latest_verdict(rows: list[dict]) -> dict | None:
         if verdicts else None
 
 
+# --------------------------------------------------------------------------
+# la porte des avis (#1374, P1-1) : comptés, indépendants, sans blocage masqué
+# --------------------------------------------------------------------------
+
+#: la classe « sensible » demande un avis d'une autre famille ; **SQL, sécurité
+#: et prod** en demandent deux, indépendants (canon §2, décision 18855a). Ces
+#: trois domaines se lisent sur le diff classé (`klass["files"]` : le chemin et
+#: la portée qui l'a classé), avec des motifs larges : un chemin critique non
+#: reconnu coûterait un avis manquant, un chemin reconnu à tort ne coûte qu'un
+#: avis de trop.
+CRITICAL_SCOPE = (
+    # SQL, migrations, stockage
+    re.compile(r"(^|/)(migrations?|supabase|storage)(/|$)|(^|/)migrations\.py$|"
+               r"(^|/)db\.py$|\.sql$"),
+    # sécurité : droits, identité, clés, secrets, décisions
+    re.compile(r"(^|/)(approve|auth|authority|identity|signing|cose|p256|jcs|decisions|"
+               r"visibility|auth_failure|dsn|assignments)(/|\.py$|$)|"
+               r"(^|/)(keys?|secrets?)(/|$)"),
+    # prod, infra, déploiement, hôtes et relais — dont la porte de fusion
+    re.compile(r"(^|/)(deploy|infra|lab|bin)(/|$)|(^|/)\.github/|"
+               r"(^|/)scripts/(ci|deploy|compute|test)|(^|/)(Dockerfile|pyproject\.toml)$|"
+               r"(^|/)host[-_]|(^|/)(hostcheck|exploitation|relay|serve|progress_serve|"
+               r"relocation|placement|merge_queue|land|fire)\.py$"),
+)
+#: le nombre d'avis d'un lot sensible hors de ces domaines
+SENSITIVE_REVIEWS = 1
+#: le nombre d'avis d'un lot sensible qui touche SQL, la sécurité ou la prod
+CRITICAL_REVIEWS = 2
+
+
+def critical_scope(klass) -> bool:
+    """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
+
+    Un doute de classe (politique ou diff illisible, `files` vide) ne se
+    suppose jamais rassurant : `required_verdicts` le compte alors comme un
+    domaine critique, faute de pouvoir exclure SQL, la sécurité ou la prod."""
+    for entry in (klass or {}).get("files") or ():
+        if str(entry.get("class") or "") == "light":
+            continue
+        candidates = [entry.get("path")] + [str(p) for p in (entry.get("rule") or ())]
+        for candidate in candidates:
+            if any(rx.search(str(candidate or "")) for rx in CRITICAL_SCOPE):
+                return True
+    return False
+
+
+def required_verdicts(klass) -> int:
+    """Le nombre d'avis indépendants que la classe exige : 0 pour un lot léger,
+    1 pour normal, 1 pour sensible (2 s'il touche SQL, la sécurité ou la prod).
+    Un doute de classe (politique ou diff illisible, `files` vide) ne se
+    suppose jamais rassurant : il garde l'exigence des domaines critiques
+    (deux avis), faute de pouvoir exclure SQL, la sécurité ou la prod.
+    Un lot release n'est jamais léger : il garde un avis (la procédure de
+    release et la protection de cible restent au pilote ; le feu, lui, refuse
+    la classe release avant tout compte)."""
+    from . import lot_class
+    klass = klass or {}
+    cls = str(klass.get("class") or lot_class.SENSITIVE)
+    if cls == lot_class.LIGHT:
+        return 0
+    if klass.get("doubt"):
+        return CRITICAL_REVIEWS
+    if cls in (lot_class.NORMAL, lot_class.RELEASE):
+        return 1
+    return CRITICAL_REVIEWS if critical_scope(klass) else SENSITIVE_REVIEWS
+
+
+def _mark_order(mark: dict) -> tuple:
+    return (float(mark.get("at_ts") or 0.0), int(mark.get("id") or 0))
+
+
+def _same_sha(a, b, repo: str | None = None) -> bool:
+    """Deux identifiants de commit qui nomment le même commit : égaux, ou
+    résolus dans `repo` (un verdict peut citer une abréviation)."""
+    left, right = str(a or "").strip().lower(), str(b or "").strip().lower()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if repo:
+        full_left, full_right = pinned(repo, left), pinned(repo, right)
+        return bool(full_left and full_right and full_left == full_right)
+    return False
+
+
+def actor_family(db, name) -> str:
+    """La famille de modèle d'un agent (`claude`, `codex`, `deepseek`), "" si
+    elle n'est pas connue : un humain, un agent absent du registre, un harnais
+    non reconnu. L'indépendance d'un avis ne se suppose jamais (#1374)."""
+    from . import registry, review_lot
+    name = str(name or "").strip()
+    if not name or name.startswith(work.HUMAN_PREFIX) or ":" in name:
+        return ""
+    try:
+        row = registry.get(db, name) or {}
+    except Exception:  # noqa: BLE001 - registre illisible : famille inconnue
+        return ""
+    return review_lot.family_of(registry.live_harness(row))
+
+
+def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
+    """Les relecteurs dont le **dernier** verdict sur cette tête est `blocked`
+    (#1374, P1-1). Un `ok` plus récent du même relecteur lève son blocage ;
+    celui d'un autre relecteur ne le masque jamais."""
+    latest: dict = {}
+    for mark in (marks or ()):
+        if mark.get("kind") != "verdict" or not _same_sha(mark.get("sha"), frozen, repo):
+            continue
+        key = str(mark.get("actor") or "").strip().lower() or "?"
+        if key not in latest or _mark_order(mark) > _mark_order(latest[key]):
+            latest[key] = mark
+    return sorted((m for m in latest.values() if (m.get("verdict") or "") == "blocked"),
+                  key=_mark_order)
+
+
+def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
+                item=None) -> dict:
+    """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
+
+    Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
+    jalon est résolu, jamais une ref). Parmi ces verdicts, seul le **dernier de
+    chaque relecteur** compte : un `ok` plus récent du même relecteur lève son
+    blocage, celui d'un autre relecteur ne le masque pas. Un blocage encore en
+    vigueur refuse la porte, quelle que soit la classe.
+
+    Le nombre d'avis dépend de la classe (`required_verdicts`) : 1 pour un lot
+    normal et pour un lot sensible hors SQL/sécurité/prod, 2 pour un lot
+    sensible qui touche ces domaines ou dont la classe reste un doute. Les avis
+    comptés sont **indépendants** : jamais le travail de l'auteur ; pour une
+    classe sensible, une famille de modèle connue et autre que celle de
+    l'auteur ; pour deux avis, deux familles distinctes. L'indépendance ne se
+    suppose jamais : une famille d'auteur inconnue refuse la porte (canon §2,
+    décision 18855a).
+
+    Rend `{ok, why, class, required, accepted, blocked, author, author_family,
+    on_freeze}` ; ne lève jamais.
+    """
+    from . import lot_class
+    klass = klass or {}
+    cls = str(klass.get("class") or lot_class.SENSITIVE)
+    frozen = str(frozen or "").strip().lower()
+    row = item or {}
+    author = str(row.get("assignee") or "").strip()
+    out = {"ok": False, "why": "", "class": cls, "required": 0, "accepted": [],
+           "blocked": [], "author": author, "author_family": "", "on_freeze": 0}
+    if not frozen:
+        out["why"] = "no freeze to review: the fire names the exact frozen head"
+        return out
+    required = required_verdicts(klass)
+    out["required"] = required
+    on_freeze = [m for m in (marks or ()) if m.get("kind") == "verdict"
+                 and _same_sha(m.get("sha"), frozen, repo)]
+    out["on_freeze"] = len(on_freeze)
+    latest: dict = {}
+    for mark in on_freeze:
+        key = str(mark.get("actor") or "").strip().lower() or "?"
+        if key not in latest or _mark_order(mark) > _mark_order(latest[key]):
+            latest[key] = mark
+    blocked = sorted((m for m in latest.values() if (m.get("verdict") or "") == "blocked"),
+                     key=_mark_order)
+    out["blocked"] = [{"actor": m.get("actor") or "", "at_ts": m.get("at_ts"),
+                       "note": m.get("note") or ""} for m in blocked]
+    if blocked:
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): blocked verdict(s) "
+                      "not lifted: %s"
+                      % (frozen[:12], cls, ", ".join(sorted(
+                          str(m.get("actor") or "relecteur sans nom") for m in blocked))))
+        return out
+    if required == 0:
+        out["ok"] = True
+        return out
+    author_family = actor_family(db, author)
+    out["author_family"] = author_family
+    # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
+    # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
+    # sécurité ou la prod — n'accepte que des familles connues et autres que
+    # celle de l'auteur. Famille d'auteur inconnue (agent absent du registre,
+    # harnais non reconnu) : aucun avis ne peut être prouvé indépendant, la
+    # porte refuse et le dit. Un auteur humain n'a pas de famille de modèle :
+    # il n'y a rien à comparer, seules les familles des relecteurs comptent.
+    strict = required >= 2 or cls == lot_class.SENSITIVE
+    author_human = bool(author) and author.lower().startswith(work.HUMAN_PREFIX)
+    if strict and not author_family and not author_human:
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s has "
+                      "no known model family, so no verdict can be proven independent "
+                      "(canon §2: independence is never assumed)"
+                      % (frozen[:12], cls, author or "(none)"))
+        return out
+    accepted = []
+    for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
+                       key=_mark_order):
+        actor = str(mark.get("actor") or "").strip()
+        if author and actor and actor.lower() == author.lower():
+            continue                      # on ne relit pas son propre travail
+        family = actor_family(db, actor)
+        if strict:
+            if not family:
+                continue                  # famille du relecteur inconnue : non prouvée
+            if family == author_family:
+                continue                  # la famille de l'auteur ne compte pas
+        accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
+                         "at_ts": mark.get("at_ts")})
+    if required >= 2:
+        chosen, seen = [], set()
+        for entry in accepted:
+            if entry["family"] in seen:
+                continue
+            seen.add(entry["family"])
+            chosen.append(entry)
+            if len(chosen) >= required:
+                break
+        accepted = chosen
+    out["accepted"] = accepted
+    if len(accepted) >= required:
+        out["ok"] = True
+        return out
+    got = ", ".join("%s (%s)" % (e["actor"] or "?", e["family"] or "famille inconnue")
+                    for e in accepted) or "aucun"
+    need = ("two independent verdicts from different model families, neither the author's"
+            if required >= 2 else
+            "one verdict from another family than the author's" if strict
+            else "one verdict from another agent")
+    out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent review "
+                  "verdict(s) required, %s; got %s"
+                  % (frozen[:12], cls, required, need, got))
+    return out
+
+
 def _remote_branch(name: str) -> str:
     """The branch of `origin` that a lot branch or a target names:
     `origin/main`, `refs/remotes/origin/main` and `main` all name `main`."""
@@ -211,6 +439,10 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     then the project's, then the repository's default) carries through the
     classification and the admission (revue #544 r2).
 
+    #1374 : les avis passent par la porte partagée `review_gate` — comptés par
+    classe, indépendants (familles distinctes, aucune celle de l'auteur) et
+    sans blocage non levé ; la même porte que le feu du pilote.
+
     The CI is required **explicitly**: for a project without `ci_required`,
     `ci=None` (no reader) and a reader that answers nothing are refused, like
     a red CI — an absent status is not a green one (revue #544 r1). A project
@@ -218,7 +450,6 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     frozen commit when no PR vouches for it (`ci=None`, or a reader that
     answers nothing because there is no open PR): a green commit CI is not
     blocked by the absence of a PR (revue #544 r2)."""
-    from . import lot_class
     from . import plan_github, radar
     row = work.get(db, lot)
     if row is None:
@@ -255,14 +486,12 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
     klass = _class_of(db, lot, row, repo, where, target, tip, cfg=cfg)
-    light = klass.get("class") == lot_class.LIGHT
-    verdict = latest_verdict(marks)
-    reviewed = pinned(where, verdict["sha"]) if verdict and verdict.get("sha") else None
-    if not light and (not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip)):
-        raise QueueError("lot #%d has no review verdict ok on its freeze %s%s (class: %s)"
-                         % (lot, tip[:12], " (last verdict: %s on %s)"
-                            % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
-                            if verdict else "", klass.get("class") or "?"))
+    # #1374 : la même porte que le feu — avis comptés par classe, indépendants
+    # (familles), et aucun blocage non levé ; un `ok` récent ne masque plus le
+    # `blocked` d'un autre relecteur (P1-1).
+    gate = review_gate(db, marks, tip, repo=where, klass=klass, item=row)
+    if not gate["ok"]:
+        raise QueueError("lot #%d: %s" % (lot, gate["why"]))
     needs_commit_ci = project is not None and getattr(project, "ci_required", False)
     status = None
     if ci is None:
@@ -286,7 +515,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-        if light and status.get("draft"):
+        if gate["required"] == 0 and status.get("draft"):
             raise QueueError("PR #%s is a draft: a light lot merges only from a "
                              "non-draft PR" % status.get("number"))
     if needs_commit_ci:
