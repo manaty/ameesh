@@ -187,7 +187,6 @@ ameesh_de() {
   local cible=$1; shift
   PYTHONPATH="$cible/src" "$VENV/bin/python" -m ameesh "$@"
 }
-installe() { [ "$(readlink "$PARTAGE/src-current" 2>/dev/null)" = "$(basename "$1")" ]; }
 
 installer() {
   local ref=${1:-HEAD} cible court

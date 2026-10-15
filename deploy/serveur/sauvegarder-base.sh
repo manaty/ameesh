@@ -48,12 +48,20 @@ fi
 # the private catalog (by the release controller) is never expired here; a
 # daily dump no record names keeps the declared local window. A set with a
 # remote member is only expired through the enrolled provider document;
-# without it that set stays protected instead of being guessed.
+# without it that set stays protected instead of being guessed. A refused
+# candidate (non-private, shared or foreign-owned dump) never expires: its
+# status is kept and re-raised after prune, which must still run, so the
+# daily timer cannot stay green over a file it will never delete.
+expiry_status=0
 "$python" "$retention" --root "$d" expire-unregistered \
-    --now "$(date +%s)" --max-age 1209600
+    --now "$(date +%s)" --max-age 1209600 || expiry_status=$?
 if [ -r /etc/ameesh/retention-provider.json ]; then
     "$python" "$retention" --root "$d" prune \
         --provider-enrollment /etc/ameesh/retention-provider.json --now "$(date +%s)"
 else
     "$python" "$retention" --root "$d" prune --now "$(date +%s)"
+fi
+if [ "$expiry_status" -ne 0 ]; then
+    echo "rétention privée : expire-unregistered a refusé un candidat ($expiry_status) ; prune a tourné" >&2
+    exit "$expiry_status"
 fi
