@@ -24,8 +24,9 @@ Règles :
      `datetime.now|today|utcnow`) : bombe à retardement au changement de jour.
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
-l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
-reste visible du relecteur.
+l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison,
+non vide, reste visible du relecteur. Un marqueur dans une chaîne de code, ou
+un commentaire sans raison, n'exempte pas (R1 #707, N1).
 
 Usage :
   scripts/test-hermeticity-lint.py [FICHIERS…]        # défaut : tests/**/test_*.py
@@ -37,13 +38,17 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import json
 import pathlib
+import re
 import subprocess
 import sys
+import tokenize
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-MARKER = "hermeticity: allow"
+#: exemption motivée : marqueur, séparateur, raison non vide (le motif est exigé)
+MARKER_RE = re.compile(r"hermeticity:\s*allow\s*[—–-]\s*\S")
 
 #: lectures de l'horloge réelle (nom canonique importé).
 CLOCK = {
@@ -173,12 +178,27 @@ def _in_subtraction(call: ast.AST, root: ast.AST) -> bool:
     return False
 
 
-def _exempt(node: ast.AST, lines: list[str]) -> bool:
-    """marqueur sur l'instruction englobante ou la ligne juste au-dessus."""
-    top: ast.AST = node
+def _comments(source: str) -> dict[int, str]:
+    """Les commentaires du source, par ligne : seuls eux peuvent exempter."""
+    out: dict[int, str] = {}
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                out.setdefault(token.start[0], token.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return out
+    return out
+
+
+def _exempt(node: ast.AST, comments: dict[int, str]) -> bool:
+    """Exemption motivée sur l'instruction ou la ligne juste au-dessus.
+
+    Seuls les vrais commentaires comptent, et la raison doit être non vide
+    (`# hermeticity: allow — <raison>`) : un marqueur dans une chaîne, ou un
+    commentaire sans motif, n'exempte pas (R1 #707, N1 ; lot #857)."""
     start, end = getattr(node, "lineno", 0), getattr(node, "end_lineno", 0)
-    for line in lines[max(0, start - 2):end]:
-        if MARKER in line:
+    for line in range(max(1, start - 1), end + 1):
+        if MARKER_RE.search(comments.get(line, "")):
             return True
     return False
 
@@ -215,7 +235,7 @@ def lint_source(path: str, source: str) -> list[Finding]:
         return [Finding(path, exc.lineno or 0, exc.offset or 0, "H0",
                         "source illisible : %s" % exc.msg, "<module>")]
     alias = _aliases(tree)
-    lines = source.splitlines()
+    comments = _comments(source)
     funcs = _functions(tree)
     findings: list[Finding] = []
     clock_lines: set[int] = set()
@@ -225,7 +245,7 @@ def lint_source(path: str, source: str) -> list[Finding]:
             body = node.test if isinstance(node, ast.Assert) else node
             for sub in ast.walk(body):
                 name = _called(sub, alias, CLOCK)
-                if name and _in_subtraction(sub, body) and not _exempt(node, lines):
+                if name and _in_subtraction(sub, body) and not _exempt(node, comments):
                     clock_lines.add(id(sub))
                     findings.append(Finding(
                         path, sub.lineno, sub.col_offset + 1, "H1",
@@ -236,11 +256,11 @@ def lint_source(path: str, source: str) -> list[Finding]:
         if not isinstance(node, ast.Call):
             continue
         name = _called(node, alias, MACHINE)
-        if name and not _exempt(node, lines):
+        if name and not _exempt(node, comments):
             findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
                                     "état global de la machine : %s()" % name,
                                     _enclosing(funcs, node)))
-        elif _proc_literal(node) and not _exempt(node, lines):
+        elif _proc_literal(node) and not _exempt(node, comments):
             findings.append(Finding(path, node.lineno, node.col_offset + 1, "H2",
                                     "état global de la machine : chemin /proc/…",
                                     _enclosing(funcs, node)))
@@ -249,7 +269,7 @@ def lint_source(path: str, source: str) -> list[Finding]:
         if not isinstance(node, ast.Call) or id(node) in clock_lines:
             continue
         name = _called(node, alias, CALENDAR)
-        if name and not _exempt(node, lines):
+        if name and not _exempt(node, comments):
             findings.append(Finding(path, node.lineno, node.col_offset + 1, "H3",
                                     "fixture dépendante du jour : %s()" % name,
                                     _enclosing(funcs, node)))

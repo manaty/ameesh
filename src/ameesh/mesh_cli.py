@@ -2397,9 +2397,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("--actor", default="",
                          help="default: the session's bound identity (AGENT_MAIL_NAME)")
     pw_move.add_argument("--correct", default=None, metavar="REASON",
-                         help="correct a state set by mistake (promoted → merged), outside "
-                              "the state machine, recorded in the log; reserved for humans and "
-                              "for orchestrators or design agents")
+                         help="correct a state set by mistake (promoted → merged, merged → build), "
+                              "outside the state machine, recorded in the log; reserved for humans "
+                              "and for orchestrators or design agents")
     pw_move.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
         "merged", help="declare a work item merged outside a PR and without freeze (local merge "

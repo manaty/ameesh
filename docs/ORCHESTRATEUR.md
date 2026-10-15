@@ -283,6 +283,21 @@ après un échec de `gh`, il n'en lit plus d'autre dans ce dépôt, et la PR en
 plus). `ameesh work sync-github` suit les mêmes règles et ne retient que
 les PR dont la branche est dans le dépôt même, pas dans un fork.
 
+Un lot peut demander plusieurs PR, l'une après l'autre : une PR fusionnée ne
+le ferme plus si une autre PR ouverte, ou la branche déclarée du lot (autre
+que la sienne), y reste liée — le relevé écrit alors « stage merged » au
+journal du lot, qui reste ouvert (#759). La dernière étape lève cette retenue
+en se déclarant :
+
+```
+ameesh-work: <numéro du lot> final
+```
+
+`ameesh-work-partial:` l'emporte : une PR partielle ne ferme jamais, même
+avec `final`. Un lot fermé trop tôt par une PR d'étape se corrige
+(`ameesh work move <id> build --correct "raison"`), réservé aux humains,
+orchestrateurs et agents de conception.
+
 ## Fusion sans PR ni branche déclarée
 
 Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,
@@ -551,7 +566,9 @@ restée 4 h fusionnée sans être déployée :
    secrets restent des décisions du propriétaire.
    The watch of an orchestrator is set with `ameesh watch enable --agent
    <orchestrator> --every 30m` (L121): its text, `src/ameesh/consignes/veille.md`,
-   carries these rules and changes only through a reviewed commit.
+   carries these rules and the working rules of the canon — integration by
+   packages, review before CI, sober proofs (canon « Processus de lot » §§3, 6,
+   12) — and changes only through a reviewed commit.
 4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
    un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
    d'exécuteur du poste le lance dans une unité systemd distincte :
