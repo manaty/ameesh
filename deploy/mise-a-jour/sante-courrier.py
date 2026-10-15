@@ -114,9 +114,9 @@ def answered(db, name: str, jeton: str) -> bool:
                for m in mail.history(db, name, limit=mail.UNREAD_LIMIT))
 
 
-def failed_turn(db, name: str, delivered: float) -> str:
+def failed_turn(db, name: str, delivered: float, row: dict | None = None) -> str:
     """Why the turn that received the probe failed, or "" (same DB clock)."""
-    row = registry.get(db, name) or {}
+    row = (registry.get(db, name) or {}) if row is None else row
     if float(row.get("last_turn_ts") or 0) < delivered:
         return ""
     if row.get("last_error") or row.get("status") == "blocked":
@@ -124,9 +124,9 @@ def failed_turn(db, name: str, delivered: float) -> str:
     return ""
 
 
-def turn_finished(db, name: str, delivered: float) -> bool:
+def turn_finished(db, name: str, delivered: float, row: dict | None = None) -> bool:
     """The turn that received the probe ended (same DB clock, #1460)."""
-    row = registry.get(db, name) or {}
+    row = (registry.get(db, name) or {}) if row is None else row
     return float(row.get("last_turn_ts") or 0) >= delivered
 
 
@@ -147,12 +147,15 @@ def probe(db, row: dict, sha: str, attente: float) -> dict:
         livre = float((message or {}).get("delivered_ts") or 0)
         if livre:
             repondu = repondu or answered(db, row["name"], jeton)
-            echec = failed_turn(db, row["name"], livre)
+            # one registry read for both verdicts: a turn ending in error
+            # between two reads must not be taken for a clean end
+            etat = registry.get(db, row["name"]) or {}
+            echec = failed_turn(db, row["name"], livre, etat)
             if echec:
                 return dict(out, tour="tour en echec : %s" % echec[:200])
             if not repondu:
                 out["tour"] = "remis, sans reponse de l'outil"
-            elif turn_finished(db, row["name"], livre):
+            elif turn_finished(db, row["name"], livre, etat):
                 # the answer proves the tool ran, the end of the turn proves the
                 # harness finished it (dev4/47164: ack then alive until timeout)
                 return dict(out, delai_s=round(time.monotonic() - debut, 1), tour="ok")

@@ -688,7 +688,9 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.mail, 'get', return_value={'delivered_ts': 100.0}), \
              mock.patch.object(self.mod.mail, 'unread', side_effect=unread), \
              mock.patch.object(self.mod.mail, 'history', side_effect=history), \
-             mock.patch.object(self.mod.registry, 'get', return_value=etat), \
+             mock.patch.object(self.mod.registry, 'get',
+                               **({'side_effect': etat} if callable(etat)
+                                  else {'return_value': etat})), \
              mock.patch.object(self.mod.time, 'sleep'):
             return self.mod.probe(object(), {'name': 'p', 'host': 'h'}, 'abc', attente)
 
@@ -718,6 +720,16 @@ class SanteCourrierTest(unittest.TestCase):
     def test_probe_ko_when_the_turn_ends_in_error_after_the_answer(self):
         out = self.sonde({'last_turn_ts': 101.0, 'status': 'running',
                           'last_error': 'timeout (124)'}, repond=True)
+        self.assertIsNone(out['delai_s'])
+        self.assertIn('timeout (124)', out['tour'])
+
+    def test_probe_ko_when_the_turn_fails_between_two_registry_reads(self):
+        """Une seule lecture du registre par passage : un tour qui finit en
+        erreur entre deux lectures n'est jamais pris pour une fin propre."""
+        lectures = iter([{'last_turn_ts': 99.0, 'status': 'running'},
+                         {'last_turn_ts': 101.0, 'status': 'blocked',
+                          'last_error': 'timeout (124)'}])
+        out = self.sonde(lambda db, nom: next(lectures), repond=True, attente=60.0)
         self.assertIsNone(out['delai_s'])
         self.assertIn('timeout (124)', out['tour'])
 
