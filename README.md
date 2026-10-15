@@ -326,8 +326,19 @@ agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
 agent-runner register <nom> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXTE]
              [--session ID] [--chantier C] [--model M] [--budget USD]
 agent-runner stop <nom>
-ameesh attach <agent> [--wait] [--ttl S]      # session interactive sur le bail (C9)
+ameesh attach <agent> [--wait] [--ttl S] [--max 2h]  # bounded native session (L82)
 ```
+
+`attach` is for native harness features such as login, settings and debugging.
+The runner finishes its turn (`--wait`), puts the resident to sleep, then
+hands over the lease. A second attach is refused. Closing the native session
+returns the lease; pending inputs wake the resident on the same session.
+The interactive session ends after two hours by default; `--max 30m` or
+`--max 4h` changes that limit. A notice precedes expiry (exit code 124), and
+inputs waiting more than ten minutes produce an alert without being consumed.
+`adopt` and an unleased `resume` refuse a session still open in another
+process or modified in the last minute: close it and let its journal settle.
+The existing audited `adopt --force` override remains available.
 
 ## Language choice
 
