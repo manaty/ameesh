@@ -971,6 +971,30 @@ class WatcherTest(PgTestCase):
         self.assertEqual(len(alertes), 1)
         self.assertIn("backend-suite.yml", alertes[0]["detail"])
 
+    def test_main_rouge_execution_orpheline_ecartee(self):
+        """#1453 N1 : une exécution de main jamais conclue (supprimée, l'API
+        rend `{}`) qui porte un job rouge ne garde pas l'alerte quand une
+        exécution plus récente du même workflow est conclue ; une exécution
+        d'un autre workflow, ou plus récente que la conclue, alerte encore."""
+        st = storage.of(self.db)
+        for run_id, sha, workflow in ((1001, "e1" * 20, "tests.yml"),
+                                      (1002, "e2" * 20, "tests.yml"),
+                                      (1003, "e2" * 20, "native.yml"),
+                                      (1005, "e3" * 20, "tests.yml")):
+            st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main", event="push",
+                           base="main", work_item_id=None, url=None, workflow=workflow)
+        for run_id in (1001, 1003, 1005):
+            st.ci.add_failure(DEPOT, run_id, part="job", test="psql 1/1", module="",
+                              status="echec", inherited=False, excerpt="", replay="",
+                              duration_s=None, failed_at=None)
+        self.assertEqual(sorted(r["run_id"] for r in ci.main_red(self.db)),
+                         [1001, 1003, 1005])
+        st.ci.conclude(DEPOT, 1002, "success")
+        # 1001 reste « running » à jamais : écartée par 1002, conclue verte ;
+        # 1003 (autre workflow) et 1005 (plus récente) alertent toujours
+        self.assertEqual(st.ci.run(DEPOT, 1001)["status"], "running")
+        self.assertEqual(sorted(r["run_id"] for r in ci.main_red(self.db)), [1003, 1005])
+
     def test_rouge_herite_par_workflow(self):
         """#1110 P2-2 : le rouge hérité se compare à la même suite ; l'échec
         d'une autre suite de la base ne rend pas le test « hérité »."""
