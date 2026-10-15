@@ -420,6 +420,15 @@ class MergeTest(_Base):
         with self.assertRaisesRegex(merge_pr.MergePrError, "targets release/1"):
             self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
 
+    def test_a_target_written_refs_remotes_origin_names_the_same_branch(self):
+        # #1253 (cx3): `refs/remotes/origin/main` must name `main`, like
+        # `origin/main` does (merge_queue's normalization); the guard used to
+        # refuse it and declare nothing.
+        self.lot_target = "refs/remotes/origin/main"
+        _git(self.origin, "update-ref", "refs/heads/main", self.head)
+        out = self.merge(self.gh(state="MERGED", mergeCommit={"oid": self.head}))
+        self.assertEqual(out["state"], "already", out)
+
     def test_an_already_merged_view_that_does_not_name_the_head_is_refused(self):
         with self.assertRaisesRegex(merge_pr.MergePrError, "head is"):
             self.merge(self.gh(state="MERGED", headRefOid="a" * 40,
@@ -562,7 +571,7 @@ class RunTest(unittest.TestCase):
         out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
                "tip": "d" * 40}
-        with mock.patch.object(merge_pr.work, "merged",
+        with mock.patch.object(merge_pr.work, "close_merged",
                                return_value={"result": "merged"}) as recorded:
             code, text = self.run_with(out, args=self.args(lot=1003, json=False))
         self.assertEqual(code, 0)
@@ -574,7 +583,7 @@ class RunTest(unittest.TestCase):
         out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
                "tip": "d" * 40}
-        patcher = mock.patch.object(merge_pr.work, "merged",
+        patcher = mock.patch.object(merge_pr.work, "close_merged",
                                     side_effect=RuntimeError("lot closed"))
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -582,10 +591,26 @@ class RunTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("WARNING lot not declared", text)
 
+    def test_an_unknown_actor_declares_nothing(self):
+        # N2 (#1253): the merged milestone is never attributed to
+        # UNKNOWN_ACTOR — the merge is a fact that is kept, the declaration is
+        # skipped and the warning names the fix.
+        out = {"state": "merged", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
+               "tree": "c" * 40, "frozen_tree": "c" * 40, "target": "main",
+               "tip": "d" * 40}
+        for actor in ("", work.UNKNOWN_ACTOR):
+            with self.subTest(actor=actor):
+                with mock.patch.object(merge_pr.work, "close_merged") as recorded:
+                    code, text = self.run_with(out, args=self.args(actor=actor, json=False))
+                self.assertEqual(code, 0)
+                recorded.assert_not_called()
+                self.assertIn("WARNING lot not declared", text)
+                self.assertIn("unknown actor", text)
+
     def test_an_already_merged_pr_is_declared_on_its_lot(self):
         out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tip": "d" * 40, "target": "main"}
-        with mock.patch.object(merge_pr.work, "merged",
+        with mock.patch.object(merge_pr.work, "close_merged",
                                return_value={"result": "merged"}) as recorded:
             code, _ = self.run_with(out, args=self.args(lot=1003, json=True))
         self.assertEqual(code, 0)
@@ -595,10 +620,36 @@ class RunTest(unittest.TestCase):
         # N1 (#1003): `--dry-run` never declares, `already` included.
         out = {"state": "already", "pr": 7, "merge": "b" * 40, "frozen": "a" * 40,
                "tip": "d" * 40, "target": "main"}
-        with mock.patch.object(merge_pr.work, "merged") as recorded:
+        with mock.patch.object(merge_pr.work, "close_merged") as recorded:
             code, _ = self.run_with(out, args=self.args(dry_run=True, json=True))
         self.assertEqual(code, 0)
         recorded.assert_not_called()
+
+    def test_verified_remote_merge_records_without_a_local_commit_or_issue(self):
+        # #1286: direct_merge removed its scratch clone. Neither an issue_ref
+        # nor the merge object in the caller's checkout is needed to record
+        # the result it already proved. Exercise the real close_merged path.
+        from types import SimpleNamespace
+        item = {"id": 1003, "state": "qa", "app": "ameesh",
+                "title": "reviewed workflow", "issue_ref": None}
+        done = dict(item, state="merged")
+        store_close = mock.Mock(return_value=done)
+        store = SimpleNamespace(work=SimpleNamespace(close_merged=store_close))
+        for state in ("merged", "already"):
+            with self.subTest(state=state):
+                store_close.reset_mock()
+                out = {"state": state, "pr": 7, "merge": "b" * 40,
+                       "frozen": "a" * 40, "tree": "c" * 40,
+                       "frozen_tree": "c" * 40, "target": "main", "tip": "d" * 40}
+                with mock.patch.object(work, "get", return_value=item), \
+                     mock.patch.object(work.storage, "of", return_value=store):
+                    code, text = self.run_with(out)
+                self.assertEqual(code, 0)
+                self.assertNotIn("record_warning", text)
+                self.assertEqual(json.loads(text)["recorded"]["result"], "merged")
+                self.assertEqual(store_close.call_args.kwargs["sha"], "b" * 40)
+                self.assertEqual(store_close.call_args.kwargs["pr_ref"], "o/r#7")
+                self.assertIn("merge seen by merge-pr", store_close.call_args.kwargs["note"])
 
     def test_exit_codes_name_the_uncertainty(self):
         for state, expected in (("pushed-unverified", 2), ("already-unverified", 1)):

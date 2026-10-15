@@ -9,6 +9,7 @@ import subprocess
 import uuid
 import urllib.parse
 import unittest
+from unittest import mock
 
 from ameesh import migrations
 
@@ -145,7 +146,9 @@ class RoleExecutorTest(PgTestCase):
         finally:
             self.db.execute("REVOKE UPDATE ON project_modules FROM %s" % db_mod.quote_ident(self.role))
         # The trusted policies are unchanged and direct storage still refuses closure.
-        with self.assertRaises(work.WorkError):
+        # Reach the module-policy gate after an independently valid Git proof.
+        with mock.patch.object(work, "_declared_merge_commit", return_value="abcdef1234"), \
+                self.assertRaises(work.WorkError):
             work.merged(self.db, lot, sha="abcdef1234")
 
     def test_module_writer_role_contract_and_executor_separation(self):
@@ -204,7 +207,8 @@ class RoleExecutorTest(PgTestCase):
             self.assertEqual(proof["payload"]["output"], "observed execution")
             self.assertFalse(self.db.query("SELECT has_table_privilege(%s, 'project_modules', 'UPDATE') AS allowed",
                                            (writer,))[0]["allowed"])
-            self.assertEqual(work.merged(self.db, lot, sha="abcdef1234")["result"], "merged")
+            with mock.patch.object(work, "_declared_merge_commit", return_value="abcdef1234"):
+                self.assertEqual(work.merged(self.db, lot, sha="abcdef1234")["result"], "merged")
         finally:
             self.db.execute("DROP OWNED BY %s" % q(writer))
             self.db.execute("DROP ROLE %s" % q(writer))

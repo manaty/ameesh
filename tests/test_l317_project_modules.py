@@ -202,6 +202,12 @@ class ExecutionTest(unittest.TestCase):
 class LifecycleGateTest(PgTestCase):
     def setUp(self):
         super().setUp()
+        # Git identity/ancestry is exercised separately in #1286; this class
+        # isolates the IT gate after a valid manual merge declaration.
+        proof = mock.patch.object(work, "_declared_merge_commit",
+                                  side_effect=lambda item, sha, **kw: sha)
+        proof.start()
+        self.addCleanup(proof.stop)
         with self.db.transaction() as tx:
             ModuleStore(tx).replace("", modules.declarations(federation()))
         self.artifact = Path(self.tmp, "artifact.py")
