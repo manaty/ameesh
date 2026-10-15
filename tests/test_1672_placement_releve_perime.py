@@ -223,7 +223,7 @@ class PlacementChoixTest(_Base):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
         self.assertIn("no codex account to place", choix.reason)
-        self.assertIn("reading older than every open window (secondaire)", choix.reason)
+        self.assertRegex(choix.reason, r"reading older than every open window \(secondaire until [0-9/: ]+\)")
         # aucun placement : pas de bascule journalisée
         self.assertEqual(self._bascules(), [])
 

@@ -1441,7 +1441,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # écarté du placement — le dire, plutôt que de le compter comme « au
         # seuil » (le relevé ne mesure plus l'état du compte). C'est une
         # prudence sur une information ancienne, pas la preuve d'un quota.
-        withheld = [p.name for p in items
+        # la remise à zéro la plus proche d'une fenêtre encore ouverte rouvre
+        # le compte (L71) : l'annoncer, comme pause_label le fait au seuil
+        from .cost import until_label
+        withheld = ["%s until %s" % (p.name, until_label(min(
+                        float(g.resets_at) for g in cache[p.name].gauges
+                        if g.resets_at and not g.reset_passed(now)), now))
+                    for p in items
                     if p.name not in sick and cache[p.name].gauges
                     and reading_outdated(cache[p.name].gauges, now)]
         why = "%sall %s accounts at threshold — %s" % (
