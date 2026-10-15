@@ -405,8 +405,8 @@ def read_psi(window: str) -> dict:
 
 
 def _unit_jobs(unit: str, tasks: tuple, run: Callable = subprocess.run, *,
-               cgroup_root: str = host.CGROUP_ROOT,
-               proc_root: str = host.PROC) -> bool | None:
+               cgroup_root: str = "/sys/fs/cgroup",
+               proc_root: str = "/proc") -> bool | None:
     """True when a task of UNIT's cgroup matches one of `tasks`.
 
     A persistent CI listener stays `active` between two jobs: the only proof
@@ -452,8 +452,8 @@ def _unit_jobs(unit: str, tasks: tuple, run: Callable = subprocess.run, *,
 
 
 def busy_count(patterns: tuple, run: Callable = subprocess.run, tasks: tuple = (), *,
-               cgroup_root: str = host.CGROUP_ROOT,
-               proc_root: str = host.PROC) -> int | None:
+               cgroup_root: str = "/sys/fs/cgroup",
+               proc_root: str = "/proc") -> int | None:
     """Application jobs in progress among the units matching `patterns`.
 
     Without `tasks`, every active matching unit counts (`busy_units` alone is
