@@ -24,9 +24,10 @@ Règles :
      `datetime.now|today|utcnow`) : bombe à retardement au changement de jour.
 
 Exemption motivée : un commentaire `# hermeticity: allow — <raison>` sur
-l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison,
-non vide, reste visible du relecteur. Un marqueur dans une chaîne de code, ou
-un commentaire sans raison, n'exempte pas (R1 #707, N1).
+l'instruction visée, ou sur la ligne juste au-dessus, l'exempte ; la raison
+contient au moins une lettre ou un chiffre et reste visible du relecteur.
+Un marqueur dans une chaîne de code, ou un commentaire sans raison,
+n'exempte pas (R1 #707, N1).
 
 Usage :
   scripts/test-hermeticity-lint.py [FICHIERS…]        # défaut : tests/**/test_*.py
@@ -47,8 +48,8 @@ import sys
 import tokenize
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
-#: exemption motivée : marqueur, séparateur, raison non vide (le motif est exigé)
-MARKER_RE = re.compile(r"hermeticity:\s*allow\s*[—–-]\s*\S")
+#: Exemption motivée : la ponctuation seule ne constitue pas une raison.
+MARKER_RE = re.compile(r"hermeticity:\s*allow\s*[—–-][^\r\n]*[^\W_]")
 
 #: lectures de l'horloge réelle (nom canonique importé).
 CLOCK = {
@@ -193,7 +194,7 @@ def _comments(source: str) -> dict[int, str]:
 def _exempt(node: ast.AST, comments: dict[int, str]) -> bool:
     """Exemption motivée sur l'instruction ou la ligne juste au-dessus.
 
-    Seuls les vrais commentaires comptent, et la raison doit être non vide
+    Seuls les vrais commentaires comptent, avec une lettre ou un chiffre
     (`# hermeticity: allow — <raison>`) : un marqueur dans une chaîne, ou un
     commentaire sans motif, n'exempte pas (R1 #707, N1 ; lot #857)."""
     start, end = getattr(node, "lineno", 0), getattr(node, "end_lineno", 0)
