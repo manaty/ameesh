@@ -18,7 +18,8 @@
 #               plafond de 30 min sous saturation) ; la suite complète, en
 #               6 parts, sur push vers main, integration/** ou release/**, sur
 #               une PR de release (sans liste pilote) et à la main
-#               (workflow_dispatch).
+#               (workflow_dispatch, sur main, release/** ou integration/**
+#               seulement, #1635).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 #
 # L1211 — canon §3 : une branche de lot ne lance que les tests impactés, plus
@@ -139,6 +140,24 @@ jobs:
       psql: ${{ steps.plan.outputs.psql }}
       psql_parts: ${{ steps.plan.outputs.psql_parts }}
     steps:
+      # #1635 : un lancement à la main publie le check requis `tests` sur la
+      # tête de la branche lancée ; sur une branche de lot, il satisferait le
+      # check de sa PR sans merge-ref ni passage par la PR. Il n'est admis que
+      # sur main, release/** et integration/** ; ailleurs le plan échoue et
+      # `tests` rougit sans exécuter de tests. La référence passe par
+      # l'environnement, jamais interpolée dans le script (#1237).
+      - name: lancement à la main (main, release/**, integration/** — #1635)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          case "$DISPATCH_REF" in
+            refs/heads/main|refs/heads/release/*|refs/heads/integration/*)
+              echo "workflow_dispatch on $DISPATCH_REF: admitted" ;;
+            *)
+              echo "::error::workflow_dispatch on '$DISPATCH_REF': only main, release/** and integration/** may be run by hand (#1635); a lot branch gets its CI through its pull request, nothing run"
+              exit 1 ;;
+          esac
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # the map commit, and whether it is an ancestor
