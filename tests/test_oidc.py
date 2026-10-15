@@ -271,7 +271,8 @@ class VerificationTest(unittest.TestCase):
                                cache=oidc.KeyCache(fetch=fetch))
 
         for champ, valeur in (("use", "enc"), ("key_ops", ["sign"]),
-                              ("key_ops", "verify"), ("alg", "ES384")):
+                              ("key_ops", "verify"), ("alg", "ES384"),
+                              ("use", None), ("key_ops", None), ("alg", None)):
             with self.assertRaises(oidc.OidcError, msg="%s=%r" % (champ, valeur)):
                 verifier_avec(dict(base, **{champ: valeur}))
         verifier_avec(base)                                            # métadonnées absentes

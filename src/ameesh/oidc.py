@@ -182,16 +182,16 @@ def jwk_allows(jwk: dict, alg: str) -> bool:
     l'en-tête ; une déclaration contraire refuse la clé. Une métadonnée absente
     reste acceptée (contrat : les fournisseurs ne les publient pas tous)."""
     use = jwk.get("use")
-    if use is not None and use != "sig":
+    if "use" in jwk and use != "sig":
         return False
     ops = jwk.get("key_ops")
-    if ops is not None:
+    if "key_ops" in jwk:
         if not isinstance(ops, list) or not all(isinstance(op, str) for op in ops):
             return False
         if "verify" not in ops:
             return False
     declared = jwk.get("alg")
-    if declared is not None and declared != alg:
+    if "alg" in jwk and declared != alg:
         return False
     return True
 
