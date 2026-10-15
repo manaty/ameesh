@@ -20,7 +20,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import unittest
+
+from unittest import mock
 
 from tests import support
 
@@ -290,6 +293,10 @@ def _coverage_disponible() -> bool:
     return True
 
 
+#: #1690 : même sonde, gardée sous son nom d'origine pour ses témoins.
+_coverage_installe = _coverage_disponible
+
+
 class CouvertureTronqueeTest(unittest.TestCase):
     """#1257 : une couverture tronquée (processus tué pendant l'écriture de sa
     donnée) ne fait plus échouer la fusion de la carte ; elle est ignorée et
@@ -521,6 +528,88 @@ class CouvertureTronqueeTest(unittest.TestCase):
                    for info in blocs.values() for m in info["modules"]}
         self.assertIn("test_l2", modules)
         self.assertNotIn("test_l1", modules)  # aucune ligne partielle versée
+class _FauxCoverageException(Exception):
+    pass
+
+
+class _FauxDataError(_FauxCoverageException):
+    pass
+
+
+class _FauxCoverageData:
+    """CoverageData minimal : `.coverage.coupee` est illisible, le reste vide."""
+
+    def __init__(self, basename=None):
+        self.basename = str(basename)
+
+    def read(self):
+        if self.basename.endswith(".coverage.coupee"):
+            raise _FauxDataError("file is not a database")
+
+    def measured_contexts(self):
+        return {"tests.test_l1.T.test_a"}
+
+    def measured_files(self):
+        return []
+
+    def contexts_by_lineno(self, fichier):
+        return {}
+
+
+class ArtefactIncompletTest(unittest.TestCase):
+    """#1690 : un artefact de mesure illisible est signalé, jamais compté."""
+
+    @staticmethod
+    def _faux_module():
+        faux = types.ModuleType("coverage")
+        faux.CoverageData = _FauxCoverageData
+        faux.CoverageException = _FauxCoverageException
+        # #1257 x #1690 : l'union lit l'exception dans `coverage.exceptions`
+        # (chemin déjà utilisé par #1257) ; la doublure l'expose donc aussi.
+        exceptions = types.ModuleType("coverage.exceptions")
+        exceptions.CoverageException = _FauxCoverageException
+        exceptions.DataError = _FauxDataError
+        faux.exceptions = exceptions
+        faux.__version__ = "faux"
+        return faux
+
+    def _merge(self, dossiers: list[pathlib.Path]) -> dict:
+        faux = self._faux_module()
+        with mock.patch.dict(sys.modules, {"coverage": faux,
+                                           "coverage.exceptions": faux.exceptions}):
+            return carte.merge([str(d) for d in dossiers], "abc")
+
+    def test_artefact_illisible_signale_et_non_compte(self):
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        coupee = dossier / "mesure-psycopg-3"
+        (coupee / "cov").mkdir(parents=True)
+        (coupee / "cov" / ".coverage.coupee").write_bytes(b"tronque")
+        lisible = dossier / "mesure-psycopg-1"
+        (lisible / "cov").mkdir(parents=True)
+        (lisible / "cov" / ".coverage.bon").write_bytes(b"vide")
+        c = self._merge([coupee, lisible])
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 1)   # le lisible seul compte
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage.coupee")])
+        self.assertIn("FauxDataError", mesure["artefacts_incomplets"][0]["erreur"])
+        self.assertIn(".coverage.coupee", carte.summary(c))
+
+    @unittest.skipUnless(_coverage_installe(),
+                         "coverage requis pour un artefact réellement tronqué")
+    def test_fichier_coverage_tronque_reel(self):
+        dossier = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, dossier)
+        part = dossier / "mesure-psycopg-3"
+        (part / "cov").mkdir(parents=True)
+        (part / "cov" / ".coverage").write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
+        c = carte.merge([str(part)], "abc")
+        mesure = c["mesure"]
+        self.assertEqual(mesure["processus"], 0)
+        self.assertEqual([i["fichier"] for i in mesure["artefacts_incomplets"]],
+                         [os.path.join("cov", ".coverage")])
+        self.assertIn(".coverage", carte.summary(c))
 
 
 def _mesure_possible() -> bool:
