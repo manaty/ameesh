@@ -168,16 +168,15 @@ def _turns_harness(db, agent: str, at_ts: float, *, contains: bool = True) -> st
     ledger = storage.of(db).turn_costs
     after = ledger.first_after(agent, float(at_ts))
     before = ledger.last_before(agent, float(at_ts))
-    if contains and after is not None and (
-            before is None
-            or float(after.get("recorded_ts") or 0) - float(at_ts) <= FREEZE_TURN_WINDOW_S):
+    within_window = after is not None and (
+        0 <= float(after.get("recorded_ts") or 0) - float(at_ts) <= FREEZE_TURN_WINDOW_S)
+    if contains and within_window:
         # le tour qui a posé le gel : la première ligne écrite après lui, si
-        # elle reste dans la fenêtre d'un tour — ou si c'est le premier tour
-        # connu de l'agent, qui ne peut être qu'un tour du gel.
+        # elle reste dans la fenêtre d'un tour, même sans tour antérieur.
         return _harness_of(after)
     if before is not None:
         return _harness_of(before)
-    return _harness_of(after)
+    return _harness_of(after) if within_window else ""
 
 
 def _author_at_freeze(db, lot: int, item: dict) -> dict:

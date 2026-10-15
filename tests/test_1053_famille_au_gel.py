@@ -24,10 +24,33 @@ produit. Témoins :
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from ameesh import registry, review_lot, work
 
 from .support import PgTestCase
+
+
+class TurnWindowTest(unittest.TestCase):
+    def harness_after(self, offset, *, contains):
+        ledger = mock.Mock()
+        ledger.last_before.return_value = None
+        ledger.first_after.return_value = {"harness": "codex", "recorded_ts": 1000 + offset}
+        with mock.patch.object(review_lot.storage, "of") as store:
+            store.return_value.turn_costs = ledger
+            return review_lot._turns_harness(None, "a1", 1000, contains=contains)
+
+    def test_a_later_session_without_prior_turn_leaves_the_family_unknown(self):
+        for contains in (False, True):
+            with self.subTest(contains=contains):
+                self.assertEqual(self.harness_after(review_lot.FREEZE_TURN_WINDOW_S + 1,
+                                                    contains=contains), "")
+
+    def test_the_first_recorded_turn_is_accepted_within_the_window(self):
+        for offset in (0, review_lot.FREEZE_TURN_WINDOW_S):
+            for contains in (False, True):
+                with self.subTest(offset=offset, contains=contains):
+                    self.assertEqual(self.harness_after(offset, contains=contains), "codex")
 
 
 class FamilleAuGelTest(PgTestCase):
