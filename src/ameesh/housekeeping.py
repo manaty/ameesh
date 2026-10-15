@@ -1310,7 +1310,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
         blocked = unremovable > quota
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
-        credited: set = set()          # #1190: dry-run inodes already freed
+        handled: set = set()          # #1190: dry-run inodes already processed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
             if blocked or counted <= quota:
@@ -1330,7 +1330,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             if now - mtime < min_age:
                 continue
             inode = (st.st_dev, st.st_ino)
-            if dry_run and inode in credited:
+            if dry_run and inode in handled:
                 # #1190: separate cache walks yield the inode again, but its
                 # names would already be gone. Mirror apply's `gone` case.
                 counted -= size
@@ -1419,14 +1419,14 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     failed.append(path)
                     break
             files += 1
+            if dry_run:
+                handled.add(inode)
             if freed:
                 # #530: a name removed from an inode another hard link still
                 # holds frees no byte; only the last link credits the quota.
                 total -= size
                 counted -= size
                 evicted += size
-                if dry_run:
-                    credited.add(inode)
             else:
                 # #530: every name the walk saw is gone, but the inode still
                 # has one it did not see (a protected subtree, another managed
