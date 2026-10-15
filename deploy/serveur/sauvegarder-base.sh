@@ -37,8 +37,6 @@ f="$d/ameesh-$(hostname)-$(date +%F-%H%M%S).dump"
 # avant l'écriture (sans toucher à son contenu).
 if [ -e "$f" ]; then chmod 600 "$f"; fi
 "$python" "$helper" dump --config /home/ameesh/.config/ameesh/config.json --output "$f"
-# même normalisation des dumps plus anciens, sans les réécrire.
-find "$d" -type f -name 'ameesh-*.dump' ! -perm 0600 -exec chmod 600 {} +
 if [ -r /etc/ameesh/sauvegarde.env ]; then
     . /etc/ameesh/sauvegarde.env
     export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_BUCKET SCW_REGION
@@ -61,6 +59,14 @@ if [ -r /etc/ameesh/retention-provider.json ]; then
 else
     "$python" "$retention" --root "$d" prune --now "$(date +%s)"
 fi
+# même normalisation des dumps plus anciens, sans les réécrire. Après la
+# rétention : un dump public est d'abord refusé par le catalogue (il ne doit
+# pas expirer sans preuve), puis normalisé ici pour que le passage suivant le
+# voie privé. Seulement les dumps de l'appelant, et seulement ceux à un seul
+# lien : un dump partagé (plusieurs liens durs) est refusé par le catalogue,
+# et changer son mode changerait aussi celui des autres chemins du même inode.
+find "$d" -type f -name 'ameesh-*.dump' -user "$(id -un)" -links 1 ! -perm 0600 \
+    -exec chmod 600 {} +
 if [ "$expiry_status" -ne 0 ]; then
     echo "rétention privée : expire-unregistered a refusé un candidat ($expiry_status) ; prune a tourné" >&2
     exit "$expiry_status"
