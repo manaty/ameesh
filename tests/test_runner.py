@@ -719,6 +719,7 @@ class RunnerTest(PgTestCase):
             fh.write('{"schema": "ameesh-host-state/1", "state": "available", "seq": 1}\n')
         env = self.env(AMEESH_TEST_SLEEP="120", AMEESH_LEASE_TTL="3",
                        AMEESH_HOST_GATE="file", AMEESH_HOST_GATE_PATH=gate_state,
+                       AMEESH_HOST_GATE_ACK=os.path.join(self.tmp, "gate-ack", "ack.json"),
                        AMEESH_HOST_GATE_FALLBACK="available")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
