@@ -59,11 +59,47 @@ eventually closes its driver. `ScopedDb` releases these sessions between SQL
 operations; explicit transactions and independent gate/controller locks retain
 their sessions until completion. No transaction is shared across threads.
 
-The VM pool permits 32 ordinary server sessions and eight reserve sessions,
-with a total ceiling of 40. Clients have a ceiling of 200. Idle *unassigned*
-server sessions are closed after 30 seconds. These limits accommodate the
-present VM runner counts; bureau checks `2 × runner_count + burst headroom < 40`
-before switching. Increasing agent count beyond this capacity requires review.
+The VM pool permits 64 ordinary server sessions and 16 reserve sessions, with
+a total ceiling of 80. Clients have a ceiling of 250. Idle *unassigned* server
+sessions are closed after 30 seconds. These limits were raised after the
+2026-10-13 incident on pc-smichea: the original pool (32+8, ceiling 40,
+100 clients) saturated in session mode (40 active, 60 waiting, then `no more
+connections allowed (max_client_conn)`), which blocked every mesh CLI of the
+host. Bureau checks `2 × runner_count + burst headroom < 80` before switching,
+and keeps the three hosts (pc-smichea, agents-1, agents-2) under the server's
+300 with 3 × 80 `max_db_connections`. Increasing agent count beyond this
+capacity requires review.
+
+An installation made before this sizing is raised **by hand**: the recipe
+refuses an existing installation, and a fresh installation elsewhere cannot
+raise the limits of a running one — an installation still carrying the earlier
+200/32/8/40 sizing is the case this covers. Back up
+`~/.config/pgbouncer/pgbouncer.ini` first (dated name, 0600), then set
+`max_client_conn = 250`, `default_pool_size = 64`, `reserve_pool_size = 16`,
+`max_db_connections = 80` and `server_idle_timeout = 30`. Reload without
+dropping clients:
+
+```sh
+systemctl --user kill -s HUP ameesh-pgbouncer.service
+```
+
+A reload applies the file to new decisions and keeps connected clients; a
+restart is not needed and must not happen in a release window. Verify on the
+admin console, which `max_client_conn` does not gate:
+
+```sh
+psql "host=$HOME/.local/state/pgbouncer/socket port=6432 user=ameesh dbname=pgbouncer" \
+  -c 'SHOW CONFIG;'
+```
+
+`SHOW CONFIG` must show the five values above.
+
+Known gap (2026-10-13): `pc-smichea` still carries the `server_idle_timeout = 600`
+written by hand at the first installation, while this recipe targets 30 s; its
+other four limits were raised during the incident (250/64/16/80). The gap only
+delays closing an idle server session, it does not affect correctness. It is to
+be reconciled at the next planned restart of the host — not during a release
+window — with the reload above or by writing these values at that restart.
 
 After the corrected runner release is available and installation verification
 passes, bureau switches and drains/restarts the runner units it manages:
@@ -108,6 +144,29 @@ If the capacity probe fails, the alert command reports the database error.
 The notifier retries the failed pass before updating its active state: an
 unobserved capacity value never resolves an existing warning or raises it
 again on recovery. A successful reading below the threshold resolves it.
+
+When the effective DSN is the local pool socket itself (its `host` is the
+`unix_socket_dir` of `~/.config/pgbouncer/pgbouncer.ini`), `ameesh alerts` and
+`ameesh notify` also read the pool console (`SHOW POOLS`, `SHOW LISTS`,
+`SHOW CONFIG`) on that socket. They raise `pgbouncer_pool_waiting` — urgent,
+pushed by default — as soon as a client has queued for at least a second
+(`cl_waiting > 0`, `maxwait >= 1`): the server pool is exhausted, well before
+the client ceiling refuses anyone. The console is deliberately not subject to
+`max_client_conn` (pgbouncer only refuses connections to other databases). The
+display reads the real ceiling (`used_clients` / `max_client_conn` from
+`SHOW CONFIG`): `free_clients` counts client objects kept for reuse, it is not
+free capacity.
+
+`ameesh notify` reads this console from `cfg` alone, **before** its database
+pass and without opening the ordinary DSN. While `max_client_conn` refuses the
+notifier's own connection — the incident this warning reports — the console
+still answers, so the warning is routed and pushed anyway. A database outage
+never resolves the other alerts: their deliveries are left untouched. An
+unreadable console does not resolve the active warning either; the observation
+error is kept, as for the server capacity probe. `ameesh alerts`, which lists
+every other alert from the database, still needs a working connection. A host
+without a local pool, or whose DSN does not use it yet, adds no probe; the
+warning is local to the host that runs the notifier.
 
 Rollback, by bureau:
 

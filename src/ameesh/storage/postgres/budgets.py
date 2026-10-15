@@ -20,12 +20,24 @@ class Budgets(interface.Budgets):
             " extract(epoch from updated_at)::float8 as updated_ts"
             " from budget_limits order by scope, window_s")
 
-    def put(self, scope, window_s, usd, *, actor) -> tuple:
+    def put(self, scope, window_s, usd, *, actor, lower_only=False, ceiling=None) -> tuple:
         with self.db.transaction() as tx:
+            # A first cap has no row to lock. Serialize its creation too,
+            # before reading the value used by lower_only and the journal.
+            tx.query("SELECT pg_advisory_xact_lock(hashtextextended("
+                     "current_schema() || ':budget_limits:' || %s || ':' || %s, 0))",
+                     (scope, str(int(window_s))))
             rows = tx.query(
                 "select usd::float8 as usd from budget_limits"
                 " where scope = %s and window_s = %s for update", (scope, int(window_s)))
             old = float(rows[0]["usd"]) if rows else None
+            if lower_only:
+                # L87: compared under the lock, so a concurrent change cannot
+                # turn this lowering into a raise
+                current = old if old is not None else ceiling
+                if usd is None or (current is not None and float(usd) >= current):
+                    raise ValueError("not a lowering: %s is not below the cap in force (%s)"
+                                     % (usd, "none" if current is None else current))
             if (old is None and usd is None) or (
                     old is not None and usd is not None and float(usd) == old):
                 return False, old

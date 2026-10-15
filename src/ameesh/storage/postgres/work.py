@@ -10,6 +10,7 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import random
 import time
@@ -17,9 +18,14 @@ import time
 from ...db import DbError, is_unique_violation
 from .. import interface
 from . import catalog as _catalog
+from .work_dependencies import _DONE as _DEPENDENCIES_DONE, _LOCK as _DEPENDENCIES_LOCK
 
-ITEM_COLUMNS = """
+#: #705 : `__REVIEWER__` est remplacé par `item_columns` — la colonne
+#: `reviewer` n'existe qu'après la migration 0421, et la base de prod peut
+#: être en 0373 quand ce code tourne (l'exécuteur migre à la mise à jour).
+_COLUMNS_TEMPLATE = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
+    __REVIEWER__,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
@@ -35,6 +41,39 @@ ITEM_COLUMNS = """
     extract(epoch from delegated_at)::float8 as delegated_ts,
     extract(epoch from due_at)::float8 as due_ts
 """
+
+
+def has_reviewer(db) -> bool:
+    """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ? La
+    réponse est mise en cache sur la connexion : une lecture par base."""
+    flag = getattr(db, "_has_reviewer", None)
+    if flag is None:
+        flag = bool(db.query(
+            "SELECT 1 AS ok FROM information_schema.columns"
+            " WHERE table_schema = current_schema() AND table_name = 'work_items'"
+            "   AND column_name = 'reviewer'"))
+        try:
+            db._has_reviewer = flag
+        except Exception:  # objet sans attributs (proxy) : on relira
+            pass
+    return flag
+
+
+def item_columns(db, ref: str | None = None) -> str:
+    """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
+    (les lectures d'avant la migration ne cassent pas, #705).
+
+    `ref` (le nom de la table dans la requête, « work_items ») lit `reviewer`
+    par `to_jsonb`, sans sonde de colonne : les commandes à budget
+    d'allers-retours (L61 : `work list`, `progress`) n'en paient pas un de
+    plus. `to_jsonb` rend NULL sur une base d'avant 0421, d'où le coalesce."""
+    if ref:
+        reviewer = "coalesce(to_jsonb(%s)->>'reviewer', '') AS reviewer" % ref
+    elif has_reviewer(db):
+        reviewer = "reviewer"
+    else:
+        reviewer = "''::text AS reviewer"
+    return _COLUMNS_TEMPLATE.replace("__REVIEWER__", reviewer)
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
@@ -62,6 +101,10 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
+#: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
+#: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
+_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 #: #443, #478 : réservation automatique du prochain numéro libre — un budget
 #: de temps (et non plus un nombre d'essais) et une attente plein jitter
 #: (`uniform(0, min(plafond, base·2^n))`) bornée au budget restant, pour que
@@ -75,6 +118,11 @@ MIGRATION_INDEX = "work_items_migration_repo_idx"
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
+
+#: #540 : verrou de transaction d'un agent : « a-t-il déjà un lot non démarré ? »
+#: et l'attribution qui suit passent l'une après l'autre
+PENDING_LOCK = ("SELECT pg_advisory_xact_lock("
+                "hashtextextended(current_schema() || ':pending_lot:' || %s, 0))")
 
 #: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
 #: depuis le début de la délégation — un tour noté par l'exécuteur
@@ -125,11 +173,12 @@ _DELAYS_SELECT = """
            extract(epoch FROM rev.at)::float8 AS reviewed_ts,
            rev.verdict AS reviewed_verdict,
            extract(epoch FROM fus.at)::float8 AS merged_ts,
+           extract(epoch FROM liv.at)::float8 AS delivered_ts,
            extract(epoch FROM (gel.at - req.at))::float8 AS request_to_freeze_s,
            extract(epoch FROM (rev.at - gel.at))::float8 AS freeze_to_review_s,
            extract(epoch FROM (fus.at - gel.at))::float8 AS freeze_to_merge_s,
            extract(epoch FROM (fus.at - rev.at))::float8 AS review_to_merge_s,
-           extract(epoch FROM (fus.at - req.at))::float8 AS total_s,
+           extract(epoch FROM (coalesce(fus.at, liv.at) - req.at))::float8 AS total_s,
            coalesce(allv.n, 0)::int AS verdicts,
            coalesce(blk.n, 0)::int AS blocked_verdicts
       FROM work_items w
@@ -147,6 +196,9 @@ _DELAYS_SELECT = """
             SELECT min(m.at) AS at FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'merged') fus ON true
       LEFT JOIN LATERAL (
+            SELECT min(m.at) AS at FROM work_item_milestones m
+             WHERE m.work_item_id = w.id AND m.kind = 'delivered') liv ON true
+      LEFT JOIN LATERAL (
             SELECT count(*) AS n FROM work_item_milestones m
              WHERE m.work_item_id = w.id AND m.kind = 'verdict') allv ON true
       LEFT JOIN LATERAL (
@@ -156,16 +208,12 @@ _DELAYS_SELECT = """
 """
 
 
-class _Refrozen(Exception):
-    """Annule la fermeture : un nouveau gel a été validé pendant l'attente."""
-
-
 class WorkItems(interface.WorkItems):
 
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
             rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
-                            % ITEM_COLUMNS, (int(item_id),))
+                            % item_columns(self.db), (int(item_id),))
             if not rows:
                 return None
             item = rows[0]
@@ -176,7 +224,7 @@ class WorkItems(interface.WorkItems):
             if item.get("app") == app:
                 return item
             rows = tx.query("UPDATE work_items SET app = %%s, updated_at = now()"
-                            " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                            " WHERE id = %%s RETURNING %s" % item_columns(self.db),
                             (app, int(item_id)))
             WorkItems(tx)._event(int(item_id), item["state"],
                                  "project %r → %r" % (item.get("app"), app), actor)
@@ -184,7 +232,7 @@ class WorkItems(interface.WorkItems):
 
     def without_project(self) -> list[dict]:
         return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
-                             " AND state NOT IN %s ORDER BY id" % (ITEM_COLUMNS, _CLOSED))
+                             " AND state NOT IN %s ORDER BY id" % (item_columns(self.db), _CLOSED))
 
     def creator(self, item_id) -> str:
         rows = self.db.query("SELECT actor FROM work_item_events WHERE work_item_id = %s"
@@ -194,10 +242,12 @@ class WorkItems(interface.WorkItems):
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
-            estimate_source=None, change_size=None, mark_item_id=None,
-            mark_note="", parent_lot=None) -> dict:
+            estimate_source=None, change_size=None, queued_note=None,
+            forced_note=None, mark_item_id=None, mark_note="",
+            parent_lot=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
+        #540 : `queued_note` (voir l'interface).
         L539 : `mark_note` marque `mark_item_id` dans la **même** transaction,
         si bien qu'un échec de la marque annule la création (et l'inverse).
         La ligne marquée est verrouillée **avant** l'insertion et la
@@ -210,24 +260,48 @@ class WorkItems(interface.WorkItems):
         edge rolls the creation back, the suite lot is never exposed ready);
         already finished, no edge is written (the suite is available at once)
         and the parent stays traced in the journal; unknown, everything is
-        rolled back. No number is ever guessed from the title or the body."""
+        rolled back. No number is ever guessed from the title or the body.
+
+        Les verrous sont pris dans l'ordre commun avec `assign` (revue R1
+        delta #540) : les lignes de lots d'abord (`mark_item_id` et
+        `parent_lot`, par identifiant croissant), le verrou d'agent ensuite.
+        `assign` verrouille la ligne du lot puis l'agent (`_pending`) ;
+        l'ordre inverse ici (agent puis parent) interbloquait l'ajout d'une
+        suite avec l'attribution de son parent."""
         with self.db.transaction() as tx:
+            # #540 : lignes de lots d'abord, par identifiant croissant, puis
+            # le verrou d'agent de `_pending` — même ordre que `assign`.
             marked = None
-            if mark_item_id is not None:
-                marked = tx.query(
-                    "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                    (int(mark_item_id),))
-                if not marked:
-                    raise DbError("mark_item_id %s: no such lot" % mark_item_id)
-                if str(issue_ref or "").strip():
-                    # le verrou sur la ligne marquée sérialise les créateurs :
-                    # le second relit la référence après le commit du premier
-                    duplicate = tx.query(
-                        "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
-                        " ORDER BY id LIMIT 1", (issue_ref,))
-                    if duplicate:
-                        raise DbError("issue_ref %s is already carried by lot #%d"
-                                      % (issue_ref, int(duplicate[0]["id"])))
+            parent = None
+            parent_id = None if parent_lot is None else int(parent_lot)
+            for lock_id in sorted({int(v) for v in (mark_item_id, parent_lot)
+                                   if v is not None}):
+                if lock_id == parent_id:
+                    parent = tx.query(
+                        "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
+                        (lock_id,))
+                    if not parent:
+                        raise DbError("parent lot %s: no such lot" % parent_lot)
+                if mark_item_id is not None and lock_id == int(mark_item_id):
+                    marked = tx.query(
+                        "SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                        (lock_id,))
+                    if not marked:
+                        raise DbError("mark_item_id %s: no such lot" % mark_item_id)
+            if mark_item_id is not None and str(issue_ref or "").strip():
+                # le verrou sur la ligne marquée sérialise les créateurs :
+                # le second relit la référence après le commit du premier
+                duplicate = tx.query(
+                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref,))
+                if duplicate:
+                    raise DbError("issue_ref %s is already carried by lot #%d"
+                                  % (issue_ref, int(duplicate[0]["id"])))
+            behind = (WorkItems(tx)._pending(assignee, None)
+                      if queued_note is not None and assignee else None)
+            if behind is not None:
+                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                                  else (None, queued_note.format(lot=behind)))
             rows = tx.query(
                 """
                 INSERT INTO work_items
@@ -238,7 +312,7 @@ class WorkItems(interface.WorkItems):
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s, %s,
                         %s, %s, %s, CASE WHEN %s THEN now() END, %s)
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", ITEM_COLUMNS),
+                """.replace("__COLUMNS__", item_columns(self.db)),
                 (type, source, app, title, body, issue_ref, workstream, assignee,
                  budget_usd, package_id, package_parent, branch, branch_target,
                  None if priority is None else int(priority),
@@ -251,15 +325,13 @@ class WorkItems(interface.WorkItems):
                 WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
                                             estimate_source, actor)
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            if behind is not None:
+                item["forced_behind" if forced_note else "queued_behind"] = behind
             if parent_lot is not None:
                 # #1193: the explicit parent of a suite lot is linked in the
                 # same transaction as the creation — never a forgotten edge,
-                # and an edge failure never leaves the lot ready.
-                parent = tx.query(
-                    "SELECT id, state FROM work_items WHERE id = %s FOR UPDATE",
-                    (int(parent_lot),))
-                if not parent:
-                    raise DbError("parent lot %s: no such lot" % parent_lot)
+                # and an edge failure never leaves the lot ready. The row was
+                # locked above, before the agent's lock (#540, ordre commun).
                 if parent[0]["state"] not in ("merged", "promoted", "closed"):
                     tx.execute(
                         "INSERT INTO work_item_dependencies(work_item_id, blocker_id,"
@@ -281,11 +353,12 @@ class WorkItems(interface.WorkItems):
 
     def get(self, item_id) -> dict | None:
         rows = self.db.query(
-            "SELECT %s FROM work_items WHERE id = %%s" % ITEM_COLUMNS, (int(item_id),))
+            "SELECT %s FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
         return rows[0] if rows else None
 
     def items(self, *, state, assignee, limit) -> list[dict]:
-        sql = "SELECT %s FROM work_items WHERE true" % ITEM_COLUMNS
+        # L61 : lecture de `reviewer` sans sonde, cette commande est bornée
+        sql = "SELECT %s FROM work_items WHERE true" % item_columns(self.db, "work_items")
         params: list = []
         if state:
             sql += " AND state = %s"
@@ -302,10 +375,10 @@ class WorkItems(interface.WorkItems):
         """Déplace le lot s'il est encore en `current` (sinon None, rien
         d'écrit), puis journalise la transition. `held` (L233) : et si une
         demande de décision ouverte le tient — vérifiée dans la même
-        instruction, la demande verrouillée (voir l'interface)."""
+        instruction, la demande verrouillée (voir l'interface). Un passage
+        vers un état terminal libère la réservation de migration (#956)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
-        rows = self.db.query(
-            """
+        sql = """
             UPDATE work_items
                SET state = %s,
                    loops = loops + %s,
@@ -315,35 +388,144 @@ class WorkItems(interface.WorkItems):
                                      THEN coalesce(started_at, now()) ELSE started_at END
              WHERE id = %s AND state = %s __HELD__
             RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", ITEM_COLUMNS).replace("__HELD__", _HELD if held else ""),
-            (state, loops, state, state, int(item_id), current)
-            + ((str(int(item_id)),) if held else ()),
-        )
+            """.replace("__COLUMNS__", item_columns(self.db)).replace("__HELD__", _HELD if held else "")
+        params = ((state, loops, state, state, int(item_id), current)
+                  + ((str(int(item_id)),) if held else ()))
+        if state not in ("merged", "promoted", "closed"):
+            rows = self.db.query(sql, params)
+            if not rows:
+                return None
+            self._event(int(item_id), state, note, actor)
+            return rows[0]
+        with self.db.transaction() as tx:
+            rows = tx.query(sql, params)
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), state, note, actor)
+            self._release_migration(tx, item_id, rows[0],
+                                    why="état %s" % state, actor=actor)
+            return rows[0]
+
+    def designate_reviewer(self, item_id, reviewer, *, actor) -> dict | None:
+        """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
+        journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
+        colonne vient de la migration 0421 : sans elle, l'écriture est refusée
+        avec la marche à suivre (les lectures, elles, s'en passent)."""
+        if not has_reviewer(self.db):
+            raise DbError("work_items.reviewer is missing (migration 0421): "
+                          "run \"ameesh migrate\", then designate the reviewer")
+        with self.db.transaction() as tx:
+            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor)
+
+    def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
+        """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
+        ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
+        pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
+        avant, un `assign` a pu la changer entre-temps."""
+        rows = self.db.query(
+            "UPDATE work_items SET reviewer = %%s, updated_at = now()"
+            " WHERE id = %%s AND state = 'qa'"
+            "   AND assignee IS DISTINCT FROM %%s"
+            " RETURNING %s" % item_columns(self.db),
+            (reviewer, int(item_id), reviewer))
         if not rows:
             return None
-        self._event(int(item_id), state, note, actor)
+        self._event(int(item_id), "qa", "reviewer %s designated" % reviewer, actor)
         return rows[0]
 
-    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+    def assign(self, item_id, assignee, *, current, note, actor,
+               queued_note=None, forced_note=None, take=False,
+               ready_only=False) -> dict | None:
         """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
         l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
         ligne de journal part dans la même transaction. L40 : la délégation
-        en cours est effacée (issue `annulee` au registre)."""
+        en cours est effacée (issue `annulee` au registre). #540 :
+        `queued_note` (voir l'interface)."""
         with self.db.transaction() as tx:
-            return WorkItems(tx)._reassign(item_id, assignee, current, None, note, actor)
+            if ready_only:
+                # Même verrou que les éditions du graphe : une dépendance ne
+                # peut apparaître entre le contrôle et l'attribution. Verrouiller
+                # aussi les amonts empêche leur réouverture pendant la prise.
+                tx.execute(_DEPENDENCIES_LOCK)
+                rows = tx.query(
+                    "SELECT id, state, assignee FROM work_items"
+                    " WHERE id = %s OR id IN (SELECT blocker_id FROM work_item_dependencies"
+                    "                         WHERE work_item_id = %s)"
+                    " ORDER BY id FOR UPDATE", (int(item_id), int(item_id)))
+                item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
+                if current is not None or item is None or item["state"] != "intake" \
+                        or item["assignee"] is not None:
+                    return None
+                if any(int(r["id"]) != int(item_id) and r["state"] not in _DEPENDENCIES_DONE
+                       for r in rows):
+                    return None
+            behind = None
+            if (queued_note is not None or take) and assignee:
+                lot = tx.query("SELECT started_at IS NULL AS fresh FROM work_items"
+                               " WHERE id = %s FOR UPDATE", (int(item_id),))
+                if lot and lot[0]["fresh"]:
+                    behind = WorkItems(tx)._pending(assignee, int(item_id))
+            if behind is not None and take:
+                raise interface.PendingLot(behind)
+            if behind is not None:
+                assignee, note = ((assignee, forced_note.format(lot=behind)) if forced_note
+                                  else (None, queued_note.format(lot=behind)))
+            row = WorkItems(tx)._reassign(item_id, assignee, current,
+                                          "intake" if ready_only else None, note, actor)
+            if row is not None and behind is not None:
+                row["forced_behind" if forced_note else "queued_behind"] = behind
+            return row
+
+    def _pending(self, assignee, item_id) -> int | None:
+        """#540, dans la transaction ouverte et sous le verrou de l'agent : son
+        plus ancien lot ouvert qui l'occupe, autre que `item_id`, ou None.
+        L165b : n'occupent pas l'agent le lot qui attend un autre (`qa`,
+        `waiting_human`, `blocked`) ni celui dont le début est prévu après
+        aujourd'hui — le jour local du processus qui attribue, comme
+        `operations.listing`."""
+        today = _dt.date.today().isoformat()
+        self.db.query(PENDING_LOCK, (assignee,))
+        rows = self.db.query(
+            "SELECT id FROM work_items WHERE assignee = %%s AND started_at IS NULL"
+            "   AND state NOT IN %s AND state NOT IN %s"
+            "   AND (planned_start IS NULL OR planned_start <= %%s)"
+            "   AND id <> %%s ORDER BY id LIMIT 1" % (_CLOSED, _WAITING_ON_OTHERS),
+            (assignee, today, int(item_id or 0)))
+        return int(rows[0]["id"]) if rows else None
 
     def _reassign(self, item_id, assignee, current, state, note, actor) -> dict | None:
-        """`assign` dans la transaction ouverte ; `state` : celui exigé."""
+        """`assign` dans la transaction ouverte ; `state` : celui exigé.
+
+        #705 r2 (B1) : la règle « le relecteur n'est pas l'assigné » vaut
+        aussi quand l'assignation arrive après la désignation — la désignation
+        tombe alors dans la MÊME écriture (l'assignation et la désignation
+        peuvent se croiser), et le journal le dit."""
+        previous_reviewer = ""
+        reviewer_set = ""
+        params: list = [assignee]
+        if has_reviewer(self.db):
+            seen = self.db.query(
+                "SELECT reviewer FROM work_items WHERE id = %s FOR UPDATE",
+                (int(item_id),))
+            previous_reviewer = (seen[0]["reviewer"] or "") if seen else ""
+            reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
+                            " ELSE reviewer END")
+            params.append(assignee)
+        params += [int(item_id), current, state, state]
         rows = self.db.query(
-            "UPDATE work_items SET assignee = %%s, updated_at = now(),"
-            "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
-            " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
-            "   AND state NOT IN ('merged', 'promoted', 'closed')"
-            "   AND (%%s::text IS NULL OR state = %%s)"
-            " RETURNING %s" % ITEM_COLUMNS,
-            (assignee, int(item_id), current, state, state))
+            ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+             "       updated_at = now(),"
+             "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+             " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
+             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+             "   AND (%s::text IS NULL OR state = %s)"
+             " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
+            tuple(params))
         if not rows:
             return None
+        if previous_reviewer and previous_reviewer == assignee:
+            note = "%s; reviewer %s cleared (they now hold the lot)" % (
+                note, previous_reviewer)
         self.db.query(
             "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
             "       resolved_by = %s"
@@ -385,12 +567,18 @@ class WorkItems(interface.WorkItems):
         échéance, le registre reçoit la nouvelle ligne, le journal la note.
         Rend `{item, delegation, replaced}` ou None (lot modifié entre-temps)."""
         with self.db.transaction() as tx:
-            rows = tx.query(
-                "SELECT id FROM work_items WHERE id = %%s"
+            with_reviewer = has_reviewer(self.db)
+            seen = tx.query(
+                "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
-                " FOR NO KEY UPDATE" % _CLOSED, (int(item_id), current))
-            if not rows:
+                " FOR NO KEY UPDATE"
+                % (", reviewer" if with_reviewer else "", _CLOSED),
+                (int(item_id), current))
+            if not seen:
                 return None
+            # #705 r2 (B1) : déléguer à son relecteur retire la désignation
+            # (le relecteur relirait son propre travail), dans l'écriture même.
+            previous_reviewer = (seen[0]["reviewer"] or "") if with_reviewer else ""
             replaced = tx.query(
                 "UPDATE work_item_delegations SET outcome = 'remplacee', resolved_at = now(),"
                 "       resolved_by = %s"
@@ -398,11 +586,20 @@ class WorkItems(interface.WorkItems):
                 " RETURNING id, delegate, delegated_by,"
                 "           extract(epoch from due_at)::float8 AS due_ts",
                 (actor or "", int(item_id)))
+            reviewer_set = ""
+            params: list = [delegate, delegated_by, float(within_s), int(item_id)]
+            if with_reviewer:
+                reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
+                                " ELSE reviewer END")
+                params = [delegate, delegate, delegated_by, float(within_s),
+                          int(item_id)]
             rows = tx.query(
-                "UPDATE work_items SET assignee = %%s, delegated_by = %%s, delegated_at = now(),"
-                "       due_at = now() + make_interval(secs => %%s), updated_at = now()"
-                " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
-                (delegate, delegated_by, float(within_s), int(item_id)))
+                ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                 "       delegated_by = %s, delegated_at = now(),"
+                 "       due_at = now() + make_interval(secs => %s), updated_at = now()"
+                 " WHERE id = %s RETURNING __COLUMNS__"
+                 ).replace("__COLUMNS__", item_columns(self.db)),
+                tuple(params))
             item = rows[0]
             delegation = tx.query(
                 "INSERT INTO work_item_delegations AS d"
@@ -410,6 +607,9 @@ class WorkItems(interface.WorkItems):
                 " SELECT id, %%s, %%s, delegated_at, due_at FROM work_items WHERE id = %%s"
                 " RETURNING %s" % _DELEGATION_COLUMNS,
                 (delegate, delegated_by, int(item_id)))[0]
+            if previous_reviewer and previous_reviewer == delegate:
+                note = "%s; reviewer %s cleared (they now hold the lot)" % (
+                    note, previous_reviewer)
             WorkItems(tx)._event(int(item_id), item["state"], note, actor)
             return {"item": item, "delegation": delegation,
                     "replaced": replaced[0] if replaced else None}
@@ -481,11 +681,12 @@ class WorkItems(interface.WorkItems):
                 return None
             # relu APRÈS le verrou, dans une instruction suivante : en READ
             # COMMITTED elle voit l'issue posée par un exécuteur concurrent
+            with_reviewer = has_reviewer(self.db)
             rows = tx.query(
-                "SELECT %s, %s AS worked, w.title, w.state, w.assignee"
+                "SELECT %s, %s AS worked, w.title, w.state, w.assignee%s"
                 "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
                 " WHERE d.id = %%s AND d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
-                % (_DELEGATION_COLUMNS, _WORKED),
+                % (_DELEGATION_COLUMNS, _WORKED, ", w.reviewer" if with_reviewer else ""),
                 (int(delegation_id), float(now_ts)))
             if not rows:
                 return None
@@ -506,23 +707,38 @@ class WorkItems(interface.WorkItems):
             if not done:
                 return None
             if outcome == "rendue":
+                # #705 : le délégant a pu être désigné relecteur pendant la
+                # délégation (il n'était plus l'assigné) ; le lot lui revient,
+                # la désignation tombe dans la même écriture.
+                reviewer_set = ""
+                params: list = [row["delegated_by"]]
+                if with_reviewer:
+                    reviewer_set = (", reviewer = CASE WHEN reviewer = %s THEN ''"
+                                    " ELSE reviewer END")
+                    params.append(row["delegated_by"])
                 item = tx.query(
-                    "UPDATE work_items SET assignee = %%s, delegated_by = NULL,"
-                    "       delegated_at = NULL, due_at = NULL, updated_at = now()"
-                    " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
-                    (row["delegated_by"], item_id))
+                    ("UPDATE work_items SET assignee = %s" + reviewer_set + ","
+                     "       delegated_by = NULL, delegated_at = NULL, due_at = NULL,"
+                     "       updated_at = now()"
+                     " WHERE id = %s RETURNING __COLUMNS__"
+                     ).replace("__COLUMNS__", item_columns(self.db)),
+                    tuple(params + [item_id]))
             elif outcome == "annulee":
                 # L46 : lot fermé OU réassigné hors `work assign` — la
                 # délégation annulée ne laisse ni délégant ni date
                 item = tx.query(
                     "UPDATE work_items SET delegated_by = NULL, delegated_at = NULL,"
-                    "       due_at = NULL WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                    "       due_at = NULL WHERE id = %%s RETURNING %s" % item_columns(self.db),
                     (item_id,))
             else:
                 item = tx.query(
                     "UPDATE work_items SET due_at = NULL WHERE id = %%s RETURNING %s"
-                    % ITEM_COLUMNS, (item_id,))
+                    % item_columns(self.db), (item_id,))
             text = describe(outcome, row) if describe else None
+            if outcome == "rendue" and row.get("reviewer") \
+                    and row["reviewer"] == row["delegated_by"]:
+                text = "%s; reviewer %s cleared (they now hold the lot)" % (
+                    text or "delegation expired", row["reviewer"])
             if text:
                 WorkItems(tx)._event(item_id, item[0]["state"], text, actor)
             return dict(row, outcome=outcome, item=item[0])
@@ -656,7 +872,7 @@ class WorkItems(interface.WorkItems):
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE work_items SET package_id = %%s, package_parent = %%s, updated_at = now()"
-                " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                " WHERE id = %%s RETURNING %s" % item_columns(self.db),
                 (package_id, parent, int(item_id)))
             if not rows:
                 return None
@@ -677,7 +893,7 @@ class WorkItems(interface.WorkItems):
                 "                             THEN NULL ELSE branch_head_at END,"
                 "       branch = %%s, branch_target = %%s, updated_at = now()"
                 " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
-                " RETURNING %s" % ITEM_COLUMNS,
+                " RETURNING %s" % item_columns(self.db),
                 (branch, branch, branch, target, int(item_id)))
             if not rows:
                 return None
@@ -685,6 +901,26 @@ class WorkItems(interface.WorkItems):
             return rows[0]
 
     # -- numéro de migration réservé (L122) ----------------------------------
+    def _release_migration(self, tx, item_id, row, *, why, actor) -> None:
+        """#956 : libère la réservation du lot qui entre dans un état terminal
+        (`merged`, `promoted`, `closed`), dans la transaction même de la
+        transition : une réservation tenue par un lot fusionné bloquait le
+        numéro pour toujours. Le numéro reste protégé tant qu'un fichier le
+        porte, puisque `repo_numbers` compte les fichiers de toutes les
+        branches du dépôt."""
+        if row.get("migration") is None:
+            return
+        number = row["migration"]
+        tx.execute(
+            "UPDATE work_items SET migration = NULL, migration_repo = NULL,"
+            "       updated_at = now() WHERE id = %s", (int(item_id),))
+        # le lot rendu à l'appelant reflète l'état validé, pas la valeur d'avant
+        row["migration"] = None
+        row["migration_repo"] = None
+        WorkItems(tx)._event(
+            int(item_id), row["state"],
+            "migration %s released (%s, #956)" % (number, why), actor)
+
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
                           release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
@@ -702,21 +938,45 @@ class WorkItems(interface.WorkItems):
             value, params = "NULL", ()
         elif number is None:
             value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
-                     "               WHERE migration_repo = %s))")
+                     "               WHERE migration_repo = %s"
+                     "                 AND state NOT IN ('merged', 'promoted', 'closed')))")
             params = (int(floor), repo)
         else:
             value, params = "%s", (int(number),)
+        # `release` libère aussi un lot déjà terminal (#956) ; les autres
+        # chemins ne visent qu'un lot ouvert.
+        guard = "" if release else " AND state NOT IN ('merged', 'promoted', 'closed')"
         deadline = time.monotonic() + _RESERVE_BUDGET_S
         wait = _RESERVE_WAIT_BASE_S
         while True:
             try:
                 with self.db.transaction() as tx:
-                    rows = tx.query(
-                        "UPDATE work_items SET migration = %s, migration_repo = %%s,"
-                        "       updated_at = now()"
-                        " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
-                        " RETURNING %s" % (value, ITEM_COLUMNS),
-                        params + (None if release else repo, int(item_id)))
+                    if not release:
+                        # #956 : une réservation héritée d'un lot terminal
+                        # (prise avant ce correctif) ne tient plus le numéro :
+                        # elle est libérée dans la transaction de la
+                        # réservation, avec sa ligne de journal. Les lignes
+                        # sont lues AVANT l'UPDATE : `RETURNING` rendrait la
+                        # valeur déjà effacée.
+                        for old in tx.query(
+                                "SELECT id, migration, state FROM work_items"
+                                " WHERE migration_repo = %s"
+                                "   AND state IN ('merged', 'promoted', 'closed')"
+                                " FOR UPDATE", (repo,)):
+                            tx.execute(
+                                "UPDATE work_items SET migration = NULL,"
+                                "       migration_repo = NULL, updated_at = now()"
+                                " WHERE id = %s", (int(old["id"]),))
+                            WorkItems(tx)._event(
+                                int(old["id"]), old["state"],
+                                "migration %s released (lot %s %s, #956)" % (
+                                    old["migration"], old["id"], old["state"]), actor)
+                    sql = ("UPDATE work_items SET migration = %s, migration_repo = %%s,"
+                           "       updated_at = now()"
+                           " WHERE id = %%s" + guard +
+                           " RETURNING %s") % (value, item_columns(self.db))
+                    rows = tx.query(sql,
+                                    params + (None if release else repo, int(item_id)))
                     if not rows:
                         return None
                     WorkItems(tx)._event(int(item_id), rows[0]["state"],
@@ -742,9 +1002,12 @@ class WorkItems(interface.WorkItems):
                         "reservation contention, retry") from exc
 
     def migration_holder(self, number, repo) -> dict | None:
+        """Le lot OUVERT qui tient ce numéro (#956 : un lot terminal ne le
+        tient plus)."""
         rows = self.db.query(
             "SELECT id, title, state FROM work_items WHERE migration = %s"
-            " AND migration_repo = %s", (int(number), repo))
+            " AND migration_repo = %s"
+            " AND state NOT IN ('merged', 'promoted', 'closed')", (int(number), repo))
         return rows[0] if rows else None
 
     # -- prepared conflict resolutions (L160d, 0057) ---------------------------
@@ -935,14 +1198,14 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items"
             " WHERE (branch IS NOT NULL OR assignee IS NOT NULL)"
             "   AND state NOT IN ('merged', 'promoted', 'closed')"
-            " ORDER BY id LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+            " ORDER BY id LIMIT %%s" % item_columns(self.db), (int(limit),))
 
     def open_for(self, assignee) -> list[dict]:
         """Les lots ouverts (ni fusionnés, ni promus, ni fermés) d'un assigné."""
         return self.db.query(
             "SELECT %s FROM work_items"
             " WHERE assignee = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
-            " ORDER BY id" % ITEM_COLUMNS, (assignee,))
+            " ORDER BY id" % item_columns(self.db), (assignee,))
 
     def open_by_ref(self, ref) -> list[dict]:
         """Les lots ouverts désignés par une référence : `issue_ref`, fiche du
@@ -954,18 +1217,18 @@ class WorkItems(interface.WorkItems):
             "   AND (lower(issue_ref) = lower(%%s) OR lower(package_id) = lower(%%s)"
             "        OR lower(branch) = lower(%%s)"
             "        OR lower(rtrim(split_part(btrim(title), ' ', 1), ':')) = lower(%%s))"
-            " ORDER BY id" % ITEM_COLUMNS, (ref, ref, ref, ref))
+            " ORDER BY id" % item_columns(self.db), (ref, ref, ref, ref))
 
     def by_issue_ref(self, ref) -> list[dict]:
         """L539 : les lots portant exactement cette `issue_ref`, quel que soit
         leur état (un lot de relecture fermé reste l'identité de sa référence)."""
         return self.db.query(
             "SELECT %s FROM work_items WHERE lower(issue_ref) = lower(%%s)"
-            " ORDER BY id" % ITEM_COLUMNS, (str(ref or ""),))
+            " ORDER BY id" % item_columns(self.db), (str(ref or ""),))
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(
-            "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % ITEM_COLUMNS,
+            "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % item_columns(self.db),
             (package_id,))
 
     def close_merged(self, item_id, *, current, sha, actor, note, pr_ref,
@@ -975,45 +1238,56 @@ class WorkItems(interface.WorkItems):
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
 
         `frozen_id` (revue codex1, P2-1) : le gel examiné doit être le dernier
-        gel du lot. L'UPDATE prend d'abord le verrou de la ligne du lot (en
-        l'attendant au besoin) ; le dernier gel est relu APRÈS, dans une
-        instruction suivante de la même transaction — en READ COMMITTED elle
-        voit tout gel validé pendant l'attente (le sous-select d'une seule
-        instruction verrait l'instantané d'avant l'attente). S'il a changé,
-        la transaction est annulée (None). Un gel ne peut pas s'insérer
-        ensuite : `add_milestone` prend le même verrou de ligne."""
-        try:
-            with self.db.transaction() as tx:
-                rows = tx.query(
-                    """
-                    UPDATE work_items
-                       SET state = 'merged', updated_at = now(), closed_at = NULL,
-                           pr_ref = coalesce(%s, pr_ref)
-                     WHERE id = %s AND state = %s
-                    RETURNING __COLUMNS__
-                    """.replace("__COLUMNS__", ITEM_COLUMNS),
-                    (pr_ref, int(item_id), current))
-                if not rows:
-                    return None
-                if frozen_id is not None:
-                    latest = tx.query(
-                        "SELECT id FROM work_item_milestones"
-                        " WHERE work_item_id = %s AND kind = 'frozen'"
-                        " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
-                    if not latest or int(latest[0]["id"]) != int(frozen_id):
-                        raise _Refrozen()
-                WorkItems(tx)._event(int(item_id), "merged", note, actor)
-                tx.query(
-                    "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
-                    " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
-                    (sha or "", actor or "", note or "", int(item_id)))
-                return rows[0]
-        except _Refrozen:
-            return None
+        gel du lot. Le `SELECT ... FOR UPDATE` prend d'abord le verrou de la
+        ligne du lot (en l'attendant au besoin) ; le dernier gel est relu
+        APRÈS, dans une instruction suivante de la même transaction — en READ
+        COMMITTED elle voit tout gel validé pendant l'attente (le sous-select
+        d'une seule instruction verrait l'instantané d'avant l'attente). S'il
+        a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
+        ensuite : `add_milestone` prend le même verrou de ligne.
 
-    def close(self, item_id, *, current, reason, superseded_by, actor, note) -> dict | None:
-        """`current` → `closed` (abandon ou remplacement) si le lot y est encore ;
-        journal et jalon `closed` dans la même transaction."""
+        Rien n'est écrit avant ce recontrôle : la fermeture est appelée dans
+        la transaction qui porte aussi le réveil des dépendants (L385 suite),
+        et un `UPDATE` suivi d'un `None` n'était annulé que par SA transaction
+        — sous une transaction englobante, la ligne serait restée modifiée.
+        """
+        with self.db.transaction() as tx:
+            locked = tx.query(
+                "SELECT id FROM work_items WHERE id = %s AND state = %s FOR UPDATE",
+                (int(item_id), current))
+            if not locked:
+                return None
+            if frozen_id is not None:
+                latest = tx.query(
+                    "SELECT id FROM work_item_milestones"
+                    " WHERE work_item_id = %s AND kind = 'frozen'"
+                    " ORDER BY at DESC, id DESC LIMIT 1", (int(item_id),))
+                if not latest or int(latest[0]["id"]) != int(frozen_id):
+                    return None
+            rows = tx.query(
+                """
+                UPDATE work_items
+                   SET state = 'merged', updated_at = now(), closed_at = NULL,
+                       pr_ref = coalesce(%s, pr_ref)
+                 WHERE id = %s AND state = %s
+                RETURNING __COLUMNS__
+                """.replace("__COLUMNS__", item_columns(self.db)),
+                (pr_ref, int(item_id), current))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), "merged", note, actor)
+            self._release_migration(tx, item_id, rows[0], why="fusion", actor=actor)
+            tx.query(
+                "UPDATE work_item_milestones SET sha = %s, actor = %s, note = %s"
+                " WHERE work_item_id = %s AND kind = 'merged' AND sha = '' RETURNING id",
+                (sha or "", actor or "", note or "", int(item_id)))
+            return rows[0]
+
+    def close(self, item_id, *, current, reason, superseded_by, sha="", actor, note) -> dict | None:
+        """`current` → `closed` (abandon, remplacement, ou livraison hors cible)
+        si le lot y est encore ; journal et jalon `closed` dans la même
+        transaction. `delivered` (#988) écrit en plus le jalon `delivered`, qui
+        porte le `sha` de la tête relue."""
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
@@ -1022,15 +1296,22 @@ class WorkItems(interface.WorkItems):
                        updated_at = now(), closed_at = now()
                  WHERE id = %s AND state = %s
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", ITEM_COLUMNS),
+                """.replace("__COLUMNS__", item_columns(self.db)),
                 (reason, superseded_by, int(item_id), current))
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), "closed", note, actor)
+            self._release_migration(tx, item_id, rows[0], why="clôture", actor=actor)
             tx.query(
                 "INSERT INTO work_item_milestones (work_item_id, kind, actor, note)"
                 " VALUES (%s, 'closed', %s, %s) ON CONFLICT DO NOTHING RETURNING id",
                 (int(item_id), actor or "", note or ""))
+            if reason == "delivered":
+                tx.query(
+                    "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, note)"
+                    " VALUES (%s, 'delivered', %s, %s, %s)"
+                    " ON CONFLICT DO NOTHING RETURNING id",
+                    (int(item_id), sha or "", actor or "", note or ""))
             return rows[0]
 
     def refresh_package_parents(self) -> int:
@@ -1057,7 +1338,7 @@ class WorkItems(interface.WorkItems):
                 VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s, %s::text[],
                         %s, %s, %s)
                 RETURNING __COLUMNS__
-                """.replace("__COLUMNS__", ITEM_COLUMNS),
+                """.replace("__COLUMNS__", item_columns(self.db)),
                 (source, title, body, expected_value, int(value_score), int(priority), team,
                  _catalog._text_array(required_capabilities) if required_capabilities else None,
                  package_id, package_parent, app or ""))
@@ -1065,13 +1346,18 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
             return item
 
-    def backlog(self, *, open_only, limit) -> list[dict]:
+    def backlog(self, *, open_only, limit, ready_only=False) -> list[dict]:
         where = ("state = 'intake' AND assignee IS NULL" if open_only
                  else "state NOT IN %s" % _CLOSED)
+        if ready_only:
+            where += (" AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
+                      "                      JOIN work_items b ON b.id = d.blocker_id"
+                      "                     WHERE d.work_item_id = work_items.id"
+                      "                       AND b.state NOT IN %s)" % _CLOSED)
         return self.db.query(
             "SELECT %s FROM work_items WHERE type = 'improvement' AND %s"
             " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
-            " LIMIT %%s" % (ITEM_COLUMNS, where), (int(limit),))
+            " LIMIT %%s" % (item_columns(self.db), where), (int(limit),))
 
     def auto_takes_since(self, seconds, note_prefix) -> int:
         rows = self.db.query(
@@ -1108,7 +1394,7 @@ class WorkItems(interface.WorkItems):
             " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
-            " LIMIT %%s") % ITEM_COLUMNS, (int(limit),))
+            " LIMIT %%s") % item_columns(self.db), (int(limit),))
 
     def assignment_events(self, item_id, prefixes) -> list[dict]:
         return self.db.query(
@@ -1157,7 +1443,7 @@ class WorkItems(interface.WorkItems):
             " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
             "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
             "          w.created_ts, w.id"
-            " LIMIT %%s" % ITEM_COLUMNS, (assignee, int(limit)))
+            " LIMIT %%s" % item_columns(self.db), (assignee, int(limit)))
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def issue_feed(self, limit) -> list[dict]:
@@ -1179,7 +1465,7 @@ class WorkItems(interface.WorkItems):
             "         ORDER BY id DESC LIMIT %%s) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN agent_registry r ON r.name = w.assignee"
-            " ORDER BY w.id" % (ITEM_COLUMNS, _CLOSED), (int(limit),))
+            " ORDER BY w.id" % (item_columns(self.db), _CLOSED), (int(limit),))
 
     def set_issue_ref(self, item_id, issue_ref, *, current) -> bool:
         rows = self.db.query(
@@ -1217,7 +1503,7 @@ class WorkItems(interface.WorkItems):
             rows = tx.query(
                 "UPDATE work_items SET estimate_minutes = %%s, estimate_source = %%s,"
                 "       estimate_by = %%s, estimate_at = now()"
-                " WHERE id = %%s AND state NOT IN %s RETURNING %s" % (_CLOSED, ITEM_COLUMNS),
+                " WHERE id = %%s AND state NOT IN %s RETURNING %s" % (_CLOSED, item_columns(self.db)),
                 (int(minutes), source or None, actor or "", int(item_id)))
             if not rows:
                 return None
@@ -1251,9 +1537,10 @@ class WorkItems(interface.WorkItems):
             return sorted(int(r["id"]) for r in rows)
 
     def estimate_history(self, *, app, limit) -> list[dict]:
-        """Les lots livrés (jalon `merged`), les plus récents d'abord : début
-        mesuré, fusion, estimation en vigueur au début (sinon la première
-        posée après, `late`), nombre d'estimations posées."""
+        """Les lots livrés (jalon `merged` ou `delivered`, #988), les plus
+        récents d'abord : début mesuré, fin (fusion ou livraison), estimation en
+        vigueur au début (sinon la première posée après, `late`), nombre
+        d'estimations posées."""
         sql = (
             "SELECT w.id, w.type, w.app, w.workstream, w.title, w.state, w.assignee,"
             "       w.change_size,"
@@ -1267,7 +1554,8 @@ class WorkItems(interface.WorkItems):
             "       coalesce(n.n, 0)::int AS revisions"
             "  FROM work_items w"
             "  JOIN LATERAL (SELECT min(m.at) AS at FROM work_item_milestones m"
-            "                 WHERE m.work_item_id = w.id AND m.kind = 'merged') fus"
+            "                 WHERE m.work_item_id = w.id"
+            "                   AND m.kind IN ('merged', 'delivered')) fus"
             "    ON fus.at IS NOT NULL"
             "  LEFT JOIN LATERAL (SELECT e.minutes, e.estimated_by, e.source"
             "                       FROM work_item_estimates e"
@@ -1279,7 +1567,7 @@ class WorkItems(interface.WorkItems):
             "                      ORDER BY e.at, e.id LIMIT 1) f ON true"
             "  LEFT JOIN LATERAL (SELECT count(*) AS n FROM work_item_estimates e"
             "                      WHERE e.work_item_id = w.id) n ON true"
-            " WHERE w.state <> 'closed'")
+            " WHERE (w.state <> 'closed' OR w.close_reason = 'delivered')")
         params: list = []
         if app:
             sql += " AND (w.app = %s OR w.workstream = %s)"
@@ -1349,7 +1637,7 @@ class WorkItems(interface.WorkItems):
         " total_minutes::float8 AS total_minutes, agent_minutes::float8 AS agent_minutes,"
         " ci_minutes::float8 AS ci_minutes, review_minutes::float8 AS review_minutes,"
         " human_minutes::float8 AS human_minutes, ci_runs, merge_sha, diff_files,"
-        " diff_insertions, diff_deletions, measured_size, declared_size")
+        " diff_insertions, diff_deletions, measured_size, declared_size, agent_source")
 
     def save_measure(self, item_id, measure) -> dict:
         m = measure
@@ -1357,9 +1645,9 @@ class WorkItems(interface.WorkItems):
             "INSERT INTO work_item_measures (work_item_id, started_at, merged_at,"
             "  total_minutes, agent_minutes, ci_minutes, review_minutes, human_minutes,"
             "  ci_runs, merge_sha, diff_files, diff_insertions, diff_deletions,"
-            "  measured_size, declared_size)"
+            "  measured_size, declared_size, agent_source)"
             " VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s,"
-            "         %s, %s, %s, %s, %s)"
+            "         %s, %s, %s, %s, %s, %s)"
             " ON CONFLICT (work_item_id) DO UPDATE SET measured_at = now(),"
             "  started_at = excluded.started_at, merged_at = excluded.merged_at,"
             + ", ".join(
@@ -1370,6 +1658,13 @@ class WorkItems(interface.WorkItems):
                 " THEN work_item_measures.%s ELSE excluded.%s END" % (c, c, c)
                 for c in ("total_minutes", "agent_minutes", "ci_minutes", "review_minutes",
                           "human_minutes", "ci_runs")) + ","
+            # même garde pour la provenance des minutes d'agent : garder les
+            # phases d'une mesure connue (ci_minutes non nul) garde leur
+            # source — 'states' ne devient jamais 'turns' (ni l'inverse) sans
+            # que agent_minutes soit recalculé par la même règle
+            "  agent_source = CASE WHEN excluded.ci_minutes IS NULL"
+            " AND work_item_measures.ci_minutes IS NOT NULL"
+            " THEN work_item_measures.agent_source ELSE excluded.agent_source END,"
             "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
             "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
             "  diff_insertions = coalesce(excluded.diff_insertions,"
@@ -1384,7 +1679,8 @@ class WorkItems(interface.WorkItems):
              m["total_minutes"], m["agent_minutes"], m.get("ci_minutes"),
              m["review_minutes"], m["human_minutes"], m.get("ci_runs"), m.get("merge_sha"),
              m.get("diff_files"), m.get("diff_insertions"), m.get("diff_deletions"),
-             m.get("measured_size"), m.get("declared_size")))
+             m.get("measured_size"), m.get("declared_size"),
+             m.get("agent_source")))
         return rows[0]
 
     def measure(self, item_id) -> dict | None:
@@ -1392,6 +1688,27 @@ class WorkItems(interface.WorkItems):
             "SELECT " + self._MEASURE_COLUMNS + " FROM work_item_measures"
             " WHERE work_item_id = %s", (int(item_id),))
         return rows[0] if rows else None
+
+    def turn_spans(self, item_id) -> list[dict]:
+        """#796 : les tours attribués au lot (grand livre, 0423), dans l'ordre
+        du début. `start_ts` = `turn_resources.started_at` quand le tour y est
+        relié (le tour a pris la main), sinon `turn_costs.started_at` (le
+        marqueur, posé avant le lancement) — jamais None : un tour sans aucun
+        des deux est omis. `end_ts` = `turn_resources.ended_at` quand le tour a
+        rendu ses ressources (la fin réelle), sinon l'écriture de la ligne : une
+        ligne réparée après une panne n'allonge donc plus la durée d'un tour
+        dont la ressource dit déjà quand il s'est terminé."""
+        return self.db.query(
+            "SELECT extract(epoch from coalesce(tr.started_at, tc.started_at))::float8"
+            "         AS start_ts,"
+            "       extract(epoch from coalesce(tr.ended_at, tc.recorded_at))::float8"
+            "         AS end_ts,"
+            "       tc.turn_id AS turn_id"
+            "  FROM turn_costs tc"
+            "  LEFT JOIN turn_resources tr ON tr.turn_id = tc.turn_id"
+            " WHERE tc.work_item_id = %s"
+            "   AND coalesce(tr.started_at, tc.started_at) IS NOT NULL"
+            " ORDER BY start_ts, tc.id", (int(item_id),))
 
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(

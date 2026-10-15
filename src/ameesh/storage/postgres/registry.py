@@ -938,24 +938,31 @@ class Leases(interface.Leases):
 
 class PendingSpend(interface.PendingSpend):
 
-    def put(self, name, start_index, turn, model) -> bool:
-        return self.put_get(name, start_index, turn, model) is not None
+    def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
+        return self.put_get(name, start_index, turn, model,
+                            work_item_id=work_item_id, turn_id=turn_id) is not None
 
-    def put_get(self, name, start_index, turn, model) -> dict | None:
+    def put_get(self, name, start_index, turn, model,
+                work_item_id=None, turn_id=None) -> dict | None:
         """Return THIS marker in its write, before any replacement can change it."""
         rows = self.db.query(
             """
-            INSERT INTO spend_pending (agent, start_index, turn, model, created_at)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
+                                       turn_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (agent) DO UPDATE SET
-                start_index = excluded.start_index,
-                turn        = excluded.turn,
-                model       = excluded.model,
-                created_at  = now()
-            RETURNING agent, start_index, turn, model,
+                start_index  = excluded.start_index,
+                turn         = excluded.turn,
+                model        = excluded.model,
+                work_item_id = excluded.work_item_id,
+                turn_id      = excluded.turn_id,
+                created_at   = now()
+            RETURNING agent, start_index, turn, model, work_item_id, turn_id,
                       extract(epoch from created_at)::float8 as created_ts
             """,
-            (name, int(start_index), turn, model),
+            (name, int(start_index), turn, model,
+             None if work_item_id is None else int(work_item_id),
+             turn_id or None),
         )
         return rows[0] if rows else None
 
@@ -969,7 +976,7 @@ class PendingSpend(interface.PendingSpend):
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT agent, start_index, turn, model,
+            SELECT agent, start_index, turn, model, work_item_id, turn_id,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,

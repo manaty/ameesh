@@ -10,10 +10,20 @@ test en échec au schéma `ameesh-test-event/1` (L161b). `ameesh notify`, sur
 l'hôte que désigne `github.host` (comme les issues des lots, L126), fait à
 chaque passage un relevé (`Watcher.tick`) :
 
-1. les exécutions en cours ou en attente du workflow des tests (`WORKFLOWS`) de chaque dépôt
-   de `github.projects` (une requête par dépôt) ; chacune est rattachée à un
-   lot : par sa branche (`work_items.branch`, L118), sinon par la ligne
-   `ameesh-work: <id>` de son commit de tête (une fusion dans main) ;
+1. les exécutions en cours ou en attente des workflows suivis de chaque dépôt
+   de `github.projects` (une requête par dépôt) ; les workflows suivis d'un
+   dépôt sont ceux que déclare `github.projects.<projet>.workflows`, sinon —
+   quand le dépôt ne publie pas `tests.yml` — les workflows actifs découverts
+   (`actions/workflows`) : un dépôt dont les suites portent d'autres noms
+   (nexlink : `backend-suite.yml`, `sql-invariant.yml`…) n'est plus ignoré en
+   silence (#1110). Chaque exécution porte son fichier de workflow, pour que
+   le verdict nomme la suite concernée ; chacune est rattachée à un lot : par
+   sa branche (`work_items.branch`, L118), sinon par la ligne
+   `ameesh-work: <id>` de son commit de tête (une fusion dans main) ; une
+   exécution courte peut naître et finir entre deux passages sans jamais être
+   vue « en cours » : un rattrapage borné des exécutions récemment terminées
+   les découvre, rend leur verdict et réveille l'agent — une seule fois, et
+   jamais pour une tête déjà remplacée (#1110) ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
@@ -32,14 +42,19 @@ L125 :
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
   fenêtre de 90 s du courrier) ;
 * verdict (vert, ou rouge avec la liste) : un événement ordinaire ; rien pour
-  une exécution annulée ou remplacée ;
+  une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
+  d'autres workflows de la même tête tournent encore, le dit — un vert de
+  `backend-suite.yml` n'est pas « la CI est verte » ;
 * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
   de la base (la cible de la PR, sinon main ; pour main, l'exécution
   précédente de main) n'est jamais imputé à l'auteur : pas d'urgent, une ligne
   dans le verdict.
 
 Une exécution rouge sur main lève aussi l'alerte `ci_main_red`
-(`exploitation`, poussée par `ameesh notify` au responsable humain).
+(`exploitation`, poussée par `ameesh notify` au responsable humain) : #846,
+dès qu'un échec est relevé sur une exécution de main encore en cours, sans
+attendre ses jobs agrégateurs — un job rouge sans événement de test publié
+(part `job`) compte aussi.
 
 Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas encore
 émis par le flux : un échec compte dès sa première occurrence.
@@ -48,15 +63,26 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 
 from . import storage
 
-#: workflows dont les exécutions sont suivies (nom du fichier)
+#: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
+#: workflow des tests L161 : comportement historique, compatible ameesh.
+#: Un dépôt qui ne le publie pas fait l'objet d'une découverte (#1110).
 WORKFLOWS = ("tests.yml",)
+#: découverte des workflows d'un dépôt : durée de validité du cache, et délai
+#: avant de réessayer après un échec de l'API
+DISCOVERY_TTL = 3600.0
+DISCOVERY_RETRY = 300.0
 #: états GitHub d'une exécution pas encore conclue que le relevé lit : une
 #: exécution en attente d'un runner est vue dès la poussée, avant que
 #: l'exécution qu'elle remplace soit annulée
 LIVE_STATUSES = ("in_progress", "queued")
+#: rattrapage borné des exécutions terminées entre deux passages (#1110) : on
+#: ne remonte pas plus loin que cette fenêtre, pour ne pas rendre de verdicts
+#: anciens après une longue interruption du veilleur
+CATCHUP_WINDOW = 3600.0
 #: préfixe du nom des check runs publiés par `scripts/ci-flow.py publish`
 CHECK_PREFIX = "tests (flux)"
 SCHEMA = "ameesh-test-event/1"
@@ -67,11 +93,50 @@ ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
                 "cancelled": "cancelled", "stale": "cancelled"}
+#: #846 : conclusions d'un check run de job qui disent un main rouge, même
+#: sans événement de test publié (panne d'installation, délai dépassé)
+FAILED_JOB_CONCLUSIONS = ("failure", "timed_out")
+#: #846 : part des échecs de job relevés ainsi (`ci_test_failures.part`)
+JOB_PART = "job"
 #: lignes d'extrait au plus dans un message
 EXCERPT_LINES = 40
 #: échecs détaillés au plus dans un message (les autres : leur nom)
 DETAILED = 3
 STATUS_SCHEMA = "ameesh-ci-status/1"
+#: #845 (arbitrage A du pilote, 14/10) : le relevé « runner busy sans job »
+#: coûte un appel par exécution non conclue (en plus des deux listes et de
+#: celle des runners) : il est mené au plus toutes les `GUARD_SCAN_S` secondes,
+#: jamais à chaque passage. La fenêtre est écrite dans la base avant le premier
+#: appel HTTP (`ci_guard_scan`) : deux `notify --once` concurrents, ou deux
+#: hôtes, ne la mènent pas deux fois. À 600 s et 63 appels au plus par relevé,
+#: cette garde seule consomme au plus 378 appels/h et par dépôt (hors appels du
+#: suivi des échecs) ; la durée d'un relevé n'est pas bornée globalement, donc
+#: aucune détection en « <= 10 min » n'est promise.
+GUARD_SCAN_S = 600.0
+#: #845 (arbitrage A) : au-delà de ce nombre d'exécutions non conclues, le
+#: relevé est trop large : rien n'est publié et l'incomplétude est journalisée
+#: (`too_many_runs`), plutôt que de risquer une fausse panne (leçon de la mesure
+#: du 13/10, #828) ou de dépasser le budget d'appels.
+GUARD_SCAN_MAX_RUNS = 60
+#: #845 : taille de page des listes du relevé (runners et jobs) ; les
+#: exécutions sont listées par le relevé lui-même, sans le filtre de workflow
+#: ni la page de 50 du suivi des échecs (un runner peut tenir un job de
+#: `carte.yml`, et 43 exécutions non conclues ont été mesurées le 13/10)
+GUARD_PER_PAGE = 100
+#: #845 (revue N/P2 2328 ; arbitrage A) : budget d'appels GitHub d'un relevé de
+#: la garde — les deux listes d'exécutions, un appel par exécution non conclue
+#: (chacune est relue : un run resté `queued` peut porter un job déjà
+#: `in_progress`, R1 cx3 B1), et la liste des runners. Le plafond couvre
+#: exactement `GUARD_SCAN_MAX_RUNS` exécutions : 2 + 60 + 1 = 63. Au-delà, le
+#: relevé est déclaré incomplet et RIEN n'est publié : un relevé partiel ne vaut
+#: pas un relevé complet, et les relevés précédents vieillissent jusqu'à ce que
+#: la fraîcheur (`exploitation.CI_GUARD_FRESH_S`, 1800 s) les clôt. Le nombre
+#: d'appels réellement consommés est journalisé dans `ci_guard_scan`.
+GUARD_SCAN_MAX_CALLS = 63
+
+
+class _GuardBudget(RuntimeError):
+    """#845 : le budget d'appels du relevé de la garde est épuisé."""
 
 
 class CiError(RuntimeError):
@@ -81,6 +146,23 @@ class CiError(RuntimeError):
 # --------------------------------------------------------------------------
 # lecture des check runs
 # --------------------------------------------------------------------------
+
+def workflow_of(path: str | None) -> str:
+    """Le fichier de workflow d'une exécution (`…/backend-suite.yml`), ou ""."""
+    return str(path or "").rsplit("/", 1)[-1].strip()
+
+
+def updated_ts(run: dict) -> float | None:
+    """L'horodatage de dernière mise à jour d'une exécution (ISO 8601), ou
+    `None` s'il est absent ou illisible."""
+    text = str(run.get("updated_at") or run.get("created_at") or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
 
 def events_of(check_runs, run_id: int) -> list[dict]:
     """Les événements `test` en échec, pour l'exécution `run_id`, portés par
@@ -109,6 +191,26 @@ def events_of(check_runs, run_id: int) -> list[dict]:
                 seen.add(key)
                 out.append(ev)
     return out
+
+
+def failed_jobs_of(check_runs, run_id: int) -> list[str]:
+    """#846 : les jobs de l'exécution `run_id` déjà en échec, d'après les check
+    runs natifs de GitHub — les seuls publiés même quand aucun événement de
+    test ne l'est (panne d'installation, délai dépassé). Un check run d'un
+    autre workflow, ou d'une autre exécution du même commit, est écarté par le
+    lien vers son job (`/actions/runs/<run_id>/job/<job_id>`)."""
+    out = set()
+    for check in check_runs or ():
+        name = str(check.get("name") or "").strip()
+        if not name or name.startswith(CHECK_PREFIX):
+            continue
+        if (check.get("conclusion") or "") not in FAILED_JOB_CONCLUSIONS:
+            continue
+        link = str(check.get("details_url") or check.get("url") or "")
+        if "/actions/runs/%d/job/" % int(run_id) not in link:
+            continue
+        out.add(name)
+    return sorted(out)
 
 
 def lot_of_run(run: dict, lots: list[dict]) -> int | None:
@@ -156,8 +258,13 @@ def _short(sha: str) -> str:
 
 def _head(run: dict, lot: dict | None) -> str:
     where = "lot #%d \"%s\"" % (lot["id"], lot.get("title") or "") if lot else "no lot"
-    return "CI of %s, head %s on %s (%s)" % (where, _short(run["head_sha"]), run["branch"],
-                                          run.get("url") or "run %s" % run["run_id"])
+    workflow = workflow_of(run.get("workflow") or run.get("path"))
+    attempt = int(run.get("run_attempt") or 1)
+    return "CI of %s%s, head %s on %s%s (%s)" % (
+        where, " (%s)" % workflow if workflow else "",
+        _short(run["head_sha"]), run["branch"],
+        ", attempt %d" % attempt if attempt > 1 else "",
+        run.get("url") or "run %s" % run["run_id"])
 
 
 def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
@@ -195,30 +302,42 @@ def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bo
     return "\n".join(lines)
 
 
-def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict]) -> str:
-    """Le message de fin d'une exécution."""
+def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
+                 pending: list[dict] | None = None) -> str:
+    """Le message de fin d'une exécution. `pending` : les autres workflows de
+    la même tête encore en cours — le verdict les nomme, pour qu'un vert d'une
+    suite ne soit pas pris pour un vert de toute la CI (#1110)."""
     head = _head(run, lot)
     own = [f for f in failures if not f.get("inherited")]
     inherited = [f for f in failures if f.get("inherited")]
+    others = sorted({workflow_of(r.get("workflow") or r.get("path")) or "?"
+                     for r in pending or ()
+                     if int(r.get("run_id") or 0) != int(run.get("run_id") or 0)})
     if status == "success" and not failures:
-        return "%s: green." % head
-    lines = []
-    if status == "success":
-        lines.append("%s: green, despite failures seen along the way "
-                     "(retried or tolerated)." % head)
-    elif not own and inherited:
-        lines.append("%s: red, but only failures inherited from %s (already red "
-                     "before your push): nothing is charged to you."
-                     % (head, run.get("base") or "main"))
-    elif not failures:
-        lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
-                     "timeout or another job): see the run." % head)
+        first = "%s: green." % head
     else:
-        lines.append("%s: red, %d failure(s)%s." % (
-            head, len(own), ", and %d inherited from the base" % len(inherited) if inherited else ""))
-    lines.append("")
-    lines += _failure_lines(own + inherited, detail=False)
-    return "\n".join(lines).rstrip()
+        lines = []
+        if status == "success":
+            lines.append("%s: green, despite failures seen along the way "
+                         "(retried or tolerated)." % head)
+        elif not own and inherited:
+            lines.append("%s: red, but only failures inherited from %s (already red "
+                         "before your push): nothing is charged to you."
+                         % (head, run.get("base") or "main"))
+        elif not failures:
+            lines.append("%s: red, with no failed test seen in the stream (part interrupted, "
+                         "timeout or another job): see the run." % head)
+        else:
+            inherited_note = (", and %d inherited from the base" % len(inherited)
+                              if inherited else "")
+            lines.append("%s: red, %d failure(s)%s." % (head, len(own), inherited_note))
+        lines.append("")
+        lines += _failure_lines(own + inherited, detail=False)
+        first = "\n".join(lines).rstrip()
+    if others:
+        first += ("\n\nOther workflow(s) of this head are still running: %s — their "
+                  "verdicts will follow." % ", ".join(others))
+    return first
 
 
 def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
@@ -261,6 +380,27 @@ def gh_api(gh=None):
     return api
 
 
+def _guard_snapshot(run_id, attempt, status, jobs) -> dict:
+    """#845 : le relevé d'une exécution — jobs `queued` (compte et plus
+    vieux) et runners qui tiennent un job `in_progress` (`{nom: job}`).
+
+    Rien n'est déduit d'un job `cancelled` : l'orphelin d'une exécution
+    annulée compte comme un job en file (#876 le traite à la source)."""
+    queued: list[tuple[str, int]] = []
+    holding: dict[str, str] = {}
+    for job in jobs:
+        job_status = str(job.get("status") or "")
+        if job_status == "queued":
+            created = str(job.get("created_at") or job.get("started_at") or "")
+            queued.append((created, int(job.get("id") or 0)))
+        elif job_status == "in_progress" and job.get("runner_name"):
+            holding.setdefault(str(job["runner_name"]), str(job.get("name") or ""))
+    oldest = min(queued, key=lambda q: (q[0], q[1])) if queued else None
+    return {"run_id": int(run_id), "attempt": int(attempt), "status": status,
+            "queued": len(queued), "oldest_id": oldest[1] if oldest else None,
+            "oldest_at": oldest[0] if oldest else None, "runners": holding}
+
+
 class Watcher:
     """Le relevé de la CI, mené par `ameesh notify` à chaque passage, sur
     l'hôte désigné (`github.host`). Une erreur (GitHub, base) d'un dépôt est
@@ -273,16 +413,74 @@ class Watcher:
         self.log = log or (lambda _text: None)
         self.clock = clock or time.time
         self.dry_run = bool(dry_run)
+        #: découverte des workflows par dépôt : (horodatage, ttl, noms)
+        self._workflows_cache: dict[str, tuple] = {}
+        #: avertissements déjà journalisés par ce passage de service
+        self._warned_workflows: set = set()
 
-    def repos(self) -> list[str]:
+    def settings(self):
+        """Les réglages `github` validés, ou None (déjà journalisé)."""
         from . import plan_github
         try:
-            settings = plan_github.settings_of(self.cfg)
+            return plan_github.settings_of(self.cfg)
         except plan_github.SettingsError:
+            return None
+
+    def repos(self) -> list[str]:
+        settings = self.settings()
+        if settings is None:
             return []  # déjà journalisé par la projection des issues
         if not settings.projects or settings.host != getattr(self.cfg, "host", None):
             return []
         return sorted(set(settings.projects.values()))
+
+    def discovered_workflows(self, repo: str) -> tuple[str, ...] | None:
+        """Les fichiers de workflow actifs du dépôt (API GitHub), ou None si
+        l'API ne répond pas. Le résultat est gardé : une découverte par heure,
+        une nouvelle tentative après un échec."""
+        now = float(self.clock())
+        cached = self._workflows_cache.get(repo)
+        if cached is not None and now - cached[0] < cached[1]:
+            return cached[2]
+        ttl, found = DISCOVERY_TTL, None
+        try:
+            data = self.api("repos/%s/actions/workflows?per_page=100" % repo) or {}
+            files = []
+            for item in data.get("workflows") or ():
+                if str(item.get("state") or "active") != "active":
+                    continue
+                name = workflow_of(item.get("path"))
+                if name and name not in files:
+                    files.append(name)
+            found = tuple(sorted(files))
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            ttl = DISCOVERY_RETRY
+            self.log("CI %s: workflow discovery failed (%s)"
+                     % (repo, " ".join(str(exc).split())[:200]))
+        self._workflows_cache[repo] = (now, ttl, found)
+        return found
+
+    def followed_workflows(self, repo: str) -> tuple[str, ...]:
+        """Les workflows suivis d'un dépôt : la liste déclarée
+        (`github.projects.<projet>.workflows`) si elle existe, sinon le défaut
+        L161 tant que le dépôt publie `tests.yml`, sinon les workflows actifs
+        découverts — un dépôt dont les suites portent d'autres noms n'est
+        jamais ignoré en silence (#1110)."""
+        settings = self.settings()
+        declared = settings.workflows_for(repo) if settings else None
+        found = self.discovered_workflows(repo)
+        if declared is not None:
+            missing = tuple(w for w in declared if found is not None and w not in found)
+            if missing and (repo, missing) not in self._warned_workflows:
+                self._warned_workflows.add((repo, missing))
+                self.log("CI %s: workflow(s) declared in github.projects but absent "
+                         "from the repository: %s" % (repo, ", ".join(missing)))
+            return declared
+        if not found:
+            return WORKFLOWS
+        if WORKFLOWS[0] in found:
+            return WORKFLOWS
+        return found
 
     def tick(self, db) -> list[dict]:
         """Un relevé de chaque dépôt ; rend les envois et retraits."""
@@ -302,21 +500,248 @@ class Watcher:
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
+        followed = set(self.followed_workflows(repo))
         live = {}
         for status in LIVE_STATUSES:
             data = self.api("repos/%s/actions/runs?status=%s&per_page=50" % (repo, status)) or {}
             for r in data.get("workflow_runs") or ():
-                if str(r.get("path") or "").rsplit("/", 1)[-1] in WORKFLOWS:
+                if workflow_of(r.get("path")) in followed:
                     live.setdefault(int(r["id"]), r)
         lots = [r for r in st.work.open_for_sweep(500) if r.get("branch")]
         out: list[dict] = []
         for run_id in sorted(live):
             out += self._follow(db, repo, live[run_id], lots)
-        for row in st.ci.running(repo):
+        # #747 : fin de l'attente d'un runner, distincte de la durée des tests
+        st.ci.mark_started(repo, [i for i, r in live.items()
+                                  if r.get("status") == "in_progress"])
+        # les exécutions courtes, nées et finies entre deux passages, n'ont
+        # jamais été vues « en cours » : rattrapage borné (#1110)
+        out += self._catch_up(db, repo, lots, followed)
+        # les lignes que ce passage conclut sont figées AVANT les envois : le
+        # verdict d'un workflow ne cite pas comme « encore en cours » un
+        # workflow conclu dans le même passage (#1110)
+        running = st.ci.running(repo)
+        finishing: dict[int, dict] = {}
+        for row in running:
+            if int(row["run_id"]) in live:
+                continue
+            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+            if (run.get("status") or "") == "completed":
+                finishing[int(row["run_id"])] = run
+        for row in running:
             out += self._failures(db, repo, row)
-            if int(row["run_id"]) not in live:
-                out += self._conclude(db, repo, row)
+            run = finishing.get(int(row["run_id"]))
+            if run is None:
+                continue
+            others = [r for r in running if int(r["run_id"]) not in finishing
+                      and int(r["run_id"]) != int(row["run_id"])
+                      and r.get("head_sha") == row.get("head_sha")
+                      and r.get("branch") == row.get("branch")]
+            out += self._conclude(db, repo, row, run=run, pending=others)
+        # #845 : la garde passe après les échecs et les verdicts — un relevé de
+        # runners coûte une requête par exécution non conclue (quelques
+        # dizaines de secondes en saturation) et ne doit pas les retarder
+        self._guard(db, repo)
         return out
+
+    def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str]) -> list[dict]:
+        """Les exécutions terminées entre deux passages (#1110) : une exécution
+        courte n'est jamais vue « en cours », donc jamais conclue sans ce
+        rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
+        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
+        la même branche est ignorée (pas de verdict périmé)."""
+        st = storage.of(db)
+        data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
+        runs = list(data.get("workflow_runs") or ())
+        # les exécutions que ce passage conclut (relevé normal compris) sont
+        # figées AVANT les envois : un verdict du rattrapage ne cite pas comme
+        # « encore en cours » un workflow conclu dans le même passage (#1110)
+        settled = {int(r["id"]) for r in runs}
+        now = float(self.clock())
+        out: list[dict] = []
+        for run in runs:
+            if workflow_of(run.get("path")) not in followed:
+                continue
+            run_id = int(run["id"])
+            if st.ci.run(repo, run_id) is not None:
+                continue
+            updated = updated_ts(run)
+            if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
+                continue
+            head = run.get("head_sha") or ""
+            branch = run.get("head_branch") or ""
+            if st.ci.head_replaced(repo, branch, head, run_id):
+                continue
+            out += self._follow(db, repo, run, lots)
+            row = st.ci.run(repo, run_id)
+            if row is None or (run.get("status") or "") != "completed":
+                continue
+            out += self._failures(db, repo, row)
+            pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
+                       and r.get("branch") == branch
+                       and int(r["run_id"]) not in settled]
+            out += self._conclude(db, repo, row, run=run, pending=pending)
+        return out
+
+    # -- #845 : la garde de la CI ---------------------------------------------
+    def _guard(self, db, repo: str) -> None:
+        """#845 : l'état des runners et de la file, relevé par l'API (sans SSH).
+
+        La file est l'âge du plus vieux **job** encore `queued`, toutes
+        exécutions non conclues : un run reste `queued` tant qu'un de ses jobs
+        attend, et son `created_at` ne date pas ses jobs (une re-exécution
+        garde la date du run, un run `in_progress` peut encore porter un job en
+        file).
+
+        Le relevé est borné (revue N/P2 2328 ; arbitrage A du pilote, 14/10) :
+        la fenêtre de 600 s est écrite dans la base avant le premier appel
+        (`ci_guard_scan`, atomique par dépôt), chaque exécution non conclue est
+        relue, et le relevé s'arrête au-delà de 60 exécutions ou de 63 appels
+        (2 listes + 60 jobs + 1 runners). Chaque exécution non conclue est
+        relue : un run resté `queued` peut porter un job déjà `in_progress`
+        quand un autre attend (mesure fondatrice #828), donc aucun instantané de
+        jobs ne peut être réutilisé sur le seul statut `queued` (R1 finale cx3,
+        B1). Un relevé incomplet ne publie **rien** : il est journalisé et daté
+        dans `ci_guard_scan`, l'état complet précédent reste en place et fonde
+        encore ses alertes jusqu'à la fraîcheur (1800 s) — jamais une mesure
+        partielle publiée comme complète.
+
+        Rien ici n'est fatal au relevé : une erreur (jeton, GitHub) est
+        journalisée et n'empêche ni les échecs, ni les verdicts.
+        """
+        try:
+            self._guard_state(db, repo)
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
+            self.log("CI %s: guard failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+
+    def _guard_state(self, db, repo) -> None:
+        st = storage.of(db)
+        now = float(self.clock())
+        # #845 (revue N/P2 2328) : la fenêtre est revendiquée AVANT le premier
+        # appel HTTP, atomiquement dans la base : deux `notify --once`
+        # concurrents (ou deux hôtes) ne doublent pas le coût, et un relevé tué
+        # en vol laisse la fenêtre expirer. Le battement en mémoire ne suffisait
+        # pas.
+        if not st.ci.claim_guard_scan(repo, now=now, window_s=GUARD_SCAN_S):
+            self.log("CI %s: guard scan skipped (window held)" % repo)
+            return
+        calls = 0
+        runs_seen = 0
+        covered = 0
+        complete = False
+        reason = None
+
+        def api(path: str):
+            """Un appel compté : le budget arrête le relevé, il ne le tronque pas."""
+            nonlocal calls
+            if calls >= GUARD_SCAN_MAX_CALLS:
+                raise _GuardBudget(path)
+            calls += 1
+            return self.api(path)
+
+        try:
+            # #845 : le relevé liste lui-même les exécutions non conclues, tous
+            # workflows et jusqu'à `GUARD_PER_PAGE` par état — la liste du suivi
+            # des échecs (50, `tests.yml` seul) ne suffit pas à la garde
+            not_done: dict[int, dict] = {}
+            truncated = False
+            for status in LIVE_STATUSES:
+                data = api("repos/%s/actions/runs?status=%s&per_page=%d"
+                           % (repo, status, GUARD_PER_PAGE)) or {}
+                page = data.get("workflow_runs") or ()
+                if int(data.get("total_count") or 0) > len(page):
+                    truncated = True
+                for r in page:
+                    not_done.setdefault(int(r["id"]), r)
+            runs_seen = len(not_done)
+            if truncated:
+                reason = "truncated"
+            elif runs_seen > GUARD_SCAN_MAX_RUNS:
+                reason = "too_many_runs"
+            else:
+                # #845 : la file se compte en jobs, pas en runs, et la date qui
+                # compte est celle du job (le run peut être ancien et sa reprise
+                # récente, et un run `in_progress` peut encore porter un job
+                # `queued`). Rien n'est déduit des jobs `cancelled` du run : une
+                # matrice `fail-fast` annule ses parts sans annuler l'exécution,
+                # et le job né après cette annulation (agrégat `tests`, job
+                # indépendant) attend réellement un runner. Un orphelin
+                # d'exécution annulée (`if: always()` créé après l'annulation,
+                # que GitHub ne sert jamais) a la même forme qu'un job légitime
+                # né après une annulation de part : aucune inférence ne les
+                # sépare sans masquer une file réelle. Les orphelins se traitent
+                # à la source (`always() && !cancelled()` sur l'agrégat, #876).
+                queued: list[tuple[str, int]] = []
+                queued_total = 0
+                holding: dict[str, str] = {}
+                for run_id in sorted(not_done):
+                    run = not_done[run_id]
+                    attempt = int(run.get("run_attempt") or 1)
+                    status = str(run.get("status") or "")
+                    jobs_data = api("repos/%s/actions/runs/%d/jobs?per_page=%d"
+                                    % (repo, run_id, GUARD_PER_PAGE)) or {}
+                    jobs = jobs_data.get("jobs") or ()
+                    if int(jobs_data.get("total_count") or 0) > len(jobs):
+                        reason = "jobs_truncated"
+                        break
+                    snap = _guard_snapshot(run_id, attempt, status, jobs)
+                    st.ci.observe_guard_run(
+                        repo, run_id=run_id, attempt=attempt, status=status,
+                        queued=int(snap["queued"]), oldest_id=snap["oldest_id"],
+                        oldest_at=snap["oldest_at"], runners=snap["runners"])
+                    covered += 1
+                    queued_total += int(snap.get("queued") or 0)
+                    if int(snap.get("queued") or 0):
+                        queued.append((str(snap.get("oldest_at") or ""),
+                                       int(snap.get("oldest_id") or 0)))
+                    holding.update(snap.get("runners") or {})
+                if reason is None:
+                    data = api("repos/%s/actions/runners?per_page=%d"
+                               % (repo, GUARD_PER_PAGE)) or {}
+                    runners = data.get("runners") or ()
+                    if int(data.get("total_count") or 0) > len(runners):
+                        reason = "runner_truncated"
+                    else:
+                        if queued:
+                            created, job_id = min(queued, key=lambda q: (q[0], q[1]))
+                            st.ci.observe_queue(repo, oldest_id=job_id,
+                                                oldest_at=created or None,
+                                                queued=queued_total)
+                        else:
+                            st.ci.observe_queue(repo, oldest_id=None, oldest_at=None,
+                                                queued=0)
+                        state = []
+                        for r in runners:
+                            name = str(r.get("name") or "")
+                            online = (r.get("status") or "online") == "online"
+                            busy = bool(r.get("busy")) and online
+                            state.append({"id": r.get("id"), "name": name, "busy": busy,
+                                          "job": holding.get(name) if busy else None,
+                                          "stuck": busy and name not in holding})
+                        st.ci.observe_runners(repo, state)
+                        complete = True
+                        try:
+                            st.ci.prune_guard_runs(
+                                repo, [(int(rid), int(r.get("run_attempt") or 1))
+                                       for rid, r in not_done.items()])
+                        except Exception as exc:  # noqa: BLE001 - cache seulement
+                            self.log("CI %s: guard cache not pruned (%s)"
+                                     % (repo, " ".join(str(exc).split())[:120]))
+        except _GuardBudget:
+            reason = "budget"
+        finally:
+            if reason is None and not complete:
+                reason = "failed"
+            try:
+                st.ci.finish_guard_scan(repo, now=now, calls=calls, runs=runs_seen,
+                                        covered=covered, complete=complete,
+                                        reason=reason)
+            except Exception as exc:  # noqa: BLE001 - le relevé continue
+                self.log("CI %s: guard scan state not recorded (%s)"
+                         % (repo, " ".join(str(exc).split())[:120]))
+            if not complete:
+                self.log("CI %s: guard scan incomplete (%s): %d/%d runs, %d calls, "
+                         "nothing published" % (repo, reason, covered, runs_seen, calls))
 
     def _follow(self, db, repo: str, run: dict, lots: list[dict]) -> list[dict]:
         """Une exécution en cours : enregistrée si nouvelle ; une exécution
@@ -359,7 +784,8 @@ class Watcher:
         st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
                        branch=run.get("head_branch") or "", event=run.get("event") or "",
                        base=base_of(run), work_item_id=lot_of_run(run, lots),
-                       url=run.get("html_url"))
+                       url=run.get("html_url"), workflow=workflow_of(run.get("path")),
+                       created_at=run.get("created_at"))
         branch = run.get("head_branch") or ""
         if not branch or branch in BASE_BRANCHES:
             return []
@@ -382,9 +808,12 @@ class Watcher:
         checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
                           % (repo, row["head_sha"])) or {}
         events = events_of(checks.get("check_runs"), int(row["run_id"]))
+        self._record_failed_jobs(st, repo, row, checks.get("check_runs"))
         if not events:
             return []
-        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0])
+        reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0],
+                                        workflow=row.get("workflow")
+                                        or workflow_of(row.get("path")))
         if reference and int(reference["run_id"]) == int(row["run_id"]):
             reference = {}
         # aucune exécution conclue de la base relevée (juste après le
@@ -418,6 +847,7 @@ class Watcher:
                              detail=False)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "failure",
+                          "workflow": row.get("workflow") or workflow_of(row.get("path")),
                           "tests": [f["test"] for f in own]}}
         if unknown_base:
             payload["ci_passif"] = True
@@ -431,11 +861,28 @@ class Watcher:
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
-    def _conclude(self, db, repo: str, row: dict) -> list[dict]:
-        """Une exécution qui n'est plus en cours : son verdict."""
+    def _record_failed_jobs(self, st, repo: str, row: dict, check_runs) -> None:
+        """#846 : sur une branche de base, un job déjà en échec est un main
+        rouge, même sans événement de test publié (panne d'installation, délai
+        dépassé). Relevé ici pour que `ci.main_red` alerte sans attendre la
+        conclusion de l'exécution. Aucun courrier n'en part : `_failures` ne
+        signale que les événements de test (part `job` mise à part)."""
+        if row.get("branch") not in BASE_BRANCHES:
+            return
+        for job in failed_jobs_of(check_runs, int(row["run_id"])):
+            st.ci.add_failure(repo, int(row["run_id"]), part=JOB_PART, test=job,
+                              module="", status="echec", inherited=False,
+                              excerpt="", replay="", duration_s=None, failed_at=None)
+
+    def _conclude(self, db, repo: str, row: dict, *, run: dict | None = None,
+                  pending: list[dict] | None = None) -> list[dict]:
+        """Une exécution qui n'est plus en cours : son verdict. `run` : son
+        dernier état GitHub, déjà relevé ; `pending` : les autres workflows de
+        la même tête encore en cours, que le verdict nomme."""
         from . import work
         st = storage.of(db)
-        run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
+        if run is None:
+            run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
         if (run.get("status") or "") != "completed":
             return []  # en attente d'un runner, ou relancée : au prochain relevé
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
@@ -450,9 +897,15 @@ class Watcher:
         if not to:
             return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
                      "status": status, "to": None}]
-        text = verdict_text(row, lot, status, failures)
+        # le verdict situe la suite : fichier du workflow et attempt du dernier
+        # état GitHub, quand la ligne ne les porte pas encore (#901, #1110)
+        view = dict(row, run_attempt=run.get("run_attempt") or row.get("run_attempt") or 1,
+                    path=run.get("path") or row.get("path") or "")
+        text = verdict_text(view, lot, status, failures, pending=pending)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "verdict", "status": status,
+                          "workflow": view.get("workflow") or workflow_of(view.get("path")),
+                          "attempt": int(view.get("run_attempt") or 1),
                           "failures": len([f for f in failures if not f.get("inherited")]),
                           "inherited": len([f for f in failures if f.get("inherited")])}}
         message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
@@ -479,7 +932,11 @@ def describe(record: dict) -> str:
 # --------------------------------------------------------------------------
 
 def main_red(db) -> list[dict]:
-    """Les dernières exécutions conclues des branches de base qui sont rouges :
+    """Les exécutions des branches de base qui sont rouges : la dernière
+    exécution conclue de chaque workflow (un succès d'une suite ne masque pas
+    l'échec d'une autre, #1110), et une exécution encore en cours dont un échec
+    est déjà relevé (#846 : un main rouge ne reste pas silencieux derrière ses
+    jobs agrégateurs, qui peuvent attendre un runner des heures).
     `{repo, branch, run_id, head_sha, url, work_item_id, concluded_ts, tests}`."""
     st = storage.of(db)
     out = []
@@ -488,7 +945,28 @@ def main_red(db) -> list[dict]:
             continue
         tests = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))]
         out.append(dict(row, tests=tests))
+    for row in st.ci.running_on(BASE_BRANCHES):
+        # hérités exclus : un échec déjà rouge à la dernière exécution conclue
+        # de la base est déjà porté par l'alerte de celle-ci, de même clé
+        own = [f["test"] for f in st.ci.failures(row["repo"], int(row["run_id"]))
+               if not f.get("inherited")]
+        if own:
+            out.append(dict(row, tests=own))
     return out
+
+
+def wait_text(run: dict, now: float) -> str:
+    """#747 : attente d'un runner et durée de l'exécution, séparées."""
+    created = run.get("created_ts") or run.get("first_seen_ts")
+    started, end = run.get("started_ts"), run.get("concluded_ts")
+    if created is None:
+        return ""
+    if started is None:
+        if run.get("status") == "running":
+            return "queued %d min" % ((now - float(created)) // 60)
+        return ""
+    return "queued %d min, ran %d min" % ((float(started) - float(created)) // 60,
+                                         ((end or now) - float(started)) // 60)
 
 
 # --------------------------------------------------------------------------
@@ -516,6 +994,7 @@ _STATUS_FR = {"running": "running", "success": "green", "failure": "red",
 
 def render_status(report: dict) -> list[str]:
     from .notify import local_time
+    now = time.time()
     lines = ["lot #%d \"%s\" (branch %s)" % (report["work_item"], report.get("title") or "",
                                           report.get("branch") or "—")]
     if not report["runs"]:
@@ -527,9 +1006,12 @@ def render_status(report: dict) -> list[str]:
             state += " by %s" % _short(run["superseded_by"])
         own = [f for f in run["failures"] if not f.get("inherited")]
         inherited = len(run["failures"]) - len(own)
-        lines.append("  %s  %s  %s  %s%s%s" % (
-            local_time(run["first_seen_ts"]), _short(run["head_sha"]), state,
+        wait = wait_text(run, now)
+        lines.append("  %s  %s  %s  %s  %s%s%s%s" % (
+            local_time(run["first_seen_ts"]), _short(run["head_sha"]),
+            run.get("workflow") or "—", state,
             "%d failure(s)" % len(own), ", %d inherited" % inherited if inherited else "",
+            "  (%s)" % wait if wait else "",
             "  %s" % run["url"] if run.get("url") else ""))
         for f in own[:10]:
             lines.append("      %s (%s)%s" % (f["test"], f.get("part") or "?",

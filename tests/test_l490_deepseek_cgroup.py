@@ -332,7 +332,8 @@ class PlacementCheckTest(unittest.TestCase):
                     40: (20, "/app.slice/dsh-subprocess-20-abcdef.scope"),
                     50: (1, "/app.slice/dsh-subprocess-20-abcdef.scope"),
                     60: (1, "/app.slice/dsh-subprocess-99-abcdef.scope"),
-                    70: (20, root + "-unrelated"), 80: (20, root)}
+                    70: (20, root + "-unrelated"), 80: (20, root),
+                    90: (1, "/app.slice/dsh-subprocess-probe-20-abcdef.scope")}
             for pid, (parent, cgroup) in rows.items():
                 entry = proc / str(pid)
                 entry.mkdir()
@@ -340,10 +341,33 @@ class PlacementCheckTest(unittest.TestCase):
                 (entry / "cgroup").write_text(f"0::{cgroup}\n")
             report = deepseek_cgroup.check(10, proc)
             self.assertFalse(report["ok"])
-            self.assertEqual([p["pid"] for p in report["outside"]], [40, 50, 70])
-            for pid in (40, 50, 70):
+            self.assertEqual([p["pid"] for p in report["outside"]], [40, 50, 70, 90])
+            for pid in (40, 50, 70, 90):
                 (proc / str(pid) / "cgroup").write_text(f"0::{root}\n")
             self.assertTrue(deepseek_cgroup.check(10, proc)["ok"])
+
+    def test_unreadable_snapshot_row_does_not_abort_the_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp)
+            root = "/ameesh.slice/ameesh-agents.slice/runner.service"
+            rows = {10: (1, root), 20: (10, root), 55: (1, "/app.slice/other.scope")}
+            for pid, (parent, cgroup) in rows.items():
+                entry = proc / str(pid)
+                entry.mkdir()
+                (entry / "stat").write_text(f"{pid} (name) S {parent} 0 0")
+                (entry / "cgroup").write_text(f"0::{cgroup}\n")
+            hidden = proc / "55" / "stat"
+            real_read_text = Path.read_text
+
+            def read_text(path, *args, **kwargs):
+                if path == hidden:
+                    raise PermissionError(13, "hidepid=1")
+                return real_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", read_text):
+                report = deepseek_cgroup.check(10, proc)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["outside"], [])
 
     def test_unknown_or_unreadable_runner_is_not_a_positive_check(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,10 +1,12 @@
-# Redémarrer et contrôler une VM d’agents
+# Installer, redémarrer et contrôler une VM d’agents
 
 Un hôte d’agents utilise les unités **utilisateur**
 `ameesh-runner-agent@<agent>.service`, sous le compte `ameesh`.
 Depuis le poste, `deploy/mise-a-jour/vm.sh agents redemarrer` les redémarre
 une par une, hors tour. `agents controler` (ou `agents verifier`) contrôle
-les unités et les baux, sans redémarrer personne.
+les unités et les baux, sans redémarrer personne. `agents installer [REF]`
+installe une révision gelée dans le layout du compte et `agents retour`
+réinstalle la précédente (#1252).
 
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
@@ -63,9 +65,77 @@ d’hôte pendant le contrôle fait échouer la preuve. En cas d’échec, la
 commande indique l’unité et la commande `journalctl --user` à lancer sous
 `ameesh` sur la VM.
 
-Ce mode couvre le redémarrage et le contrôle du code déjà installé.
-`installer` et `retour` restent les opérations du serveur du mesh ; elles
-sont refusées en mode agents. Les migrations de la base commune doivent
-être appliquées avant l’installation du code, selon la procédure de
-[BASCULE.md](BASCULE.md). Les commandes de cette page sont à exécuter par
-le responsable du déploiement après revue et validation CI.
+## Installer une révision gelée, revenir en arrière
+
+Le mode agents travaille dans le layout du compte `ameesh`
+(`~/.local/share/ameesh` : clone `src`, instantanés `src-<sha7>`, venv,
+`previous-sha`, journal `installation-en-cours`). Un `BASCULE_ENV` par VM porte
+`AGENTS_SSH` et `HOTE_AGENTS`.
+
+```sh
+deploy/mise-a-jour/vm.sh agents verifier
+deploy/mise-a-jour/vm.sh agents installer <sha40>
+deploy/mise-a-jour/vm.sh agents redemarrer
+deploy/mise-a-jour/vm.sh agents controler
+deploy/mise-a-jour/vm.sh agents retour
+```
+
+`installer` et `retour` refusent d’abord si l’identité effective du compte
+runner — `AMEESH_HOST` de son `EnvironmentFile`, lue dans l’environnement de
+l’unité — n’est pas `HOTE_AGENTS` : un `BASCULE_ENV` qui vise une autre VM
+n’écrit rien. La lecture passe par le paquet installé ; si celui-ci ne
+s’importe plus (une installation inachevée peut l’avoir cassé), un repli
+reproduit `config.load().host` sans l’importer : `AMEESH_HOST` puis
+`AGENT_MESH_HOST`, sinon le champ `host` du JSON désigné par `AMEESH_CONFIG`
+ou `AGENT_MESH_CONFIG` (repli sur `~/.config/agent-mesh/config.json` comme
+`config.load`), sinon le nom court de la machine. Un fichier de configuration
+présent mais illisible, ou un host non textuel ou vide, ferme la commande
+plutôt que de retomber sur le nom machine.
+
+`installer` refuse ensuite tant que les migrations du commit visé manquent de
+la base commune du mesh (`poste.sh migrer` d’abord), et refuse un code d’avant
+non traçable (`direct_url.json` du venv ou HEAD du clone). Il ne redémarre
+personne. Il sauvegarde l’état (env et unités, 0600, sous
+`~/.local/state/ameesh/mise-a-jour`), vérifie ou crée les instantanés exacts
+`src-<sha7>` du code quitté et du commit visé, puis écrit un **journal de
+récupération** (`installation-en-cours`) avant de mettre le clone en détaché
+sur le SHA visé et de réinstaller depuis l’instantané
+(`pip --force-reinstall --no-deps` puis les dépendances). Un instantané est un
+worktree détaché du commit : son arbre est celui du commit, jamais une copie
+d’un clone sale. Avant réutilisation, les artefacts de construction ignorés
+(`build/`, `*.egg-info`, `__pycache__`) en sont retirés, puis chaque fichier du
+disque est haché et comparé aux objets du commit, sans passer par l’index :
+`assume-unchanged` et `skip-worktree` ne masquent rien, et un fichier modifié,
+absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
+écrasé — le retirer à la main pour le reconstruire.
+
+`previous-sha` n’est publié qu’après une installation réussie, et seulement
+quand le code installé change : relancer `installer` sur le SHA déjà en place le
+laisse intact (sans `previous-sha`, on n’en invente pas un — pas de faux
+retour), et le journal est alors effacé. Si l’installation échoue (même après un premier `pip` qui a
+déjà remplacé le paquet et publié `direct_url.json`), la commande ferme en
+conservant le journal : `retour` ramène au code quitté qu’il désigne, et non à
+un `previous-sha` plus ancien — y compris à la première utilisation, sans
+`previous-sha`. Tant que ce journal existe, `installer` refuse avant toute
+mutation et oriente vers `retour` : une relance ne peut ni écraser la cible de
+récupération ni prendre pour elle le SHA dont le venv porte déjà le
+`direct_url.json`. `retour` réinstalle le commit du journal depuis son
+instantané puis enchaîne `redemarrer` et `controler` ; après réussite il laisse
+`previous-sha` sur le code installé, donc un second `retour` est idempotent. Il
+refuse si la cible (journal ou `previous-sha`) est absente, invalide ou
+introuvable dans le clone de la VM comme dans le dépôt du poste.
+
+Si la VM n’a pas le commit visé, il est envoyé en paquet git par SSH depuis le
+poste. Le fichier distant est créé par `mktemp` (racine, mode privé : ni nom
+fixe pré-créable, ni symlink exploitable), puis rendu lisible par le compte
+`ameesh` (`chmod 644` sur la cible — le umask du root distant ne décide pas de
+la lecture), et retiré après le `fetch`. Le paquet exclut le HEAD du clone de la
+VM, dont la présence est prouvée avant l’envoi ; sans base lisible, ou si
+l’exclusion vide le paquet, il est autonome — une cible déjà fusionnée dans
+`origin/main` passe donc, comme le retour vers un ancêtre absent de la VM.
+
+Les migrations de la base commune doivent être appliquées avant l’installation
+du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
+page sont à exécuter par le responsable du déploiement après revue et
+validation CI, une VM à la fois ; `controler` affiche le code installé, le
+clone et `previous-sha` avant les unités.
