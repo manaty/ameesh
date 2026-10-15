@@ -1527,10 +1527,48 @@ class DrainStopTest(unittest.TestCase):
                                   clock=lambda: self.clock[0],
                                   monotonic=lambda: self.clock[0])
         self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
-        self.assertNotIn(["user-998.slice"],
-                         [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"])
+        self.assertIn(["user-998.slice"],
+                      [c[2:] for c in self.calls if len(c) > 1 and c[1] == "stop"])
         self.assertEqual(enforcer.stopped["units"],
                          {"ameesh-guest-runner@1.service": 2000.0})
+
+    def test_level_4_stops_sessions_even_when_the_user_manager_is_inactive(self):
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-runner@1.service loaded active running guest\n"))
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n")
+            if argv[1] == "is-active":
+                return mock.Mock(returncode=3 if argv[-1] == "user@998.service" else 0)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0], monotonic=lambda: self.clock[0])
+        self.assertTrue(self.at(enforcer, 2000.0).stop_guest())
+        self.assertIn(["systemctl", "stop", "user-998.slice"], self.calls)
+        self.assertNotIn("user@998.service", enforcer.stopped["units"])
+
+    def test_ci_only_host_uses_the_required_covering_agent_pattern(self):
+        # ci-runners.sh refuses prepare/enable/check unless agent_units covers
+        # ameesh-guest-ci@1.service (guard_covers); this is the admitted config.
+        self.cfg = dataclasses.replace(self.cfg, agent_units="ameesh-guest-*.service")
+        def run(argv, **kw):
+            self.calls.append(argv)
+            if argv[1] == "list-units":
+                self.assertEqual(argv[-1], "ameesh-guest-*.service")
+                return mock.Mock(returncode=0, stdout=(
+                    "ameesh-guest-ci@1.service loaded active running guest\n"))
+            if argv[1] == "show" and argv[2] == "--property=UID":
+                return mock.Mock(returncode=0, stdout="998\n")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None,
+                                  clock=lambda: self.clock[0], monotonic=lambda: self.clock[0])
+        self.assertTrue(enforcer.stop_guest())
+        self.assertIn(["systemctl", "stop", "user-998.slice"], self.calls)
+        self.assertIn("ameesh-guest-ci@1.service", enforcer.stopped["units"])
 
     def test_a_failed_user_manager_stop_is_retried_after_the_units_are_gone(self):
         # R2 N2 : si l'arrêt de user-UID.slice échoue, le nouvel essai ne

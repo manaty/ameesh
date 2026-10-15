@@ -1204,12 +1204,13 @@ class Enforcer:
         users, users_ok = [], True
         for uid in sorted(uids):
             manager = "user@%s.service" % uid
-            # a manager that was not running has nothing to stop (and is not
-            # started again later): only what this stop takes down comes back
-            if not self._unit_active(manager):
-                continue
+            # Session scopes can still occupy the user slice when its manager
+            # is inactive. Always stop the slice, but only restart a manager
+            # this stop actually found running.
+            manager_active = self._unit_active(manager)
             if self._systemctl("stop", "user-%s.slice" % uid):
-                users.append(manager)
+                if manager_active:
+                    users.append(manager)
             else:
                 users_ok = False
         boot = self.boot_id()

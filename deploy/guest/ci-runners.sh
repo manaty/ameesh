@@ -357,10 +357,22 @@ snapshot() { # SRC DST : the archive bytes, read by root into its private file
   python3 -I - "$1" "$2" "$MAX_ARCHIVE_BYTES" <<'PYSNAP'
 import os, stat, sys
 src, dst, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+parent_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
-    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    # O_NOFOLLOW on the leaf does not protect a substituted ci/cache parent.
+    # Pin each directory before opening its child, never following a link.
+    parts = os.path.abspath(src).split("/")[1:]
+    for part in parts[:-1]:
+        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=parent_fd)
+        os.close(parent_fd)
+        parent_fd = next_fd
+    fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                 dir_fd=parent_fd)
 except OSError as exc:
     sys.exit("cannot open %s without following a link: %s" % (src, exc))
+finally:
+    os.close(parent_fd)
 try:
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):

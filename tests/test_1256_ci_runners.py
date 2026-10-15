@@ -1248,6 +1248,18 @@ class CiRunnersTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("larger than 10 bytes", res.stderr)
 
+    def test_archive_snapshot_refuses_a_symlinked_parent(self):
+        # O_NOFOLLOW on the leaf alone still follows a replaced cache directory.
+        work = os.path.join(self.host, "snap-parent")
+        os.makedirs(os.path.join(work, "private"))
+        real = os.path.join(work, "private", "runner.tar.gz")
+        with open(real, "wb") as fh:
+            fh.write(b"private-bytes")
+        os.symlink(os.path.join(work, "private"), os.path.join(work, "cache"))
+        res = self.snap(self.snapshot_block(), os.path.join(work, "cache", "runner.tar.gz"),
+                        os.path.join(work, "out.bin"))
+        self.assertNotEqual(res.returncode, 0, "a substituted ancestor must be refused")
+
     def gate_document(self, state="stopped"):
         return self.write("run/ameesh-gate/state/state.json", json.dumps(
             {"schema": "ameesh-host-state/1", "state": state, "seq": 3,
