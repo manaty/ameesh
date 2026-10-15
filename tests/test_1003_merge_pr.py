@@ -546,7 +546,7 @@ class RunTest(unittest.TestCase):
         data.update(over)
         return argparse.Namespace(**data)
 
-    def run_with(self, out, args=None, **patches):
+    def run_with(self, out, args=None, db=None, **patches):
         import contextlib
         import io
         args = args or self.args()
@@ -555,7 +555,7 @@ class RunTest(unittest.TestCase):
              mock.patch.object(merge_pr.plan_git, "_out", return_value=""), \
              mock.patch.object(merge_pr.migrations, "origin_repo", return_value="o/r"), \
              contextlib.redirect_stdout(buf):
-            code = merge_pr.run(None, None, args)
+            code = merge_pr.run(None, db, args)
         return code, buf.getvalue()
 
     def test_a_verified_merge_is_declared_on_the_lot(self):
@@ -610,6 +610,11 @@ class RunTest(unittest.TestCase):
         done = dict(item, state="merged")
         store_close = mock.Mock(return_value=done)
         store = SimpleNamespace(work=SimpleNamespace(close_merged=store_close))
+        # Current main closes the lot and wakes its dependents in one
+        # transaction. Keep those unrelated DB ports explicit in this unit
+        # witness; close_merged itself still runs, without any Git proof.
+        database = mock.MagicMock()
+        from ameesh import work_dependencies
         for state in ("merged", "already"):
             with self.subTest(state=state):
                 store_close.reset_mock()
@@ -617,8 +622,10 @@ class RunTest(unittest.TestCase):
                        "frozen": "a" * 40, "tree": "c" * 40,
                        "frozen_tree": "c" * 40, "target": "main", "tip": "d" * 40}
                 with mock.patch.object(work, "get", return_value=item), \
-                     mock.patch.object(work.storage, "of", return_value=store):
-                    code, text = self.run_with(out)
+                     mock.patch.object(work.storage, "of", return_value=store), \
+                     mock.patch.object(work_dependencies, "lock"), \
+                     mock.patch.object(work, "_notify_released"):
+                    code, text = self.run_with(out, db=database)
                 self.assertEqual(code, 0)
                 self.assertNotIn("record_warning", text)
                 self.assertEqual(json.loads(text)["recorded"]["result"], "merged")
