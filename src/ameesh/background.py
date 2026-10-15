@@ -188,6 +188,9 @@ class Entry:
     process_lock: object = field(default_factory=threading.RLock, repr=False)
     #: autres processus vivants du groupe (descendants des racines)
     others: int = 0
+    #: L498 : cgroup délégué du tour (chemin relatif à la monture cgroup v2),
+    #: None hors délégation — il porte la propriété et le nettoyage
+    cgroup: str | None = None
     #: conteneurs du tour sans lot : en cours, et tous ceux vus
     containers: list = field(default_factory=list)
     containers_seen: dict = field(default_factory=dict)
@@ -280,12 +283,17 @@ class Tracker:
             return {}
 
     def survivors(self, turn_id: str, pgid: int | None, *,
-                  handles: dict | None = None) -> tuple[list, list] | None:
+                  handles: dict | None = None,
+                  cgroup: str | None = None) -> tuple[list, list] | None:
         """À la fin d'un tour normal (harnais fini et moissonné) : ce qui
         tourne encore, `(processus vivants du groupe, conteneurs du tour sans
         lot)`, ou None si rien. Attend `SETTLE_S` au plus que le groupe se
         vide de lui-même. Si l'OS ne permet pas de lister le groupe : None —
-        le nettoyage immédiat d'avant s'applique."""
+        le nettoyage immédiat d'avant s'applique.
+
+        L498 : un cgroup encore peuplé est un survivant même si le relevé des
+        pid ne l'a pas vu (double `fork` + `setsid`) — il prend le délai de
+        grâce et sera vidé par `cgroup.kill` à l'échéance."""
         vivants: list[dict] = []
         if pgid:
             fin = time.monotonic() + self.SETTLE_S
@@ -314,6 +322,14 @@ class Tracker:
                 conteneurs = []
         if not vivants and not conteneurs and not any(
                 h.live() for h in (handles or {}).values()):
+            if cgroup:
+                from .platform import turn_cgroup
+                try:
+                    populated = turn_cgroup.populated(cgroup)
+                except Exception:
+                    populated = None
+                if populated:  # un descendant invisible au relevé des pid
+                    return [], []
             return None
         return vivants, conteneurs
 
@@ -337,21 +353,24 @@ class Tracker:
 
     def start(self, *, agent: str, turn_id: str, pgid: int | None, members: list,
               containers: list, grace_s: int, now: float | None = None,
-              handles: dict | None = None) -> Entry:
+              handles: dict | None = None,
+              cgroup: str | None = None) -> Entry:
         """Inscrit le travail de fond d'un tour fini en délai de grâce."""
         now = time.time() if now is None else float(now)
         pids = {p["pid"] for p in members}
         entry = Entry(agent=agent, turn_id=turn_id, pgid=pgid, ended=now,
                       deadline=now + max(0, int(grace_s)), grace_s=max(0, int(grace_s)),
                       lineage=set(pids) | ({pgid} if pgid else set()),
+                      cgroup=cgroup,
                       containers=list(containers),
                       containers_seen={c["id"]: c for c in containers},
                       containers_at=now, handles=dict(handles or {}))
         # A snapshot after reaping proves identity, never turn ownership.
         owned = self._owned_members(entry, members)
         self._capture(entry, owned)
-        entry.unverified = entry.unverified or any(
-            p["pid"] not in entry.handles and not p["zombie"] for p in members)
+        if not entry.cgroup:
+            entry.unverified = entry.unverified or any(
+                p["pid"] not in entry.handles and not p["zombie"] for p in members)
         for p in members:
             if p["ppid"] not in pids:  # racine : son parent (le harnais) a fini
                 entry.jobs[p["pid"]] = Job(p["pid"], describe_process(p), start=p.get("start"))
@@ -424,8 +443,10 @@ class Tracker:
                 # remaining container never authorizes a later group signal.
                 # A live member without ownership proof is uncertain, not
                 # evidence of successful cleanup. Preserve it as orphaned.
-                entry.unverified = any(p["pgid"] == entry.pgid and not p["zombie"]
-                                       for p in table)
+                # L498 : avec un cgroup, la propriété ne dépend pas du pid.
+                if not entry.cgroup:
+                    entry.unverified = any(p["pgid"] == entry.pgid and not p["zombie"]
+                                           for p in table)
                 entry.pgid = None
                 # Detached members remain ours through their retained handle.
                 for pid, handle in list(entry.handles.items()):
@@ -450,7 +471,17 @@ class Tracker:
         if not vivants or now - entry.containers_at >= self.CONTAINERS_EVERY_S:
             self._containers(entry, now)
         retained_live = any(h.live() for h in entry.handles.values())
-        if not vivants and not retained_live and not entry.containers:
+        # L498 : `cgroup.events` est la preuve de vie du cgroup — un descendant
+        # détaché (double fork + setsid) n'apparaît dans aucun relevé de pid.
+        cgroup_live = None
+        if entry.cgroup:
+            from .platform import turn_cgroup
+            try:
+                cgroup_live = turn_cgroup.populated(entry.cgroup)
+            except Exception:
+                cgroup_live = None
+        if (not vivants and not retained_live and not entry.containers
+                and not cgroup_live):
             # le verdict de CE passage fait foi jusqu'à la fermeture : une
             # nouvelle sonde verrait un groupe au numéro recyclé (#458 r2)
             self._close(entry, "done", now, survives=False)
@@ -487,7 +518,12 @@ class Tracker:
         Never signal a cached group number. New members may be captured only
         while a live retained handle still anchors that group in this pass.
         Unreadable tables or unavailable handles mean no numeric fallback.
-        """
+
+        L498 : un cgroup délégué remplace cette mécanique — il porte la
+        propriété (les membres suivent fork/exec, `setsid` compris) et se vide
+        d'un bloc ; les pidfds restent de la télémétrie."""
+        if entry.cgroup:
+            return self._kill_cgroup(entry)
         if not entry.pgid and not entry.handles:
             return entry.unverified
         try:
@@ -533,6 +569,33 @@ class Tracker:
             return self._survival_verdict(entry)
         finally:
             self._drop_handles(entry)
+
+    def _kill_cgroup(self, entry: Entry) -> bool:
+        """L498 : `cgroup.kill`, attente bornée de `populated 0`, `rmdir`.
+
+        Rend True s'il survit quelque chose (cgroup non vidé, ou `unverified`) ;
+        False si le cgroup est vidé et enlevé. Les zombies adoptés sont
+        moissonnés au passage pour les codes de sortie (télémétrie)."""
+        from .platform import turn_cgroup
+        try:
+            emptied = turn_cgroup.kill(entry.cgroup)
+        except Exception as exc:
+            self.log("[%s] background cgroup %s not killed (%s)"
+                     % (entry.agent, entry.cgroup, exc))
+            entry.unverified = True
+            return True
+        if not emptied:
+            entry.unverified = True
+        try:
+            table = platform.process_table()
+        except Exception:
+            table = None
+        if table is not None and entry.pgid:
+            try:
+                self._members(entry.pgid, table, entry)
+            except Exception:
+                pass
+        return not emptied
 
     def _foreign_groups(self, entry: Entry) -> set[int] | None:
         """Live ownership registry plus launches in this executor; None if unknown."""
@@ -704,7 +767,8 @@ class Tracker:
                 self.log("[%s] background pid %s: no stable handle; no signal"
                          % (entry.agent, p["pid"]))
         if eligible:
-            entry.unverified = any(p["pid"] not in entry.handles for p in eligible)
+            if not entry.cgroup:
+                entry.unverified = any(p["pid"] not in entry.handles for p in eligible)
             with self.observed_lock:
                 for p in eligible:
                     pid = p["pid"]
@@ -766,6 +830,21 @@ class Tracker:
             except Exception:
                 restants = []
         orphelin = bool(restants) or survives or entry.unverified
+        if entry.cgroup and not orphelin:
+            # L498 : le cgroup doit avoir été vidé (par `_kill` à l'échéance,
+            # ou de lui-même) ; on enlève le répertoire vide. S'il est encore
+            # peuplé, la ressource reste orpheline, avec son chemin.
+            from .platform import turn_cgroup
+            try:
+                if not turn_cgroup.remove(entry.cgroup):
+                    orphelin = True
+                    self.log("[%s] cgroup %s of turn %s still populated after "
+                             "cleanup; resource remains orphan"
+                             % (entry.agent, entry.cgroup, entry.turn_id[:8]))
+            except Exception as exc:
+                orphelin = True
+                self.log("[%s] cgroup %s of turn %s not removed (%s)"
+                         % (entry.agent, entry.cgroup, entry.turn_id[:8], exc))
         try:
             storage.of(db).turn_resources.close_turn(entry.turn_id, orphan=orphelin,
                                                      containers=restants or None)
