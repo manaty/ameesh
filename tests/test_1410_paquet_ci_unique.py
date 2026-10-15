@@ -224,13 +224,9 @@ class DeclenchementTest(unittest.TestCase):
 
     def test_tests_yml_ne_part_plus_sur_une_poussee_de_paquet(self):
         on = _sans_commentaires(_bloc_on(TESTS))
-        # #1343 : `integration/**` est une base de PR du parcours sur étiquette
-        # (pull_request.branches), jamais un déclencheur de poussée — la poussée
-        # de paquet reste portée par le portier (paquet.yml, workflow_call).
-        push = on.split("pull_request:", 1)[0]
-        self.assertNotIn("integration/**", push,
+        self.assertNotIn("integration/**", on,
                          "une poussée de paquet ne doit plus déclencher tests.yml")
-        self.assertIn('branches: [main, "release/**"]', push)
+        self.assertIn('branches: [main, "release/**"]', on)
 
     def test_tests_yml_reste_appelable_et_requis(self):
         on = _sans_commentaires(_bloc_on(TESTS))
