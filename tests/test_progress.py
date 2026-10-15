@@ -648,10 +648,12 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(lot["waiting_for"]["what"], "verdict")
 
     def test_ci_suite_du_veilleur(self):
-        """#1476 : la vue ne compte que les suites complètes CONCLUES (main,
-        release/**, integration/** et PR dont la source ou la cible l'est) ;
-        annulée, remplacée, en cours et hors fenêtre sont écartées ; la borne
-        de lecture est par dépôt."""
+        """#1476 : la vue ne compte que les suites complètes CONCLUES des
+        contextes qui les garantissent — release/**, integration/** (source ou
+        cible) et exécution manuelle ; une poussée sur main est écartée (voie
+        documentation seule possible, L161a). Annulée, remplacée, en cours et
+        hors fenêtre sont aussi écartées ; la borne de lecture est par
+        dépôt."""
         def run(run_id, branch, base, status, *, repo="manaty/ameesh", minutes=10,
                 age_s=0, event="push"):
             self.db.execute(
@@ -663,30 +665,31 @@ class ProgressPgTest(PgTestCase):
                 "      ELSE to_timestamp(extract(epoch from now()) - %s) END)",
                 (repo, run_id, "0" * 40, branch, event, base, status,
                  float(minutes * 60 + age_s), status, float(age_s)))
-        run(1, "main", "main", "success", minutes=10)
+        run(1, "main", "main", "success", minutes=10)          # voie doc possible
         run(2, "release/1.11.0", "main", "failure", minutes=12)
         run(3, "integration/1204", "main", "success", minutes=14)
         run(4, "lot/1476", "integration/1204", "success", minutes=16, event="pull_request")
         run(5, "lot/999", "main", "success", minutes=18, event="pull_request")  # impactés
-        run(6, "main", "main", "cancelled", minutes=5)
-        run(7, "main", "main", "superseded", minutes=5)
-        run(8, "release/1.11.0", "main", "running", minutes=5)
-        run(9, "main", "main", "success", minutes=10, age_s=8 * 86400)
-        run(10, "main", "main", "success", minutes=10, repo="manaty/nexlink")
-        run(11, "main", "main", "success", minutes=11, repo="manaty/nexlink")
+        run(6, "main", "main", "success", minutes=11, event="workflow_dispatch")
+        run(7, "main", "main", "cancelled", minutes=5)
+        run(8, "main", "main", "superseded", minutes=5)
+        run(9, "release/1.11.0", "main", "running", minutes=5)
+        run(10, "main", "main", "success", minutes=10, age_s=8 * 86400)
+        run(11, "release/2.0", "main", "success", minutes=10, repo="manaty/nexlink")
+        run(12, "integration/9", "main", "success", minutes=11, repo="manaty/nexlink")
 
         st = storage.of(self.db).progress
         # l'instant de référence vient de la base : aucune horloge locale
         depuis = self.db.query("SELECT extract(epoch from now())::float8 AS epoch")[0]["epoch"] \
             - 7 * 86400
         rows = st.ci_suite(since_ts=depuis, limit=100)
-        self.assertEqual([r["run_id"] for r in rows], [11, 10, 4, 3, 2, 1])
-        attendu = {1: 600.0, 2: 720.0, 3: 840.0, 4: 960.0, 10: 600.0, 11: 660.0}
+        self.assertEqual([r["run_id"] for r in rows], [12, 11, 6, 4, 3, 2])
+        attendu = {2: 720.0, 3: 840.0, 4: 960.0, 6: 660.0, 11: 600.0, 12: 660.0}
         for row in rows:
             self.assertAlmostEqual(row["duration_s"], attendu[row["run_id"]], delta=2)
         # la borne est par dépôt : le dépôt actif ne chasse pas l'autre
         self.assertEqual([r["run_id"] for r in st.ci_suite(since_ts=depuis, limit=1)],
-                         [11, 4])
+                         [12, 6])
 
         snap = progress.snapshot(self.db, self.cfg, book=self._book())
         self.assertEqual([r["repo"] for r in snap["ci_suite"]["repos"]],
@@ -695,8 +698,8 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(ameesh["runs"], 4)
         self.assertEqual(ameesh["median_s"], 780.0)          # (720 + 840) / 2
         self.assertEqual(ameesh["priority_runs"], 3)         # release/**, integration/**, cible
-        self.assertEqual(ameesh["priority_median_s"], 840.0)
->>>>>>> 9f3efb106 (#1476 : la durée médiane de la suite complète s'affiche dans progress)
+        self.assertEqual(ameesh["priority_median_s"], 840.0)  # la main dispatchée n'en est pas
+        self.assertEqual(snap["ci_suite"]["repos"][1]["runs"], 2)
 
     def test_vide(self):
         snap = progress.snapshot(self.db, self.cfg, book=self._book())

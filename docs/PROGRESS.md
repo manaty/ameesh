@@ -313,14 +313,18 @@ right to within one interval.
 
 A `repos[]` entry: `{repo, runs, median_s, p80_s, last_s, last_concluded_ts,
 priority_runs, priority_median_s}`. Only **concluded** runs count (`success`
-or `failure`; a cancelled or superseded run has no suite duration) on `main`,
-`release/**` or `integration/**`, pushed or as a pull request whose source or
-target is one of those branches; the reading is bounded to the 500 most
-recent concluded runs **per repository**. `priority_runs` and
-`priority_median_s` restrict to the #1468 priority pool (`integration/**`,
-`release/**`): a push on `main` follows the merge of a package already
-validated on its integration branch and is not the critical path. The text
-render shows the median and p80 against the target; the page shows the same.
+or `failure`; a cancelled or superseded run has no suite duration) in the
+contexts that **guarantee** the full suite: a push or pull request whose
+source or target is `release/**` or `integration/**`, or a manual run
+(`workflow_dispatch`). A push to `main` is left out: an all-documentation
+pushed range takes the L161a fast lane there (the parts are skipped) and
+`ci_runs` keeps neither the plan mode nor the jobs, so counting it would pull
+the median down. The reading is bounded to the 500 most recent concluded runs
+**per repository**. `priority_runs` and `priority_median_s` restrict to the
+#1468 priority pool (`integration/**`, `release/**`): a push on `main` follows
+the merge of a package already validated on its integration branch and is not
+the critical path. The text render shows the median and p80 against the
+target; the page shows the same.
 
 ## `actions[]`
 
