@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from unittest import mock
 
 from ameesh import db as db_mod, train, train_ci, train_policy
@@ -48,6 +48,42 @@ projects: {}
 
 def stamp(hour):
     return datetime.fromisoformat("2026-10-15T%s:00:00+02:00" % hour).timestamp()
+
+
+def verify_pinned_canon_calendar(rules):
+    """Check the pinned canon through the consumer's scheduling port."""
+    check = unittest.TestCase()
+    check.assertEqual(rules.timezone, "Europe/Paris")
+    check.assertEqual(rules.cutoffs, ("11:00", "23:00"))
+    check.assertEqual(rules.packet_cutoffs, tuple("%02d:00" % hour for hour in range(24)))
+    policy = train.Policy(enabled=True, schedule=rules)
+    counts = {}
+    for day, count, repeated in (("2026-10-15", 24, 1),
+                                 ("2026-03-29", 23, 0),
+                                 ("2026-10-25", 25, 2)):
+        packets = rules.packets_on(date.fromisoformat(day))
+        epochs = [at for at, _ in packets]
+        check.assertEqual(len(packets), count)
+        check.assertEqual(epochs, sorted(set(epochs)))
+        check.assertEqual(sum(label == "02:00" for _, label in packets), repeated)
+        for index, at in enumerate(epochs):
+            check.assertEqual(policy.cutoff(at), at)
+            check.assertEqual(policy.cutoff(at + 5), at)
+            check.assertEqual(rules.next_packet(at - 1), at)
+            if index + 1 < len(epochs):
+                check.assertEqual(rules.next_packet(at), epochs[index + 1])
+        counts[day] = count
+    for first, second in (("2026-10-15T23:00:00+02:00", "2026-10-16T00:00:00+02:00"),
+                          ("2026-03-29T01:00:00+01:00", "2026-03-29T03:00:00+02:00"),
+                          ("2026-10-25T02:00:00+02:00", "2026-10-25T02:00:00+01:00")):
+        before, after = [datetime.fromisoformat(at).timestamp() for at in (first, second)]
+        check.assertEqual(rules.next_packet(before), after)
+        check.assertEqual(policy.cutoff(after - 1), before)
+        check.assertEqual(policy.cutoff(after), after)
+    check.assertEqual(rules.cutoff(stamp("12")), stamp("11"))
+    check.assertEqual(policy.cutoff(stamp("12")), stamp("12"))
+    check.assertEqual(rules.next_packet(stamp("12")), stamp("13"))
+    return counts
 
 
 class RealMechanicsTest(TrainRunnerTest):
@@ -271,8 +307,9 @@ if __name__ == "__main__":
                         or rules.merge_repeat_freeze is not False \
                         or rules.merge_on_green_packet is not True:
                     raise AssertionError((project, actual, rules.to_dict()))
+                calendar = verify_pinned_canon_calendar(rules)
                 print(json.dumps(dict(project=project, commit=rules.commit, reviews=actual,
-                                      merge=rules.to_dict()["merge"])))
+                                      merge=rules.to_dict()["merge"], packets=calendar)), flush=True)
         names = [name for name in RealMechanicsTest.__dict__ if name.startswith("test_")]
         names += ["test_new_clone_reads_real_history_then_lands_exact_ci_head_across_connections",
                   "test_competing_runner_cannot_touch_the_reserved_train_or_share_its_clone",

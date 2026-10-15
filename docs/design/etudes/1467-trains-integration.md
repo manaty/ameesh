@@ -34,9 +34,11 @@ l'admission.
 dernier commit vert), puis tague et déploie en staging. Cette sélection
 ne demande aucune composition supplémentaire au train. Le calendrier des
 paquets et celui des releases doivent être distingués par le contrat
-mécanique. `home#94` ne contient pas encore `processus/mecanique.yaml` :
-le port horaire est confié à impl07 dans #1757 après son P1 #1749, sans
-remplacer sa source par un intervalle local. Mesh-design le qualifie le
+mécanique. `home#94` ne contient pas `processus/mecanique.yaml` ; #1757 livre
+ce bloc avec la prose horaire dans home#96 au commit exact
+`21d6653922bac554d2d6cd0570e7f6497b215c37`, avec le fournisseur
+`735651aa7e88184cd09e5fe9e5104f49ada2045a` (impl07, courrier du 15 octobre
+à 21:09), sans intervalle local. Mesh-design qualifie le port le
 15 octobre à 20:04 : `packets.cutoffs` fournit `packet_cutoffs`, `packets_on`,
 `last_packet(now)` (borne incluse) et `next_packet(now)` (strictement future).
 Le consommateur exige ces ports, sans repli sur `cutoff`/`next_cutoff` des
@@ -50,14 +52,17 @@ au passage à l'heure d'hiver peuvent donc produire deux paquets distincts,
 y compris après reprise entre les deux. Au passage à l'heure d'été, une CI
 en cours conserve son manifeste jusqu'à sa conclusion ; la prochaine
 composition prend le dernier créneau réel fourni. Ces comportements sont
-éprouvés avec des epochs explicites dans le banc du consommateur ; le calcul
-du calendrier et son raccord Git/SQL restent à qualifier sur le fournisseur
-exact #1757.
+éprouvés avec des epochs explicites dans le banc du consommateur. Le probe
+interbranches contrôle séparément les objets du canon réel pour ameesh et
+Nexlink : 24/23/25 créneaux, epochs uniques et triés, bornes et passage de
+minuit via le port consommateur `train.Policy.cutoff`.
 Le banc Git/SQL conserve aussi le même manifeste pendant une CI à travers
 chacun des deux changements d'heure, après reconstruction du passage sur une
 connexion fraîche, puis promeut la tête exacte avec un seul lancement CI.
 Il utilise des epochs de fixture ; le probe interbranches réemploie les mêmes
-assertions avec le calendrier chargé par le fournisseur exact, encore attendu.
+assertions avec le calendrier chargé par le fournisseur #1757 exact sur un
+canon horaire de fixture versionné. Git et SQL y sont réels ; CI et provenance
+restent simulées. Ce raccord ne sélectionne aucun canon ni profil actif.
 L'ancien calendrier autonome de 11 h/23 h reste
 uniquement un banc de préparation ; aucun profil actif ne le sélectionne.
 
