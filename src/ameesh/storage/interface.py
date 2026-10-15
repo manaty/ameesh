@@ -1202,6 +1202,20 @@ class WorkItems(Domain):
         """L160e2 (0058): frees the lease, if still held at that epoch."""
 
     @abc.abstractmethod
+    def train_read(self, key: str) -> dict | None:
+        """#1467: durable train document and its revision, or None."""
+
+    @abc.abstractmethod
+    def train_save(self, key: str, document: dict, *, revision: int,
+                   owner: str, epoch: int) -> dict | None:
+        """#1467: compare-and-swap train state under the existing land lease.
+
+        revision=0 creates it. Every write locks and then rechecks the lease
+        against wall time, and compares the previous document revision.
+        A stale holder cannot overwrite a newer train. No remote API grant.
+        """
+
+    @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
         """L160e (0058): the queue rows (of `target`, else every target),
         ranked first, then by arrival."""

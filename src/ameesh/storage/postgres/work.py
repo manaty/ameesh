@@ -896,6 +896,37 @@ class WorkItems(interface.WorkItems):
             (key, owner, int(epoch)))
         return bool(rows)
 
+    def train_read(self, key) -> dict | None:
+        rows = self.db.query(
+            "SELECT revision, document FROM integration_trains WHERE target_key = %s", (key,))
+        if not rows:
+            return None
+        document = rows[0]["document"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        return dict(document, revision=int(rows[0]["revision"]))
+
+    def train_save(self, key, document, *, revision, owner, epoch) -> dict | None:
+        with self.db.transaction() as tx:
+            held = tx.query("SELECT owner, epoch"
+                            " FROM merge_locks WHERE target = %s FOR UPDATE", (key,))
+            if not held or held[0]["owner"] != owner or int(held[0]["epoch"]) != epoch:
+                return None
+            # Recheck after the row lock, never using a pre-lock clock.
+            live = tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (key,))
+            if not live:
+                return None
+            rows = tx.query(
+                "INSERT INTO integration_trains (target_key, revision, document)"
+                " SELECT %s, 1, %s::jsonb WHERE %s = 0"
+                " ON CONFLICT (target_key) DO NOTHING RETURNING revision",
+                (key, json.dumps(document), int(revision))) if revision == 0 else tx.query(
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
+                " RETURNING revision", (json.dumps(document), key, int(revision)))
+            return dict(document, revision=int(rows[0]["revision"])) if rows else None
+
     def queue(self, target=None) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"

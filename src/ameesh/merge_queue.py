@@ -892,6 +892,12 @@ def run(cfg, db, args) -> int:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
             project = radar_project(cfg, repo)
+            if project is None and plan_git._out(repo, "remote", "get-url", "origin"):
+                raise QueueError(
+                    "no radar project matches repository %s (source %s) in the loaded "
+                    "configuration: select the profile declaring radar.projects for this "
+                    "repository, including its land/protected conditions; --repo selects "
+                    "a local checkout, not a configuration profile" % (repo, source_of(repo)))
             clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
                 if project else None
             row = enter(db, args.id, repo=repo, actor=args.actor, project=project,
