@@ -460,3 +460,35 @@ class AccountBudgetTest(PgTestCase):
                                  "2026-07-15 00:00")
         finally:
             time.tzset()
+
+    def test_instruction_d_un_autre_fil_hors_de_la_transaction(self):
+        """Review (dev7): on the shared driver, a plain write from another
+        thread entered the open `transaction()` block and was lost with its
+        ROLLBACK (an accounting marker, a ledger row). It now waits for the
+        block to end, then commits on its own."""
+        shared = self.connect()
+        self.db.execute("CREATE TABLE sonde_1469 (v int)")
+        inside, written = threading.Event(), threading.Event()
+
+        def ecrit():
+            inside.wait(10)
+            shared.execute("INSERT INTO sonde_1469 VALUES (1)")
+            written.set()
+
+        b = threading.Thread(target=ecrit)
+        b.start()
+        try:
+            with self.assertRaises(RuntimeError):
+                with shared.transaction():
+                    shared.query("SELECT 1 AS x")
+                    inside.set()
+                    # before the fix the write lands here at once; with it, it waits
+                    written.wait(2)
+                    raise RuntimeError("rollback")
+            b.join(10)
+            self.assertTrue(written.is_set())
+            self.assertEqual(self.db.query("SELECT count(*) AS n FROM sonde_1469")[0]["n"], 1)
+        finally:
+            b.join(10)
+            shared.close()
+            self.db.execute("DROP TABLE sonde_1469")
