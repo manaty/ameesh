@@ -159,6 +159,7 @@ from .conversations import Conversations
 from .work_dependencies import WorkDependencies
 
 import abc
+import re
 from typing import Any, Callable, Protocol, Sequence
 
 
@@ -2174,33 +2175,41 @@ class Progress(Domain):
         return [{"work_item_id": lot, "last_ts": last[lot]} for lot in sorted(last)]
 
     def lot_hold_events(self, item_ids: Sequence[int],
-                        prefixes: Sequence[str]) -> list[dict]:
+                        patterns: Sequence[str]) -> list[dict]:
         """Événements utiles à la lecture des retenues (#1664) : les
         transitions d'état (une retenue tombe au changement d'état) et les
-        lignes dont la note commence par l'un des préfixes littéraux
-        `prefixes` (notes hold/levée), fusionnées par identifiant et ordonnées
-        comme le journal (`created_ts`, id). Une note portée par une transition
-        est rendue avec elle, et le texte des notes ordinaires n'est jamais lu
-        ni transmis.
+        lignes dont la note correspond à l'un des motifs `patterns` (notes
+        hold/levée ; mêmes motifs que `planned_waits`), fusionnées par
+        identifiant — la ligne à note l'emporte, elle seule porte le texte —
+        et rendues dans l'ordre d'écriture (`id`), comme `lot_transitions`.
+        Une note portée par une transition est donc rendue avec elle, et le
+        texte des notes ordinaires n'est jamais lu ni transmis. Un motif vide
+        est refusé (`ValueError`) : il ferait sortir toutes les notes.
 
-        Lecture DÉRIVÉE (pas une opération du contrat médié) : le pilote
-        PostgreSQL ne transfère que ces lignes ; le repli ci-dessous lit
-        `lot_events` une fois."""
+        Les motifs suivent la syntaxe des deux lecteurs (repli Python `re`,
+        pilote PostgreSQL ARE : `^`, `\\s`, `(?:…)`) et s'appliquent à la note
+        débarrassée de ses blancs de bord. Lecture DÉRIVÉE (pas une opération
+        du contrat médié) : le pilote PostgreSQL ne transfère que ces lignes ;
+        le repli ci-dessous lit `lot_events` une fois. Un appelant qui a déjà
+        lu `lot_transitions` paie une seconde lecture bornée des transitions
+        (`max_lots`) — le contrat reste inchangé."""
         ids = [int(i) for i in item_ids]
         if not ids:
             return []
-        wanted = tuple(str(prefix).lower() for prefix in prefixes if str(prefix))
+        wanted = tuple(str(pattern) for pattern in patterns)
+        if any(not pattern for pattern in wanted):
+            raise ValueError("empty hold pattern")
+        compiled = tuple(re.compile(pattern, re.I) for pattern in wanted)
         events = list(self.lot_events(ids))
         merged: dict[tuple[int, int], dict] = {}
         for ev in _transitions(events):
             merged[(int(ev["work_item_id"]), int(ev["id"]))] = ev
-        if wanted:
+        if compiled:
             for ev in events:
-                note = str(ev.get("note") or "").strip().lower()
-                if note and note.startswith(wanted):
+                note = str(ev.get("note") or "").strip()
+                if note and any(rx.match(note) for rx in compiled):
                     merged[(int(ev["work_item_id"]), int(ev["id"]))] = dict(ev)
-        return sorted(merged.values(),
-                      key=lambda e: (float(e.get("created_ts") or 0.0), int(e["id"])))
+        return sorted(merged.values(), key=lambda e: int(e["id"]))
 
     @abc.abstractmethod
     def lot_milestones(self, item_ids: Sequence[int]) -> list[dict]:

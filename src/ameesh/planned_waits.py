@@ -24,11 +24,11 @@ _PACKAGE = re.compile(r"^(?:lot|package|workpackage)\s+(\S+)$", re.I)
 _HOLD = re.compile("^" + re.escape(LotSessions.HOLD_PREFIX), re.I)
 #: les notes de levée explicite ; un changement d'état du lot lève aussi.
 _LIFT = re.compile(r"^(?:unhold|hold\s+(?:lifted|released|cleared))\s*:", re.I)
-#: #1664 : préfixes littéraux donnés au stockage pour la lecture groupée ciblée
-#: (`Progress.lot_hold_events`) — un sur-ensemble de `_HOLD` et `_LIFT`
-#: (« hold » couvre `hold:` et `hold lifted:`…, « unhold » couvre `unhold:`).
-#: Le filtre exact reste ici (`is_hold_note`/`is_lift_note`).
-HOLD_NOTE_PREFIXES = ("hold", "unhold")
+#: #1664 : motifs donnés au stockage pour la lecture groupée ciblée
+#: (`Progress.lot_hold_events`) — exactement `_HOLD` et `_LIFT` (syntaxe `re`
+#: côté repli, ARE côté pilote PostgreSQL) : toutes les notes hold/levée,
+#: aucune note ordinaire. Le filtre exact reste ici.
+HOLD_NOTE_PATTERNS = (_HOLD.pattern, _LIFT.pattern)
 
 
 def is_hold_note(text) -> bool:
@@ -220,7 +220,7 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     if dependencies is None:
         dependencies = st.work_dependencies.for_items(ids)
     if holds is None:
-        holds = pilot_holds(db, st.progress.lot_hold_events(ids, HOLD_NOTE_PREFIXES))
+        holds = pilot_holds(db, st.progress.lot_hold_events(ids, HOLD_NOTE_PATTERNS))
     dates = {int(r["id"]): r for r in st.roadmap.item_plans(ids)}
     commitments = st.roadmap.commitments(statuses=["open"])
     packages = (packages if packages is not None else

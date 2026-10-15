@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import re
 import time
 import unittest
 from unittest import mock
@@ -152,20 +153,26 @@ class UnitTest(unittest.TestCase):
         self.assertTrue(label.startswith("hold by pilote since "), label)
         self.assertIsNone(D.wait_label(None))
 
-    def test_hold_prefixes_cover_the_exact_notes(self):
-        """#1664 B2 : les préfixes littéraux donnés au stockage couvrent
-        toutes les notes que `is_hold_note`/`is_lift_note` acceptent — le
-        filtre SQL ne peut pas manquer une retenue, et les notes ordinaires
-        qui les portent en préfixe restent filtrées par le motif exact."""
-        for text in ("hold: fenêtre", "HOLD: fenêtre",
+    def test_hold_patterns_cover_the_exact_notes(self):
+        """#1664 B2 : les motifs donnés au stockage couvrent toutes les notes
+        que `is_hold_note`/`is_lift_note` acceptent, et aucune note ordinaire —
+        le filtre SQL ne peut ni manquer une retenue ni transférer un texte
+        ordinaire."""
+        acceptees = ("hold: fenêtre", "HOLD: fenêtre",
                      "unhold: feu", "UNHOLD: feu", "unhold : feu",
                      "hold lifted: feu", "hold released: feu", "hold cleared: feu",
-                     "hold   lifted : feu"):
+                     "hold   lifted : feu")
+        for text in acceptees:
             with self.subTest(text=text):
                 self.assertTrue(W.is_hold_note(text) or W.is_lift_note(text))
-                self.assertTrue(text.strip().lower().startswith(W.HOLD_NOTE_PREFIXES))
-        for text in ("triage: relevé", "unholding the gate", "threshold reached", ""):
-            self.assertFalse(W.is_hold_note(text) or W.is_lift_note(text))
+                self.assertTrue(any(re.match(p, text.strip(), re.I)
+                                    for p in W.HOLD_NOTE_PATTERNS))
+        for text in ("triage: relevé", "unholding the gate", "holding pattern",
+                     "hold-up: staging", "threshold reached", ""):
+            with self.subTest(text=text):
+                self.assertFalse(W.is_hold_note(text) or W.is_lift_note(text))
+                self.assertFalse(any(re.match(p, text.strip(), re.I)
+                                     for p in W.HOLD_NOTE_PATTERNS))
 
     def test_targeted_stream_holds_like_the_full_journal(self):
         """#1664 B2 : le flux ciblé du stockage (transitions + notes hold/levée)
@@ -184,31 +191,38 @@ class UnitTest(unittest.TestCase):
                     "actor": actor, "created_ts": float(ident)}
 
         bruit = "triage: " + "x" * 5000
+        proche = "holding pattern: bruit ordinaire"
         journal = [row(1, "intake", "created"),
                    row(2, "build", "prise"),
                    row(3, "build", bruit),
-                   row(4, "build", "hold: fenêtre opérateur", actor="human:pilote"),
-                   row(5, "build", bruit),
-                   row(6, "qa", "hold: porte portée par la transition",
+                   row(4, "build", proche),
+                   row(5, "build", "hold: fenêtre opérateur", actor="human:pilote"),
+                   row(6, "build", bruit),
+                   row(7, "qa", "hold: porte portée par la transition",
                        actor="human:pilote"),
-                   row(7, "qa", bruit)]
-        flux = SI.Progress.lot_hold_events(Journal(journal), [1], W.HOLD_NOTE_PREFIXES)
+                   row(8, "qa", bruit)]
+        flux = SI.Progress.lot_hold_events(Journal(journal), [1], W.HOLD_NOTE_PATTERNS)
         notes = [str(e.get("note") or "") for e in flux]
         self.assertNotIn(bruit, notes)
+        self.assertNotIn(proche, notes)     # même un mot proche ne sort pas
         self.assertIn("hold: fenêtre opérateur", notes)
         # la note portée par la transition est rendue avec la transition
-        porte = next(e for e in flux if e["id"] == 6)
+        porte = next(e for e in flux if e["id"] == 7)
         self.assertEqual(porte["state"], "qa")
         self.assertEqual(porte["note"], "hold: porte portée par la transition")
         # le flux ciblé et le journal complet donnent le même hold
         autorises = {"human:pilote"}
         self.assertEqual(W.explicit_holds(journal, allowed=autorises),
                          W.explicit_holds(flux, allowed=autorises))
-        self.assertEqual(W.explicit_holds(flux, allowed=autorises)[1]["since"], 6.0)
-        # sans préfixe, le flux ne porte que les transitions, sans note
+        self.assertEqual(W.explicit_holds(flux, allowed=autorises)[1]["since"], 7.0)
+        # sans motif, le flux ne porte que les transitions, sans note
         transitions = SI.Progress.lot_hold_events(Journal(journal), [1], ())
-        self.assertEqual([e["id"] for e in transitions], [1, 2, 6])
+        self.assertEqual([e["id"] for e in transitions], [1, 2, 7])
         self.assertTrue(all("note" not in e for e in transitions))
+        # un motif vide est refusé : il ferait sortir toutes les notes
+        with self.assertRaises(ValueError):
+            SI.Progress.lot_hold_events(Journal(journal), [1],
+                                        (W.HOLD_NOTE_PATTERNS[0], ""))
 
 
 class PgTest(PgTestCase):
@@ -427,6 +441,17 @@ class PgTest(PgTestCase):
         self.old(lot)
         self.assertIn(lot["id"],
                       [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
+        # la note de transition est stockée telle qu'authentifiée, blancs ôtés :
+        # un préfixe Unicode ne peut pas échapper au filtre littéral du pilote SQL
+        espace = self.item("porte sur transition espacée")
+        work.move(self.db, espace["id"], "build", note="\u00a0hold: fenêtre opérateur ",
+                  actor="human:pilote")
+        self.old(espace)
+        stockee = next(e for e in work.events(self.db, espace["id"])
+                       if e["state"] == "build")["note"]
+        self.assertEqual(stockee, "hold: fenêtre opérateur")
+        self.assertNotIn(espace["id"],
+                         [r["id"] for r in stagnation.stagnant_lots(self.db, now=self.now)])
 
     def test_grouped_views_read_the_targeted_stream_never_the_journal(self):
         """#1664 B2 : avec un hold posé, les vues groupées (alerte, work list,

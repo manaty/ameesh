@@ -292,7 +292,7 @@ def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict, list]:
         # lu une fois pour toute la vue.
         from . import planned_waits
         hold_events = list(st.progress.lot_hold_events(
-            ids, planned_waits.HOLD_NOTE_PREFIXES))
+            ids, planned_waits.HOLD_NOTE_PATTERNS))
         for ms in st.progress.lot_milestones(ids):
             milestones.setdefault(int(ms["work_item_id"]), []).append(ms)
         for act in st.progress.lot_actions(ids):

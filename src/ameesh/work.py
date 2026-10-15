@@ -1464,7 +1464,10 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
 
     held = state == "waiting_human"
     # #1664 r2 (B1) : la note de transition peut poser ou lever une retenue ;
-    # elle s'authentifie au même titre que `work note`.
+    # elle s'authentifie au même titre que `work note`. Elle se stocke nette,
+    # comme `work note` : la lecture groupée ciblée (`lot_hold_events`) lit le
+    # motif des retenues sans dépendre des blancs Unicode du texte écrit.
+    note = (note or "").strip()
     actor = check_wait_note(getattr(db, "cfg", None), db, actor, note)
     text = note or ("%s → %s" % (current, state))
     if reviewer:

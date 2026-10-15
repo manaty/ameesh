@@ -46,8 +46,10 @@ merged by event id), never from the full journal: ordinary note text is not
 read or transferred, the event order is preserved, and a state change still
 lifts the hold. A hold written on a transition
 (`ameesh work move <id> <state> --note "hold: …"`) is read with that
-transition. The exact hold/lift patterns remain those of `planned_waits`; the
-storage filter is only a literal-prefix pre-selection.
+transition. The storage pre-selects on the same motifs as this module
+(`HOLD_NOTE_PATTERNS`, applied to the note stripped of its edge whitespace),
+so no ordinary note is fetched, and a transition note is stored stripped —
+what was authenticated is what is stored and read.
 
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free

@@ -766,7 +766,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         db, items, now=now, packages=packages,
         dependencies=[e for edges in dependencies.values() for e in edges],
         holds=planned_waits.pilot_holds(
-            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PREFIXES), cfg=cfg))
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
