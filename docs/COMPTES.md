@@ -15,20 +15,24 @@ compte est choisi ainsi :
 3. Sinon (ouverture de session, rotation, ou compte de la session au seuil) :
    parmi les comptes **utilisables** (profil valide, sous le seuil de la garde
    `min(90 %, part écoulée + 10 points)` dans **toutes** leurs fenêtres,
-   décision 0019), celui qui a **le plus de retard sur son rythme** : le plus
-   petit rapport `utilisé / rythme` (le rythme est le plafond de la garde à cet
-   instant de la fenêtre, colonne « rythme » de `ameesh accounts list`), pris
-   sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte sans
-   fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
+   décision 0019), celui dont le **budget s'évapore le plus vite** : la part
+   inutilisée (`1 − utilisé`) de la fenêtre qui se remet à zéro le plus tôt,
+   rapportée au temps qui reste (`lost_rate`, #1789/N1) — consommer d'abord ce
+   qui sera perdu. À égalité, celui qui a **le plus de retard sur son rythme** :
+   le plus petit rapport `utilisé / rythme` (le rythme est le plafond de la
+   garde à cet instant de la fenêtre, colonne « rythme » de `ameesh accounts
+   list`), pris sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte
+   sans fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
    premier**. Un **relevé partiel** (#1561 : une fenêtre datée remise à zéro
    alors qu'une autre court encore, ou un relevé non daté plus vieux que sa
    plus courte fenêtre) n'est plus un instantané courant : le compte est **non
    vérifié** et passe après tout compte à relevé courant, quel que soit son
    rythme lu — il reste utilisable en dernier recours (L71, « essayé, pas
-   écarté »). À égalité, celui dont la capacité inutilisée expire le plus tôt,
-   puis l'ordre déclaré (amendement du 2026-10-10 à 0034, lot L117 : un compte
-   jamais utilisé ne doit pas rester inutilisé ; avant, le primaire, toujours
-   en fenêtre ouverte, gagnait toujours).
+   écarté »). À égalité de perte et de retard, celui dont la capacité inutilisée
+   expire le plus tôt, puis la plus grosse part perdue, puis l'ordre déclaré
+   (amendement du 2026-10-10 à 0034, lot L117 : un compte jamais utilisé ne doit
+   pas rester inutilisé ; avant, le primaire, toujours en fenêtre ouverte,
+   gagnait toujours).
 4. Tous les comptes au seuil : pause.
 
 Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
@@ -112,9 +116,9 @@ dans le canon :
 }
 ```
 
-* L'ordre départage les égalités de retard et d'échéance (par exemple deux
-  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
-  primaire.
+* L'ordre départage les égalités de budget — perte par seconde, retard,
+  échéance, part perdue (par exemple deux comptes jamais utilisés, ou les clés
+  d'API sans jauge) : le premier est le primaire.
 * `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
   dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
   hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex

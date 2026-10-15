@@ -50,6 +50,23 @@ class LostAtResetTest(unittest.TestCase):
         sans_date = [cost.Gauge("claude", "seven_day", 0.50, None, WEEK)]
         self.assertEqual(accounts.lost_at_reset(sans_date, self.NOW), 0.0)
 
+    def test_perte_par_seconde_jusqu_a_la_remise_a_zero(self):
+        """#1789/N1 : la part perdue rapportée au temps qui reste. Une fenêtre
+        de 5 h à 20 % qui se remet à zéro dans 2 h perd 0,8 en 2 h, soit
+        0,4/h ; la même part à 7 jours s'évapore 84 fois moins vite."""
+        court = [cost.Gauge("claude", "five_hour", 0.20, self.NOW + 2 * HOUR, 5 * HOUR)]
+        long = [cost.Gauge("claude", "seven_day", 0.20, self.NOW + 2 * 24 * HOUR, WEEK)]
+        self.assertAlmostEqual(accounts.lost_rate(court, self.NOW), 0.80 / (2 * HOUR))
+        self.assertAlmostEqual(accounts.lost_rate(long, self.NOW), 0.80 / (2 * 24 * HOUR))
+        self.assertGreater(accounts.lost_rate(court, self.NOW),
+                           accounts.lost_rate(long, self.NOW))
+        # rien n'expire : aucune perte par seconde
+        self.assertEqual(accounts.lost_rate([], self.NOW), 0.0)
+        self.assertEqual(accounts.lost_rate(
+            [cost.Gauge("claude", "seven_day", 0.95, self.NOW - 60, WEEK)], self.NOW), 0.0)
+        self.assertEqual(accounts.lost_rate(
+            [cost.Gauge("claude", "seven_day", 0.50, None, WEEK)], self.NOW), 0.0)
+
 
 class OrdreDuChoixTest(unittest.TestCase):
     """`accounts.rank` : les critères de budget avant l'ordre déclaré."""
@@ -94,11 +111,37 @@ class OrdreDuChoixTest(unittest.TestCase):
                                   limits={"seven_day": (0.60, "pace cap")}),
         }
         # secondaire : 0,60/0,90 = 0,667 de rythme, il reste derrière les deux
-        # autres (0,5) ; entre eux, la part perdue décide : 0,75 > 0,70
+        # autres (0,5) ; entre eux, la perte par seconde décide : 0,75/3 j >
+        # 0,70/3 j (la part perdue, elle, départage à perte égale)
         self.assertEqual(accounts.lost_at_reset(primaire, self.NOW), 0.75)
         self.assertEqual(accounts.lost_at_reset(tertiaire, self.NOW), 0.70)
         ranked = accounts.rank(items, evs, self.NOW)
         self.assertEqual([p.name for p in ranked], ["primaire", "tertiaire", "secondaire"])
+
+    def test_la_perte_la_plus_rapide_passe_avant_le_retard(self):
+        """#1789/N1 : entre deux comptes utilisables, celui dont le budget
+        s'évapore le plus vite par seconde passe avant le plus en retard sur
+        son rythme."""
+        # primaire : fenêtre de 5 h à 10 %, remise à zéro dans 30 min → 0,9
+        # perdu en 0,5 h, soit 1,8/h ; tertiaire : semaine intacte, remise à
+        # zéro dans 5 jours → 1,0 perdu en 120 h, soit ~0,008/h.
+        evs = {
+            "primaire": self._ev("primaire", [_gauge(0.10, 0.5 * HOUR,
+                                                     window=5 * HOUR,
+                                                     key="five_hour")]),
+            "tertiaire": self._ev("tertiaire", [_gauge(0.0, 5 * 24 * HOUR)]),
+            "secondaire": self._ev("secondaire", [_gauge(0.50, 3 * 24 * HOUR)]),
+        }
+        self.assertGreater(accounts.lost_rate(evs["primaire"].gauges, self.NOW),
+                           accounts.lost_rate(evs["tertiaire"].gauges, self.NOW))
+        # le tertiaire est le plus en retard (0 %), mais ne perd rien : le
+        # primaire passe d'abord, le tertiaire avant le secondaire (0,5 de
+        # rythme et 0,0069/h)
+        self.assertEqual([p.name for p in accounts.rank(self._items(), evs, self.NOW)],
+                         ["primaire", "tertiaire", "secondaire"])
+        # la raison dit le critère qui a décidé, pas le retard (#1789/N1)
+        self.assertIn("losing its budget fastest", accounts.reason_of(
+            accounts.rank(self._items(), evs, self.NOW), evs, self.NOW))
 
     def test_a_egalite_de_budget_l_ordre_declare_departage(self):
         """Budget identique : L226b reste le départage, et la raison le dit."""
@@ -115,8 +158,12 @@ class OrdreDuChoixTest(unittest.TestCase):
             {"name": "primaire", "cap": 0.50, "priority": 100},
             {"name": "tertiaire", "cap": 0.90, "priority": 10},
         ]})
+        # #1789/N1: the loss rates are tied on purpose — 0.80 / (0.1 W) =
+        # 0.70 / (0.0875 W) — so the fixed caps decide through `lag` alone:
+        # primary .20/.50 = .40, tertiary .30/.90 ≈ .333. Without the caps
+        # both read .20/pace and .30/pace, and the primary comes first.
         gauges = {"primaire": [_gauge(0.20, 0.1 * WEEK)],
-                  "tertiaire": [_gauge(0.30, 0.1 * WEEK)]}
+                  "tertiaire": [_gauge(0.30, 0.0875 * WEEK)]}
         evaluations = {}
 
         def evaluate(book, profile, items, now, **kwargs):

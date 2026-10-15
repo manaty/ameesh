@@ -96,6 +96,41 @@ class WidgetUsageTest(unittest.TestCase):
         self.assertEqual([g.scope for g in gauges], ["", "", "fable"])
         # resetsAt ISO → epoch, à la seconde près
         self.assertAlmostEqual(gauges[0].resets_at, self.now + 4 * HEURE, places=2)
+        # #1789/N2 : le relevé expose sa date, comme les jauges de journal
+        for gauge in gauges:
+            self.assertAlmostEqual(gauge.read_at, self.now - 60, places=2)
+
+    def test_repli_mtime_porte_aussi_la_date(self):
+        """#1789/N2 : sans `updatedAt`, la date du relevé vient du mtime et
+        reste exposée (`read_at`)."""
+        stamp = self.now - 120
+        instantane = self._instantane()
+        del instantane["updatedAt"]
+        self._ecrit("claude-secondary.json", instantane, mtime=stamp)
+        gauges = widget_usage.read(_profil(self.compte, "secondaire"),
+                                   now=self.now, directory=self.dossier)
+        self.assertIsNotNone(gauges)
+        self.assertAlmostEqual(gauges[0].read_at, stamp, places=2)
+
+    def test_titre_de_seau_avec_parenthese(self):
+        """#1789/N4 : « Fable Weekly (7-day) » donne la portée « fable », pas
+        « fable ( ) » — le seau n'est plus écarté du filtrage par modèle."""
+        instantane = self._instantane()
+        instantane["limits"] = [
+            {"label": "Weekly (7-day)", "percent": 0.93,
+             "resetsAt": _iso(self.now + 6 * JOUR)},
+            {"label": "Fable Weekly (7-day)", "title": "Fable Weekly (7-day)",
+             "percent": 0.0, "resetsAt": _iso(self.now + 6 * JOUR)},
+        ]
+        self._ecrit("claude-secondary.json", instantane)
+        gauges = widget_usage.read(_profil(self.compte, "secondaire"),
+                                   now=self.now, directory=self.dossier)
+        self.assertIsNotNone(gauges)
+        self.assertEqual(widget_usage._scope_of("Fable Weekly (7-day)"), "fable")
+        self.assertEqual([g.key for g in gauges], ["seven_day", "seven_day@fable"])
+        self.assertEqual([g.scope for g in gauges], ["", "fable"])
+        fable = accounts.model_scoped(gauges, "claude-fable-5")
+        self.assertIn("seven_day@fable", [g.key for g in fable])
 
     def test_iso_avec_et_sans_microsecondes(self):
         avant = widget_usage._iso_epoch("2026-10-21T12:00:00+00:00")
@@ -328,6 +363,42 @@ class GaugesOfTest(unittest.TestCase):
             vus = accounts.gauges_of(self.book, profil, [profil], now=self.now)
             self.assertEqual([g.key for g in vus], ["five_hour"])
             self.assertAlmostEqual(vus[0].used, 0.8)    # le journal, pas le widget
+
+    def test_cle_api_ne_lit_pas_le_widget_du_primaire(self):
+        """#1789/N3 : une clé API n'a pas de dossier de configuration — sans
+        garde, `home()` retombe sur le dossier par défaut et sa ligne
+        afficherait les jauges du primaire."""
+        cle = accounts.Profile("claude", "cle", kind="api_key_env",
+                               env="ANTHROPIC_API_KEY")
+        self._ecrit({"schemaVersion": 1, "ready": True,
+                     "updatedAt": _iso(self.now - 60),
+                     "limits": [{"label": "Session (5-hour)", "percent": 0.2,
+                                 "resetsAt": _iso(self.now + 4 * HEURE)}]})
+        with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}), \
+                mock.patch.object(widget_usage, "read") as lecture:
+            vus = accounts.gauges_of(self.book, cle, [cle], now=self.now)
+        lecture.assert_not_called()
+        self.assertEqual([g.key for g in vus], ["five_hour"])
+        self.assertAlmostEqual(vus[0].used, 0.8)        # le journal du compte
+
+    def test_deux_dossiers_de_meme_nom_ne_partagent_pas_le_fichier(self):
+        """#1789/N3 : `a/claude` et `b/claude` tombaient sur le même
+        `claude.json` ; la clé passe au chemin complet — le widget n'écrit pas
+        ce fichier, le journal reprend la main au lieu d'afficher les jauges
+        d'un autre dossier."""
+        a = _profil(os.path.join(self.tmp, "a", "claude"), "a")
+        b = _profil(os.path.join(self.tmp, "b", "claude"), "b")
+        for profil in (a, b):
+            os.makedirs(profil.path, exist_ok=True)
+        self._ecrit({"schemaVersion": 1, "ready": True,
+                     "updatedAt": _iso(self.now - 60),
+                     "limits": [{"label": "Session (5-hour)", "percent": 0.2,
+                                 "resetsAt": _iso(self.now + 4 * HEURE)}]})
+        with mock.patch.dict(os.environ, {DIR_ENV: self.dossier}):
+            for profil in (a, b):
+                vus = accounts.gauges_of(self.book, profil, [a, b], now=self.now)
+                self.assertEqual([g.key for g in vus], ["five_hour"])
+                self.assertAlmostEqual(vus[0].used, 0.8)   # le journal, pas le widget
 
 
 class ChooseAvecWidgetTest(_Base):

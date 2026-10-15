@@ -130,8 +130,6 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
         # les agents d'un autre modèle. La capacité par modèle reste à faire.
         result = accounts.evaluate(book, profile, items, now, record=False,
                                    reserve=True, model="")
-        if not result.ok or result.hard:
-            continue
         # Une fenêtre échue ne mesure pas la suivante, et une courte échue
         # invalide la longue encore ouverte (#1561). L'affichage ne promet
         # rien sans une marge courante, même si la garde autorise un essai.
@@ -144,8 +142,15 @@ def _offer(items: list, agents: list, now: float, book) -> Offer:
         long = [g for g in result.gauges if g.window_s >= LONG_WINDOW_S]
         if not long:
             continue  # aucune fenêtre longue mesurée : rien à porter
-        free += min(max(0.0, result.limits[g.key][0] - g.used_at(now)) for g in long)
+        # #1789/N5 : l'unité observée somme l'usage de TOUS les comptes
+        # mesurables du harnais, y compris celui que la garde écarte (saturé,
+        # plafond fixe) : ses agents comptent dans `agents`, sa consommation
+        # doit compter aussi — sinon l'unité est sous-estimée et la capacité
+        # annoncée trop grande.
         used += sum(g.used_at(now) for g in long)
+        if not result.ok or result.hard:
+            continue
+        free += min(max(0.0, result.limits[g.key][0] - g.used_at(now)) for g in long)
         measured.append(profile.name)
     unit = DEFAULT_AGENT_SHARE
     if agents:

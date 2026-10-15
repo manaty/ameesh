@@ -128,6 +128,17 @@ class PlanUnderusedTest(_Base):
         self.jauge("claude", "seven_day", 0.95, 2 * JOUR, 7 * JOUR, account="primaire")
         self.assertEqual(self.alertes(), [])
 
+    def test_seau_de_modele_au_seuil_ne_bloque_pas_la_fenetre_generale(self):
+        """#1789/N6 : un seau propre à un modèle (#1580, clé `seven_day@fable`)
+        au seuil ne rend pas la capacité **générale** du compte inutilisable —
+        l'alerte de fin de fenêtre de la fenêtre de 5 h reste due."""
+        self.jauge("claude", "five_hour", 0.10, 30 * 60, 5 * HEURE, account="primaire")
+        self.jauge("claude", "seven_day@fable", 0.95, 2 * JOUR, 7 * JOUR,
+                   account="primaire")
+        out = self.alertes()
+        self.assertEqual([(a["gauge"], a["reason"]) for a in out],
+                         [("five_hour", "fin_de_fenetre")])
+
     def test_releve_echu_et_releves_sans_compte(self):
         # fenêtre échue : la suivante ne court qu'au premier usage
         self.jauge("codex", "codex-300min", 0.0, -60, 5 * HEURE, account="secondaire")

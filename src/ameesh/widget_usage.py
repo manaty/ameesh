@@ -63,11 +63,24 @@ def usage_dir(environ=None) -> str:
         environ.get(DIR_ENV) or DEFAULT_DIR))
 
 
-def snapshot_path(profile, *, directory=None, environ=None) -> str:
-    """Le fichier du compte : `claude.json` pour le dossier par défaut,
-    `claude-<nom>.json` sinon (`~/.claude-secondary` →
-    `claude-secondary.json`)."""
-    base = os.path.basename(os.path.normpath(profile.home(environ))).lstrip(".") or "claude"
+def snapshot_key(profile, *, environ=None) -> str:
+    """The widget's file key for this account: its configuration directory
+    (`~/.claude-secondary` → `claude-secondary`; the default `~/.claude` →
+    `claude`). The widget names its files after the directory it watches, not
+    after the ameesh account name (constat impl-01, 15/10: `claude.json`,
+    `claude-secondary.json`, `claude-tertiary.json` for accounts named
+    primaire/secondaire/tertiaire)."""
+    home = os.path.normpath(profile.home(environ))
+    return os.path.basename(home).lstrip(".") or "claude"
+
+
+def snapshot_path(profile, *, directory=None, environ=None, key=None) -> str:
+    """The account's file: `claude.json` for the default directory,
+    `claude-<dir>.json` otherwise (`~/.claude-secondary` →
+    `claude-secondary.json`). `key` overrides the directory-derived name
+    (#1789/N3: `accounts.gauges_of` keys on the full path when two declared
+    directories share a basename — the widget cannot tell them apart)."""
+    base = key or snapshot_key(profile, environ=environ)
     return os.path.join(directory or usage_dir(environ), base + ".json")
 
 
@@ -112,12 +125,16 @@ def _window_of(label: str):
 
 
 def _scope_of(title: str) -> str:
-    """Le modèle d'un seau à `title` : « Fable Weekly » → « fable »."""
-    return " ".join(_MODEL_WORDS.sub(" ", title).split()).lower()
+    """Le modèle d'un seau à `title` : « Fable Weekly (7-day) » → « fable ».
+
+    #1789/N4 : seuls les mots alphanumériques restent — la ponctuation du
+    titre formait « fable ( ) », qui ne correspondait à aucun modèle et
+    faisait écarter le seau par `accounts.model_scoped`."""
+    return " ".join(re.findall(r"[a-z0-9]+", _MODEL_WORDS.sub(" ", title).lower()))
 
 
 def read(profile, *, now: float | None = None, directory=None,
-         environ=None) -> Gauges | None:
+         environ=None, key=None) -> Gauges | None:
     """Les jauges du compte lues dans son instantané, ou None (source absente,
     illisible, d'un autre schéma, non prête, ou périmée).
 
@@ -126,7 +143,7 @@ def read(profile, *, now: float | None = None, directory=None,
     retombe sur les journaux.
     """
     now = time.time() if now is None else now
-    path = snapshot_path(profile, directory=directory, environ=environ)
+    path = snapshot_path(profile, directory=directory, environ=environ, key=key)
     try:
         stat = os.stat(path)
         with open(path, encoding="utf-8") as fh:
@@ -140,6 +157,9 @@ def read(profile, *, now: float | None = None, directory=None,
     limits = raw.get("limits")
     if not isinstance(limits, list) or not limits:
         return None
+    # #1789/N2 : le relevé porte sa date (`read_at`) sur chaque jauge — le
+    # contrôle d'âge de `rebalance._offer` (#1561) la lit comme les journaux.
+    stamp = _iso_epoch(raw.get("updatedAt")) or stat.st_mtime
     gauges = []
     for item in limits:
         if not isinstance(item, dict):
@@ -154,10 +174,9 @@ def read(profile, *, now: float | None = None, directory=None,
             key = "%s@%s" % (key, scope)
         gauges.append(Gauge("claude", key, _fraction(item.get("percent")),
                             _iso_epoch(item.get("resetsAt")), window,
-                            scope=scope))
+                            read_at=stamp, scope=scope))
     if not gauges:
         return None
-    stamp = _iso_epoch(raw.get("updatedAt")) or stat.st_mtime
     if now - stamp > min(g.window_s for g in gauges):
         return None
     return Gauges(gauges)
