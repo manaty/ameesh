@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import unittest
-from unittest import mock
 
 from tests import test_1277_rebase_sujet as banc
 
@@ -21,7 +21,7 @@ class RebasePlageTest(banc.RebaseSujetTest):
         for i in range(lots):
             Path(self.depot, "f%d.txt" % i).write_text(str(i))
             _git(self.depot, "add", ".")
-            _git(self.depot, "commit", "-qm", "#900 lot %d" % i)
+            _git(self.depot, "commit", "-qm", "#900 lot %d" % i, "-m", "corps %d" % i)
         _git(self.depot, "checkout", "-q", "main")
         for i in range(upstream):
             _git(self.depot, "commit", "--allow-empty", "-qm", "amont %d" % i)
@@ -40,14 +40,17 @@ class RebasePlageTest(banc.RebaseSujetTest):
 
     def test_perte_au_dela_de_cinquante_commits(self):
         self._branches(lots=55)
-        # L'éditeur supprime volontairement le premier sujet, plus ancien que
-        # l'ancienne fenêtre de collecte de cinquante commits.
+        # #1516 : un drop volontaire n'est plus une perte. Le témoin garde son
+        # intention — un sujet perdu au-delà de l'ancienne fenêtre de collecte
+        # de cinquante commits est détecté — en simulant le défaut de #1277
+        # (l'éditeur mange la ligne « #… ») sur le plus ancien commit, reword.
         editor = os.path.join(self.base, "sequence-editor.py")
         with open(editor, "w") as fh:
-            fh.write("#!/usr/bin/env python3\nimport sys\np=sys.argv[1]\ns=open(p).read()\ns=s.replace('pick ', 'drop ', 1)\nopen(p,'w').write(s)\n")
+            fh.write("#!/usr/bin/env python3\nimport sys\np=sys.argv[1]\ns=open(p).read()\ns=s.replace('pick ', 'reword ', 1)\nopen(p,'w').write(s)\n")
         os.chmod(editor, 0o700)
-        with mock.patch.dict(GIT_ENV, GIT_SEQUENCE_EDITOR=editor):
-            proc = self._lancer("bash", LANCEUR, "-i", "main")
+        env = dict(GIT_ENV, GIT_SEQUENCE_EDITOR=editor, GIT_EDITOR="sed -i 1d")
+        proc = subprocess.run(["bash", LANCEUR, "-i", "main"], cwd=self.depot,
+                              capture_output=True, text=True, env=env)
         self.assertEqual(proc.returncode, 4, proc.stderr)
         self.assertIn("#900 lot 0", proc.stderr)
 
