@@ -23,6 +23,7 @@
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
 test_1467_train_admissions  # stockage : admissions courantes, prérequis et exclusion CAS sous bail (#1467)
+test_1467_train_candidates  # stockage : inventaire qa complet, distinct des générations de file (#1467)
 test_1467_train_fire  # stockage : feu exact, retrait/réservation sérialisés et reprise SQL (#1467)
 test_1467_train_history  # stockage : historique de jalons sans troncature, ancien blocage conservé (#1467)
 test_1467_train_runner  # stockage : passage, clone privé, provenance et promotion Git réels (#1467)

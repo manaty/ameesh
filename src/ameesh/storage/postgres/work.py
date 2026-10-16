@@ -294,7 +294,7 @@ class WorkItems(interface.WorkItems):
             sql += " AND assignee = %s"
             params.append(assignee)
         sql += " ORDER BY updated_at DESC LIMIT %s"
-        params.append(int(limit))
+        params.append(None if limit is None else int(limit))
         return self.db.query(sql, tuple(params))
 
     def move(self, item_id, state, *, current, loops, note, actor,

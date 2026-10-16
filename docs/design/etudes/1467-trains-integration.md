@@ -223,6 +223,17 @@ le lot, la base, le gel, la classe, le nombre d'avis et le commit de politique.
 Le mode `packet` ne lit aucune CI de lot ; `targeted` exige un lecteur explicite
 et ses runs exacts.
 
+`train_candidates.Inventory` fournit la lecture préalable des lots `qa`
+du projet via le fournisseur explicite `freeze_candidate` (#1756). Les lots
+et leurs jalons sont lus sans limite de page ; chaque diagnostic conserve
+son origine et les refus restent nommés. Ce résultat ne porte aucune
+génération de file et n'est pas une admission. Le cas Nexlink #2005
+(courrier codex3 #80142 du 16/10, gel `5dfba839f556`, avis 8770/8772)
+illustre la frontière restante : `queue add` exige encore une CI individuelle
+avant l'inscription que le train consomme. L'inscription explicite, après
+qualification historique/politique/branche publiée et par le stockage réel,
+reste à raccorder ; la preuve complète du paquet reste due avant promotion.
+
 Le fournisseur de politique reste obligatoire : il reçoit le lot courant,
 l'admission, la base exacte et le dépôt d'historique. Il doit rendre un
 `Requirement` sur ce lot/base/tête, avec classe et nombre d'avis connus,

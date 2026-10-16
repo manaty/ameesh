@@ -11,12 +11,33 @@ import subprocess
 import types
 import unittest
 
-from ameesh import train
+from ameesh import train, train_candidates
 from tests.test_1467_train_history import RecordedHistoryTest
 
 
 class SelectionBoundary(RecordedHistoryTest):
     candidate = None
+
+    def inventory(self):
+        project = types.SimpleNamespace(name="nexlink", repo=self.path, target="develop")
+        self.ops.items.return_value = [dict(id=1, app="nexlink", state="qa",
+            branch="agent/member", branch_target="develop", type="improvement")]
+        return train_candidates.Inventory(None, project, candidate=self.candidate).read()
+
+    def test_inventory_reads_the_supplier_without_manufacturing_a_queue_entry(self):
+        candidate = self.inventory()["candidates"][0]
+        self.assertEqual(candidate["candidate"]["sha"], self.head)
+        self.assertEqual(candidate["causes"], [])
+        self.assertNotIn("generation", candidate)
+        self.assertEqual([call[0] for call in self.ops.mock_calls], ["items", "milestones"])
+        self.ops.milestones.assert_called_once_with(1, None)
+
+    def test_inventory_preserves_a_derived_candidate_without_promoting_it_to_a_freeze(self):
+        self.marks = [mark for mark in self.marks if mark["kind"] != "frozen"]
+        candidate = self.inventory()["candidates"][0]["candidate"]
+        self.assertEqual((candidate["origin"], candidate["sha"]), ("verdict", self.head))
+        with self.assertRaisesRegex(train.TrainError, "current freeze missing"):
+            self.qualify()
 
     def test_stale_declared_freeze_is_diagnostic_not_queue_rewrite(self):
         self.marks[0]["sha"] = self.first
@@ -80,6 +101,8 @@ def main():
     exec(compile(source, args.commit + ":" + path, "exec"), provider.__dict__)
     SelectionBoundary.candidate = staticmethod(provider.freeze_candidate)
     names = (
+        "test_inventory_reads_the_supplier_without_manufacturing_a_queue_entry",
+        "test_inventory_preserves_a_derived_candidate_without_promoting_it_to_a_freeze",
         "test_stale_declared_freeze_is_diagnostic_not_queue_rewrite",
         "test_missing_declared_freeze_is_visible_without_inventing_a_generation",
         "test_light_candidate_needs_no_verdict_but_preserves_exact_author_history",

@@ -37,8 +37,49 @@ PYTHONPATH=src:. .venv/bin/python reviews/1467-selection-contract/probe.py \
 ```
 
 Git est réel ; jalons, stockage et provenance sont des fixtures explicites.
-Le raccord de l'inventaire `qa` à ce lecteur reste distinct de l'admission
-historique : aucune seconde dérivation de gel n'est ajoutée au train.
+`train_candidates.Inventory` raccorde désormais l'inventaire `qa` à ce
+lecteur explicite. Il lit tous les lots `qa` et tous leurs jalons sans limite
+de page, filtre le projet et conserve les diagnostics du fournisseur. Un lot
+sans branche, sur une autre cible ou de release reste nommé avec sa cause.
+Le résultat porte le candidat et son origine ; il ne crée ni gel, ni génération
+de file, ni preuve de relecture ou de CI. Le lecteur de branche publiée et
+l'admission historique restent des étapes distinctes.
+
+```python
+inventory = train_candidates.Inventory(
+    db, project, candidate=qualified_plan_git.freeze_candidate
+).read()
+```
+
+Le fournisseur est obligatoire, sans repli sur une nouvelle dérivation locale
+du gel. Deux parcours du probe ci-dessus consomment son objet exact à travers
+l'inventaire, avec Git réel : candidat déclaré sans écriture et candidat issu
+d'un avis sans transformation en gel. Quatre frontières isolées et une lecture
+SQL de plus de 200 lots couvrent les diagnostics, le périmètre et l'absence
+de troncature.
+
+Validation de ce raccord : quatre contrôles isolés et six parcours du probe
+verts ; la lecture SQL 205 lots contre une page de 200 est verte avec psycopg
+et psql sous `ameesh heavy`. Le contrat médié est inchangé et ses 19 contrôles
+restent verts. Aucun lecteur de candidature ni profil n'est activé.
+
+### Frontière d'inscription illustrée par Nexlink #2005
+
+Le courrier **#80142 de codex3, 16 octobre 2026 à 12:22 Paris**, décrit le gel
+`5dfba839f55641ec66f736ab3dbe7751f1e5181d`, ses avis exacts **8770/8772** et le
+refus de `work queue add` faute de CI individuelle. Cette commande passe par
+`merge_queue.readiness`, qui exige encore une CI de lot avant `queue_add`.
+À l'inverse, `Admissions.qualify(..., mode="packet")` ne lit aucune CI
+individuelle, mais ne voit que les générations déjà inscrites dans cette file.
+
+Le raccord manquant est l'inscription explicite d'un candidat qualifié pour
+le train dans la file persistante. Il doit valider la branche publiée, les
+avis historiques et la politique, puis recevoir sa génération du stockage
+réel. L'inventaire ne fabrique pas cette génération et ne contourne pas la
+porte individuelle. La CI complète du paquet, sur son arbre exact et avec un
+manifeste qui couvre ce membre, reste due avant promotion ; l'absence de CI
+individuelle n'est jamais exposée comme un statut vert. Le paquet 26 et la
+demande d'admission manuelle de codex3 à impl-02 restent hors de ce raccord.
 
 ## Port de transport qualifié
 

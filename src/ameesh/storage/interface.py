@@ -1280,8 +1280,8 @@ class WorkItems(Domain):
         """Un lot, ou None."""
 
     @abc.abstractmethod
-    def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
-        """Lots, du plus récemment modifié au plus ancien."""
+    def items(self, *, state: str | None, assignee: str | None, limit: int | None) -> list[dict]:
+        """Lots, du plus récemment modifié au plus ancien ; None sans limite."""
 
     @abc.abstractmethod
     def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
