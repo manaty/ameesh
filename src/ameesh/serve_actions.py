@@ -18,9 +18,8 @@ ameesh-approve and returns the **link**: the human signs on that origin with
 their passkey, and the receipt comes back through `ameesh action
 fetch-receipt`, never through this API.
 
-Not here yet: pausing and resuming an agent, and acknowledging an alert. No
-library function does them today (lot #375 note): their routes come with
-their primitive.
+Operator pause/resume (L87b, #1462) retains prompts and lets the active turn
+finish. Alert acknowledgements (L87c, #1463) persist for the human recipient.
 """
 from __future__ import annotations
 
@@ -236,6 +235,28 @@ def _stop(ctx, db, params, body) -> dict:
                           str(exc)) from exc
 
 
+def _operator_pause(ctx, db, params, body, *, paused: bool) -> dict:
+    from . import agent_pause
+    reason = _text(body, "reason", limit=agent_pause.REASON_MAX)
+    try:
+        return agent_pause.change(db, params["agent"], paused=paused, reason=reason,
+                                  actor=ctx.human, principal=principal(ctx))
+    except agent_pause.PauseRefused as exc:
+        if exc.code == "unknown_agent":
+            raise ActionError(404, "not_found", str(exc)) from exc
+        if exc.code == "external_agent":
+            raise ActionError(409, "refused", str(exc)) from exc
+        raise ActionError(400, "bad_body", str(exc)) from exc
+
+
+def _pause(ctx, db, params, body) -> dict:
+    return _operator_pause(ctx, db, params, body, paused=True)
+
+
+def _resume(ctx, db, params, body) -> dict:
+    return _operator_pause(ctx, db, params, body, paused=False)
+
+
 def _assign(ctx, db, params, body) -> dict:
     """Reassign a lot (rules of 0030 §2, `work.check_assignee`). Never to an
     external agent: forcing that commits the organisation (study §2.1)."""
@@ -317,8 +338,21 @@ def _approval_request(ctx, db, params, body) -> dict:
                                              "action_id", "approver", "digest")}
 
 
+def _ack_alert(ctx, db, params, body) -> dict:
+    from . import alert_ack
+    try:
+        return alert_ack.acknowledge(ctx.cfg, db, params["key"], actor=ctx.human,
+                                     principal=principal(ctx))
+    except alert_ack.AckRefused as exc:
+        status = {"not_found": 404, "forbidden": 403, "native_only": 403}.get(exc.code, 400)
+        raise ActionError(status, exc.code, str(exc)) from exc
+
+
 _TEXT = ({"type": "string", "minLength": 1, "maxLength": MAX_TEXT}, True)
 ACTIONS = (
+    Action("/alerts/{key}/ack", "ack_alert",
+           "Acknowledge an alert as its human recipient; the alert remains visible",
+           _ack_alert, {}),
     Action("/agents/{agent}/messages", "message",
            "Message to an agent: its mailbox and its thread (`agent-mail send`)", _message,
            {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False),
@@ -337,6 +371,12 @@ ACTIONS = (
     Action("/agents/{agent}/stop", "stop",
            "Stop an agent by hand, with a reason (0030 §4: `manuel`)", _stop,
            {"reason": ({"type": "string", "minLength": 1, "maxLength": 500}, True)}),
+    Action("/agents/{agent}/pause", "pause",
+           "Operator pause: finish this turn, start no new one", _pause,
+           {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True)}),
+    Action("/agents/{agent}/resume", "resume",
+           "Lift only the operator pause; do not restart a stopped agent", _resume,
+           {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True)}),
     Action("/lots/{id}/assign", "assign",
            "Reassign a lot (`ameesh work assign`, 0030 §2; never to an external agent)",
            _assign, {"assignee": ({"type": "string"}, True)}),

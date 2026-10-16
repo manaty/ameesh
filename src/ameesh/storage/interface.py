@@ -103,6 +103,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
    api_requests    reserve complete release
+   alert_acknowledgements live acknowledge invalidate clock
    watches         put delete list deliver
    events          record after readable waiting bounds count_before prune
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
@@ -213,6 +214,15 @@ class Agents(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """La ligne de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def operator_pause(self, name: str, *, paused: bool, reason: str,
+                       actor: str, principal: str) -> dict | None:
+        """Native human hold: row lock, state and audit in one atomic statement.
+
+        No status/prompt/lease changes; repeated state has no new event.
+        External agents are returned unchanged. Not exposed to executors.
+        """
 
     @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
@@ -634,6 +644,28 @@ class Budgets(Domain):
 # --------------------------------------------------------------------------
 # API idempotency (L87, migration 0440)
 # --------------------------------------------------------------------------
+
+class AlertAcknowledgements(Domain):
+    """L87c: native operator acknowledgements; expired rows retain the audit."""
+
+    @abc.abstractmethod
+    def live(self) -> list[dict]:
+        """Active rows: id, alert_key, severity, observation_host, actor, principal,
+        acknowledged_ts."""
+
+    @abc.abstractmethod
+    def acknowledge(self, key: str, severity: str, actor: str, principal: str, *,
+                    observation_host: str | None = None) -> dict:
+        """Atomically acknowledge once per key/principal/severity; row + changed."""
+
+    @abc.abstractmethod
+    def invalidate(self, id: int, *, reason: str, observed_ts: float) -> bool:
+        """Expire a row predating the observation, retaining actor/principal."""
+
+    @abc.abstractmethod
+    def clock(self) -> float:
+        """Database clock before collecting the snapshot, epoch seconds."""
+
 
 class ApiRequests(Domain):
     """The `Idempotency-Key` of the API's actions (`ameesh serve`): one row
@@ -3509,6 +3541,7 @@ class Storage(abc.ABC):
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests
+    alert_acknowledgements: AlertAcknowledgements
     watches: Watches
     events: Events
     mailbox: Mailbox

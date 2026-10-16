@@ -196,7 +196,7 @@ MESH_COMMANDS = (
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
 #: adoption et reprise (L39, décision 0030)
-REPRISE_COMMANDS = ("adopt", "resume")
+REPRISE_COMMANDS = ("adopt", "resume", "pause")
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
 #: actions sous porte et file des décisions (actions_cli)

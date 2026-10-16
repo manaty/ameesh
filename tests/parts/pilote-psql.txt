@@ -77,6 +77,7 @@ test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEE
 test_l72_panne_de_base  # panne de base, reconnexion, réveils (listener)
 test_l78_conversations  # storage: cursor locking, JSON pages, R12 outbox, retention and commit NOTIFY (L78)
 test_l82_attach  # leases: resident handoff, duplicate refusal and queued inputs across native attach (L82)
+test_l87c_alert_ack  # storage: alert acknowledgement, concurrent insert, expiry and durable actor/principal (L87c)
 test_migrations  # couche base : migrations sur un schéma neuf
 test_registry_lease  # verrous et baux : comportement différent entre psql et psycopg
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)
