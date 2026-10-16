@@ -197,6 +197,8 @@ class RelectureConfigTest(unittest.TestCase):
         worker = SimpleNamespace(cfg=ancien, _cfg_pending=None,
                                  _cfg_lock=threading.Lock(), stopping=threading.Event())
         worker.ensure_watchdog = lambda: None
+        # #1349 : process_once publie aussi l'état de peek avant le tour
+        worker.ensure_peek = lambda: None
         # #1270 (main) : process_once attend d'abord l'échéance de reprise
         worker.retry_remaining = lambda: 0.0
         worker.apply_restart_if_requested = lambda: None
