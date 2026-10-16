@@ -14,8 +14,8 @@
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
   ameesh activity <persona> [--since 24h] [--json]   persona activity log (L59);
-  ameesh attach <agent> [--wait] [--ttl S]
-        an interactive session on the agent's lease, same session (C9);
+  ameesh attach <agent> [--wait] [--ttl S] [--max 2h]
+        bounded native access: sleep the resident, then return its lease (L82);
   ameesh list | show          observability (host, lease, unread, budget, key);
   ameesh key …                public keys (owner / agent);
   ameesh approve | approvals | verify   signed approvals;
