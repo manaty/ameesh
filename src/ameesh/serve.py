@@ -267,7 +267,7 @@ def _lots(ctx: Context, db, params, query) -> dict:
     return {"schema": "ameesh-lots/1", "lots": mesh_cli.work_rows(
         db, state=_checked(_one(query, "state"), _NAME_RE, "state"),
         assignee=_checked(_one(query, "assignee"), _NAME_RE, "assignee"),
-        limit=limit, threshold=stagnation.stale_after(None))}
+        limit=limit, threshold=stagnation.stale_after(None), cfg=ctx.cfg)}
 
 
 def _lot(ctx: Context, db, params, query) -> dict:

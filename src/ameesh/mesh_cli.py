@@ -1259,9 +1259,12 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
 
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
-              freeze: bool = False, repo: str | None = None,
+              cfg=None, freeze: bool = False, repo: str | None = None,
               target: str | None = None) -> list:
     """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
+
+    `cfg` : le contexte de classe de revue (#1822), pour que la ligne d'un lot
+    léger attende la fusion, pas un verdict.
 
     `freeze` ajoute à chaque ligne le gel effectif dérivé (#1756), en un seul
     balayage de jalons : le composeur du paquet horaire lit ce champ au lieu
@@ -1275,7 +1278,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 
     def lire(db):
         rows = work.list_items(db, state=state, assignee=assignee, limit=limit)
-        plan.annotate(db, rows, threshold=threshold)
+        plan.annotate(db, rows, threshold=threshold, cfg=cfg)
         # Les délais viennent d'un seul balayage, restreint aux lots
         # affichés (jamais une requête par ligne) ; le JSON les porte
         # aussi, pour la frise (L24). Le filtre porte sur les lignes
@@ -1303,7 +1306,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                 target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import canon as canon_mod, plan
+    from . import canon as canon_mod, plan, stagnation
 
     def lire(db):
         item = work.get(db, lot_id)
@@ -1318,7 +1321,17 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
-        plan.annotate(db, [item])
+        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
+        # doute rend `sensitive` et le dit) — résolue avant l'annotation pour
+        # que #1822 la lise sans la relire.
+        from . import lot_class
+        try:
+            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
+                                    "why": "unreadable (%s)" % exc, "files": []}
+        plan.annotate(db, [item], cfg=cfg,
+                      review_class={lot_id: stagnation.class_value(item["review_class"])})
         # L96 : dates prévues (feuille de route)
         planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
         item["planned"] = {k: planned.get("planned_" + k)
@@ -1344,14 +1357,6 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                                   if int(r["work_item_id"]) == lot_id), None)
         except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
             item["queue"] = None
-        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
-        # doute rend `sensitive` et le dit)
-        from . import lot_class
-        try:
-            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
-        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
-            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
-                                    "why": "unreadable (%s)" % exc, "files": []}
         # L157c: actual time by phase and merged diff size, once delivered
         from . import lot_measures
         item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
@@ -1519,7 +1524,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
                              threshold=stagnation.stale_after(args.stale_after),
-                             freeze=getattr(args, "freeze", False),
+                             cfg=cfg, freeze=getattr(args, "freeze", False),
                              repo=getattr(args, "git_dir", None),
                              target=getattr(args, "freeze_target", None))
             if args.json:

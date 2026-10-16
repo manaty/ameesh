@@ -859,6 +859,26 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                       dependencies=dependencies.get(int(item["id"]), []),
                       agent_externals=externals)
             for item in items]
+    # #1822 : un lot léger sans verdict courant attend la fusion, pas un
+    # verdict ; la classe n'est lue — une fois par passage — que pour ces lots.
+    from . import lot_class
+    classes: dict = {}
+    for lot, item in zip(lots, items):
+        if (lot.get("waiting_for") or {}).get("what") != "verdict":
+            continue
+        cls = stagnation.review_class_of(db, item, cfg=cfg, memo=classes,
+                                         milestones=declared.get(int(item["id"]), []))
+        if cls != lot_class.LIGHT:
+            continue
+        rid = int(item["id"])
+        acts = by_item.get(rid, [])
+        jalons = _work_item_milestones(item, events.get(rid, []), acts, declared.get(rid))
+        lot["waiting_for"] = stagnation.with_availability(
+            stagnation.waiting(item, jalons, acts,
+                               responsible=(packages.get(item.get("package_id"))
+                                            or {}).get("responsible"),
+                               review_class=cls),
+            states, externals)
     package_items = st.package_items()
     plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)

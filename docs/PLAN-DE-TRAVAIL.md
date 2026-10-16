@@ -101,6 +101,13 @@ bis/#87, a verdict kept from a reviewed head) — the lot then waits only for
 its merge and no reminder reaches a reviewer. Designating a reviewer lifts
 the waiver; a current blocking verdict refuses it (a fix is due).
 
+The **review class** of the lot (canon §2, #1822) routes that wait too: a light
+lot's review happens after the merge, so a light lot with no current verdict
+waits for the merge, not for a verdict — even when a reviewer is designated.
+The class is read once per pass, and only for lots whose wait would otherwise
+be a verdict; when it cannot be read (no repository, no freeze, unreadable
+policy), the prudent verdict wait is kept instead of guessing a class.
+
 A lot neither merged nor closed with no activity (change, transition, note,
 milestone, action, linked message) since the threshold (`--stale-after`,
 `AMEESH_STALE_AFTER`, default 6 h) is **stale**: it is reported with the
