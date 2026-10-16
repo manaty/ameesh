@@ -700,6 +700,21 @@ class VerificateursTest(unittest.TestCase):
                         "stop_work", references={"reason": "superseded",
                                                  "superseded_by": replaced_by}),
                         full_snapshot()))
+        # N6 : un remplacant qui n'est pas un identifiant de lot ne prouve rien
+        # (`_as_int` rend -1, distinct de l'id du lot : il passait).
+        for replaced_by in ("abc", "#1924", 0, -3, "-3"):
+            with self.subTest(superseded_by=replaced_by):
+                self.assertRefusal(
+                    "evidence-invalid",
+                    verify(command_for(
+                        "stop_work", references={"reason": "superseded",
+                                                 "superseded_by": replaced_by}),
+                        full_snapshot()))
+        decision = verify(
+            command_for("stop_work", references={"reason": "superseded",
+                                                 "superseded_by": "1924"}),
+            full_snapshot())
+        self.assertTrue(decision.accepted, decision)
 
     def test_reparations_bornees(self):
         blocked = blocked_snapshot().milestones

@@ -784,8 +784,9 @@ def _check_stop_work(command: Command, snapshot: Snapshot) -> Decision:
 
     N6 de la revue #1924 : C ne dispose d'aucune collection de lots, donc
     l'**existence** du lot remplacant n'est pas prouvable ici. Ce qui est
-    lisible dans le snapshot est verifie : le remplacant ne peut pas etre le
-    lot lui-meme (meme regle que `work.close` cote natif). Une collection
+    lisible dans le snapshot est verifie : le remplacant est un identifiant de
+    lot (entier positif, ou sa chaine) et ne peut pas etre le lot lui-meme
+    (meme regle que `work.close` cote natif). Une collection
     `items` cote B permettra d'exiger l'existence reelle sans nouveau pouvoir
     de gouvernance.
     """
@@ -798,7 +799,12 @@ def _check_stop_work(command: Command, snapshot: Snapshot) -> Decision:
         if not _present(replaced_by):
             return _refuse("evidence-missing",
                            "supersession sans lot remplacant", snapshot)
-        if _as_int(replaced_by) == _as_int(snapshot.item.get("id")):
+        replacement = _as_int(replaced_by)
+        if replacement <= 0:
+            return _refuse("evidence-invalid",
+                           "lot remplacant %r : identifiant de lot attendu"
+                           % (replaced_by,), snapshot)
+        if replacement == _as_int(snapshot.item.get("id")):
             return _refuse("evidence-invalid",
                            "supersession du lot par lui-meme", snapshot)
     return _accept(command, ("reason",))
