@@ -225,10 +225,35 @@ _DELAYS_SELECT = """
 """
 
 
+def _lock_migration_writer(tx, item_id, proposed=None):
+    """Take repository locks before the lot and recheck its observed scope."""
+    before = tx.query('SELECT migration_repo FROM work_items WHERE id = %s', (int(item_id),))
+    if not before:
+        return False
+    previous = before[0]['migration_repo']
+    repositories = {repo for repo in (previous, proposed) if repo}
+    # A legacy reservation may move between repositories. Lock both old and
+    # new in canonical order, including release's OLD repository.
+    for repo in sorted(repositories):
+        tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                   "current_schema() || ':migration-repo:' || %s, 0))", ('github.com/' + repo,))
+    after = tx.query('SELECT migration_repo FROM work_items WHERE id = %s FOR NO KEY UPDATE',
+                     (int(item_id),))
+    if not after:
+        return False
+    # A concurrent legacy reservation can change the repository while we
+    # wait. Abort rather than acquire a new repo lock after locking the lot.
+    if after[0]['migration_repo'] != previous:
+        raise DbError('lot migration repository changed; retry')
+    return True
+
+
 class WorkItems(interface.WorkItems):
 
     def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
                             % item_columns(self.db), (int(item_id),))
             if not rows:
@@ -402,7 +427,10 @@ class WorkItems(interface.WorkItems):
         vers un état terminal libère la réservation de migration (#956).
         Un lot pinné sur une révision Process (`workflow_ref`) n'est jamais
         déplacé ici : la garde est aussi dans le SQL, pour la course entre la
-        lecture de l'appelant et l'adoption concurrente (#1922/N8)."""
+        lecture de l'appelant et l'adoption concurrente (#1922/N8).
+
+        #711 : le verrou du dépôt de migration est pris dans la transaction
+        avant toute écriture (voir `_lock_migration_writer`)."""
         # L157 : le premier passage en build (ou qa) date le début du travail
         sql = """
             UPDATE work_items
@@ -427,19 +455,16 @@ class WorkItems(interface.WorkItems):
                   + ((REVIEWER_NONE, state) if waiver else ())
                   + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
-        if state not in ("merged", "promoted", "closed"):
-            rows = self.db.query(sql, params)
-            if not rows:
-                return None
-            self._event(int(item_id), state, note, actor)
-            return rows[0]
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(sql, params)
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), state, note, actor)
-            self._release_migration(tx, item_id, rows[0],
-                                    why="état %s" % state, actor=actor)
+            if state in ("merged", "promoted", "closed"):
+                self._release_migration(tx, item_id, rows[0],
+                                        why="état %s" % state, actor=actor)
             return rows[0]
 
     def designate_reviewer(self, item_id, reviewer, *, actor, event=None) -> dict | None:
@@ -984,6 +1009,8 @@ class WorkItems(interface.WorkItems):
         journal ; le dernier commit vu est oublié si la branche change. None
         si le lot n'est plus ouvert."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 "UPDATE work_items SET"
                 "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
@@ -1042,8 +1069,10 @@ class WorkItems(interface.WorkItems):
         elif number is None:
             value = ("greatest(%s, (SELECT coalesce(max(migration), 0) + 1 FROM work_items"
                      "               WHERE migration_repo = %s"
-                     "                 AND state NOT IN ('merged', 'promoted', 'closed')))")
-            params = (int(floor), repo)
+                     "                 AND state NOT IN ('merged', 'promoted', 'closed')),"
+                     " (SELECT coalesce(max(number), 0) + 1 FROM work_migration_reservations"
+                     " WHERE target_repo = %s AND status = 'reserved'))")
+            params = (int(floor), repo, "github.com/" + repo)
         else:
             value, params = "%s", (int(number),)
         # `release` libère aussi un lot déjà terminal (#956) ; les autres
@@ -1056,6 +1085,8 @@ class WorkItems(interface.WorkItems):
         while True:
             try:
                 with self.db.transaction() as tx:
+                    if not _lock_migration_writer(tx, item_id, None if release else repo):
+                        return None
                     if not release:
                         # #956 : une réservation héritée d'un lot terminal
                         # (prise avant ce correctif) ne tient plus le numéro :
@@ -1095,7 +1126,8 @@ class WorkItems(interface.WorkItems):
                     return rows[0]
             except DbError as exc:
                 if (number is not None or release
-                        or not is_unique_violation(exc, MIGRATION_INDEX)):
+                        or not (is_unique_violation(exc, MIGRATION_INDEX)
+                                or is_unique_violation(exc, "work_migration_reservations_active_idx"))):
                     raise
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1372,12 +1404,12 @@ class WorkItems(interface.WorkItems):
         par le trigger de 0013) reçoit le commit et l'auteur de la fusion.
 
         `frozen_id` (revue codex1, P2-1) : le gel examiné doit être le dernier
-        gel du lot. Le `SELECT ... FOR UPDATE` prend d'abord le verrou de la
-        ligne du lot (en l'attendant au besoin) ; le dernier gel est relu
-        APRÈS, dans une instruction suivante de la même transaction — en READ
-        COMMITTED elle voit tout gel validé pendant l'attente (le sous-select
-        d'une seule instruction verrait l'instantané d'avant l'attente). S'il
-        a changé, rien n'est écrit (None). Un gel ne peut pas s'insérer
+        gel du lot. Après le verrou de dépôt, la ligne du lot est verrouillée
+        (en l'attendant au besoin) ; le dernier gel est relu APRÈS, dans une
+        instruction suivante de la même transaction — en READ COMMITTED elle
+        voit tout gel validé pendant l'attente (le sous-select d'une seule
+        instruction verrait l'instantané d'avant l'attente). S'il a changé,
+        la transaction est annulée (None). Un gel ne peut pas s'insérer
         ensuite : `add_milestone` prend le même verrou de ligne.
 
         `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri,
@@ -1393,6 +1425,8 @@ class WorkItems(interface.WorkItems):
         """
         number, repo = landed if landed else (None, None)
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             locked = tx.query(
                 "SELECT id FROM work_items WHERE id = %s AND state = %s AND "
                 + _UNPINNED + " FOR UPDATE",
@@ -1435,6 +1469,8 @@ class WorkItems(interface.WorkItems):
         porte le `sha` de la tête relue. Un lot pinné sur une révision Process
         n'est jamais fermé ici : le filtre est dans le SQL (#1922/N8)."""
         with self.db.transaction() as tx:
+            if not _lock_migration_writer(tx, item_id):
+                return None
             rows = tx.query(
                 """
                 UPDATE work_items

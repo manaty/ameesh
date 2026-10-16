@@ -1668,6 +1668,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     (event.get("actor") or "—")[:12], event["note"]))
             return 0
         if args.work_command == "migration":
+            from . import migration_reservations
+            if (args.slot or args.list or args.landed or args.target_branch
+                    or args.target_sha or args.reservation_id):
+                return migration_reservations.run(db, args, cfg)
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
                                           repo=args.repo, actor=args.actor, cfg=cfg,
@@ -2603,6 +2607,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
+    from . import migration_reservations
+    migration_reservations.add_options(pw_mig)
     pw_mig.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)

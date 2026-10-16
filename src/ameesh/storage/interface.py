@@ -159,6 +159,7 @@ from __future__ import annotations
 
 from .conversations import Conversations
 from .work_dependencies import WorkDependencies
+from .migration_reservations import MigrationReservations
 
 import abc
 from typing import Any, Callable, Protocol, Sequence, TypedDict
@@ -3561,6 +3562,7 @@ class Storage(abc.ABC):
     nonces: Nonces
     work: WorkItems
     work_dependencies: WorkDependencies
+    migration_reservations: MigrationReservations
     lot_sessions: LotSessions
     packages: WorkPackages
     actions: Actions
