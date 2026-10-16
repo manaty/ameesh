@@ -141,7 +141,15 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    diff of the freeze is one commit of the target (**squash**). `--verbatim` does not
    normalize any whitespace (`--stable` would confuse `"a b"` and `"ab"`): false
    negative rather than false positive; without it (git < 2.40), only ancestry
-   proves. Closing is conditioned in the database on the examined freeze: a new
+   proves. Each of these proofs is voided by an **effective revert** (#1825): a
+   later `Revert "…"` that cites the commit carrying the content, undoes exactly
+   its patch, and is reapplied by no later commit — the content is not delivered
+   and the lot stays open (`how: reverted`). Detection is best-effort, not a
+   guarantee: it scans only the most recent commits of the target (200) and
+   requires `git patch-id --verbatim` (git ≥ 2.40); a revert outside that window,
+   or an ancestry proof without `--verbatim`, still closes a reverted lot
+   wrongly. `sync-branches` and `sync-merges` carry the same guard. Closing is
+   conditioned in the database on the examined freeze: a new
    freeze declared in the meantime prevents it (`refrozen`);
 3. **the linked PR** (as a fallback, or alone):
 
