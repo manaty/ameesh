@@ -543,6 +543,20 @@ class VerificateursTest(unittest.TestCase):
             verify(command_for("work_completed",
                                references={"outcome": "note publiee"}),
                    without_review))
+        # N2 : le libelle non-code ne vaut que rattache a la tete relue ; un ok
+        # sur le commit de fusion ne couvre pas le gel qui a servi de revision.
+        on_merge_only = full_snapshot(
+            item=item(type="docs"),
+            milestones=({"kind": "frozen", "sha": OTHER, "verdict": None},
+                        {"kind": "merged", "sha": REV, "verdict": None},
+                        {"kind": "verdict", "sha": REV, "verdict": "ok",
+                         "actor": REVIEWER}),
+            revision=REV)
+        self.assertRefusal(
+            "completion-review-missing",
+            verify(command_for("work_completed",
+                               references={"outcome": "note publiee"}),
+                   on_merge_only))
 
     # -- relecture, arret, reparations, holds ------------------------------
 
@@ -675,6 +689,17 @@ class VerificateursTest(unittest.TestCase):
                                                  "superseded_by": 1924}),
             full_snapshot())
         self.assertTrue(decision.accepted, decision)
+        # N6 : le remplacant ne peut pas etre le lot lui-meme (item id 7),
+        # entier comme chaine ; l'existence du lot remplacant n'est pas
+        # verifiable cote C (aucune collection de lots).
+        for replaced_by in (7, "7"):
+            with self.subTest(superseded_by=replaced_by):
+                self.assertRefusal(
+                    "evidence-invalid",
+                    verify(command_for(
+                        "stop_work", references={"reason": "superseded",
+                                                 "superseded_by": replaced_by}),
+                        full_snapshot()))
 
     def test_reparations_bornees(self):
         blocked = blocked_snapshot().milestones

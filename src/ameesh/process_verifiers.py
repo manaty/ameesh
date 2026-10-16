@@ -38,7 +38,10 @@ Regles de decision :
 * la completion d'un type qui exige une revue (tous les types installes)
   **relie la livraison a la tete relue** qui a ete fusionnee/livree
   (`reviewed_head_for`) : une livraison acceptee sans verdict ok applicable ne
-  complete pas (`completion-review-missing`).
+  complete pas (`completion-review-missing`). Pour un type non-code, le
+  `outcome` est un **libelle client** non interpretable (aucune collection de
+  resultats cote B) : il est exige non vide, et la completion reste reliee a la
+  revue de la tete relue (N2 de la revue #1924).
 
 Registre fini (contrat #1379, commentaire 6207021753) : `GUARD_NAMES`. Types
 installes opt-in : `INSTALLED_TYPES` ; les types de code (`CODE_TYPES`)
@@ -777,18 +780,41 @@ def _check_repair_started(command: Command, snapshot: Snapshot) -> Decision:
 
 
 def _check_stop_work(command: Command, snapshot: Snapshot) -> Decision:
+    """Arret explicite : abandon, ou supersession par un lot distinct.
+
+    N6 de la revue #1924 : C ne dispose d'aucune collection de lots, donc
+    l'**existence** du lot remplacant n'est pas prouvable ici. Ce qui est
+    lisible dans le snapshot est verifie : le remplacant ne peut pas etre le
+    lot lui-meme (meme regle que `work.close` cote natif). Une collection
+    `items` cote B permettra d'exiger l'existence reelle sans nouveau pouvoir
+    de gouvernance.
+    """
     reason = _ref(command, "reason")
     if reason not in ("abandoned", "superseded"):
         return _refuse("evidence-invalid",
                        "raison d'arret attendue: abandoned ou superseded", snapshot)
-    if reason == "superseded" and not _present(
-            (command.references or {}).get("superseded_by")):
-        return _refuse("evidence-missing",
-                       "supersession sans lot remplacant", snapshot)
+    if reason == "superseded":
+        replaced_by = (command.references or {}).get("superseded_by")
+        if not _present(replaced_by):
+            return _refuse("evidence-missing",
+                           "supersession sans lot remplacant", snapshot)
+        if _as_int(replaced_by) == _as_int(snapshot.item.get("id")):
+            return _refuse("evidence-invalid",
+                           "supersession du lot par lui-meme", snapshot)
     return _accept(command, ("reason",))
 
 
 def _check_work_completed(command: Command, snapshot: Snapshot) -> Decision:
+    """Completion par type, sur preuves reelles.
+
+    N2 de la revue #1924 : pour un type non-code, `outcome` est un **libelle
+    client** — B ne publie aucune collection de resultats, C n'en interprete
+    donc pas le contenu. Le rattachement exigible est celui de la tete relue :
+    tous les types installes exigent la revue, et la completion n'est acceptee
+    que sur une revision dont la tete relue applicable porte un verdict
+    courant `ok` (`completion-review-missing` sinon). Un libelle seul, sans
+    revue applicable, ne complete pas.
+    """
     revision = _revision(snapshot)
     if not revision:
         return _refuse("revision-missing",
@@ -1152,7 +1178,9 @@ def completion_policy(kind: str) -> CompletionPolicy:
 
     Les types de code exigent une livraison/acceptation reelle et la revue
     applicable ; les autres leur propre resultat et la revue applicable. Aucun
-    type ne complete sur une PR de promotion seule.
+    type ne complete sur une PR de promotion seule. Pour un type non-code, le
+    resultat est le libelle client `outcome` (aucune collection de resultats
+    cote B) : sa verification est le rattachement a la tete relue (N2).
     """
     if kind in CODE_TYPES:
         return CompletionPolicy(kind, True, True, True,
