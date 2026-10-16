@@ -26,7 +26,7 @@ def marque_temoin(genre: str, schema: str) -> str:
     return "l835-%s-%s" % (genre, schema)
 
 
-def attente_vue(observateur, marque: str, evenement: str, timeout: float = 5.0) -> bool:
+def attente_vue(observateur, marque: str, evenement: str, timeout: float = 30.0) -> bool:
     """Le backend `marque` est-il *vu* par le serveur en attente d'un verrou ?
 
     `evenement` est le `wait_event` de `pg_stat_activity` : `relation` pour un
@@ -36,6 +36,11 @@ def attente_vue(observateur, marque: str, evenement: str, timeout: float = 5.0) 
     d'une autre exécution de la suite sur le même cluster (R2 cx2/auditeur).
     Cette preuve remplace le sleep : un témoin qui n'a pas encore atteint son
     SQL ne peut plus passer vert à tort (L835 R1).
+
+    La borne est large (30 s, N1 de #920) : sous un runner saturé (#824), le
+    fil de migration peut mettre plus de 5 s à atteindre son SQL et l'assertion
+    échouerait à tort. En cas vert, la boucle rend la main dès l'attente vue :
+    la borne ne coûte rien.
     """
     requete = (
         "SELECT count(*)::int AS n FROM pg_stat_activity "
