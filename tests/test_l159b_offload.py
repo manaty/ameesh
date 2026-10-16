@@ -7,17 +7,23 @@ locally: real git, real processes, no network, no database.
 """
 from __future__ import annotations
 
+import ast
+import contextlib
 import errno
+import importlib.util
+import io
 import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -274,6 +280,25 @@ class RunTest(OffloadBase):
             self.assertIn("OFFLOAD_SLICE is set by the host", res.stderr)
         ok = self.offload("run", "--env", "FOO=bar baz", "--", "sh", "-c", 'echo "$FOO"')
         self.assertEqual(ok.stdout, "bar baz\n")
+
+    def test_the_client_env_never_reaches_the_profile_hooks(self):
+        # B1 of the #354 R2 review: the hooks are root-owned install-side code
+        # and run in the job's scope with the user manager; the client's
+        # --env there (LD_AUDIT…) would load its library before any filter.
+        # The command, the client's own code, keeps it.
+        before = os.path.join(self.tmp, "before.env")
+        after = os.path.join(self.tmp, "after.env")
+        self.write_profile("hooked", {
+            "before": 'printf "%%s" "${LD_AUDIT-unset}" > %s' % before,
+            "after": 'printf "%%s" "${LD_AUDIT-unset}" > %s' % after})
+        res = self.offload("run", "--profile", "hooked",
+                           "--env", "LD_AUDIT=./client.so", "--",
+                           "sh", "-c", 'printf "%s" "${LD_AUDIT-unset}"')
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "./client.so")
+        for path in (before, after):
+            with open(path) as fh:
+                self.assertEqual(fh.read(), "unset")
 
     def test_timeout_is_not_rerun_locally(self):
         marker = os.path.join(self.tmp, "local-run")
@@ -808,26 +833,41 @@ class ShellTest(OffloadBase):
         self.assertIn(b"unknown commit", res.stderr)  # unknown commit first: nothing runs
         self.assertIn(b"invalid job id", self.shell("status ../x").stderr)
 
+    def wait_for_job_state(self, state: str, what: str, timeout: float) -> list[dict]:
+        """The jobs once one of them is in `state`. Fails with the observed
+        jobs if `timeout` elapses: a silent timeout used to let the test go on
+        with no running job at all on a loaded runner (canon §3: no assertion
+        on a fixed delay of the host)."""
+        deadline = time.time() + timeout
+        while True:
+            jobs = self.status_jobs()
+            if any(j.get("state") == state for j in jobs):
+                return jobs
+            if time.time() >= deadline:
+                self.fail("%s: no job in state %r after %.0f s (jobs: %s)"
+                          % (what, state, timeout, jobs))
+            time.sleep(0.2)
+
     def test_slots_queue_status_and_cancel(self):
         self.config["slots"] = 1
+        # the first job runs until cancelled: its admission (checkout, profile
+        # cache, hooks) may take tens of seconds on a loaded runner, and a
+        # fixed sleep would expire before the assertions
+        self.config["max_job_seconds"] = 300
         self.save_config()
-        first = subprocess.Popen([AMEESH, "offload", "run", "--", "sleep", "30"],
+        first = subprocess.Popen([AMEESH, "offload", "run", "--", "sleep", "300"],
                                  cwd=self.repo, env=self.env(), stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         self.addCleanup(first.kill)
-        deadline = time.time() + 20
-        while time.time() < deadline and not any(
-                j.get("state") == "running" for j in self.status_jobs()):
-            time.sleep(0.2)
+        self.wait_for_job_state("running", "first job admitted", timeout=120)
         second = subprocess.Popen([AMEESH, "offload", "run", "--", "echo", "second"],
                                   cwd=self.repo, env=self.env(), stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
         self.addCleanup(second.kill)
-        deadline = time.time() + 20
-        while time.time() < deadline and not any(
-                j.get("state") == "waiting" for j in self.status_jobs()):
-            time.sleep(0.2)
-        (job,) = [j for j in self.status_jobs() if j.get("state") == "running"]
+        jobs = self.wait_for_job_state("waiting", "second job queued", timeout=60)
+        running = [j for j in jobs if j.get("state") == "running"]
+        self.assertEqual(len(running), 1, jobs)
+        job = running[0]
         res = self.offload("cancel", job["job"])
         self.assertEqual(res.returncode, 0, res.stderr)
         out, err = first.communicate(timeout=20)
@@ -1020,13 +1060,43 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("ForceCommand ", res.stdout)
         self.assertIn(" -I /usr/local/lib/ameesh-guest/ameesh-offload-shell", res.stdout)
         self.assertIn('"profiles": "/etc/ameesh-guest/profiles"', res.stdout)
+        # L159b2: the job user, its launcher and the rule that names the guest
+        self.assertIn("Defaults:%s !requiretty" % guest, res.stdout)
+        self.assertIn("%s ALL=(ameesh-job) NOPASSWD: "
+                      "/usr/local/lib/ameesh-guest/ameesh-job-launcher" % guest, res.stdout)
+        self.assertIn('"executor": "job-user"', res.stdout)
+        self.assertIn('"job_group": "ameesh-jobs"', res.stdout)
+        self.assertIn("usermod -aG ameesh-jobs %s" % guest, res.stdout)
+        # B4 of the #354 R3 reading: the payload may not trace its user
+        # manager nor the hooks (same UID); raised to 1 at least, never lowered
+        self.assertRegex(res.stdout, r"kernel\.yama\.ptrace_scope = [123]\n")
+        self.assertRegex(res.stdout, r"\+ sysctl -q -w kernel\.yama\.ptrace_scope=[123]\n")
+        for sub in ("mirrors", "cache", "jobs"):
+            self.assertIn("install -d -m 2750 -o %s -g ameesh-jobs /srv/ameesh-guest/%s"
+                          % (guest, sub), res.stdout)
         self.assertNotIn("No such file", res.stderr)
 
-    def test_the_vm_shell_is_standalone(self):
-        # installed alone as /usr/local/lib/ameesh-guest/ameesh-offload-shell
-        # and run with python3 -I: nothing of ameesh can be imported there
-        import ast
-        with open(offload_shell.__file__, encoding="utf-8") as fh:
+    def test_the_legacy_dry_run_keeps_the_guest_alone(self):
+        # --no-job-user: no job user, no group, no launcher, no rule the
+        # guest cannot satisfy; the volume stays the guest's own (L159b)
+        guest = "ameesh-guest-legacy-dry-run"
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--user", guest,
+                              "--no-job-user",
+                              "--key", "ssh-ed25519 AAAAC3Nza test@poste"],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn('"executor": "user-scope"', res.stdout)
+        self.assertIn("install -d -m 0700 -o %s -g %s /srv/ameesh-guest" % (guest, guest),
+                      res.stdout)
+        self.assertNotIn("ameesh-jobs", res.stdout)
+        self.assertNotIn("ameesh-job-launcher", res.stdout)
+        self.assertNotIn("ptrace_scope", res.stdout)
+        self.assertNotIn("No such file", res.stderr)
+
+    def _assert_standalone(self, path):
+        # installed alone as /usr/local/lib/ameesh-guest/<name> and run with
+        # python3 -I: nothing of ameesh can be imported there
+        with open(path, encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
@@ -1035,6 +1105,13 @@ class InstallScriptTest(unittest.TestCase):
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     self.assertNotEqual(alias.name.split(".")[0], "ameesh")
+
+    def test_the_vm_shell_is_standalone(self):
+        self._assert_standalone(offload_shell.__file__)
+
+    def test_the_job_launcher_is_standalone(self):
+        self._assert_standalone(os.path.join(REPO, "deploy", "guest",
+                                             "ameesh-job-launcher.py"))
 
     def test_shipped_profiles_load(self):
         profiles = os.path.join(REPO, "deploy", "guest", "profiles")
@@ -1048,6 +1125,600 @@ class InstallScriptTest(unittest.TestCase):
                     subprocess.run(["sh", "-n", "-c", profile[hook]], check=True)
         subprocess.run(["sh", "-n", os.path.join(REPO, "deploy", "guest", "job-postgres.sh")],
                        check=True)
+
+
+class JobUserExecutorTest(unittest.TestCase):
+    """L159b2: the job runs under its own UID, through the root-owned launcher."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="l159b2-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "vm")
+        os.makedirs(os.path.join(self.root, "profiles"))
+        self.launcher = os.path.join(self.tmp, "ameesh-job-launcher")
+        with open(self.launcher, "w") as fh:
+            fh.write(textwrap.dedent("""\
+                #!/bin/sh
+                # test double: keeps the verb, the argv and the environment
+                verb=$1; shift
+                cat > "$AMEESH_TEST_STDIN"
+                printf '%s %s\\n' "$verb" "$*" >> "$AMEESH_TEST_LOG"
+                exit 0
+                """))
+        os.chmod(self.launcher, 0o755)
+        self.log = os.path.join(self.tmp, "log")
+        self.sent = os.path.join(self.tmp, "stdin")
+        self.job_id = "20261014-120000-abcdef"
+        self.cfg = {"root": self.root, "slots": 1, "max_job_seconds": 60,
+                    "executor": "job-user", "job_user": "ameesh-job",
+                    "job_home": os.path.join(self.root, "home"),
+                    "launcher": self.launcher,
+                    "profiles": os.path.join(self.root, "profiles")}
+
+    def test_load_config_defaults_and_refuses_an_unknown_executor(self):
+        path = os.path.join(self.root, "offload.json")
+        with open(path, "w") as fh:
+            json.dump({"root": self.root, "executor": "job-user"}, fh)
+        cfg = offload_shell.load_config(path)
+        self.assertEqual(cfg["job_user"], "ameesh-job")
+        self.assertEqual(cfg["launcher"], "/usr/local/lib/ameesh-guest/ameesh-job-launcher")
+        self.assertEqual(cfg["job_home"], os.path.join(self.root, "home"))
+        with open(path, "w") as fh:
+            json.dump({"root": self.root, "executor": "wat"}, fh)
+        with self.assertRaises(ValueError):
+            offload_shell.load_config(path)
+
+    def test_make_executor_picks_the_mode(self):
+        self.assertIsInstance(offload_shell.make_executor(dict(self.cfg, executor="user-scope"), "j"),
+                              offload_shell.UserScopeExecutor)
+        self.assertIsInstance(offload_shell.make_executor(self.cfg, "j"),
+                              offload_shell.JobUserExecutor)
+        with self.assertRaises(offload_shell.Refused):
+            offload_shell.make_executor(dict(self.cfg, executor="nope"), "j")
+
+    def test_argv_goes_through_sudo_and_the_launcher(self):
+        ex = offload_shell.make_executor(self.cfg, self.job_id)
+        argv = ex.argv("command", ["pytest", "-q"])
+        self.assertEqual(argv[:6], ["/usr/bin/sudo", "-n", "-u", "ameesh-job", "--",
+                                    self.launcher])
+        self.assertEqual(argv[6:11], ["run", "--job", self.job_id, "--phase", "command"])
+        self.assertEqual(argv[11:], ["--", "pytest", "-q"])
+        self.assertFalse(ex.same_uid)
+        self.assertTrue(ex.env_on_stdin)
+        self.assertTrue(ex.scope)
+
+    def test_check_refuses_without_the_launcher(self):
+        ex = offload_shell.make_executor(dict(self.cfg, launcher=os.path.join(self.tmp, "gone")),
+                                         self.job_id)
+        with self.assertRaises(offload_shell.Refused):
+            ex.check({})
+
+    def test_tune_env_refuses_an_unknown_job_user(self):
+        # a VM whose install.sh never created the job user: refused, so the
+        # client falls back locally instead of reading a traceback
+        ex = offload_shell.make_executor(dict(self.cfg, job_user="no-such-job-user-159b2"),
+                                         self.job_id)
+        with self.assertRaises(offload_shell.Refused):
+            ex.tune_env({})
+
+    def test_grant_adds_group_write_and_keeps_the_exec_bit(self):
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        tree = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(tree, "sub"))
+        script = os.path.join(tree, "run.sh")
+        with open(script, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(script, 0o755)
+        os.chmod(os.path.join(tree, "sub"), 0o700)
+        ex.grant(tree)
+        self.assertTrue(os.stat(tree).st_mode & 0o020)
+        self.assertTrue(os.stat(tree).st_mode & 0o2000)
+        self.assertEqual(os.stat(script).st_mode & 0o770, 0o770)
+        self.assertTrue(os.stat(os.path.join(tree, "sub")).st_mode & 0o2000)
+
+    def test_grant_never_chmods_through_a_symlink(self):
+        # a checkout may carry symlinks: the walk must not touch their target
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        tree = os.path.join(self.tmp, "work")
+        os.makedirs(tree)
+        outside = os.path.join(self.tmp, "outside")
+        with open(outside, "w") as fh:
+            fh.write("x")
+        os.chmod(outside, 0o600)
+        os.symlink(outside, os.path.join(tree, "link"))
+        ex.grant(tree)
+        self.assertEqual(os.stat(outside).st_mode & 0o777, 0o600)
+
+    def test_grant_never_gives_itself_a_path_to_a_swapped_link(self):
+        # B3 of the #354 R2 review: a same-UID job can replace an entry while
+        # the shell walks a tree it may write. Every entry is opened
+        # O_NOFOLLOW and changed on the descriptor, so the swap below makes it
+        # unreadable to the walk instead of chmod'ing the link's target.
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        tree = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(tree, "sub"))
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        victim = os.path.join(outside, "config")
+        with open(victim, "w") as fh:
+            fh.write("x")
+        os.chmod(victim, 0o600)
+        real_listdir = os.listdir
+        swapped = []
+
+        def swap(fd):
+            names = real_listdir(fd)
+            if not swapped:                    # after the listing, before the opens
+                swapped.append(True)
+                os.rmdir(os.path.join(tree, "sub"))
+                os.symlink(outside, os.path.join(tree, "sub"))
+            return names
+
+        with mock.patch.object(offload_shell.os, "listdir", swap):
+            ex.grant(tree)
+        self.assertEqual(os.stat(victim).st_mode & 0o777, 0o600)
+
+    def test_grant_changes_modes_on_the_descriptor_only(self):
+        # B3: the fix is fd-based by construction; any return to a path-based
+        # os.chmod/os.chown (which follow a swapped link) trips this witness
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        tree = os.path.join(self.tmp, "work")
+        os.makedirs(os.path.join(tree, "sub"))
+        with open(os.path.join(tree, "run.sh"), "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(os.path.join(tree, "run.sh"), 0o755)
+        with mock.patch.object(offload_shell.os, "chmod",
+                               side_effect=AssertionError("path chmod")), \
+                mock.patch.object(offload_shell.os, "chown",
+                                  side_effect=AssertionError("path chown")):
+            ex.grant(tree)
+        self.assertTrue(os.stat(tree).st_mode & 0o020)
+        self.assertTrue(os.stat(os.path.join(tree, "sub")).st_mode & 0o2000)
+
+    def test_grant_tree_closes_the_descriptors_left_by_a_failing_walk(self):
+        # N3 of the #354 R2 review: a raising grant (fstat/fchmod) must not
+        # leave the directories still stacked open. The root is granted
+        # first, then its four children are opened before the first one is
+        # granted: the injected failure happens with a non-empty stack.
+        tree = os.path.join(self.tmp, "work")
+        for name in ("a", "b", "c", "d"):
+            os.makedirs(os.path.join(tree, name))
+        real_open, real_fchmod = os.open, os.fchmod
+        opened: list[int] = []
+        grants = {"count": 0}
+
+        def tracking_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def failing_fchmod(fd, mode):
+            grants["count"] += 1
+            if grants["count"] == 2:
+                raise OSError(errno.EIO, "injected")
+            return real_fchmod(fd, mode)
+
+        with mock.patch.object(offload_shell.os, "open", tracking_open), \
+                mock.patch.object(offload_shell.os, "fchmod", failing_fchmod):
+            with self.assertRaises(OSError):
+                offload_shell._grant_tree(tree)
+        self.assertGreaterEqual(len(opened), 3)
+        for fd in opened:
+            with self.assertRaises(OSError):
+                os.fstat(fd)                    # closed, not left to the caller
+
+    def test_granted_requires_the_shared_group_and_write(self):
+        # B3: a ready cache is reused only when the shell already granted it
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        path = os.path.join(self.tmp, "cache")
+        os.makedirs(path)
+        with mock.patch.object(offload_shell.JobUserExecutor, "_gid",
+                               return_value=None):
+            os.chmod(path, 0o700)
+            self.assertFalse(ex.granted(path))
+            os.chmod(path, 0o2770)
+            self.assertTrue(ex.granted(path))
+        with mock.patch.object(offload_shell.JobUserExecutor, "_gid",
+                               return_value=os.getgid() + 1):
+            self.assertFalse(ex.granted(path))       # another group: rebuild
+
+    def test_a_legacy_ready_cache_is_rebuilt_not_regranted(self):
+        # B3: a cache that does not qualify is never re-granted by path (a
+        # same-UID job could have planted a link inside it); it is rebuilt
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        work = os.path.join(self.tmp, "work")
+        os.makedirs(work)
+        profile = {"lockfiles": [], "setup": "true"}
+        final = os.path.join(self.cfg["root"], "cache", "py",
+                             offload_shell._lock_hash(work, profile))
+        os.makedirs(final)
+        with open(os.path.join(final, ".ready"), "w") as fh:
+            fh.write("")
+        os.chmod(final, 0o700)                   # legacy: the job cannot write it
+        job = mock.MagicMock()
+        job.cfg, job.executor, job.stop = self.cfg, ex, {}
+        job.check.return_value = {}
+        runs: list[str] = []
+
+        def run(phase, argv, cwd, env, **kwargs):
+            runs.append(phase)
+            return 0, ""
+
+        job.run.side_effect = run
+        with mock.patch.object(offload_shell.JobUserExecutor, "_gid",
+                               return_value=None), \
+                mock.patch.object(offload_shell.JobUserExecutor, "clean",
+                                  lambda self, path: shutil.rmtree(path, True)):
+            self.assertEqual(offload_shell.prepare_cache(job, "py", profile,
+                                                         work, {}), final)
+            self.assertEqual(runs, ["setup"])    # rebuilt, not reused
+            runs.clear()
+            # the rebuild granted it: the next run reuses it without touching it
+            self.assertEqual(offload_shell.prepare_cache(job, "py", profile,
+                                                         work, {}), final)
+            self.assertEqual(runs, [])
+
+    def test_dir_keeps_the_setgid_of_a_shared_parent(self):
+        # B1 of the #354 R1 review: the explicit chmod of `_dir` must not
+        # clear the setgid bit inherited from the volume, or the next level
+        # down takes the shell's primary group and `grant` (chmod alone)
+        # cannot repair it
+        root = os.path.join(self.tmp, "shared")
+        os.makedirs(root)
+        os.chmod(root, 0o2710)
+        leaf = offload_shell._dir(dict(self.cfg, root=root), "cache", "profile",
+                                  mode=0o750)
+        self.assertEqual(stat.S_IMODE(os.stat(leaf).st_mode), 0o2750)
+        self.assertEqual(os.stat(leaf).st_gid, os.stat(root).st_gid)
+
+    def test_dir_does_not_invent_a_setgid_on_a_private_parent(self):
+        root = os.path.join(self.tmp, "private")
+        os.makedirs(root)
+        os.chmod(root, 0o700)
+        leaf = offload_shell._dir(dict(self.cfg, root=root), "locks", mode=0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(leaf).st_mode), 0o700)
+
+    def test_grant_traverse_leaves_no_group_write(self):
+        # B2 of the #354 R1 review: the job enters its folder, but cannot
+        # create, rename or remove anything in it (meta.json, cancel)
+        job_dir = os.path.join(self.tmp, "job")
+        os.makedirs(job_dir, mode=0o700)
+        offload_shell.JobUserExecutor(self.cfg, self.job_id).grant_traverse(job_dir)
+        mode = os.stat(job_dir).st_mode
+        self.assertTrue(mode & 0o2000)        # setgid kept for work/tmp below
+        self.assertTrue(mode & 0o050)         # group reads and traverses
+        self.assertFalse(mode & 0o020)        # never writes: no planted link
+
+    def test_write_meta_does_not_follow_a_planted_link(self):
+        # the job used to plant meta.json.tmp as a link to a shell file: the
+        # shell wrote through it under its own UID (B2)
+        job_dir = os.path.join(self.tmp, "job")
+        os.makedirs(job_dir)
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("private")
+        os.symlink(victim, os.path.join(job_dir, "meta.json.tmp"))
+        offload_shell._write_meta(os.path.join(job_dir, "meta.json"), {"job": "x"})
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "private")
+        meta = os.path.join(job_dir, "meta.json")
+        self.assertFalse(os.path.islink(meta))
+        with open(meta) as fh:
+            self.assertEqual(json.load(fh), {"job": "x"})
+
+    def test_private_writes_never_follow_a_planted_link(self):
+        # the cancel flag and the cache's `.ready` go through the same helper
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("private")
+        flag = os.path.join(self.tmp, "cancel")
+        os.symlink(victim, flag)
+        offload_shell._write_private(flag)
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "private")
+        self.assertFalse(os.path.islink(flag))
+
+    def test_cancel_does_not_follow_a_planted_link(self):
+        cfg = dict(self.cfg)
+        job_dir = os.path.join(cfg["root"], "jobs", self.job_id)
+        os.makedirs(job_dir)
+        victim = os.path.join(self.tmp, "victim")
+        with open(victim, "w") as fh:
+            fh.write("private")
+        os.symlink(victim, os.path.join(job_dir, "cancel"))
+        with open(os.path.join(job_dir, "meta.json"), "w") as fh:
+            json.dump({"job": self.job_id}, fh)   # no live shell to signal
+        self.assertEqual(offload_shell.cmd_cancel(cfg, [self.job_id]), 0)
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "private")
+        self.assertFalse(os.path.islink(os.path.join(job_dir, "cancel")))
+
+    def _run(self, phase: str, env: dict) -> int:
+        job_dir = os.path.join(self.root, "jobs", self.job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        ex = offload_shell.JobUserExecutor(self.cfg, self.job_id)
+        with mock.patch.object(offload_shell.JobUserExecutor, "_launcher",
+                               lambda self, *args: [self.launcher, *args]):
+            job = offload_shell.Job(self.cfg, self.job_id, job_dir, executor=ex)
+            rc, _ = job.run(phase, ["/bin/true"], job_dir, env)
+        return rc
+
+    def test_run_sends_the_environment_on_stdin(self):
+        env = {"HOME": self.cfg["job_home"], "USER": "ameesh-job", "PATH": "/usr/bin",
+               "XDG_RUNTIME_DIR": "/run/user/1001",
+               "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus",
+               "AMEESH_TEST_STDIN": self.sent, "AMEESH_TEST_LOG": self.log}
+        self.assertEqual(self._run("command", dict(env)), 0)
+        with open(self.sent) as fh:
+            sent = json.load(fh)
+        # the client's code never gets the job's user manager
+        self.assertNotIn("XDG_RUNTIME_DIR", sent)
+        self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", sent)
+        self.assertEqual(sent["HOME"], self.cfg["job_home"])
+        with open(self.log) as fh:
+            self.assertIn("run --job %s --phase command -- /bin/true" % self.job_id, fh.read())
+
+    def test_a_hook_keeps_the_user_manager_for_podman(self):
+        env = {"HOME": self.cfg["job_home"], "PATH": "/usr/bin",
+               "XDG_RUNTIME_DIR": "/run/user/1001",
+               "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus",
+               "AMEESH_TEST_STDIN": os.path.join(self.tmp, "hook-stdin"),
+               "AMEESH_TEST_LOG": self.log}
+        self.assertEqual(self._run("after", dict(env)), 0)
+        with open(os.path.join(self.tmp, "hook-stdin")) as fh:
+            sent = json.load(fh)
+        self.assertEqual(sent["XDG_RUNTIME_DIR"], "/run/user/1001")
+
+
+class JobLauncherTest(unittest.TestCase):
+    """The root-owned launcher's own checks (L159b2)."""
+
+    SCRIPT = os.path.join(REPO, "deploy", "guest", "ameesh-job-launcher")
+    MODULE = os.path.join(REPO, "deploy", "guest", "ameesh-job-launcher.py")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="l159b2-launcher-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = os.path.join(self.tmp, "vm")
+        os.makedirs(os.path.join(self.root, "jobs"))
+        spec = importlib.util.spec_from_file_location("ameesh_job_launcher", self.MODULE)
+        self.launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.launcher)
+        self.launcher.CONFIG = os.path.join(self.tmp, "offload.json")
+        with open(self.launcher.CONFIG, "w") as fh:
+            json.dump({"root": self.root, "agent_memory_max": "1G"}, fh)
+
+    def test_the_wrapper_is_a_standalone_isolated_invocation(self):
+        subprocess.run(["sh", "-n", self.SCRIPT], check=True)
+        with open(self.SCRIPT) as fh:
+            text = fh.read()
+        self.assertIn("-I /usr/local/lib/ameesh-guest/ameesh-job-launcher.py", text)
+
+    def test_the_launcher_names_match_the_shell(self):
+        for job_id in ("20261014-120000-abcdef", "20261014-120000-a1b2c3"):
+            self.assertEqual(self.launcher.unit_names(job_id),
+                             offload_shell.unit_names(job_id))
+
+    def _execv_cmd(self, phase: str) -> list[str]:
+        """The argv the launcher hands to systemd-run for that phase."""
+        stdin = types.SimpleNamespace(buffer=io.BytesIO(b"{}"))
+        # cmd_run clears and replaces os.environ before exec: run it in a copy
+        # of the environment, or every later test loses PATH and HOME
+        with mock.patch.dict(os.environ), \
+                mock.patch.object(self.launcher.os, "execv") as execv, \
+                mock.patch.object(self.launcher.sys, "stdin", stdin):
+            self.assertEqual(self.launcher.main(
+                ["run", "--job", "20261014-120000-abcdef", "--phase", phase,
+                 "--", "/bin/true"]), 70)
+        return execv.call_args[0][1]
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_a_client_phase_runs_under_the_filter(self):
+        # B3 of the #354 R1 review: removing the manager's variables was not
+        # enough; the payload now runs under the launcher's `exec`, which
+        # denies socket(AF_UNIX) before its first instruction
+        for phase in ("command", "setup"):
+            payload = self._execv_cmd(phase)
+            payload = payload[payload.index("--") + 1:]
+            self.assertEqual(payload[:4], [sys.executable, "-I", self.MODULE,
+                                           "exec"])
+            self.assertEqual(payload[4:], ["--", "/bin/true"])
+        for phase in ("before", "after"):
+            # the profile hooks are root-owned install-side code (Podman needs
+            # the manager): they keep it
+            payload = self._execv_cmd(phase)
+            payload = payload[payload.index("--") + 1:]
+            self.assertEqual(payload, ["/bin/true"])
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_filter_refuses_af_unix_even_when_the_bus_is_reconstructed(self):
+        # the exact witness of B3: the payload rebuilds XDG_RUNTIME_DIR and
+        # the bus address, then socket(AF_UNIX) is refused; socketpair stays
+        # allowed (asyncio, multiprocessing), and a child of the payload
+        # inherits the filter, so no child can run the launcher unfiltered
+        child = ("import socket\n"
+                 "try:\n"
+                 "    socket.socket(socket.AF_UNIX)\n"
+                 "    print('child allowed')\n"
+                 "except OSError as exc:\n"
+                 "    print('child', exc.errno)")
+        probe = textwrap.dedent("""\
+            import os, socket, subprocess, sys
+            os.environ["XDG_RUNTIME_DIR"] = "/run/user/UID"
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/UID/bus"
+            try:
+                socket.socket(socket.AF_UNIX)
+            except OSError as exc:
+                print("af_unix", exc.errno)
+            left, right = socket.socketpair()
+            print("socketpair", bool(left))
+            left.close()
+            right.close()
+            print(subprocess.run([sys.executable, "-c", CHILD],
+                                 capture_output=True, text=True).stdout.strip())
+            """).replace("UID", str(os.getuid())).replace("CHILD", repr(child))
+        res = subprocess.run([sys.executable, "-I", self.MODULE, "exec", "--",
+                              sys.executable, "-c", probe],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("af_unix %d" % errno.EAFNOSUPPORT, res.stdout)
+        self.assertIn("socketpair True", res.stdout)
+        self.assertIn("child %d" % errno.EAFNOSUPPORT, res.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_filter_masks_the_domain_to_the_kernels_int(self):
+        # B3 of the R2 reading: the kernel reads `domain` as a 32-bit int while
+        # libseccomp had compared the whole 64-bit register, so a raw
+        # socket(0x100000001) started a real AF_UNIX socket under SCMP_CMP_EQ.
+        # The masked rule must refuse the widened domain and keep a widened
+        # AF_INET (same high bits, other family) allowed: the mask hides the
+        # bits the kernel ignores, it does not block everything above 32 bits.
+        try:
+            import ctypes
+            ctypes.CDLL(self.launcher.SECCOMP_SO)
+        except OSError:
+            self.skipTest("no %s on this host" % self.launcher.SECCOMP_SO)
+        probe = textwrap.dedent("""\
+            import ctypes, os, socket
+            lib = ctypes.CDLL("libseccomp.so.2")
+            lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+            lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+            nr = lib.seccomp_syscall_resolve_name(b"socket")
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.syscall.restype = ctypes.c_long
+            def raw(domain):
+                ctypes.set_errno(0)
+                fd = libc.syscall(ctypes.c_long(nr),
+                                  ctypes.c_ulonglong(domain),
+                                  ctypes.c_ulonglong(socket.SOCK_STREAM),
+                                  ctypes.c_ulonglong(0))
+                err = ctypes.get_errno()
+                if fd >= 0:
+                    os.close(fd)
+                    return "fd"
+                return err
+            print("widened-unix", raw(0x100000001))
+            print("widened-inet", raw(0x100000002))
+            """)
+        res = subprocess.run([sys.executable, "-I", self.MODULE, "exec", "--",
+                              sys.executable, "-c", probe],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("widened-unix %d" % errno.EAFNOSUPPORT, res.stdout)
+        self.assertIn("widened-inet fd", res.stdout)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_filter_strips_the_manager_address(self):
+        probe = ("import os;print(os.environ.get('XDG_RUNTIME_DIR'),"
+                 "os.environ.get('DBUS_SESSION_BUS_ADDRESS'))")
+        env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/1000",
+                   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/1000/bus")
+        res = subprocess.run([sys.executable, "-I", self.MODULE, "exec", "--",
+                              sys.executable, "-c", probe],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.split(), ["None", "None"])
+
+    def test_it_fails_closed_without_an_installable_filter(self):
+        with mock.patch.object(self.launcher, "install_socket_filter",
+                               side_effect=OSError(errno.ENOSYS, "no libseccomp")), \
+                mock.patch.object(self.launcher.os, "execvp") as execvp:
+            self.assertEqual(self.launcher.main(["exec", "--", "/bin/true"]), 78)
+        execvp.assert_not_called()
+
+    def test_the_self_test_refuses_when_the_filter_is_unavailable(self):
+        with mock.patch.object(self.launcher, "install_socket_filter",
+                               side_effect=OSError(errno.ENOSYS, "no libseccomp")):
+            self.assertEqual(self.launcher.filter_selftest(), 1)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_the_self_test_passes_with_libseccomp(self):
+        try:
+            import ctypes
+            ctypes.CDLL(self.launcher.SECCOMP_SO)
+        except OSError:
+            self.skipTest("no %s on this host" % self.launcher.SECCOMP_SO)
+        self.assertEqual(self.launcher.filter_selftest(), 0)
+
+    def test_it_validates_the_job_and_the_verb(self):
+        with self.assertRaises(ValueError):
+            self.launcher.job_arg(["--job", "../../etc"])
+        with self.assertRaises(ValueError):
+            self.launcher.job_arg(["--job"])
+        self.assertEqual(self.launcher.job_arg(["--job", "20261014-120000-abcdef"]),
+                         "20261014-120000-abcdef")
+        self.assertEqual(self.launcher.main(["nope"]), 2)
+
+    def test_clean_stays_inside_the_root(self):
+        self.assertEqual(self.launcher.main(["clean", "--path", "/etc"]), 2)
+        self.assertEqual(self.launcher.main(["clean", "--path", self.root]), 2)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_clean_empties_a_folder_the_shell_owns(self):
+        # the job's folder belongs to the shell: the launcher (the job's UID)
+        # cannot unlink it, so it empties it and the shell removes the rest
+        victim = os.path.join(self.root, "jobs", "20261014-120000-abcdef")
+        os.makedirs(os.path.join(victim, "work", "deep"))
+        with open(os.path.join(victim, "work", "deep", "file"), "w") as fh:
+            fh.write("x")
+        jobs = os.path.dirname(victim)
+        os.chmod(jobs, 0o500)
+        try:
+            self.assertEqual(self.launcher.main(["clean", "--path", victim]), 0)
+            self.assertTrue(os.path.isdir(victim))
+            self.assertEqual(os.listdir(victim), [])
+        finally:
+            os.chmod(jobs, 0o755)
+
+    def _check_with_scope(self, scope_path: str) -> tuple[int, str, str]:
+        """`main(["check"])` under a fake user manager, with the Yama read
+        pointed at `scope_path`; returns (rc, stdout, stderr)."""
+        run = os.path.join(self.tmp, "run")
+        os.makedirs(os.path.join(run, "bus"), exist_ok=True)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, XDG_RUNTIME_DIR=run), \
+                mock.patch.object(self.launcher, "runtime_env"), \
+                mock.patch.object(self.launcher, "systemctl",
+                                  return_value=subprocess.CompletedProcess([], 0)), \
+                mock.patch.object(self.launcher, "filter_selftest", return_value=0), \
+                mock.patch.object(self.launcher, "YAMA_SCOPE", scope_path), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.launcher.main(["check"])
+        return rc, out.getvalue(), err.getvalue()
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_check_refuses_a_kernel_without_yama(self):
+        # B4 of the Codex reading: yama_scope() renders None when Yama is
+        # missing or unreadable, and `scope is not None and scope < 1`
+        # accepted that case, though install.sh --check and the README refuse
+        # a kernel without Yama; the filter does not block
+        # open(/proc/<pid>/mem), so the launcher must refuse it too
+        absent = os.path.join(self.tmp, "absent")
+        unreadable = os.path.join(self.tmp, "unreadable")
+        os.makedirs(unreadable)  # open() raises OSError, as when it is unreadable
+        garbage = os.path.join(self.tmp, "garbage")
+        with open(garbage, "w") as fh:
+            fh.write("not a number\n")
+        for scope in (absent, unreadable, garbage):
+            with self.subTest(scope=scope):
+                rc, _, err = self._check_with_scope(scope)
+                self.assertEqual(rc, 2)
+                self.assertIn("kernel.yama.ptrace_scope=None", err)
+
+    @unittest.skipIf(os.geteuid() == 0, "the launcher refuses to run as root")
+    def test_check_accepts_scope_one_and_refuses_zero(self):
+        zero = os.path.join(self.tmp, "zero")
+        with open(zero, "w") as fh:
+            fh.write("0\n")
+        rc, _, err = self._check_with_scope(zero)
+        self.assertEqual(rc, 2)
+        self.assertIn("kernel.yama.ptrace_scope=0", err)
+        one = os.path.join(self.tmp, "one")
+        with open(one, "w") as fh:
+            fh.write("1\n")
+        rc, out, err = self._check_with_scope(one)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out, "ok\n")
 
 
 if __name__ == "__main__":

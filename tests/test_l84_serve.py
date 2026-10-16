@@ -122,9 +122,12 @@ class DefencesTest(ServerMixin, unittest.TestCase):
         self.assertEqual(self.get("/api/v1/me", host="localhost:%d" % self.port)[0], 200)
 
     def test_read_only_methods(self):
-        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        # L87: POST acts, on its own routes only; a read route refuses it
+        status, headers, _b = self.get("/api/v1/me", method="POST")
+        self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD"))
+        for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
             status, headers, _b = self.get("/api/v1/me", method=method)
-            self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD"), method)
+            self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD, POST"), method)
         status, headers, body = self.get("/api/v1/me", method="HEAD")
         self.assertEqual((status, body), (200, b""))
         self.assertGreater(int(headers["Content-Length"]), 0)
@@ -241,16 +244,21 @@ class OpenApiTest(unittest.TestCase):
             operation = doc["paths"][route.path]["get"]
             if route.auth:
                 self.assertNotIn("security", operation)  # the global Bearer
-                ref = operation["responses"]["200"]["content"]["application/json"]["schema"]
+                content = operation["responses"]["200"]["content"]
+                # L85: the event stream documents the `data` of its messages
+                ref = content["text/event-stream"]["x-ameesh-data"] if route.stream \
+                    else content["application/json"]["schema"]
                 self.assertEqual(ref["$ref"].rsplit("/", 1)[1],
                                  route.schema.replace("/", "-"))
             else:
                 self.assertEqual(operation["security"], [])
         self.assertEqual(doc["paths"]["/.well-known/ameesh"]["get"]["security"], [])
 
-    def test_no_write_route(self):
-        for item in serve.openapi()["paths"].values():
-            self.assertEqual(set(item), {"get"})
+    def test_writes_are_the_actions_only(self):
+        # L87: a POST exists exactly on the human actions, nothing else writes
+        actions = {action.path for action in serve.ACTIONS}
+        for path, item in serve.openapi()["paths"].items():
+            self.assertEqual(set(item) - {"get"}, {"post"} if path in actions else set(), path)
 
 
 class SystemdUnitTest(unittest.TestCase):
@@ -294,6 +302,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/projects/{project}/progress": "/api/v1/projects/demo/progress?since=2d",
             "/api/v1/agents": "/api/v1/agents",
             "/api/v1/agents/{agent}": "/api/v1/agents/a1",
+            "/api/v1/agents/{agent}/chat": "/api/v1/agents/a1/chat?limit=5",
             "/api/v1/lots": "/api/v1/lots?state=build&limit=10",
             "/api/v1/lots/{id}": "/api/v1/lots/" + lot,
             "/api/v1/decisions": "/api/v1/decisions?all=1",
@@ -304,6 +313,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/threads/{project}": "/api/v1/threads/demo",
             "/api/v1/threads/{project}/{lot}": "/api/v1/threads/demo/" + lot,
             "/api/v1/openapi.json": "/api/v1/openapi.json",
+            "/api/v1/events": None,   # L85: a stream, tested in test_l85_events
         }
 
     def test_every_route_answers_in_line_with_its_schema(self):
@@ -311,6 +321,8 @@ class ServePgTest(ServerMixin, PgTestCase):
         self.assertEqual(set(paths), {route.path for route in serve.ROUTES})
         components = json.loads(OPENAPI_FILE.read_text(encoding="utf-8"))["components"]
         for route in serve.ROUTES:
+            if route.stream:
+                continue
             status, data = self.get_json(paths[route.path])
             self.assertEqual(status, 200, (route.path, data))
             if route.schema == "openapi":

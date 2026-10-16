@@ -340,8 +340,8 @@ ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
-ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID)
-ameesh work sync-merges [--dry-run] [--json]          # close frozen lots whose content is merged (L29)
+ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA)
+ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
 ameesh work measure [<id>…] [--no-ci] [--json]        # actual time per phase, merged diff size (L157c)
@@ -349,6 +349,9 @@ ameesh work project-github --app PROJECT [--repo R] [--dry-run]   # one issue pe
 ameesh work resolve <lot> --with <other> [--json]     # prepare a conflict resolution (L160d)
 ameesh work queue add <id> | remove <id> | show [--target BRANCH] [--json]   # merge queue (L160e)
 ameesh work land <id> [--project P] [--json]          # land the queue head (L160e2)
+ameesh release open <id> --base SHA                   # freeze the release perimeter (L750)
+ameesh release check <id> [--repo R] [--json]         # moved base, full suite on the head (L756)
+ameesh release reason <id> --text "…"                 # record why the release base moved after the freeze
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
@@ -369,7 +372,9 @@ idempotent and visible in `work show`. `work set-app` corrects a
 lot's project and `work backfill-app` fills the uniquely inferred ones, both
 with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 (`--none` detaches it),
-`work close` closes an abandoned or superseded lot, and `work sync-merges`
+`work close` closes an abandoned, superseded or delivered-outside-target lot
+(`--delivered --sha <reviewed head>`: the `delivered` milestone carries the
+head and counts as a delivery in `estimates`, #988), and `work sync-merges`
 closes the frozen lots whose content is already merged (L29). `work schedule`
 proposes the planned dates of open assigned lots at the p80 of the L157
 reference table (`--apply` writes), and `work measure` records the actual time

@@ -203,7 +203,11 @@ local files). The lease is the only authorization to run.
   that hangs (lock, slow query) is cancelled by the server; the `psql` driver
   adds a client delay (the same + 5 s) that abandons the subprocess if the
   server no longer responds at all. Migrations, for their part, lift the timeout for
-  the duration of their transaction (`SET LOCAL statement_timeout = 0`).
+  the duration of their transaction (`SET LOCAL statement_timeout = 0`) and bound their
+  wait for a table lock (`SET LOCAL lock_timeout = 5 s`; a migration that must wait
+  longer sets its own, which wins): a migration queued behind an `ACCESS EXCLUSIVE`
+  lock fails in seconds and stays pending, instead of holding every reader and writer
+  of the table behind it.
 * **Robust heartbeat** — a database outage during a turn does not leave the
   harness running without a lease: the heartbeat counts failures
   (`max(3, ttl/3)` second interval), and stops the process as soon as the
@@ -317,7 +321,7 @@ test (three messages → three notifications) caught the bug.
   the interruption and its reason.
 * **Session rotation (0018)**: when the session exceeds
   `AMEESH_SESSION_MAX_TOKENS` (default 150,000) or a turn lasted more than
-  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 900 s), after at least
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 3,600 s), after at least
   `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**, a
   summary turn is played in the session, the summary is written to the thread
   (R12), the old session id is kept in
@@ -329,6 +333,12 @@ test (three messages → three notifications) caught the bug.
   within the bound, states the cut. An empty final answer (for Codex: the
   agent's last message empty) is not a summary: the rotation is
   cancelled, and the account cutover uses the deterministic brief (L39).
+  The latency threshold has a floor of **twice the effective turn cap**
+  (`turn_max_seconds`, the agent's own setting included): a turn allowed to
+  last 1,800 s does not, by itself, make the session be forgotten; a higher
+  explicitly configured threshold is kept, and with no turn cap
+  (`turn_max_seconds=0`) the configured threshold applies alone
+  ([EXPLOITATION.md](EXPLOITATION.md#plafonds-pendant-le-tour-l105)).
   The size is read
   from the usage in each harness's stream (keys normalized by
   `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
@@ -382,6 +392,20 @@ Hooks produce the **same JSON** as v0 (including the `Stop` decision
 and the cap of 3 nudges, counted locally in
 `~/.local/state/agent-mesh/hooks/<nom>.stops`): a test compares the output of the
 v0 script and that of v1 for the four events.
+
+**Fast path of the hooks and the status line (#1604).** The `agent-mail`
+console script goes through `ameesh.entry`, which serves `statusline` and
+`hook <harness>` without importing `ameesh.cli` (database, psycopg). A local
+mailbox marker (`<state_dir>/mail/<agent>.json`) records the outcome of the
+last COMPLETE read: a `PostToolUse` hook skips the database only when the
+marker is fresh (`AMEESH_HOOK_FAST_TTL`, 15 s by default) and says there is
+nothing to deliver. `Stop`, `SessionStart` and `UserPromptSubmit` always go
+through the database; a local send (`send`, `forward`, `sweep`) invalidates the
+recipient's marker; the status line is cached for a few seconds
+(`AMEESH_STATUSLINE_TTL`, 5 s). The fast path delivers no mail and writes no
+registry: it cannot confuse an identity or a session, at worst it delays a
+delivery, which the next complete pass (at the latest the `Stop` hook) catches
+up.
 
 **Identity tied to the lease, never to the directory (mesh-design incident of 2026-10-09).**
 A session only has an identity if `AGENT_MAIL_NAME` is set; if

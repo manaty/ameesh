@@ -692,12 +692,16 @@ class PassAndAlertTest(PgTestCase):
         for i in range(5):
             _write(os.path.join(tmp, "rootdir", "f%d" % i))
         self.addCleanup(_read_only(os.path.join(tmp, "rootdir")))
-        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        # l'horloge est menée (`now`), pas attendue : la deuxième passe a un
+        # autre instant, donc si `since` était recalculé l'assertion le verrait
+        first_now = time.time()
+        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t",
+                        now=first_now)
         first = [a for a in exploitation._housekeeping_alerts([], self.db)
                  if a["type"] == "tmp_unremovable"]
         self.assertEqual(len(first), 1)
-        time.sleep(1.1)                       # a different at_ts, same episode
-        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t")
+        menage.run_pass(self.mine, self.db, self.pol, host="pc", actor="t",
+                        now=first_now + 2.0)
         second = [a for a in exploitation._housekeeping_alerts([], self.db)
                   if a["type"] == "tmp_unremovable"]
         self.assertEqual(len(second), 1)

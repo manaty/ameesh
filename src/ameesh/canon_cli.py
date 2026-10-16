@@ -53,6 +53,14 @@ confiance configurée d'un canon qui n'est pas le canon par défaut est la `ref`
 de SON entrée `canons` (AMEESH_CANONS n'en donne pas : amorçage par
 `canon sync --canon <id> --bootstrap-ref BRANCHE`). `--bootstrap-ref` ne sert
 qu'aux canons dont le registre n'est pas encore amorcé.
+
+L814 : le journal des authentificateurs est unique par canon, tous hôtes
+confondus. Avant de juger, `canon sync` (et la passe de l'exécuteur) rattrape
+le clone de l'hôte : quand un dernier commit appliqué est inconnu du dépôt,
+les dépôts du canon sont fetchés et le canon relu ; le checkout du clone
+canonique est ensuite avancé à la révision lue (fast-forward seulement). Un
+checkout qui ne peut pas la contenir (clone divergé, modifications locales)
+fait refuser l'écriture des authentificateurs — registre inchangé.
 """
 from __future__ import annotations
 
@@ -435,6 +443,7 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
               "ameesh placement check --agent A" % (tag, host, ", ".join(refused)))
     print(_status_line(host, report.status, report.diagnostic, recorded=True))
     _print_packages(report.packages)
+    _print_mechanics(report.mechanics)
     _print_authenticators(report.authenticators)
     if report.errors:
         print("canon INVALID — %s: the affected agents are not claimable "
@@ -461,6 +470,26 @@ def _print_packages(done) -> None:
         if done.relinked else ""))
     if done.skipped:
         print("  in error: %s (ameesh canon check)" % ", ".join(done.skipped))
+
+
+def _print_mechanics(done) -> None:
+    """#1616 : les paramètres mécaniques compilés du canon appliqué (constat)."""
+    if done is None:
+        return
+    if done.status == "ok":
+        packets = "%d/jour" % len(done.packets) if done.packets else "aucun"
+        print("mechanics (#1616) : cutoffs %s %s; paquets %s; max_in_build %d; CI %s "
+              "(incident %s); families %s"
+              % (", ".join(done.cutoffs), done.timezone, packets, done.max_in_build,
+                 done.ci.get("packet", "?"), done.ci.get("incident_label", "?"),
+                 ", ".join(done.reviews.get("families") or [])))
+    elif done.status == "absent":
+        print("mechanics (#1616) : absent — the strict reader refuses; "
+              "consumers must not fall back (%s)" % done.error)
+    elif done.status == "invalid":
+        print("mechanics (#1616) : INVALID — %s" % done.error)
+    else:
+        print("mechanics (#1616) : no exact canon commit — not compiled")
 
 
 def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:

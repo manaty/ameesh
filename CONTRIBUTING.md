@@ -40,6 +40,13 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
   vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
   jamais annulée par la fusion suivante.
+- **Release : la suite sur une autre classe de système de fichiers** (#748) :
+  la PR de release (branche `release/**` en tête ou en base) rejoue les parts
+  psycopg avec les racines temporaires sur l'autre classe que celle du runner
+  (tmpfs ↔ disque, lue à l'exécution) ; ce job compte alors dans le check
+  « tests ». Un test qui ne tient que sur la classe ordinaire s'y révèle : le
+  corriger à la source (horodatages, renommage entre périphériques, `TMPDIR`),
+  jamais en le relançant.
 - **Concurrence par hôte de la CI** (#899, pilote, 2026-10-13) : l'occupation
   d'un hôte de la flotte `ameesh-ci` est bornée par le nombre de runners de cet
   hôte, fixé par une mesure de capacité (CPU, RAM, disque, PSI ; lot #824), et
@@ -70,6 +77,16 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Historique : git et les PR** (L160a) : la description de la PR dit ce
   qui change et pourquoi ; aucun journal tenu à la main. Les PR fusionnées
   sont liées depuis `docs/design/index.md`.
+- **Rebaser une branche de lot** : `git rebase --continue`, comme
+  `git commit --amend`, ouvre un éditeur dont le nettoyage par défaut retire
+  une ligne commençant par `#` — le sujet `#<lot> …` disparaît et le corps
+  devient le sujet (lot #1277). Rebasez avec
+  `scripts/rebase-lot.sh <arguments de git rebase>` : il passe
+  `core.commentChar=';'` à chaque invocation, `--continue` compris, et
+  signale un sujet perdu après coup. À défaut,
+  `git -c core.commentChar=';' rebase …` et
+  `git -c core.commentChar=';' commit --amend`. Après tout rebasage,
+  contrôlez `git log --format='%s' <base>..HEAD`.
 - **Ajouter plutôt que modifier** (L160a) : on ajoute des fichiers (un module,
   un test, une page, une décision par sujet) plutôt que de modifier un fichier
   commun, pour que deux PR ouvertes en même temps ne se gênent pas à la fusion.
@@ -88,6 +105,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   nouveaux fichiers source.
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
+
+Undecided ideas go to the [exploration inbox](docs/design/explorations/index.md):
+one file per idea, `type: Exploration`, `status: exploration`, with a problem,
+intuitions and open questions. No proposed lots, no dates, no estimates, no
+"done" criterion; no lot, WorkPackage, backlog entry or roadmap line is
+derived from an exploration. Only an explicit owner decision, recorded in
+`docs/design/decisions/`, allows promotion to a study and then to lots. Plan
+and lot cards point to the decided study. The `tests.test_l1124_explorations`
+guard verifies this separation in the repository.
 
 ## Numérotation des versions
 

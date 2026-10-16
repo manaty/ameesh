@@ -22,7 +22,7 @@ class _Base(PgTestCase):
     def lot(self, title, *, assignee=None):
         item = work.add(self.db, title=title, app="nexlink")
         if assignee:
-            work.assign(self.db, item["id"], assignee, cfg=self.cfg)
+            work.assign(self.db, item["id"], assignee, cfg=self.cfg, force="test: lots multiples (#540)")
         return work.get(self.db, item["id"])
 
 

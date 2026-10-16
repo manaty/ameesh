@@ -365,7 +365,7 @@ def restore(cfg: BackupConfig, key: str, home: str, *, env=None, overwrite: bool
 
 USAGE = """\
 ameesh session list <agent> [--host H]            list off-device session backups
-ameesh session backup <agent> [--force]           back up the current session now
+ameesh session backup <agent> [--force] [--home DIR]  back up the current session now
 ameesh session restore <agent> [--session S] [--key K] [--home DIR] [--overwrite]
                                                   [--allow-other-agent]
                                                   restore the latest backup (or K)
@@ -373,17 +373,37 @@ ameesh session restore <agent> [--session S] [--key K] [--home DIR] [--overwrite
 """
 
 
-def _agent_home(cfg, row: dict) -> tuple[str, tuple[str, ...]]:
-    from . import accounts, harnesses
+def _session_patterns(row: dict) -> tuple[str, ...]:
+    """Les motifs de fichiers de session déclarés par le harnais de l'agent."""
+    from . import harnesses
+    descriptor = harnesses.get(row.get("harness") or "")
+    return tuple(getattr(descriptor, "session_files", ()) or ())
+
+
+def _agent_home(cfg, row: dict, agent: str = "") -> str:
+    """Le home du propriétaire, seulement s'il est prouvable (N de relecture #731).
+
+    Le propriétaire est le compte de session inscrit au registre. Seul un
+    profil `config_dir` qui déclare explicitement son `path` prouve son home.
+    Sans profil, pour un compte par défaut (`config_dir` sans `path`) ou pour
+    un profil à clé d'API, `Profile.home()` le prendrait dans l'environnement
+    de l'appelant (`config_env_of`, home par défaut partagé du harnais) : on
+    refuse. `--home` reste la désignation explicite, faite par l'appelant,
+    d'un home qu'il assume.
+    """
+    from . import accounts
     harness = row.get("harness") or ""
-    descriptor = harnesses.get(harness)
-    patterns = tuple(getattr(descriptor, "session_files", ()) or ())
-    profile = accounts.by_name(accounts.profiles(cfg, harness), row.get("session_account"))
-    if profile is not None:
-        return profile.home(), patterns
-    return os.path.abspath(os.path.expanduser(
-        os.environ.get(accounts.config_env_of(harness)) or accounts.default_home_of(harness))), \
-        patterns
+    account = row.get("session_account")
+    profile = accounts.by_name(accounts.profiles(cfg, harness), account)
+    if profile is not None and profile.kind == "config_dir" and profile.path:
+        return profile.home()
+    reason = ("no account profile %s" % (repr(account) if account else "(none)")
+              if profile is None else
+              "account profile %s declares no path" % repr(profile.name))
+    raise BackupError(
+        "cannot prove the home of %s: %s for harness %s "
+        "(use --home to designate the account home)"
+        % (agent or "the session owner", reason, harness or "?"))
 
 
 def key_owner(key: str) -> str:
@@ -395,10 +415,22 @@ def key_owner(key: str) -> str:
     return parts[1]
 
 
+def _same_home(left: str, right: str) -> bool:
+    """True when both paths designate the same directory, symlinks resolved (L731).
+
+    A path that cannot be resolved reads as different: the caller then refuses
+    without `--allow-other-agent`, never guesses."""
+    try:
+        return os.path.realpath(left) == os.path.realpath(right)
+    except (OSError, ValueError):
+        return False
+
+
 def restore_agent(db, cfg, conf, args) -> tuple[str, str, list[str]]:
     """Lock both destination and key owner through extraction; refuse active turns."""
     owner = key_owner(args.key) if args.key else args.agent
-    if owner != args.agent and not getattr(args, "allow_other_agent", False):
+    allow_other = bool(getattr(args, "allow_other_agent", False))
+    if owner != args.agent and not allow_other:
         raise BackupError("backup belongs to %s, not %s: use --allow-other-agent "
                           "for an explicit cross-agent restore" % (owner, args.agent))
     with db.transaction() as tx:
@@ -417,7 +449,25 @@ def restore_agent(db, cfg, conf, args) -> tuple[str, str, list[str]]:
                 raise BackupError("cannot restore an active agent: stop %s first" % agent)
             locked[agent] = row
         row = locked[args.agent]
-        home = args.home or _agent_home(cfg, row)[0]
+        if args.home:
+            home = args.home
+            # L731: an explicit destination home must be the key owner's own
+            # home. Anything else — another agent's home, or a directory whose
+            # owner we cannot prove (N #782) — is a foreign home and needs the
+            # same explicit flag as a foreign key, before any download.
+            if not allow_other:
+                try:
+                    owner_home = _agent_home(cfg, locked[owner], owner)
+                except Exception as exc:  # fail closed: an unprovable home is refused
+                    raise BackupError("cannot identify the home of %s (%s): an explicit "
+                                      "destination home needs --allow-other-agent"
+                                      % (owner, exc)) from exc
+                if not _same_home(home, owner_home):
+                    raise BackupError("destination home %s is not the home of %s: use "
+                                      "--allow-other-agent for an explicit restore into "
+                                      "another home" % (home, owner))
+        else:
+            home = _agent_home(cfg, row, args.agent)
         session = args.session or row.get("session_id")
         key = args.key or latest(conf, agent=args.agent, session=session or "")
         if not key:
@@ -442,10 +492,11 @@ def main(argv) -> int:
     p.add_argument("--force", action="store_true")
     p.add_argument("--session")
     p.add_argument("--key")
-    p.add_argument("--home")
+    p.add_argument("--home", help="account home to use instead of the declared one")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--allow-other-agent", action="store_true",
-                   help="explicitly allow a key owned by another agent; both agents must be idle")
+                   help="explicitly allow a key owned by another agent, or a destination "
+                        "home that is not the key owner's (L731); both agents must be idle")
     args = p.parse_args(rest)
     cfg = load_config()
     try:
@@ -480,7 +531,8 @@ def main(argv) -> int:
         if not row:
             print("ameesh session: unknown agent %s" % args.agent, file=sys.stderr)
             return 2
-        home, patterns = _agent_home(cfg, row)
+        patterns = _session_patterns(row)
+        home = args.home or _agent_home(cfg, row, args.agent)
         if sub == "backup":
             if not row.get("session_id"):
                 print("ameesh session: %s n'a pas de session" % args.agent, file=sys.stderr)

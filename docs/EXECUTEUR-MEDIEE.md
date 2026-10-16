@@ -2,7 +2,8 @@
 
 Contrat figé par le lot L107 (version `1.0.0`, schéma
 `ameesh-exec-contract/1`), complété à l'assemblage de la voie B (version
-`1.1.0`, compatible : voir « Contrat 1.1 »). Étude et décision :
+`1.1.0`, compatible : voir « Contrat 1.1 ») puis par l'expiration médiée des
+fils (version `1.2.0`, compatible : voir « Contrat 1.2 »). Étude et décision :
 `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -15,7 +16,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 63 opérations et la liste des 296 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 64 opérations et la liste des 350 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -58,13 +59,13 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 63 opérations, dont 25 lectures et 38 écritures. 53 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Cinq
-lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
-servies aussi par `session/op`. Le test
+Comptes : 64 opérations, dont 25 lectures et 39 écritures. 54 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Six
+lignes de `op` sont marquées `session: true` (contrats 1.1 et 1.2) : elles
+sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (377
-opérations après intégration de main et de #330) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (414
+opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 `turn_resources.running_started_before` est une lecture de portée H :
@@ -76,12 +77,13 @@ Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
 qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
-l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
-L96), `turn_costs.correct`, `ledger`, `spent_between` (grand livre, L95),
-`operations.assigners`, `latest_gauges` (sous-utilisation, L94),
-`hosts.usage` et `turn_resources.get`. Un exécuteur médié ne fait ni ménage
-local ni passage périodique de ménage : son dossier de travail est effacé en
-fin de bail.
+l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
+`roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
+`spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
+(sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
+`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
+exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
+dossier de travail est effacé en fin de bail.
 
 Les deux opérations de L31b (`leases.hold_note`, `leases.release_hold` :
 l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
@@ -263,6 +265,42 @@ table : aucun écart n'est toléré d'un côté seulement.
   `ScopeError("forbidden_scope")` quand le bail n'appartient pas à
   l'exécuteur ou que l'agent est hors de son invitation. Les commandes
   sont `ameesh host` (serveur) et `ameesh device` (appareil).
+
+## Contrat 1.2
+
+L'expiration des fils d'un exécuteur médié (L361b, #499) ajoute une
+opération, `threads.recount` : le fil est un fichier sur l'appareil,
+l'index (`thread_index`) est sur le serveur. L'appareil réécrit son fichier
+sous son propre verrou, puis cette seule opération verrouille la ligne
+d'index, reprend le census du fichier et l'écrit dans la même transaction.
+L'ajout est compatible : la version passe à `1.2.0` et une sixième ligne de
+`op` est marquée `session: true`.
+
+- **`threads.recount`** (écriture, portée H, sans enveloppe de bail) :
+  `project`, `lot`, `transport`, `host` (forcé à celui de l'exécuteur),
+  `location`, `kept` (entrées gardées), `last` (la plus récente, ou `null`)
+  et `end` (fin logique du fil). Rend le `counted_until` retenu. Un
+  `counted_until` au-delà de `end` (recomptage plus récent) n'est pas
+  repris ; à `end` égal le census n'est repris que s'il ne rallonge pas la
+  ligne (`kept <= entries`) : à fin logique constante, seule une expiration
+  change le fil (elle le raccourcit), donc un census plus long a été lu
+  avant elle et est périmé (L361c). `threads.lock`, `threads.expired` et
+  `threads.indexed` restent refusés : un verrou ne tient pas d'une requête
+  distante à l'autre.
+- **Indexation.** Sur un exécuteur médié, l'entrée qui vient d'être écrite
+  est indexée par le même census absolu que l'expiration (L361c, #877) :
+  l'appareil calcule le census du fichier après l'écriture et le porte par
+  `threads.recount` — un `+1` local ne peut donc plus compter deux fois une
+  entrée déjà reprise par une expiration, ni être effacé par un census plus
+  court arrivé après. La trace dans la boîte (`agent_mailbox.meta`) reste une
+  écriture `threads.index` (`count` faux, portée B, auteur membre du fil) :
+  elle marque la boîte et rafraîchit `location`, jamais `entries` ni
+  `last_*` — une entrée expirée entre-temps ne peut pas revenir par sa trace.
+  Deux requêtes pour une entrée qui porte un message, une seule sinon. Le
+  contrat ne change pas (`threads.recount` et `threads.index` existent tous
+  deux en 1.2.0) ; seule la répartition des écritures change.
+- **Sans connexion, rien n'expire** : `fil expire` refuse et ne touche à
+  aucun fichier ; `--dry-run` liste ce qui expirerait.
 
 ## Porte d'hôte
 
@@ -451,7 +489,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 63 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 64 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

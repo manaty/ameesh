@@ -11,6 +11,8 @@ le reste du code. Un sous-module par sujet :
   chemin d'un descripteur, table des processus (groupes), sous-moissonneur et
   moisson d'un enfant, environnement initial d'un processus (L124) ;
 * `terminal` : le terminal de l'humain ;
+* `notify` : la notification de bureau (L66) — `notify-send` sous Linux,
+  `osascript` sous macOS, toast Windows par `powershell.exe` sous WSL2 ;
 * `host` : mémoire, swap, charge, alimentation, système de fichiers,
   allocation btrfs (#246) ;
 * `offload_shell` : le côté VM du déport (L159b), Linux seulement par

@@ -28,15 +28,23 @@ l'humain. Quatre familles, quatre règles :
 * **Worktrees** : ceux qui APPARAISSENT pendant un tour (diff de `git
   worktree list` avant/après, sous-agents compris) sont enregistrés avec
   l'agent, le tour et le lot — s'ils sont sous le dossier de travail de
-  l'agent ; ceux d'ailleurs (un autre agent qui travaille sur le même dépôt)
-  sont suivis « non attribués » et jamais retirés (L73b). À la fin du lot
-  (fusion ou fermeture), ils sont retirés par `git worktree remove` (jamais
-  forcé) s'ils sont propres, non verrouillés, âgés d'au moins une heure,
-  sans tour en cours de leur agent ni processus dedans, et que leur HEAD est
-  INTÉGRÉ à la branche principale distante (ancêtre, rebase, fusion écrasée :
-  `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés (`worktree_kept`) au
-  responsable. L230: one kept although its lot is merged is removed after 24 h
-  if clean and pushed; its branch stays.
+  l'agent, ou si leur branche (`lot/<id>`, `agent/<nom>-<id>`,
+  `review/<nom>-<id>`) ou leur dossier (`<nom>-<id>`) nomme un lot assigné à
+  cet agent (#1665). Ceux d'ailleurs que rien ne rattache à lui (un autre
+  agent qui travaille sur le même dépôt) sont suivis « non attribués »
+  (L73b) : ils ne partent que par la règle des orphelins ci-dessous. À la fin
+  du lot (fusion ou fermeture), ils sont retirés par `git worktree remove`
+  (jamais forcé) s'ils sont propres, non verrouillés, âgés d'au moins une
+  heure, sans tour en cours de leur agent ni processus dedans, et que leur
+  HEAD est INTÉGRÉ à la branche principale distante (ancêtre, rebase, fusion
+  écrasée : `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés
+  (`worktree_kept`) au responsable. L230: one kept although its lot is merged
+  is removed after 24 h if clean and pushed; its branch stays. #1665 : un
+  worktree orphelin (aucun lot nommé, ou lot fini sans intégration) est
+  retiré après `ORPHAN_WORKTREE_IDLE_S` (24 h) d'inactivité s'il est propre
+  et poussé et qu'aucun agent ne l'utilise (aucun tour, aucun processus
+  dedans) ; ses sorties de build partent d'abord, puis son dossier, par la
+  poubelle journalisée (L230).
 * **Build output of idle worktrees** (L230, [`build_artifacts`]):
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
   with no process of the user inside; never in a main checkout.
@@ -94,8 +102,11 @@ DEFAULT_TMPFS_ALERT = 0.6            # alerte (la contre-pression est à 0,8)
 DEFAULT_ORPHAN_MIN_SIZE = 50 * MIB   # entrée de /tmp signalée au-delà
 #: âge minimal d'un fichier évincé (secondes) : jamais un fichier en écriture
 EVICT_MIN_AGE_S = 3600.0
-#: âge au-delà duquel un worktree SANS lot est retirable par `menage --apply`
-LOTLESS_TTL_S = 7 * 24 * 3600.0
+#: #1665 : inactivité (secondes) d'un worktree orphelin (aucun lot nommé par
+#: sa branche ou son dossier) avant que le ménage ne le retire s'il est
+#: propre et poussé ; owner, 15/10/2026 14:50 (« fais en sorte que les agents
+#: d'ameesh nettoient leurs worktrees »)
+ORPHAN_WORKTREE_IDLE_S = 24 * 3600.0
 #: âge minimal d'un worktree retiré (secondes, depuis son enregistrement ET
 #: depuis la dernière modification de son dossier) : jamais un worktree neuf
 WORKTREE_MIN_AGE_S = 3600.0
@@ -119,6 +130,9 @@ ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
 UNATTRIBUTED_REFRESH_S = 12 * 3600.0
 #: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
 TMP_TOP = 5
+#: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
+#: journal garde le compte total (`others_total`), jamais une liste non bornée
+OTHERS_TOP = 20
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
@@ -1185,6 +1199,18 @@ def _unlink_in_root(path: str, root: str, *, expected=None,
     return freed
 
 
+def _dir_writable(path: str, writable: dict) -> bool:
+    """#762: `path`'s directory lets us unlink it (cached by directory).
+
+    Unlike the ownership test of `_removable`, this is what the kernel
+    enforces: an unlink in a directory we may not write is refused whatever
+    the file's owner."""
+    parent = os.path.dirname(path)
+    if parent not in writable:
+        writable[parent] = os.access(parent, os.W_OK | os.X_OK)
+    return writable[parent]
+
+
 def _removable(path: str, uid: int | None, writable: dict) -> bool:
     """#500: this pass can unlink `path`: owned by us (any owner when the
     platform has no uid) and its directory writable (cached in `writable`)."""
@@ -1194,10 +1220,7 @@ def _removable(path: str, uid: int | None, writable: dict) -> bool:
         return False
     if uid is not None and st.st_uid != uid:
         return False
-    parent = os.path.dirname(path)
-    if parent not in writable:
-        writable[parent] = os.access(parent, os.W_OK | os.X_OK)
-    return writable[parent]
+    return _dir_writable(path, writable)
 
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
@@ -1301,6 +1324,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
         blocked = unremovable > quota
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
+        handled: set = set()          # #1190: dry-run inodes already processed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
             if blocked or counted <= quota:
@@ -1319,6 +1343,12 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 continue               # a `.git` appeared, or a mount point
             if now - mtime < min_age:
                 continue
+            inode = (st.st_dev, st.st_ino)
+            if dry_run and inode in handled:
+                # #1190: separate cache walks yield the inode again, but its
+                # names would already be gone. Mirror apply's `gone` case.
+                counted -= size
+                continue
             # #500: a candidate whose deletion is refused (path no longer in
             # the root, or unlink failed) is reclassified as unremovable and
             # STOPS the eviction: never a more recent file deleted to make up
@@ -1329,8 +1359,26 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 blocked = unremovable > quota
                 failed.append(path)
                 break
-            freed = st.st_nlink == 1   # #530: dry-run, read from the scan's stat
-            if not dry_run:
+            others = [p for p in (scan.get("links") or {}).get(
+                (st.st_dev, st.st_ino), ()) if p != path and _located_in(p, root)]
+            if dry_run:
+                # #762 (codex P2): the dry-run announces what the pass would
+                # do, and the pass removes every name the walk saw before
+                # crediting. The inode is therefore freed exactly when no name
+                # escapes the walk: `st_nlink` counts them all, the walked
+                # ones included. Reading `st_nlink == 1` alone counted a fully
+                # walked inode as unremovable and blocked the dry-run.
+                # A walked name whose directory forbids the unlink would be
+                # refused by the pass, which stops there: predict that stop
+                # rather than crediting the block.
+                if not all(_dir_writable(other, writable) for other in others):
+                    unremovable += size
+                    counted -= size
+                    blocked = unremovable > quota
+                    failed.append(path)
+                    break
+                freed = st.st_nlink == len(set(others)) + 1
+            else:
                 # #500 r6 (codex P2 r5): an inode with hard links is counted
                 # once, but it can still have several names inside the managed
                 # root. Removing only one leaves the bytes in place while
@@ -1339,8 +1387,6 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 # `counted` once none is left. A name that cannot be removed
                 # keeps the whole inode counted, and stops the pass like any
                 # other refused deletion.
-                others = [p for p in (scan.get("links") or {}).get(
-                    (st.st_dev, st.st_ino), ()) if p != path and _located_in(p, root)]
                 kept = False
                 for other in others:
                     try:
@@ -1387,6 +1433,8 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                     failed.append(path)
                     break
             files += 1
+            if dry_run:
+                handled.add(inode)
             if freed:
                 # #530: a name removed from an inode another hard link still
                 # holds frees no byte; only the last link credits the quota.
@@ -1458,7 +1506,13 @@ def tmp_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
             break
         current = ("truncated" if result.get("truncated") else
                    "unremovable" if result.get("unremovable") else None)
-        if current == previous:
+        # #762 (codex P3): `truncated` and `mounts_unreadable` feed the same
+        # `tmp_unscanned` alert; a pass whose mount table was unreadable and
+        # the truncated listing that follows are one episode, so the second
+        # keeps the first's `since` instead of re-announcing the alert.
+        same_episode = current == previous or (
+            previous == "mounts_unreadable" and current == "truncated")
+        if same_episode:
             # #530: same episode (a second truncated listing, or the bytes
             # still there): keep its first observation
             out["since"] = float(data.get("episode_since") or row.get("at_ts") or now)
@@ -2187,6 +2241,69 @@ def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
     return True
 
 
+#: #1665 : branches qui nomment le lot qu'un worktree sert — `lot/<id>[-…]`
+#: (L118b), `work/<id>[-…]`, `agent/<nom>-<id>[-…]`, `review/<nom>-<id>[-…]`.
+#: Le nom de l'agent peut porter un chiffre (`mty-nxl-rel-01`, `deepseek3`) :
+#: sous `lot/` et `work/` l'id est le premier groupe numérique, sous `agent/`
+#: et `review/` le dernier. #1694 : une branche peut citer plusieurs groupes
+#: (`review/claude2-t3-unit-459-460-r2`) ; ils sont essayés dans cet ordre.
+CITED_LOT = re.compile(r"^(lot|work|agent|review)/(.+)$")
+
+
+def cited_lots(branch: str) -> list[int]:
+    """#1694: every lot id a branch name cites, in trial order — first to last
+    under `lot/`/`work/`, last to first under `agent/`/`review/` (the agent
+    name may itself carry a digit, the lot id is the last group there). Empty
+    when the branch cites no number."""
+    found = CITED_LOT.match(branch or "")
+    if not found:
+        return []
+    groupes = [int(part) for part in found.group(2).split("-") if part.isdigit()]
+    return groupes if found.group(1) in ("lot", "work") else list(reversed(groupes))
+
+
+def cited_lot(branch: str) -> int | None:
+    """#1665 : l'id de lot cité par un nom de branche, ou None — le premier
+    candidat de `cited_lots`, pour les appelants qui n'en veulent qu'un."""
+    lots = cited_lots(branch)
+    return lots[0] if lots else None
+
+
+def named_lot(name: str, agent: str) -> int | None:
+    """#1665 : l'id de lot du dossier `<agent>-<id>[-…]` (convention des
+    worktrees de lot), ou None."""
+    if not name or not agent or not name.startswith(agent + "-"):
+        return None
+    found = re.match(r"^(\d+)(?:-|$)", name[len(agent) + 1:])
+    return int(found.group(1)) if found else None
+
+
+def lot_of_worktree(db, agent: str, path: str, branch: str = "") -> str | None:
+    """#1665 : le lot qu'un worktree SERT, quand c'est prouvable : sa branche
+    ou, à défaut, son dossier nomment l'id, et ce lot est assigné à CET agent.
+    Sinon None : le worktree reste non attribué (jamais retiré à ce titre, il
+    suivra la règle des orphelins). Un lot d'un autre agent, inconnu, ou un
+    registre illisible ne prouve rien : None.
+
+    #1694: the branch candidates are tried in `cited_lots` order and the first
+    lot owned by the agent wins; the folder name is only read when the branch
+    cites no number (the #1665 rule)."""
+    if not agent:
+        return None
+    idents = cited_lots(branch)
+    if not idents:
+        nom = named_lot(os.path.basename(os.path.normpath(path)), agent)
+        idents = [nom] if nom is not None else []
+    for ident in idents:
+        try:
+            row = storage.of(db).work.get(ident)
+        except Exception:
+            return None
+        if row and row.get("assignee") == agent:
+            return str(ident)
+    return None
+
+
 def worktree_in_use(path: str) -> bool:
     """Un processus de l'hôte travaille-t-il dans ce worktree (dossier courant
     ou fichier ouvert dedans) ? Lu par la couche plateforme (L63). Si l'OS ne
@@ -2337,26 +2454,40 @@ class Turn:
                 # L73b : `git worktree list` couvre tout le dépôt ; un worktree
                 # d'un autre agent apparu pendant ce tour n'est pas à nous.
                 mine = others is not False and owns_worktree(wt["path"], self.cwd, others)
+                branch = wt.get("branch") or ""
+                served = None
+                if not mine and others is not False:
+                    # #1665 : hors du dossier de l'agent, la branche (ou le
+                    # dossier) nomme le lot, et ce lot lui est assigné : c'est
+                    # le sien, il suivra la fin de ce lot. Un worktree sous le
+                    # dossier d'un AUTRE agent reste au sien (L73b).
+                    ailleurs = any(other and _under(_real(wt["path"]), _real(other))
+                                   for other in others)
+                    if not ailleurs:
+                        served = lot_of_worktree(db, self.agent, wt["path"], branch)
+                        mine = served is not None
                 repo = repo or common_dir(self.cwd)
                 hk = storage.of(db).housekeeping
                 row = hk.register_worktree(
                     host=host, path=wt["path"], repo=repo, agent=self.agent,
-                    lot=lot if mine else None, turn_id=turn_id,
-                    branch=wt.get("branch") or "", head=wt.get("head") or "")
+                    lot=(served or lot) if mine else None, turn_id=turn_id,
+                    branch=branch, head=wt.get("head") or "")
                 if row is None:
                     continue
                 if mine:
                     detail = ("appeared during turn %s (%s); removed at the end of the lot if "
                               "clean and integrated into the main branch"
-                              % (turn_id[:8], wt.get("branch") or "detached"))
+                              % (turn_id[:8], branch or "detached"))
                 else:
                     detail = ("%s: appeared during turn %s (%s) outside the agent's "
-                              "directory; never removed automatically"
-                              % (UNATTRIBUTED, turn_id[:8], wt.get("branch") or "detached"))
+                              "directory; removed once orphaned (clean, pushed, idle for "
+                              "24 h, no agent using it)"
+                              % (UNATTRIBUTED, turn_id[:8], branch or "detached"))
                     hk.set_worktree_status(row["id"], "active", detail)
                 self.entries.append({
                     "kind": "worktree", "action": "registered", "path": wt["path"],
-                    "agent": self.agent, "lot": lot if mine else None, "detail": detail})
+                    "agent": self.agent, "lot": (served or lot) if mine else None,
+                    "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
         found_all = new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
@@ -2452,7 +2583,7 @@ def _mtime(path: str) -> float | None:
         return None
 
 
-def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
+def _worktree_pass(db, host: str, *, dry_run: bool,
                    protected: set[str], now: float,
                    running: set | None = None, artifacts=None,
                    allow=(), lock_path: str | None = None, journal_path: str | None = None,
@@ -2460,49 +2591,65 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
-    tour (jamais un worktree « non attribué »), pas le dossier de travail
-    d'un agent ni un dossier qui en contient un, agent propriétaire sans tour
-    en cours (`running`), au moins `WORKTREE_MIN_AGE_S` depuis son
-    enregistrement et depuis la dernière modification de son dossier, non
-    verrouillé, aucun processus dedans, propre, et HEAD INTÉGRÉ à la branche
-    principale distante (poussé ne suffit pas).
+    tour (ou à un lot que sa branche ou son dossier nomme et qui lui est
+    assigné, #1665), pas le dossier de travail d'un agent ni un dossier qui
+    en contient un, agent propriétaire sans tour en cours (`running`), au
+    moins `WORKTREE_MIN_AGE_S` depuis son enregistrement et depuis la
+    dernière modification de son dossier, non verrouillé, aucun processus
+    dedans, propre, et HEAD INTÉGRÉ à la branche principale distante (poussé
+    ne suffit pas).
 
     L230: a worktree kept although its lot is merged (`LOT_MERGED`, state
     of the lot in ameesh) is removed once kept for more than a day for the
     same reason, if clean, pushed, without ignored files other than build
     output (`artifacts` rules), and with no process of the user inside by
     the strict check of the artifacts (`platform.user_paths`, `allow`);
-    how: `_remove_kept_merged` (host lock `lock_path`, journal
-    `journal_path`, managed roots `skip_roots`)."""
+    how: `_remove_kept_worktree` (host lock `lock_path`, journal
+    `journal_path`, managed roots `skip_roots`).
+
+    #1665 : un worktree orphelin — aucun lot nommé par sa branche ou son
+    dossier — suit la même fin, mais après `ORPHAN_WORKTREE_IDLE_S` (24 h)
+    d'inactivité, propre et poussé (la branche reste) ; c'est le ménage que
+    l'owner a demandé le 15/10 14:50."""
     entries: list[dict] = []
     plan: list[dict] = []
     running = set(running or ())
     store = storage.of(db).housekeeping
     for row in store.worktrees(host, ("active", "kept")):
         path, lot = row["path"], row.get("lot")
-        base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
         if (row.get("detail") or "").startswith((UNATTRIBUTED, UNATTRIBUTED_LEGACY)):
-            if not os.path.isdir(path):
-                plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
-                if not dry_run:
-                    prune_worktrees(row.get("repo") or "")
-                    store.set_worktree_status(row["id"], "gone",
-                                              "directory gone (%s)" % UNATTRIBUTED)
-                    entries.append(dict(base, action="gone", detail="directory gone; "
-                                        "git worktree prune (%s)" % UNATTRIBUTED))
-            else:
-                plan.append(dict(base, action="garde", detail=row.get("detail")))
+            # #1665 : la branche (ou, à défaut, le dossier) d'un worktree
+            # frère nomme le lot qu'il sert ; si ce lot est assigné à l'agent
+            # qui l'a vu apparaître, il suit la fin de son lot au lieu de
+            # rester « non attribué » à jamais.
+            lot = lot_of_worktree(db, row.get("agent") or "", path, row.get("branch") or "")
+        base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
+        if not os.path.isdir(path):
+            plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
+            if not dry_run:
+                prune_worktrees(row.get("repo") or "")
+                store.set_worktree_status(row["id"], "gone",
+                                          "directory gone (%s)" % UNATTRIBUTED)
+                entries.append(dict(base, action="gone", detail="directory gone; "
+                                    "git worktree prune (%s)" % UNATTRIBUTED))
+            continue
+        named = cited_lot(row.get("branch") or "") or named_lot(
+            os.path.basename(os.path.normpath(path)), row.get("agent") or "")
+        if lot is None and named is not None:
+            # A named lot that cannot be attributed is not an orphan: the
+            # lot may be open, belong to another agent, or be unreadable.
+            plan.append(dict(base, action="garde", detail="named lot #%s not attributable"
+                             % named))
             continue
         state = _lot_state(db, lot) if lot else None
         ended = state in LOT_ENDED
-        lotless_due = (include_lotless and not lot
-                       and now - float(row.get("created_ts") or now) >= LOTLESS_TTL_S)
-        if not ended and not lotless_due:
-            plan.append({"path": path, "agent": row["agent"], "lot": lot,
-                         "action": "attend", "detail": "lot %s" % (state or "unknown")
-                         if lot else "no lot"})
+        orphan = lot is None
+        if not ended and not orphan:
+            plan.append(dict(base, action="attend",
+                             detail="lot %s" % (state or "unknown")))
             continue
-        why = ("lot #%s %s" % (lot, state)) if ended else "no lot for more than 7 d"
+        why = ("lot #%s %s" % (lot, state)) if ended else \
+            "no lot named by the branch or the directory (orphan)"
         target = _real(path)
         if any(_under(_real(cwd), target) for cwd in protected):
             plan.append(dict(base, action="garde", detail="an agent's working directory"))
@@ -2513,9 +2660,11 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
             continue
         moments = [float(row.get("created_ts") or now), _mtime(path)]
         youngest = max(m for m in moments if m is not None)
-        if now - youngest < WORKTREE_MIN_AGE_S:
+        floor = ORPHAN_WORKTREE_IDLE_S if orphan else WORKTREE_MIN_AGE_S
+        if now - youngest < floor:
             plan.append(dict(base, action="attend",
-                             detail="%s; created or modified less than an hour ago" % why))
+                             detail="%s; created or modified less than %s ago" % (
+                                 why, "24 h" if orphan else "an hour")))
             continue
         st = worktree_state(path)
         if not st["exists"]:
@@ -2536,12 +2685,24 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
         detail = "%s: kept — %s" % (why, st["reason"])
         # L230: a worktree kept although its lot is merged goes once kept
         # (same reason) for more than a day, if clean and its HEAD is on the
-        # remote: nothing is lost; its branch stays (not merged into main)
-        kept_merged = (state in LOT_MERGED and row["status"] == "kept"
-                       and row.get("detail") == detail and st["clean"] and st["pushed"]
-                       and not st["submodules"]
-                       and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
-        if kept_merged:
+        # remote: nothing is lost; its branch stays (not merged into main).
+        # #1665: an orphan (or a lot that ended without integration) follows
+        # the same end after ORPHAN_WORKTREE_IDLE_S of inactivity, clean and
+        # pushed; the branch stays too.
+        grace = (state in LOT_MERGED and row["status"] == "kept"
+                 and row.get("detail") == detail
+                 and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
+        abandoned = (ended or orphan) and now - youngest >= ORPHAN_WORKTREE_IDLE_S
+        if (grace or abandoned) and st["clean"] and st["pushed"] and not st["submodules"]:
+            idle_before = None if grace else now - ORPHAN_WORKTREE_IDLE_S
+            if idle_before is not None:
+                activity = build_artifacts.survey(path, build_artifacts.rules_of(artifacts),
+                    skip_roots=skip_roots,
+                    budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+                if not activity["complete"] or activity["latest"] > idle_before:
+                    plan.append(dict(base, action="garde", detail="%s; %s" % (
+                        detail, activity["why"] or "worktree active within 24 h")))
+                    continue
             leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts))
             if leftovers is None:
                 hold = "ignored files unreadable (git status --ignored)"
@@ -2556,16 +2717,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
             if hold:
                 plan.append(dict(base, action="garde", detail="%s; %s" % (detail, hold)))
                 continue
-            why = "%s; kept for more than 24 h, clean and pushed" % why
+            why = "%s; %s, clean and pushed" % (
+                why, "kept for more than 24 h" if grace else "idle for more than 24 h")
             if dry_run:
                 size, _whole = build_artifacts.size_of(
                     path, budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
                 plan.append(dict(base, action="retrait", bytes=size, detail=why))
                 continue
-            outcome, freed, note, built = _remove_kept_merged(
+            outcome, freed, note, built = _remove_kept_worktree(
                 path, row.get("repo") or common_dir(path), st["gitdir"], artifacts=artifacts,
                 allow=allow,
-                lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots)
+                lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
+                idle_before=idle_before)
             entries += [dict(base, kind="artifact", detail="%s; %s" % (why, b.pop("detail")),
                              **b) for b in built]
             if outcome in ("garde", "attend"):
@@ -2605,9 +2768,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
     return entries, plan
 
 
-def _remove_kept_merged(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
-                        journal_path, skip_roots=()) -> tuple[str, int, str, list]:
-    """L230: removal of a worktree kept although its lot is merged, under the
+def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
+                          journal_path, skip_roots=(), idle_before: float | None = None
+                          ) -> tuple[str, int, str, list]:
+    """L230/#1665: removal of a kept worktree (lot merged, or orphan), under the
     host lock of the deleting passes (`build_artifacts`). Its build output
     goes first like an idle worktree's (descriptors, journal, `.git`,
     filesystem and managed-root protections); then the tree must be fully
@@ -2667,6 +2831,8 @@ def _remove_kept_merged(path: str, repo: str, gitdir: str, *, artifacts, allow, 
                                        budget=budget)
         if not found["complete"]:
             return "garde", 0, "artifacts: %s" % found["why"], built
+        if idle_before is not None and found["latest"] > idle_before:
+            return "garde", 0, "worktree active within 24 h", built
         if ident is None or found["identity"] != ident:
             return "garde", 0, "directory changed during the pass", built
         for artifact in found["artifacts"]:
@@ -2749,17 +2915,34 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     s'ils portent `ameesh.lot`, une fois le lot fini ; les autres sont
     seulement signalés, avec la commande proposée.
 
+    #1411 : le relevé couvre aussi les conteneurs ARRÊTÉS (`ps -a`) — un
+    conteneur étiqueté sorti ou jamais démarré ne consomme plus de
+    processus, mais retient sa couche et ses volumes anonymes, et restait
+    invisible du ménage comme de la mesure. Une base de test d'un lot ENCORE
+    OUVERT reste gardée jusqu'à la fin du lot (L73) : une photographie de
+    l'état des tours ne prouve pas l'absence d'usage d'un hôte entier, et
+    rien ne l'exclut d'un démarrage de tour qui suivrait le constat (R1
+    #1411). On ne détruit donc pas sur cette photographie.
+
+    #1547 (N4) : ce repli ne réduit pas la pression (couches, swap) des bases
+    de lots encore ouverts — c'est le prix de la sûreté tant qu'un verrou
+    commun avec le démarrage d'un tour n'existe pas ; le relevé `ps -a` les
+    rend au moins visibles et comptées.
+
     Un conteneur étiqueté par un tour INCONNU de cette base, ou d'un autre
     hôte, n'est pas supprimé (signalé). Rend `{entries, plan, ameesh,
-    others}` ; `ameesh`/`others` à None si le moteur ne répond pas."""
-    out: dict = {"entries": [], "plan": [], "ameesh": None, "others": None}
+    others, others_total}` ; `ameesh`/`others` à None si le moteur ne répond
+    pas ; `others` est borné à `OTHERS_TOP` entrées (#1547 N3), le compte
+    total restant dans `others_total`."""
+    out: dict = {"entries": [], "plan": [], "ameesh": None, "others": None,
+                 "others_total": None}
     if runtime is None:
         return out
-    rows = runtime.list_all()
+    rows = runtime.list_all(stopped=True)
     if rows is None:
         return out
     binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
-    ours, others = [], []
+    ours, others, others_total = [], [], 0
     turns = storage.of(db).turn_resources
     for c in rows:
         labels = c.get("labels") or {}
@@ -2767,9 +2950,11 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
         ref = c.get("name") or c.get("id", "")[:12]
         if not turn:
             if only_turn is None:
-                others.append({"id": c.get("id", "")[:12], "name": c.get("name"),
-                               "image": c.get("image"), "status": c.get("status"),
-                               "command": "%s rm -f %s" % (binary, shlex.quote(ref))})
+                others_total += 1
+                if len(others) < OTHERS_TOP:
+                    others.append({"id": c.get("id", "")[:12], "name": c.get("name"),
+                                   "image": c.get("image"), "status": c.get("status"),
+                                   "command": "%s rm -f %s" % (binary, shlex.quote(ref))})
             continue
         if only_turn is not None and turn != only_turn:
             continue
@@ -2808,6 +2993,7 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
             ours.append(dict(base, action="kept", detail=entry["detail"]))
     out["ameesh"] = ours
     out["others"] = others if only_turn is None else None
+    out["others_total"] = others_total if only_turn is None else None
     return out
 
 
@@ -2837,7 +3023,7 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
-             include_lotless: bool = False, now: float | None = None,
+             now: float | None = None,
              runtime=None, artifact_scan: bool = True) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
@@ -2847,6 +3033,9 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       tourne (`busy` faux) ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
+      #1665 : un worktree orphelin (aucun lot nommé, ou lot fini sans
+      intégration) est retiré après 24 h d'inactivité s'il est propre et
+      poussé et qu'aucun agent ne l'utilise ;
     * L230: regenerable build dirs of idle worktrees (`build_artifacts`),
       when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
@@ -3031,7 +3220,6 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         skipped.append("worktrees: registry unreadable, no removal")
     elif policy.worktrees:
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
-                                             include_lotless=include_lotless,
                                              protected=protected, now=now, running=running,
                                              artifacts=policy.artifacts,
                                              allow=policy.unreadable_ok, lock_path=lock_path,
@@ -3080,7 +3268,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                        detail=known.get("detail"))
         top["command"] = "rm -rf -- %s" % shlex.quote(top["path"])
     report_measure["containers"] = {
-        "ameesh": conteneurs["ameesh"], "others": conteneurs["others"]}
+        "ameesh": conteneurs["ameesh"], "others": conteneurs["others"],
+        "others_total": conteneurs["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
     if not dry_run:
@@ -3177,6 +3366,9 @@ def print_report(report: dict) -> None:
         for c in autres:
             print("    %s  %s  (%s)  →  %s" % (c.get("name") or c.get("id"), c.get("image"),
                                               c.get("status") or "?", c["command"]))
+    reste = (conteneurs.get("others_total") or len(autres)) - len(autres)
+    if reste > 0:
+        print("    … %d more not listed (report bounded to %d)" % (reste, OTHERS_TOP))
     orphans = report.get("orphans") or []
     if orphans:
         print("  /tmp entries that appeared during a turn (never deleted by ameesh, except an "
@@ -3235,7 +3427,7 @@ def cmd_housekeeping(cfg, args) -> int:
         actor = getattr(args, "by", "") or "human:%s" % getpass.getuser()
         from . import containers as containers_mod
         report = run_pass(cfg, db, policy, host=host, actor=actor, dry_run=not apply,
-                          busy=busy, include_lotless=apply,
+                          busy=busy,
                           runtime=containers_mod.Runtime.from_config(cfg))
         if getattr(args, "json", False):
             print(json.dumps(dict(report, schema="ameesh-menage/1"), ensure_ascii=False,

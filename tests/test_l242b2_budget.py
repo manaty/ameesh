@@ -92,11 +92,15 @@ class ReserveForfaitTest(_Comptes):
 
 
 class DebutDeFenetreTest(unittest.TestCase):
-    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début
-    (décision du propriétaire du 2026-10-13, option b : « pas de réserve sur
-    une fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) »), et
-    la pause annonce l'heure où le rythme rattrape l'usage, pas la remise à
-    zéro (remarque de l'auditeur)."""
+    """#777 : la réserve de L242b protège la fin d'une fenêtre, pas son début.
+    Décision du propriétaire du 2026-10-13, option b : « pas de réserve sur une
+    fenêtre écoulée à moins de 10 %, plafond = max(écoulé, marge) » — cet
+    énoncé décrit le début de fenêtre, qui s'entend `multiplier × écoulé` face
+    à la marge (`multiplier = 1`, `reserve = 10` ici : à 8 % d'écoulé avec
+    `multiplier = 2` le seuil vaut 16 %, pas 10 % — #1028 P3) ; en fin de
+    fenêtre le seuil vaut `PACE_CEILING − réserve` (80 %), il ne suit plus
+    `max(écoulé, marge)` (#1028 N1). La pause annonce l'heure où le rythme
+    rattrape l'usage, pas la remise à zéro (remarque de l'auditeur)."""
 
     SEPT_JOURS = 7 * 86400.0
 
@@ -409,6 +413,32 @@ class AlerteCritiqueTest(PgTestCase):
         briefs = alert_briefs.briefs(alerte, listing, {}, ["auditeur", "mesh-design"])
         self.assertEqual(sorted(briefs), ["auditeur", "orch"])
         self.assertIn("Critical agent paused on budget", briefs["auditeur"])
+
+    def test_la_pause_budget_ne_reprend_pas_la_date_d_un_autre_blocage(self):
+        # #1521 : `blocked` sur auth depuis 3 h puis `blocked` sur budget
+        # depuis 1 min : la pause budget est datée de 1 min, pas de 3 h ;
+        # l'actualisation du détail (même motif) ne remet pas la date à zéro.
+        registry.set_status(self.db, "mesh-design", "blocked",
+                            status_text="auth_blocked: claude/compte-a")
+        self.db.execute(
+            "UPDATE agent_registry SET status_since = now() - make_interval(secs => %s),"
+            " status_reason_since = now() - make_interval(secs => %s) WHERE name = %s",
+            (3 * HEURE, 3 * HEURE, "mesh-design"))
+        avant = registry.get(self.db, "mesh-design")["status_reason_since_ts"]
+        raison = "pause (account a, five_hour 96 %) until 14:20; all claude accounts at threshold"
+        registre = "%s%s%s" % (budget.PAUSE_PREFIX, budget.CRITICAL_MARK, raison)
+        registry.set_status(self.db, "mesh-design", "blocked", status_text=registre)
+        apres = registry.get(self.db, "mesh-design")["status_reason_since_ts"]
+        self.assertGreater(apres - avant, 2 * HEURE)
+        [alerte] = [a for a in exploitation.alerts(self.cfg, self.db,
+                                                   orchestrators_declared=("orch",))
+                    if a["type"] == "critical_budget_pause"]
+        self.assertLess(time.time() - alerte["since"], 60,
+                        "la pause budget vient de commencer")
+        registry.set_status(self.db, "mesh-design", "blocked",
+                            status_text=registre.replace("96 %", "97 %"))
+        self.assertEqual(registry.get(self.db, "mesh-design")["status_reason_since_ts"],
+                         apres, "même motif : même depuis")
 
 
 class MarqueDeLExecuteurTest(_L30Base):

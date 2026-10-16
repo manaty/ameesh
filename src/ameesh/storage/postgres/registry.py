@@ -46,6 +46,7 @@ AGENT_COLUMNS = """
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
     extract(epoch from status_since)::float8         as status_since_ts,
+    extract(epoch from status_reason_since)::float8  as status_reason_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
@@ -53,7 +54,9 @@ AGENT_COLUMNS = """
     -- #1037 : le harnais, le dossier et l'id d'OUVERTURE de la session ACTIVE
     -- (0384) ; NULL hors d'une session ouverte par l'exécuteur. Le harnais
     -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
-    session_harness, session_cwd, session_origin
+    session_harness, session_cwd, session_origin,
+    operator_paused, operator_pause_reason, operator_pause_by, operator_pause_for,
+    extract(epoch from operator_pause_at)::float8 as operator_pause_ts
 """
 
 
@@ -195,6 +198,12 @@ def name_lock_key(name: str) -> str:
 
 class Agents(interface.Agents):
 
+    def operator_pause(self, name, *, paused, reason, actor, principal) -> dict | None:
+        rows = self.db.query(
+            "SELECT * FROM ameesh_operator_pause(%s, %s, %s, %s, %s)",
+            (name, paused, reason, actor, principal))
+        return rows[0] if rows else None
+
     def upsert(self, name, *, chantier, harness, host, cwd, session_id, status,
                status_text, model, budget_usd, mode=None) -> dict:
         # L37 (0030) : `mode` ne vaut qu'à l'INSERT — un agent existant
@@ -303,9 +312,12 @@ class Agents(interface.Agents):
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
-                   responsible, team, provider, credential_mode, capabilities, canon_ref,
+                   responsible, team, projects, provider, credential_mode, capabilities,
+                   canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    mode, stop_reason, canon,
+                   p.operator_paused, p.operator_pause_reason, p.operator_pause_by,
+                   p.operator_pause_for, p.operator_pause_ts,
                    __GOVERNED__ AS canon_governed,
                    (SELECT s.status FROM canon_state s WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_status,
@@ -317,6 +329,12 @@ class Agents(interface.Agents):
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
                    __CLAIM_OK__ AS canon_claim_ok
             FROM agent_mesh_overview o
+            LEFT JOIN LATERAL (
+                SELECT operator_paused, operator_pause_reason, operator_pause_by,
+                       operator_pause_for,
+                       extract(epoch from operator_pause_at)::float8 AS operator_pause_ts
+                  FROM agent_registry WHERE name = o.name
+            ) p ON true
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("o"))
@@ -845,7 +863,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, pending_prompt, lease_owner, lease_epoch,
+                SELECT name, status, handoff_fenced, operator_paused, pending_prompt, lease_owner, lease_epoch,
                        lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
@@ -859,6 +877,7 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.pending_prompt IS NOT NULL
+               AND NOT verrou.operator_paused
                AND NOT verrou.handoff_fenced
                AND ameesh_host_claims_open(r.host)
                AND verrou.status <> 'stopped'
@@ -873,7 +892,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, handoff_fenced, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, handoff_fenced, operator_paused, lease_owner, lease_epoch, lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -883,6 +902,7 @@ class Leases(interface.Leases):
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
                AND NOT verrou.handoff_fenced
+               AND NOT verrou.operator_paused
                AND ameesh_host_claims_open(r.host)
                AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
@@ -901,6 +921,8 @@ class Leases(interface.Leases):
                        ELSE current_prompt || E'\n\n' || pending_prompt
                    END,
                    current_prompt = NULL,
+                   status = CASE WHEN operator_paused AND status = 'running'
+                                 THEN 'queued' ELSE status END,
                    updated_at = now()
              WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
                AND current_prompt IS NOT NULL
@@ -938,21 +960,33 @@ class Leases(interface.Leases):
 
 class PendingSpend(interface.PendingSpend):
 
-    def put(self, name, start_index, turn, model) -> bool:
+    def put(self, name, start_index, turn, model, work_item_id=None, turn_id=None) -> bool:
+        return self.put_get(name, start_index, turn, model,
+                            work_item_id=work_item_id, turn_id=turn_id) is not None
+
+    def put_get(self, name, start_index, turn, model,
+                work_item_id=None, turn_id=None) -> dict | None:
+        """Return THIS marker in its write, before any replacement can change it."""
         rows = self.db.query(
             """
-            INSERT INTO spend_pending (agent, start_index, turn, model, created_at)
-            VALUES (%s, %s, %s, %s, now())
+            INSERT INTO spend_pending (agent, start_index, turn, model, work_item_id,
+                                       turn_id, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (agent) DO UPDATE SET
-                start_index = excluded.start_index,
-                turn        = excluded.turn,
-                model       = excluded.model,
-                created_at  = now()
-            RETURNING agent
+                start_index  = excluded.start_index,
+                turn         = excluded.turn,
+                model        = excluded.model,
+                work_item_id = excluded.work_item_id,
+                turn_id      = excluded.turn_id,
+                created_at   = now()
+            RETURNING agent, start_index, turn, model, work_item_id, turn_id,
+                      extract(epoch from created_at)::float8 as created_ts
             """,
-            (name, int(start_index), turn, model),
+            (name, int(start_index), turn, model,
+             None if work_item_id is None else int(work_item_id),
+             turn_id or None),
         )
-        return bool(rows)
+        return rows[0] if rows else None
 
     def set_model(self, name, model) -> bool:
         rows = self.db.query(
@@ -964,7 +998,7 @@ class PendingSpend(interface.PendingSpend):
     def get(self, name) -> dict | None:
         rows = self.db.query(
             """
-            SELECT agent, start_index, turn, model,
+            SELECT agent, start_index, turn, model, work_item_id, turn_id,
                    extract(epoch from created_at)::float8 as created_ts
               FROM spend_pending WHERE agent = %s
             """,
@@ -975,4 +1009,13 @@ class PendingSpend(interface.PendingSpend):
     def clear(self, name) -> bool:
         rows = self.db.query("DELETE FROM spend_pending WHERE agent = %s RETURNING agent",
                              (name,))
+        return bool(rows)
+
+    def clear_if(self, name, created_ts) -> bool:
+        """#1469 : efface le marqueur seulement s'il est encore celui de ce tour
+        (même `created_ts`) — jamais celui d'un remplaçant, en une instruction."""
+        rows = self.db.query(
+            "DELETE FROM spend_pending WHERE agent = %s"
+            " AND abs(extract(epoch from created_at)::float8 - %s) < 0.0000005"
+            " RETURNING agent", (name, float(created_ts)))
         return bool(rows)

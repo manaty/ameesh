@@ -10,9 +10,11 @@ jalon, action liée, message lié (`agent_mailbox.work_item_id`). Un lot
 (`closed`, L29) sans activité depuis un seuil (défaut 6 h ; `--stale-after`,
 `AMEESH_STALE_AFTER`).
 
-L368: a future planned start or an explicit open commitment/plan dependency
-on another open lot defers stagnation; `planned_waits` resolves those sources
-for all three views, without interpreting notes or changing activity.
+L368: a future planned start, an explicit open commitment/plan dependency on
+another open lot, or a dated external hold (`gate:<name>` in a commitment's
+`depends_on`, ended by its due day) defers stagnation; `planned_waits` resolves
+those sources for all three views, without interpreting notes or changing
+activity.
 
 **Attente** (`waiting`) : `{what, who, label}`, déduite de l'état, des jalons
 (L10, lus par `progress._jalons_de_lot`) et des actions, jamais inventée
@@ -22,7 +24,8 @@ for all three views, without interpreting notes or changing activity.
    réconciliation (`unknown`) — passe avant tout (`merge-approval`,
    `merge-outcome` pour la fusion `git-merge`, `decision` sinon) ;
 2. `waiting_human` → `decision` (du responsable de la fiche du lot) ;
-3. un verdict `blocked` POSTÉRIEUR au dernier gel → `fix` (l'auteur) ;
+3. un verdict `blocked` portant sur le dernier gel (même SHA, même quand le
+   gel a été renouvelé après l'avis) → `fix` (l'auteur) ;
 4. puis selon l'état : `start`, `build`, `unblock`, `verdict`, `merge`.
 
 `waiting_for` (forme d'origine de L26, champ du même nom de `ameesh-alert/1`)
@@ -83,10 +86,14 @@ def stale_after(text: str | None = None, env: dict | None = None) -> float:
 # --------------------------------------------------------------------------
 
 def last_activity(item: dict, events: Iterable[dict] = (), milestones: Iterable[dict] = (),
-                  actions: Iterable[dict] = (), messages_ts: float | None = None
-                  ) -> float | None:
-    """Dernière activité : ligne du lot, transition ou note, jalon, action, message."""
-    stamps = [item.get("updated_ts"), item.get("created_ts"), messages_ts]
+                  actions: Iterable[dict] = (), messages_ts: float | None = None,
+                  events_ts: float | None = None) -> float | None:
+    """Dernière activité : ligne du lot, transition ou note, jalon, action, message.
+
+    `events_ts` porte le dernier instant du journal quand `events` ne contient
+    que les transitions (`lot_transitions`) : une note récente ne doit pas
+    disparaître de l'activité (#1647)."""
+    stamps = [item.get("updated_ts"), item.get("created_ts"), messages_ts, events_ts]
     stamps += [e.get("created_ts") for e in events]
     stamps += [m.get("at_ts") for m in milestones]
     stamps += [a.get("updated_ts") or a.get("created_ts") for a in actions]
@@ -268,36 +275,48 @@ def waiting_for(item: dict, events: Iterable[dict], milestones: Iterable[dict],
 # lecture groupée (alerte stale_lot, work list, progress)
 # --------------------------------------------------------------------------
 
-def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict]:
+def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict, dict]:
     events: dict = {}
     milestones: dict = {}
     actions: dict = {}
     messages: dict = {}
+    last_events: dict = {}
     if ids:
-        for ev in st.progress.lot_events(ids):
+        # #1647 : les vues groupées ne lisent que les transitions ; le texte
+        # des notes (des mégaoctets) n'est ni transféré ni recopié, et le
+        # dernier instant du journal vient d'une agrégation.
+        for ev in st.progress.lot_transitions(ids):
             events.setdefault(int(ev["work_item_id"]), []).append(ev)
+        for row in st.progress.lot_event_last(ids):
+            last_events[int(row["work_item_id"])] = float(row["last_ts"])
         for ms in st.progress.lot_milestones(ids):
             milestones.setdefault(int(ms["work_item_id"]), []).append(ms)
         for act in st.progress.lot_actions(ids):
             actions.setdefault(int(act["work_item"]), []).append(act)
         for row in st.progress.lot_messages(ids):
             messages[int(row["work_item_id"])] = row.get("last_ts")
-    return events, milestones, actions, messages
+    return events, milestones, actions, messages, last_events
 
 
 def describe(db, rows: list[dict], *, now: float | None = None,
              threshold: float = DEFAULT_THRESHOLD_S,
              open_items: list[dict] | None = None) -> dict[int, dict]:
     """Pour chaque lot (lignes de `work_items`) : `{waiting, waiting_for,
-    last_activity_ts, stale}`. Une lecture groupée, aucune requête par lot."""
+    last_activity_ts, project, stale}`. `project` (#705, lu par
+    `projects.lot_project`) : le projet du lot, dont l'orchestrateur est
+    prévenu quand un lot en qa n'a pas de relecteur désigné. Une lecture
+    groupée, aucune requête par lot."""
     from . import progress  # import tardif : progress importe ce module
+    from . import projects
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
     ids = [int(r["id"]) for r in rows]
     packages = {p["id"]: p for p in st.packages.all(include_absent=True)}
-    states, externals = agent_availability(db)
-    events, milestones, actions, messages = _grouped(st, ids)
+    agents = st.progress.agents(None)
+    states, externals = availability_of(agents)
+    agent_projects = {r["name"]: projects.agent_project(r) for r in agents}
+    events, milestones, actions, messages, last_events = _grouped(st, ids)
     from . import planned_waits
     from . import work_dependencies
     dependencies = work_dependencies.grouped(db, ids)
@@ -307,16 +326,18 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     for row in rows:
         rid = int(row["id"])
         acts = actions.get(rid, [])
+        package = packages.get(row.get("package_id")) or {}
         jalons = progress._jalons_de_lot(row, events.get(rid, []), acts, milestones.get(rid))
         detail = with_availability(
             waiting(row, jalons, acts,
-                    responsible=(packages.get(row.get("package_id")) or {}).get(
-                        "responsible")),
+                    responsible=package.get("responsible")),
             states, externals)
         last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
-                             messages.get(rid))
+                             messages.get(rid), events_ts=last_events.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
+                    "project": projects.lot_project(row, agent_projects,
+                                                    package_team=package.get("team")),
                     "planned_wait": holds.get(rid),
                     "dependencies": dependencies.get(rid, []),
                     "stale": None if rid in holds else
@@ -329,8 +350,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     """Les lots ouverts inactifs depuis au moins `threshold_s` secondes.
 
     Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
-    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26) et `waiting`
-    (`{what, who, label}`, L29)."""
+    `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26), `waiting`
+    (`{what, who, label}`, L29) et `project` (#705 : le projet du lot, dont
+    l'orchestrateur est prévenu quand aucun relecteur n'est désigné)."""
     from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
@@ -359,5 +381,6 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "idle_s": int(now - float(row["last_activity_ts"])),
             "waiting_for": info["waiting_for"],
             "waiting": info["waiting"],
+            "project": info.get("project"),
         })
     return out[:max(0, int(limit))]

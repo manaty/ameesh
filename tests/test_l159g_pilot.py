@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -17,6 +19,12 @@ from .support import REPO, PgTestCase
 
 GUEST = os.path.join(REPO, "deploy", "guest")
 GIB = 1024 ** 3
+# #1601: the pilot's guard accepts a path only when every character is in
+# [A-Za-z0-9/._-] and no component goes through a symbolic link. A host
+# TMPDIR may fail both (an agent's …/<agent>~<id>, a symlinked /tmp): the
+# fixture then failed on the machine instead of testing the script (canon §3).
+# The install fixtures take this fixed, resolved parent instead of TMPDIR.
+FIXED_TMP = os.path.realpath("/var/tmp")
 
 
 def unit(name: str) -> dict[str, list[str]]:
@@ -103,6 +111,12 @@ class InstallPilotTest(unittest.TestCase):
     SCRIPT = os.path.join(GUEST, "install-pilot.sh")
 
     def setUp(self):
+        # #1601: the fixtures take a fixed, resolved parent (FIXED_TMP): the
+        # guard rightly refuses an agent TMPDIR (…/<agent>~<id>) and any
+        # symlinked path, so a fixture built from TMPDIR tested the machine.
+        # tempfile's default is restored after each test.
+        self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+        tempfile.tempdir = FIXED_TMP
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.host = os.path.realpath(tmp.name)
@@ -167,6 +181,61 @@ class InstallPilotTest(unittest.TestCase):
                         out.index("systemctl enable --now ameesh-guard.service"))
         # no guest runner is started by the install
         self.assertNotIn("+ systemctl enable --now ameesh-guest-runner@", out)
+
+    def test_offload_only_installs_the_guard_without_runner_nor_secret(self):
+        # #193 (L159h, b1 on the CI VM, decision #47757): the guard and its
+        # gate for install.sh --gate file; no guest runner, no agent, no
+        # secrets file: offloaded jobs carry no secret
+        res = self.dry("--allow-rootfs", "--offload-only")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn('"max_agents": 0', out)
+        self.assertIn("systemctl enable --now ameesh-guard.service", out)
+        self.assertIn("ameesh-gate.tmpfiles.conf", out)
+        self.assertNotIn("ameesh-guest-runner@.service (", out)
+        self.assertNotIn("guest.env", out)
+        self.assertNotIn("guest-deepseek", out)
+        self.assertIn("install.sh --gate file", out)
+        # the full pilot still writes them (the switch is what removes them)
+        out = self.dry("--allow-rootfs").stdout
+        self.assertIn("ameesh-guest-runner@.service (", out)
+        self.assertIn("/etc/ameesh/guest-deepseek6.env (0640 root:ameesh-guest)", out)
+
+    def test_offload_only_ignores_a_harness_on_path(self):
+        bindir = self.on_host("/opt/harness/bin")
+        harness = os.path.join(bindir, "dsh")
+        with open(harness, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(harness, 0o755)
+        res = self.dry("--allow-rootfs", "--offload-only",
+                       PATH=bindir + os.pathsep + os.environ["PATH"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("ameesh-guest-runner@.service.d", res.stdout)
+        self.assertNotIn("Environment=PATH=", res.stdout)
+
+    def test_offload_only_refuses_agents(self):
+        for args in (["--agent", "deepseek5"], ["--path", "/opt/node/bin"],
+                     ["--max-agents", "2"], ["--enable", "deepseek5"], ["--disable", "deepseek5"]):
+            with self.subTest(args=args):
+                res = self.dry("--allow-rootfs", "--offload-only", *args)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("--offload-only", res.stderr)
+        res = self.dry("--allow-rootfs", "--offload-only", "--max-agents", "0")
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_offload_only_check_wants_no_secret(self):
+        with open(os.path.join(self.host, "etc", "passwd"), "a", encoding="utf-8") as fh:
+            fh.write("ameesh-guest:x:998:998::/srv/ameesh-guest/home:/bin/bash\n")
+        out = self.run_script("--check", "--host", "vm-test", "--offload-only").stdout
+        self.assertIn("ok   no /etc/systemd/system/ameesh-guest-runner@.service (--offload-only)", out)
+        self.assertNotIn("AMEESH_DSN", out)
+        self.assertNotIn("git-credential-guest", out)
+        self.on_host("/etc/ameesh/guest.env", "AMEESH_DSN=x\n")
+        self.on_host("/etc/systemd/system/ameesh-guest-runner@.service", "[Service]\n")
+        out = self.run_script("--check", "--host", "vm-test", "--offload-only").stdout
+        self.assertIn("FAIL /etc/ameesh/guest.env present: a secrets file on a b1 host", out)
+        self.assertIn("FAIL /etc/systemd/system/ameesh-guest-runner@.service present: "
+                      "a guest runner on a b1 host", out)
 
     def test_the_dry_run_reads_the_test_host_only(self):
         # mesh-design #436: the tests never read the machine they run on
@@ -885,6 +954,82 @@ class InstallPilotTest(unittest.TestCase):
                       "holds a secret", out)
         self.assertNotIn(self.TOKEN, out)
 
+    def test_check_reports_the_volume_tree(self):
+        # L1586: --check reads the volume's modes and owners, so a layout that
+        # a reinstall no longer reopens is seen instead of repaired in silence
+        self.guest_user()
+        root = "/srv/ameesh-guest"
+        for d in ("", "/home", "/tmp", "/work"):
+            os.chmod(self.on_host(root + d), 0o700 if d else 0o2710)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("ok   %s (2710 " % root, out)
+        for d in ("home", "tmp", "work"):
+            self.assertIn("ok   %s/%s (700 " % (root, d), out)
+        # a tree reopened by hand is said, never silently repaired
+        os.chmod(self.host + root + "/home", 0o755)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL %s/home is 755 " % root, out)
+        self.assertIn("expected 700 and ameesh-guest's own", out)
+        # a volume the install never made: said too
+        os.rmdir(self.host + root + "/work")
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL missing %s/work" % root, out)
+        # the root may be a hand-made layout (2710 here); a world-writable
+        # one is a defect, not a layout (dev2 R2 N1)
+        os.chmod(self.host + root, 0o777)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("FAIL %s is 777 " % root, out)
+        self.assertIn("world-writable", out)
+
+    def test_check_accepts_the_job_users_home(self):
+        # L159b2 through deploy/guest/install.sh: $ROOT/home is the job user's
+        # passwd home (--job-user, a name --check does not know), so its owner
+        # is accepted there; tmp and work stay the guest's alone.
+        root = "/srv/ameesh-guest"
+        with open(os.path.join(self.host, "etc", "passwd"), "a", encoding="utf-8") as fh:
+            fh.write("ameesh-guest:x:998:998::%s/home:/bin/bash\n" % root)
+            fh.write("ameesh-job:x:%d:%d::%s/home:/bin/bash\n"
+                     % (os.getuid(), os.getgid(), root))
+        for d in ("", "/home", "/tmp", "/work"):
+            os.chmod(self.on_host(root + d), 0o700 if d else 0o2710)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        # the tree is the test's uid: not the guest's (998), but the job
+        # user's, whose passwd home is exactly $ROOT/home
+        self.assertIn("ok   %s/home (700 " % root, out)
+        self.assertIn("the job user's home, L159b2", out)
+        for d in ("tmp", "work"):
+            self.assertIn("FAIL %s/%s is 700 " % (root, d), out)
+        self.assertIn("not owned by ameesh-guest (uid 998)", out)
+
+    def test_a_fresh_tree_under_a_setgid_root_is_created_700(self):
+        # R1 #1586: step 1's own command, replayed for real under a 2710 root
+        # (no chmod by hand: install -d -m 0700 leaves 2700 there, which
+        # --check refuses). The witness reads the modes back, then --check
+        # accepts what the install just made.
+        self.guest_user()
+        root = "/srv/ameesh-guest"
+        self.on_host(root)
+        os.chmod(self.host + root, 0o2710)
+        res = self.dry()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        for d in ("home", "tmp", "work"):
+            line = next(l for l in out.splitlines()
+                        if l.startswith("+ install -d -m ")
+                        and l.endswith(" %s/%s" % (root, d)))
+            # the guest exists in the test's passwd only, mapped to the test's
+            # uid/gid; the command is replayed with those, nothing else changed
+            cmd = line[2:].replace("-o ameesh-guest -g ameesh-guest",
+                                   "-o %d -g %d" % (os.getuid(), os.getgid()))
+            subprocess.run(shlex.split(cmd.replace(root, self.host + root)),
+                           check=True, capture_output=True)
+        for d in ("home", "tmp", "work"):
+            made = self.host + root + "/" + d
+            self.assertEqual(stat.S_IMODE(os.stat(made).st_mode), 0o700, made)
+        out = self.run_script("--check", "--host", "vm-test").stdout
+        for d in ("home", "tmp", "work"):
+            self.assertIn("ok   %s/%s (700 " % (root, d), out)
+
     def test_uninstall_removes_the_helper(self):
         res = self.dry("--uninstall")
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -925,6 +1070,11 @@ class InstallPilotTest(unittest.TestCase):
         # codex #383 r1 P1, P2: one record per directory the script creates,
         # written before it; a directory that is there is not recorded
         with tempfile.TemporaryDirectory() as tmp:
+            # #1587: the script compares --root and the records as resolved
+            # paths; without this, a TMPDIR reached through a symbolic link
+            # (/tmp, /var on some systems) makes the fixture fail on the
+            # machine instead of testing the script.
+            tmp = os.path.realpath(tmp)
             root = os.path.join(tmp, "guest")
             os.makedirs(os.path.join(root, "home"))
             res = self.dry("--allow-rootfs", "--root", root)
@@ -934,17 +1084,42 @@ class InstallPilotTest(unittest.TestCase):
             self.assertNotIn("guest-tree %s/home'" % root, out)
             for d in ("tmp", "work"):
                 rec = out.index("record 'guest-tree %s/%s'" % (root, d))
-                self.assertLess(rec, out.index("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/%s"
+                self.assertLess(rec, out.index("install -d -m 00700 -o ameesh-guest -g ameesh-guest %s/%s"
                                                % (root, d)))
             # the test's host has no /opt/ameesh/venv
             self.assertLess(out.index("record 'venv-tree /opt/ameesh/venv'"),
                             out.index("python3 -m venv /opt/ameesh/venv"))
+
+    def test_an_existing_volume_tree_is_never_reopened(self):
+        # L1586: a reinstall creates what is missing and leaves what is there:
+        # a 2710 root (L159b's layout), or a home given to the guest, keeps
+        # its mode and owner; the check reads them instead (below).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "guest")
+            for d in ("", "home", "tmp"):
+                os.makedirs(os.path.join(root, d), exist_ok=True)
+            os.chmod(root, 0o2710)
+            res = self.dry("--allow-rootfs", "--root", root)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout
+            self.assertNotIn("install -d -m 0755 %s\n" % root, out)
+            for d in ("home", "tmp"):
+                self.assertNotIn("install -d -m 00700 -o ameesh-guest -g ameesh-guest %s/%s\n"
+                                 % (root, d), out)
+                self.assertNotIn("guest-tree %s/%s'" % (root, d), out)
+                # what a reinstall keeps is said at step 1, not only at --check
+                self.assertIn("%s/%s exists: kept as is (" % (root, d), out)
+            # only the missing one is created, and recorded before it
+            self.assertIn("record 'guest-tree %s/work'" % root, out)
+            self.assertIn("install -d -m 00700 -o ameesh-guest -g ameesh-guest %s/work\n" % root,
+                          out)
 
     def test_purge_removes_only_the_recorded_paths(self):
         # codex #383 r1 P1: the absolute paths recorded, never /home, /tmp,
         # /work nor the --root of the command line; the last created first
         with tempfile.TemporaryDirectory() as tmp:
             made = os.path.join(tmp, "guest")
+            made = os.path.realpath(made)   # records are compared resolved (#1587)
             for d in ("work", "tmp", "home"):
                 os.makedirs(os.path.join(made, d))
             state = os.path.join(tmp, "pilot-install.state")
@@ -974,6 +1149,7 @@ class InstallPilotTest(unittest.TestCase):
         # codex #383 r2 P1: a file where a directory goes is refused before
         # any record (a purge would delete it)
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)   # --root is compared resolved (#1587)
             root = os.path.join(tmp, "guest")
             os.makedirs(root)
             with open(os.path.join(root, "work"), "w") as fh:
@@ -1182,6 +1358,56 @@ class InstallPilotTest(unittest.TestCase):
             else:
                 self.assertEqual(res.returncode, 0, (args, res.stderr))
 
+
+    def test_ci_vm_runbook_commands_run(self):
+        # PILOT-ci-vm.md (#193, b1 only): its offer is valid and its
+        # install-pilot.sh commands, dry run, never prepare an agent
+        import re
+        import shlex
+        from ameesh import capacity_guard
+        with open(os.path.join(GUEST, "PILOT-ci-vm.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        offer_text = re.search(r"```json\n(.*?)```", text, re.S).group(1)
+        offer, problems, unknown = capacity_guard.parse_lend(json.loads(offer_text))
+        self.assertEqual((problems, unknown), ([], []))
+        # the runners' services stay active between jobs: no busy_units (R1 cx1)
+        self.assertNotIn("busy_units", offer["reclaim"])
+        # install.sh caps the offloaded jobs, not the guard: same values
+        caps = shlex.split(re.search(r'CAPS="([^"]*)"', text).group(1))
+        caps = dict(zip(caps[::2], caps[1::2]))
+        gib = 1024 ** 3
+        self.assertEqual(int(caps["--slots"]) * offer["agent_memory_max"] // gib,
+                         offer["memory_max"] // gib)
+        self.assertEqual(int(caps["--memory-max"].rstrip("G")), offer["memory_max"] // gib)
+        self.assertEqual(int(caps["--job-memory-max"].rstrip("G")),
+                         offer["agent_memory_max"] // gib)
+        self.assertEqual(float(caps["--cpu-share"]) * 16, offer["cpu_max"])  # 16 vCPU
+        self.assertEqual(len(re.findall(r"sudo deploy/guest/install\.sh (?:--dry-run )?--gate file \$CAPS",
+                                        text)), 2)
+        self.assertTrue(all(w.endswith("Europe/Paris") for w in offer["windows"]))
+        offer_file = os.path.join(self.host, "offer.json")
+        with open(offer_file, "w", encoding="utf-8") as fh:
+            fh.write(offer_text)
+        text = re.sub(r"\\\n\s*", "", text)
+        commands = []
+        for line in text.splitlines():
+            m = re.search(r"sudo deploy/guest/install-pilot\.sh([^`#|]*)", line)
+            if m:
+                commands.append(shlex.split(m.group(1).replace("[--purge]", "")))
+        self.assertGreaterEqual(len(commands), 5)
+        for args in commands:
+            self.assertIn("--offload-only", args + (["--offload-only"] if "--uninstall" in args else []))
+            args = [{"<vm>": "vm-test", "<offer.json>": offer_file}.get(a, a)
+                    for a in args if a != "--dry-run"]
+            if "--host" not in args:
+                args = ["--host", "vm-test", *args]
+            res = self.run_script("--allow-rootfs", *args) if "--lend" in args \
+                else self.run_script(*args)
+            if "--check" in args:
+                self.assertNotIn("install-pilot.sh:", res.stderr, args)
+            else:
+                self.assertEqual(res.returncode, 0, (args, res.stderr))
+                self.assertNotIn("guest-deepseek", res.stdout)
 
 def reading(ts, **over):
     row = {"sampled_ts": float(ts), "mem_available_bytes": 8 * GIB, "swap_used_bytes": 0,

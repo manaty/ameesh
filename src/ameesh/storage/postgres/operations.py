@@ -18,6 +18,7 @@ from typing import Any
 from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
+from .work import has_reviewer
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
@@ -82,7 +83,8 @@ class Operations(interface.Operations):
         today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
-            SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
+            SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
                    r.turn_grace_seconds,
@@ -97,6 +99,8 @@ class Operations(interface.Operations):
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
                    extract(epoch from r.lease_expires_at)::float8 AS lease_expires_ts,
                    extract(epoch from r.status_since)::float8     AS status_since_ts,
+                   -- #1521 : le début du motif affiché (status_text), pas du statut
+                   extract(epoch from r.status_reason_since)::float8 AS status_reason_since_ts,
                    extract(epoch from r.last_turn_at)::float8     AS last_turn_ts,
                    extract(epoch from r.updated_at)::float8       AS updated_ts,
                    extract(epoch from r.restart_requested_at)::float8 AS restart_requested_ts,
@@ -336,6 +340,7 @@ class Operations(interface.Operations):
     #: WHERE, qui peut lui-même porter un `%s`.
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   w.priority, w.app, w.workstream, __REVIEWER__,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
@@ -355,7 +360,13 @@ class Operations(interface.Operations):
             """
 
     def _lots_activity(self, where, params) -> list[dict]:
-        return self.db.query(self._LOTS_ACTIVITY % where, params)
+        # #705 : `w.reviewer` n'existe qu'après la migration 0421 ; avant elle,
+        # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
+        reviewer = ("w.reviewer" if has_reviewer(self.db)
+                    else "''::text AS reviewer")
+        return self.db.query(
+            self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where,
+            params)
 
     def open_lots_activity(self, limit) -> list[dict]:
         return self._lots_activity(
@@ -370,8 +381,9 @@ class Operations(interface.Operations):
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
-               " input_tokens, cached_input_tokens, output_tokens,"
-               " extract(epoch from recorded_at)::float8 AS recorded_ts"
+               " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " extract(epoch from recorded_at)::float8 AS recorded_ts,"
+               " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
                " AND void_reason IS NULL")
         params: list = [float(since_s)]

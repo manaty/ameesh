@@ -39,12 +39,15 @@ done
 IMAGE=${AMEESH_PG_IMAGE:-postgres:17}
 NOM=${AMEESH_PARTS_NOM:-ameesh-pg-part-$$}
 SORTIE=$(mktemp -d "${TMPDIR:-/tmp}/ameesh-parts-XXXXXX")
+# config vide des tests (#1127), créée plus bas et supprimée par nettoyer (#1145)
+CONFIG_TMP=""
 
 CONTENEURS=()
 PIDS=()
 nettoyer() {
   for pid in "${PIDS[@]}"; do pkill -P "$pid" 2>/dev/null || true; kill "$pid" 2>/dev/null || true; done
   for c in "${CONTENEURS[@]}"; do docker rm -f -v "$c" >/dev/null 2>&1 || true; done
+  if [ -n "$CONFIG_TMP" ]; then rm -f -- "$CONFIG_TMP" || true; fi
 }
 trap nettoyer EXIT
 trap 'echo "interrompu" >&2; exit 130' INT TERM
@@ -80,9 +83,11 @@ echo "${#CONTENEURS[@]} base(s) prête(s) ; journaux dans $SORTIE"
 
 # --- environnement des tests (comme scripts/test.sh) --------------------------
 export AMEESH_REQUIRE_DB=1
-# fichier VIDE mais existant : un chemin explicite absent est refusé (#1127)
-AMEESH_CONFIG="$(mktemp "${TMPDIR:-/tmp}/ameesh-config-vide-XXXXXX")"
-printf '{}\n' > "$AMEESH_CONFIG"
+# fichier VIDE mais existant : un chemin explicite absent est refusé (#1127) ;
+# nettoyer le supprime à la sortie, quel que soit le code de retour (#1145)
+CONFIG_TMP="$(mktemp "${TMPDIR:-/tmp}/ameesh-config-vide-XXXXXX")"
+printf '{}\n' > "$CONFIG_TMP"
+AMEESH_CONFIG="$CONFIG_TMP"
 export AMEESH_CONFIG
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 unset DEEPSEEK_API_KEY AMEESH_DEEPSEEK_API_BASE AMEESH_DSN AGENT_MESH_DSN

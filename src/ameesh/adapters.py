@@ -754,7 +754,14 @@ class ClaudeStream(StreamReader):
             if event.get("session_id") and principal:
                 out["session"] = event["session_id"]
             if event.get("is_error"):
-                out["error"] = event.get("subtype") or "harness error"
+                # #1397 : un `result` marqué `is_error` est le texte du CLI
+                # (canal fournisseur), pas le dernier message libre du modèle.
+                # Il entre donc dans `error`, que `rate_limit.classify` lit —
+                # un quota Claude n'apparaît que là. Un `result` non marqué
+                # reste ignoré du classement.
+                sous_type = event.get("subtype") or "harness error"
+                texte = str(event.get("result") or "").strip()
+                out["error"] = "%s: %s" % (sous_type, texte) if texte else sous_type
         return out
 
 
@@ -1179,6 +1186,10 @@ class HarnessAdapter:
             # outils voisins d'un harnais mise) est aussi visible du harnais
             base = out.get("PATH") or os.environ.get("PATH") or os.defpath
             out["PATH"] = os.pathsep.join([*prepend, base])
+        if self.key == "deepseek" and platform.is_linux():
+            from . import deepseek_cgroup
+            out["NODE_OPTIONS"] = deepseek_cgroup.node_options(
+                out.get("NODE_OPTIONS", os.environ.get("NODE_OPTIONS", "")))
         return out
 
     # -- lecture -----------------------------------------------------------
