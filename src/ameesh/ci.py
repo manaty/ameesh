@@ -893,7 +893,8 @@ class Watcher:
                     # la queue ci-dessous rend ses échecs et son verdict
                     out += self._follow(db, repo, run, lots, bases)
                     row = st.ci.run(repo, run_id)
-                    if row is None or row.get("status") != "running":
+                    if row is None or row.get("status") != "running" \
+                            or int(row.get("run_attempt") or 1) != attempt:
                         continue  # tête remplacée, ou ligne non rouverte
                 else:
                     # même attempt : la liste en retard (#828) redit terminée
@@ -1273,7 +1274,10 @@ class Watcher:
         to = recipient_of(lot)
         if not to:
             # sans destinataire, aucun message ne portera jamais ces lignes :
-            # seules les nouvelles sont journalisées, pas toutes à chaque passe
+            # seules les nouvelles sont journalisées, pas toutes à chaque passe.
+            # #1612 : une ligne préinscrite sous l'attempt suivant n'est donc
+            # pas rejournalisée à sa réouverture sans destinataire. Elle reste
+            # en base pour ci.main_red ; aucun marqueur de courrier n'est créé.
             own = [f for f in own if (f["part"], f["test"]) in fresh]
             return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                      "tests": [f["test"] for f in own], "to": None}] if own else []
@@ -1339,6 +1343,11 @@ class Watcher:
             run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
         if (run.get("status") or "") != "completed":
             return []  # en attente d'un runner, ou relancée : au prochain relevé
+        # Le détail GitHub porte le dernier attempt, même si la réouverture
+        # a été refusée (tête plus récente sur la branche, #1612). Son verdict
+        # ne doit jamais conclure une autre tentative encore suivie en base.
+        if int(run.get("run_attempt") or 1) != int(row.get("run_attempt") or 1):
+            return []
         status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
         if not st.ci.conclude(repo, int(row["run_id"]), status):
             return []

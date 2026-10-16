@@ -750,7 +750,7 @@ class WatcherTest(PgTestCase):
         self.assertEqual(self.watcher.tick(self.db), [])
         # fin de l'attempt 2 : verdict, la ligne ne reste pas figée
         self.api.live = []
-        self.api.done[801] = {"status": "completed", "conclusion": "failure"}
+        self.api.done[801] = completed(".github/workflows/tests.yml", "failure", attempt=2)
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "failure")])
         row = storage.of(self.db).ci.run(DEPOT, 801)
@@ -817,7 +817,8 @@ class WatcherTest(PgTestCase):
                          [("tests.test_b.T.test_2", 2)])
         # le verdict ne charge que l'attempt courant ; test_1 reste en base
         # (son message d'attempt 1 est toujours retirable)
-        self.api.live, self.api.done[811] = [], {"status": "completed", "conclusion": "failure"}
+        self.api.live = []
+        self.api.done[811] = completed(".github/workflows/tests.yml", "failure", attempt=2)
         self.watcher.tick(self.db)
         verdict = self.mails("dev-a")[-1]["body"]
         self.assertIn("red, 1 failure(s)", verdict)
@@ -1275,7 +1276,7 @@ class WatcherTest(PgTestCase):
         """Le verdict situe la suite et l'attempt relancé (#901, #1110)."""
         self.api.workflows = ["backend-suite.yml"]
         sha = "3" * 40
-        self.api.live = [run_view(960, sha, "lot/1-un", workflow="backend-suite.yml")]
+        self.api.live = [run_view(960, sha, "lot/1-un", workflow="backend-suite.yml", attempt=2)]
         self.watcher.tick(self.db)
         self.api.live = []
         self.api.done[960] = completed(".github/workflows/backend-suite.yml", "success",
@@ -1486,6 +1487,34 @@ class WatcherTest(PgTestCase):
         # un seul verdict par tentative : le passage suivant ne double rien
         self.assertEqual(watcher.tick(self.db), [])
         self.assertEqual(len(self.mails("dev-a")), 2)
+
+    def test_verdict_d_un_autre_attempt_ne_conclut_pas_la_ligne(self):
+        """#1612 : le dernier état GitHub ne conclut jamais un autre attempt,
+        au rattrapage comme au relevé normal d'une ligne encore running."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        st = storage.of(self.db)
+        for index, (catchup, tracked) in enumerate(((False, 1), (True, 1),
+                                                   (False, 3), (True, 3))):
+            with self.subTest(catchup=catchup, tracked=tracked):
+                run_id = 1040 + index * 2
+                sha = "%040x" % run_id
+                # Sur main les anciennes têtes restent running. La tête plus
+                # récente empêche reopen_run de rouvrir celle-ci à l'attempt 2.
+                st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main",
+                               event="push", base="main", work_item_id=self.lot_main["id"],
+                               url=None, workflow="tests.yml", run_attempt=tracked)
+                st.ci.open_run(DEPOT, run_id + 1, head_sha="%040x" % (run_id + 1),
+                               branch="main", event="push", base="main",
+                               work_item_id=None, url=None, workflow="tests.yml")
+                self.api.done[run_id] = completed(".github/workflows/tests.yml", "success",
+                                                  attempt=2)
+                self.api.terminated = [self.terminated(run_id, sha, "main",
+                                                       conclusion="success", attempt=2)] \
+                    if catchup else []
+                self.assertEqual(watcher.tick(self.db), [])
+                row = st.ci.run(DEPOT, run_id)
+                self.assertEqual((row["status"], row["run_attempt"]), ("running", tracked))
+                self.assertEqual(self.mails("dev-b"), [])
 
     def test_echec_de_l_attempt_suivant_inscrit_avant_la_reouverture(self):
         """#1573 N2 : une liste en retard (#828) peut publier un échec de
