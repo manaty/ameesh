@@ -239,6 +239,19 @@ que pour une session **de ce modèle** ; un modèle inconnu l'ignore, et
 `accounts list` les montre tous (la ligne d'état peut donc être retenue par un
 seau de modèle).
 
+Un relevé ne date pas de son écriture : un `rate_limit_event` ne porte aucun
+instant, et le dater au `mtime` du journal faisait passer la dernière mesure
+d'un agent arrêté pour une mesure fraîche (incident du 13/10 : seven_day 67 %
+a écrasé 87 % et l'admission est passée sous le plafond). Chaque relevé Claude
+porte donc sa **provenance** : l'instant de production — le ts du marqueur du
+tour qui l'a publié, absent pour un flux sans marqueur — et le journal
+d'origine. Un relevé dont une fenêtre était déjà close quand le tour a
+commencé est un **rejeu** du harnais : il reste lisible (la fenêtre échue vaut
+0 %, L71) mais n'est pas daté et ne remplace jamais une mesure datée. Les
+lecteurs départagent par instant de production, jamais par l'heure
+d'insertion ; l'historique partagé (0434) complète la lecture locale d'un
+exécuteur, fenêtre par fenêtre, quand un autre état a publié plus frais.
+
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
 premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire

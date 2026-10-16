@@ -81,7 +81,9 @@ l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
 `roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
 `spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
 (sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.
-`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même. Un
+`housekeeping.latest_by_path`, ajouté après la 1.6.x, est refusé de même, et
+`operations.gauge_latest` (#1132 : provenance des relevés, instant de
+production et source) avec lui. Un
 exécuteur médié ne fait ni ménage local ni passage périodique de ménage : son
 dossier de travail est effacé en fin de bail.
 

@@ -98,7 +98,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity state_lots_activity turns record_gauges
-                   gauge_history latest_gauges assigners record_balance balances
+                   gauge_history latest_gauges gauge_latest assigners
+                   record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    lot_sessions    switch listing actionable note_wake purge
    budgets         limits put events
@@ -2790,22 +2791,36 @@ class Operations(Domain):
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:
         """Ajoute les relevés de jauge (harness, key, used, resets_at,
-        window_s, et `account` facultatif — L30, 0028) qui CHANGENT le dernier
-        relevé de leur jauge (du même compte), ou dont le dernier relevé a plus
-        de dix minutes. Rend le nombre de lignes."""
+        window_s, `account` facultatif — L30, 0028, `produced_at` et `source`
+        facultatifs — #1132, 0434) qui CHANGENT le dernier relevé de leur jauge
+        (du même compte), ou dont le dernier relevé a plus de dix minutes. Rend
+        le nombre de lignes. `produced_at` (epoch) est l'instant de PRODUCTION
+        du relevé, NULL quand le flux ne le date pas ; `source` nomme le
+        journal d'origine."""
 
     @abc.abstractmethod
     def gauge_history(self, *, since_s: float, harness: str | None,
                       account: str | None = None) -> list[dict]:
         """Relevés des `since_s` dernières secondes, dans l'ordre
-        chronologique : harness, key, used, resets_at_ts, window_s,
-        observed_ts, account (L30 ; None sans comptes). `account` filtre."""
+        chronologique d'insertion : harness, key, used, resets_at_ts, window_s,
+        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132) et
+        account (L30 ; None sans comptes). `account` filtre."""
 
     @abc.abstractmethod
     def latest_gauges(self, *, since_s: float) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
-        observé dans les `since_s` dernières secondes : harness, key, used,
-        resets_at_ts, window_s, observed_ts, account (None sans comptes)."""
+        observé dans les `since_s` dernières secondes, choisi par instant de
+        PRODUCTION (#1132 : `produced_at` d'abord, NULL en dernier, puis
+        `observed_at`) : harness, key, used, resets_at_ts, window_s,
+        observed_ts, produced_ts, source, account (None sans comptes)."""
+
+    @abc.abstractmethod
+    def gauge_latest(self, *, harness: str, account: str) -> list[dict]:
+        """#1132 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
+        sans limite d'âge : le plus récent par instant de production
+        (`produced_at` d'abord, NULL en dernier), puis par insertion — harness,
+        key, used, resets_at_ts, window_s, observed_ts, produced_ts, source,
+        account. Aucune ligne pour un compte inconnu."""
 
     @abc.abstractmethod
     def assigners(self, *, since_s: float) -> list[str]:
