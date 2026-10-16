@@ -165,16 +165,19 @@ def extract(repo: str, commit: str, dest: str) -> None:
 
 
 def selector_env(root: str, home: str) -> dict:
-    """L'environnement du sélecteur : minimal, jamais celui de l'hôte.
+    """Keep the selector's environment minimal, without host tokens or DSNs.
 
-    Le sélecteur vient de l'arbre du dépôt (commit épinglé de la cible), pas
-    de la configuration de l'hôte : il ne voit ni les jetons, ni les DSN, ni
-    les variables d'outillage de la session qui l'exécute. `PATH` (lancer
-    `node`), `HOME` et `TMPDIR` (un répertoire temporaire supprimé avec
-    l'arbre) et `GITHUB_WORKSPACE` (la racine extraite, comme le job de plan)
-    suffisent au contrat."""
-    return {"PATH": os.environ.get("PATH") or os.defpath, "HOME": home,
-            "TMPDIR": home, "GITHUB_WORKSPACE": root, "LC_ALL": "C"}
+    PATH finds the runtime; HOME and TMPDIR stay in the temporary tree.
+    LD_LIBRARY_PATH keeps relocated runtimes working: Actions Python has a
+    RUNPATH under /opt/hostedtoolcache, so removing the runtime library path
+    can load the system libpython alongside a different stdlib and crash
+    instead of rejecting invalid JSON (#1938).
+    """
+    env = {"PATH": os.environ.get("PATH") or os.defpath, "HOME": home,
+           "TMPDIR": home, "GITHUB_WORKSPACE": root, "LC_ALL": "C"}
+    if os.environ.get("LD_LIBRARY_PATH"):
+        env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+    return env
 
 
 def _plan_file(path: str, plan) -> tuple:
