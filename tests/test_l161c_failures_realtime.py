@@ -446,8 +446,8 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["tests"], o["urgent"]) for o in out],
                          [(["tests.test_b.T.test_2"], False)])
-        # fin de l'exécution : verdict rouge, urgent (#795 : la fin de CI
-        # préempte le tour en cours)
+        # fin de l'exécution : verdict rouge, ordinaire (#514 : la fin de CI
+        # réveille l'agent, elle ne perce pas le tour en cours)
         self.api.live = []
         self.api.done[201] = {"status": "completed", "conclusion": "failure"}
         out = self.watcher.tick(self.db)
@@ -456,7 +456,7 @@ class WatcherTest(PgTestCase):
         self.assertEqual(len(mails), 3)
         verdict = mails[-1]
         self.assertIn("red, 2 failure(s)", verdict["body"])
-        self.assertTrue(mail.is_urgent(verdict))
+        self.assertFalse(mail.is_urgent(verdict))
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 201)["status"], "failure")
         # ameesh ci status
         report = ci.status_of(self.db, self.lot["id"])
@@ -472,8 +472,8 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["status"], o["to"]) for o in out], [("success", "dev-a")])
         self.assertIn(": green.", self.mails("dev-a")[0]["body"])
-        # #795 : le verdict vert aussi perce le tour en cours
-        self.assertTrue(mail.is_urgent(self.mails("dev-a")[0]))
+        # #514 : le verdict vert réveille l'agent, il ne perce pas son tour
+        self.assertFalse(mail.is_urgent(self.mails("dev-a")[0]))
 
     def test_annulee_sans_message(self):
         self.api.live = [run_view(203, "e" * 40, "lot/1-un")]
@@ -1629,8 +1629,10 @@ class WatcherTest(PgTestCase):
         (verdict,) = self.mails("dev-a")
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 802)["verdict_message_id"],
                          verdict["id"])
-        self.assertTrue(self._interrupt_allowed(
-            mail.unread_urgent(self.db, "dev-a")[-1]))
+        # #514 : le verdict reste ordinaire, même publié avec sa preuve — il
+        # réveille l'agent, il ne préempte pas son tour.
+        self.assertFalse(mail.is_urgent(verdict))
+        self.assertEqual(mail.unread_urgent(self.db, "dev-a"), [])
 
 
 if __name__ == "__main__":

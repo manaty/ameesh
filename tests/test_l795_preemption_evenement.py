@@ -3,8 +3,8 @@
 
 Le chemin de préemption existe (courrier `urgent` → `interrupt_allowed` →
 `request_preempt`, tour coupé), mais il était inerte : `AMEESH_INTERRUPT_SENDERS`
-vide partout, et le verdict de CI partait ordinaire (`urgent=False`), donc
-« fin de CI » n'ouvrait jamais de tour prioritaire.
+vide partout, et l'urgent d'un événement système (`ameesh`) n'était pas
+vérifiable en base.
 
 Règles vérifiées ici :
 
@@ -15,8 +15,10 @@ Règles vérifiées ici :
   bien assigné à cet agent, et ce courrier est celui que la CI a posé pour
   cette exécution (première alerte ou verdict). Un `--from ameesh` imité avec
   un payload `ci` ne préempte donc rien (même garde que L317c) ;
-- la première alerte d'échec et le verdict (vert ou rouge) partent urgents
-  (témoin côté `ci.Watcher` dans test_l161c_failures_realtime).
+- la **première alerte d'échec** part urgente (témoin côté `ci.Watcher` dans
+  test_l161c_failures_realtime) ; le verdict reste ordinaire (#514 : il
+  réveille l'agent sans couper son tour). La garde accepte aussi la référence
+  d'un verdict : elle vérifie la provenance, pas l'urgence.
 """
 from __future__ import annotations
 

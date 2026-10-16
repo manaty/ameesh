@@ -477,9 +477,10 @@ courrier les rappelle) :
   avant de continuer (build cassé sur la branche commune, fusion à arrêter,
   question sans laquelle il tourne à vide). De l'owner (`human:*`) ou d'un
   expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même
-  un tour en cours : à réserver aux vraies urgences. Depuis #795, la fin de CI
-  d'un lot (première alerte, verdict vert ou rouge) est elle-même un urgent
-  vérifié en base qui interrompt le tour de l'agent du lot.
+  un tour en cours : à réserver aux vraies urgences. Depuis #795, la première
+  alerte d'échec d'un lot est elle-même un urgent vérifié en base qui
+  interrompt le tour de l'agent du lot ; le verdict (vert ou rouge), lui,
+  réveille sans couper (#514).
 * **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
   prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
   l'équipe, rarement.

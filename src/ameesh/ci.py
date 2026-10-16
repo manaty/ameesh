@@ -41,12 +41,14 @@ L125 :
   hérité ;
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
   fenêtre de 90 s du courrier) ;
-* verdict (vert, ou rouge avec la liste) : un événement **urgent** (#795) —
-  la fin de CI perce le tour en cours ; le courrier et la référence qui le
-  rend vérifiable (`ci_runs.verdict_message_id`) sont publiés dans la même
-  transaction (#795 N2) ; rien pour une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
-  d'autres workflows de la même tête tournent encore, le dit — un vert de
-  `backend-suite.yml` n'est pas « la CI est verte » ;
+* verdict (vert, ou rouge avec la liste) : un événement ordinaire (#514 : la
+  fin de CI réveille l'agent, elle ne perce pas le tour en cours ; le rouge
+  perce déjà par la première alerte d'échec) ; le courrier et la référence qui
+  le rend vérifiable (`ci_runs.verdict_message_id`) sont publiés dans la même
+  transaction (#795 N2) ; rien pour une exécution annulée ou remplacée ; le
+  verdict nomme le workflow et, quand d'autres workflows de la même tête
+  tournent encore, le dit — un vert de `backend-suite.yml` n'est pas « la CI
+  est verte » ;
 * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
   de la base (la cible de la PR, sinon main ; pour main, l'exécution
   précédente de main) n'est jamais imputé à l'auteur : pas d'urgent, une ligne
@@ -952,14 +954,14 @@ class Watcher:
                           "attempt": int(view.get("run_attempt") or 1),
                           "failures": len([f for f in failures if not f.get("inherited")]),
                           "inherited": len([f for f in failures if f.get("inherited")])}}
-        # #795 : la fin de CI est un événement qui perce le tour en cours
-        # (0018 §2) — le verdict (vert ou rouge) part urgent, comme la première
-        # alerte d'échec. L'exécuteur ne le préempte que s'il est vérifiable en
-        # base (`interrupt_allowed` : exécution relevée + lot de l'agent).
-        # #795 N2 : le courrier du verdict et `verdict_message_id` dans la même
-        # transaction, sans quoi un relevé intercalé refuse la préemption.
+        # #514 : la fin de CI réveille l'agent (événement ordinaire), elle ne
+        # perce pas le tour en cours ; le rouge perce déjà par la première
+        # alerte d'échec, urgente et vérifiable en base (`interrupt_allowed`).
+        # #795 N2 : le courrier du verdict et `verdict_message_id` restent
+        # publiés dans la même transaction (un relevé intercalé ne voit jamais
+        # l'un sans l'autre).
         message_id = _send_posed(
-            db, to, text, text, lot=lot["id"], payload=payload, urgent=True,
+            db, to, text, text, lot=lot["id"], payload=payload, urgent=False,
             pose=lambda st, mid: st.ci.set_message(repo, int(row["run_id"]),
                                                    "verdict", mid))
         return [{"action": "verdict", "repo": repo, "run_id": row["run_id"], "status": status,
