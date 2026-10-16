@@ -313,17 +313,18 @@ class AbandonDbTest(_Systeme, PgTestCase):
         return menage.run_pass(self.cfgl, self.db, kw.pop("policy", self.pol), host="pc",
                                actor="t", now=time.time() + decalage, **kw)
 
-    def _sonde_teneurs_disponible(self) -> None:
+    def _sans_doute_d_un_tiers(self) -> None:
         """L63b : quand un processus du même utilisateur cache ses fichiers
-        ouverts (gpg-agent non dumpable, #1749), la sonde ne peut ni nommer un
-        détenteur ni prouver qu'il n'y en a plus : le ménage garde alors toute
-        entrée (« holders unreadable », fail-closed). Les décisions de
-        suppression ne sont pas observables sur un tel hôte — on le dit, sans
-        relâcher le garde-fou."""
-        try:
-            platform.holders(self.sys)
-        except platform.NotAvailable as exc:
-            self.skipTest("fichiers ouverts d'un tiers illisibles (L63b) : %s" % exc)
+        ouverts (gpg-agent non dumpable, #1749), la sonde ne peut pas prouver
+        qu'aucun détenteur ne reste et le ménage garde toute entrée (« holders
+        unreadable », fail-closed) — garde-fou témoigné par test_l63_platform.
+        Ici, ce sont les décisions du ménage qu'on observe : le doute d'un tiers
+        de l'hôte, étranger au test, est neutralisé pour qu'elles ne dépendent
+        pas de l'hôte ; la détection réelle (fichier ouvert, dossier courant)
+        reste en jeu."""
+        patch = mock.patch.object(platform.process, "_settle", lambda *a, **k: None)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _en_tour(self, agent: str) -> None:
         """`agent` en tour sur l'hôte « pc » : statut running, bail vivant."""
@@ -449,7 +450,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertEqual(recents, {heures, jours})
 
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
-        self._sonde_teneurs_disponible()
+        self._sans_doute_d_un_tiers()
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
                         capture_output=True)
@@ -491,7 +492,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn("tmp_orphan", types)
 
     def test_garde_fous(self):
-        self._sonde_teneurs_disponible()
+        self._sans_doute_d_un_tiers()
         ouvert = os.path.join(self.sys, "ouvert")
         sale = os.path.join(self.sys, "clone-sale")
         homonyme = os.path.join(self.sys, "recree")
@@ -546,7 +547,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
                             for a in alertes))
 
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
-        self._sonde_teneurs_disponible()
+        self._sans_doute_d_un_tiers()
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
         self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main),
