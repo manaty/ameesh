@@ -135,10 +135,18 @@ class ReservationTest(PgTestCase):
         self.assertEqual(self.ops.land_lock(self.key, self.owner, 1800, epoch=newer), newer)
 
     def test_new_namespace_is_not_silently_substituted_for_the_held_key(self):
-        with mock.patch.object(land, "lock_key", return_value="nexlink:develop"):
+        # #1374 normalizes target aliases in `land.lock_key`: the lease held
+        # here stays in the legacy namespace (raw target) that deployment must
+        # reconcile, while the installed function returns the canonical form.
+        # The port must not silently substitute that new key for the held one.
+        legacy = "%s:%s" % (self.project.name, self.target)
+        self.assertNotEqual(legacy, self.key)
+        self.assertTrue(self.ops.land_unlock(self.key, self.owner, self.epoch))
+        self.epoch = self.ops.land_lock(legacy, self.owner, 1800)
+        with mock.patch.object(land, "lock_key", return_value=self.key):
             with self.assertRaisesRegex(reservation.ReservationError, "missing"):
                 self.ticket()
-        self.assertIsNone(self.ops.land_lock(self.key, "ordinary-writer", 1800))
+        self.assertIsNone(self.ops.land_lock(legacy, "ordinary-writer", 1800))
 
     def test_invalid_ticket_or_time_never_writes_a_lease(self):
         for over in ({"epoch": None}, {"epoch": True}, {"branch": "agent/lot"},

@@ -1513,6 +1513,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "merge-pr":   # REL-11 (#1003) : fusion hors API gh
             from . import merge_pr
             return merge_pr.run(cfg, db, args)
+        if args.work_command == "fire":   # #1374 : le feu du pilote au gel
+            from . import fire
+            return fire.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -2857,8 +2860,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms = work_sub.add_parser(
         "milestone", help="declare a timeline milestone (freeze, verdict) — R19")
     pw_ms.add_argument("id", type=int)
-    pw_ms.add_argument("kind", choices=list(work.MANUAL_KINDS),
-                       help="frozen (branch frozen) or verdict (review delivered)")
+    # le feu (#1374) a sa propre commande (`ameesh work fire`) : lui seul
+    # contrôle qu'il porte sur le gel courant et retire l'auto-fusion.
+    pw_ms.add_argument("kind", choices=["frozen", "verdict"],
+                       help="frozen (branch frozen) or verdict (review delivered); "
+                            "the pilot's fire is `ameesh work fire`")
     pw_ms.add_argument("--sha", default="", help="the frozen or reviewed commit")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
@@ -2881,6 +2887,8 @@ def build_parser() -> argparse.ArgumentParser:
     land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
     from . import merge_pr
     merge_pr.add_parser(work_sub, cmd_work)  # fusion hors API gh (REL-11, #1003)
+    from . import fire
+    fire.add_parser(work_sub, cmd_work)  # feu du pilote au gel (#1374)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
