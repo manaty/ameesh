@@ -62,7 +62,9 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   équipe. L'agent le prend s'il figure parmi les projets déclarés de sa fiche
   (`projects`, L243) ; hors du projet primaire, il faut en plus que son
   dossier de travail pour ce projet soit prêt (#811), sinon le lot reste en
-  file et une note le dit, une fois par lot.
+  file et une note nominative le dit, sans doublon pour le même agent sur le
+  lot — chaque agent qui le tente peut poser la sienne tant que #1538 n'a pas
+  ramené la note à une par lot.
 * Équipe du lot : la sienne, sinon celle de sa fiche (ou de la fiche
   parente), sinon son application. Elle ne choisit plus le preneur : elle
   désigne les orchestrateurs prévenus et sert au personnel et aux alertes. Un
