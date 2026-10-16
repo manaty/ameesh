@@ -110,7 +110,8 @@ class TrainAdmissionsTest(PgTestCase):
         def git(*args):
             return subprocess.check_output(["git", "-C", self.tmp, *args], env=env,
                                            text=True, stderr=subprocess.PIPE).strip()
-        git("init", "-q")
+        # Enrollment creates main at base after these commits.
+        git("init", "-q", "-b", "fixture")
         def commit(content):
             with open(os.path.join(self.tmp, "content"), "w") as fh:
                 fh.write(content)

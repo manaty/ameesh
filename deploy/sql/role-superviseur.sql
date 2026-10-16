@@ -53,6 +53,11 @@
 --       executor_tokens.token_sha256, executor_invitations.code_sha256,
 --       executor_assertion_jti.jti, executors.public_key, .device_attestation,
 --       exec_idempotency.response
+--   * #1467 (0442) : plans de train et reçus rejouables ; tables entièrement
+--     fermées aux deux rôles superviseurs, sans nouveau GRANT :
+--       integration_trains.*, integration_train_fires.*,
+--       integration_train_queue_receipts.*
+--       provenance_receipts.* (#1465, 0445, préalable du train)
 --   * empreinte d'un identifiant de connexion (#210) — SHA-256 tronqué d'un
 --     jeton de rafraîchissement ou d'une clé : ne le révèle pas, mais
 --     reconnaîtrait un jeton fuité ; inutile à la supervision :
