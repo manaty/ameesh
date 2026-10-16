@@ -47,7 +47,7 @@ import re
 import math
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Iterator, Sequence
 
 from . import config as config_mod
 from . import harnesses
@@ -260,6 +260,11 @@ class Gauge:
     #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
     #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
     read_at: float | None = None
+    #: #1580 (tranche 3) : le modèle auquel ce seau est propre (le `title` du
+    #: widget omarchy, ex. « Fable Weekly » → « fable »), '' pour une fenêtre
+    #: générale. Un seau propre à un modèle ne compte que pour une session de
+    #: ce modèle (`accounts.gauges_of`) ; l'affichage les montre tous.
+    scope: str = ""
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
@@ -813,26 +818,41 @@ class CostBook:
         except OSError:
             return ""
 
-    def events(self, agent: str, start: int = 0, tail: bool = False) -> list:
-        """Les événements JSONL d'un agent, à partir de la ligne `start`."""
+    def events(self, agent: str, start: int = 0, tail: bool = False,
+               end: int | None = None) -> list:
+        """Les événements JSONL d'un agent, de la ligne `start` (incluse) à la
+        ligne `end` (exclue ; None = fin du flux).
+
+        #2096 : le flux est lu **en flux**, jamais chargé entier. Un journal de
+        200 Mo rendait une liste de tous ses événements (pic de plusieurs
+        centaines de Mo par lecture, et plusieurs lectures par tour) alors
+        qu'un tour n'en veut que la tranche ; les lignes hors de la tranche
+        sont comptées en C, jamais analysées, et la lecture reprend à l'octet
+        de `start`. Avec `tail`, seule la fin du fichier est lue et les index
+        partent du début de cette fin (inchangé)."""
         path = os.path.join(self.agent_dir(agent), "events.jsonl")
-        raw = _read_tail(path) if tail else _read_all(path)
-        out = []
-        for index, line in enumerate(raw.splitlines()):
-            if index < start:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue
-            # Un `[]` ou un `null` est une ligne JSON valide mais pas un événement :
-            # la garder ferait planter le premier `.get` venu (sonde codex2).
-            if isinstance(event, dict):
-                out.append(event)
-        return out
+        if tail:
+            return _parse_events(_read_tail(path).splitlines(), start, end)
+        try:
+            with open(path, "rb") as flux:
+                offset = _byte_offset_of_line(flux, start)
+                if offset is None:
+                    return []
+                fin = None if end is None else _byte_offset_of_line(flux, end)
+                if fin is not None and fin <= offset:
+                    return []  # tranche vide (end <= start)
+                flux.seek(offset)
+                brut = flux.read() if fin is None else flux.read(fin - offset)
+        except OSError:
+            return []
+        # la tranche lue est exactement [start, end) : tout ce qu'elle contient
+        # est dans la tranche, et un octet invalide écarte sa ligne (JSON
+        # illisible) au lieu de faire échouer toute la lecture. Coupée sur
+        # "\n" seul, comme le compte de l'exécuteur (`events_start`) : un
+        # `splitlines()` couperait aussi sur U+2028 ou U+0085, qu'un harnais
+        # écrit tels quels dans une chaîne JSON, et perdrait l'événement.
+        texte = brut.decode("utf-8", "replace")
+        return _parse_events(texte.split("\n"), 0)
 
     # -- jauges de forfait --------------------------------------------------
     def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
@@ -1111,7 +1131,9 @@ class CostBook:
                                   int(row["cum_output_tokens"] or 0)]
                     if row["cum_input_tokens"] is not None else None,
                 }
-        before = self.events(agent)[:max(0, start)] if start else []
+        # #2096 : le préfixe seul est demandé — inutile de lire (et d'analyser)
+        # les événements du tour qui suit, encore moins de charger le journal.
+        before = self.events(agent, end=max(0, start)) if start else []
         current = ""
         found: dict = {}
         for event in before:
@@ -1279,8 +1301,28 @@ class CostBook:
         nouveau `thread.started`, et la session se perdrait alors sur la ligne —
         le relevé suivant, comparé au mauvais repère, compterait un tour de trop
         (sonde codex2, B5). La session se résout donc en amont et se transmet.
+
+        #2096 : lue **de la fin vers le début**, elle n'a plus à charger ni à
+        analyser le journal entier à chaque tour ; la dernière session est
+        presque toujours dans les derniers blocs. Le parcours reste complet
+        quand il faut (flux sans session, ou que des sous-agents en fin de
+        flux), et rend la même session que le parcours direct.
         """
-        return _last_session(self.events(agent)) or None
+        path = os.path.join(self.agent_dir(agent), "events.jsonl")
+        for ligne in _lines_reverse(path):
+            ligne = ligne.strip()
+            if not ligne:
+                continue
+            try:
+                event = json.loads(ligne)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            trouve = _session_event(event)
+            if trouve:
+                return trouve
+        return None
 
     def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
                    model: str | None = None, ended: float | None = None) -> TurnUsage:
@@ -2078,32 +2120,115 @@ def _codex_config_model(path: str) -> str:
     return ""
 
 
+def _byte_offset_of_line(flux, numero: int, bloc: int = 1 << 20) -> int | None:
+    """L'offset du début de la ligne `numero` (0 = la première) d'un flux binaire.
+
+    Compte les sauts de ligne par blocs, sans décoder ni garder une ligne :
+    c'est le saut rapide de `events(start=…)` sur un journal de plusieurs
+    centaines de Mo. None quand le flux a moins de lignes (appelant : aucun
+    événement dans la tranche)."""
+    if numero <= 0:
+        return 0
+    flux.seek(0)
+    vues = 0
+    offset = 0
+    while True:
+        morceau = flux.read(bloc)
+        if not morceau:
+            return None
+        debut = 0
+        while True:
+            i = morceau.find(b"\n", debut)
+            if i < 0:
+                break
+            vues += 1
+            if vues == numero:
+                return offset + i + 1
+            debut = i + 1
+        offset += len(morceau)
+
+
+def _parse_events(lines: Iterable[str], start: int, end: int | None = None) -> list:
+    """Les événements JSONL des lignes `[start, end)` (#2096).
+
+    Les lignes hors de la tranche sont comptées sans être analysées : c'est
+    tout l'intérêt du flux — le journal peut faire des centaines de Mo, la
+    tranche d'un tour quelques kilo-octets. Un `[]` ou un `null` est une ligne
+    JSON valide mais pas un événement : le garder ferait planter le premier
+    `.get` venu (sonde codex2)."""
+    out = []
+    for index, line in enumerate(lines):
+        if index < start:
+            continue
+        if end is not None and index >= end:
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            out.append(event)
+    return out
+
+
+def _lines_reverse(path: str, bloc: int = 1 << 20) -> Iterator[bytes]:
+    """Les lignes d'un fichier, de la dernière à la première (#2096).
+
+    Lit par blocs depuis la fin et recolle la ligne à cheval sur deux blocs :
+    la mémoire reste bornée par le bloc et la plus longue ligne, jamais par le
+    fichier. Les lignes sont rendues en octets, décodées par l'appelant."""
+    try:
+        with open(path, "rb") as flux:
+            flux.seek(0, os.SEEK_END)
+            pos = flux.tell()
+            reste = b""
+            while pos > 0:
+                debut = max(0, pos - bloc)
+                flux.seek(debut)
+                donnees = flux.read(pos - debut) + reste
+                pos = debut
+                parties = donnees.split(b"\n")
+                reste = parties[0]  # peut-être la fin d'une ligne antérieure
+                for ligne in reversed(parties[1:]):
+                    yield ligne
+            if reste:
+                yield reste
+    except OSError:
+        return
+
+
+def _session_event(event: dict) -> str:
+    """Ce qu'un événement apporte à la session courante (L60, L221).
+
+    Vide pour un événement de sous-agent ; sinon sa clé `session` si elle est
+    remplie, à défaut le dernier identifiant non vide (`session_id`,
+    `thread_id`, `sessionId` — l'ordre des remplacements du relevé direct)."""
+    if event.get("parent_tool_use_id"):
+        return ""                # L221 : la session d'un sous-agent n'est pas celle du tour
+    found = ""
+    for key in ("session_id", "thread_id", "sessionId"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            found = value
+    session = event.get("session")
+    if isinstance(session, str) and session:
+        found = session
+    return found
+
+
 def _last_session(events: Iterable[dict]) -> str:
     """L'identifiant de session/fil le plus récent du flux, s'il y en a un.
 
     `sessionId` est la clé du harnais DeepSeek (`{"type": "session",
     "sessionId": …}`) et du pont ACP : sans elle, les tours DeepSeek étaient
     inscrits au grand livre sans session (L60)."""
-    found = None
+    found = ""
     for event in events:
-        if event.get("parent_tool_use_id"):
-            continue                 # L221 : la session d'un sous-agent n'est pas celle du tour
-        for key in ("session_id", "thread_id", "sessionId"):
-            value = event.get(key)
-            if isinstance(value, str) and value:
-                found = value
-        session = event.get("session")
-        if isinstance(session, str) and session:
-            found = session
-    return found or ""
-
-
-def _read_all(path: str) -> str:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read()
-    except OSError:
-        return ""
+        found = _session_event(event) or found
+    return found
 
 
 def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:

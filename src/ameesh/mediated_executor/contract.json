@@ -3957,12 +3957,12 @@
   }
  ],
  "refused": {
-  "interface_total": 414,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
    "agents": "hors du sous-ensemble de l'exécuteur médié",
+   "alert_acknowledgements": "human alert acknowledgement (L87c): native operator only",
    "api_requests": "API idempotency (L87): ameesh serve only",
    "approvals": "autorité : jamais d'approbation depuis l'appareil (0012)",
    "authenticators": "autorité (0012)",
@@ -4003,10 +4003,14 @@
    "accounts": [
     "hold",
     "holds",
+    "identities",
     "init_active",
+    "placement_state",
+    "publish_identity",
     "release",
     "set_auto",
     "switch",
+    "switch_guarded",
     "switches"
    ],
    "action_source": [
@@ -4037,6 +4041,12 @@
     "wake_check",
     "note_unleased",
     "operator_pause"
+   ],
+   "alert_acknowledgements": [
+    "acknowledge",
+    "clock",
+    "invalidate",
+    "live"
    ],
    "api_requests": [
     "complete",
@@ -4122,6 +4132,7 @@
     "prune_guard_runs",
     "queued",
     "queued_oldest",
+    "reopen_run",
     "run",
     "running",
     "running_on",
@@ -4217,6 +4228,7 @@
     "pending_recipients_sorted",
     "unread_active",
     "unread_counts",
+    "unread_mid_turn",
     "unread_total",
     "withdraw"
    ],
@@ -4235,6 +4247,7 @@
     "record_balance",
     "request_restart",
     "resume",
+    "set_dormant",
     "set_settings",
     "state_lots_activity",
     "turns"
@@ -4242,6 +4255,7 @@
    "packages": [
     "all",
     "get",
+    "lock_sync",
     "retire",
     "upsert"
    ],
@@ -4294,6 +4308,7 @@
     "unpriced"
    ],
    "turn_resources": [
+    "attach_cgroup",
     "begin_grace",
     "churn",
     "get",
@@ -4350,6 +4365,7 @@
     "measure",
     "measure_candidates",
     "migration_holder",
+    "migration_landed_holder",
     "milestones",
     "open_by_ref",
     "open_for",
@@ -4361,6 +4377,7 @@
     "queue_remove",
     "queue_update",
     "recent_or_cited",
+    "record_landed_migration",
     "record_resolution",
     "reference",
     "refresh_package_parents",

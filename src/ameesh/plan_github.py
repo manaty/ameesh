@@ -72,6 +72,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -358,42 +359,70 @@ def reads_scope(base: str | None, token: str | None = None) -> str:
 
 #: instances vivantes du processus : leurs compteurs en mémoire restent
 #: visibles (`counters`) et partent une fois à la fin du passage (N3) —
-#: jamais un verrou et une réécriture par hit de cache.
+#: jamais un verrou de fichier ni une réécriture par hit de cache. #1927 :
+#: chaque instance porte un verrou en mémoire, pris par `count`, le retrait
+#: (`_take_pending`) et `counters`, jamais pendant une E/S.
 _LIVE_READS: "weakref.WeakSet" = weakref.WeakSet()
 
 
-def _merge_counters(data: dict, pending: dict, clock) -> list[str]:
-    """Fusionne `pending` dans `data["counters"]` ; rend les noms fusionnés."""
+def _merge_counters(data: dict, delta: dict, clock) -> None:
+    """Fusionne un `delta` de compteurs dans `data["counters"]`."""
     counters = data.setdefault("counters", {})
     if not isinstance(counters, dict):
         counters = data["counters"] = {}
-    merged = []
-    for name, n in pending.items():
+    for name, n in delta.items():
         counters[name] = int(counters.get(name) or 0) + int(n)
-        merged.append(name)
-    if merged:
+    if delta:
         counters["updated"] = float(clock())
-    return merged
 
 
-def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> None:
+def _take_pending(pending: dict, lock) -> dict:
+    """Retire les compteurs en attente sous verrou et les rend (#1927).
+
+    Le retrait est un échange, jamais un vidage après coup : un incrément reçu
+    pendant l'écriture se dépose dans le dictionnaire devenu vide et reste
+    visible (`counters`), au lieu d'être purgé sans avoir été fusionné."""
+    with lock:
+        taken = dict(pending)
+        pending.clear()
+    return taken
+
+
+def _restore_pending(pending: dict, taken: dict, lock) -> None:
+    """Rend au dictionnaire les compteurs d'un `taken` dont l'écriture a
+    échoué, en s'ajoutant aux incréments arrivés entre-temps (#1927)."""
+    if not taken:
+        return
+    with lock:
+        for name, n in taken.items():
+            pending[name] = int(pending.get(name) or 0) + int(n)
+
+
+def _write_counters(state_dir, root, lock_path, quota_path, pending, clock,
+                    pending_lock) -> None:
     """Écrit une fois les compteurs en mémoire dans `quota.json` (N3).
 
     Un état d'hôte disparu (dossier temporaire nettoyé, poste effacé) n'est
     pas ressuscité pour y écrire des compteurs. Jamais bloquant : une panne
-    (droits, disque) laisse `pending` intact pour le prochain essai."""
-    if not pending:
+    (droits, disque) rend au dictionnaire les compteurs retirés, pour le
+    prochain essai ; un incrément arrivé pendant l'écriture n'est jamais
+    emporté par le retrait (#1927)."""
+    taken = _take_pending(pending, pending_lock)
+    if not taken:
         return
     if not os.path.isdir(state_dir):
+        _restore_pending(pending, taken, pending_lock)
         return
     for directory in (root, os.path.join(root, "reads")):
         with contextlib.suppress(OSError):
             os.makedirs(directory, mode=0o700, exist_ok=True)
     if not os.path.isdir(root):
+        _restore_pending(pending, taken, pending_lock)
         return
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
+        _restore_pending(pending, taken, pending_lock)
         return
     merged = False
     try:
@@ -406,7 +435,7 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> N
                 data = loaded
         except (OSError, ValueError):
             data = {}
-        _merge_counters(data, pending, clock)
+        _merge_counters(data, taken, clock)
         _atomic_write(quota_path, data)
         merged = True
     except (OSError, ValueError):
@@ -414,10 +443,34 @@ def _write_counters(state_dir, root, lock_path, quota_path, pending, clock) -> N
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-    if merged:
-        for name in list(pending):
-            pending.pop(name, None)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        # Dans `finally` : une panne d'un autre type (TypeError d'un
+        # `quota.json` aux valeurs étrangères) se propage, mais rend aussi
+        # les compteurs retirés.
+        if not merged:
+            _restore_pending(pending, taken, pending_lock)
+
+
+def flush_reads(state_dir) -> int:
+    """Écrit une fois les compteurs en attente des caches vivants de ce
+    processus pour `state_dir` (#1813).
+
+    Le passage du Watcher dure toute la vie du runner : sans cet appel, une
+    suite de hits de cache restait invisible sur disque jusqu'à la requête
+    réelle suivante (`note`) ou à la fin du processus. Rend le nombre de
+    caches concernés ; jamais bloquant (une panne laisse `pending` intact)."""
+    state_dir = str(state_dir or "").strip()
+    if not state_dir:
+        return 0
+    root = os.path.join(state_dir, READS_DIR)
+    flushed = 0
+    for reads in list(_LIVE_READS):
+        if reads.root != root:
+            continue
+        reads.flush()
+        flushed += 1
+    return flushed
 
 
 class SharedReads:
@@ -445,8 +498,11 @@ class SharedReads:
     N1 : une construction ou une lecture ne crée aucun dossier — le cache
     naît à sa première écriture, et un `state_dir` vide est refusé plutôt
     que de fabriquer un chemin relatif. N3 : les compteurs s'agrègent en
-    mémoire et s'écrivent une fois par passage (`flush`, fin de processus),
-    jamais un verrou par hit. N4 : la clé d'une entrée porte la base d'API
+    mémoire et s'écrivent une fois par passage (`flush` : fin de passage du
+    Watcher, #1813, ou fin de processus),
+    jamais un verrou par hit ; le retrait avant écriture est un échange sous
+    verrou, donc un incrément concurrent n'est jamais perdu (#1927).
+    N4 : la clé d'une entrée porte la base d'API
     et une empreinte non réversible du jeton."""
 
     def __init__(self, state_dir, *, clock=time.time, ttl: float = READS_TTL,
@@ -465,11 +521,15 @@ class SharedReads:
         self._lock_path = os.path.join(self.root, ".lock")
         self._stores = 0
         self._pending: dict = {}
+        # #1927 : `count` peut venir d'un autre fil que `flush`/`note` ; ce
+        # verrou ne protège que le dictionnaire en mémoire, jamais une E/S.
+        self._pending_lock = threading.Lock()
         _LIVE_READS.add(self)
         # N3 : les compteurs en attente partent une fois, à la fin du passage
         # (objet libéré ou processus terminé), sans ressusciter un état disparu.
         weakref.finalize(self, _write_counters, self.state_dir, self.root,
-                         self._lock_path, self._quota_path, self._pending, self.clock)
+                         self._lock_path, self._quota_path, self._pending,
+                         self.clock, self._pending_lock)
 
     def _ensure_dirs(self) -> None:
         """La racine du cache (0700), créée avant une écriture, jamais pour lire."""
@@ -487,7 +547,8 @@ class SharedReads:
         finally:
             with contextlib.suppress(OSError):
                 fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
     # -- entrées du cache ---------------------------------------------------
     def _entry_path(self, path: str) -> str:
@@ -593,25 +654,28 @@ class SharedReads:
         for reads in list(_LIVE_READS):
             if reads.root != self.root:
                 continue
-            for name, n in reads._pending.items():
+            with reads._pending_lock:
+                pending = list(reads._pending.items())
+            for name, n in pending:
                 merged[name] = int(merged.get(name) or 0) + int(n)
         return merged
-
-    def _merge_pending(self, data: dict) -> list[str]:
-        """Fusionne les compteurs en mémoire dans `data` ; rend leurs noms."""
-        return _merge_counters(data, self._pending, self.clock)
 
     def count(self, name: str, n: int = 1) -> None:
         """Un compteur partagé (hits, stale, refused…) ; jamais bloquant.
 
-        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (ou la fin
-        du processus) fait une seule écriture par passage, au lieu d'un verrou
-        et d'une réécriture de `quota.json` à chaque hit de cache."""
+        N3 : il s'agrège en mémoire et n'écrit rien ici — `flush()` (fin de
+        passage du Watcher, #1813, ou fin du processus) fait une seule écriture
+        par passage, au lieu d'un verrou de fichier et d'une réécriture de
+        `quota.json` à chaque hit de cache.
+        #1927 : le verrou en mémoire rend l'incrément sûr entre fils, et le
+        retrait avant écriture (`_take_pending`) ne l'emporte jamais."""
         try:
             key = str(name)
-            self._pending[key] = self._pending.get(key, 0) + int(n)
+            value = int(n)
         except (TypeError, ValueError):
             return
+        with self._pending_lock:
+            self._pending[key] = self._pending.get(key, 0) + value
 
     def flush(self) -> None:
         """Écrit une fois les compteurs agrégés depuis le dernier `flush` (N3).
@@ -619,7 +683,8 @@ class SharedReads:
         Sans compteur en attente, ne touche à rien. Une panne (droits, disque)
         laisse les compteurs en mémoire : le prochain passage réessaiera."""
         _write_counters(self.state_dir, self.root, self._lock_path,
-                        self._quota_path, self._pending, self.clock)
+                        self._quota_path, self._pending, self.clock,
+                        self._pending_lock)
 
     def note(self, headers, *, status: int, now=None) -> float | None:
         """Enregistre le quota lu dans les en-têtes, compte la requête.
@@ -635,10 +700,12 @@ class SharedReads:
         resource = str(header_of(headers, "X-RateLimit-Resource") or "").strip().lower() \
             or DEFAULT_RESOURCE
         self._ensure_dirs()
+        taken = _take_pending(self._pending, self._pending_lock)
+        written = False
         try:
             with self._locked():
                 data = self._load()
-                merged = self._merge_pending(data)
+                _merge_counters(data, taken, self.clock)
                 quotas = data.setdefault("quota", {})
                 if not isinstance(quotas, dict):
                     quotas = data["quota"] = {}
@@ -664,11 +731,16 @@ class SharedReads:
                 quota["blocked_until"] = blocked if blocked > now else 0.0
                 quota["checked"] = now
                 _atomic_write(self._quota_path, data)
-                for name in merged:
-                    self._pending.pop(name, None)
+                written = True
                 return quota["blocked_until"] or None
         except (OSError, ValueError):
             return None
+        finally:
+            # #1927 : le retrait n'est confirmé qu'une fois l'écriture faite ;
+            # les compteurs retirés reviennent tant qu'elle n'a pas eu lieu,
+            # quelle que soit la panne.
+            if not written:
+                _restore_pending(self._pending, taken, self._pending_lock)
 
     def blocked(self, now=None, resource: str = DEFAULT_RESOURCE) -> float | None:
         """L'instant (epoch) jusqu'auquel cette ressource est épuisée, sinon None."""
@@ -1487,9 +1559,9 @@ BODY_MAX = 30000
 SUMMARY_MAX = 300
 #: clé `github` de la configuration de l'hôte : clés admises, cadence
 SETTINGS_KEYS = ("projects", "host", "interval", "ci_ttl", "exclude_terms")
-#: forme longue d'un projet : `repo`, et les workflows suivis par le veilleur
-#: de CI (#1110, `ci.Watcher`)
-PROJECT_KEYS = ("repo", "workflows")
+#: forme longue d'un projet : `repo`, les workflows suivis par le veilleur de
+#: CI (#1110, `ci.Watcher`) et la ou les branches de base du dépôt (#1483)
+PROJECT_KEYS = ("repo", "workflows", "base")
 #: suffixes admis pour un fichier de workflow (`.github/workflows/…`)
 WORKFLOW_SUFFIXES = (".yml", ".yaml")
 DEFAULT_INTERVAL = 300.0
@@ -1552,6 +1624,10 @@ class Settings:
     #: {dépôt: (fichiers de workflow, …)} — les workflows que le veilleur de CI
     #: suit dans ce dépôt (#1110) ; sans entrée, il découvre ceux du dépôt
     workflows: dict = field(default_factory=dict)
+    #: {dépôt: (branches de base, …)} — les branches sur lesquelles une
+    #: exécution n'est jamais remplacée et dont le rouge sert de référence
+    #: (#1483 : Nexlink a `develop` pour base) ; sans entrée, `ci.BASE_BRANCHES`
+    bases: dict = field(default_factory=dict)
 
     def project_name(self, project: str | None) -> str | None:
         """Le nom configuré d'un projet (sans casse), ou None."""
@@ -1572,6 +1648,25 @@ class Settings:
         return next((tuple(files) for name, files in self.workflows.items()
                      if name.casefold() == key), None)
 
+    def bases_for(self, repo: str | None) -> tuple | None:
+        """Les branches de base déclarées d'un dépôt, ou None (défaut du
+        veilleur : `ci.BASE_BRANCHES`)."""
+        key = (repo or "").strip().casefold()
+        if not key:
+            return None
+        return next((tuple(branches) for name, branches in self.bases.items()
+                     if name.casefold() == key), None)
+
+    def all_bases(self) -> tuple:
+        """Toutes les branches de base déclarées, sans doublon, dans l'ordre
+        de déclaration : la lecture des alertes (`ci.main_red`) couvre ainsi
+        les bases de tous les dépôts (le défaut `main` reste à la charge de
+        l'appelant)."""
+        out: list[str] = []
+        for branches in self.bases.values():
+            out.extend(branches)
+        return tuple(dict.fromkeys(out))
+
 
 def parse_settings(raw) -> Settings:
     """Valide la clé `github` (SettingsError : message actionnable)."""
@@ -1589,6 +1684,7 @@ def parse_settings(raw) -> Settings:
         raise SettingsError("`github.projects`: object {\"project\": \"owner/repo\"} expected")
     projects: dict = {}
     workflows: dict = {}
+    bases: dict = {}
     for name, value in declared.items():
         name = str(name).strip()
         where = "`github.projects.%s`" % name
@@ -1597,32 +1693,51 @@ def parse_settings(raw) -> Settings:
         if any(other.casefold() == name.casefold() for other in projects):
             raise SettingsError("%s: project declared twice (case-insensitive)" % where)
         files = None
+        declared_bases = None
         if isinstance(value, dict):
             extra = sorted(set(map(str, value)) - set(PROJECT_KEYS))
             if extra:
                 raise SettingsError("%s: unknown key(s) %s (allowed: %s)"
                                     % (where, ", ".join(extra), ", ".join(PROJECT_KEYS)))
             files = value.get("workflows")
+            declared_bases = value.get("base")
             value = value.get("repo")
         if not isinstance(value, str) or not _REPO_RE.fullmatch(value.strip()):
             raise SettingsError("%s: repository \"owner/repo\" expected, not %r" % (where, value))
         projects[name] = value.strip()
         if files is not None:
-            where = "%s.workflows" % where
+            where_files = "%s.workflows" % where
             if not isinstance(files, list) or not files:
-                raise SettingsError("%s: non-empty list of workflow file names expected" % where)
+                raise SettingsError("%s: non-empty list of workflow file names expected"
+                                    % where_files)
             names = []
             for item in files:
                 if not isinstance(item, str) or not item.strip():
-                    raise SettingsError("%s: workflow file name expected, not %r" % (where, item))
+                    raise SettingsError("%s: workflow file name expected, not %r"
+                                        % (where_files, item))
                 filename = item.strip().rsplit("/", 1)[-1]
                 if not filename.endswith(WORKFLOW_SUFFIXES):
                     raise SettingsError("%s: %r is not a workflow file name (…%s)"
-                                        % (where, item, "/".join(WORKFLOW_SUFFIXES)))
+                                        % (where_files, item, "/".join(WORKFLOW_SUFFIXES)))
                 if filename not in names:
                     names.append(filename)
             key = projects[name]
             workflows[key] = tuple(dict.fromkeys(workflows.get(key, ()) + tuple(names)))
+        if declared_bases is not None:
+            where = "%s.base" % where
+            items = [declared_bases] if isinstance(declared_bases, str) else declared_bases
+            if not isinstance(items, list) or not items:
+                raise SettingsError("%s: branch name or non-empty list expected "
+                                    "(\"develop\" or [\"main\", \"develop\"])" % where)
+            names = []
+            for item in items:
+                if not isinstance(item, str) or not item.strip() or item.strip() != item \
+                        or any(ch.isspace() for ch in item):
+                    raise SettingsError("%s: branch name expected, not %r" % (where, item))
+                if item not in names:
+                    names.append(item)
+            key = projects[name]
+            bases[key] = tuple(dict.fromkeys(bases.get(key, ()) + tuple(names)))
     host = raw.get("host")
     if host is not None and not isinstance(host, str):
         raise SettingsError("`github.host`: host name expected")
@@ -1643,7 +1758,7 @@ def parse_settings(raw) -> Settings:
     return Settings(projects=projects, host=(host or "").strip() or None,
                     interval=float(interval), ci_ttl=float(ci_ttl),
                     exclude_terms=tuple(dict.fromkeys(t.strip() for t in terms)),
-                    workflows=workflows)
+                    workflows=workflows, bases=bases)
 
 
 def settings_of(cfg) -> Settings:

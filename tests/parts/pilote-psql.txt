@@ -16,9 +16,10 @@
 # pilote (connexion persistante, notifications, nombre d'allers-retours).
 #
 # Liste additive (L160a) : un module par ligne, sa raison en commentaire sur la
-# même ligne, ordre alphabétique, sans doublon (scripts/test-parts.py refuse
-# une liste mal rangée). Deux lots qui ajoutent chacun un module touchent ainsi
-# deux endroits différents du fichier, sans conflit.
+# même ligne, ordre alphabétique, sans doublon ; la lecture range et
+# dédoublonne ce qu'une fusion `union` produit (un nom inconnu reste refusé).
+# Deux lots qui ajoutent chacun un module touchent ainsi deux endroits
+# différents du fichier, sans conflit.
 
 test_1037_bascule_harnais  # stockage : adoption (0384, session_harness) et reglages du harnais quitte purges en SQL (#1037)
 test_1060_alert_types  # stockage : alerts() lit la base (tri d'un type d'alerte inconnu, garde ALERT_TYPES) (#1060)
@@ -30,6 +31,7 @@ test_789_slo_alerts  # storage: niveaux d'alerte SLO, priorité SQL, attentes pl
 test_802_canon_sync_concurrency  # storage/driver : N syncs concurrents d'un même canon, statement_timeout réel des deux pilotes (#802)
 test_810_multi_project_consumers  # stockage : `projects` lu par la vue par projet et le filtre progress, prise au projet primaire (L243-3)
 test_753_stop_returns_lots  # stockage : retour transactionnel des lots, journal et réattribution des promus (#753)
+test_831_packages_lock_scope  # storage : un verrou de sync par schéma (tous canons), attente hors statement_timeout (#831)
 test_catalog_store  # stockage : le catalogue en base, opérations du domaine (paramètres en liste)
 test_events_attach  # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_l108_executor_server  # storage: scoped operations, fencing, idempotency and executor audit
@@ -54,6 +56,9 @@ test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS 
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
 test_l165c_sessions_par_lot  # stockage : sessions mises de côté par (agent, lot), bascule fencée par le bail, lots actionnables, réveils (L165b, #408)
 test_l232a_handoffs  # storage: physical reservations, controller locks, claim fence, CAS journal and recovery (L232a)
+test_l232b_bootstrap  # owner-signed bootstrap scopes, original approval expiry and account digest binding (L232b)
+test_l232b_migration_worker  # database-wide migration election, atomic inventory and additive release guard (L232b)
+test_l232b_release_fence  # signed release closure, racing claim/turn writers, draining and durable receipt replay (L232b)
 test_l232e_drain_handoffs  # storage: lifecycle generation checks, drain/return handoffs and readiness (L232e)
 test_l232e_host_lifecycle  # storage: persistent withdrawal, stale-host detection and concurrent gate/claim guards (L232e)
 test_l232e_loss_recovery  # storage: scoped recovery proof, expired lease fencing and source loss thresholds (L232e)
@@ -70,6 +75,9 @@ test_l59_activity  # storage: bounded timeline SQL, timestamps, voided costs and
 test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)
 test_l72_panne_de_base  # panne de base, reconnexion, réveils (listener)
 test_l78_conversations  # storage: cursor locking, JSON pages, R12 outbox, retention and commit NOTIFY (L78)
+test_l82_attach  # leases: resident handoff, duplicate refusal and queued inputs across native attach (L82)
+test_l87c_alert_ack  # storage: alert acknowledgement, concurrent insert, expiry and durable actor/principal (L87c)
 test_migrations  # couche base : migrations sur un schéma neuf
+test_process_registry  # stockage/driver : reçus transactionnels, verrous FOR UPDATE/FOR SHARE, concurrence et annulation (#1922)
 test_registry_lease  # verrous et baux : comportement différent entre psql et psycopg
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)

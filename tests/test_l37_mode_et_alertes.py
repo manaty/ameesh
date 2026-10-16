@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import threading
 import unittest
 
 from ameesh import exploitation, mail, registry, stagnation, storage, work
@@ -208,6 +209,104 @@ class AttributionGardeeTest(_Base):
         proc = self.mesh("work", "assign", str(lot["id"]), "ouvrier")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("nothing to reassign", proc.stderr)
+
+    def test_work_assign_claim(self):
+        """#1026 : `--claim` ne prend qu'un lot sans assigné ; un lot pris est
+        refusé en nommant son porteur, et rien ne change de main."""
+        self.register("second", "codex", cwd=self.tmp)
+        self.register("troisieme", "codex", cwd=self.tmp)
+        lot = work.add(self.db, title="à prendre")
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "second")
+        proc = self.mesh("work", "assign", str(lot["id"]), "troisieme", "--claim",
+                         "--actor", "orch-b")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("already assigned to second", proc.stderr)
+        self.assertIn("claim refused", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "second")
+        # une réassignation explicite reste possible (L37)
+        proc = self.mesh("work", "assign", str(lot["id"]), "troisieme", "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # agent refusé : rien n'est pris
+        autre = work.add(self.db, title="inconnu")
+        proc = self.mesh("work", "assign", str(autre["id"]), "fantome", "--claim")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("unknown agent", proc.stderr)
+        self.assertIsNone(work.get(self.db, autre["id"])["assignee"])
+
+    def test_work_assign_claim_concurrent(self):
+        """#1026 : deux orchestrateurs concurrents sur le même lot sans agent —
+        une seule affectation, l'autre refuse lisiblement, pas de changement
+        de main silencieux."""
+        self.register("second", "codex", cwd=self.tmp)
+        self.register("troisieme", "codex", cwd=self.tmp)
+        lot = work.add(self.db, title="course")
+        other = self.connect()          # sa propre connexion : vraiment concurrent
+        depart = threading.Barrier(2)
+        out: dict = {}
+
+        def prendre(db, agent):
+            depart.wait(10)
+            try:
+                done = work.assign(db, lot["id"], agent, cfg=self.cfg,
+                                   actor="orch-" + agent, claim=True)
+                out[agent] = done["item"]["assignee"]
+            except work.WorkError as exc:
+                out[agent] = str(exc)
+
+        threads = [threading.Thread(target=prendre, args=(self.db, "second")),
+                   threading.Thread(target=prendre, args=(other, "troisieme"))]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        finally:
+            other.close()
+        gagnants = [agent for agent, issue in out.items() if issue == agent]
+        self.assertEqual(len(gagnants), 1, out)
+        perdants = [issue for agent, issue in out.items() if issue != agent]
+        self.assertIn("claim refused", perdants[0], out)
+        # un seul porteur, une seule affectation au journal
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], gagnants[0])
+        notes = [e["note"] for e in work.events(self.db, lot["id"])
+                 if "assigned to" in e["note"]]
+        self.assertEqual(len(notes), 1, notes)
+
+    def test_work_assign_claim_refuse_si_l_agent_a_deja_un_lot(self):
+        """#1787 N2 : un claim qui retombe dans la file d'équipe (#540) n'a pas
+        pris : refus lisible et code 1, le lot reste sans porteur."""
+        self.register("second", "codex", cwd=self.tmp)
+        premier = work.add(self.db, title="déjà en attente", assignee="second")
+        lot = work.add(self.db, title="à prendre")
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("claim refused", proc.stderr)
+        self.assertIn("#540", proc.stderr)
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
+        self.assertEqual(work.get(self.db, premier["id"])["assignee"], "second")
+
+    def test_work_assign_claim_du_porteur_est_un_noop(self):
+        """#1787 N3 : le porteur qui re-claim son lot n'est pas refusé : no-op
+        réussi, sans nouvelle ligne d'affectation."""
+        self.register("second", "codex", cwd=self.tmp)
+        lot = work.add(self.db, title="à prendre")
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        avant = [e["note"] for e in work.events(self.db, lot["id"])
+                 if "assigned to" in e["note"]]
+        proc = self.mesh("work", "assign", str(lot["id"]), "second", "--claim",
+                         "--actor", "orch")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("no-op", proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "second")
+        apres = [e["note"] for e in work.events(self.db, lot["id"])
+                 if "assigned to" in e["note"]]
+        self.assertEqual(apres, avant)
 
 
 class AlertesVivaciteTest(_Base):

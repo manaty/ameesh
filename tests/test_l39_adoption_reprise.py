@@ -9,15 +9,20 @@ harnais de `tests/fakebin`.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
 import os
+import subprocess
+import sys
 import time
 import unittest
 import uuid
 from unittest import mock
 
 from ameesh import account_turn, accounts, fil, mail, registry, reprise, storage, work
+from ameesh import main as mesh_main
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -25,6 +30,9 @@ from .support import FAKEBIN, PgTestCase
 #: #1196 : un SID unique par exécution. Un SID fixe se retrouve dans l'argv du
 #: CLI d'un job parallèle (psql/psycopg du même run) ; `holders()` le voit et
 #: refuse `adopt` à tort — test dépendant de l'environnement (canon §3).
+#: Identifiant FICTIF, tiré à chaque exécution : un id fixe publié (fil,
+#: documentation) peut être cité par un processus réel du même hôte et faire
+#: croire à une session ouverte (#1283). Voir `reprise.holders`.
 SID = str(uuid.uuid4())
 
 
@@ -53,12 +61,21 @@ def _rollout(home: str, sid: str, cwd: str, used_percent: float | None = None) -
                     "primary": {"used_percent": used_percent, "window_minutes": 300,
                                 "resets_at": time.time() + 3600},
                     "secondary": None}}}) + "\n")
+    # L82: this fixture is a closed, quiet session, ready for adoption.
+    quiet = time.time() - 120
+    os.utime(chemin, (quiet, quiet))
     return chemin
 
 
 class _Base(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
+        # Session holders are an explicit observation in these adoption tests;
+        # unrelated non-dumpable host processes must not decide their result.
+        # Platform discovery and fail-closed refusals have their own L63 tests.
+        holders = mock.patch.object(reprise, "holders", return_value=[])
+        holders.start()
+        self.addCleanup(holders.stop)
         for table in ("account_active", "account_holds", "account_switches", "turn_costs",
                       "spend_pending", "quota_gauge_readings"):
             self.db.execute("DELETE FROM %s" % table)
@@ -142,6 +159,26 @@ class AdoptTest(_Base):
                           row["session_account"]),
                          ("atelier", "codex", "Termine le lot 12.", "primaire"))
 
+    def test_un_brief_qui_cite_la_session_ne_bloque_pas_l_adoption(self):
+        """#1283 : un processus réel dont l'argv CITE l'id (brief JSON) n'est
+        pas un détenteur ; l'adoption n'a pas à être forcée pour lui."""
+        comptes = self._codex()
+        _rollout(comptes["codex"][0]["path"], SID, self.travail)
+        pret = os.path.join(self.tmp, "citant-pret")
+        citant = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)",
+             pret, "--json", json.dumps({"brief": "reprends la session %s" % SID})])
+        self.addCleanup(lambda: (citant.kill(), citant.wait()))
+        fin = time.monotonic() + 10
+        while not os.path.exists(pret):
+            self.assertLess(time.monotonic(), fin, "délai dépassé")
+            time.sleep(0.05)
+        out = reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
+                            harness="codex")
+        self.assertFalse(out["forced"])
+        self.assertEqual(registry.get(self.db, "coord")["session_id"], SID)
+
     def test_introuvable_refus_clair(self):
         comptes = self._codex()
         with self.assertRaises(reprise.RepriseError) as ctx:
@@ -169,7 +206,9 @@ class AdoptTest(_Base):
         comptes = self._codex()
         chemin = _rollout(comptes["codex"][0]["path"], SID, self.travail)
         self._externe("coord")
-        with open(chemin, "a", encoding="utf-8"):  # un « harnais » la tient ouverte
+        tenant = [{"pid": os.getpid(), "why": "open file", "cmd": "test harness"}]
+        with open(chemin, "a", encoding="utf-8"), \
+                mock.patch.object(reprise, "holders", return_value=tenant):
             with self.assertRaises(reprise.RepriseError) as ctx:
                 reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
                               harness="codex")
@@ -203,6 +242,10 @@ class AdoptTest(_Base):
             fh.write(json.dumps({"type": "user", "cwd": self.travail}) + "\n")
         dsh = _dossier(os.path.join(self.tmp, "dsh-home"))
         os.makedirs(os.path.join(dsh, "sessions", "--tmp--", "session-" + SID))
+        quiet = time.time() - 120
+        for closed in (os.path.join(projet, SID + ".jsonl"),
+                       os.path.join(dsh, "sessions", "--tmp--", "session-" + SID)):
+            os.utime(closed, (quiet, quiet))
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": claude, "DSH_HOME": dsh}):
             out = reprise.adopt(self._cfg(), self.db, "cl", session_id=SID, harness="claude")
             self.assertEqual((out["account"], out["cwd"]), (None, self.travail))
@@ -226,10 +269,13 @@ class AdoptTest(_Base):
         with open(config, "w", encoding="utf-8") as fh:
             json.dump({"accounts": comptes}, fh)
         self._externe("coord")
-        proc = self.mesh("adopt", "coord", "--session", SID, "--harness", "codex", "--json",
-                         env=self.env(AMEESH_CONFIG=config))
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        out = json.loads(proc.stdout)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.env(AMEESH_CONFIG=config)), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = mesh_main.main(["adopt", "coord", "--session", SID,
+                                   "--harness", "codex", "--json"])
+        self.assertEqual(code, 0, stderr.getvalue())
+        out = json.loads(stdout.getvalue())
         self.assertEqual((out["agent"], out["account"]), ("coord", "secondaire"))
         proc = self.mesh("show", "coord")
         self.assertEqual(proc.returncode, 0, proc.stderr)

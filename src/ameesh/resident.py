@@ -27,18 +27,24 @@ Interface (`ResidentDriver`): `start()` opens or resumes the session;
 `send(text)` starts a turn and returns its `Turn` handle (`ResidentBusy` if
 one is running); `steer(text)` serves an input at the safe point of the
 running turn (outside a turn, it is `send`); `interrupt()` ends the running
-turn without killing the process; `probe()` checks that the harness answers;
-`close()` stops the process group. A turn steered one or more times stays
-**one** logical turn: its `TurnResult` lists every input it served, whatever
-the protocol does underneath (a second `result` for Claude, a second
-`turn/start` for Codex when the steer lost the race against the end of the
-turn, a second `session/prompt` for ACP).
+turn without killing the process; `probe(timeout)` checks, bounded, that the
+harness answers — a control round-trip (`initialize` again for Claude,
+`thread/read` for Codex, `session/list` for ACP). The Claude CLI answers
+`success` to the second `initialize` (observed, no model call), so any answer
+proves it alive, a refusal from another harness too; only silence is a failure.
+`close()` stops the process group. A turn steered one or
+more times stays **one** logical turn: its `TurnResult` lists every input it
+served, whatever the protocol does underneath (a second `result` for Claude, a
+second `turn/start` for Codex when the steer lost the race against the end of
+the turn, a second `session/prompt` for ACP).
 
-Every event read from the harness goes to `on_event(raw, parsed)`: `raw` is
-the harness's own message, `parsed` the contract of `adapters.StreamReader`
-(`session`, `display`, `final`, `usage`, `call_usage`, `cost`, `safe_point`,
-`error`, `model`), so that the runner can log and display it as it does for a
-turn process.
+Every event of a turn read from the harness goes to `on_event(raw, parsed)`:
+`raw` is the harness's own message, `parsed` the contract of
+`adapters.StreamReader` (`session`, `display`, `final`, `usage`, `call_usage`,
+`cost`, `safe_point`, `error`, `model`), so that the runner can log and
+display it as it does for a turn process. A harness can also push messages of
+its own outside any turn (Claude Code's command list, UI state, background
+tasks…): they are not a turn's events and never enter its stream (#1337).
 
 The harness runs in its own process group (`pgid`), which the runner records
 and kills as a whole. No lock is held while waiting for the harness: the
@@ -88,6 +94,47 @@ FAILED = "failed"
 _CODEX_NOT_ACTIONS = ("userMessage", "hookPrompt", "agentMessage", "reasoning", "plan",
                       "contextCompaction", "enteredReviewMode", "exitedReviewMode")
 
+#: #1337 (L76) : messages du protocole `stream-json` de Claude Code qui ne sont
+#: jamais la sortie d'un tour — ses poussées « fire-and-forget » (liste des
+#: commandes, état d'interface, tâches de fond, hooks, miroir de transcription…).
+#: C'est sa propre classification (`isTurnMessage` du SDK, 2.1.296). Une sonde
+#: de vivacité en déclenche hors tour : observé sur 2.1.296,
+#: `system/commands_changed` arrive ~1,4 s après la réponse à `initialize`,
+#: donc après le drain qui précède l'envoi — sans ce filtre il tombait dans le
+#: flux du tour suivant.
+NOT_TURN_TYPES = frozenset((
+    "stream_event", "keep_alive", "prompt_suggestion", "conversation_reset",
+    "transcript_mirror", "command_lifecycle", "active_goal",
+    "autocompact_state", "control_cancel_request",
+))
+NOT_TURN_SYSTEM = frozenset((
+    "session_state_changed", "permission_denied", "task_notification",
+    "task_started", "task_updated", "task_progress", "background_tasks_changed",
+    "feedback_draft_queued", "control_request_progress", "notification",
+    "post_turn_summary", "task_summary", "session_metadata", "hook_started",
+    "hook_progress", "hook_response", "commands_changed",
+    "elicitation_complete", "files_persisted", "mirror_error",
+    "code_change_published", "tool_host_result", "peer_message_hold",
+    "ui_invalidate", "ui_log", "ui_toast", "ui_status", "ui_panes",
+    "ui_scroll", "ui_focus", "permission_check_status", "vcs_state_changed",
+    "dev_intent", "session_title_changed", "turn_preempted",
+    "per_turn_effort_changed", "instruction_size_warning",
+    "file_attachments_missing",
+))
+
+
+def is_turn_event(event: Mapping) -> bool:
+    """#1337 (L76) : l'événement appartient-il à un tour ? La classification du
+    CLI lui-même : une poussée hors tour (liste des commandes, état
+    d'interface, tâche de fond, hook…) n'est jamais la sortie d'un tour. Un
+    type ou sous-type inconnu (ou non textuel) reste un événement de tour :
+    seul ce que le CLI déclare hors tour est écarté."""
+    kind = event.get("type")
+    if kind == "system":
+        subtype = event.get("subtype")
+        return not isinstance(subtype, str) or subtype not in NOT_TURN_SYSTEM
+    return not isinstance(kind, str) or kind not in NOT_TURN_TYPES
+
 
 class ResidentError(RuntimeError):
     """The resident harness cannot do what was asked (start, protocol, dead)."""
@@ -99,6 +146,13 @@ class InputRefused(ResidentError):
 
 class ResidentBusy(ResidentError):
     """A turn is running: the input waits for its end (or is steered)."""
+
+
+class RequestRefused(ResidentError):
+    """The harness answered a control request, but refused it: it is alive
+    (`probe`), which is not the same as silence. The Claude CLI answers
+    `success` to the probe's `initialize`; counting a refusal as an answer
+    covers another harness, or a protocol that changes."""
 
 
 def log(message: str) -> None:
@@ -122,7 +176,9 @@ class TurnResult:
     calls), plus `context_tokens` (context of its last call) and
     `context_window` when the harness gives them. `cost`: USD of the turn
     when it can be told apart from the session's cumulative cost
-    (`cost_total`)."""
+    (`cost_total`). `compact`: the native compaction the harness reported in
+    the turn (`{"pre": …, "post": …}`, tokens before and after; L81), None
+    when it reported none."""
 
     status: str
     final: str = ""
@@ -133,6 +189,7 @@ class TurnResult:
     cost: float | None = None
     cost_total: float | None = None
     duration_s: float = 0.0
+    compact: dict | None = None
 
 
 class Turn:
@@ -571,6 +628,8 @@ class ResidentDriver:
         self._window: int | None = None
         self._cost: float | None = None
         self._cost_total: float | None = None
+        #: L81: native compaction reported in this turn (compact_boundary)
+        self._compact: dict | None = None
 
     def _add_usage(self, input_tokens: int = 0, cache_read: int = 0, cache_creation: int = 0,
                    output_tokens: int = 0) -> None:
@@ -608,7 +667,8 @@ class ResidentDriver:
                 session=self.session_id, usage=usage,
                 inputs=tuple(i for i in current.inputs if i not in self._unconfirmed),
                 cost=self._cost, cost_total=self._cost_total,
-                duration_s=round(time.monotonic() - current.started, 3))
+                duration_s=round(time.monotonic() - current.started, 3),
+                compact=dict(self._compact) if self._compact else None)
             self._turn = None
             self._followups.clear()
             self._unconfirmed.clear()
@@ -853,8 +913,8 @@ class ClaudeStreamJson(ResidentDriver):
                 self._controls.pop(request_id, None)
         response = slot["response"] or {}
         if response.get("subtype") != "success":
-            raise ResidentError("%s refused: %s" % (request.get("subtype"),
-                                                     response.get("error") or response))
+            raise RequestRefused("%s refused: %s" % (request.get("subtype"),
+                                                      response.get("error") or response))
         return response
 
     def _user(self, text: str, wire: str, input_id: str) -> None:
@@ -895,6 +955,23 @@ class ClaudeStreamJson(ResidentDriver):
         except ResidentError as exc:
             log("interrupt: %s" % exc)
             return False
+
+    def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
+        """Does the harness answer? The `initialize` handshake of `start()`,
+        sent again outside a turn and bounded by `timeout`: it carries no turn
+        and no state the driver depends on. The CLI answers `success` to it
+        (observed, no model call): any answer proves the control channel and
+        its reader alive — a refusal from another harness too — and only
+        silence, or a process gone meanwhile, is a failure (L76 T3, #285)."""
+        if not self.alive:
+            return False
+        try:
+            self._control({"subtype": "initialize"}, timeout)
+        except RequestRefused:
+            return True                     # it answered
+        except ResidentError:
+            return False                    # silence, or gone meanwhile
+        return True
 
     # -- reading -----------------------------------------------------------
     def _read_loop(self) -> None:
@@ -953,9 +1030,18 @@ class ClaudeStreamJson(ResidentDriver):
             except ResidentError:
                 pass
             return
+        if not is_turn_event(event):
+            # #1337 : une poussée du CLI hors tour (la sonde de vivacité en
+            # déclenche une) n'entre pas dans la file : elle ne peut pas être
+            # lue comme un événement du tour suivant.
+            return
         parsed = self.adapter.parse(line)
         if parsed.get("session"):
             self.session_id = str(parsed["session"])
+        if ((kind == "system" and event.get("subtype") == "compact_boundary")
+                or kind == "compact_boundary"):
+            # L81 (étude §6.2) : la compaction native est un événement du tour
+            self._on_compact(event)
         principal = not event.get("parent_tool_use_id")
         if kind == "user" and event.get("isReplay"):
             with self._lock:
@@ -970,12 +1056,46 @@ class ClaudeStreamJson(ResidentDriver):
         if kind == "result" and principal:
             self._on_result(event)
 
+    def _on_compact(self, event: dict) -> None:
+        """L81 (étude §6.2) : la compaction native rapportée par le harnais —
+        ses jetons avant/après ; le contexte mesuré suit l'après, pour que la
+        décision d'entretien ne redemande pas une compaction sans fin."""
+        meta = event.get("compact_metadata")
+        if not isinstance(meta, dict):
+            meta = event
+
+        def token(*names) -> int | None:
+            for name in names:
+                value = meta.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return int(value)
+            return None
+
+        compact = {"pre": token("pre_tokens", "preTokens", "pre"),
+                   "post": token("post_tokens", "postTokens", "post")}
+        with self._lock:
+            self._compact = compact
+            if compact["post"] is not None:
+                self._context = compact["post"]
+
     def _on_result(self, event: dict) -> None:
         usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
         self._add_usage(_number(usage.get("input_tokens")),
                         _number(usage.get("cache_read_input_tokens")),
                         _number(usage.get("cache_creation_input_tokens")),
                         _number(usage.get("output_tokens")))
+        # L81 (étude §6.1) : la fenêtre du modèle, donnée par `modelUsage`
+        # (Claude Code) ; sans elle la décision de compaction ne peut se
+        # prendre sur la part du contexte.
+        model_usage = event.get("modelUsage")
+        if isinstance(model_usage, dict):
+            for entry in model_usage.values():
+                window = _number((entry or {}).get("contextWindow")) \
+                    if isinstance(entry, dict) else 0
+                if window:
+                    with self._lock:
+                        self._window = window
+                    break
         with self._lock:
             total = event.get("total_cost_usd")
             if isinstance(total, (int, float)) and not isinstance(total, bool):
