@@ -164,12 +164,48 @@ version id and category (`intent`, `installed`, `health`, `transport`,
 `revoked`…). Version ids are random and never derived from the value; the
 journal carries no value, no digest and no connection string.
 
+## Delivery intent (retry after an ambiguous failure)
+
+`Livraison` writes a durable intent before sending a frame
+(`/var/lib/ameesh-secrets/intents/<sha256 of reference, host, account>.json`,
+`0700`/`0600`): reference, host, account, operation, version and destination,
+never a value or a digest of one. It is cleared on the first decided receipt
+(`ok` true or false). After an `Uncertain` failure (transport, unreadable or
+inconsistent receipt) the next `deliver` for the same triple replays **the
+same version**: the helper either recognises it (`replayed: true`, nothing
+rewritten) or installs it. A different operation or destination while an
+intent is open is refused (`pending_delivery`); an altered intent is refused
+(`intent_record`). A rotation replay still asks the turn boundary. If the
+store value changed in between, the helper answers `replay_mismatch` instead of
+overwriting: an operator settles it. The journal records `retry` for a replay.
+
+## Secret channel (transport, dispatcher, delegation)
+
+The channel is separate from L232b's restart delegation, which is bounded to
+restart actions by construction (pilot decision, 16/10):
+
+- `deploy/mise-a-jour/transport-secrets.py` — `SSHSecretTransport`, the
+  `transport` of `Livraison`: same enrollment checks, pinned SSH options and
+  bounded exchange as `transport-release.py` (`validate_enrollment`,
+  `ssh_args`, `exchange`), for the dedicated account `ameesh-secrets`. The
+  frame crosses SSH stdin only.
+- `deploy/mise-a-jour/hote-secrets.py` — root-owned dispatcher reached only by
+  that account's forced command through sudo, without arguments: same isolated
+  root runtime and trust rule as `hote-release.py`, then
+  `coffre-release.helper_main` on stdin with the root-private
+  `/etc/ameesh-secrets/helper.json`. Any failure answers
+  `{"error":"host_action_unavailable"}`.
+- `deploy/mise-a-jour/delegation-secrets.py` — `render(plan)` and
+  `question(bundle)`: the exact wrapper, sudoers line, authorized key and sshd
+  `Match` of `ameesh-secrets`, built by the same functions as the restart
+  delegation (`access_files`), with no file in common with it. Rendering has
+  no host effect; **installing the bundle is a distinct gesture on a scoped
+  signed decision**, by an authorised operator.
+
 ## What remains before a host pilot
 
-- **Transport**: wire `Livraison` to L232b's `transport-release.py` exchange
-  and to the root host dispatcher (the `helper-*.py` pattern) that calls
-  `Installeur.handle` on its stdin. The enrollment documents must be installed
-  as root at their fixed paths.
+- **Installation**: the delegation bundle, `helper.json` and `policy.json` must
+  be installed as root at their fixed paths after a signed decision.
 - **Turn boundary**: `Livraison` requires an injected `boundary(host, account)`
   for a rotation and refuses (`boundary_unavailable`, `busy`) without one; the
   live implementation must come from the account/turn state so no key changes
@@ -191,7 +227,7 @@ journal carries no value, no digest and no connection string.
 
 `tests/test_l232c_coffre.py` (57 cases, no database, no root, no network):
 
-    PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre
+    PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre tests.test_l232c_cablage
 
 It covers reference grammar, environment parsing, store permissions and
 symlinks, policy/enrollment exact keys, the bridge modes, atomic install,
