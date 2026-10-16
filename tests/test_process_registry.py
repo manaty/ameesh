@@ -43,6 +43,7 @@ import time
 import unittest
 import uuid
 from dataclasses import dataclass
+from unittest import mock
 
 from ameesh import process_registry as pr
 from ameesh import storage
@@ -1480,6 +1481,27 @@ class RegistryTest(PgTestCase):
         self.assertIsNone(store.close_merged(
             lot, current="qa", sha="a" * 40, actor="test", note="n", pr_ref=None))
         self.assertEqual(self.row(lot)["state"], "qa")
+        self.assertEqual(self.events(lot), [])
+
+    def test_la_course_avec_une_adoption_nomme_la_retenue(self):
+        """N14 (relecture Claude) : entre la lecture applicative (lot non
+        pinné) et l'UPDATE, le registre adopte le lot. Le filtre SQL refuse
+        (N8) ; le refus legacy doit nommer la retenue, pas un « moved in the
+        meantime » générique qui ferait réessayer une écriture réservée au
+        registre."""
+        lot = self.lot(state="build")
+        stale = work.get(self.db, lot)          # instantané non pinné
+        self.db.execute(
+            "UPDATE work_items SET workflow_ref = %s, workflow_stage = 'implementation',"
+            " workflow_version = 1 WHERE id = %s", (self.spec.workflow_ref, lot))
+        fresh = work.get(self.db, lot)          # la même lecture, après adoption
+        for call in (lambda: work.move(self.db, lot, "qa", actor=ACME_ACTOR),
+                     lambda: work.close(self.db, lot, abandoned=True, actor=ACME_ACTOR)):
+            with self.subTest(call=call), \
+                    mock.patch.object(work, "get", side_effect=[stale, fresh]), \
+                    self.assertRaisesRegex(work.WorkError, "pinned to workflow"):
+                call()
+        self.assertEqual(self.row(lot)["state"], "build")
         self.assertEqual(self.events(lot), [])
 
     def _restore_workflow_columns(self) -> None:
