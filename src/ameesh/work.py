@@ -1298,6 +1298,14 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
         if item is None:
             raise WorkError("lot %s not found" % item_id)
         state = item["state"]
+        pinned = _pinned_ref(item)
+        if pinned:
+            # #1922 : sous workflow, l'état `merged` est écrit par le registre
+            # (garde serveur `merged_and_staging_deployed`), jamais par le
+            # constat de fusion seul.
+            return {"id": int(item_id), "result": "refused", "item": item,
+                    "detail": "lot pinned to workflow %s: transitions go through "
+                              "process_registry" % pinned}
         if state in MERGED_STATES:
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": "already %s" % state}
@@ -1505,6 +1513,12 @@ def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int |
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pinned = _pinned_ref(item)
+    if pinned:
+        # #1922 : la fermeture d'un lot sous workflow passe par le registre.
+        raise WorkError(
+            "lot %s is pinned to workflow %s: closing goes through "
+            "process_registry" % (item_id, pinned))
     if superseded_by is not None:
         if int(superseded_by) == int(item_id):
             raise WorkError("a lot cannot supersede itself")
@@ -1550,6 +1564,18 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
 
+def _pinned_ref(item: dict) -> str:
+    """La révision Process qui pinne le lot (colonne 0452), '' sinon.
+
+    Lue dans l'élément rendu par `work.get`, donc portée par l'interface de
+    stockage — et par le contrat médié pour une session de VM. Aucun SELECT
+    brut ici : il est refusé sur une connexion d'exécuteur médié (B5, #1922).
+    Une base d'avant 0452 rend '' (aucun lot n'y est pinné), comme
+    `workflow_ref` absent d'un élément.
+    """
+    return str(item.get("workflow_ref") or "")
+
+
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
          correct: str | None = None, reviewer: str | None = None) -> dict:
     """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
@@ -1588,6 +1614,14 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
+    pinned = _pinned_ref(item)
+    if pinned:
+        # #1922 : un lot pinné sur une révision Process ne bouge que par le
+        # registre (process_registry), qui vérifie la garde côté serveur et
+        # écrit le reçu dans la même transaction.
+        raise WorkError(
+            "lot %s is pinned to workflow %s: transitions go through "
+            "process_registry" % (item_id, pinned))
     current = item["state"]
     if current == state:
         raise WorkError("lot %s already in %s" % (item_id, state))

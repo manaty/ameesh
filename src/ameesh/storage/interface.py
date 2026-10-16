@@ -1483,7 +1483,12 @@ class WorkItems(Domain):
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
-        """Un lot, ou None."""
+        """Un lot, ou None. #1922/B5 : le lot porte `workflow_ref` (la
+        révision Process pinnée, '' quand il n'y en a pas — y compris sur une
+        base d'avant la migration 0452). Les commandes historiques
+        (`work.move`/`close`/`close_merged`) lisent la garde par cette
+        interface, jamais par un SELECT brut : celui-ci est refusé sur une
+        connexion d'exécuteur médié."""
 
     @abc.abstractmethod
     def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
