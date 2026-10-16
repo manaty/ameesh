@@ -299,17 +299,30 @@ def hook_rapide(cfg: Config, tool: str, raw: str) -> bool:
 # cache de la barre d'état
 # --------------------------------------------------------------------------
 
-def statusline_key(data: dict) -> str:
-    """La clé du cache : le dossier et la session, rien d'autre (affichage)."""
+def statusline_cwd(data: dict) -> str:
+    """Le dossier courant du JSON de la barre d'état, résolu."""
     espace = data.get("workspace")
     cwd = ((espace or {}).get("current_dir") if isinstance(espace, dict) else None) \
         or data.get("cwd") or os.getcwd()
-    session = str(data.get("session_id") or "")
     try:
-        cwd = os.path.realpath(cwd)
+        return os.path.realpath(cwd)
     except (OSError, TypeError, ValueError):
-        cwd = str(cwd)
-    return hashlib.sha256(("%s\0%s" % (cwd, session)).encode()).hexdigest()[:24]
+        return str(cwd)
+
+
+def statusline_key(data: dict, name: str = "") -> str:
+    """La clé du cache : dossier, session ET nom d'agent (affichage seul).
+
+    #1628 : sans le nom, deux sessions du même dossier — sans identifiant de
+    session — partageaient la ligne en cache quelques secondes.
+    `transcript_path` (fourni par Claude Code) départage en plus les sessions.
+    Le chemin rapide et le chemin complet doivent passer le même nom ; une
+    valeur différente ne coûte qu'un cache raté (rendu refait, jamais une ligne
+    fausse).
+    """
+    session = str(data.get("session_id") or data.get("transcript_path") or "")
+    return hashlib.sha256(("%s\0%s\0%s" % (
+        statusline_cwd(data), session, name or "")).encode()).hexdigest()[:24]
 
 
 def _statusline_path(cfg: Config, key: str) -> str:
