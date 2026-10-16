@@ -188,6 +188,15 @@ class AgentAliasTest(PgTestCase):
         self.assertEqual(work.open_lots(self.db, 'another-name')[0]['id'], item['id'])
         self.assertEqual(work.list_items(self.db, assignee='old-worker')[0]['id'], item['id'])
 
+    def test_reviewer_designation_resolves_alias(self):
+        item = work.add(self.db, title='Alias reviewed work', assignee='worker',
+                        estimate='1h', cfg=self.cfg)
+        self.assertEqual(work.check_reviewer(self.db, 'old-worker', cfg=self.cfg), 'worker')
+        with self.assertRaises(work.WorkError):
+            work.check_reviewer_choice(self.db, item, 'another-name', cfg=self.cfg)
+        self.assertEqual(work.check_reviewer_choice(self.db, item, 'reviewer', cfg=self.cfg),
+                         'reviewer')
+
     def test_systemd_runner_filter_is_primary_and_deduplicated(self):
         instance = runner.Runner(self.cfg, self.db, agents=['old-worker', 'worker'])
         self.assertEqual(instance.agents_filter, ['worker'])
