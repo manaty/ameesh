@@ -3072,11 +3072,17 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
                              ensure_ascii=False, indent=2))
             return 0
         for row in rows:
-            print("%s  %-7s %-16s %5.1f%%  resets %s" % (
+            # #1132 : la provenance — instant de production et journal d'origine
+            # — est affichée quand le relevé la porte.
+            produit = ("  produit %s" % _fmt_moment(row["produced_ts"])
+                       if row.get("produced_ts") else "")
+            source = ("  source %s" % row["source"]) if row.get("source") else ""
+            print("%s  %-7s %-16s %5.1f%%  resets %s%s%s" % (
                 _fmt_moment(row["observed_ts"]),
                 row["harness"] + ("/%s" % row["account"] if row.get("account") else ""),
                 row["key"],
-                float(row["used"]) * 100, _fmt_moment(row.get("resets_at_ts"))))
+                float(row["used"]) * 100, _fmt_moment(row.get("resets_at_ts")),
+                produit, source))
         return 0
     from . import balance as balance_mod
     names = [args.provider] if args.provider else None
