@@ -30,6 +30,7 @@ inconnue (`codex ou claude`) — elle n'est jamais devinée du registre.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -127,20 +128,41 @@ def _marked(ops, lot: int, ref: str) -> bool:
 UNTRACED = "non tracé au gel"
 
 
-def _freeze(db, lot: int) -> Optional[dict]:
-    """Le dernier gel du lot (jalon `frozen` le plus récent), ou None.
+def _freezes(db, lot: int) -> list:
+    """Les gels du lot (jalons `frozen`), du plus récent au plus ancien.
 
     Même règle que `plan_git.latest_freeze` : c'est le gel le plus récent qui
-    fait autorité. Une lecture impossible rend None (famille inconnue), jamais
+    fait autorité. Une lecture impossible rend [] (famille inconnue), jamais
     une exception : la fusion est un fait, l'attribution reste descriptive."""
     try:
         rows = work.milestones(db, int(lot)) or []
         freezes = [r for r in rows if r.get("kind") == "frozen"]
-        if not freezes:
-            return None
-        return max(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)))
+        return sorted(freezes, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0)),
+                      reverse=True)
     except Exception:  # noqa: BLE001 - jalons illisibles : pas de trace
-        return None
+        return []
+
+
+#: #1525 : les notes du journal qui nomment un détenteur du lot
+_HELD = re.compile(r"(?:^|; )(?:assigned to|delegated to) ([^\s,;()]+)|\(before: ([^\s,;()]+)")
+
+
+def _holders(db, lot: int, item: dict) -> set:
+    """Les agents qui ont tenu le lot : l'assigné courant et ceux que le
+    journal nomme (`assigned to X`, `delegated to X`, `(before: X)`).
+
+    #1525 : un pilote ou le bureau qui repose le gel n'a jamais tenu le lot ;
+    il n'en est pas l'auteur, et sa famille ne doit pas être celle du lot."""
+    names = {str(item.get("assignee") or "").strip()}
+    try:
+        for e in storage.of(db).work.events(int(lot), 500) or []:
+            for m in _HELD.finditer(str(e.get("note") or "")):
+                names.add(m.group(1) or m.group(2))
+    except Exception:  # noqa: BLE001 - journal illisible : l'assigné seul
+        pass
+    names.discard("")
+    names.discard("nobody")
+    return names
 
 
 def _turns_harness(db, agent: str, at_ts: float) -> str:
@@ -166,19 +188,34 @@ def _author_at_freeze(db, lot: int, item: dict) -> dict:
     (`_turns_harness`). L'assigné courant ne le remplace pas : la relecture
     réassigne le lot après le gel. Sans gel, sans acteur ou sans tour tracé, la
     famille reste inconnue : le registre courant n'est jamais consulté pour la
-    deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`)."""
+    deviner, il ne prouve rien d'historique (L242b, rotation, `adopt`).
+
+    #1525 : l'acteur d'un gel ne compte que s'il a tenu le lot (`_holders`).
+    Un tiers qui repose le gel (pilote, bureau) est écarté : on remonte au gel
+    précédent d'un détenteur ; s'il n'y en a pas, l'auteur est inconnu et le
+    corps nomme l'acteur écarté (`refroze`)."""
     assignee = str(item.get("assignee") or "").strip()
     out = {"name": assignee, "harness": ""}
     try:
-        freeze = _freeze(db, lot)
-        if freeze is None:
+        freezes = _freezes(db, lot)
+        if not freezes:
             return out
-        name = str(freeze.get("actor") or "").strip() or assignee
-        out["name"] = name
-        at_ts = freeze.get("at_ts")
-        if not name or at_ts is None:
-            return out
-        out["harness"] = _turns_harness(db, name, at_ts)
+        holders = _holders(db, lot, item)
+        third = ""
+        for freeze in freezes:
+            name = str(freeze.get("actor") or "").strip() or assignee
+            if name and name not in holders:
+                third = third or name
+                continue
+            out["name"] = name
+            at_ts = freeze.get("at_ts")
+            if name and at_ts is not None:
+                out["harness"] = _turns_harness(db, name, at_ts)
+            break
+        else:
+            out["name"] = ""
+        if third:
+            out["refroze"] = third
     except Exception:  # noqa: BLE001 - toute trace illisible : famille inconnue
         pass
     return out
@@ -196,6 +233,9 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     author = author or {}
     who = author.get("name") or "inconnu"
     harness = author.get("harness") or UNTRACED
+    if author.get("refroze"):
+        # #1525 : un tiers a reposé le gel ; il n'est pas l'auteur
+        harness += "; gel reposé par %s, qui n'a pas tenu le lot" % author["refroze"]
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     lines = [
