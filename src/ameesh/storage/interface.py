@@ -2956,6 +2956,13 @@ class TurnResources(Domain):
         """Ouvre la ligne d'un tour (idempotent sur `turn_id`)."""
 
     @abc.abstractmethod
+    def attach_cgroup(self, turn_id: str, cgroup: str) -> None:
+        """L498 : rattache le cgroup délégué du tour (chemin relatif à la
+        monture cgroup v2). Appelée juste après `open_turn` par l'exécuteur
+        qui a un cgroup ; un exécuteur médié ne l'a pas (opération refusée au
+        contrat, la ligne reste sans cgroup)."""
+
+    @abc.abstractmethod
     def close_turn(self, turn_id: str, *, orphan: bool,
                    containers: Sequence[str] | None = None) -> None:
         """Ferme la ligne : `done` si la ressource est rendue, `orphan` sinon."""
