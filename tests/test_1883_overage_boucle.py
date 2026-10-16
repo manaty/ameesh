@@ -73,7 +73,7 @@ CREDITS = {"has_credits": True, "unlimited": False}
 
 
 class DossiersPartagesTest(unittest.TestCase):
-    """`parse` refuse deux comptes qui lisent le même dossier."""
+    """`parse` refuse deux comptes qui **déclarent** le même dossier."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1883-")
@@ -105,6 +105,19 @@ class DossiersPartagesTest(unittest.TestCase):
         with self.assertRaises(accounts.AccountError):
             accounts.parse({"codex": [{"name": "primaire"},
                                       {"name": "secondaire", "path": defaut}]})
+
+    def test_deux_comptes_sans_dossier_acceptes(self):
+        """Deux comptes sans `path` ne déclarent aucun dossier : L94 les nomme
+        pour lire leur `pace_multiplier` sans exiger un dossier à chacun. Les
+        refuser vidait `accounts.parse` pour les lecteurs qui l'attrapent et
+        faisait disparaître l'alerte de sous-utilisation (CI du 16/10)."""
+        profils = accounts.parse({"codex": [
+            {"name": "primaire", "pace_multiplier": 2.0},
+            {"name": "secondaire"}]})["codex"]
+        self.assertEqual([p.name for p in profils], ["primaire", "secondaire"])
+        self.assertEqual([p.pace_multiplier for p in profils], [2.0, 1.0])
+        self.assertTrue(all(p.default for p in profils))
+        self.assertEqual(len({p.home() for p in profils}), 1)
 
     def test_dossiers_distincts_acceptes(self):
         a = _dossier(os.path.join(self.tmp, "codex-1"), creds="auth.json")

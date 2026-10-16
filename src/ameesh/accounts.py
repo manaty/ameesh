@@ -548,28 +548,40 @@ def parse(raw) -> dict[str, list[Profile]]:
 
 
 def _refuse_shared_homes(harness: str, profiles: list[Profile]) -> None:
-    """#1883 : deux comptes déclarés ne peuvent pas lire le MÊME dossier.
+    """#1883 : deux comptes ne peuvent pas DÉCLARER le même dossier.
 
-    Un compte `config_dir` sans `path` désigne le dossier par défaut du
-    harnais : le déclarer à côté d'un autre compte qui y résout fait lire les
-    jauges d'un compte sous le nom de l'autre — le 16/10, le choix a vu
-    « secondaire » tantôt dans son dossier (5 h à 100 %, en dépassement),
-    tantôt dans celui du primaire (34 %), et a basculé en boucle en lançant
-    des tours facturés au-delà du forfait. La comparaison est faite sur le
-    chemin **résolu** (`realpath`) : deux liens vers le même dossier sont le
-    même compte. Refus à la lecture de la configuration, jamais un choix
-    silencieux."""
-    seen: dict[str, str] = {}
+    Un compte `config_dir` qui porte un `path` désigne ce dossier ; un compte
+    sans `path` suit le dossier par défaut du harnais. Deux comptes dont l'un
+    au moins **déclare** un dossier ne doivent pas résoudre vers le même — le
+    16/10, le choix a vu « secondaire » tantôt dans son dossier (5 h à 100 %,
+    en dépassement), tantôt dans celui du primaire (34 %), et a basculé en
+    boucle en lançant des tours facturés au-delà du forfait. La comparaison est
+    faite sur le chemin **résolu** (`realpath`) : deux liens vers le même
+    dossier sont le même compte. Refus à la lecture de la configuration, jamais
+    un choix silencieux.
+
+    Deux comptes sans `path` ne déclarent rien : ils lisent le même dossier par
+    défaut, et c'est la spécification de L94 (`pace_multiplier` d'un compte
+    déclaré se lit sans exiger un dossier à chacun). Les refuser rendait
+    `accounts.parse` silencieusement vide pour les lecteurs qui l'attrapent
+    (`sous_utilisation._declared_profiles`) : le rythme retombait à ×1 sans
+    alerte, et la sous-utilisation disparaissait — la CI du 16/10 a rougi là
+    (`test_le_rythme_percu_suit_le_multiplicateur_du_profil`)."""
+    seen: dict[str, tuple[str, bool]] = {}
     for profile in profiles:
         if profile.kind != "config_dir":
             continue
         home = os.path.realpath(profile.home())
+        declare = bool(profile.path)
         if home in seen:
-            raise AccountError(
-                "`accounts.%s`: accounts %r and %r resolve to the same "
-                "configuration directory (%s) — one reading cannot stand for two "
-                "accounts" % (harness, seen[home], profile.name, home))
-        seen[home] = profile.name
+            other, other_declares = seen[home]
+            if declare or other_declares:
+                raise AccountError(
+                    "`accounts.%s`: accounts %r and %r resolve to the same "
+                    "configuration directory (%s) — one reading cannot stand for two "
+                    "accounts" % (harness, other, profile.name, home))
+        else:
+            seen[home] = (profile.name, declare)
 
 
 def profiles(cfg, harness: str) -> list[Profile]:
