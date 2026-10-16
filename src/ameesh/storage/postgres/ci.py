@@ -61,11 +61,6 @@ class CiResults(interface.CiResults):
             "UPDATE ci_runs SET started_at = now() WHERE repo = %%s AND run_id IN (%s)"
             " AND started_at IS NULL" % _ints(run_ids), (repo,))
 
-    def queued(self) -> list[dict]:
-        return self.db.query(
-            "SELECT %s FROM ci_runs WHERE status = 'running' AND started_at IS NULL"
-            " ORDER BY coalesce(created_at, first_seen_at), run_id" % RUN_COLUMNS)
-
     def reopen_run(self, repo, run_id, *, run_attempt) -> dict | None:
         # #901 : GitHub dit l'exécution de nouveau `queued`/`in_progress` avec
         # le même run_id : c'est une relance. La tête a pu bouger depuis (une
@@ -357,30 +352,11 @@ class CiResults(interface.CiResults):
             (float(now), int(calls), int(runs), int(covered), bool(complete),
              reason, repo))
 
-    def guard_runs(self, repo) -> dict:
-        """Le cache des relevés par exécution : `{(run_id, attempt): {...}}`."""
-        rows = self.db.query(
-            """
-            SELECT run_id, attempt, status, queued, oldest_id, oldest_at, runners
-              FROM ci_guard_run
-             WHERE repo = %s
-            """, (repo,))
-        out: dict = {}
-        for row in rows:
-            runners = row.get("runners")
-            if isinstance(runners, str):
-                try:
-                    runners = json.loads(runners or "{}")
-                except ValueError:
-                    runners = {}
-            out[(int(row["run_id"]), int(row["attempt"]))] = dict(
-                row, runners=dict(runners or {}))
-        return out
-
     def observe_guard_run(self, repo, *, run_id, attempt, status, queued,
                           oldest_id, oldest_at, runners) -> None:
-        """Écrit le relevé d'une exécution : seules les exécutions restées
-        `queued` (aucun job commencé) sont réutilisées sans nouvel appel."""
+        """Écrit le relevé d'une exécution (#845) : trace de la fenêtre en
+        cours, sans relecture — depuis le retrait du lecteur (B1), chaque
+        relevé relit toutes les exécutions au lieu de réutiliser ce cache."""
         self.db.execute(
             """
             INSERT INTO ci_guard_run AS r
