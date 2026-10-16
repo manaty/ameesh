@@ -17,9 +17,12 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
-        L233b: before any take, the intake and build lots of a non-critical
-        Claude agent paused on budget go to a free DeepSeek agent of the
-        same project (`ameesh.handoff.budget_handoff`);
+        L233b/L165: before any take, the non-started (`intake`) lots of a
+        non-critical Claude agent paused on budget are returned to the team
+        queue (no assignee, a journal note), where the automatic take gives
+        them to any free capable agent (DeepSeek or Codex); its started
+        (`build`) lots go to a free DeepSeek or Codex agent of the same
+        project (`ameesh.handoff.budget_handoff`);
         `--handoff-max-per-hour 0` turns it off.
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
@@ -1372,10 +1375,12 @@ class Notifier:
             return
         for move in moved:
             item = move["item"]
+            queued = bool(move.get("queued"))
             entry = {"alert": {"type": "budget_handoff", "agent": move["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
                      "human": None, "source": "pause budget de %s" % move["previous"]}
-            self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
+            self._record("budget_handoff", entry,
+                         "a_blanc" if self.dry_run else ("rendu" if queued else "prise"), {})
 
     # -- levée ----------------------------------------------------------------
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
@@ -1828,7 +1833,7 @@ _DELIVERY_LABELS = {"a_blanc": "dry run", "envoyee": "sent", "echec": "failed",
                     "sans_destinataire": "no recipient", "sans_canal": "no channel",
                     "resumee": "summarized", "abandonnee": "abandoned",
                     "sans_envoi": "not sent", "prise": "taken", "nouvelle": "new",
-                    "envoi": "sending"}
+                    "rendu": "returned to the queue", "envoi": "sending"}
 
 
 def _format(record: dict) -> str:
@@ -1919,14 +1924,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--handoff-max-per-hour", type=int,
                         default=int(exploitation._env_float(
                             "AMEESH_HANDOFF_MAX_PER_HOUR", handoff.DEFAULT_MAX_PER_HOUR)),
-                        help="maximum lots handed per rolling hour from non-critical Claude "
-                             "agents paused on budget to free DeepSeek agents of the same "
-                             "project (default 4; 0 turns this off)")
+                        help="maximum lots returned to the queue or handed per rolling hour "
+                             "from non-critical Claude agents paused on budget, the handed "
+                             "ones to free DeepSeek or Codex agents of the same project "
+                             "(default 4; 0 turns this off)")
     parser.add_argument("--handoff-idle", type=float,
                         default=exploitation._env_float("AMEESH_HANDOFF_IDLE",
                                                         handoff.DEFAULT_IDLE_S),
-                        help="a DeepSeek agent takes a handed lot once idle for S seconds "
-                             "(default 300)")
+                        help="a DeepSeek or Codex agent takes a handed lot once idle for S "
+                             "seconds (default 300)")
     return parser
 
 

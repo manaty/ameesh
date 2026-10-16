@@ -100,7 +100,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_HOST_GATE_ACK`, `AMEESH_HOST_GATE_DRAIN` | `host_gate_ack`, `host_gate_drain` | —, 0 | acknowledgement file written by the runner, and drain duration applied when the gate says `draining` |
 | `AMEESH_HOST_GATE_FALLBACK` | `host_gate_fallback` | — | state assumed when the gate is unreadable: `available`, `draining` or `stopped` |
 | `AMEESH_HOST_MEDIATED` | `host_mediated` | off | declares this host a mediated host (L107–L114): provider and database credentials stay on the mesh server. It does **not** select the transport — `backend = "mediated"` (`AMEESH_BACKEND`) does; the flag also allows the `socket` host gate |
-| `AMEESH_HANDOFF_MAX_PER_HOUR`, `AMEESH_HANDOFF_IDLE`, `AMEESH_HANDOFF_ENABLE_WORKERS` | — | 4, 300 s, 4 | budget handoff (L233b): at most N lots per rolling hour leave a non-critical Claude agent paused on budget for a free DeepSeek agent of the same project, which takes one after S seconds idle; the workers bound concurrent held host handoffs (L232a) |
+| `AMEESH_HANDOFF_MAX_PER_HOUR`, `AMEESH_HANDOFF_IDLE`, `AMEESH_HANDOFF_ENABLE_WORKERS` | — | 4, 300 s, 4 | budget handoff (L233b, L165): at most N lots per rolling hour leave a non-critical Claude agent paused on budget — its non-started lots returned to the team queue (automatic take), its started lots handed to a free DeepSeek or Codex agent of the same project, which takes one after S seconds idle; the workers bound concurrent held host handoffs (L232a) |
 | `AMEESH_GUARD_CONFIG` | — | `/etc/ameesh/guard.json` | capacity-guard configuration (`ameesh guard`, L159e) |
 | `AMEESH_GUEST_CGROUP` | — | detected | guest cgroups counted in the lendable capacity of the host measure (L159d) |
 

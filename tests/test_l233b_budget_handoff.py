@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L233b : les lots `intake` et `build` d'un agent Claude non critique en
-pause budget passent à un agent DeepSeek libre du même projet."""
+"""L233b / L165 : les lots d'un agent Claude en pause budget — les `intake`
+retournent à la file d'équipe (prise automatique L165), les `build` passent à
+un agent DeepSeek ou Codex libre du même projet."""
 from __future__ import annotations
 
 import dataclasses
@@ -241,49 +242,84 @@ class _Handoff(_Base):
 
 
 class HandoffTest(_Handoff):
-    def test_lots_repris_avec_note_et_courriers(self):
+    def test_intake_rendu_a_la_file_et_build_repris(self):
         self.team()
         self.agent("deepseek2", "deepseek", team="nexlink", since_s=HEURE)
         intake = self.lot("export", priority=1)
         build = self.lot("import", state="build", branch="lot/import")
         with mock.patch.object(handoff, "lot_git", return_value=GIT_OK) as checked:
             out = self.hand()
-        # le plus long repos d'abord, un lot par preneur
-        self.assertEqual([(m["agent"], m["item"]["id"], m["previous"]) for m in out],
-                         [("deepseek1", intake["id"], "claude1"),
-                          ("deepseek2", build["id"], "claude1")])
+        # l'intake est rendu à la file (aucun preneur), le build part au preneur
+        # le plus long repos d'abord
+        self.assertEqual([(m["agent"], m["item"]["id"], m["previous"], m["queued"])
+                          for m in out],
+                         [(None, intake["id"], "claude1", True),
+                          ("deepseek1", build["id"], "claude1", False)])
         self.assertEqual(checked.call_args.kwargs["host"], self.cfg.host)
-        self.assertEqual((self.assignee(intake), self.assignee(build)),
-                         ("deepseek1", "deepseek2"))
+        self.assertIsNone(self.assignee(intake))
+        self.assertEqual(self.assignee(build), "deepseek1")
+        note = work.events(self.db, intake["id"])[0]
+        self.assertTrue(note["note"].startswith(handoff.RETURN_NOTE))
+        self.assertIn("file d'équipe", note["note"])
+        self.assertIn("DeepSeek ou Codex", note["note"])
+        self.assertIn("ne revient pas seul", note["note"])
+        self.assertEqual(note["actor"], "ameesh")
         note = work.events(self.db, build["id"])[0]
         self.assertTrue(note["note"].startswith(handoff.HANDOFF_NOTE))
         self.assertIn("rien ne revient seul", note["note"])
         self.assertIn("branche lot/import", note["note"])
         self.assertEqual(note["actor"], "ameesh")
         mails = self.mails()
+        # un lot rendu ne produit pas de courrier : la prise automatique (L165)
+        # préviendra son preneur
         self.assertEqual([(m["recipient"], m["kind"], m["work_item_id"]) for m in mails],
-                         [("deepseek1", "event", str(intake["id"])),
-                          ("claude1", "event", str(intake["id"])),
-                          ("deepseek2", "event", str(build["id"])),
+                         [("deepseek1", "event", str(build["id"])),
                           ("claude1", "event", str(build["id"]))])
-        self.assertIn("review by another family stays required", mails[2]["body"])
-        self.assertIn("pushed branch lot/import", mails[2]["body"])
-        self.assertIn("Do not push to lot/import", mails[3]["body"])
+        self.assertIn("review by another family stays required", mails[0]["body"])
+        self.assertIn("pushed branch lot/import", mails[0]["body"])
+        self.assertIn("Do not push to lot/import", mails[1]["body"])
         payload = mails[0]["payload"]
         payload = json.loads(payload) if isinstance(payload, str) else payload
         self.assertEqual(payload["budget_handoff"],
-                         {"lot": intake["id"], "from": "claude1", "to": "deepseek1"})
-        # les preneurs ne sont plus libres : plus rien au passage suivant
+                         {"lot": build["id"], "from": "claude1", "to": "deepseek1"})
+        # le preneur n'est plus libre : plus rien au passage suivant
         self.assertEqual(self.hand(), [])
 
     def test_a_blanc(self):
         self.team()
         intake = self.lot("export")
-        out = self.hand(dry_run=True)
-        self.assertEqual([(m["agent"], m["item"]["id"]) for m in out],
-                         [("deepseek1", intake["id"])])
+        build = self.lot("import", state="build", branch="lot/import")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            out = self.hand(dry_run=True)
+        self.assertEqual([(m["agent"], m["item"]["id"], m["queued"]) for m in out],
+                         [(None, intake["id"], True),
+                          ("deepseek1", build["id"], False)])
         self.assertEqual(self.assignee(intake), "claude1")
+        self.assertEqual(self.assignee(build), "claude1")
         self.assertEqual(self.mails(), [])
+
+    def test_intake_rendu_sans_preneur_libre(self):
+        # la règle : un lot non démarré revient à la file même si aucun agent
+        # DeepSeek ou Codex n'est libre pour le prendre
+        self.agent("claude1", team="nexlink")
+        self.pause("claude1")
+        intake = self.lot("export")
+        out = self.hand()
+        self.assertEqual([(m["agent"], m["item"]["id"], m["queued"]) for m in out],
+                         [(None, intake["id"], True)])
+        self.assertIsNone(self.assignee(intake))
+
+    def test_un_build_repris_par_un_codex_libre(self):
+        # le lot : DeepSeek ET Codex reprennent les lots prêts
+        self.agent("claude1", team="nexlink")
+        self.pause("claude1")
+        self.agent("codex1", "codex", team="nexlink")
+        build = self.lot("import", state="build", branch="lot/import")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            out = self.hand()
+        self.assertEqual([(m["agent"], m["item"]["id"]) for m in out],
+                         [("codex1", build["id"])])
+        self.assertEqual(self.assignee(build), "codex1")
 
     def test_agent_critique_ou_pas_en_pause(self):
         self.team()
@@ -338,13 +374,14 @@ class HandoffTest(_Handoff):
         lot = self.lot("export", assignee="codex1")
         self.assertEqual(self.hand(), [])
         self.assertEqual(self.assignee(lot), "codex1")
-        # un agent Claude libre ne prend pas : seul DeepSeek reprend
+        # un agent Claude libre ne prend pas : DeepSeek ou Codex reprennent
         self.agent("claude1", team="nexlink")
         self.pause("claude1")
         self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = %s",
                         ("deepseek1",))
-        mine = self.lot("import")
-        self.assertEqual(self.hand(), [])
+        mine = self.lot("import", state="build", branch="lot/import")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            self.assertEqual(self.hand(), [])
         self.assertEqual(self.assignee(mine), "claude1")
 
     def test_jamais_en_revue_gele_sensible_ou_en_decision(self):
@@ -378,17 +415,27 @@ class HandoffTest(_Handoff):
 
     def test_autre_projet_ou_hors_budget(self):
         self.team()
+        # un lot non démarré revient à la file sans dépendre d'un preneur
+        intake = self.lot("export")
         self.db.execute("UPDATE agent_registry SET team = 'web' WHERE name = 'deepseek1'")
-        lot = self.lot("export")
-        self.assertEqual(self.hand(), [])
-        self.db.execute("UPDATE agent_registry SET team = 'nexlink' WHERE name = 'deepseek1'")
-        self.assertEqual(self.hand(budget_check=lambda agent: "cap reached"), [])
-        # un orchestrateur DeepSeek ne se sert pas
-        self.assertEqual(self.hand(orchestras=["deepseek1"]), [])
-        # un preneur occupé ou au repos trop court
-        self.assertEqual(self.hand(idle_s=3 * HEURE), [])
-        self.assertEqual(self.assignee(lot), "claude1")
-        self.assertEqual(len(self.hand()), 1)
+        out = self.hand()
+        self.assertEqual([(m["agent"], m["item"]["id"]) for m in out],
+                         [(None, intake["id"])])
+        self.assertIsNone(self.assignee(intake))
+        # un lot démarré, lui, exige un preneur du bon projet, dans son budget
+        build = self.lot("import", state="build", branch="lot/import")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            self.assertEqual(self.hand(), [])
+            self.db.execute("UPDATE agent_registry SET team = 'nexlink'"
+                            " WHERE name = 'deepseek1'")
+            self.assertEqual(self.hand(budget_check=lambda agent: "cap reached"), [])
+            # un orchestrateur DeepSeek ne se sert pas
+            self.assertEqual(self.hand(orchestras=["deepseek1"]), [])
+            # un preneur occupé ou au repos trop court
+            self.assertEqual(self.hand(idle_s=3 * HEURE), [])
+            self.assertEqual(self.assignee(build), "claude1")
+            self.assertEqual(len(self.hand()), 1)
+        self.assertEqual(self.assignee(build), "deepseek1")
 
     def test_derniere_attribution_humaine(self):
         self.team()
@@ -437,6 +484,36 @@ class HandoffTest(_Handoff):
         self.assertEqual(len(self.hand(max_per_hour=1)), 1)
         self.assertEqual(self.hand(max_per_hour=1), [])
         self.assertEqual(self.hand(max_per_hour=0), [])
+
+    def test_plafond_horaire_partage_rendus_et_reprises(self):
+        # un rendu et une reprise comptent dans le même plafond glissant
+        self.team()
+        build = self.lot("import", state="build", branch="lot/import")
+        intake = self.lot("export", priority=1)
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            out = self.hand(max_per_hour=1)
+        self.assertEqual([(m["item"]["id"], m["queued"]) for m in out],
+                         [(intake["id"], True)])
+        self.assertIsNone(self.assignee(intake))
+        self.assertEqual(self.assignee(build), "claude1")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            self.assertEqual(self.hand(max_per_hour=1), [])
+        self.assertEqual(self.assignee(build), "claude1")
+
+    def test_note_de_lot_saute_hors_plafond(self):
+        # la note d'un build sauté n'est pas un mouvement : elle ne consomme
+        # pas le plafond horaire, qui compte les rendus et les reprises
+        self.team()
+        build = self.lot("import", state="build", branch="lot/import")
+        dirty = {"ok": False, "reason": "uncommitted changes in /w", "paths": None}
+        with mock.patch.object(handoff, "lot_git", return_value=dirty):
+            self.assertEqual(self.hand(max_per_hour=1), [])
+        self.assertTrue(any(e["note"].startswith(handoff.SKIP_NOTE)
+                            for e in work.events(self.db, build["id"])))
+        intake = self.lot("export", priority=1)
+        out = self.hand(max_per_hour=1)
+        self.assertEqual([(m["item"]["id"], m["queued"]) for m in out],
+                         [(intake["id"], True)])
 
     def take(self, lot, *, current="claude1", state="intake", assignee="deepseek1",
              max_per_window=4):
@@ -531,7 +608,7 @@ class HandoffTest(_Handoff):
         self.assertEqual(seen, {"now": self.now, "dry_run": False, "max_per_hour": 4,
                                 "idle_s": 300.0})
         self.assertEqual([(r["event"], r["agent"], r["lot"], r["delivery"]) for r in records],
-                         [("budget_handoff", "deepseek1", lot["id"], "prise")])
+                         [("budget_handoff", None, lot["id"], "rendu")])
         self.assertIn("budget handoff", notify._format(records[0]))
         args = notify.build_parser().parse_args(["--handoff-max-per-hour", "0"])
         self.assertIsNone(notify.handoff_settings(args))
