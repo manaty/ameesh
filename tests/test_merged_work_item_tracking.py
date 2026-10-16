@@ -1442,6 +1442,109 @@ class ContentDeliveryTest(_Base):
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
 
+class ProbePartialCloneTest(_Base):
+    """#1772 : dans un clone partiel, le commit d'un gel absent localement est
+    rapatrié par un fetch explicite borné, au lieu de se lire « not in the
+    repository » (#1749 coupe le fetch paresseux des sondes de présence).
+
+    Hors clone partiel (aucun remote *promisor*), aucun fetch n'est tenté :
+    la cible reste lue telle que le clone la connaît."""
+
+    def setUp(self):
+        super().setUp()
+        self.remote = os.path.join(self.tmp, "remote1772")
+        os.makedirs(self.remote)
+        _git(self.remote, "init", "-q", "-b", "main")
+        self.commit(self.remote, "socle")
+        # le serveur local doit servir le filtre (clone partiel) et un objet
+        # par son sha (fetch explicite d'un commit)
+        _git(self.remote, "config", "uploadpack.allowFilter", "true")
+        _git(self.remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.repo = os.path.join(self.tmp, "clone1772")
+        _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
+             "file://" + self.remote, self.repo)
+        # un second clone partiel, intact : les têtes publiées ensuite n'y sont
+        # pas encore (preuve du best-effort sans toucher au premier clone)
+        self.autre = os.path.join(self.tmp, "clone1772-bis")
+        _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
+             "file://" + self.remote, self.autre)
+        self.agent("claude1", cwd=self.repo)
+
+    def commit(self, repo, name):
+        with open(os.path.join(repo, name), "w") as fh:
+            fh.write(name + "\n")
+        _git(repo, "add", name)
+        _git(repo, "commit", "-q", "-m", "ajoute %s" % name)
+        return _git(repo, "rev-parse", "HEAD")
+
+    def publish(self):
+        """Une tête publiée sur une branche du remote, PAS rapatriée par le
+        clone : la branche existe, le commit est absent localement."""
+        _git(self.remote, "checkout", "-q", "-b", "agent/libre", "main")
+        sha = self.commit(self.remote, "libre")
+        _git(self.remote, "checkout", "-q", "main")
+        return sha
+
+    def test_1772_gel_absent_rapatrie_par_un_fetch_explicite(self):
+        sha = self.publish()
+        self.assertIsNone(plan_git._commit(self.repo, sha))      # absent du clone
+        found = plan_git.probe(self.repo, sha, "origin/main")
+        self.assertFalse(found["merged"], found)
+        self.assertNotIn("not in the repository", found["detail"])
+        self.assertIn("missing from origin/main", found["detail"])
+        self.assertIsNotNone(plan_git._commit(self.repo, sha))   # rapatrié
+        self.assertEqual(plan_git._promisor_remote(self.repo, "origin/main"), "origin")
+
+    def test_1772_sha_introuvable_reste_une_absence_dite(self):
+        found = plan_git.probe(self.repo, "c" * 40, "origin/main")
+        self.assertIn("not in the repository", found["detail"])
+        self.assertIn("explicit fetch from origin brought nothing", found["detail"])
+
+    def test_1772_clone_complet_ne_fetch_pas(self):
+        complet = os.path.join(self.tmp, "complet1772")
+        _git(self.tmp, "clone", "-q", "--no-local", "file://" + self.remote, complet)
+        sha = self.publish()
+        found = plan_git.probe(complet, sha, "origin/main")
+        self.assertIn("not in the repository", found["detail"])
+        self.assertNotIn("explicit fetch", found["detail"])
+        self.assertIsNone(plan_git._commit(complet, sha))
+
+    def test_1772_commit_present_aucun_acces_au_remote(self):
+        # une sonde sur un commit présent ne touche pas le remote : même avec
+        # une URL cassée elle conclut, le fetch paresseux compris
+        head = _git(self.repo, "rev-parse", "origin/main")
+        _git(self.repo, "remote", "set-url", "origin",
+             "file://" + os.path.join(self.tmp, "nulle-part"))
+        found = plan_git.probe(self.repo, head, "origin/main")
+        self.assertTrue(found["merged"], found)
+
+    def test_1772_fetch_borne_et_best_effort(self):
+        sha = self.publish()
+        real = plan_git._git
+        vus = []
+
+        def espion(repo, *args, **kw):
+            vus.append((args, kw))
+            return real(repo, *args, **kw)
+
+        with mock.patch.object(plan_git, "_git", side_effect=espion):
+            plan_git.probe(self.repo, sha, "origin/main")
+        fetches = [kw for args, kw in vus if args and args[0] == "fetch"]
+        self.assertEqual(len(fetches), 1)
+        self.assertEqual(fetches[0].get("timeout"), plan_git.FETCH_TIMEOUT)
+
+        # un fetch qui échoue (réseau) ne casse pas la sonde : l'absence est dite
+        def sans_reseau(repo, *args, **kw):
+            if args and args[0] == "fetch":
+                raise plan_git.GitError("git fetch: timed out")
+            return real(repo, *args, **kw)
+
+        with mock.patch.object(plan_git, "_git", side_effect=sans_reseau):
+            found = plan_git.probe(self.autre, sha, "origin/main")
+        self.assertIn("not in the repository", found["detail"])
+        self.assertIn("explicit fetch from origin brought nothing", found["detail"])
+
+
 class CurrentLotTest(_Base):
     """`ameesh projects` : le lot en cours est le dernier lot OUVERT cité."""
 
