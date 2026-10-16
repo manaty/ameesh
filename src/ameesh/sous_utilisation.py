@@ -112,9 +112,6 @@ _ROLE_OF = {alias: role for role, aliases in ROLE_SYNONYMS.items() for alias in 
 #: L242c (#424 r2) : constats de chargement qui laissent un canon lu en partie
 #: (fiche ou manifeste illisible) — ses rôles ne sont alors pas connus
 READ_ERRORS = ("canon-git-error", "frontmatter-invalid", "federation-invalid")
-#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
-#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
-#: leur dossier, `CRITICAL_DIR`)
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -202,9 +199,17 @@ def _common_responsible(rows) -> str | None:
 # --------------------------------------------------------------------------
 
 def _gauge(row: dict) -> cost_mod.Gauge:
-    return cost_mod.Gauge(row["harness"], row["key"], float(row.get("used") or 0.0),
+    """La jauge d'une ligne d'historique, portée par modèle restituée.
+
+    #1789/N6 : la clé d'un seau propre à un modèle porte sa portée
+    (`seven_day@fable`, #1580) — l'historique ne stocke pas le `scope` ; le
+    relire ici évite qu'un seau de modèle soit pris pour la fenêtre générale
+    du compte (alertes de sous-utilisation, `plan_underused`)."""
+    key = row["key"]
+    _, _, scope = key.partition("@")
+    return cost_mod.Gauge(row["harness"], key, float(row.get("used") or 0.0),
                           row.get("resets_at_ts"), float(row.get("window_s") or 0.0)
-                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]))
+                          or float(cost_mod.KNOWN_WINDOWS["seven_day"]), scope=scope)
 
 
 def expiring(gauge, now: float) -> tuple | None:
@@ -293,9 +298,13 @@ def plan_underused(db, listing: list, now: float, *,
         # une autre fenêtre du compte au seuil : sa capacité n'est pas
         # utilisable d'ici là, rien n'est « perdu » par négligence
         live = [(g, seen) for g, seen in gauges if expiring(g, now) is not None]
+        # #1789/N6 : un seau propre à un modèle (#1580 tranche 3) ne rend pas
+        # la capacité générale du compte inutilisable — seules les fenêtres
+        # générales se taisent entre elles ; un seau de modèle reste alerte.
+        blocking = [(g, seen) for g, seen in live if not getattr(g, "scope", "")]
         for gauge, seen in live:
             if any(other.exceeded(now, 0.0, multiplier, ceiling)
-                   for other, _ in live if other is not gauge):
+                   for other, _ in blocking if other is not gauge):
                 continue
             resets_at, unused = expiring(gauge, now)
             remaining = resets_at - now
@@ -481,6 +490,9 @@ def fully_read(canon) -> bool:
 #: invalide, fichier ou dossier dont on ne peut se fier) — « inconnu » vaut
 #: critique
 UNKNOWN = "unknown"
+#: L242c (#424 r2) : les derniers verdicts lus, dans l'état de l'hôte —
+#: relus par un exécuteur redémarré et par `ameesh resume` (#424 r4 : dans
+#: leur dossier, `CRITICAL_DIR`)
 #: #424 r4 : le dossier du cache (0700, à nous ; verrouillé lui-même) et ses
 #: données (renommées seules)
 CRITICAL_DIR, CRITICAL_DATA = "critical-known", "known.json"

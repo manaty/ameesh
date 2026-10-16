@@ -20,7 +20,7 @@ from unittest import mock
 
 from ameesh import merge_pr, merge_queue, radar, work
 
-from .test_l160b_radar import _git
+from .test_l160b_radar import _git, git_env
 
 
 def _write(repo, path, text):
@@ -81,7 +81,7 @@ class _Base(unittest.TestCase):
         self.base = _git(self.repo, "rev-parse", "main")
         self.origin = os.path.join(self.tmp, "origin.git")
         subprocess.run(["git", "clone", "-q", "--bare", self.repo, self.origin],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=git_env())
         # la branche de la PR : un fichier de workflow ET un fichier de code
         _git(self.repo, "checkout", "-q", "-b", "lot/7-work")
         _write(self.repo, ".github/workflows/ci.yml", "on: push\njobs:\n  t:\n    steps: []\n")
@@ -156,7 +156,7 @@ class _Base(unittest.TestCase):
         mover = os.path.join(self.tmp, "mover")
         if not os.path.isdir(mover):
             subprocess.run(["git", "clone", "-q", self.origin, mover], check=True,
-                           capture_output=True)
+                           capture_output=True, env=git_env())
         _write(mover, "README.md", "moved %f\n" % time.time())
         _git(mover, "add", "-A")
         _git(mover, "commit", "-q", "-m", "moved")
@@ -327,7 +327,7 @@ class IdentityTest(_Base):
         """Un dépôt B avec les MÊMES commits (base et gel) que A."""
         twin = os.path.join(self.tmp, "twin.git")
         subprocess.run(["git", "clone", "-q", "--bare", self.repo, twin],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, env=git_env())
         _git(twin, "update-ref", "refs/pull/7/head", self.head)
         return twin
 

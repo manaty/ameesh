@@ -40,9 +40,14 @@ La fermeture est conditionnée en base au gel examiné : si un nouveau gel est
 déclaré entre l'examen et l'écriture, rien n'est fermé (`refrozen`).
 
 Lecture seule du dépôt (`git merge-base`, `rev-list`, `log -p`, `patch-id`) ;
-aucun `fetch` : la cible est lue telle que le clone la connaît. Un lot
-absorbé par un autre ou remplacé se clôt par `ameesh work close <id>
---superseded-by <id>` ; jamais de réouverture d'un lot fermé.
+la cible est lue telle que le clone la connaît. Seule exception (#1772) :
+dans un clone partiel (remote *promisor*), le commit d'un gel absent
+localement est rapatrié par UN fetch explicite, borné et best-effort — le
+fetch paresseux des sondes de présence est coupé (`GIT_NO_LAZY_FETCH`,
+#1749) — puis la sonde conclut ; si le commit reste absent, la preuve
+d'absence est dite. Un lot absorbé par un autre ou remplacé se clôt par
+`ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
+lot fermé.
 """
 from __future__ import annotations
 
@@ -50,7 +55,7 @@ import re
 
 from . import storage
 from . import work as work_mod
-from .canon import GitError, NO_LAZY_FETCH, _git
+from .canon import FETCH_TIMEOUT, GitError, NO_LAZY_FETCH, _git
 
 #: cible historique du relevé de contenu (`--target` explicite) ; sans lui,
 #: c'est la cible déclarée du lot ou du dépôt qui fait foi (#1005)
@@ -137,6 +142,52 @@ def _diff_patch_id(repo: str, base: str, head: str) -> str | None:
     return next(iter(ids), None)
 
 
+def _promisor_remote(repo: str, target: str) -> str | None:
+    """Le remote *promisor* dont dépend le clone (#1772), ou None.
+
+    Un clone partiel marque son remote d'origine `remote.<nom>.promisor=true`
+    (`extensions.partialClone`) : lui seul peut porter un objet absent
+    localement. Sont essayés le remote nommé par `target` (« origin/main » →
+    « origin »), celui d'`extensions.partialClone`, puis `origin`. Un dépôt
+    complet n'a pas de promisor : aucun fetch n'est tenté, la cible reste lue
+    telle que le clone la connaît."""
+    candidates: list[str] = []
+    remote, sep, _branch = target.partition("/")
+    if sep and remote and not remote.startswith("refs"):
+        candidates.append(remote)
+    partial = _out(repo, "config", "--get", "extensions.partialClone")
+    if partial and partial not in candidates:
+        candidates.append(partial)
+    if "origin" not in candidates:
+        candidates.append("origin")
+    for name in candidates:
+        if _out(repo, "config", "--bool", "--get",
+                "remote.%s.promisor" % name) == "true":
+            return name
+    return None
+
+
+def _fetch_missing(repo: str, sha: str, target: str) -> str | None:
+    """Rapatrie le seul commit `sha` absent localement, dans un clone partiel.
+
+    #1772 : #1749 coupe le fetch paresseux des sondes de présence
+    (`GIT_NO_LAZY_FETCH`) ; l'absence locale d'un gel n'est alors plus
+    distinguable d'un gel inconnu du dépôt, alors qu'un clone partiel peut
+    l'aller chercher chez son remote. Le fetch est explicite (jamais
+    paresseux), borné (`FETCH_TIMEOUT`) et best-effort : toute erreur — objet
+    non servi, réseau, remote absent — est avalée, la sonde conclut comme
+    avant. Rend le remote employé, ou None si aucun fetch n'a été tenté."""
+    remote = _promisor_remote(repo, target)
+    if remote is None:
+        return None
+    try:
+        _git(repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+             "--", remote, sha, timeout=FETCH_TIMEOUT)
+    except GitError:
+        pass                      # best-effort : l'absence se conclut plus bas
+    return remote
+
+
 def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
     """Le commit `sha` est-il entré dans `target` ? Rend `{merged, how, ref, detail}`.
 
@@ -147,7 +198,11 @@ def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
     #1825 : une preuve par le contenu est annulée par un revert postérieur
     (`reverted_content`) — une tête ancêtre de la cible dont la fusion a été
     annulée n'est pas livrée ; de même un patch-id encore présent dans
-    l'historique quand le commit qui le porte a été annulé depuis."""
+    l'historique quand le commit qui le porte a été annulé depuis.
+
+    #1772 : un gel absent localement est rapatrié par un fetch explicite
+    borné quand le clone est partiel ; sinon l'absence est conclue telle
+    quelle."""
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
@@ -155,8 +210,15 @@ def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
         return {"merged": False, "how": None, "ref": None, "detail": "unreadable commit"}
     frozen = _commit(repo, sha)
     if frozen is None:
-        return {"merged": False, "how": None, "ref": None,
-                "detail": "commit %s not in the repository" % sha[:12]}
+        # #1772 : dans un clone partiel, l'absence locale n'est pas une
+        # preuve — un fetch explicite et borné du seul commit manquant.
+        remote = _fetch_missing(repo, sha, target)
+        frozen = _commit(repo, sha)
+        if frozen is None:
+            detail = "commit %s not in the repository" % sha[:12]
+            if remote:
+                detail += " (explicit fetch from %s brought nothing)" % remote
+            return {"merged": False, "how": None, "ref": None, "detail": detail}
     if _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0:
         stopped = reverted_content(repo, frozen, target, lot=lot)
         if stopped:
@@ -1610,7 +1672,8 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     fusion, les refs d'intégration du remote (`develop`, `main`, `master`,
     `release/*`) sont essayées à leur tour : une fusion citante y ferme le
     lot, avec la ref trouvée dans la note. Aucune autre ref (branche de
-    travail, autre remote), aucun fetch.
+    travail, autre remote) ; seul le commit d'un gel absent localement est
+    rapatrié, et seulement dans un clone partiel (#1772).
 
     #1005 : à défaut de branche et de citation, le dernier gel du lot,
     ancêtre de la ref examinée, prouve la livraison par le contenu (une

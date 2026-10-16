@@ -1008,7 +1008,7 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
-         "provider", "currency", "urgent",
+         "provider", "currency", "urgent", "severity", "level",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
@@ -1053,6 +1053,8 @@ class Notifier:
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
                  ) -> list:
+        from . import alert_ack
+        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         now = float(self.clock())
         if current is None:
             # #1179 : la console du pool local n'est pas lue par la passe
@@ -1063,7 +1065,27 @@ class Notifier:
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
-        notifications = group_orphan_lots(current, router.resolve)
+        acknowledgements = alert_ack.reconcile(
+            db, current, observed_ts=observed_ts, dry_run=self.dry_run,
+            observation_host=getattr(self.cfg, "host", None)) if db is not None else []
+        # Reuse each subject's route for acknowledgement and group membership;
+        # lot/package lookups belong to this snapshot, not to every projection.
+        routes = {id(a): router.resolve(a) for a in current}
+
+        def resolve_current(alert):
+            return routes[id(alert)]
+
+        notifications = group_orphan_lots(current, resolve_current)
+        # Retain all group identities, including fully acknowledged groups:
+        # filtering them out of wanted would falsely announce a resolution.
+        unacknowledged = [a for a in current if alert_ack.matches(
+            acknowledgements, a, resolve_current(a)[0]) is None]
+        audible = {key_of(a): a for a in group_orphan_lots(unacknowledged, resolve_current)}
+        subjects_by_key = {}
+        for subject in current:
+            group = group_orphan_lots([subject], resolve_current)[0]
+            subjects_by_key.setdefault(key_of(group), []).append({
+                "key": alert_ack.key_of(subject), "severity": alert_ack.severity(subject)})
         # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
         # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
         # perd pas — elle atteint l'humain même si son type a été retiré de
@@ -1093,6 +1115,8 @@ class Notifier:
                 # preuve de résolution.
                 continue
             del active[key]
+            if self._acknowledged(entry, acknowledgements):
+                self._mute(entry)
             if entry["alert"].get("type") not in self.ncfg.types \
                     and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
@@ -1102,6 +1126,30 @@ class Notifier:
             self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
+            subjects = subjects_by_key[key]
+            human, _ = (routes[id(alert)] if id(alert) in routes
+                        else router.resolve(alert))
+            muted = key not in audible
+            # A partial orphan group only mentions its unacknowledged members.
+            alert = audible.get(key, alert)
+            level = alert_ack.severity(alert)
+            changed_ack_level = any(r["principal"] == human
+                and any(r["alert_key"] == a["key"] and r["severity"] != a["severity"]
+                        for a in subjects)
+                for r in acknowledgements)
+            if entry is not None and ((entry.get("status") == "acknowledged" and not muted)
+                                      or changed_ack_level):
+                self._forget_summary(entry)
+                entry.update(status="nouvelle", channels={}, alert={
+                    k: alert.get(k) for k in _KEPT if alert.get(k) is not None})
+                entry.pop("escalated", None)
+            if muted:
+                if entry is None:
+                    entry = active[key] = {"alert": {k: alert.get(k) for k in _KEPT
+                        if alert.get(k) is not None}, "raised_ts": now, "channels": {}}
+                entry.update(human=human, severity=level, ack_subjects=subjects)
+                self._mute(entry)
+                continue
             if entry is None:
                 entry = active[key] = {
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
@@ -1129,9 +1177,13 @@ class Notifier:
                     self._raise(entry, router, now)
                 else:
                     self._retry(entry, "raised", now)
+            entry.update(severity=level, ack_subjects=subjects)
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
+            if self._acknowledged(entry, acknowledgements):
+                del self.state["resolved"][key]
+                continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
@@ -1213,6 +1265,33 @@ class Notifier:
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
+
+    @staticmethod
+    def _acknowledged(entry: dict, rows: list) -> bool:
+        from . import alert_ack
+        subjects = entry.get("ack_subjects") or [{"key": alert_ack.key_of(entry["alert"]),
+                                                "severity": alert_ack.severity(entry["alert"])}]
+        return all(any(r["alert_key"] == a["key"] and r["severity"] == a["severity"]
+                       and r["principal"] == entry.get("human") for r in rows)
+                   for a in subjects)
+
+    def _forget_summary(self, entry: dict) -> None:
+        if entry.get("status") != "resumee":
+            return
+        bucket = self.state["summary"].get(entry.get("human"))
+        if bucket:
+            kind = entry["alert"]["type"]
+            remaining = bucket["raised"].get(kind, 0) - 1
+            if remaining > 0:
+                bucket["raised"][kind] = remaining
+            else:
+                bucket["raised"].pop(kind, None)
+            if not bucket["raised"] and not bucket["resolved"]:
+                self.state["summary"].pop(entry.get("human"), None)
+
+    def _mute(self, entry: dict) -> None:
+        self._forget_summary(entry)
+        entry.update(status="acknowledged", channels={})
 
     def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
         """Adopt persisted per-lot deliveries before checking for resolutions.
@@ -1473,6 +1552,14 @@ class Notifier:
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
             if entry is not None:
+                # #1787 N1 : la relance repart aux destinataires de la levée,
+                # pas à ceux que l'état vivant désignerait maintenant (le brief
+                # d'un lot sans assigné est atomique, #1026) ; si aucun n'est
+                # plus joignable, rien ne part et `reminded` reste à poser.
+                keep = {str(n) for n in entry.get("to") or ()}
+                briefs = {n: t for n, t in briefs.items() if n in keep}
+                if not briefs:
+                    continue
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
@@ -1550,6 +1637,9 @@ class Notifier:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
             return
+        if status == "acknowledged":
+            self._record("resolved", entry, "sans_envoi", {})
+            return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
             self.log("alert resolved [%s] %s (never sent: %s)" % (
                 alert.get("type"), _subject(alert), _DELIVERY_LABELS.get(status, status)))
@@ -1565,6 +1655,7 @@ class Notifier:
             self._record("resolved", entry, "abandonnee", {})
             return
         resolved = {"alert": alert, "raised_ts": entry.get("raised_ts"), "resolved_ts": now,
+                    "ack_subjects": entry.get("ack_subjects"),
                     "human": human, "source": entry.get("source"), "status": "envoi",
                     "channels": {name: {"ok": False, "attempts": 0, "error": None}
                                  for name in delivered}}
