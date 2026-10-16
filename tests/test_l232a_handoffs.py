@@ -11,7 +11,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import handoffs, registry, resources, storage, work
+from ameesh import agent_pause, handoffs, registry, resources, storage, work
 from .support import PgTestCase
 
 GIB = 1024**3
@@ -503,6 +503,36 @@ class HandoffTest(PgTestCase):
         self.advance(op)
         self.advance(op)
         self.assertTrue(AgentWorker.maybe_relocate(worker, {}))
+        self.assertTrue(worker.stopping.is_set())
+        self.assertTrue(worker.wake.is_set())
+
+    def test_operator_pause_does_not_block_a_host_drain(self):
+        # N1 de la R2 qa-01 (#1533) : _pick servait la pause L87b avant
+        # maybe_relocate, donc un drainage d'hôte ne pouvait ni réserver ni
+        # clore le passage de ce worker tant que la pause tenait.
+        from ameesh.runner import AgentWorker
+        worker = object.__new__(AgentWorker)
+        threading.Thread.__init__(worker)
+        worker.db, worker.name = self.db, "dev"
+        worker.stopping, worker.wake = threading.Event(), threading.Event()
+        worker.runner = SimpleNamespace(relocate=True,
+                                        handoff_limits_for=lambda host: self.limits)
+        agent_pause.change(self.db, "dev", paused=True, reason="maintenance",
+                           actor="human:alice")
+        actual_run = subprocess.run
+        def git_remote(argv, *args, **kwargs):
+            if argv[0] == "git":
+                return SimpleNamespace(stdout="git@forge:acme/app.git")
+            return actual_run(argv, *args, **kwargs)
+        with mock.patch("ameesh.runner.subprocess.run", side_effect=git_remote):
+            self.assertIsNone(worker._pick())
+        op = self.api.handoffs.active("dev")
+        self.assertEqual(op["state"], "planned")
+        self.assertFalse(worker.stopping.is_set())
+        self.advance(op)
+        self.advance(op)
+        with mock.patch("ameesh.runner.subprocess.run", side_effect=git_remote):
+            self.assertIsNone(worker._pick())
         self.assertTrue(worker.stopping.is_set())
         self.assertTrue(worker.wake.is_set())
 

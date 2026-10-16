@@ -372,6 +372,8 @@ class InterruptTest(_Base):
             name=name, agent={"name": name}, db=self.db,
             cfg=types.SimpleNamespace(interrupt_senders=()),
             runner=types.SimpleNamespace(is_auditor=lambda n, a=None: n == "auditeur"),
+            _system_event_interrupt=lambda sender, row: runner.AgentWorker
+            ._system_event_interrupt(self._worker, sender, row),
             _deep_analysis_interrupt=lambda sender, row: runner.AgentWorker
             ._deep_analysis_interrupt(self._worker, sender, row))
 

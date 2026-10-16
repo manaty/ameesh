@@ -5,8 +5,9 @@
 # carte, pas reporté.
 #
 # La suite passe sous mesure (couverture par test, sous-processus compris,
-# fichiers lus, tables touchées) : psycopg en 4 parts, plus les modules
-# « pilote » en psql (le code propre au pilote psql n'est exécuté que là).
+# fichiers lus, tables touchées) : psycopg en 6 parts, plus les modules
+# « pilote » en psql en 4 parts (le code propre au pilote psql n'est exécuté
+# que là).
 # Le job « carte » fusionne les mesures en carte.json.gz (ameesh-carte/1) :
 #   - cache GitHub Actions `carte-<sha>` (une PR lit les caches de sa branche
 #     de base ; clé de repli `carte-`), sur main et à la main seulement ;
@@ -21,9 +22,11 @@
 #     carte précédente (`--map`), pas par la table statique mesurée sans
 #     couverture : le surcoût de la mesure varie de 1,2× à 9,3× selon les
 #     modules, et la table statique ne couvre que 76 modules sur 250 ;
-#   - B : les modules « pilote » psql sont mesurés en 2 parts (une seule part
-#     de 45 modules pesait 38 min de mur pour un plafond de 40, annulée deux
-#     fois) ;
+#   - B : les modules « pilote » psql sont mesurés en 4 parts, et les modules
+#     psycopg en 6 (une seule part de 45 modules pesait 38 min de mur pour un
+#     plafond de 40, annulée deux fois ; le run 38845518821 du 16/10 a encore
+#     annulé psycopg 2/4, 3/4 et psql 1/2, 2/2 à 40m30, d'où le resserrage à
+#     plafond conservé — arbitrage pilote du 16/10) ;
 #   - D : la fusion refuse de publier une carte si une part attendue manque ou
 #     n'a pas écrit ses `durees.json` (part annulée), ou si la matrice de
 #     mesure n'est pas verte ; elle vérifie aussi la couverture *effective*
@@ -92,7 +95,8 @@ env:
   # liste : une seule source pour les parts attendues.
   PARTS_MESURE: >-
     mesure-psycopg-1 mesure-psycopg-2 mesure-psycopg-3 mesure-psycopg-4
-    mesure-psql-1 mesure-psql-2
+    mesure-psycopg-5 mesure-psycopg-6
+    mesure-psql-1 mesure-psql-2 mesure-psql-3 mesure-psql-4
 
 # Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
 # four runners): GitHub's free tier caps hosted jobs at 20 for the whole
@@ -139,17 +143,24 @@ jobs:
     name: mesure ${{ matrix.pilote }} ${{ matrix.part }}/${{ matrix.parts }}
     needs: plan-mesure
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
+    # 16/10 — arbitrage pilote sur le run 38845518821 (main fae0df2b3) :
+    # plafond 40 min conservé, répartition resserrée à 6 parts psycopg et
+    # 4 parts psql (psycopg 2/4, 3/4 et psql 1/2, 2/2 annulées à 40m30).
     timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { pilote: psycopg, part: 1, parts: 4 }
-          - { pilote: psycopg, part: 2, parts: 4 }
-          - { pilote: psycopg, part: 3, parts: 4 }
-          - { pilote: psycopg, part: 4, parts: 4 }
-          - { pilote: psql, part: 1, parts: 2 }
-          - { pilote: psql, part: 2, parts: 2 }
+          - { pilote: psycopg, part: 1, parts: 6 }
+          - { pilote: psycopg, part: 2, parts: 6 }
+          - { pilote: psycopg, part: 3, parts: 6 }
+          - { pilote: psycopg, part: 4, parts: 6 }
+          - { pilote: psycopg, part: 5, parts: 6 }
+          - { pilote: psycopg, part: 6, parts: 6 }
+          - { pilote: psql, part: 1, parts: 4 }
+          - { pilote: psql, part: 2, parts: 4 }
+          - { pilote: psql, part: 3, parts: 4 }
+          - { pilote: psql, part: 4, parts: 4 }
     services:
       postgres:
         image: postgres:17
@@ -187,7 +198,7 @@ jobs:
             # qui les touchait renvoyait le lot à la suite complète.
             .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'pyyaml>=6'
           else
-            .venv-carte/bin/pip install -q 'coverage>=7.10'
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'pyyaml>=6'
           fi
           .venv-carte/bin/python scripts/map.py install
       - name: base jetable (sans fsync) et client psql
@@ -230,7 +241,9 @@ jobs:
   carte:
     name: carte
     needs: mesure
-    if: always()
+    # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
+    # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
+    if: always() && !cancelled()
     # supprimer les mesures du run (étape finale) ; le reste du workflow reste en lecture
     permissions:
       contents: read

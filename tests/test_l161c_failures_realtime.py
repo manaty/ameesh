@@ -9,6 +9,11 @@ ensuite et le verdict à la fin, n'impute jamais un rouge hérité de main, et
 retire les messages non lus d'une tête remplacée. `ci_main_red` signale main
 rouge dès le premier échec relevé, agrégateurs encore en file compris (#846) ;
 `ameesh ci status` montre les exécutions d'un lot.
+
+#795 N2 : le courrier d'un événement de CI et sa preuve
+(`ci_runs.urgent_message_id` / `verdict_message_id`) sont publiés dans la
+même transaction — un lecteur intercalé ne voit jamais le courrier engagé
+sans la référence qui rend la préemption vérifiable.
 """
 from __future__ import annotations
 
@@ -22,11 +27,13 @@ import pathlib
 import re
 import tempfile
 import time
+import types
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, storage, work
+from ameesh import ci, db as db_mod, exploitation, mail, notify, registry, runner, storage, work
+from ameesh.storage.postgres.ci import CiResults
 
 from .support import PgTestCase
 
@@ -54,9 +61,12 @@ def ev_test(test, statut="echec", execution=101, part="psycopg 1/4", **extra):
                  "rejouer": "python -m unittest %s" % test}, **extra)
 
 
-def check_run(events, name="tests (flux) psycopg 1/4"):
-    """Un check run tel que GitHub le rend, sortie produite par ci-flow.py."""
-    return {"name": name, "output": ciflux.check_output(events)}
+def check_run(events, name="tests (flux) psycopg 1/4", attempt=1):
+    """Un check run tel que GitHub le rend, sortie produite par ci-flow.py.
+
+    `attempt` est celui de la part qui publie (#901) : GitHub ne rend, pour un
+    même nom, que le dernier check publié."""
+    return {"name": name, "output": ciflux.check_output(events, attempt)}
 
 
 def check_job(name, run_id, conclusion="failure"):
@@ -118,6 +128,30 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual(ci.events_of([{"name": "tests (flux) p", "output": sortie}], 102), [])
         # un check run d'un autre nom est ignoré
         self.assertEqual(ci.events_of([{"name": "tests", "output": sortie}], 101), [])
+        # #901 : la sortie publiée à l'attempt 2 n'est relue que pour l'attempt
+        # 2 ; celle de l'attempt 1 (encore le dernier check publié tant que la
+        # relance n'a pas republié) n'est jamais imputée à la relance
+        relance = [{"name": "tests (flux) p 1/1", "output": ciflux.check_output(events, 2)}]
+        self.assertEqual([e["test"] for e in ci.events_of(relance, 101, 2)],
+                         ["tests.test_a.T.test_ko", "tests.test_a.T.test_err"])
+        self.assertEqual([e["attempt"] for e in ci.events_of(relance, 101, 2)], [2, 2])
+        self.assertEqual(ci.events_of(relance, 101, 1), [])
+        # sans filtre, le relevé voit toutes les lignes avec leur provenance
+        self.assertEqual([ci.event_attempt(e) for e in ci.events_of(relance, 101)], [2, 2])
+        # l'ancien check et celui de la relance, du même nom, ne se masquent pas
+        les_deux = [{"name": "tests (flux) p 1/1", "output": sortie},
+                    {"name": "tests (flux) p 1/1", "output": ciflux.check_output(events, 2)}]
+        self.assertEqual([ci.event_attempt(e) for e in ci.events_of(les_deux, 101)],
+                         [1, 1, 2, 2])
+        # une ligne publiée avant #901 (sans marque) vaut attempt 1 et n'est
+        # jamais imputée à une relance
+        sans_marque = {"name": "tests (flux) p 1/1",
+                       "output": {"text": ciflux.MARKER + "\n```jsonl\n"
+                                  + json.dumps(ev_test("tests.test_a.T.test_ko")) + "\n```"}}
+        self.assertEqual([e["test"] for e in ci.events_of([sans_marque], 101, 1)],
+                         ["tests.test_a.T.test_ko"])
+        self.assertEqual(ci.events_of([sans_marque], 101, 2), [])
+        self.assertEqual([ci.event_attempt(e) for e in ci.events_of([sans_marque], 101)], [1])
 
     def test_sortie_bornee(self):
         gros = "x" * 3000 + "\n"
@@ -229,6 +263,12 @@ class RoutageTest(unittest.TestCase):
         self.assertIn("nothing is charged to you", herite)
         rouge = ci.verdict_text(run, lot, "failure", [f, dict(f, test="t2", inherited=True)])
         self.assertIn("red, 1 failure(s), and 1 inherited from the base", rouge)
+        # #901 : l'attempt paraît dans l'en-tête dès qu'il y en a plusieurs
+        self.assertIn("attempt 2", ci.verdict_text(dict(run, run_attempt=2), lot, "success", []))
+        self.assertNotIn("attempt", ci.verdict_text(run, lot, "success", []))
+        self.assertEqual(ci.describe({"action": "rerun", "repo": DEPOT, "run_id": 801,
+                                      "attempt": 2}),
+                         "CI %s run 801 re-run attempt 2: tracking reopened" % DEPOT)
 
 
 # --------------------------------------------------------------------------
@@ -249,6 +289,8 @@ class FauxApi:
         #: #845 : runners du dépôt, jobs par exécution, liste d'exécutions
         #: tronquée, panne de l'API des runners
         self.runners, self.jobs, self.truncated, self.runners_fail = [], {}, False, False
+        #: #846/#901 B1 : jobs d'une tentative — (run_id, attempt) -> jobs
+        self.attempt_jobs: dict[tuple[int, int], list[dict]] = {}
         #: #845 : chemins appelés, pour compter les appels de la garde
         self.paths: list[str] = []
 
@@ -257,6 +299,9 @@ class FauxApi:
         if "/actions/runs/" in path and "/jobs" in path:
             run_id = int(path.split("/actions/runs/")[1].split("/")[0])
             jobs = self.jobs.get(run_id, [])
+            if "/attempts/" in path:  # jobs d'une tentative (#846/#901 B1)
+                attempt = int(path.split("/attempts/")[1].split("/")[0])
+                jobs = self.attempt_jobs.get((run_id, attempt), [])
             return {"total_count": len(jobs), "jobs": list(jobs)}
         if "/actions/runners" in path:
             if self.runners_fail:
@@ -303,8 +348,11 @@ def runner_view(runner_id, name, *, busy=True, status="online"):
     return {"id": runner_id, "name": name, "status": status, "busy": busy}
 
 
-def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None):
+def job_view(name, *, status="in_progress", runner="", job_id=None, created_at=None,
+             conclusion=None):
     job = {"name": name, "status": status, "runner_name": runner}
+    if conclusion is not None:
+        job["conclusion"] = conclusion
     if job_id is not None:
         job["id"] = job_id
     if created_at is not None:
@@ -318,6 +366,7 @@ def run_view(run_id, sha, branch, *, base="main", message="", workflow="tests.ym
             if branch != "main" else "push", "path": ".github/workflows/%s" % workflow,
             "run_attempt": attempt,
             "html_url": "https://github.com/%s/actions/runs/%d" % (DEPOT, run_id),
+            "run_attempt": attempt,
             "pull_requests": [{"base": {"ref": base}}] if branch != "main" else [],
             "head_commit": {"message": message}}
     if updated_at:
@@ -351,6 +400,22 @@ class WatcherTest(PgTestCase):
         st.ci.open_run(DEPOT, 100, head_sha="0" * 40, branch="main", event="push",
                        base="main", work_item_id=None, url=None, workflow="tests.yml")
         st.ci.conclude(DEPOT, 100, "success")
+        # #845 : les appels HTTP de la garde, comptés à la source (pendant
+        # `_guard_state`). Depuis #1483, la liste du veilleur demande elle aussi
+        # `per_page=100` : l'URL ne sépare plus les deux relevés.
+        self._guard_paths: list[str] = []
+        reel = ci.Watcher._guard_state
+
+        def compte(watcher, db, repo):
+            avant = len(self.api.paths)
+            try:
+                return reel(watcher, db, repo)
+            finally:
+                self._guard_paths.extend(self.api.paths[avant:])
+
+        patcher = mock.patch.object(ci.Watcher, "_guard_state", compte)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def mails(self, to):
         """Les messages d'ameesh à `to`, du plus ancien au plus récent."""
@@ -415,6 +480,64 @@ class WatcherTest(PgTestCase):
         self.assertEqual(self.watcher.tick(self.db), [])
         self.assertEqual(st.ci.run(DEPOT, 220)["work_item_id"], lot["id"])
 
+    def test_run_conclu_sans_lot_recoit_son_verdict_a_la_pose(self):
+        """#2021 : une ligne terminale restée sans lot (branche posée après la
+        conclusion) est rattachée au rattrapage et son verdict part une seule
+        fois à l'assigné — le cas des runs de paquet vus avant la pose."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        registry.upsert(self.db, "dev-d", harness="claude", host=self.cfg.host)
+        sha = "d1" * 20
+        self.api.live = [run_view(230, sha, "agent/dev-d-230")]
+        watcher.tick(self.db)
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 230)["work_item_id"])
+        # l'exécution se conclut avant qu'aucun lot ne porte la branche : la
+        # ligne reste terminale, sans lot et sans verdict
+        self.api.live = []
+        self.api.done[230] = completed(".github/workflows/tests.yml", "success")
+        self.api.terminated = [self.terminated(230, sha, "agent/dev-d-230",
+                                               conclusion="success")]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("verdict", None)])
+        self.assertEqual(self.mails("dev-d"), [])
+        # la branche du lot est posée : le rattrapage rattache la ligne
+        # terminale et délivre son verdict, une seule fois
+        lot = work.add(self.db, title="L4 : branche posée après la conclusion",
+                       branch="agent/dev-d-230", assignee="dev-d")
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("verdict", "dev-d")])
+        row = storage.of(self.db).ci.run(DEPOT, 230)
+        self.assertEqual(row["work_item_id"], lot["id"])
+        self.assertIsNotNone(row["verdict_message_id"])
+        self.assertIn(": green.", self.mails("dev-d")[-1]["body"])
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-d")), 1)
+
+    def test_ligne_terminale_sans_lot_non_rattachee_si_tete_remplacee(self):
+        """#2021 : une tête plus récente vue sur la branche laisse la ligne
+        terminale sans lot — son verdict serait périmé (même garde que #1321)."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        registry.upsert(self.db, "dev-e", harness="claude", host=self.cfg.host)
+        vieille, neuve = "e1" * 20, "e2" * 20
+        self.api.live = [run_view(240, vieille, "agent/dev-e-240")]
+        watcher.tick(self.db)
+        self.api.live = []
+        self.api.done[240] = completed(".github/workflows/tests.yml", "success")
+        self.api.terminated = [self.terminated(240, vieille, "agent/dev-e-240",
+                                               conclusion="success")]
+        self.assertEqual([o["action"] for o in watcher.tick(self.db)], ["verdict"])
+        # une tête plus récente de la même branche a été vue
+        self.api.live = [run_view(241, neuve, "agent/dev-e-240")]
+        self.api.terminated = []
+        watcher.tick(self.db)
+        self.api.live = []
+        work.add(self.db, title="L5 : tête remplacée", branch="agent/dev-e-240",
+                 assignee="dev-e")
+        self.api.terminated = [self.terminated(240, vieille, "agent/dev-e-240",
+                                               conclusion="success")]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 240)["work_item_id"])
+        self.assertEqual(self.mails("dev-e"), [])
+
     def test_urgent_puis_ordinaire_puis_verdict(self):
         sha = "c" * 40
         self.api.live = [run_view(201, sha, "lot/1-un")]
@@ -439,7 +562,8 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["tests"], o["urgent"]) for o in out],
                          [(["tests.test_b.T.test_2"], False)])
-        # fin de l'exécution : verdict rouge, ordinaire
+        # fin de l'exécution : verdict rouge, ordinaire (#514 : la fin de CI
+        # réveille l'agent, elle ne perce pas le tour en cours)
         self.api.live = []
         self.api.done[201] = {"status": "completed", "conclusion": "failure"}
         out = self.watcher.tick(self.db)
@@ -464,6 +588,8 @@ class WatcherTest(PgTestCase):
         out = self.watcher.tick(self.db)
         self.assertEqual([(o["status"], o["to"]) for o in out], [("success", "dev-a")])
         self.assertIn(": green.", self.mails("dev-a")[0]["body"])
+        # #514 : le verdict vert réveille l'agent, il ne perce pas son tour
+        self.assertFalse(mail.is_urgent(self.mails("dev-a")[0]))
 
     def test_annulee_sans_message(self):
         self.api.live = [run_view(203, "e" * 40, "lot/1-un")]
@@ -586,6 +712,203 @@ class WatcherTest(PgTestCase):
         self.watcher.tick(self.db)
         self.assertEqual(storage.of(self.db).ci.run(DEPOT, 422)["status"], "running")
 
+    # -- relance du même run_id (#901) --------------------------------------
+
+    def test_relance_rouvre_la_ligne_et_suit_l_attempt(self):
+        """`gh run rerun` garde le run_id et passe à l'attempt suivant : la
+        ligne conclue est rouverte, l'attempt suivi, le verdict envoyé. Tant
+        que la relance est en file, le check run de l'attempt 1 reste le
+        dernier publié : ses échecs ne sont pas imputés à l'attempt 2."""
+        sha = "9" * 40
+        # attempt 1 : un échec, puis annulation (le cas du seuil psql)
+        self.api.live = [run_view(801, sha, "lot/1-un", attempt=1)]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=801)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", True)])
+        self.api.live = []
+        self.api.done[801] = {"status": "completed", "conclusion": "cancelled"}
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertEqual((row["status"], row["run_attempt"]), ("cancelled", 1))
+        # relance : GitHub redit le même run `in_progress`, attempt 2 ; le
+        # check run de l'attempt 1 est encore le dernier publié (le nouveau job
+        # n'a pas encore publié le sien) : sa ligne n'est pas relue
+        self.api.live = [run_view(801, sha, "lot/1-un", attempt=2)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt")) for o in out], [("rerun", 2)])
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertEqual((row["status"], row["run_attempt"]), ("running", 2))
+        self.assertEqual(len(self.mails("dev-a")), 1)  # l'ancien échec n'est pas relu
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+        # l'attempt 2 échoue à son tour sur le même test : signalé
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=801)],
+                                          attempt=2)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out], [("failures", True)])
+        # l'attempt 2 est suivi : rien de neuf au relevé suivant
+        self.assertEqual(self.watcher.tick(self.db), [])
+        # fin de l'attempt 2 : verdict, la ligne ne reste pas figée
+        self.api.live = []
+        self.api.done[801] = {"status": "completed", "conclusion": "failure"}
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out], [("verdict", "failure")])
+        row = storage.of(self.db).ci.run(DEPOT, 801)
+        self.assertEqual((row["status"], row["run_attempt"]), ("failure", 2))
+        verdict = self.mails("dev-a")[-1]
+        self.assertIn("attempt 2", verdict["body"])
+        self.assertIn("red, 1 failure(s)", verdict["body"])
+        payload = verdict["payload"]
+        if not isinstance(payload, dict):
+            payload = json.loads(payload)
+        self.assertEqual(payload["ci"]["attempt"], 2)
+        # ameesh ci status voit l'attempt
+        report = ci.status_of(self.db, self.lot["id"])
+        self.assertEqual(report["runs"][0]["run_attempt"], 2)
+        self.assertIn("(attempt 2)", "\n".join(ci.render_status(report)))
+
+    def test_liste_en_retard_ne_rouvre_pas_un_attempt_identique(self):
+        """R1 (bureau) : une liste d'exécutions en retard (#828) peut redire
+        `in_progress` une exécution conclue, au même attempt, sans qu'elle ait
+        été relancée. Ni le relevé ni `reopen_run` ne la rouvrent : sinon son
+        verdict repartirait à chaque passe. Un attempt supérieur, lui, rouvre."""
+        sha = "99" * 20
+        self.api.live = [run_view(851, sha, "lot/1-un", attempt=1)]
+        self.watcher.tick(self.db)
+        self.api.live, self.api.done[851] = [], {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)
+        row = storage.of(self.db).ci.run(DEPOT, 851)
+        self.assertEqual((row["status"], row["run_attempt"]), ("failure", 1))
+        self.assertEqual(len(self.mails("dev-a")), 1)  # le verdict, une fois
+        # la ligne elle-même refuse un attempt qui n'augmente pas (WHERE)
+        self.assertIsNone(storage.of(self.db).ci.reopen_run(DEPOT, 851, run_attempt=1))
+        # la liste en retard redit le run en cours au même attempt : rien
+        self.api.live = [run_view(851, sha, "lot/1-un", attempt=1)]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.watcher.tick(self.db), [])
+        row = storage.of(self.db).ci.run(DEPOT, 851)
+        self.assertEqual((row["status"], row["run_attempt"]), ("failure", 1))
+        self.assertEqual(len(self.mails("dev-a")), 1)
+        # l'attempt suivant est bien une relance : la ligne est rouverte
+        self.api.live = [run_view(851, sha, "lot/1-un", attempt=2)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt")) for o in out], [("rerun", 2)])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 851)["run_attempt"], 2)
+
+    def test_relance_impute_les_echecs_de_l_attempt_courant(self):
+        """Un échec de l'attempt précédent qui n'est pas re-vu n'est plus
+        imputé ; un échec qui revient compte comme nouveau (re-signalé)."""
+        sha = "a9" * 20
+        self.api.live = [run_view(811, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=811)])]
+        self.watcher.tick(self.db)
+        self.api.live, self.api.done[811] = [], {"status": "completed", "conclusion": "cancelled"}
+        self.watcher.tick(self.db)
+        # relance : test_1 passe, test_2 échoue (le nouveau check, marqué de
+        # l'attempt 2, remplace celui de l'attempt 1)
+        self.api.live = [run_view(811, sha, "lot/1-un", attempt=2)]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_b.T.test_2", execution=811)],
+                                          attempt=2)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("tests"), o.get("urgent")) for o in out],
+                         [("rerun", None, None), ("failures", ["tests.test_b.T.test_2"], True)])
+        failures = storage.of(self.db).ci.failures(DEPOT, 811)
+        self.assertEqual([(f["test"], f["run_attempt"]) for f in failures],
+                         [("tests.test_b.T.test_2", 2)])
+        # le verdict ne charge que l'attempt courant ; test_1 reste en base
+        # (son message d'attempt 1 est toujours retirable)
+        self.api.live, self.api.done[811] = [], {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)
+        verdict = self.mails("dev-a")[-1]["body"]
+        self.assertIn("red, 1 failure(s)", verdict)
+        self.assertNotIn("test_1", verdict)
+        rows = self.db.query("SELECT test, run_attempt FROM ci_test_failures"
+                             " WHERE repo = %s AND run_id = 811 ORDER BY test", (DEPOT,))
+        self.assertEqual([(r["test"], r["run_attempt"]) for r in rows],
+                         [("tests.test_a.T.test_1", 1), ("tests.test_b.T.test_2", 2)])
+
+    def test_rerun_failed_ne_relit_pas_les_parts_non_rejouees(self):
+        """`gh run rerun --failed` ne rejoue que les jobs en échec : les parts
+        non rejouées gardent leur check run de l'attempt 1 (un échec toléré y
+        figure). Il est enregistré sous son attempt, jamais imputé à la
+        relance ni re-signalé."""
+        sha = "a8" * 20
+        self.api.live = [run_view(812, sha, "lot/1-un")]
+        self.api.checks[sha] = [
+            check_run([ev_test("tests.test_a.T.test_1", execution=812)]),
+            check_run([ev_test("tests.test_b.T.test_2", execution=812)],
+                      name="tests (flux) psycopg 2/4")]
+        self.watcher.tick(self.db)
+        self.assertEqual(len(self.mails("dev-a")), 1)  # les deux échecs, attempt 1
+        self.api.live, self.api.done[812] = [], {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)  # verdict
+        self.assertEqual(len(self.mails("dev-a")), 2)
+        # relance --failed : la part en échec republie (attempt 2), l'autre
+        # garde son check de l'attempt 1
+        self.api.live = [run_view(812, sha, "lot/1-un", attempt=2)]
+        self.api.checks[sha] = [
+            check_run([ev_test("tests.test_a.T.test_1", execution=812)], attempt=2),
+            check_run([ev_test("tests.test_b.T.test_2", execution=812)],
+                      name="tests (flux) psycopg 2/4")]
+        avant = len([m for m in self.mails("dev-a") if "test_2" in m["body"]])
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("tests")) for o in out],
+                         [("rerun", None), ("failures", ["tests.test_a.T.test_1"])])
+        # l'échec de la part non rejouée n'est pas re-signalé...
+        self.assertEqual(len([m for m in self.mails("dev-a") if "test_2" in m["body"]]), avant)
+        self.assertNotIn("test_2", self.mails("dev-a")[-1]["body"])
+        # ...et l'attempt courant ne charge que la part rejouée
+        failures = storage.of(self.db).ci.failures(DEPOT, 812)
+        self.assertEqual([(f["test"], f["run_attempt"]) for f in failures],
+                         [("tests.test_a.T.test_1", 2)])
+        rows = self.db.query("SELECT test, run_attempt FROM ci_test_failures"
+                             " WHERE repo = %s AND run_id = 812 ORDER BY test", (DEPOT,))
+        self.assertEqual([(r["test"], r["run_attempt"]) for r in rows],
+                         [("tests.test_a.T.test_1", 2), ("tests.test_b.T.test_2", 1)])
+
+    def test_relance_d_une_execution_remplacee_ne_la_ressuscite_pas(self):
+        """La relance d'un run périmé (une tête plus récente est suivie) ne
+        rouvre pas sa ligne."""
+        old, new = "b9" * 20, "c9" * 20
+        self.api.live = [run_view(821, old, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live, self.api.done[821] = [], {"status": "completed", "conclusion": "failure"}
+        self.watcher.tick(self.db)
+        # une tête plus récente est suivie : 821 reste conclue
+        self.api.live = [run_view(822, new, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live = [run_view(821, old, "lot/1-un", attempt=2),
+                         run_view(822, new, "lot/1-un", attempt=1)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([o for o in out if o["action"] == "rerun"], [])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 821)["status"], "failure")
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 821)["run_attempt"], 1)
+
+    def test_relance_d_une_execution_superseded_ignoree(self):
+        """Une ligne remplacée (`superseded`) n'est jamais rouverte."""
+        self.api.live = [run_view(831, "d9" * 20, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live = [run_view(832, "e9" * 20, "lot/1-un")]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([o["action"] for o in out if o["action"] == "superseded"],
+                         ["superseded"])
+        # l'agent relance l'ancien run : la ligne reste remplacée
+        self.api.live = [run_view(831, "d9" * 20, "lot/1-un", attempt=2)]
+        self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 831)["status"], "superseded")
+
+    def test_attempt_suivi_sans_conclusion_vue(self):
+        """Le relevé a manqué la fin de l'attempt 1 : le nouvel attempt est
+        quand même noté et suivi."""
+        sha = "f9" * 20
+        self.api.live = [run_view(841, sha, "lot/1-un", attempt=1)]
+        self.watcher.tick(self.db)
+        self.api.live = [run_view(841, sha, "lot/1-un", attempt=2)]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt")) for o in out], [("rerun", 2)])
+        row = storage.of(self.db).ci.run(DEPOT, 841)
+        self.assertEqual((row["status"], row["run_attempt"]), ("running", 2))
+
     def test_sans_base_relevee_passif(self):
         # relecture (4) : aucune exécution conclue de main relevée, l'échec
         # est peut-être hérité : message passif, jamais urgent
@@ -658,20 +981,35 @@ class WatcherTest(PgTestCase):
                       if a["type"] == "ci_main_red"]
         self.assertEqual(exploitation.alert_key(alerte2), cle)
 
+    def job_failures(self, run_id, repo=DEPOT):
+        """#846/#901 : les échecs natifs relevés, avec leur tentative."""
+        return [(int(r["run_attempt"]), r["test"]) for r in self.db.query(
+            "SELECT run_attempt, test FROM ci_test_failures"
+            " WHERE repo = %s AND run_id = %s AND part = %s"
+            " ORDER BY test, run_attempt", (repo, int(run_id), ci.JOB_PART))]
+
     def test_main_rouge_sur_un_job_sans_evenement(self):
         # #846 : un job en échec sans événement de test publié (installation,
         # délai dépassé) est un main rouge ; il est relevé, alerte, et ne
-        # produit aucun courrier de test (les jobs d'une autre exécution du
-        # même commit sont écartés)
+        # produit aucun courrier de test. #901 B1 : la provenance est la
+        # tentative (`attempts/<n>/jobs`), donc les check runs de la tête
+        # (ceux d'une autre exécution ou d'une autre tentative) sont écartés.
         sha = "a9" * 20
         self.api.live = [run_view(802, sha, "main",
                                   message="L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"])]
+        self.api.attempt_jobs[(802, 1)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure"),
+            job_view("plan", status="completed", conclusion="success"),
+            job_view("psql 1/1", status="completed", conclusion="cancelled")]
+        # la tête porte encore le check run natif d'une autre exécution et
+        # celui du job en échec : seul le job de la tentative compte
         self.api.checks[sha] = [check_job("psycopg 2/4", 802),
                                 check_job("plan", 802, conclusion="success"),
                                 check_job("psycopg 3/4", 999),
                                 check_job("psql 1/1", 802, conclusion="cancelled")]
         self.assertEqual(self.watcher.tick(self.db), [])
         self.assertEqual(self.mails("dev-b"), [])
+        self.assertEqual(self.job_failures(802), [(1, "psycopg 2/4")])
         (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
                      if a["type"] == "ci_main_red"]
         self.assertEqual((alerte["agent"], alerte["lot"]), ("dev-b", self.lot_main["id"]))
@@ -679,8 +1017,61 @@ class WatcherTest(PgTestCase):
         self.assertNotIn("psycopg 3/4", alerte["detail"])
         # le relevé suivant ne double ni le relevé ni l'alerte
         self.assertEqual(self.watcher.tick(self.db), [])
+        self.assertEqual(self.job_failures(802), [(1, "psycopg 2/4")])
         self.assertEqual(len([a for a in exploitation.alerts(self.cfg, self.db)
                               if a["type"] == "ci_main_red"]), 1)
+
+    def test_relance_ne_reporte_pas_un_echec_natif_de_l_attempt_precedent(self):
+        # #901 B1 (R2 dev1/Claude, sonde auditeur) : un job en échec de
+        # l'attempt 1, encore publié pendant la relance, garde sa provenance ;
+        # le suivi de l'attempt 2 ne l'inscrit pas sous le sien. Le job réussit
+        # à la relance : la ligne de l'attempt 1 n'est plus imputée, aucun faux
+        # rouge ne subsiste.
+        sha = "b9" * 20
+        message = "L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"]
+        self.api.live = [run_view(803, sha, "main", message=message, attempt=1)]
+        self.api.attempt_jobs[(803, 1)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(803), [(1, "psycopg 2/4")])
+        # la relance démarre : le job de l'attempt 2 tourne, et le check run de
+        # l'attempt 1 est encore le dernier publié pour ce nom
+        self.api.live = [run_view(803, sha, "main", message=message, attempt=2)]
+        self.api.checks[sha] = [check_job("psycopg 2/4", 803)]
+        self.api.attempt_jobs[(803, 2)] = [job_view("psycopg 2/4", status="in_progress")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(803), [(1, "psycopg 2/4")])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_main_red"], [])
+        # il réussit à la relance : plus aucun échec imputé à l'exécution
+        self.api.live = []
+        self.api.done[803] = completed(".github/workflows/tests.yml", "success", attempt=2)
+        self.watcher.tick(self.db)
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 803)["status"], "success")
+        self.assertEqual(storage.of(self.db).ci.failures(DEPOT, 803), [])
+        self.assertEqual(self.job_failures(803), [(1, "psycopg 2/4")])
+
+    def test_echec_natif_de_l_attempt_courant_conserve(self):
+        # #901 B1 : un vrai échec natif de l'attempt 2 est relevé sous 2 et
+        # garde l'alerte #846 — la correction ne supprime pas le rouge d'une
+        # relance.
+        sha = "c9" * 20
+        message = "L0 (#3)\n\nameesh-work: %d\n" % self.lot_main["id"]
+        self.api.live = [run_view(804, sha, "main", message=message, attempt=1)]
+        self.api.attempt_jobs[(804, 1)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(804), [(1, "psycopg 2/4")])
+        # la relance échoue aussi : la ligne passe à l'attempt 2, l'alerte tient
+        self.api.live = [run_view(804, sha, "main", message=message, attempt=2)]
+        self.api.attempt_jobs[(804, 2)] = [
+            job_view("psycopg 2/4", status="completed", conclusion="failure")]
+        self.watcher.tick(self.db)
+        self.assertEqual(self.job_failures(804), [(2, "psycopg 2/4")])
+        (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                     if a["type"] == "ci_main_red"]
+        self.assertEqual((alerte["agent"], alerte["lot"]), ("dev-b", self.lot_main["id"]))
+        self.assertIn("psycopg 2/4", alerte["detail"])
 
     def test_attente_d_un_runner_separee_sans_double_alerte(self):
         # #747 : 1 h 24 d'attente lue comme « psql bloqué 2 h 20 »
@@ -902,10 +1293,10 @@ class WatcherTest(PgTestCase):
     AT_NOW = "1970-01-12T13:46:40+00:00"
 
     def terminated(self, run_id, sha, branch, *, conclusion, workflow="tests.yml",
-                   updated_at=None):
+                   updated_at=None, attempt=1):
         """Une exécution terminée telle que la liste `status=completed` la rend."""
         return dict(run_view(run_id, sha, branch, workflow=workflow,
-                             updated_at=updated_at or self.AT_NOW),
+                             updated_at=updated_at or self.AT_NOW, attempt=attempt),
                     status="completed", conclusion=conclusion)
 
     def test_execution_courte_terminee_avant_le_premier_passage(self):
@@ -958,7 +1349,7 @@ class WatcherTest(PgTestCase):
             st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main", event="push",
                            base="main", work_item_id=None, url=None, workflow=workflow)
             if conclusion == "failure":
-                st.ci.add_failure(DEPOT, run_id, part="psql 1/1",
+                st.ci.add_failure(DEPOT, run_id, run_attempt=1, part="psql 1/1",
                                   test="tests.test_a.T.test_1", module="tests.test_a",
                                   status="echec", inherited=False, excerpt="", replay="",
                                   duration_s=None, failed_at=None)
@@ -984,9 +1375,9 @@ class WatcherTest(PgTestCase):
             st.ci.open_run(DEPOT, run_id, head_sha=sha, branch="main", event="push",
                            base="main", work_item_id=None, url=None, workflow=workflow)
         for run_id in (1001, 1003, 1005):
-            st.ci.add_failure(DEPOT, run_id, part="job", test="psql 1/1", module="",
-                              status="echec", inherited=False, excerpt="", replay="",
-                              duration_s=None, failed_at=None)
+            st.ci.add_failure(DEPOT, run_id, run_attempt=1, part="job", test="psql 1/1",
+                              module="", status="echec", inherited=False, excerpt="",
+                              replay="", duration_s=None, failed_at=None)
         self.assertEqual(sorted(r["run_id"] for r in ci.main_red(self.db)),
                          [1001, 1003, 1005])
         st.ci.conclude(DEPOT, 1002, "success")
@@ -1005,7 +1396,7 @@ class WatcherTest(PgTestCase):
             st.ci.open_run(DEPOT, run_id, head_sha=base_sha, branch="main", event="push",
                            base="main", work_item_id=None, url=None, workflow=workflow)
             if conclusion == "failure":
-                st.ci.add_failure(DEPOT, run_id, part="psql 1/1",
+                st.ci.add_failure(DEPOT, run_id, run_attempt=1, part="psql 1/1",
                                   test="tests.test_a.T.test_1", module="tests.test_a",
                                   status="echec", inherited=False, excerpt="", replay="",
                                   duration_s=None, failed_at=None)
@@ -1023,6 +1414,102 @@ class WatcherTest(PgTestCase):
         (message,) = self.mails("dev-a")
         self.assertIn("tests.test_a.T.test_1", message["body"])
         self.assertNotIn("inherited", self.payload_of(message).get("ci_passif", ""))
+
+    def test_reference_du_rouge_herite_suit_la_tete_la_plus_recente(self):
+        """#1683 N1 : la référence du rouge hérité est la tête la plus
+        récemment poussée, pas l'exécution conclue le plus récemment — une
+        exécution lente d'une tête plus ancienne ne redevient pas la base, et
+        un réessai tardif de cette tête ne la rajeunit pas."""
+        st = storage.of(self.db)
+        repo = "manaty/hors-fixture"  # le setUp ne pose des exécutions que sur DEPOT
+        ancienne, recente = "0a" * 20, "0b" * 20
+        # M1 : tête ancienne, observée d'abord, conclue en dernier
+        st.ci.open_run(repo, 2001, head_sha=ancienne, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(repo, 2001, run_attempt=1, part="psql 1/1", test="tests.test_a.T.test_1",
+                          module="tests.test_a", status="echec", inherited=False,
+                          excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 2001, "failure")
+        # M2 : tête plus récente, observée après M1, conclue avant
+        st.ci.open_run(repo, 2002, head_sha=recente, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.conclude(repo, 2002, "success")
+        self.db.execute(
+            "UPDATE ci_runs SET first_seen_at = now() - interval '10 min',"
+            " created_at = now() - interval '10 min', concluded_at = now()"
+            " WHERE repo = %s AND run_id = 2001", (repo,))
+        self.db.execute(
+            "UPDATE ci_runs SET first_seen_at = now() - interval '5 min',"
+            " created_at = now() - interval '5 min', concluded_at = now() - interval '1 min'"
+            " WHERE repo = %s AND run_id = 2002", (repo,))
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2002, recente))
+        self.assertEqual(reference["tests"], [])
+        # un réessai de la tête ancienne, observé plus tard, ne la rajeunit pas :
+        # la première observation de cette tête reste la référence d'ordre
+        st.ci.open_run(repo, 2003, head_sha=ancienne, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.conclude(repo, 2003, "failure")
+        self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml")["run_id"],
+                         2002)
+
+    def test_reference_garde_le_dernier_resultat_de_la_tete_recente(self):
+        """Une reprise actualise le résultat, jamais l'âge de sa tête."""
+        st = storage.of(self.db)
+        ancienne, recente = "0c" * 20, "0d" * 20
+        for premier, dernier in (("failure", "success"), ("success", "failure")):
+            repo = "manaty/reprise-" + premier
+            runs = ((2001, ancienne, "cancelled"), (2002, recente, premier),
+                    (2003, ancienne, "failure"), (2004, recente, dernier))
+            for minute, (run_id, head, status) in enumerate(runs):
+                st.ci.open_run(repo, run_id, head_sha=head, branch="main", event="push",
+                               base="main", work_item_id=None, url=None, workflow="tests.yml",
+                               created_at="2026-01-01T10:%02d:00Z" % minute)
+                if status == "failure":
+                    st.ci.add_failure(repo, run_id, run_attempt=1, part="psql 1/1",
+                                      test="tests.test_a.T.test_1",
+                                      module="tests.test_a", status="echec", inherited=False,
+                                      excerpt="", replay="", duration_s=None, failed_at=None)
+                st.ci.conclude(repo, run_id, status)
+                self.db.execute("UPDATE ci_runs SET concluded_at = %s::timestamptz"
+                                " WHERE repo = %s AND run_id = %s",
+                                ("2026-01-01T11:%02d:00Z" % minute, repo, run_id))
+            reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+            self.assertEqual((reference["run_id"], reference["head_sha"]), (2004, recente))
+            self.assertEqual(reference["tests"], ["tests.test_a.T.test_1"]
+                             if dernier == "failure" else [])
+
+    def test_raccord_1683_901_reference_recente_et_attempt_courant(self):
+        """Raccord #1683 x #901 : la référence reste la tête la plus récemment
+        poussée, et son rouge est celui de l'attempt courant — une relance
+        rouverte ne ressuscite pas l'échec de l'attempt précédent, et un échec
+        non re-vu à l'attempt 2 n'est plus imputé."""
+        st = storage.of(self.db)
+        repo = "manaty/raccord-attempt"
+        tete = "0e" * 20
+        st.ci.open_run(repo, 2101, head_sha=tete, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        for test in ("tests.test_a.T.test_1", "tests.test_a.T.test_2"):
+            st.ci.add_failure(repo, 2101, run_attempt=1, part="psql 1/1", test=test,
+                              module="tests.test_a", status="echec", inherited=False,
+                              excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 2101, "failure")
+        self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml")["tests"],
+                         ["tests.test_a.T.test_1", "tests.test_a.T.test_2"])
+        # relance GitHub : la tête repasse en cours, sans conclusion — plus de
+        # référence, et pas de retour à une tête plus ancienne
+        self.assertTrue(st.ci.reopen_run(repo, 2101, run_attempt=2))
+        self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml"), {})
+        # l'attempt 2 ne re-voit qu'un test : l'autre échec reste à l'attempt 1
+        # et n'est plus lu
+        st.ci.add_failure(repo, 2101, run_attempt=2, part="psql 1/1",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=False, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 2101, "failure")
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2101, tete))
+        self.assertEqual(reference["tests"], ["tests.test_a.T.test_1"])
 
     def test_pending_ne_cite_que_la_meme_tete(self):
         """#1110 P3 : le verdict ne cite comme « encore en cours » que les
@@ -1067,6 +1554,81 @@ class WatcherTest(PgTestCase):
         self.assertEqual(len(bodies), 2)
         self.assertFalse([b for b in bodies if "still running" in b])
 
+    def test_relance_courte_finie_entre_deux_passages_est_rouverte(self):
+        """#1573 N1 : `gh run rerun` garde le run_id ; si l'attempt 2 naît et
+        finit entre deux passages, le rattrapage ne voit qu'une ligne connue.
+        Elle est rouverte (relance) puis conclue — sans quoi le verdict de la
+        relance ne partirait jamais."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "71" * 20
+        # passage 1 : attempt 1 suivi, puis conclu (échec)
+        self.api.live = [run_view(1030, sha, "lot/1-un", attempt=1)]
+        watcher.tick(self.db)
+        self.api.live, self.api.done[1030] = [], {"status": "completed",
+                                                  "conclusion": "failure"}
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("status")) for o in out],
+                         [("verdict", "failure")])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+        # passage 2 : la relance est née et finie entre les deux passages : elle
+        # n'apparaît que dans la liste des exécutions terminées (attempt 2)
+        self.api.terminated = [self.terminated(1030, sha, "lot/1-un",
+                                               conclusion="success", attempt=2)]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt"), o.get("status")) for o in out],
+                         [("rerun", 2, None), ("verdict", None, "success")])
+        row = storage.of(self.db).ci.run(DEPOT, 1030)
+        self.assertEqual((row["status"], row["run_attempt"]), ("success", 2))
+        # un seul verdict par tentative : le passage suivant ne double rien
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 2)
+
+    def test_echec_de_l_attempt_suivant_inscrit_avant_la_reouverture(self):
+        """#1573 N2 : une liste en retard (#828) peut publier un échec de
+        l'attempt 2 pendant que la ligne est encore à l'attempt 1. La ligne
+        l'enregistre sous son attempt ; à la réouverture, `add_failure` ne le
+        réinsère pas (même attempt) — il doit pourtant être signalé."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "72" * 20
+        # passage 1 : attempt 1 suivi
+        self.api.live = [run_view(1031, sha, "lot/1-un", attempt=1)]
+        watcher.tick(self.db)
+        # passage 2 : la liste dit encore attempt 1, mais le check run de la
+        # relance (attempt 2) est déjà publié et échoue
+        self.api.checks[sha] = [check_run([ev_test("tests.test_b.T.test_2", execution=1031,
+                                                   attempt=2)], attempt=2)]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
+        rows = self.db.query("SELECT test, run_attempt, message_id FROM ci_test_failures"
+                             " WHERE repo = %s AND run_id = %s", (DEPOT, 1031))
+        self.assertEqual([(r["test"], r["run_attempt"], r["message_id"]) for r in rows],
+                         [("tests.test_b.T.test_2", 2, None)])
+        # passage 3 : la liste rattrape l'attempt 2 ; la ligne est rouverte et
+        # l'échec déjà inscrit est signalé, une seule fois
+        self.api.live = [run_view(1031, sha, "lot/1-un", attempt=2)]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("attempt"), o.get("tests"), o.get("urgent"))
+                          for o in out],
+                         [("rerun", 2, None, None),
+                          ("failures", None, ["tests.test_b.T.test_2"], True)])
+        mails = self.mails("dev-a")
+        self.assertEqual(len(mails), 1)
+        self.assertIn("tests.test_b.T.test_2", mails[0]["body"])
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+
+    def test_echec_sans_destinataire_journalise_une_seule_fois(self):
+        """#1573 R2 : une exécution sans lot (main) n'envoie aucun message ;
+        ses échecs déjà inscrits ne sont pas rejournalisés à chaque passe."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "73" * 20
+        self.api.live = [run_view(1032, sha, "main")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_c.T.test_3", execution=1032)])]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o.get("tests"), o["to"]) for o in out],
+                         [("failures", ["tests.test_c.T.test_3"], None)])
+        self.assertEqual(watcher.tick(self.db), [])
+
     def test_reference_stricte_par_workflow(self):
         """#1110 P2-2 : une ligne sans workflow (écrite avant 0433 par un
         ancien processus) ne sert pas de référence à une autre suite : l'échec
@@ -1075,7 +1637,7 @@ class WatcherTest(PgTestCase):
         sha_main = "0" * 40  # la ligne verte `tests.yml` du setUp
         st.ci.open_run(DEPOT, 993, head_sha=sha_main, branch="main", event="push",
                        base="main", work_item_id=None, url=None)  # sans workflow
-        st.ci.add_failure(DEPOT, 993, part="psql 1/1", test="tests.test_a.T.test_1",
+        st.ci.add_failure(DEPOT, 993, run_attempt=1, part="psql 1/1", test="tests.test_a.T.test_1",
                           module="tests.test_a", status="echec", inherited=False,
                           excerpt="", replay="", duration_s=None, failed_at=None)
         st.ci.conclude(DEPOT, 993, "failure")
@@ -1093,6 +1655,176 @@ class WatcherTest(PgTestCase):
         (message,) = self.mails("dev-a")
         self.assertTrue(self.payload_of(message).get("ci_passif"))
         self.assertFalse(st.ci.failures(DEPOT, 997)[0]["inherited"])
+
+    # -- #1483 : suites P3 de la R2 Claude de #1110 --------------------------
+    def test_rattrapage_ne_perd_pas_un_verdict_de_main_remplace(self):
+        """#1483 N1 : sur une branche de base, une exécution courte de la tête
+        M1 garde son verdict — et le réveil du lot fusionné avec elle — même
+        quand la tête M2 est déjà relevée : le relevé normal ne remplace jamais
+        rien sur une base, le rattrapage ne doit pas non plus."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        m1, m2 = "a2" * 20, "a3" * 20
+        st = storage.of(self.db)
+        # la tête M2 est déjà relevée : `head_replaced` est vrai pour M1
+        st.ci.open_run(DEPOT, 1111, head_sha=m2, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        self.assertTrue(st.ci.head_replaced(DEPOT, "main", m1, 1110))
+        self.api.terminated = [dict(
+            run_view(1110, m1, "main", updated_at=self.AT_NOW,
+                     message="Merge pull request #9\n\nameesh-work: %d\n"
+                             % self.lot_main["id"]),
+            status="completed", conclusion="success")]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["run_id"], o["status"], o["to"]) for o in out],
+                         [("verdict", 1110, "success", "dev-b")])
+        self.assertEqual(st.ci.run(DEPOT, 1110)["status"], "success")
+        self.assertIn(": green.", self.mails("dev-b")[-1]["body"])
+        # le passage suivant ne double rien
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-b")), 1)
+
+    def test_rattrapage_ecarte_la_tete_du_lot_remplacee(self):
+        """#1483 N4 : dans le rattrapage, une exécution dont la tête n'est plus
+        celle de la branche du lot (`branch_head`) est écartée — la même garde
+        que `_follow` sur une ligne connue ; la tête courante rend son
+        verdict."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        old, new = "e1" * 20, "e2" * 20
+        st = storage.of(self.db)
+        self.assertTrue(st.work.set_branch_head(self.lot["id"], "lot/1-un", new))
+        self.api.terminated = [self.terminated(1500, old, "lot/1-un", conclusion="success")]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertIsNone(st.ci.run(DEPOT, 1500))
+        self.assertEqual(self.mails("dev-a"), [])
+        # la tête courante de la branche, elle, rend son verdict
+        self.api.terminated = [self.terminated(1501, new, "lot/1-un", conclusion="success")]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["run_id"], o["status"]) for o in out],
+                         [("verdict", 1501, "success")])
+        self.assertIn(": green.", self.mails("dev-a")[-1]["body"])
+
+    def test_base_develop_declaree_pour_nexlink(self):
+        """#1483 N2 : `github.projects.<projet>.base` déclare la base d'un
+        dépôt — `develop` pour Nexlink : une exécution de develop n'est jamais
+        remplacée, un push hors PR prend develop pour référence du rouge hérité,
+        et l'alerte `ci_main_red` voit develop rouge."""
+        repo = "manaty/nexlink"
+        cfg = dataclasses.replace(self.cfg, github={
+            "projects": {"nexlink": {"repo": repo, "base": "develop"}},
+            "host": self.cfg.host})
+        api = FauxApi()
+        api.workflows = ["backend-suite.yml"]
+        watcher = ci.Watcher(cfg, api=api)
+        # main reste une base : jamais une branche de lot (R1 dev4)
+        self.assertEqual(watcher.bases(repo), ("develop", "main"))
+        st = storage.of(self.db)
+        # deux têtes de develop : la première n'est pas remplacée (base)
+        api.live = [run_view(1200, "b1" * 20, "develop", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        api.live = [run_view(1201, "b2" * 20, "develop", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        self.assertEqual((st.ci.run(repo, 1200)["status"], st.ci.run(repo, 1201)["status"]),
+                         ("running", "running"))
+        # ni deux têtes de main (release de Nexlink)
+        api.live = [run_view(1204, "c1" * 20, "main", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        api.live = [run_view(1205, "c2" * 20, "main", workflow="backend-suite.yml")]
+        watcher.tick(self.db)
+        self.assertEqual((st.ci.run(repo, 1204)["status"], st.ci.run(repo, 1205)["status"]),
+                         ("running", "running"))
+        # un push hors PR sur une branche de lot prend develop pour base
+        run = run_view(1203, "b3" * 20, "lot/1-un", workflow="backend-suite.yml")
+        run["pull_requests"], run["event"] = [], "push"
+        api.live = [run]
+        watcher.tick(self.db)
+        self.assertEqual(st.ci.run(repo, 1203)["base"], "develop")
+        # develop rouge : `ci_main_red` et l'alerte le voient
+        st.ci.open_run(repo, 1202, head_sha="b2" * 20, branch="develop", event="push",
+                       base="develop", work_item_id=None, url=None,
+                       workflow="backend-suite.yml")
+        st.ci.add_failure(repo, 1202, run_attempt=1, part="psql 1/1", test="tests.test_a.T.test_1",
+                          module="tests.test_a", status="echec", inherited=False,
+                          excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 1202, "failure")
+        # #1683 N3 : une branche `develop` d'un dépôt qui ne la déclare pas
+        # n'est pas une base — la lecture sans `bases_for` (appel historique)
+        # la voit pourtant : c'est l'écart que l'alerte ne doit plus avoir
+        st.ci.open_run(DEPOT, 1206, head_sha="d1" * 20, branch="develop", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 1206, run_attempt=1, part="psql 1/1", test="tests.test_b.T.test_1",
+                          module="tests.test_b", status="echec", inherited=False,
+                          excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 1206, "failure")
+        self.assertEqual(sorted((r["repo"], r["branch"], r["run_id"]) for r in
+                                ci.main_red(self.db, ("main", "develop"))),
+                         [(DEPOT, "develop", 1206), (repo, "develop", 1202)])
+        self.assertEqual(
+            [a["reason"] for a in exploitation.alerts(cfg, self.db)
+             if a["type"] == "ci_main_red"],
+            ["%s:develop:backend-suite.yml" % repo])
+
+    def test_listes_de_100_et_troncature_journalisee(self):
+        """#1483 N3 : les listes d'exécutions demandent 100 lignes (la file
+        d'autres workflows ne cache plus une suite suivie) et une liste
+        tronquée est journalisée une fois."""
+        journal = []
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, log=journal.append)
+        self.api.truncated = True
+        self.api.live = [run_view(1300, "c1" * 20, "lot/1-un")]
+        watcher.tick(self.db)
+        for status in ("queued", "in_progress", "completed"):
+            self.assertIn("repos/%s/actions/runs?status=%s&per_page=100" % (DEPOT, status),
+                          self.api.paths)
+        self.assertEqual([line for line in journal if "run list truncated" in line],
+                         ["CI %s: in_progress run list truncated (1 of 2), a followed run "
+                          "may be seen late" % DEPOT,
+                          "CI %s: queued run list truncated (0 of 1), a followed run may "
+                          "be seen late" % DEPOT])
+
+    def test_decouverte_ne_suit_que_les_suites(self):
+        """#1483 N3 : un workflow découvert qui n'a pas la forme d'une suite
+        (déploiement, sonde) n'est pas suivi — pas de verdict de bruit ; il est
+        journalisé, et une liste déclarée le suit si on le veut. #1683 N2 : un
+        `ci.yml` générique est écarté comme les autres dès qu'une suite est
+        reconnue — comportement assumé, journalisé, et déclarable."""
+        repo = "manaty/nexlink"
+        cfg = dataclasses.replace(self.cfg, github={"projects": {"nexlink": repo},
+                                                    "host": self.cfg.host})
+        api = FauxApi()
+        api.workflows = ["backend-suite.yml", "sql-invariant.yml", "deploy-api-prod.yml",
+                         "compute-probe.yml", "ci.yml"]
+        journal = []
+        watcher = ci.Watcher(cfg, api=api, log=journal.append)
+        api.live = [run_view(1400, "d1" * 20, "lot/1-un", workflow="backend-suite.yml"),
+                    run_view(1401, "d2" * 20, "lot/1-un", workflow="sql-invariant.yml"),
+                    run_view(1402, "d3" * 20, "lot/1-un", workflow="deploy-api-prod.yml"),
+                    run_view(1403, "d4" * 20, "lot/1-un", workflow="compute-probe.yml"),
+                    run_view(1405, "d6" * 20, "lot/1-un", workflow="ci.yml")]
+        watcher.tick(self.db)
+        st = storage.of(self.db)
+        self.assertEqual([st.ci.run(repo, 1400)["workflow"],
+                          st.ci.run(repo, 1401)["workflow"]],
+                         ["backend-suite.yml", "sql-invariant.yml"])
+        self.assertIsNone(st.ci.run(repo, 1402))
+        self.assertIsNone(st.ci.run(repo, 1403))
+        self.assertIsNone(st.ci.run(repo, 1405))
+        self.assertEqual([line for line in journal if "not followed" in line],
+                         ["CI %s: discovered workflow(s) not followed (not a test suite): "
+                          "ci.yml, compute-probe.yml, deploy-api-prod.yml; declare them in "
+                          "github.projects to follow them" % repo])
+        # une liste déclarée suit explicitement un workflow hors convention
+        cfg = dataclasses.replace(self.cfg, github={
+            "projects": {"nexlink": {"repo": repo,
+                                     "workflows": ["deploy-api-prod.yml", "ci.yml"]}},
+            "host": self.cfg.host})
+        api = FauxApi()
+        api.workflows = ["backend-suite.yml", "deploy-api-prod.yml", "ci.yml"]
+        watcher = ci.Watcher(cfg, api=api)
+        api.live = [run_view(1404, "d5" * 20, "lot/1-un", workflow="deploy-api-prod.yml"),
+                    run_view(1406, "d7" * 20, "lot/1-un", workflow="ci.yml")]
+        watcher.tick(self.db)
+        self.assertEqual(st.ci.run(repo, 1404)["workflow"], "deploy-api-prod.yml")
+        self.assertEqual(st.ci.run(repo, 1406)["workflow"], "ci.yml")
 
     # -- #845 : la garde de la CI (runners et file) --------------------------
     def test_garde_runner_busy_sans_job(self):
@@ -1307,20 +2039,11 @@ class WatcherTest(PgTestCase):
             (repo, int(runner_id)))
         return row["seen_ts"]
 
-    @staticmethod
-    def est_appel_garde(path: str) -> bool:
-        """#845 : un appel de la garde (listes 100, jobs, runners).
-
-        La liste de suivi des échecs (`watch`, `per_page=50`) et les check
-        runs (`/commits/.../check-runs?per_page=100`) ne comptent pas dans le
-        budget de la garde."""
-        if "per_page=100" not in path:
-            return False
-        return ("/actions/runs?" in path or "/jobs" in path or "/actions/runners" in path)
-
     def guard_calls(self) -> list[str]:
-        """#845 : les appels de la garde du faux API."""
-        return [p for p in self.api.paths if self.est_appel_garde(p)]
+        """#845 : les appels HTTP de la garde, relevés pendant `_guard_state`.
+        Depuis #1483, la liste du veilleur demande elle aussi `per_page=100` :
+        l'URL ne sépare plus les deux relevés, le compte se fait à la source."""
+        return list(self._guard_paths)
 
     def test_garde_fenetre_persistee_avant_le_premier_appel(self):
         """#845 (revue N/P2 2328) : la fenêtre est écrite dans la base AVANT le
@@ -1330,30 +2053,42 @@ class WatcherTest(PgTestCase):
         horloge = FauxHorloge()
         logs = []
         vu: list[bool] = []
-        reel = self.api
+        reel = ci.Watcher._guard_state
 
-        def api_qui_verifie(path):
-            if self.est_appel_garde(path) and not vu:
-                vu.append(bool(self.db.query(
-                    "SELECT 1 FROM ci_guard_scan WHERE repo = %s", (DEPOT,))))
-            return reel(path)
+        def guard_qui_verifie(watcher, db, repo):
+            """Le premier appel HTTP de la garde voit la fenêtre déjà écrite."""
+            reel_api = watcher.api
 
-        premier = ci.Watcher(self.cfg_ci, api=api_qui_verifie, clock=horloge,
-                             log=logs.append)
+            def api_qui_verifie(path):
+                if not vu:
+                    vu.append(bool(self.db.query(
+                        "SELECT 1 FROM ci_guard_scan WHERE repo = %s", (DEPOT,))))
+                return reel_api(path)
+
+            watcher.api = api_qui_verifie
+            try:
+                return reel(watcher, db, repo)
+            finally:
+                watcher.api = reel_api
+
+        premier = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
         self.api.runners = [runner_view(21, "ameesh-ci-1-1", busy=False)]
         self.api.live = [run_view(901, "9" * 40, "main")]
         self.api.jobs[901] = []
-        premier.tick(self.db)
+        with mock.patch.object(ci.Watcher, "_guard_state", guard_qui_verifie):
+            premier.tick(self.db)
         self.assertEqual(vu, [True], "fenêtre absente avant le premier appel HTTP")
         self.assertEqual(self.scan_state(), (True, None, 4))
         second = ci.Watcher(self.cfg_ci, api=self.api, clock=horloge, log=logs.append)
         self.api.paths.clear()
+        self._guard_paths.clear()
         second.tick(self.db)
         self.assertEqual(self.guard_calls(), [], "le second relevé a appelé la garde")
         self.assertTrue(any("window held" in line for line in logs), logs)
         # la fenêtre expirée, le relevé reprend
         horloge.avance(ci.GUARD_SCAN_S)
         self.api.paths.clear()
+        self._guard_paths.clear()
         second.tick(self.db)
         self.assertEqual(len(self.guard_calls()), 4)
         self.assertEqual(self.scan_state()[0], True)
@@ -1484,6 +2219,7 @@ class WatcherTest(PgTestCase):
         # l'instantané du premier relevé est périmé.
         horloge.avance(ci.GUARD_SCAN_S)
         self.api.paths.clear()
+        self._guard_paths.clear()
         self.api.runners = [runner_view(21, "ameesh-ci-1-1")]
         self.api.jobs[906] = [
             job_view("psql 1/1", runner="ameesh-ci-1-1", job_id=9061),
@@ -1567,6 +2303,86 @@ class WatcherTest(PgTestCase):
                          "une erreur du relevé a publié la file")
         self.assertEqual(self.runner_seen_ts(21), runner_avant,
                          "une erreur du relevé a rafraîchi les runners")
+
+    # -- #795 N2 : le courrier et sa preuve dans la même transaction ---------
+
+    def _interrupt_allowed(self, row, name="dev-a"):
+        """Ce que `runner.AgentWorker.interrupt_allowed` décide pour ce
+        courrier (même montage que tests/test_l795_preemption_evenement.py)."""
+        worker = types.SimpleNamespace(
+            name=name, agent={"name": name}, db=self.db,
+            cfg=types.SimpleNamespace(interrupt_senders=()),
+            runner=types.SimpleNamespace(is_auditor=lambda n, a=None: False),
+            _system_event_interrupt=lambda sender, r: runner.AgentWorker
+            ._system_event_interrupt(worker, sender, r),
+            _deep_analysis_interrupt=lambda sender, r: runner.AgentWorker
+            ._deep_analysis_interrupt(worker, sender, r))
+        return runner.AgentWorker.interrupt_allowed(worker, row)
+
+    def _publication_probe(self, seen):
+        """`set_message` instrumenté : au point de publication de la preuve,
+        une AUTRE connexion lit la boîte et `ci_runs`, puis la preuve est
+        écrite. Un lecteur intercalé (le dispatch de l'exécuteur) ne doit
+        jamais voir le courrier engagé sans sa référence."""
+        real = CiResults.set_message
+
+        def set_message(st, repo, run_id, which, message_id):
+            other = db_mod.connect(self.cfg)
+            try:
+                mails = other.query(
+                    "SELECT count(*)::int AS n FROM agent_mailbox WHERE recipient = %s",
+                    ("dev-a",))[0]["n"]
+                run = other.query(
+                    "SELECT urgent_message_id, verdict_message_id FROM ci_runs"
+                    " WHERE repo = %s AND run_id = %s", (DEPOT, run_id))[0]
+            finally:
+                other.close()
+            seen.append((which, mails, run["urgent_message_id"],
+                         run["verdict_message_id"]))
+            return real(st, repo, run_id, which, message_id)
+        return set_message
+
+    def test_alerte_et_preuve_publiees_ensemble(self):
+        sha = "9" * 40
+        self.api.live = [run_view(801, sha, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=801)])]
+        seen = []
+        with mock.patch.object(CiResults, "set_message",
+                               self._publication_probe(seen)):
+            out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["urgent"]) for o in out],
+                         [("failures", True)])
+        # au point de publication : ni courrier visible, ni référence
+        self.assertEqual(seen, [("urgent", 0, None, None)])
+        (alerte,) = self.mails("dev-a")
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 801)["urgent_message_id"],
+                         alerte["id"])
+        # après le commit, l'urgent est vérifiable : il préempte
+        self.assertTrue(self._interrupt_allowed(
+            mail.unread_urgent(self.db, "dev-a")[-1]))
+
+    def test_verdict_et_preuve_publiees_ensemble(self):
+        sha = "b" * 40
+        self.api.live = [run_view(802, sha, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.api.live = []
+        self.api.done[802] = {"status": "completed", "conclusion": "success"}
+        seen = []
+        with mock.patch.object(CiResults, "set_message",
+                               self._publication_probe(seen)):
+            out = self.watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["status"]) for o in out],
+                         [("verdict", "success")])
+        self.assertEqual(seen, [("verdict", 0, None, None)])
+        (verdict,) = self.mails("dev-a")
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 802)["verdict_message_id"],
+                         verdict["id"])
+        # #514 : le verdict reste ordinaire, même publié avec sa preuve — il
+        # réveille l'agent, il ne préempte pas son tour.
+        self.assertFalse(mail.is_urgent(verdict))
+        self.assertEqual(mail.unread_urgent(self.db, "dev-a"), [])
 
 
 if __name__ == "__main__":

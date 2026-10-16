@@ -15,11 +15,15 @@ Claude. Trois temoins de contrat ici :
   `session_origin`) et efface modele, effort et tier quand le harnais declare
   change — en base comme dans l'etat local, que l'exécuteur relit avant les
   colonnes du registre ;
-* la porte de relecture lit le harnais de la session vivante
-  (`registry.live_harness`), pas l'etiquette declaree ;
 * l'historique (`persona_sessions`) dit le harnais de la session vivante, pas
   l'etiquette declaree, et garde la declaration quand l'origine est inconnue
-  (#1251, N2 de la R2).
+  (#1251, N2 de la R2) ;
+* #1250 : `show` et `list` nomment le harnais de la session vivante quand il
+  differe du harnais declare (l'emprunt L242b reste visible a l'ecran) ;
+* la porte de relecture relit desormais les tours du GEL
+  (`test_1053_famille_au_gel`, #1053/#1777) ; le lecteur de session vivante
+  (`registry.live_harness`), qui servait a cette porte, garde son temoin
+  direct ci-dessous.
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import persona_sessions as ps, platform, registry, reprise, review_lot
+from ameesh import persona_sessions as ps, platform, registry, reprise
 from ameesh.backend import PgBackend
 
 from .support import PgTestCase
@@ -109,18 +113,21 @@ class AdoptBasculeTest(PgTestCase):
                         out["notes"])
 
 
-class PorteLitLaSessionVivanteTest(PgTestCase):
-    """La porte §2 suit la session vivante, pas l'etiquette declaree."""
+class SessionVivanteTest(PgTestCase):
+    """`registry.live_harness` suit la session vivante, pas l'etiquette declaree.
 
-    def test_famille_de_l_auteur_suit_la_session_vivante(self):
+    #1777 : la porte §2 a change de source (les tours du gel), ce lecteur reste
+    l'API du registre pour ses autres appelants."""
+
+    def test_le_harnais_lu_est_celui_de_la_session_vivante(self):
         registry.upsert(self.db, "auteur", harness="claude", host=self.cfg.host,
                         cwd=self.tmp, model="claude-opus-5-5")
         self.db.execute(
             "UPDATE agent_registry SET session_id = %s, session_origin = %s, "
             "session_harness = 'codex' WHERE name = 'auteur'", (SID, SID))
-        auteur = review_lot._author(self.db, "auteur")
-        self.assertEqual(auteur["harness"], "codex")
-        self.assertEqual(review_lot.reviewer_family(auteur["harness"]), "claude")
+        row = registry.get(self.db, "auteur")
+        self.assertEqual(row["harness"], "claude")             # etiquette declaree
+        self.assertEqual(registry.live_harness(row), "codex")  # session vivante
 
 
 class HistoriqueSuitLeHarnaisDeLaSessionTest(PgTestCase):
@@ -154,6 +161,50 @@ class HistoriqueSuitLeHarnaisDeLaSessionTest(PgTestCase):
         self.assertIsNone(ligne["session_harness"])
         ps.record_start(self.db, "bascule", SID)
         self.assertEqual(ps.sessions(self.db, "bascule")[0]["harness"], "claude")
+
+
+class AffichageHarnaisSessionTest(PgTestCase):
+    """#1250 : `show` et `list` nomment le harnais de la session vivante quand
+    il differe du harnais declare (l'emprunt L242b etait invisible a l'ecran)."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "auteur", harness="claude", host=self.cfg.host,
+                        cwd=self.tmp, model="claude-opus-5-5")
+        self.db.execute(
+            "UPDATE agent_registry SET session_id = %s, session_origin = %s, "
+            "session_harness = 'codex' WHERE name = 'auteur'", (SID, SID))
+
+    def _sans_emprunt(self):
+        """La session vivante est du meme harnais que la declaration."""
+        self.db.execute("UPDATE agent_registry SET session_harness = 'claude' "
+                        "WHERE name = 'auteur'")
+
+    def test_show_nomme_le_harnais_de_la_session(self):
+        proc = self.mesh("show", "auteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("harness  : claude", proc.stdout)
+        self.assertIn("session harness: codex", proc.stdout)
+
+    def test_list_nomme_le_harnais_de_la_session(self):
+        proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("codex*", proc.stdout)
+        self.assertIn("session harness: the live session", proc.stdout)
+
+    def test_show_sans_emprunt_ne_repete_pas_la_declaration(self):
+        self._sans_emprunt()
+        proc = self.mesh("show", "auteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("session harness", proc.stdout)
+
+    def test_list_sans_emprunt_ne_marque_rien(self):
+        self._sans_emprunt()
+        proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("session harness", proc.stdout)
+        self.assertNotIn("codex", proc.stdout)
+        self.assertIn("claude", proc.stdout)
 
 
 if __name__ == "__main__":

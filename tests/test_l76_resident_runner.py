@@ -338,7 +338,7 @@ class ResidentRunnerTest(PgTestCase):
         self.assertIsNone(worker.resident)
         self.assertEqual(len(launched), 1)        # the turn's own harness
         self.assertGreater(worker._resident_refused_until, time.monotonic())
-        self.assertIn("resident start failed",
+        self.assertIn("resident failed recently",
                       worker._resident_refusal(self.adapter, False))
 
     def test_a_relayed_turn_never_uses_the_resident(self):
@@ -429,6 +429,86 @@ class ResidentRunnerTest(PgTestCase):
         self.assertEqual(len(self._starts()), 2)
         self.assertEqual(worker.resident.driver.extra_env["AMEESH_TURN_MAIL_MAX"], "1")
 
+    # T2
+
+    def test_failures_double_the_wait_and_a_turn_resets_it(self):
+        _runner, worker = self._worker()
+        attentes = []
+        for _ in range(3):
+            avant = time.monotonic()
+            worker._resident_failed("test")
+            attentes.append(round(worker._resident_refused_until - avant))
+        self.assertEqual(attentes, [60, 120, 240])
+        for _ in range(10):
+            worker._resident_failed("test")
+        self.assertLessEqual(worker._resident_refused_until - time.monotonic(),
+                             runner_mod.RESIDENT_RETRY_MAX_S)
+        worker._resident_refused_until = 0.0
+        self.assertTrue(self._turn(worker, "un"))
+        self.assertEqual(worker._resident_failures, 0)
+
+    def test_a_death_counts_and_falls_back(self):
+        _runner, worker = self._worker()
+        self.assertFalse(self._turn(worker, "CRASH"))
+        self.assertEqual(worker._resident_failures, 1)
+        self.assertIn("1 in a row", worker._resident_refusal(self.adapter, False))
+        # between turns too
+        worker._resident_refused_until = 0.0
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        rp.kill_now()
+        deadline = time.monotonic() + 5
+        while rp.alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+        worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertEqual(worker._resident_failures, 1)   # reset by the turn, then 1
+
+    def test_dormant_after_sleep_and_under_pressure(self):
+        runner, worker = self._worker(resident_sleep="60")
+        self.assertTrue(self._turn(worker, "un"))
+        worker.resident.last_used -= 61
+        worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        agent = registry.get(self.db, "res1")
+        self.assertEqual(agent["status"], "idle")
+        self.assertTrue(agent["status_text"].startswith("dormant: asleep after 60s"))
+        self.assertEqual(worker._resident_failures, 0)     # a sleep is no failure
+        self.assertTrue(self._turn(worker, "deux"))
+        rp = worker.resident
+        with mock.patch.object(runner, "host_pressure", return_value={"blocked": True}):
+            worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertIn("host under pressure", registry.get(self.db, "res1")["status_text"])
+
+    def test_dormant_never_hides_a_blocked_agent(self):
+        _runner, worker = self._worker()
+        registry.set_status(self.db, "res1", "blocked", status_text="turn failed")
+        worker._note_dormant("asleep")
+        self.assertEqual(registry.get(self.db, "res1")["status_text"], "turn failed")
+
+    def test_dormant_never_resumes_a_stopped_agent_nor_without_the_lease(self):
+        # codex r1 (#422): one conditional write, no read-then-write window
+        _runner, worker = self._worker()
+        registry.set_status(self.db, "res1", "stopped", status_text="stopped by owner",
+                            stop_reason=registry.STOP_REASONS[0])
+        worker._note_dormant("asleep")
+        agent = registry.get(self.db, "res1")
+        self.assertEqual((agent["status"], agent["status_text"]),
+                         ("stopped", "stopped by owner"))
+        registry.set_status(self.db, "res1", "idle", status_text="")
+        worker.epoch += 1                          # no longer our lease
+        worker._note_dormant("asleep")
+        self.assertEqual(registry.get(self.db, "res1")["status_text"] or "", "")
+
+    def test_many_failures_never_overflow(self):
+        _runner, worker = self._worker()
+        worker._resident_failures = 5000           # codex r1 (#422), P3
+        worker._resident_failed("test")
+        self.assertLessEqual(worker._resident_refused_until - time.monotonic(),
+                             runner_mod.RESIDENT_RETRY_MAX_S)
+
     def test_resident_off_stops_it_between_turns(self):
         _runner, worker = self._worker()
         self.assertTrue(self._turn(worker, "un"))
@@ -437,6 +517,119 @@ class ResidentRunnerTest(PgTestCase):
         worker._resident_between_turns()
         self.assertIsNone(worker.resident)
         self.assertTrue(_group_gone(rp.pgid))
+
+    # T3
+
+    def _probe_due(self, rp) -> None:
+        """Comme si la dernière preuve de vie datait d'avant la cadence."""
+        rp.probed_at -= resident_runner.PROBE_EVERY_S + 1
+
+    def test_an_idle_resident_that_answers_the_probe_is_kept(self):
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self._probe_due(rp)
+        worker._resident_between_turns()          # la sonde répond
+        self.assertIs(worker.resident, rp)
+        self.assertFalse(rp.probe_due())          # preuve de vie rafraîchie
+        self.assertEqual(len(self._starts()), 1)  # aucun processus neuf
+        self.assertEqual(worker._resident_failures, 0)
+
+    def test_a_silent_resident_is_stopped_between_turns(self):
+        # T3 (#285): the process lives, its protocol no longer answers (DEAF);
+        # the bounded probe, outside any turn, stops it and counts a failure
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "DEAF"))
+        rp = worker.resident
+        self.assertTrue(rp.alive)
+        self._probe_due(rp)
+        with mock.patch.object(resident_runner, "PROBE_TIMEOUT_S", 0.3):
+            worker._resident_between_turns()
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertEqual(storage.of(self.db).turn_resources.get(rp.life_id)["status"],
+                         "done")
+        self.assertEqual(worker._resident_failures, 1)
+        self.assertIn("resident failed recently",
+                      worker._resident_refusal(self.adapter, False))
+
+    def test_a_probed_resident_still_serves_the_next_turn(self):
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        self._probe_due(rp)
+        self.assertTrue(self._turn(worker, "deux"))
+        self.assertIs(worker.resident, rp)
+        self.assertEqual(len(self._starts()), 1)
+        controles = [e["control"] for e in self._trace() if "control" in e]
+        self.assertEqual(controles.count("initialize"), 2)   # démarrage + sonde
+
+    def test_a_push_of_the_probe_never_enters_the_next_turn(self):
+        # #1337 (#1780, dev2) : le CLI pousse sa liste de commandes
+        # (`system/commands_changed`) de façon asynchrone après la réponse à
+        # `initialize` — donc après le drain qui précède l'envoi, quand le
+        # tour est déjà ouvert. Cette poussée n'est pas un événement du tour :
+        # elle n'entre pas dans le flux (le faux harnais trace qu'il a poussé).
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_PUSH_AFTER": "0.4"}):
+            _runner, worker = self._worker()
+            self.assertTrue(self._turn(worker, "un"))
+            rp = worker.resident
+            self._probe_due(rp)
+            self.assertTrue(self._turn(worker, "SLOW deux"))
+        self.assertIs(worker.resident, rp)
+        self.assertTrue([e for e in self._trace() if e.get("push")],
+                        "the fake harness pushed nothing")
+        with open(worker._path("events.jsonl"), encoding="utf-8") as fh:
+            flux = fh.read()
+        self.assertNotIn("commands_changed", flux)
+        self.assertIn("ECHO:SLOW deux", flux)
+
+    def test_a_silent_resident_before_a_turn_serves_it_one_per_event(self):
+        # T3 (#285): probed before the turn; silent -> stopped, T2 failure
+        # series, and the turn runs on its own harness (no fresh resident)
+        _runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "DEAF"))
+        rp = worker.resident
+        self.assertTrue(rp.alive)
+        self._probe_due(rp)
+        launched = []
+        real_popen = runner_mod.subprocess.Popen
+
+        def popen(argv, **kwargs):
+            if list(argv[:1]) != [sys.executable]:   # psql, git…: as they are
+                return real_popen(argv, **kwargs)
+            launched.append(list(argv))
+            return real_popen([sys.executable, "-c", "pass"], **kwargs)
+        with mock.patch.object(resident_runner, "PROBE_TIMEOUT_S", 0.3), \
+                mock.patch.object(runner_mod.subprocess, "Popen", side_effect=popen):
+            self._turn(worker, "deux")
+        self.assertIsNone(worker.resident)
+        self.assertTrue(_group_gone(rp.pgid))
+        self.assertEqual(len(launched), 1)        # the turn's own harness
+        self.assertEqual(len(self._starts()), 1)  # no fresh resident
+        self.assertEqual(worker._resident_failures, 1)
+
+    def test_the_life_resource_of_a_resident_is_reviewed_after_a_reboot(self):
+        # T3 (#285): the resource row of a resident LIFE (opened when the
+        # process starts, under its `life_id`) is covered by the boot review
+        # (L106/L147) exactly as a turn's: after a simulated reboot, nothing
+        # survives — it is settled, never left `running`
+        from ameesh import resources as resources_mod
+        runner, worker = self._worker()
+        self.assertTrue(self._turn(worker, "un"))
+        rp = worker.resident
+        rp.kill_now()
+        self.assertTrue(_group_gone(rp.pgid))
+        turns = storage.of(self.db).turn_resources
+        self.assertEqual(turns.get(rp.life_id)["status"], "running")
+        self.db.execute("UPDATE turn_resources SET started_at = now() - interval '2 hours'"
+                        " WHERE turn_id = %s", (rp.life_id,))
+        with mock.patch.object(resources_mod, "boot_time",
+                               return_value=time.time() - 3600), \
+                mock.patch.object(runner_mod, "log"):
+            restes = [r["turn_id"] for r in runner.report_boot_orphans()]
+        self.assertNotIn(rp.life_id, restes)      # rien ne survit : pas d'orphelin
+        self.assertEqual(turns.get(rp.life_id)["status"], "done")
 
 
 if __name__ == "__main__":
