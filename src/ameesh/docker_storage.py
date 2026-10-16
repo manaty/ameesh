@@ -20,18 +20,31 @@ DEFAULT_BUILD_CACHE = 20 * 1024 ** 3
 MAX_AGE_S = 1800
 
 
-def _rows(runtime, args):
+def _run(runtime, args):
     try:
-        result = runtime.run([runtime.binary, *args], capture_output=True, text=True,
-                             timeout=min(10, max(0.5, runtime.timeout)))
-        if result.returncode:
-            return None
+        return runtime.run([runtime.binary, *args], capture_output=True, text=True,
+                           timeout=min(10, max(0.5, runtime.timeout)))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return None
+
+
+def _rows(runtime, args):
+    result = _run(runtime, args)
+    if result is None or result.returncode:
+        return None
+    try:
         rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         if not all(isinstance(row, dict) for row in rows):
             return None
         return rows
-    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return None
+
+
+def _buildx_available(runtime):
+    """Whether the docker CLI exposes the buildx plugin (client-side probe)."""
+    result = _run(runtime, ['buildx', 'version'])
+    return result is not None and result.returncode == 0
 
 
 def collect(runtime, *, now=None) -> dict | None:
@@ -40,6 +53,8 @@ def collect(runtime, *, now=None) -> dict | None:
     Names and descriptions are deliberately absent from the persisted
     summary. An error is unknown, never a zero measurement. Build cache is
     for the default Docker builder; shared records are not reclaimable disk.
+    A runtime without the buildx plugin leaves the cache unmeasured and
+    flagged unsupported, which is not an error: the counter stays unknown.
     """
     if (runtime is None or os.path.basename(getattr(runtime, 'binary', '')) != 'docker'
             or not hasattr(runtime, 'run') or not hasattr(runtime, 'timeout')):
@@ -47,7 +62,8 @@ def collect(runtime, *, now=None) -> dict | None:
     out = {'sampled_ts': time.time() if now is None else now, 'builder': 'default',
            'orphan_volumes': None, 'anonymous_orphan_volumes': None,
            'named_orphan_volumes': None, 'build_cache_bytes': None,
-           'build_cache_reclaimable_bytes': None, 'errors': []}
+           'build_cache_reclaimable_bytes': None, 'build_cache_unsupported': False,
+           'errors': []}
     volumes = _rows(runtime, ['volume', 'ls', '--filter', 'dangling=true',
                               '--format', '{{json .}}'])
     if volumes is None or any(not isinstance(row.get('Name'), str) for row in volumes):
@@ -59,7 +75,12 @@ def collect(runtime, *, now=None) -> dict | None:
                    named_orphan_volumes=len(volumes) - anonymous)
     cache = _rows(runtime, ['buildx', 'du', '--builder', 'default', '--format=json'])
     if cache is None:
-        out['errors'].append('default builder cache inventory unavailable')
+        # Debian docker.io ships no buildx plugin (agents-1/2): the cache is
+        # not measurable here, a durable fact rather than a failed measure.
+        if _buildx_available(runtime):
+            out['errors'].append('default builder cache inventory unavailable')
+        else:
+            out['build_cache_unsupported'] = True
     else:
         try:
             total = reclaimable = 0

@@ -3372,6 +3372,9 @@ def print_report(report: dict) -> None:
         print("  Docker storage (reported only, cleanup requires owner approval): "
               "%s orphan volumes; %s private reclaimable build cache" % (
                   docker.get("orphan_volumes"), _fmt(docker.get("build_cache_reclaimable_bytes"))))
+        if docker.get("build_cache_unsupported"):
+            print("    build cache not measured: the docker buildx plugin is absent "
+                  "(finding, not an alert)")
         for error in docker.get("errors") or ():
             print("    %s" % error)
     for c in conteneurs.get("ameesh") or ():

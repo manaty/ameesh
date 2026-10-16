@@ -9,12 +9,15 @@ from ameesh import containers, docker_storage as D, exploitation, menage
 
 
 class DockerStorageTest(unittest.TestCase):
-    def runtime(self, volumes=(), cache=()):
+    def runtime(self, volumes=(), cache=(), cache_rc=0, buildx_rc=0):
         calls = []
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
+            if argv[1:3] == ['buildx', 'version']:
+                return SimpleNamespace(returncode=buildx_rc, stdout='', stderr='')
             rows = volumes if argv[1] == 'volume' else cache
-            return SimpleNamespace(returncode=0, stdout='\n'.join(json.dumps(r) for r in rows))
+            return SimpleNamespace(returncode=cache_rc if argv[1] == 'buildx' else 0,
+                                   stdout='\n'.join(json.dumps(r) for r in rows))
         return containers.Runtime('docker', timeout=4, run=run), calls
 
     def test_read_only_counts_and_private_reclaimable_bytes(self):
@@ -49,6 +52,25 @@ class DockerStorageTest(unittest.TestCase):
         self.assertTrue(data['errors'])
         alerts = D.findings(data, menage.Policy(), 'pc', 1000)
         self.assertEqual([a['type'] for a in alerts], ['docker_storage_unavailable'])
+
+    def test_missing_buildx_is_unsupported_not_a_permanent_error(self):
+        runtime, calls = self.runtime([{'Name': 'v', 'Labels': ''}],
+                                      cache_rc=1, buildx_rc=1)
+        data = D.collect(runtime, now=1000)
+        self.assertIsNone(data['build_cache_bytes'])
+        self.assertEqual(data['errors'], [])
+        self.assertTrue(data['build_cache_unsupported'])
+        self.assertEqual(D.findings(data, menage.Policy(), 'pc', 1000), [])
+        self.assertEqual([c[0][1:3] for c in calls],
+                         [['volume', 'ls'], ['buildx', 'du'], ['buildx', 'version']])
+
+    def test_cache_failure_with_buildx_present_stays_an_error(self):
+        runtime, _ = self.runtime(cache_rc=1, buildx_rc=0)
+        data = D.collect(runtime, now=1000)
+        self.assertFalse(data['build_cache_unsupported'])
+        self.assertEqual(data['errors'], ['default builder cache inventory unavailable'])
+        self.assertEqual([a['type'] for a in D.findings(data, menage.Policy(), 'pc', 1000)],
+                         ['docker_storage_unavailable'])
 
     def test_malformed_cache_never_becomes_zero(self):
         for row in ({'Size': '-1', 'Reclaimable': True, 'Shared': False},
