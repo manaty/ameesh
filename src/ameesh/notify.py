@@ -1467,6 +1467,14 @@ class Notifier:
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
             if entry is not None:
+                # #1787 N1 : la relance repart aux destinataires de la levée,
+                # pas à ceux que l'état vivant désignerait maintenant (le brief
+                # d'un lot sans assigné est atomique, #1026) ; si aucun n'est
+                # plus joignable, rien ne part et `reminded` reste à poser.
+                keep = {str(n) for n in entry.get("to") or ()}
+                briefs = {n: t for n, t in briefs.items() if n in keep}
+                if not briefs:
+                    continue
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
