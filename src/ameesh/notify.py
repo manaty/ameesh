@@ -994,7 +994,7 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
-         "provider", "currency", "urgent", "critical", "severity", "level",
+         "provider", "currency", "urgent", "severity", "level",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
@@ -1054,15 +1054,22 @@ class Notifier:
         acknowledgements = alert_ack.reconcile(
             db, current, observed_ts=observed_ts, dry_run=self.dry_run,
             observation_host=getattr(self.cfg, "host", None)) if db is not None else []
-        notifications = group_orphan_lots(current, router.resolve)
+        # Reuse each subject's route for acknowledgement and group membership;
+        # lot/package lookups belong to this snapshot, not to every projection.
+        routes = {id(a): router.resolve(a) for a in current}
+
+        def resolve_current(alert):
+            return routes[id(alert)]
+
+        notifications = group_orphan_lots(current, resolve_current)
         # Retain all group identities, including fully acknowledged groups:
         # filtering them out of wanted would falsely announce a resolution.
         unacknowledged = [a for a in current if alert_ack.matches(
-            acknowledgements, a, router.resolve(a)[0]) is None]
-        audible = {key_of(a): a for a in group_orphan_lots(unacknowledged, router.resolve)}
+            acknowledgements, a, resolve_current(a)[0]) is None]
+        audible = {key_of(a): a for a in group_orphan_lots(unacknowledged, resolve_current)}
         subjects_by_key = {}
         for subject in current:
-            group = group_orphan_lots([subject], router.resolve)[0]
+            group = group_orphan_lots([subject], resolve_current)[0]
             subjects_by_key.setdefault(key_of(group), []).append({
                 "key": alert_ack.key_of(subject), "severity": alert_ack.severity(subject)})
         # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
@@ -1106,7 +1113,8 @@ class Notifier:
         for key, alert in wanted.items():
             entry = active.get(key)
             subjects = subjects_by_key[key]
-            human, _ = router.resolve(alert)
+            human, _ = (routes[id(alert)] if id(alert) in routes
+                        else router.resolve(alert))
             muted = key not in audible
             # A partial orphan group only mentions its unacknowledged members.
             alert = audible.get(key, alert)
