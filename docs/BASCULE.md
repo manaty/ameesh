@@ -1251,7 +1251,9 @@ migrated database, which every update since L60 already verifies. So we migrate
 for the content of each version):
 
 1. `poste.sh verifier`, `poste.sh sauvegarder`.
-2. `poste.sh migrer REF` (explicit REF required): extracts the `src-<sha>` snapshot of REF and runs
+2. `poste.sh migrer [REF]` (REF defaults to HEAD, as for `installer`, #1245;
+   the L232b release controller always migrates the snapshot of its pinned
+   commit): extracts the `src-<sha>` snapshot of REF and runs
    **its** `ameesh migrate --additive-only`, without installing it
    (`PYTHONPATH=<instantané>/src`, with the venv's Python). Mesh database, only
    once, then the old database. `migrate --dry-run` first displays each

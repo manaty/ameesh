@@ -121,10 +121,15 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
         self.assertEqual(calls[2]["args"], ["doctor", "--probe"])
 
-    def test_missing_ref_never_runs_migrations(self):
+    def test_missing_ref_takes_clone_head(self):
+        # #1245 : sans REF, « migrer » migre le HEAD du dépôt de déploiement,
+        # comme « installer » ; le contrôleur L232b migre, lui, son commit épinglé.
         done = self.run_script("migrer")
-        self.assertNotEqual(done.returncode, 0)
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        calls = self.calls()
+        self.assertEqual([call["release"] for call in calls], ["B", "B", "B"])
+        self.assertEqual(calls[0]["args"], ["migrate", "--dry-run", "--additive-only"])
+        self.assertEqual(calls[1]["args"], ["migrate", "--additive-only"])
 
     def test_installed_nonadditive_still_refused_with_override(self):
         c = self.commit("C", nonadditive=True)

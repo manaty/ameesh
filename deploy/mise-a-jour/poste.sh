@@ -8,9 +8,10 @@
 #
 #   verifier     contrôles, rien n'est modifié ; affiche les bases visées
 #   sauvegarder  pg_dump de la base du mesh (sur la VM) et de l'ancienne base
-#   migrer [--additif-seulement] REF
-#                migrations de REF (obligatoire), lancées depuis son instantané
-#                AVANT de l'installer : base du mesh (UNE fois), puis ancienne
+#   migrer [--additif-seulement] [REF]
+#                migrations de REF (défaut HEAD, comme installer), lancées
+#                depuis son instantané AVANT de l'installer : base du mesh
+#                (UNE fois), puis ancienne
 #                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent)
@@ -38,7 +39,8 @@
 #   $DISTANT/main local). Ces deux étapes ne lisent pas $BASCULE_ENV.
 #
 # REF : commit, branche ou étiquette du dépôt qui contient ce script.
-# Obligatoire pour migrer ; défaut HEAD pour installer. MIGRER_APRES=1
+# Défaut HEAD pour migrer et installer (#1245) ; le contrôleur de release L232b,
+# lui, migre toujours l'instantané de son commit épinglé. MIGRER_APRES=1
 # ne désactive jamais la garde additive de migrer (docs/BASCULE.md, L232b).
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
@@ -219,15 +221,15 @@ installer() {
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 
-# Migrations du commit explicite REF : garde additive même si ce code est
-# déjà installé. Le lien src-current n'accorde aucune autorité de migration.
-# --additif-seulement reste accepté pour les appels de staging (#1155).
+# Migrations du commit REF (défaut HEAD, comme installer) : garde additive même
+# si ce code est déjà installé. Le lien src-current n'accorde aucune autorité de
+# migration. --additif-seulement reste accepté pour les appels de staging (#1155).
 migrer() {
   local ref cible d garde=(--additive-only) sha
   if [ "${1:-}" = "--additif-seulement" ]; then
     shift
   fi
-  ref=${1:?REF requis pour migrer}
+  ref=${1:-HEAD}
   sha=$(git -C "$DEPOT" rev-parse --verify "$ref^{commit}")
   cible=$(instantane "$sha")
   etape "migrations du commit $sha, additives seulement"
