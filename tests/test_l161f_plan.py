@@ -1767,6 +1767,26 @@ class PlanTest(unittest.TestCase):
         self.assertIn("psycopg=[1, 2, 3, 4]", (d / "out").read_text(encoding="utf-8"))
 
 
+def _full_suite_parts(driver: str) -> list[int]:
+    """`of` de chaque part de la suite complète, lu de `plan.PARTS`.
+
+    Le découpage appartient au plan (#1692 : 9 parts psql ; #1476 : 12 psql et
+    8 psycopg), épinglé par
+    `PlanTest.test_pull_request_psql_part_is_split_for_the_cap`. Un témoin de
+    cette voie le lit au lieu de recopier le nombre : sinon chaque changement
+    de découpage casse l'union des lots (#1343 × #1476, 5 FAIL sur l'arbre
+    composé du paquet 1700).
+    """
+    n = plan.PARTS[driver][1]
+    return [n] * n
+
+
+def _lot_request_parts(driver: str) -> list[int]:
+    """`of` de chaque part d'une demande de lot (voie rapide, `n_pr`)."""
+    n = plan.PARTS[driver][0]
+    return [n] * n
+
+
 class LotBranchTest(unittest.TestCase):
     """L1211 (canon §3) : une branche de lot ne lance que les tests impactés,
     plus toujours les tests de contrat, et se replie sur la suite complète
@@ -1882,8 +1902,10 @@ class LotBranchTest(unittest.TestCase):
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertEqual(self._ran(p), sorted(self.mods))
         self.assertEqual(self._ran(p, "psql"), sorted(self.mods))
-        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _full_suite_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
 
     def test_release_pull_request_never_takes_the_impacted_selection(self):
         # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
@@ -1905,8 +1927,10 @@ class LotBranchTest(unittest.TestCase):
                 self.assertIn("release/**", p["selection"]["why"])
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
                 self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+                self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                                 _full_suite_parts("psycopg"))
+                self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                                 _full_suite_parts("psql"))
                 self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
@@ -3012,15 +3036,18 @@ class LotFreezePlanTest(unittest.TestCase):
         p = self._plan("lot", head_ref="release/1.10.0")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertIn("release/**", p["selection"]["why"])
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_demande_full_garde_la_suite_complete(self):
         self._code_change()
         p = self._plan("full")
         self.assertEqual(p["selection"]["mode"], "full")
-        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _full_suite_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
 
     def test_demande_full_ne_prend_pas_la_voie_version_seule(self):
         # #1343 : une demande explicite `ci-full-<sha>` ne peut pas verdir par
@@ -3030,19 +3057,23 @@ class LotFreezePlanTest(unittest.TestCase):
                                        "files": ["pyproject.toml"]})
         self.assertFalse(p["version_only"], p["why"])
         self.assertNotEqual(p["parts"]["psycopg"], [])
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
 
     def test_repli_d_un_gel_garde_la_forme_du_lot(self):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="lot/x")
-        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]], [4] * 4)
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3] * 3)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _lot_request_parts("psycopg"))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _lot_request_parts("psql"))
         self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_repli_d_un_gel_release_garde_la_suite_complete(self):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="release/1.10.0")
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [9] * 9)
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_cli_mode_lot_sans_base_refuse(self):
