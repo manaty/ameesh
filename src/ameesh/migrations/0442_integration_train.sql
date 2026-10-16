@@ -26,7 +26,9 @@ create table if not exists integration_train_fires (
 create index if not exists integration_train_fires_plan
     on integration_train_fires(target_key, plan_id, id desc);
 
--- Queue identity evidence is written only by allocation/withdrawal operations.
+-- The storage adapter writes queue identity evidence only during allocation
+-- or withdrawal. This is an API boundary, not isolation from arbitrary SQL:
+-- the existing executor role has DML rights on these tables (role-executor.sql).
 -- Free-text work_item_events are never admission receipts, including older
 -- notes with the same apparent format: do not import them into this table.
 create table if not exists integration_train_queue_receipts (

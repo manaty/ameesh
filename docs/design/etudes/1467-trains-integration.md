@@ -256,6 +256,13 @@ même gel après suppression de sa ligne de file. Le
 retrait et l'allocation prennent le même verrou de lot ; le retrait conserve
 le gel de la ligne supprimée. Une note libre, même au format des anciens
 reçus, n'est jamais une preuve de file (signalement dev7 du 16/10 à 13:38).
+Le cadrage mesh-design du 16/10 à 14:16 est explicité dans le
+[contrat de sélection](../../../reviews/1467-selection-contract/README.md#inscription-explicite-et-reprise) :
+identités issues des lignes réelles et erreurs SQL atomiques éprouvées sur
+deux connexions. Les reçus sont protégés des écritures libres du journal,
+mais le rôle SQL exécuteur existant possède des droits DML sur ces tables ;
+une écriture SQL arbitraire reste dans le périmètre de confiance, sans
+nouvelle séparation de rôles ni privilège dans 0442.
 L'ambiguïté d'un ancien retrait sans trace structurée exige un lecteur initial qualifié,
 injecté explicitement ; son absence produit `queue-history-unknown`, sans
 présumer jamais-inscrit d'une ligne absente. Les reprises déjà tracées

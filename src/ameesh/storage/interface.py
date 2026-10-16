@@ -1170,8 +1170,9 @@ class WorkItems(Domain):
         existing different entry, withdrawal, or changed snapshot refuses.
         Packet allocation/withdrawal receipts survive in typed train storage,
         separate from free-text work notes (including legacy receipt notes);
-        they never certify historical reviews or CI. A first insertion also
-        needs `packet_initial=True` from the caller's qualified history
+        they never certify historical reviews or CI. These adapter write
+        paths do not isolate receipts from a trusted role's arbitrary SQL.
+        A first insertion also needs `packet_initial=True` from the caller's qualified history
         provider: absence of a queue row cannot prove never-withdrawn for
         historical lots. It cannot override a recorded withdrawal."""
 

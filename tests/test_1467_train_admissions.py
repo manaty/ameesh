@@ -11,6 +11,7 @@ from unittest import mock
 
 from ameesh import (resolutions, storage, train, train_admissions, train_candidates,
                     train_git, train_history, train_policy, work)
+from ameesh.db import DbError
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
 
@@ -411,9 +412,23 @@ class PacketAllocationTest(PgTestCase):
         existing = self.allocate(packet=None)
         forged = "ameesh-queue-receipt/1 " + json.dumps(dict(
             kind="packet", frozen_id=existing["frozen_id"], generation=existing["generation"]))
-        self.ops.note(self.item, "qa", forged, "another-agent")
-        self.assertIsNone(self.allocate(packet_initial=False))
-        self.assertEqual(self.ops.queue(None), [existing])
+        writers = (
+            lambda: self.ops.note(self.item, "qa", forged, "another-agent"),
+            lambda: self.ops._event(self.item, "qa", forged, "fixture"),
+            lambda: self.ops.queue_update(self.item, note=forged, actor="another-agent"),
+        )
+        for index, writer in enumerate(writers):
+            with self.subTest(writer=index):
+                writer()
+                # An old binary's prefixed event is indistinguishable from
+                # these notes. No actor or historical prefix is authoritative.
+                self.assertIsNone(self.allocate(packet_initial=False))
+                actual = self.ops.queue(None)
+                self.assertEqual(len(actual), 1)
+                # queue_update legitimately refreshes updated_at.
+                self.assertEqual({k: v for k, v in actual[0].items() if k != "updated_ts"},
+                                 {k: v for k, v in existing.items() if k != "updated_ts"})
+                self.assertFalse(self.db.query("SELECT * FROM integration_train_queue_receipts"))
 
     def test_withdrawal_after_refreeze_records_the_deleted_entry_freeze(self):
         previous = self.allocate()
@@ -426,6 +441,12 @@ class PacketAllocationTest(PgTestCase):
         self.assertIsNotNone(renewed)
         self.assertNotEqual(renewed["generation"], previous["generation"])
         self.assertEqual(renewed["frozen_id"], mark["id"])
+        self.assertEqual(other.query("SELECT kind, generation, frozen_id"
+                                     " FROM integration_train_queue_receipts ORDER BY id"), [
+            dict(kind="packet", generation=previous["generation"], frozen_id=previous["frozen_id"]),
+            dict(kind="removed", generation=previous["generation"], frozen_id=previous["frozen_id"]),
+            dict(kind="packet", generation=renewed["generation"], frozen_id=mark["id"]),
+        ])
 
     def test_free_text_withdrawal_does_not_override_a_typed_allocation(self):
         row = self.allocate()
@@ -509,3 +530,57 @@ class PacketAllocationTest(PgTestCase):
         self.assertEqual(self.ops.queue(None), [])
         self.assertFalse(self.db.query("SELECT * FROM integration_train_queue_receipts"))
         self.assertIsNotNone(self.allocate())
+
+    def test_rollback_restores_withdrawn_entry_and_discards_removal_receipt(self):
+        row = self.allocate()
+        before = work.events(self.db, self.item)
+        other = self.connect()
+        self.addCleanup(other.close)
+        receipts = other.query("SELECT * FROM integration_train_queue_receipts")
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            with self.db.transaction() as tx:
+                self.assertTrue(storage.of(tx).work.queue_remove(self.item, note="rollback", actor="fixture"))
+                self.assertEqual(tx.query("SELECT kind FROM integration_train_queue_receipts ORDER BY id"),
+                                 [dict(kind="packet"), dict(kind="removed")])
+                raise RuntimeError("rollback")
+        self.assertEqual(storage.of(other).work.queue(None), [row])
+        self.assertEqual(work.events(other, self.item), before)
+        self.assertEqual(other.query("SELECT * FROM integration_train_queue_receipts"), receipts)
+        self.assertEqual(self.allocate(storage.of(other).work, packet_initial=False), row)
+
+    def test_receipt_insert_error_rolls_back_allocation_with_its_event(self):
+        self.assert_receipt_insert_error_rolls_back("packet")
+
+    def test_receipt_insert_error_rolls_back_withdrawal_with_its_event(self):
+        self.allocate()
+        self.assert_receipt_insert_error_rolls_back("removed")
+
+    def assert_receipt_insert_error_rolls_back(self, kind):
+        other = self.connect()
+        self.addCleanup(other.close)
+        ops = storage.of(other).work
+        before = (ops.queue(None), work.events(other, self.item),
+                  other.query("SELECT * FROM integration_train_queue_receipts"))
+        # A real SQL failure after the queue mutation and journal write;
+        # constraints and all data live only in this disposable test schema.
+        check = {"packet": "kind <> 'packet'", "removed": "kind <> 'removed'"}[kind]
+        self.db.execute("ALTER TABLE integration_train_queue_receipts"
+                        " ADD CONSTRAINT fixture_receipt_failure CHECK (" + check + ")")
+        try:
+            with self.assertRaisesRegex(DbError, "fixture_receipt_failure"):
+                if kind == "packet":
+                    self.allocate()
+                else:
+                    self.ops.queue_remove(self.item, note="failed removal", actor="fixture")
+        finally:
+            self.db.execute("ALTER TABLE integration_train_queue_receipts"
+                            " DROP CONSTRAINT fixture_receipt_failure")
+        self.assertEqual((ops.queue(None), work.events(other, self.item),
+                          other.query("SELECT * FROM integration_train_queue_receipts")), before)
+        # A successful retry writes exactly the one corresponding receipt.
+        if kind == "packet":
+            self.assertIsNotNone(self.allocate(ops))
+        else:
+            self.assertTrue(ops.queue_remove(self.item, note="retry removal", actor="fixture"))
+        self.assertEqual(other.query("SELECT kind FROM integration_train_queue_receipts WHERE kind = %s",
+                                     (kind,)), [dict(kind=kind)])

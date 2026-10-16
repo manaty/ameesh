@@ -151,12 +151,41 @@ Cette séparation corrige le signalement de **dev7, 16 octobre à 13:38** :
 une note libre `ameesh-queue-receipt/1` pouvait auparavant forger une reprise.
 Le lecteur ignore désormais toutes ces notes, y compris celles écrites par
 un ancien binaire ou un autre chemin du journal ; aucune n'est importée comme
-preuve typée. Le contrat SQL ne donne aucun pouvoir d'inscription à `work note`.
+preuve typée. Les chemins `work note`, `_event` et `queue_update(note=...)`
+ne peuvent créer de reçu typé, quel que soit l'acteur du journal. Un ancien
+binaire qui écrit ce préfixe reste dans ce même journal ignoré.
 Deux témoins SQL ont reproduit les défauts avant correction (fausse reprise,
 retrait F1 après regel F2). Après correction, les 34 tests d'admission et
 trois contrôles de compatibilité de la file passent avec psycopg et psql ;
 les 19 contrôles du contrat médié passent également. Un troisième témoin
 vérifie qu'une fausse note de retrait ne supplante pas une allocation typée.
+
+Le cadrage du pilote du **16 octobre à 14:16** précise la frontière de
+confiance : l'adaptateur n'écrit les reçus que dans `queue_add(packet=...)`
+et `queue_remove`, depuis l'identité de la ligne allouée ou supprimée sous
+verrou, dans leur transaction. Il n'expose aucun écrivain générique de reçu ;
+le contrat médié refuse le domaine `work` et n'ajoute aucune opération.
+Ce contrôle des chemins applicatifs ne constitue pas une séparation des
+droits SQL. Le rôle exécuteur existant reçoit `SELECT, INSERT, UPDATE, DELETE`
+sur toutes les tables et les futures tables du schéma dans
+[`role-executor.sql`](../../deploy/sql/role-executor.sql), hors exceptions
+explicites qui ne comprennent pas ces reçus. Un détenteur de ce rôle ou le
+propriétaire peut donc les forger par SQL direct. La migration 0442 ne change
+pas ce modèle de confiance et n'offre aucune résistance à cet acteur.
+Une séparation de rôles nécessiterait un changement distinct de ce contrat,
+pas une propriété supposée de cette table.
+
+Les témoins complémentaires provoquent une erreur SQL réelle à l'insertion
+de chacun des deux types de reçus, après modification de file et écriture du
+journal : une seconde connexion retrouve l'état antérieur complet, puis un
+nouvel essai écrit exactement le reçu attendu. Un rollback après retrait et
+reçu rétablit également la ligne et permet sa reprise exacte. Le cas F1/F2
+vérifie sur la seconde connexion que seul F1 porte le reçu de retrait.
+Validation de ce complément : 14 témoins `PacketAllocationTest` verts avec
+psycopg (9,7 s) puis psql, et les 19 contrôles du contrat médié verts (33 tests
+en 69,8 s pour cette seconde commande), sous `ameesh heavy`. Les deux erreurs
+SQL sont provoquées par une contrainte temporaire du schéma jetable ; elles
+ne changent aucun rôle ni table réelle. Aucune suite générale n'est rejouée.
 
 Un ancien `queue_remove` pouvait avoir supprimé la ligne avant l'introduction
 de ces traces. L'absence de ligne et de reçu ne prouve donc pas une première

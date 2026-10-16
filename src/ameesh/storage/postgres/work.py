@@ -871,7 +871,7 @@ class WorkItems(interface.WorkItems):
             if packet is not None:
                 tx.execute("INSERT INTO integration_train_queue_receipts"
                            " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
-                           (int(item_id), row["generation"], frozen_id))
+                           (row["work_item_id"], row["generation"], row["frozen_id"]))
             return row
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
@@ -931,7 +931,7 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             tx.execute("INSERT INTO integration_train_queue_receipts"
                        " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'removed')",
-                       (int(item_id), rows[0]["generation"], rows[0]["frozen_id"]))
+                       (rows[0]["work_item_id"], rows[0]["generation"], rows[0]["frozen_id"]))
             return True
 
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
