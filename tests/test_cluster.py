@@ -98,6 +98,12 @@ FERMEES = {
     # #373 (L85) : rôles des agents dans la vue d'ensemble — fermés tant que le
     # contrat des rôles superviseur ne les accorde pas (paquet horaire du 15/10)
     "agent_mesh_overview": {"roles"},
+    # #1883 (0451) : l'identité d'un compte est l'empreinte sha256 du dossier
+    # résolu qu'il lit — jamais le chemin. Le propriétaire est alerté du conflit
+    # par notify (`account_identity`) et le lot n'ouvre aucun accès distant
+    # (arbitrage pilote du 16/10) : la table reste fermée, aucun GRANT modifié.
+    "account_identities": {"host", "harness", "account", "identity",
+                           "first_seen", "last_seen"},
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set()) | FERMEES.get(rel, set())
            for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES)}
