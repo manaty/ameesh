@@ -2787,8 +2787,10 @@ class Operations(Domain):
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
         assignee, `package_id`, type et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
-        son relecteur désigné), `workflow_ref` (#1922/N13 : la révision Process
-        qui pinne le lot, '' sur une base d'avant la 0452). Les plus
+        son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
+        celle de son paquet ou du parent, sinon son `app`), `workflow_ref`
+        (#1922/N13 : la révision Process qui pinne le lot, '' sur une base
+        d'avant la 0452). Les plus
         anciennement actifs d'abord. `limit=None` lit toute la vérité avant le
         filtrage des attentes planifiées (L368)."""
 

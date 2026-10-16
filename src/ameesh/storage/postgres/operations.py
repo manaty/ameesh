@@ -355,11 +355,15 @@ class Operations(interface.Operations):
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
+                   coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
+                            nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(
                        w.updated_at, ev.at, ms.at, ac.at, mb.at))::float8 AS last_activity_ts
               FROM work_items w
+              LEFT JOIN work_packages k ON k.id = w.package_id
+              LEFT JOIN work_packages kp ON kp.id = w.package_parent
               LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM work_item_events e
                                   WHERE e.work_item_id = w.id) ev ON true
               LEFT JOIN LATERAL (SELECT max(at) AS at FROM work_item_milestones m
