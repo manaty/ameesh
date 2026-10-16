@@ -58,7 +58,7 @@ import time
 from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
-from . import migrations, placement, registry
+from . import migrations, placement, progress, registry
 from . import fil, release, signing, storage, work
 from .config import Config
 from .db import Db
@@ -147,12 +147,12 @@ def _annotate_agents(cfg: Config, db, rows: list) -> list:
     # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
     from . import exploitation
     exploitation.annotate(cfg, db, rows)
-    # #1070 : la pause budget, distincte du `state` « paused » d'un `blocked`
-    # hors budget (hôte non prêt, authentification) — un lecteur machine n'a
-    # pas à déchiffrer un `status_text` français. Posé ici plutôt que dans
-    # `exploitation.agent_view` (§8 prod) : `agent_rows` sert aussi
-    # `GET /api/v1/agents`, les deux chemins le portent sans toucher au prod.
-    from . import progress
+    # #1070 : the budget pause, distinct from the `state` "paused" of a
+    # `blocked` for another cause (host not ready, authentication) — a
+    # machine reader must not have to decode a French `status_text`. Set
+    # here rather than in `exploitation.agent_view` (§8 prod): `agent_rows`
+    # also serves `GET /api/v1/agents`; both paths carry it without touching
+    # prod.
     for row in rows:
         row["paused_on_budget"] = progress.paused_on_budget(row)
     return rows
@@ -175,6 +175,9 @@ def agent_detail(db, name: str) -> dict | None:
     if row is None:
         return None
     row = dict(row)
+    # #1070 : the budget pause reaches `show --json` too, as it does
+    # `list --json` and `/api/v1/agents` (set in `_annotate_agents`)
+    row["paused_on_budget"] = progress.paused_on_budget(row)
     row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
     row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
     row["key_updated_ts"] = (info or {}).get("key_updated_ts")
@@ -225,7 +228,6 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
         # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
-        from . import progress
         from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
@@ -257,9 +259,9 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("operator_paused") and row.get("status") not in ("stopped", "dead", "blocked"):
                 status = ("pause-next" if row.get("status") == "running" else "op-paused")
             if progress.paused_on_budget(row):
-                # #1070 : le mot « pause » doit survivre à la troncature de la
-                # colonne — « blocked/bud » masquait les pauses budget (le
-                # bilan du bureau en comptait zéro).
+                # #1070 : the word "pause" must survive the column truncation
+                # — "blocked/bud" hid the budget pauses (the bureau's tally
+                # counted none).
                 status = "paused/%s" % row["status_text"][:22]
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
@@ -3025,7 +3027,6 @@ def cmd_accounts(cfg: Config, args) -> int:
 
 
 def _since_seconds(text: str) -> float:
-    from . import progress
     now = time.time()
     return max(0.0, now - progress.parse_since(text, now))
 
