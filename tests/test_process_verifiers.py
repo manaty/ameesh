@@ -263,6 +263,21 @@ class VerificateursTest(unittest.TestCase):
 
     # -- types et completion ----------------------------------------------
 
+    def test_matrice_garde_type(self):
+        """Chaque type installe passe une garde de base et sa completion."""
+        for kind in INSTALLED_TYPES:
+            with self.subTest(kind=kind):
+                snap = full_snapshot(item=item(type=kind))
+                self.assertTrue(verify(command_for("start_work"), snap).accepted)
+                if kind in CODE_TYPES:
+                    decision = verify(command_for("work_completed"), snap)
+                else:
+                    decision = verify(
+                        command_for("work_completed",
+                                    references={"outcome": "resultat"}),
+                        snap)
+                self.assertTrue(decision.accepted, (kind, decision))
+
     def test_types_installes_et_politiques(self):
         self.assertEqual(set(INSTALLED_TYPES), {
             "bug", "evolution", "docs", "investigation",
