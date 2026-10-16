@@ -364,8 +364,14 @@ class WorkItems(interface.WorkItems):
             return item
 
     def get(self, item_id) -> dict | None:
+        # #1922/B5 : `workflow_ref` (0452) est porté par la lecture, comme
+        # `reviewer` (#705) l'est par `item_columns` — `to_jsonb` rend '' sur
+        # une base d'avant la migration. Les commandes historiques le lisent
+        # par cette interface : un SELECT brut serait refusé sur une connexion
+        # d'exécuteur médié (`work move`/`note`/`close` d'une VM).
         rows = self.db.query(
-            "SELECT %s FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
+            "SELECT %s, coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"
+            " FROM work_items WHERE id = %%s" % item_columns(self.db), (int(item_id),))
         return rows[0] if rows else None
 
     def items(self, *, state, assignee, limit) -> list[dict]:

@@ -128,7 +128,11 @@ sources = pr.read_sources(context)                # collections réelles, dans l
    une adoption concurrente, qui garde l'état, ne laisse plus passer un move
    legacy entre la lecture et l'UPDATE, et une retenue `blocked` du registre ne
    tombe pas à la fermeture d'un prérequis (elle n'est levée que par une
-   commande `release` vérifiée).
+   commande `release` vérifiée). La lecture de `workflow_ref`, elle, passe par
+   l'interface de stockage (`work.get` le porte comme `reviewer`, '' sur une
+   base d'avant 0452, et donc par le contrat médié) : les commandes tournent
+   aussi sur une connexion d'exécuteur médié (session de VM), où un SELECT
+   brut est refusé (B5).
 8. Ordre des verrous : `agent_mailbox` (demandes de décision ouvertes du lot)
    **avant** `work_items`, comme la réponse du propriétaire
    (`decisions.answer` ferme la demande, puis déplace le lot) : pas
@@ -157,6 +161,9 @@ public : avance gardée `planning`, retenue, reprise, `waiting_human` par
 encore dans `main`. `tests/test_l385_work_dependencies.py` garde la réouverture
 #1668 : un dépendant pinné, retenu `blocked`, non assigné, n'est pas rouvert à
 la fermeture de son dernier prérequis (B4) — sa retenue ne tombe que par une
-`release` vérifiée. Le module est
+`release` vérifiée. La lecture médiée de la garde est gardée par
+`tests/test_l109_mediated_mode.py` (B5) : `work note`/`move` sur un lot non
+pinné, et le refus d'un lot pinné, ne font aucun SELECT brut — la session de
+VM n'enverrait que `work.get`, jamais `work.move`. Le module est
 déclaré dans `tests/parts/pilote-psql.txt` (transaction, verrous, concurrence :
 comportement des deux pilotes).
