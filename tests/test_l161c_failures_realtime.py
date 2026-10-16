@@ -1050,6 +1050,44 @@ class WatcherTest(PgTestCase):
         self.assertIn("tests.test_a.T.test_1", message["body"])
         self.assertNotIn("inherited", self.payload_of(message).get("ci_passif", ""))
 
+    def test_reference_du_rouge_herite_suit_la_tete_la_plus_recente(self):
+        """#1683 N1 : la référence du rouge hérité est la tête la plus
+        récemment poussée, pas l'exécution conclue le plus récemment — une
+        exécution lente d'une tête plus ancienne ne redevient pas la base, et
+        un réessai tardif de cette tête ne la rajeunit pas."""
+        st = storage.of(self.db)
+        repo = "manaty/hors-fixture"  # le setUp ne pose des exécutions que sur DEPOT
+        ancienne, recente = "0a" * 20, "0b" * 20
+        # M1 : tête ancienne, observée d'abord, conclue en dernier
+        st.ci.open_run(repo, 2001, head_sha=ancienne, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(repo, 2001, part="psql 1/1", test="tests.test_a.T.test_1",
+                          module="tests.test_a", status="echec", inherited=False,
+                          excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(repo, 2001, "failure")
+        # M2 : tête plus récente, observée après M1, conclue avant
+        st.ci.open_run(repo, 2002, head_sha=recente, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.conclude(repo, 2002, "success")
+        self.db.execute(
+            "UPDATE ci_runs SET first_seen_at = now() - interval '10 min',"
+            " created_at = now() - interval '10 min', concluded_at = now()"
+            " WHERE repo = %s AND run_id = 2001", (repo,))
+        self.db.execute(
+            "UPDATE ci_runs SET first_seen_at = now() - interval '5 min',"
+            " created_at = now() - interval '5 min', concluded_at = now() - interval '1 min'"
+            " WHERE repo = %s AND run_id = 2002", (repo,))
+        reference = st.ci.base_failures(repo, "main", workflow="tests.yml")
+        self.assertEqual((reference["run_id"], reference["head_sha"]), (2002, recente))
+        self.assertEqual(reference["tests"], [])
+        # un réessai de la tête ancienne, observé plus tard, ne la rajeunit pas :
+        # la première observation de cette tête reste la référence d'ordre
+        st.ci.open_run(repo, 2003, head_sha=ancienne, branch="main", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.conclude(repo, 2003, "failure")
+        self.assertEqual(st.ci.base_failures(repo, "main", workflow="tests.yml")["run_id"],
+                         2002)
+
     def test_pending_ne_cite_que_la_meme_tete(self):
         """#1110 P3 : le verdict ne cite comme « encore en cours » que les
         workflows de la même tête, pas ceux d'un autre lot."""
@@ -1210,9 +1248,18 @@ class WatcherTest(PgTestCase):
                           module="tests.test_a", status="echec", inherited=False,
                           excerpt="", replay="", duration_s=None, failed_at=None)
         st.ci.conclude(repo, 1202, "failure")
-        self.assertEqual([(r["repo"], r["branch"], r["run_id"]) for r in
-                          ci.main_red(self.db, ("main", "develop"))],
-                         [(repo, "develop", 1202)])
+        # #1683 N3 : une branche `develop` d'un dépôt qui ne la déclare pas
+        # n'est pas une base — la lecture sans `bases_for` (appel historique)
+        # la voit pourtant : c'est l'écart que l'alerte ne doit plus avoir
+        st.ci.open_run(DEPOT, 1206, head_sha="d1" * 20, branch="develop", event="push",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.add_failure(DEPOT, 1206, part="psql 1/1", test="tests.test_b.T.test_1",
+                          module="tests.test_b", status="echec", inherited=False,
+                          excerpt="", replay="", duration_s=None, failed_at=None)
+        st.ci.conclude(DEPOT, 1206, "failure")
+        self.assertEqual(sorted((r["repo"], r["branch"], r["run_id"]) for r in
+                                ci.main_red(self.db, ("main", "develop"))),
+                         [(DEPOT, "develop", 1206), (repo, "develop", 1202)])
         self.assertEqual(
             [a["reason"] for a in exploitation.alerts(cfg, self.db)
              if a["type"] == "ci_main_red"],
@@ -1239,19 +1286,22 @@ class WatcherTest(PgTestCase):
     def test_decouverte_ne_suit_que_les_suites(self):
         """#1483 N3 : un workflow découvert qui n'a pas la forme d'une suite
         (déploiement, sonde) n'est pas suivi — pas de verdict de bruit ; il est
-        journalisé, et une liste déclarée le suit si on le veut."""
+        journalisé, et une liste déclarée le suit si on le veut. #1683 N2 : un
+        `ci.yml` générique est écarté comme les autres dès qu'une suite est
+        reconnue — comportement assumé, journalisé, et déclarable."""
         repo = "manaty/nexlink"
         cfg = dataclasses.replace(self.cfg, github={"projects": {"nexlink": repo},
                                                     "host": self.cfg.host})
         api = FauxApi()
         api.workflows = ["backend-suite.yml", "sql-invariant.yml", "deploy-api-prod.yml",
-                         "compute-probe.yml"]
+                         "compute-probe.yml", "ci.yml"]
         journal = []
         watcher = ci.Watcher(cfg, api=api, log=journal.append)
         api.live = [run_view(1400, "d1" * 20, "lot/1-un", workflow="backend-suite.yml"),
                     run_view(1401, "d2" * 20, "lot/1-un", workflow="sql-invariant.yml"),
                     run_view(1402, "d3" * 20, "lot/1-un", workflow="deploy-api-prod.yml"),
-                    run_view(1403, "d4" * 20, "lot/1-un", workflow="compute-probe.yml")]
+                    run_view(1403, "d4" * 20, "lot/1-un", workflow="compute-probe.yml"),
+                    run_view(1405, "d6" * 20, "lot/1-un", workflow="ci.yml")]
         watcher.tick(self.db)
         st = storage.of(self.db)
         self.assertEqual([st.ci.run(repo, 1400)["workflow"],
@@ -1259,20 +1309,24 @@ class WatcherTest(PgTestCase):
                          ["backend-suite.yml", "sql-invariant.yml"])
         self.assertIsNone(st.ci.run(repo, 1402))
         self.assertIsNone(st.ci.run(repo, 1403))
+        self.assertIsNone(st.ci.run(repo, 1405))
         self.assertEqual([line for line in journal if "not followed" in line],
                          ["CI %s: discovered workflow(s) not followed (not a test suite): "
-                          "compute-probe.yml, deploy-api-prod.yml; declare them in "
+                          "ci.yml, compute-probe.yml, deploy-api-prod.yml; declare them in "
                           "github.projects to follow them" % repo])
         # une liste déclarée suit explicitement un workflow hors convention
         cfg = dataclasses.replace(self.cfg, github={
-            "projects": {"nexlink": {"repo": repo, "workflows": ["deploy-api-prod.yml"]}},
+            "projects": {"nexlink": {"repo": repo,
+                                     "workflows": ["deploy-api-prod.yml", "ci.yml"]}},
             "host": self.cfg.host})
         api = FauxApi()
-        api.workflows = ["backend-suite.yml", "deploy-api-prod.yml"]
+        api.workflows = ["backend-suite.yml", "deploy-api-prod.yml", "ci.yml"]
         watcher = ci.Watcher(cfg, api=api)
-        api.live = [run_view(1404, "d5" * 20, "lot/1-un", workflow="deploy-api-prod.yml")]
+        api.live = [run_view(1404, "d5" * 20, "lot/1-un", workflow="deploy-api-prod.yml"),
+                    run_view(1406, "d7" * 20, "lot/1-un", workflow="ci.yml")]
         watcher.tick(self.db)
         self.assertEqual(st.ci.run(repo, 1404)["workflow"], "deploy-api-prod.yml")
+        self.assertEqual(st.ci.run(repo, 1406)["workflow"], "ci.yml")
 
     # -- #845 : la garde de la CI (runners et file) --------------------------
     def test_garde_runner_busy_sans_job(self):
