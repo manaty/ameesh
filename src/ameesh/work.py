@@ -898,7 +898,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
            cfg=None, branch: str | None = None, branch_target: str | None = None,
-           force: str | None = None, claim: bool = False) -> dict:
+           force: str | None = None, claim: bool = False,
+           if_holder: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
     le nouvel assigné. Rend `{item, check, previous}`.
@@ -916,13 +917,26 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
 
     #1787 : une re-prise par le porteur lui-même (`claim` sur son propre lot)
     est un no-op réussi (`noop`) : l'attribution ne change pas et n'est pas
-    journalisée ; seule une `branch` fournie est enregistrée (`set_branch`)."""
+    journalisée ; seule une `branch` fournie est enregistrée (`set_branch`).
+
+    #2016 : `if_holder` nomme le titulaire lu par l'appelant (l'instantané
+    d'une alerte) ; si le lot a changé de main depuis, la réassignation est
+    refusée en nommant le porteur courant. Deux agents partis du même brief ne
+    se volent plus le lot : le second relit le lot au lieu d'écraser le
+    premier."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
+    if if_holder is not None:
+        expected = str(if_holder).strip() or None
+        if (previous or None) != expected:
+            raise WorkError(
+                "lot %s changed holder since the reading: now %s (expected %s); "
+                "re-read the lot and retry" % (item_id, previous or "nobody",
+                                               expected or "nobody"))
     _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
     if claim and previous:
