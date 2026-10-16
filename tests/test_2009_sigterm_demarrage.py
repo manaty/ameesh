@@ -300,29 +300,22 @@ class RemplacementSansAttenteTest(unittest.TestCase):
 
     @staticmethod
     def _tube_plein():
-        """Remplit un tube sans toucher au mode du descripteur partagé."""
+        """Remplit le tube jusqu'à EAGAIN, puis rend une écriture bloquante."""
         r, w = os.pipe()
-        ecrits = [0]
-        copie = os.dup(w)
-
-        def remplir() -> None:
+        try:
+            os.set_blocking(w, False)
             try:
                 while True:
-                    os.write(copie, b"x")
-                    ecrits[0] += 1
-            except OSError:
+                    # Un octet : même le dernier espace libre doit être pris.
+                    os.write(w, b"x")
+            except BlockingIOError:
                 pass
             finally:
-                os.close(copie)
-
-        threading.Thread(target=remplir, daemon=True,
-                         name="remplir-tube-2032").start()
-        dernier, stable = -1, time.monotonic()
-        while time.monotonic() - stable < 0.3:
-            time.sleep(0.05)
-            if ecrits[0] != dernier:
-                dernier, stable = ecrits[0], time.monotonic()
-        assert ecrits[0] > 0, "tube non rempli"
+                os.set_blocking(w, True)
+        except BaseException:
+            os.close(r)
+            os.close(w)
+            raise
         return r, w
 
     def test_ecriture_sans_attendre_tube_plein(self):
