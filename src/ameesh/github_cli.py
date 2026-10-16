@@ -22,11 +22,13 @@ revalidation `If-None-Match` (un 304 ne consomme pas de quota), arrêt au quota
     ameesh github read "/repos/acme/web/pulls/42"
 
 Sortie : le corps JSON de la réponse, sur une ligne, tel que l'API le rend.
-Codes de sortie :
+Le chemin est normalisé sans barre initiale (`repos/owner/repo/…`), la clé du
+cache partagé de #848 : une veille et `notify` qui lisent la même ressource ne
+paient qu'une entrée. Codes de sortie :
 
 * 0 : lecture servie (réseau, revalidation ou cache) ;
-* 1 : erreur GitHub ou de transport (404, panne, chemin refusé) ;
-* 2 : usage ;
+* 1 : erreur GitHub ou de transport (404, panne) ;
+* 2 : usage (chemin ou `--ttl` refusé) ;
 * 3 : quota épuisé **et** rien en cache pour ce chemin : le veilleur attend le
   reset (donné par le message sur `stderr`) au lieu de boucler.
 
@@ -37,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 
@@ -51,35 +54,56 @@ MIN_TTL = 5.0
 def read_path(cfg, path: str, *, ttl: float | None = None):
     """Lit `path` par le client GitHub partagé de l'hôte (#848).
 
-    Sans `ttl`, la garde est le réglage `github.ci_ttl` de la configuration
-    (défaut 60 s) : une lecture identique est servie du disque, une lecture
-    périmée est revalidée sans consommer de quota si rien n'a changé."""
+    Le chemin est accepté en graphie d'URL (`/repos/…`) et normalisé sans
+    barre initiale — la clé du cache partagé des lecteurs internes (`notify`,
+    `ci`, `versions`). Sans `ttl`, la garde est le réglage `github.ci_ttl` de
+    la configuration (défaut 60 s) : une lecture identique est servie du
+    disque, une lecture périmée est revalidée sans consommer de quota si rien
+    n'a changé."""
     from . import plan_github
 
-    ttl = plan_github.settings_of(cfg).ci_ttl if ttl is None else float(ttl)
+    key = check_path(path)
+    ttl = plan_github.settings_of(cfg).ci_ttl if ttl is None else ttl_of(ttl)
     client = plan_github.client(cache_dir=getattr(cfg, "state_dir", None),
                                 ttl=float(ttl))
     if client is None:  # pragma: no cover - `client` ne rend None que sur demande
         raise plan_github.GithubError("no GitHub token and no local gh")
-    return client.get(path)
+    return client.get(key)
+
+
+def _has_control(text: str) -> bool:
+    """Vrai si `text` porte un caractère de contrôle C0, DEL ou C1 (N1 #894)."""
+    return any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in text)
 
 
 def check_path(path: str) -> str:
-    """Le chemin REST : absolu (`/repos/…`), sans blanc ni saut de ligne."""
+    """Le chemin REST, normalisé **sans barre initiale** (la clé du cache #848).
+
+    Les lecteurs internes d'ameesh lisent `repos/owner/repo/…` : la clé du
+    cache partagé est ce chemin-là. La commande accepte la graphie d'URL
+    (`/repos/…`) et la normalise, pour qu'une veille et `notify` qui lisent la
+    même ressource ne paient pas deux entrées.
+
+    Un blanc ou un caractère de contrôle (C0, DEL, C1) est refusé : `urllib`
+    lèverait `http.client.InvalidURL`, hors des erreurs que la commande sait
+    rendre (N1 #894)."""
     text = str(path or "")
     if not text.startswith("/"):
         raise ValueError("a REST path starting with / is expected, not %r" % path)
-    if any(char.isspace() for char in text):
-        raise ValueError("a REST path carries no whitespace, not %r" % path)
-    return text
+    if any(char.isspace() for char in text) or _has_control(text):
+        raise ValueError(
+            "a REST path carries no whitespace or control character, not %r" % path)
+    return text.lstrip("/")
 
 
 def ttl_of(value) -> float:
-    """`--ttl` validé : un nombre de secondes, au moins `MIN_TTL`."""
+    """`--ttl` validé : un nombre de secondes fini, au moins `MIN_TTL`."""
     try:
         ttl = float(value)
     except (TypeError, ValueError):
         raise ValueError("--ttl: a number of seconds is expected, not %r" % value)
+    if not math.isfinite(ttl):
+        raise ValueError("--ttl: a finite number of seconds is expected, not %r" % value)
     if ttl < MIN_TTL:
         raise ValueError("--ttl: at least %d seconds, not %s" % (MIN_TTL, value))
     return ttl
@@ -89,17 +113,15 @@ def cmd_read(cfg, args) -> int:
     from . import plan_github
 
     try:
-        path = check_path(args.path)
         ttl = None if args.ttl is None else ttl_of(args.ttl)
-    except ValueError as exc:
+        value = read_path(cfg, args.path, ttl=ttl)
+    except ValueError as exc:          # chemin ou --ttl refusés : usage
         print("github: %s" % exc, file=sys.stderr)
         return 2
-    try:
-        value = read_path(cfg, path, ttl=ttl)
     except plan_github.GithubRateLimited as exc:
         when = time.strftime("%H:%M:%SZ", time.gmtime(exc.reset)) if exc.reset else "unknown"
         print("github: quota exhausted (reset at %s) and %s is not in the shared "
-              "cache yet" % (when, path), file=sys.stderr)
+              "cache yet" % (when, args.path), file=sys.stderr)
         return EXIT_RATE_LIMITED
     except plan_github.GithubError as exc:
         print("github: %s" % exc, file=sys.stderr)

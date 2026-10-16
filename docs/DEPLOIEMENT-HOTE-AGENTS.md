@@ -36,17 +36,23 @@ de la démarrer : le tour en cours draine, borné par `TimeoutStopSec` (35 min),
 et le démarrage n’a lieu qu’après preuve du point sûr (`ActiveState=inactive`
 et `MainPID=0`). Aucune fenêtre « idle » n’est attendue : une persona en tour
 ne bloque plus la mise à jour. Il relit le placement avant chaque redémarrage :
-un agent déplacé, arrêté ou passé en observation est ignoré. Le compte
+un agent déplacé ou passé en observation est ignoré. Un agent arrêté n’est pas
+réactivé (aucun bail, aucun tour — #1131), mais son unité encore active est
+rechargée sur le nouveau code (#1633), sans quoi elle servirait la reprise de
+l’owner avec la version d’avant le déploiement. Le compte
 `ameesh` doit avoir un gestionnaire systemd utilisateur ; le script pose
 `HOME`, `XDG_RUNTIME_DIR` et `DBUS_SESSION_BUS_ADDRESS` pour joindre son bus.
 Le CLI distant est celui de l’unité :
 `/home/ameesh/.local/share/ameesh/venv/bin/ameesh`.
 La CLI et la lecture de l’horloge passent par `systemd-run --user --pipe
---wait --quiet`, avec `EnvironmentFile=%h/.config/ameesh/env` obligatoire.
-Systemd lit ce fichier avec le même parseur que le runner : les valeurs
-contenant `$USER`, des guillemets ou `#` restent intactes. Un fichier absent
-ou illisible produit une erreur avant toute exécution, sans configuration
-de repli.
+--wait --quiet`, avec `EnvironmentFile` sur un chemin absolu : `systemd-run
+-p` n’étend pas le spécificateur `%h` dans une unité transitoire (#1133), le
+shell expanse donc `$HOME` (`/home/ameesh/.config/ameesh/env`). Les fichiers
+d’unité `deploy/systemd/*.service` gardent `%h`, résolu dans une unité
+installée. Systemd lit ce fichier avec le même parseur que le runner : les
+valeurs contenant `$USER`, des guillemets ou `#` restent intactes. Un
+fichier absent ou illisible produit une erreur avant toute exécution, sans
+configuration de repli.
 
 Une unité active ne suffit pas à prouver la reprise d’un bail. Le contrôle
 partagé avec le poste et le serveur (`deploy/mise-a-jour/bail.sh`, #502/#503)

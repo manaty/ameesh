@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+from types import SimpleNamespace
 
 from . import plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -386,7 +387,9 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
     run on the exact head, green, its jobs included (`skipped`/`neutral`/unread
     jobs certify nothing). QueueError otherwise (no run, running, missing, red,
     unreadable); `full_ci` reads the runs (`radar.full_suite_ci` by default
-    when the project has a GitHub repo)."""
+    when the project has a GitHub repo). Une suite non **déclarée** est refusée
+    pour ce qu'elle est — la clé `radar.projects.<p>.full_suite` manquante —,
+    jamais comme une lecture gh impossible (#886)."""
     from . import plan_github, radar
     who = "lot #%s" % lot if lot is not None else "this lot"
     reader = full_ci
@@ -395,6 +398,14 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
             raise QueueError("%s is class release: no full-suite reader (project without a "
                              "GitHub repository) — a full run on the frozen head %s is required"
                              % (who, sha[:12]))
+        if not tuple(getattr(project, "full_suite", ()) or ()):
+            # #886 (P3, R2 mty-amh-qa-01 sur PR manaty/ameesh#633) : une
+            # déclaration manquante n'est pas une panne de lecture ; le message
+            # nomme la clé et ne renvoie pas à « once gh works ».
+            raise QueueError("%s is class release: project %s declares no full suite "
+                             "(radar.projects.%s.full_suite — the workflow files of the full "
+                             "run): a green full-suite run on the frozen head %s is required"
+                             % (who, project.name, project.name, sha[:12]))
         reader = lambda one: radar.full_suite_ci(project, one)
     try:
         runs = reader(sha)
@@ -938,6 +949,28 @@ def radar_project(cfg, repo: str):
     if len(matching) > 1:
         raise QueueError("multiple radar projects match this repository; landing conditions are ambiguous")
     return matching[0] if matching else None
+
+
+def writer_project(cfg, repo: str, app: str = "", project=None):
+    """The project identity a single-lot writer shares with the train (#1703).
+
+    `land.lock_key` keys a target lease on `project.name`. A packet train holds
+    the key of the **declared** radar project of its repository, so the direct
+    merge path (`merge_pr.direct_merge`) must resolve that same identity,
+    never a parallel one: the declared project comes first, whatever the
+    admitted lot's `app` says. Without a declared project no train can run on
+    this host, and the lot's `app` is then the explicit identity already
+    carried by the queue — no repository key is invented here (#1680). An
+    empty app refuses: an anonymous writer would open a key space of its own.
+    """
+    if project is None:
+        project = radar_project(cfg, repo)
+    if project is not None:
+        return project
+    name = (app or "").strip()
+    if not name:
+        raise QueueError("cannot reserve an undeclared target project")
+    return SimpleNamespace(name=name)
 
 
 def working_clone(cfg, repo: str, project) -> tuple:

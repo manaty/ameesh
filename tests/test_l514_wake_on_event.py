@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import ci, cli, hostcheck, mail, registry, storage, work
 from ameesh.runner import AgentWorker, Runner
@@ -61,6 +62,21 @@ class _Base(PgTestCase):
             "SELECT body FROM agent_mailbox WHERE recipient = %s AND delivered_at IS NULL "
             "ORDER BY id", (name,))]
 
+    def _touched(self, name: str) -> int:
+        """#885 : les non-lus qu'une réservation a touchés (posée puis rendue,
+        ou soldée) — le témoin du churn : `consigne` ou `deja_consigne`."""
+        return self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox"
+            " WHERE recipient = %s AND delivered_at IS NULL"
+            "   AND (meta ? 'consigne' OR meta ? 'deja_consigne')", (name,))[0]["n"]
+
+    def _backlog(self, name: str, n: int) -> None:
+        """#885 : `n` non-lus ordinaires d'un coup (sans passer par `mail.send`)."""
+        self.db.execute(
+            "INSERT INTO agent_mailbox (sender, recipient, body, kind, payload)"
+            " SELECT 'bulk', %s, 'Ordinary backlog ' || i, 'notify', '{}'::jsonb"
+            "   FROM generate_series(1, %s) i", (name, n))
+
 
 class MidTurnHookTest(_Base):
     def _mail(self, name: str) -> None:
@@ -91,6 +107,62 @@ class MidTurnHookTest(_Base):
                 self.assertEqual(stop["decision"], "block")
                 self.assertIn("Ordinary progress note.", stop["reason"])
                 self.assertEqual(self._pending(name), [])
+
+    def test_verdict_behind_two_hundred_unread_is_seen_mid_turn(self):
+        """#885 : le verdict est derrière plus de `UNREAD_LIMIT` non-lus ; il
+        est vu au point sûr, et le retard ordinaire n'est pas touché (aucune
+        réservation, aucune libération : pas de churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "deep-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 250)
+                mail.send(self.db, "codex-review", name, "Verdict beyond 200.",
+                          payload={"verdict": True})
+                context = json.loads(self._hook(worker, harness, "PostToolUse")
+                                     )["hookSpecificOutput"]["additionalContext"]
+                self.assertIn("Verdict beyond 200.", context)
+                self.assertNotIn("Ordinary backlog", context)
+                self.assertEqual(len(self._pending(name)), 250)
+                self.assertEqual(self._touched(name), 0)
+
+    def test_ordinary_mail_does_not_churn_the_reservation(self):
+        """#885 : deux points sûrs sans rien d'urgent n'écrivent RIEN — l'ancien
+        chemin réservait jusqu'à 200 non-lus puis les relâchait (le churn)."""
+        for harness in ("deepseek", "codex"):
+            with self.subTest(harness=harness):
+                name = "churn-" + harness
+                worker = self._leased(name, harness)
+                self._backlog(name, 3)
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._hook(worker, harness, "PostToolUse"), "")
+                self.assertEqual(self._touched(name), 0)
+                self.assertEqual(len(self._pending(name)), 3)
+
+    def test_active_reservations_do_not_hide_the_next_eligible_message(self):
+        worker = self._leased("reserved-codex", "codex")
+        ids = [int(row["id"]) for row in self.db.query(
+            "INSERT INTO agent_mailbox (sender, recipient, body, payload)"
+            " SELECT 'review', %s, 'Reserved verdict ' || i, '{\"verdict\":true}'::jsonb"
+            " FROM generate_series(1, 200) i RETURNING id", (worker.name,))]
+        mail.reserve(self.db, worker.name, worker.runner.runner_id, worker.epoch,
+                     "other-token", ids=ids, porteur="consigne", ttl_seconds=3600)
+        last = mail.send(self.db, "review", worker.name, "Verdict after reservations",
+                         payload={"verdict": True})
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=1)], [last])
+        out = self._hook(worker, "codex", "PostToolUse")
+        self.assertIn("Verdict after reservations", out)
+        self.assertNotIn("Reserved verdict", out)
+        self.assertEqual(len(self._pending(worker.name)), 200)
+        # A reservation from an old lease or an expired one is reclaimable.
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,epoch}', to_jsonb(%s::bigint)) WHERE id = %s",
+                        (worker.epoch - 1, ids[0]))
+        self.db.execute("UPDATE agent_mailbox SET meta = jsonb_set(meta,"
+                        " '{consigne,expire}', '0'::jsonb) WHERE id = %s", (ids[1],))
+        self.assertEqual([int(m["id"]) for m in mail.unread_mid_turn(
+            self.db, worker.name, limit=2)], ids[:2])
 
     def test_owner_mail_alone_interrupts_a_dsh_turn(self):
         for harness in ("deepseek", "codex"):
@@ -224,10 +296,16 @@ class DoctorHooksTest(unittest.TestCase):
         return {"hooks": {event: [{"hooks": [{"type": "command", "command": command}]}]
                           for event, command in events.items()}}
 
-    def _lines(self, home: str, harness: str = "deepseek") -> dict:
+    def _lines(self, home: str, harness: str = "deepseek",
+               manager_path: str = "") -> dict:
+        """Les lignes du doctor ; `manager_path` remplace le PATH du
+        gestionnaire systemd (vide : celui de la session du doctor, le
+        comportement d'avant #514 N2)."""
         variable = {"deepseek": "DSH_HOME", "codex": "CODEX_HOME",
                     "claude": "CLAUDE_CONFIG_DIR"}[harness]
-        return hostcheck.hook_lines(None, [harness], environ={variable: home})
+        with mock.patch.object(hostcheck.adapters, "systemd_manager_path",
+                               return_value=manager_path):
+            return hostcheck.hook_lines(None, [harness], environ={variable: home})
 
     def test_hook_commands_reads_the_nested_format(self):
         document = self._document({"PostToolUse": "bin/agent-mail hook deepseek"})
@@ -247,6 +325,52 @@ class DoctorHooksTest(unittest.TestCase):
         texte = "\n".join(out["lines"])
         self.assertIn(missing, texte)
         self.assertIn("127", texte)
+
+    def test_binary_missing_sous_le_path_du_gestionnaire_est_ko(self):
+        """#514 N2 : le gestionnaire systemd peut lancer les harnais avec SON
+        PATH ; un binaire absent là sort en 127, même s'il est visible ici."""
+        home = self._home(binary=True)
+        self._write(home, self._document({"PostToolUse": "agent-mail hook deepseek",
+                                          "Stop": "agent-mail hook deepseek"}))
+        with mock.patch.dict(os.environ, {"PATH": home}):
+            out = self._lines(home, manager_path="/nowhere-l514")
+        self.assertFalse(out["ok"])
+        texte = "\n".join(out["lines"])
+        self.assertIn("systemd manager PATH", texte)
+        self.assertIn("127", texte)
+
+    def test_binary_visible_seulement_sous_le_gestionnaire_est_ko(self):
+        """#1395 (avis bloquant cx2) : la présence sous le gestionnaire ne
+        prouve pas que le hook tournera — le PATH réel du service est celui de
+        son unité ; absent de la session, le binaire reste un défaut."""
+        home = self._home(binary=True)
+        self._write(home, self._document({"PostToolUse": "agent-mail hook deepseek",
+                                          "Stop": "agent-mail hook deepseek"}))
+        with mock.patch.dict(os.environ, {"PATH": "/nowhere-l514"}):
+            out = self._lines(home, manager_path=home)
+        self.assertFalse(out["ok"], out["lines"])
+        texte = "\n".join(out["lines"])
+        self.assertIn("this session's PATH", texte)
+        self.assertIn("127", texte)
+
+    def test_binary_visible_dans_les_deux_contextes_est_ok(self):
+        home = self._home(binary=True)
+        self._write(home, self._document({"PostToolUse": "agent-mail hook deepseek",
+                                          "Stop": "agent-mail hook deepseek"}))
+        with mock.patch.dict(os.environ, {"PATH": home}):
+            out = self._lines(home, manager_path=home)
+        self.assertTrue(out["ok"], out["lines"])
+        self.assertIn("2 event(s)", "\n".join(out["lines"]))
+
+    def test_binary_missing_resout_le_path_donne(self):
+        """`_binary_missing` cherche un nom seul sous le PATH reçu ; vide ou
+        absent, il retombe sur le PATH ambiant (comme avant #514 N2)."""
+        home = self._home(binary=True)
+        self.assertFalse(hostcheck._binary_missing("agent-mail", path=home))
+        self.assertTrue(hostcheck._binary_missing("agent-mail", path="/nowhere-l514"))
+        with mock.patch.dict(os.environ, {"PATH": home}):
+            self.assertFalse(hostcheck._binary_missing("agent-mail"))
+            self.assertFalse(hostcheck._binary_missing("agent-mail", path=""))
 
     def test_found_command_and_all_events(self):
         home = self._home(binary=True)

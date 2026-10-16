@@ -454,6 +454,8 @@ def agent_state(row: dict) -> str:
         return "paused"
     if status == "running":
         return "working" if row.get("lease_live") else "stopped"
+    if row.get("operator_paused") and status not in ("stopped", "dead"):
+        return "paused"
     if status == "blocked":
         return "paused"                 # pause budget ou comptable (L13)
     if status in ("stopped", "dead"):
@@ -515,6 +517,13 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         # L37 (0030) : mode et raison d'arrêt structurée
         "mode": row.get("mode") or "execute",
         "stop_reason": row.get("stop_reason") if state == "stopped" else None,
+        "operator_pause": ({
+            "reason": row.get("operator_pause_reason"),
+            "by": row.get("operator_pause_by"),
+            "for": row.get("operator_pause_for"),
+            "since_ts": _round(row.get("operator_pause_ts")),
+            "after_turn": state == "working",
+        } if row.get("operator_paused") else None),
     }
 
 
@@ -788,7 +797,7 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     # agrégation, jamais de la lecture des notes.
     for ev in st.lot_transitions(ids):
         events.setdefault(int(ev["work_item_id"]), []).append(ev)
-    last_events = {int(r["work_item_id"]): r.get("last_ts")
+    last_events = {int(r["work_item_id"]): float(r["last_ts"])
                    for r in st.lot_event_last(ids)}
     by_item: dict = {}
     for row in st.lot_actions(ids):
@@ -1050,6 +1059,11 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("turn: %s" % (turn["task"] or turn["label"] or "running"), "    ")
         elif agent["state"] in ("paused", "stopped") and agent["status_text"]:
             line("reason: %s" % agent["status_text"], "    ")
+        hold = agent.get("operator_pause")
+        if hold:
+            line("operator pause%s: %s (by %s for %s)" % (
+                " after this turn" if hold["after_turn"] else "",
+                hold["reason"], hold["by"], hold["for"]), "    ")
 
     out.append("")
     if snap["milestones"]:

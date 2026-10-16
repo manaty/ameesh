@@ -358,7 +358,9 @@ redemarrer_hors_tour() {  # unité — 0 quand l'arrêt est prouvé puis l'unit�
 # part. On n'attend plus un créneau « idle » : un statut `running` à chaque
 # lecture faisait expirer la mise à jour sans même arrêter l'unité (starvation
 # de l'incident impl07, #1152/R1). Le statut sert encore à la garde `stopped`
-# (#1131) : une persona arrêtée par le propriétaire n'est pas relancée.
+# (#1131) : une persona arrêtée par le propriétaire n'est pas relancée ; son
+# unité encore active est seulement rechargée sur le nouveau code (#1633),
+# sans bail ni tour.
 redemarrer_liste() {
   local base=$1; shift
   local u p st avant ligne heure tenu attendu
@@ -369,8 +371,20 @@ redemarrer_liste() {
     # #1131 : le propriétaire a arrêté cette persona ; un déploiement ne la
     # réactive pas (incident du 14/10 : unités dev1/dev2/dev4/dev7 restées
     # actives malgré le registre `stopped`).
+    # #1633 : la laisser tourner sur l'ancien code faisait repartir une
+    # reprise ultérieure sur cette version. Si son unité est encore active,
+    # on la redémarre pour charger le nouveau code — sans exiger de bail :
+    # la persona reste arrêtée, aucun tour. Une unité déjà arrêtée n'est pas
+    # relancée (elle chargera le nouveau code à son démarrage).
     if [ "$st" = stopped ]; then
-      echo "$p : arrêté dans le registre — unité $u ignorée, pas de redémarrage (systemctl --user disable --now $u pour la retirer)"
+      if systemctl --user is-active --quiet "$u"; then
+        systemctl --user restart "$u" \
+          && systemctl --user is-active --quiet "$u" \
+          || { echo "$u : unité d'une persona arrêtée, ne redémarre pas — journalctl --user -u $u -n 50" >&2; exit 1; }
+        echo "$p : arrêté dans le registre — unité $u redémarrée pour charger le nouveau code, aucun tour"
+      else
+        echo "$p : arrêté dans le registre — unité $u déjà arrêtée, rien à recharger"
+      fi
       continue
     fi
     # #502: only a runner that held its lease must take it again (bail.sh)
