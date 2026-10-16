@@ -4293,6 +4293,7 @@
    "operations": [
     "adopt",
     "assigners",
+    "build_lots_activity",
     "gauge_history",
     "gauge_latest",
     "latest_gauges",
@@ -4392,6 +4393,7 @@
     "add",
     "add_milestone",
     "assign",
+    "assign_capped",
     "assignment_events",
     "auto_takes_since",
     "backlog",
@@ -4400,6 +4402,7 @@
     "by_package",
     "close",
     "close_merged",
+    "count_builds",
     "creator",
     "current_delegation",
     "delays",
@@ -4452,8 +4455,11 @@
     "set_partial_seen",
     "timeline",
     "turn_spans",
+    "unassign",
+    "unassign_surplus",
     "unassigned_lots",
     "waiting_episodes",
+    "wip_exceptions",
     "without_project"
    ],
    "watches": [

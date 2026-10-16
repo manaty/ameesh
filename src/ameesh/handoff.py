@@ -34,9 +34,10 @@ import os
 import time
 
 from . import storage
+from .storage import interface
 
 #: début de la note de reprise (le plafond horaire compte ces lignes)
-HANDOFF_NOTE = "repris pendant la pause budget"
+HANDOFF_NOTE = interface.HANDOFF_NOTE
 #: début de la note d'un lot `build` sauté (une fois par pause)
 SKIP_NOTE = "pause budget : lot non repris"
 #: harnais de l'agent en pause, et du preneur
@@ -52,8 +53,10 @@ DEFAULT_IDLE_S = 300.0
 LOTS_PER_AGENT = 50
 #: lignes de journal lues pour la note d'un lot sauté (une fois par pause)
 EVENTS_READ = 1000
-#: débuts de note d'une attribution (`work assign`, création, prises)
-_ASSIGN_NOTES = ("assigned to ", "assigné à ", "created and assigned to ")
+#: débuts de note d'une attribution (`work assign`, création, délégation,
+#: prises automatiques, reprise budget) — une seule source, avec `wip_exceptions`
+#: et `requeued_sql` (§4)
+_ASSIGN_NOTES = interface.ASSIGN_NOTE_PREFIXES
 
 
 def paused(row: dict) -> bool:
@@ -64,9 +67,9 @@ def paused(row: dict) -> bool:
 
 
 def assign_prefixes() -> tuple:
-    """Débuts des notes d'une attribution du lot."""
-    from . import backlog
-    return _ASSIGN_NOTES + (backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE, HANDOFF_NOTE)
+    """Débuts des notes d'une attribution du lot (toutes : attribution,
+    création, délégation, prises automatiques, reprise sur pause budget)."""
+    return _ASSIGN_NOTES
 
 
 def last_assigner(events: list) -> str:

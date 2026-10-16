@@ -383,10 +383,12 @@ class Operations(interface.Operations):
     #: corps commun de `open_lots_activity` / `state_lots_activity` : la
     #: dernière activité d'un lot (ligne, transitions, jalons, actions,
     #: messages). `%%s` du LIMIT est échappé : `_lots_activity` injecte le
-    #: WHERE, qui peut lui-même porter un `%s`.
+    #: WHERE, qui peut lui-même porter un `%s` ; `__REQUEUED__` est remplacé
+    #: APRÈS le `%` (`requeued_sql` porte ses propres `%s`).
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, __REVIEWER__,
+                   (w.state = 'build' AND __REQUEUED__) AS returned_to_queue,
                    coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),
                             nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
@@ -414,8 +416,14 @@ class Operations(interface.Operations):
         # la lecture rend '' (l'alerte ne nomme alors personne, comme hier).
         reviewer = ("w.reviewer" if has_reviewer(self.db)
                     else "''::text AS reviewer")
-        return self.db.query(
-            self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where, params)
+        # §4 : `returned_to_queue` distingue un lot `build` RENDU à la file
+        # (limite d'en-cours) d'un lot en cours sans assigné (prérequis,
+        # travail confié par courrier) — voir `work.requeued_sql`.
+        from .work import REQUEUED_PARAMS, requeued_sql
+
+        sql = self._LOTS_ACTIVITY.replace("__REVIEWER__", reviewer) % where
+        sql = sql.replace("__REQUEUED__", requeued_sql("w"))
+        return self.db.query(sql, REQUEUED_PARAMS + tuple(params))
 
     def open_lots_activity(self, limit) -> list[dict]:
         return self._lots_activity(
@@ -426,6 +434,33 @@ class Operations(interface.Operations):
         return self._lots_activity(
             "w.state = %s",
             (state, int(limit) if limit is not None else None))
+
+    def build_lots_activity(self, limit) -> list[dict]:
+        """§4 : les lots en `build` assignés à un agent, avec leur dernière
+        activité (même calcul qu'`open_lots_activity`) — la lecture dédiée du
+        balayage de la limite d'en-cours, sans le plafond global des lots
+        ouverts."""
+        return self.db.query(
+            """
+            SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
+                   extract(epoch from w.updated_at)::float8 AS updated_ts,
+                   extract(epoch from w.created_at)::float8 AS created_ts,
+                   extract(epoch from greatest(
+                       w.updated_at, ev.at, ms.at, ac.at, mb.at))::float8 AS last_activity_ts
+              FROM work_items w
+              LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM work_item_events e
+                                  WHERE e.work_item_id = w.id) ev ON true
+              LEFT JOIN LATERAL (SELECT max(at) AS at FROM work_item_milestones m
+                                  WHERE m.work_item_id = w.id) ms ON true
+              LEFT JOIN LATERAL (SELECT max(updated_at) AS at FROM actions a
+                                  WHERE a.work_item = w.id) ac ON true
+              LEFT JOIN LATERAL (SELECT max(created_at) AS at FROM agent_mailbox b
+                                  WHERE b.work_item_id = w.id::text) mb ON true
+             WHERE w.state = 'build' AND w.assignee IS NOT NULL
+             ORDER BY last_activity_ts ASC, w.id
+             LIMIT %s
+            """,
+            (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
