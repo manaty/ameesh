@@ -69,6 +69,7 @@ SIGNATURES = {
 #: contenus (texte libre) : refusés au rôle de base, seuls lisibles par le rôle
 #: « contenus » (role-superviseur-contenus.sql)
 CONTENUS = {
+    "agent_peek": {"payload"},
     "agent_mailbox": {"body", "payload", "meta"},
     "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},

@@ -139,6 +139,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agents/{agent}/peek": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Responsible human's agent summary (`ameesh agent peek`) */
+        get: operations["agents_agent_peek"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/agents/{agent}/resume": {
         parameters: {
             query?: never;
@@ -483,6 +500,17 @@ export interface components {
             };
             /** @constant */
             schema: "ameesh-agent-detail/1";
+        };
+        "ameesh-agent-peek-1": {
+            agent: string;
+            captured_ts: number | null;
+            events: Record<string, never>[];
+            host: string;
+            lot: Record<string, never>;
+            /** @constant */
+            schema: "ameesh-agent-peek/1";
+            stale: boolean;
+            workspace: Record<string, never>;
         };
         "ameesh-agents-1": {
             agents: {
@@ -1379,6 +1407,76 @@ export interface operations {
             };
             /** @description key already used for another request */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    agents_agent_peek: {
+        parameters: {
+            query?: {
+                /** @description latest public messages and tool summaries (default 10) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                agent: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Responsible human's agent summary (`ameesh agent peek`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-agent-peek-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description responsible human required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
