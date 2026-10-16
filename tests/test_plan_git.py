@@ -188,6 +188,28 @@ class RebaseIdentityTest(unittest.TestCase):
         out = plan_git.rebase_identity(self.depot, self.reviewed, union, "main")
         self.assertTrue(out["mechanical"], out)
 
+    def test_contenu_introduit_dans_un_merge_refuse(self) -> None:
+        _git(self.depot, "checkout", "-q", "-b", "union", self.reviewed)
+        _git(self.depot, "merge", "-q", "--no-commit", "main")
+        self._ecrire("a.txt", "contenu jamais relu dans le merge\n")
+        _git(self.depot, "commit", "-qam", "union modifiee")
+        union = self._rev("HEAD")
+        out = plan_git.rebase_identity(self.depot, self.reviewed, union, "main")
+        self.assertFalse(out["mechanical"], out)
+        out = plan_git.freeze_candidate(
+            [verdict(self.reviewed, 10), frozen(union, 20)],
+            repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("freeze-after-verdict", out["causes"])
+
+    def test_avis_ancien_ne_leve_pas_un_blocage_de_la_tete_gelee(self) -> None:
+        rows = [verdict(self.frozen, 11, id=1, actor="cx1", kind="blocked"),
+                verdict(self.reviewed, 12, id=2, actor="cx1", kind="ok"),
+                frozen(self.frozen, 20, id=3)]
+        out = plan_git.freeze_candidate(rows, repo=self.depot, target="main")
+        self.assertEqual(out["sha"], "")
+        self.assertIn("blocked-verdict", out["causes"])
+
     def test_contenu_change_n_est_pas_mecanique(self) -> None:
         self._ecrire("a.txt", "lot 1 corrige\n")
         _git(self.depot, "commit", "-qam", "#1905 correction")

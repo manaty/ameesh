@@ -194,8 +194,9 @@ def rebase_identity(repo: str, reviewed: str, frozen: str, target: str) -> dict:
     `reviewed` (celle d'un avis) et la tête gelée `frozen` (gel republié après
     un rebase ou une correction de base) ?
 
-    Un rebase mécanique ne change pas le contenu du lot : les commits du lot
-    et leur diff écrasé ont les mêmes `patch-id` de part et d'autre. Les bases
+    Un rebase mécanique ne change pas le contenu du lot : son delta net
+    doit avoir le même `patch-id` de part et d'autre. Les commits individuels
+    servent au diagnostic, jamais à ignorer le contenu d'une fusion. Les bases
     sont la base commune de chaque tête avec `target` (le rebase déplace la
     base, pas les commits du lot). Rend `{mechanical, detail}` ; `mechanical`
     est faux dès qu'un SHA ou un delta est illisible — jamais de report sur un
@@ -219,9 +220,9 @@ def rebase_identity(repo: str, reviewed: str, frozen: str, target: str) -> dict:
         new_ids = _patch_ids(repo, "%s..%s" % (bases["new"], new))
     except (_NoVerbatim, MergeProbeError) as exc:
         return {"mechanical": False, "detail": "delta illisible: %s" % (exc or "refusé")}
-    if old_ids and set(old_ids) == set(new_ids):
-        return {"mechanical": True,
-                "detail": "%d commit(s) de patch-id identiques" % len(old_ids)}
+    # Les commits seuls ne suffisent pas : --no-merges ignore une résolution
+    # introduisant du contenu neuf, et un ensemble perd ordre/multiplicité.
+    # Le delta net doit aussi être identique avant tout report d'avis.
     try:
         old_squash = _diff_patch_id(repo, bases["old"], old)
         new_squash = _diff_patch_id(repo, bases["new"], new)
@@ -347,10 +348,14 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
         if not applies:
             continue
         actor = (v.get("actor") or "").strip()
-        seen = by_actor.get(actor)
+        # Un avis sur l'ancienne tête ne peut lever un blocage de la nouvelle,
+        # même s'il est rendu plus tard par le même relecteur.
+        scope = "carried" if cand and not same_commit(cand, out["sha"]) else "current"
+        key = (actor, scope)
+        seen = by_actor.get(key)
         if seen is None or (v.get("at_ts") or 0, int(v.get("id") or 0)) > \
                 (seen.get("at_ts") or 0, int(seen.get("id") or 0)):
-            by_actor[actor] = v
+            by_actor[key] = v
     blocked = sorted({(v.get("actor") or "?") for v in by_actor.values()
                       if (v.get("verdict") or "ok") != "ok"})
     if blocked:
