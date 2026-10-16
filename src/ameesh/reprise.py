@@ -226,11 +226,12 @@ def locate(cfg: Config, harness: str, session_id: str,
 
 def holders(path: str | None, session_id: str) -> list[dict]:
     """Les processus qui tiennent la session : fichier ouvert (ou dossier
-    ouvert ou courant), ou id de session sur la ligne de commande (`codex
-    resume <id>`, `claude --resume <id>`) — hors ce processus et ses
-    ascendants, dont la ligne de commande porte l'id passé à `ameesh adopt`.
-    Par la couche plateforme (L63) ; les processus illisibles (autre
-    utilisateur, disparus) sont ignorés.
+    ouvert ou courant), ou id de session sur la ligne de commande d'une
+    REPRISE (`codex resume <id>`, `claude --resume <id>`, `dsh --session-id
+    <id>`) — hors ce processus et ses ascendants, dont la ligne de commande
+    porte l'id passé à `ameesh adopt`. L'id simplement CITÉ (brief, message,
+    chemin) ne compte pas (#1283). Par la couche plateforme (L63) ; les
+    processus illisibles (autre utilisateur, disparus) sont ignorés.
 
     Lève `platform.NotAvailable` si l'OS ne permet pas de le vérifier :
     jamais de liste vide qui voudrait dire « personne » sans contrôle.
@@ -239,7 +240,8 @@ def holders(path: str | None, session_id: str) -> list[dict]:
     écriture ; une session interactive démarrée sans `--resume` n'est donc vue
     que si elle écrit au moment du contrôle.
     """
-    return platform.holders(path, session_id, exclude=platform.ancestry())
+    return platform.holders(path, session_id, exclude=platform.ancestry(),
+                            session=True)
 
 
 def recently_modified(path: str | None) -> bool:
@@ -1298,7 +1300,10 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine,
-                             critical=_critical(cfg, row))
+                             critical=_critical(cfg, row),
+                             # #1580 (tranche 3) : le compte simulé pour cet
+                             # agent tient compte de son modèle
+                             model=row.get("model") or book.model_of(row["name"]))
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
@@ -1318,7 +1323,9 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
         sick = auth_failure.failing(db, cfg.host, harness)
     except db_mod.DbError:
         sick = {}
-    usable, raison = account_turn.summary_possible(old, book, items, sick=sick)
+    usable, raison = account_turn.summary_possible(
+        old, book, items, sick=sick,
+        model=row.get("model") or book.model_of(row["name"]))
     if usable:
         out.update(keep=True, deterministic=False,
                    why="session %s (account %s) is not portable to %s; the old "

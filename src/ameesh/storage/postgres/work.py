@@ -45,6 +45,11 @@ _COLUMNS_TEMPLATE = """
 """
 
 
+#: #1979 : la marque « verdict non requis » de la colonne `reviewer`
+#: (`work.waive_review`) ; un nom d'agent ne commence jamais par `-`.
+REVIEWER_NONE = "-none"
+
+
 def has_reviewer(db) -> bool:
     """#705 : `work_items.reviewer` existe-t-elle (migration 0421) ?
 
@@ -407,11 +412,20 @@ class WorkItems(interface.WorkItems):
                    closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
                    started_at = CASE WHEN %s IN ('build', 'qa')
                                      THEN coalesce(started_at, now()) ELSE started_at END
+                   __WAIVER__
              WHERE id = %s AND state = %s AND __UNPINNED__ __HELD__
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", item_columns(self.db)).replace(
                 "__UNPINNED__", _UNPINNED).replace("__HELD__", _HELD if held else "")
-        params = ((state, loops, state, state, int(item_id), current)
+        # #1979 : la dispense de re-verdict vaut pour la tête de sa revue ; un
+        # lot qui quitte qa (reprise, correction) la perd — sa prochaine revue
+        # est due.
+        waiver = has_reviewer(self.db)
+        sql = sql.replace("__WAIVER__", ", reviewer = CASE WHEN reviewer = %s AND %s <> 'qa'"
+                                        " THEN '' ELSE reviewer END" if waiver else "")
+        params = ((state, loops, state, state)
+                  + ((REVIEWER_NONE, state) if waiver else ())
+                  + (int(item_id), current)
                   + ((str(int(item_id)),) if held else ()))
         if state not in ("merged", "promoted", "closed"):
             rows = self.db.query(sql, params)
@@ -428,18 +442,20 @@ class WorkItems(interface.WorkItems):
                                     why="état %s" % state, actor=actor)
             return rows[0]
 
-    def designate_reviewer(self, item_id, reviewer, *, actor) -> dict | None:
+    def designate_reviewer(self, item_id, reviewer, *, actor, event=None) -> dict | None:
         """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
         journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
         colonne vient de la migration 0421 : sans elle, l'écriture est refusée
-        avec la marche à suivre (les lectures, elles, s'en passent)."""
+        avec la marche à suivre (les lectures, elles, s'en passent).
+        #1979 : `reviewer` vide efface la désignation, et `event` remplace la
+        ligne de journal par défaut (retrait, « verdict non requis »)."""
         if not has_reviewer(self.db):
             raise DbError("work_items.reviewer is missing (migration 0421): "
                           "run \"ameesh migrate\", then designate the reviewer")
         with self.db.transaction() as tx:
-            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor)
+            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor, event)
 
-    def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
+    def _designate_reviewer(self, item_id, reviewer, actor, event=None) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
@@ -452,7 +468,8 @@ class WorkItems(interface.WorkItems):
             (reviewer, int(item_id), reviewer))
         if not rows:
             return None
-        self._event(int(item_id), "qa", "reviewer %s designated" % reviewer, actor)
+        self._event(int(item_id), "qa",
+                    event or ("reviewer %s designated" % reviewer), actor)
         return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor,
@@ -905,9 +922,33 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if kind == "frozen" and has_reviewer(self.db):
+                WorkItems(tx)._lapse_waiver(int(item_id), milestone, actor)
             if on_frozen is not None:
                 on_frozen(tx, milestone, threads)
         return milestone
+
+    def _lapse_waiver(self, item_id, milestone, actor) -> None:
+        """#1979 : un gel d'une AUTRE tête lève la dispense de re-verdict
+        (`REVIEWER_NONE`) — elle valait pour la tête gelée de sa revue, comme
+        un verdict (même règle que `progress._verdict_applies`) ; un gel
+        renouvelé sur le même commit la garde."""
+        sha = (milestone.get("sha") or "").strip()
+        previous = self.db.query(
+            "SELECT sha FROM work_item_milestones WHERE work_item_id = %s"
+            "   AND kind = 'frozen' AND id < %s ORDER BY id DESC LIMIT 1",
+            (item_id, milestone["id"]))
+        before = (previous[0]["sha"] or "").strip() if previous else ""
+        if sha and before and (sha.startswith(before) or before.startswith(sha)):
+            return
+        rows = self.db.query(
+            "UPDATE work_items SET reviewer = '', updated_at = now()"
+            " WHERE id = %s AND reviewer = %s RETURNING state",
+            (item_id, REVIEWER_NONE))
+        if rows:
+            self._event(item_id, rows[0]["state"],
+                        "verdict required again: new freeze %s (#1979)"
+                        % (sha[:12] or "without sha"), actor)
 
     def delays(self, limit, *, ids=None) -> list[dict]:
         if ids is not None:

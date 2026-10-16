@@ -13,6 +13,7 @@ liste est vide et le rattachement par groupe de processus reste la garantie.
 """
 from __future__ import annotations
 
+import datetime
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -25,6 +26,28 @@ DEFAULT_TIMEOUT = 5.0
 
 #: variable qui porte les étiquettes à poser sur un conteneur du tour
 LABELS_ENV = "AMEESH_CONTAINER_LABELS"
+
+#: L73/#2003 : étiquette d'un volume nommé créé par un banc de test du mesh
+#: (`scripts/pg-up.sh`). Le ménage ne récolte que les volumes dont le mesh a
+#: DÉCLARÉ le cycle de vie : cette étiquette, avec la valeur
+#: [`BENCH_DISPOSABLE`], posée sur déclaration explicite de l'appelant
+#: (`AMEESH_PG_DISPOSABLE=1`). Le banc partagé et persistant (`ameesh-pg-data`)
+#: n'en porte aucune : conservation par défaut. Un volume anonyme ne porte, lui,
+#: aucune provenance du mesh (il part avec le conteneur étiqueté qui l'a créé,
+#: `rm -f -v`) : jamais récolté par le ménage.
+BENCH_LABEL = "ameesh.bench"
+
+#: #2003 : seule valeur de [`BENCH_LABEL`] qui autorise la récolte — un banc
+#: de lot que son appelant a DÉCLARÉ jetable, dont les données se recréent.
+#: Toute autre valeur (ou l'absence d'étiquette) est conservée et signalée.
+BENCH_DISPOSABLE = "disposable"
+
+#: marque que Docker pose sur un volume créé implicitement pour un conteneur
+ANONYMOUS_LABEL = "com.docker.volume.anonymous"
+
+#: volumes inspectés par commande (`volume inspect` accepte une liste ; l'argv
+#: reste borné sur un hôte qui en porte des centaines)
+INSPECT_BATCH = 200
 
 
 def turn_labels(turn_id: str, agent: str, lot: str | None = None) -> str:
@@ -199,6 +222,116 @@ class Runtime:
         if not agent:
             return []
         return self._ids("ameesh.agent=%s" % agent)
+
+    def volumes(self, *, dangling: bool = True) -> list[dict] | None:
+        """Les volumes nommés de l'hôte (L73/#2003, lecture seule) : `name`,
+        `driver`, `labels`, `mountpoint` ; None si le moteur ne répond pas ou
+        rend une ligne illisible (une liste partielle ne décide jamais d'une
+        suppression).
+
+        `dangling` (défaut) : seulement ceux qu'AUCUN conteneur ne référence,
+        arrêtés compris (`volume ls --filter dangling=true`) — un volume
+        encore monté, même par un conteneur arrêté, est en service.
+        `dangling=False` : TOUS les volumes, pour distinguer une absence
+        continue d'une reprise (le ménage #2003 réinitialise alors l'épisode)."""
+        args = ["volume", "ls"]
+        if dangling:
+            args += ["--filter", "dangling=true"]
+        args += ["--format", "{{json .}}"]
+        try:
+            proc = self.run(self._argv(*args), capture_output=True, text=True,
+                            timeout=self.timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        import json
+        out: list[dict] = []
+        for line in (proc.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                return None
+            if not isinstance(row, dict) or not str(row.get("Name") or ""):
+                return None
+            out.append({"name": str(row["Name"]),
+                        "driver": str(row.get("Driver") or ""),
+                        "labels": parse_labels(row.get("Labels")),
+                        "mountpoint": str(row.get("Mountpoint") or "")})
+        return out
+
+    def volume_created(self, names) -> dict[str, float] | None:
+        """`CreatedAt` (secondes epoch) des volumes `names`, par lots bornés ;
+        None si le moteur ne répond pas, refuse, ou rend une date illisible
+        (l'identité du volume n'est alors pas établie, donc rien n'est
+        supprimé).
+
+        #2003 : sert d'IDENTITÉ d'un volume (un nom recréé est un autre
+        volume, dont l'épisode d'absence repart) et d'information de relevé.
+        Ce n'est jamais l'âge de création qui tient lieu de délai sans
+        conteneur : ce délai se mesure sur les relevés successifs du ménage.
+
+        Docker refuse tout l'appel si un nom a disparu entre le relevé et
+        l'inspection : le passage suivant repart d'un relevé frais."""
+        out: dict[str, float] = {}
+        names = [str(name) for name in names]
+        for start in range(0, len(names), INSPECT_BATCH):
+            chunk = names[start:start + INSPECT_BATCH]
+            argv = self._argv("volume", "inspect", "--format", "{{json .}}", *chunk)
+            try:
+                proc = self.run(argv, capture_output=True, text=True,
+                                timeout=self.timeout * 6)
+            except (OSError, subprocess.SubprocessError):
+                return None
+            if getattr(proc, "returncode", 1) != 0:
+                return None
+            import json
+            for line in (proc.stdout or "").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    return None
+                name = str(row.get("Name") or "") if isinstance(row, dict) else ""
+                stamp = parse_created(row.get("CreatedAt")) if isinstance(row, dict) else None
+                if not name or stamp is None:
+                    return None
+                out[name] = stamp
+        return out
+
+    def remove_volume(self, name: str) -> tuple[bool, str]:
+        """`volume rm <name>` (L73/#2003) : réservé aux volumes que l'appelant
+        a explicitement DÉCLARÉS jetables ; Docker refuse de son côté un volume
+        encore monté (la course avec un `docker run` qui le reprend est donc
+        fermée)."""
+        argv = self._argv("volume", "rm", name)
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        if getattr(proc, "returncode", 1) != 0:
+            return False, (getattr(proc, "stderr", "") or "refused").strip()[:300]
+        return True, ""
+
+
+def parse_created(value) -> float | None:
+    """`CreatedAt` d'un volume (RFC 3339, `Z` ou décalage), en secondes epoch ;
+    None si illisible. Python 3.9/3.10 ne lit pas le `Z` de `fromisoformat`."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+    return stamp.timestamp()
 
 
 def _engine(binary: str) -> str:

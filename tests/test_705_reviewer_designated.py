@@ -59,6 +59,31 @@ class ReviewerMilestonesTest(unittest.TestCase):
         jalons = progress._work_item_milestones(self._item(), [], [])
         self.assertIsNone(jalons["reviewer"])
 
+    def test_verdict_non_requis_dispense_la_revue(self):
+        """#1979 : la marque « verdict non requis » (colonne du relecteur) dit
+        qu'aucun re-verdict n'est dû — le lot est prêt à fusionner, pas « en
+        revue », et la marque ne sort pas comme un nom de relecteur."""
+        jalons = progress._work_item_milestones(
+            self._item(reviewer=work.REVIEWER_NONE), [], [])
+        self.assertFalse(jalons["verdict_required"])
+        self.assertEqual(jalons["reviewer"], work.REVIEWER_NONE)
+        self.assertEqual(progress.lot_state("qa", jalons), "approved")
+
+    def test_verdict_requis_par_defaut(self):
+        """#1979 : sans la marque, la revue reste due (désignée ou pas)."""
+        jalons = progress._work_item_milestones(self._item(reviewer="relecteur"), [], [])
+        self.assertTrue(jalons["verdict_required"])
+        self.assertEqual(progress.lot_state("qa", jalons), "review")
+
+    def test_verdict_non_requis_et_bloquant_perime(self):
+        """#1979 : un verdict bloquant périmé ne barre pas la dispense (même
+        règle que `stagnation.waiting`) ; un bloquant courant, si."""
+        jalons = {"verdict_kind": "blocked", "verdict_current": False,
+                  "verdict_required": False}
+        self.assertEqual(progress.lot_state("qa", jalons), "approved")
+        jalons["verdict_current"] = True
+        self.assertEqual(progress.lot_state("qa", jalons), "review")
+
 
 class ReviewerBriefsTest(unittest.TestCase):
     """#705 : routage de l'alerte `stale_lot` d'un lot en qa (textes et destinataires)."""
@@ -370,6 +395,172 @@ class ReviewerDesignationTest(PgTestCase):
                          "--actor", "chef", env=self._env())
         self.assertEqual(proc.returncode, 1)
         self.assertIn("not qa", proc.stderr)
+
+    # -- #1979 : retirer une désignation, ou la marquer « verdict non requis »
+
+    def test_retrait_de_la_designation(self):
+        """#1979 : `--remove` rend le lot à l'attente réelle d'un relecteur."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--remove",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("designation removed", proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "verdict")
+        self.assertEqual(rows[0]["waiting_for"]["label"],
+                         "verdict from a reviewer (none designated)")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("reviewer designation removed" in n for n in notes), notes)
+
+    def test_verdict_non_requis_dispense_la_revue_et_les_rappels(self):
+        """#1979 : `--no-verdict` (résolution mécanique, canon §11 bis/#87) :
+        l'attente passe à la fusion, la vue n'est plus « en revue », et
+        l'alerte ne réclame ni relecteur ni verdict."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        self.register("orchestrateur", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("orchestrateur",))
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot, "--reviewer", "relecteur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("verdict not required", proc.stdout)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], work.REVIEWER_NONE)
+
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "merge")
+        self.assertEqual(rows[0]["waiting_for"]["label"],
+                         "merge (executor not designated)")
+
+        proc = self.mesh("work", "show", str(lot["id"]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reviewer : — (verdict not required", proc.stdout)
+        self.assertIn("waiting  : merge (executor not designated)", proc.stdout)
+
+        jalons = progress._jalons_de_lot(
+            work.get(self.db, lot["id"]),
+            storage.of(self.db).progress.lot_transitions([lot["id"]]),
+            [], work.milestones(self.db, lot["id"]))
+        self.assertFalse(jalons["verdict_required"])
+        self.assertEqual(progress.lot_state("qa", jalons), "approved")
+
+        self._stale(lot["id"])
+        alert = self._stale_alert(lot["id"])
+        self.assertEqual(alert["waiting"]["what"], "merge")
+        briefs = self._briefs(alert)
+        self.assertIn("orchestrateur", briefs)
+        self.assertNotIn("relecteur", briefs)
+        for text in briefs.values():
+            self.assertNotIn("ameesh work reviewer", text)
+            self.assertNotIn("ameesh work milestone", text)
+        self.assertIn("merge packet/queue", briefs["orchestrateur"])
+
+    def test_verdict_non_requis_refuse_sur_verdict_bloquant_courant(self):
+        """#1979 : un verdict bloquant courant demande une correction, pas une
+        dispense — la marque dormirait et dispenserait la revue suivante."""
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.milestone(self.db, lot["id"], "verdict", verdict="blocked", actor="chef")
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("blocked verdict", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+
+    def test_verdict_non_requis_accepte_sur_verdict_bloquant_perime(self):
+        """#1979 : un verdict bloquant PÉRIMÉ (gel postérieur) ne barre pas la
+        dispense — c'est le cas de la résolution de composition mécanique."""
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.milestone(self.db, lot["id"], "verdict", verdict="blocked",
+                       sha="a" * 7, actor="chef")
+        work.milestone(self.db, lot["id"], "frozen", sha="b" * 7, actor="chef")
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], work.REVIEWER_NONE)
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "merge")
+
+    def test_la_dispense_vaut_pour_la_tete_de_sa_revue(self):
+        """#1979 (relecture ameesh-dev2) : un gel d'une autre tête, ou une
+        sortie de qa, lève la dispense — la revue suivante est due ; un gel
+        renouvelé sur le même commit la garde."""
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.milestone(self.db, lot["id"], "frozen", sha="a" * 40, actor="chef")
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.milestone(self.db, lot["id"], "frozen", sha="a" * 12, actor="chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], work.REVIEWER_NONE)
+
+        work.milestone(self.db, lot["id"], "frozen", sha="c" * 40, actor="chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["what"], "verdict")
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertTrue(any("verdict required again" in n for n in notes), notes)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        work.move(self.db, lot["id"], "build", actor="chef")
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "")
+
+    def test_une_designation_leve_la_dispense(self):
+        """#1979 : désigner un relecteur après la dispense rend la revue due."""
+        self.register("relecteur", "codex", cwd=self.tmp)
+        lot = self._lot(app="ameesh")
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "relecteur",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["reviewer"], "relecteur")
+        rows = work.list_items(self.db, limit=10)
+        plan.annotate(self.db, rows)
+        self.assertEqual(rows[0]["waiting_for"]["label"], "verdict by relecteur")
+
+    def test_les_marques_sont_des_gestes_de_pilote_et_exclusives(self):
+        """#1979 : même autorité que la désignation, et un seul geste à la fois."""
+        lot = self._lot()
+        proc = self._qa(lot)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
+                         "--actor", "auteur", env=self._env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("designation refused", proc.stderr)
+
+        proc = self.mesh("work", "reviewer", str(lot["id"]),
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("give AGENT", proc.stderr)
+        proc = self.mesh("work", "reviewer", str(lot["id"]), "chef", "--remove",
+                         "--actor", "chef", env=self._env())
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("mutually exclusive", proc.stderr)
 
     # -- #705 r2 (B1) : la règle « le relecteur n'est pas l'assigné » tient
     #    aussi APRÈS la désignation, dans l'écriture elle-même --------------

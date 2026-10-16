@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 
 from .. import interface
+from .packages import WorkPackages
 from .placement import PROFILE_PARAMS_SQL, profile_params, profile_sql
 from .registry import NAME_LOCK_CTE, name_lock_key
 
@@ -139,6 +140,10 @@ class Canon(interface.Canon):
         # L46 (0036) : `actions.canon` est immuable sauf pendant CE rebase ; le
         # réglage ne vaut que pour la transaction de l'appelant (SET LOCAL),
         # que `adopt_default` ouvre.
+        # #831 : la bascule écrit `work_packages.canon` ; sans le verrou de
+        # synchronisation, un sync du canon par défaut parti avant elle pouvait
+        # réécrire NULL après. Même verrou que `canon sync` (par schéma).
+        WorkPackages(self.db).lock_sync()
         self.db.execute("SET LOCAL ameesh.rebase_default = 'on'")
         moved_actions = self.db.query(
             "UPDATE actions SET canon = %s WHERE canon = '' RETURNING action_id", (previous,))

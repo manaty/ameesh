@@ -46,7 +46,7 @@ BEGIN
         END IF;
     END LOOP;
     FOR item IN SELECT c.oid,c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-                 WHERE n.nspname=current_schema() AND c.relkind IN ('r','p') LOOP
+                 WHERE n.nspname=current_schema() AND c.relkind IN ('r','p','v','m','f') LOOP
         FOREACH p IN ARRAY ARRAY['INSERT','UPDATE','DELETE','TRUNCATE','TRIGGER','REFERENCES','MAINTAIN'] LOOP
             IF item.relname='agent_registry' AND p='UPDATE' THEN
                 -- Table UPDATE would allow turn/lease and owner-key changes;

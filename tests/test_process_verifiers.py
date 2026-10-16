@@ -702,7 +702,11 @@ class VerificateursTest(unittest.TestCase):
                         full_snapshot()))
         # N6 : un remplacant qui n'est pas un identifiant de lot ne prouve rien
         # (`_as_int` rend -1, distinct de l'id du lot : il passait).
-        for replaced_by in ("abc", "#1924", 0, -3, "-3"):
+        # Post-fusion #1937 : les formes qui passaient le pre-filtre
+        # `lstrip("-").isdigit()` sans etre des entiers (`--3`, `²`) levaient
+        # une ValueError au lieu du refus nomme ; elles rendent -1 comme les
+        # autres, jamais une exception.
+        for replaced_by in ("abc", "#1924", 0, -3, "-3", "--3", "²"):
             with self.subTest(superseded_by=replaced_by):
                 self.assertRefusal(
                     "evidence-invalid",

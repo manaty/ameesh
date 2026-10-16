@@ -44,6 +44,10 @@ class BriefsTest(unittest.TestCase):
         self.assertIn("ameesh work close 42 --delivered --sha <reviewed head>", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
         self.assertIn("ameesh work dependencies 42 --add <blocker>", text)
+        # #2016 : la réassignation proposée porte le titulaire lu (instantané) ;
+        # un second agent parti du même brief sera refusé si le lot a changé de
+        # main entre-temps.
+        self.assertIn("ameesh work assign 42 <agent> --if-holder dev1", text)
 
     def test_stale_lot_offre_le_hold_de_dependance(self):
         """#1642 : le brief doit offrir la dépendance déclarée (planned_wait),
@@ -216,6 +220,30 @@ class NotifierBriefsTest(PgTestCase):
         self.assertEqual(notifier.state["briefs"], {})
         notifier.run_pass(self.db, current=[alert])                # levée de nouveau
         self.assertEqual(len(self.mails("orch")), 3)
+
+    def test_relance_aux_memes_destinataires_que_la_levee(self):
+        """#1787 N1 : la relance garde les destinataires de la levée, même si
+        l'état vivant en désignerait un autre entre-temps."""
+        registry.upsert(self.db, "orch-b", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET team = 'b' WHERE name = 'orch-b'")
+        clock = [self.now]
+        notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+                                   sender=object(), log=lambda t: None,
+                                   clock=lambda: clock[0])
+        # lot sans assigné, sans relecteur : le brief part aux orchestrateurs du
+        # projet du lot (#705) ; « orch-b » est encore d'un autre projet.
+        alert = dict(STALE, agent=None, waiting={"what": "verdict"}, project="a")
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(len(self.mails("orch-b")), 0)
+        # l'état vivant change : « orch-b » rejoint le projet du lot
+        self.db.execute("UPDATE agent_registry SET team = 'a' WHERE name = 'orch-b'")
+        clock[0] += 6 * HEURE
+        notifier.run_pass(self.db, current=[alert])
+        rows = self.mails("orch")
+        self.assertEqual(len(rows), 2, rows)
+        self.assertTrue(rows[1]["body"].startswith("Reminder"))
+        self.assertEqual(len(self.mails("orch-b")), 0)   # jamais briefé : pas de relance
 
 
 if __name__ == "__main__":

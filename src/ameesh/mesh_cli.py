@@ -59,6 +59,7 @@ from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
+from . import rebalance as rebalance_mod
 from . import fil, release, signing, storage, work
 from .config import Config
 from .db import Db
@@ -1258,9 +1259,12 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
 
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
-              freeze: bool = False, repo: str | None = None,
+              cfg=None, freeze: bool = False, repo: str | None = None,
               target: str | None = None) -> list:
     """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
+
+    `cfg` : le contexte de classe de revue (#1822), pour que la ligne d'un lot
+    léger attende la fusion, pas un verdict.
 
     `freeze` ajoute à chaque ligne le gel effectif dérivé (#1756), en un seul
     balayage de jalons : le composeur du paquet horaire lit ce champ au lieu
@@ -1274,7 +1278,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 
     def lire(db):
         rows = work.list_items(db, state=state, assignee=assignee, limit=limit)
-        plan.annotate(db, rows, threshold=threshold)
+        plan.annotate(db, rows, threshold=threshold, cfg=cfg)
         # Les délais viennent d'un seul balayage, restreint aux lots
         # affichés (jamais une requête par ligne) ; le JSON les porte
         # aussi, pour la frise (L24). Le filtre porte sur les lignes
@@ -1302,7 +1306,7 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
 def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                 target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
-    from . import canon as canon_mod, plan
+    from . import canon as canon_mod, plan, stagnation
 
     def lire(db):
         item = work.get(db, lot_id)
@@ -1317,7 +1321,17 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
-        plan.annotate(db, [item])
+        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
+        # doute rend `sensitive` et le dit) — résolue avant l'annotation pour
+        # que #1822 la lise sans la relire.
+        from . import lot_class
+        try:
+            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
+                                    "why": "unreadable (%s)" % exc, "files": []}
+        plan.annotate(db, [item], cfg=cfg,
+                      review_class={lot_id: stagnation.class_value(item["review_class"])})
         # L96 : dates prévues (feuille de route)
         planned = (storage.of(db).roadmap.item_plans([lot_id]) or [{}])[0]
         item["planned"] = {k: planned.get("planned_" + k)
@@ -1343,14 +1357,6 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
                                   if int(r["work_item_id"]) == lot_id), None)
         except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
             item["queue"] = None
-        # L539 : la classe de revue du lot (lecture seule ; ne lève jamais, un
-        # doute rend `sensitive` et le dit)
-        from . import lot_class
-        try:
-            item["review_class"] = lot_class.of_lot(db, lot_id, cfg=cfg, item=item)
-        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
-            item["review_class"] = {"lot": lot_id, "class": lot_class.DOUBT,
-                                    "why": "unreadable (%s)" % exc, "files": []}
         # L157c: actual time by phase and merged diff size, once delivered
         from . import lot_measures
         item["measure"] = lot_measures.view(storage.of(db).work.measure(lot_id))
@@ -1456,11 +1462,20 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
                               branch_target=args.target, force=args.force,
-                              claim=args.claim)
+                              claim=args.claim, if_holder=args.if_holder)
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
+                if args.claim:
+                    # #1787 N2 : un claim qui retombe dans la file d'équipe
+                    # (#540) n'a pas pris : refus lisible, code 1.
+                    print("claim refused: %s" % out["queue_warning"], file=sys.stderr)
+                    return 1
                 print("warning: %s" % out["queue_warning"], file=sys.stderr)
+            elif out.get("noop"):
+                # #1787 N3 : le porteur qui re-claim son propre lot : no-op.
+                print("lot #%d already assigned to %s: claim is a no-op, nothing changed"
+                      % (out["item"]["id"], out["item"]["assignee"]))
             elif out["previous"] == out["item"]["assignee"]:
                 print("lot #%d: branch %s (assigned to %s)" % (
                     out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
@@ -1509,7 +1524,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
                              threshold=stagnation.stale_after(args.stale_after),
-                             freeze=getattr(args, "freeze", False),
+                             cfg=cfg, freeze=getattr(args, "freeze", False),
                              repo=getattr(args, "git_dir", None),
                              target=getattr(args, "freeze_target", None))
             if args.json:
@@ -1558,7 +1573,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
-            if item.get("reviewer"):
+            if item.get("reviewer") == work.REVIEWER_NONE:
+                print("reviewer : — (verdict not required, #1979)")
+            elif item.get("reviewer"):
                 print("reviewer : %s (designated for the review, #705)" % item["reviewer"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
@@ -1678,10 +1695,31 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # #705 : désigner (ou changer) le relecteur d'un lot DÉJÀ en qa,
             # sans aller-retour build/qa ; c'est la commande que l'alerte
             # `stale_lot` recommande à l'orchestrateur du projet.
-            item = work.designate_reviewer(cfg, db, args.id, args.agent, actor=args.actor)
-            print("lot #%d: reviewer %s (state %s, designated by %s)" % (
-                item["id"], item["reviewer"], item["state"],
-                args.actor or "the bound identity"))
+            # #1979 : `--remove` retire la désignation, `--no-verdict` marque
+            # « verdict non requis » (résolution de composition mécanique,
+            # canon §11 bis/#87) : l'attente passe à la fusion, sans rappel.
+            if args.agent and (args.remove or args.no_verdict):
+                print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
+                      "mutually exclusive", file=sys.stderr)
+                return 2
+            if not args.agent and not (args.remove or args.no_verdict):
+                print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
+                      file=sys.stderr)
+                return 2
+            if args.remove:
+                item = work.clear_reviewer(cfg, db, args.id, actor=args.actor)
+                print("lot #%d: reviewer designation removed (state %s, by %s)" % (
+                    item["id"], item["state"], args.actor or "the bound identity"))
+            elif args.no_verdict:
+                item = work.waive_review(cfg, db, args.id, actor=args.actor)
+                print("lot #%d: verdict not required (state %s, by %s)" % (
+                    item["id"], item["state"], args.actor or "the bound identity"))
+            else:
+                item = work.designate_reviewer(cfg, db, args.id, args.agent,
+                                               actor=args.actor)
+                print("lot #%d: reviewer %s (state %s, designated by %s)" % (
+                    item["id"], item["reviewer"], item["state"],
+                    args.actor or "the bound identity"))
             return 0
         if args.work_command == "merged":
             done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
@@ -2586,8 +2624,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="#705: designate (or change) the reviewer of a lot already in qa, "
              "without a build/qa round trip")
     pw_reviewer.add_argument("id", type=int)
-    pw_reviewer.add_argument("agent", metavar="AGENT",
+    pw_reviewer.add_argument("agent", nargs="?", metavar="AGENT",
                              help="a registry agent, or human:<id>; never the lot's assignee")
+    pw_reviewer.add_argument("--remove", action="store_true",
+                             help="#1979: remove the designation (the review goes back to "
+                                  "« verdict from a reviewer (none designated) »)")
+    pw_reviewer.add_argument("--no-verdict", dest="no_verdict", action="store_true",
+                             help="#1979: mark « verdict not required » (mechanical composition "
+                                  "resolution, canon §11 bis/#87): the lot waits for its merge "
+                                  "and no reminder goes to a reviewer")
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
@@ -2618,6 +2663,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign.add_argument("--claim", action="store_true",
                            help="assign only if the work item has no assignee (atomic "
                                 "claim); refused, naming its holder, if it is already taken")
+    pw_assign.add_argument("--if-holder", default=None, metavar="AGENT",
+                           help="#2016: refuse unless the current assignee is still AGENT "
+                                "(the holder read when the alert was written)")
     pw_assign.add_argument("--branch", default=None,
                            help="work item branch (L118); allowed on a work item already assigned "
                                 "to this agent")
@@ -3041,6 +3089,9 @@ def cmd_accounts(cfg: Config, args) -> int:
         for row in rows:
             for cle in ("_gauges", "_limits", "_ceilings"):
                 row.pop(cle, None)
+        # #1580 point 2 : la marge des forfaits et les agents déplaçables
+        # (lecture seule : aucune bascule n'est faite ici)
+        prop = rebalance_mod.proposal(cfg, db, book)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):
@@ -3050,10 +3101,11 @@ def cmd_accounts(cfg: Config, args) -> int:
                 sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
                               "accounts": rows, "switches": bascules,
-                              "credentials": sante},
+                              "credentials": sante, "proposal": prop.as_dict()},
                              ensure_ascii=False, indent=2, default=str))
             return 0
         print(accounts_mod.format_rows(rows))
+        print(prop.text())
         if bascules:
             print()
             print("latest switches:")
