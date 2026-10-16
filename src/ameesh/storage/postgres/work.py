@@ -415,6 +415,131 @@ class WorkItems(interface.WorkItems):
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
 
+    def items_missing_ref(self, *, states, ref_prefix, limit,
+                          attempt_prefix="", retry_s=0, terminal_prefix="",
+                          max_attempts=0, since=None) -> list[dict]:
+        """L539 (#1104) : les lots dont `ref_prefix + id` n'existe pas encore.
+
+        L'anti-jointure est faite **avant** la borne : `limit` borne les
+        manquants rendus, pas un balayage de lots déjà pourvus (R2 #1104
+        P2-2 : vingt pourvus plus récents ne cachent plus un manquant ancien).
+        Les états forment un seul ensemble ordonné ; `id` départage deux
+        `updated_at` égaux, sans quoi la sélection ne serait pas stable.
+
+        `attempt_prefix`/`retry_s` (binôme mesh-design, 14/10) : une tentative
+        de rattrapage sans création journalise `attempt_prefix<id>` (voir
+        `log_review_attempt`) ; un lot dont la tentative est plus récente que
+        `retry_s` est exclu **avant** la borne, sinon les mêmes candidats
+        confirmés (non-light, doutes, erreurs) consommeraient chaque passage et
+        affameraient les plus anciens. Le délai passé, la tentative redevient
+        sélectionnable : le marqueur est un délai, pas une suppression.
+
+        `since` (arbitrage pilote du 15/10) : ne rend que les lots dont le
+        jalon `merged` est à `since` ou après — la borne d'activation, jamais
+        l'historique. `terminal_prefix`/`max_attempts` : une marque terminale
+        exclut toujours, et un candidat qui a déjà `max_attempts` tentatives
+        n'est plus sélectionné (traitement borné, jamais perpétuel).
+
+        Le filtre lui-même (`_missing_ref_gates`) est partagé avec
+        `missing_ref_eligible`, pour qu'un lot donné reçoive la même vérité que
+        le balayage (B1 de la R1 #1104)."""
+        wanted = [str(s) for s in (states or ())]
+        if not wanted:
+            return []
+        params: list = list(wanted)
+        sql = (
+            "SELECT __COLUMNS__ FROM work_items w"
+            " WHERE w.state IN (__STATES__)"
+            + self._missing_ref_gates(
+                params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
+                retry_s=retry_s, terminal_prefix=terminal_prefix,
+                max_attempts=max_attempts, since=since)
+            + " ORDER BY w.updated_at DESC, w.id DESC LIMIT %s"
+        )
+        params.append(int(limit))
+        return self.db.query(
+            sql.replace("__COLUMNS__", item_columns(self.db)).replace(
+                "__STATES__", ", ".join(["%s"] * len(wanted))),
+            tuple(params))
+
+    @staticmethod
+    def _missing_ref_gates(params: list, *, ref_prefix, attempt_prefix="",
+                           retry_s=0, terminal_prefix="", max_attempts=0,
+                           since=None) -> str:
+        """L539 (#1104) : les conditions « relecture encore due » d'un lot.
+
+        Rendues en SQL pour être ajoutées après `WHERE …, ` et complète
+        `params` dans l'ordre du texte produit — le même filtre sert au
+        balayage borné (`items_missing_ref`) et à un lot donné
+        (`missing_ref_eligible`)."""
+        sql = (
+            "   AND NOT EXISTS (SELECT 1 FROM work_items r"
+            "                    WHERE r.issue_ref = %s || w.id::text)"
+        )
+        params.append(str(ref_prefix))
+        if since is not None:
+            sql += (
+                "   AND EXISTS (SELECT 1 FROM work_item_milestones m"
+                "                WHERE m.work_item_id = w.id AND m.kind = 'merged'"
+                "                  AND m.at >= %s)"
+            )
+            params.append(since)
+        if terminal_prefix:
+            sql += (
+                "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                "                    WHERE e.work_item_id = w.id"
+                "                      AND split_part(e.note, ' ', 1) = %s || w.id::text)"
+            )
+            params.append(str(terminal_prefix))
+        if attempt_prefix:
+            if int(max_attempts) > 0:
+                sql += (
+                    "   AND (SELECT count(*) FROM work_item_events e"
+                    "         WHERE e.work_item_id = w.id"
+                    "           AND split_part(e.note, ' ', 1) = %s || w.id::text) < %s"
+                )
+                params += [str(attempt_prefix), int(max_attempts)]
+            if float(retry_s) > 0:
+                sql += (
+                    "   AND NOT EXISTS (SELECT 1 FROM work_item_events e"
+                    "                    WHERE e.work_item_id = w.id"
+                    "                      AND split_part(e.note, ' ', 1) = %s || w.id::text"
+                    "                      AND e.created_at > now() - make_interval(secs => %s))"
+                )
+                params += [str(attempt_prefix), float(retry_s)]
+        return sql
+
+    def missing_ref_eligible(self, item_id, *, ref_prefix, attempt_prefix="",
+                             retry_s=0, terminal_prefix="", max_attempts=0,
+                             since=None) -> bool:
+        """L539 (#1104, B1 de la R1) : le lot `item_id` passerait-il la
+        sélection de `items_missing_ref` ?
+
+        Même filtre, une seule ligne : le chemin `already` de `close_merged`
+        ne relance l'ouverture que pour un lot que le rattrapage borné
+        sélectionnerait encore — jamais pour l'historique d'avant l'activation
+        (migration 0438) ni pour un lot terminal, que `sync-github` rappelle
+        pourtant à chaque passage."""
+        params: list = []
+        sql = ("SELECT 1 FROM work_items w WHERE w.id = %s"
+               + self._missing_ref_gates(
+                   params, ref_prefix=ref_prefix, attempt_prefix=attempt_prefix,
+                   retry_s=retry_s, terminal_prefix=terminal_prefix,
+                   max_attempts=max_attempts, since=since)
+               + " LIMIT 1")
+        return bool(self.db.query(sql, (int(item_id),) + tuple(params)))
+
+    def review_catch_up_bound(self):
+        """L539 (#1104) : la borne d'activation (ligne unique de la migration
+        0438), ou None si elle manque — le rattrapage reste alors fermé. Rend
+        une chaîne ISO-8601, identique pour les deux pilotes (`psql` rend le
+        texte, `psycopg` un `datetime`), utilisable telle quelle en paramètre."""
+        rows = self.db.query("SELECT bound_at FROM review_catch_up WHERE id")
+        if not rows:
+            return None
+        value = rows[0]["bound_at"]
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
     def move(self, item_id, state, *, current, loops, note, actor,
              held=False) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
@@ -1033,6 +1158,14 @@ class WorkItems(interface.WorkItems):
         self._event(int(item_id), state, text, actor)
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
+
+    def log_review_attempt(self, item_id, state, text, actor) -> None:
+        """L539 (#1104) : journalise une tentative de rattrapage sans création.
+
+        N'écrit que le journal (`work_item_events`) : `updated_at` n'est pas
+        touché — une tentative de fond ne doit ni réordonner la sélection ni
+        faire passer le lot pour actif."""
+        self._event(int(item_id), str(state or ""), str(text or ""), actor)
 
     def lock_deep_analysis(self, item_id) -> None:
         self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
