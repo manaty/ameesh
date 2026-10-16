@@ -243,14 +243,19 @@ def finite_float(value) -> float | None:
 
 
 def parse_count(value) -> int | None:
-    """#2022: a count (`max_zombies`): a positive integer, None otherwise."""
+    """#2022: a count (`max_zombies`): a positive integer, None otherwise.
+    ASCII digits only (`"²".isdigit()` is true, `int("²")` raises), and, like
+    every number of a host policy, one that fits a float (codex #212 r4)."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip()) or None
-    return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not (text.isascii() and text.isdigit()):
+            return None
+        value = int(text)
+    if not isinstance(value, int) or value <= 0:
+        return None
+    return value if finite_float(value) is not None else None
 
 
 def parse_percent(value) -> float | None:

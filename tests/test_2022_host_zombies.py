@@ -66,9 +66,13 @@ class ThresholdTest(unittest.TestCase):
         self.assertEqual(resources.thresholds(None)["max_zombies"], 200)
         self.assertEqual(resources.thresholds({"resources": {"max_zombies": 50}})
                          ["max_zombies"], 50)
-        for bad in (0, -3, "many", True, 2.5):
+        # "²" is a str.isdigit() digit int() refuses; 10**400 fits no float
+        # (codex #212 r4, test_l159a_capacity_guard)
+        for bad in (0, -3, "many", True, 2.5, "\u00b2", "\u0663", 10 ** 400, "1" + "0" * 400):
             self.assertEqual(resources.thresholds({"resources": {"max_zombies": bad}})
                              ["max_zombies"], 200, bad)
+        self.assertEqual(resources.thresholds({"resources": {"max_zombies": " 75 "}})
+                         ["max_zombies"], 75)
         self.assertEqual(resources.fmt_value("max_zombies", 200), "200")
 
     def test_never_a_pause(self):
