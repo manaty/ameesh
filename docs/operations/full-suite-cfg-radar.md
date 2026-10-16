@@ -309,7 +309,9 @@ Aucun geste sur les VM (§3.2).
    from ameesh.config import load
    from ameesh import radar
    p = radar.settings_of(load()).projects["ameesh"]
-   print(radar.full_suite_ci(p, "3754ffffbc6f"))   # sha du run vert 38350245246
+   print(radar.full_suite_ci(p, "3754ffffbc6f487ee54f6cfebc2249341348e279"))
+   # sha COMPLET du run vert 38350245246 : un sha abrégé rend 0 run -> `missing`
+   # (`gh run list --commit` n'accepte pas les préfixes) — voir §7.
    PY
    ```
 
@@ -341,6 +343,13 @@ dépôt, aucun geste GitHub.
   (fail-closed), jamais en silence : garder §2 en phase avec
   `.github/workflows/tests.yml` et les suites Nexlink.
 * `repo` doit être fetché avant le contrôle ; le radar, lui, ne fetche jamais.
+* `gh run list --commit` exige le sha **complet** (40 caractères) : un sha
+  abrégé rend 0 exécution, donc `green: False` avec la suite en `missing` —
+  jamais une erreur. Relevé de première main du 16/10 (interpréteur de
+  l'exécuteur, bloc §3 ameesh) : `3754ffffbc6f` →
+  `{'runs': 0, …, 'missing': ['.github/workflows/tests.yml']}` ;
+  `3754ffffbc6f487ee54f6cfebc2249341348e279` → `{'runs': 1, 'suites': 1,
+  'green': True, …}`.
 * Sur une VM, le clone dédié et le courrier du radar sont les deux seuls
   effets — aucun test n'y est lancé par la porte (elle lit l'API).
 
@@ -382,5 +391,15 @@ dépôt, aucun geste GitHub.
   périmètre (pc seul, §3.2 hors périmètre, chemins/acteurs, prérequis pc
   ouvert) ; branche rebasée sur `main` `b63e0bae` ; **aucune CI** (docs seuls),
   aucun geste de production.
+* **Contrôle à blanc §5.5 exécuté (2026-10-16, `ameesh-agents-1`, qa-01)** :
+  bloc §3 ameesh (mêmes `jobs`/`tolerate`) fusionné dans une **copie
+  temporaire** de configuration (la configuration réelle de l'hôte n'est pas
+  touchée), interpréteur de l'exécuteur (1.11.2, `'full_suite' in
+  radar.PROJECT_KEYS` → `True`). §5.3 rend `ameesh 1 / nexlink 5`. §5.5 rend
+  `{'runs': 1, 'suites': 1, 'green': True, 'pending': [], 'failed': [],
+  'missing': []}` avec le sha **complet** du run `38350245246`
+  (`3754ffffbc6f487ee54f6cfebc2249341348e279`), et
+  `{'runs': 0, …, 'missing': ['.github/workflows/tests.yml']}` avec le sha
+  abrégé `3754ffffbc6f` — d'où le piège §7 et le sha complet dans §5.5.
 * **Aucune écriture** : pas de configuration modifiée, pas de run CI créé,
   pas de PR ouverte.
