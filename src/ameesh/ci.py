@@ -23,7 +23,9 @@ chaque passage un relevé (`Watcher.tick`) :
    exécution courte peut naître et finir entre deux passages sans jamais être
    vue « en cours » : un rattrapage borné des exécutions récemment terminées
    les découvre, rend leur verdict et réveille l'agent — une seule fois, et
-   jamais pour une tête déjà remplacée (#1110) ;
+   jamais pour une tête déjà remplacée (#1110) ; une ligne restée sans lot
+   (branche du lot posée après sa première vue, #1321) est rattrapée par ce
+   même relevé, verdict compris, tant qu'elle est encore récente (#2021) ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
    (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
@@ -722,8 +724,11 @@ class Watcher:
         """Les exécutions terminées entre deux passages (#1110) : une exécution
         courte n'est jamais vue « en cours », donc jamais conclue sans ce
         rattrapage. Borné aux exécutions récentes ; une ligne déjà connue est
-        laissée au relevé normal (pas de doublon) ; une tête déjà remplacée sur
-        la même branche est ignorée (pas de verdict périmé)."""
+        laissée au relevé normal (pas de doublon), sauf si elle est restée sans
+        lot : le rattachement tardif (#1321) est retenté ici, car une ligne
+        terminale n'est plus revue vivante et son verdict se perdrait (#2021).
+        Une tête déjà remplacée sur la même branche est ignorée (pas de verdict
+        périmé)."""
         st = storage.of(db)
         data = self.api("repos/%s/actions/runs?status=completed&per_page=50" % repo) or {}
         runs = list(data.get("workflow_runs") or ())
@@ -737,13 +742,15 @@ class Watcher:
             if workflow_of(run.get("path")) not in followed:
                 continue
             run_id = int(run["id"])
-            if st.ci.run(repo, run_id) is not None:
-                continue
             updated = updated_ts(run)
             if updated is None or not 0 <= now - updated <= CATCHUP_WINDOW:
                 continue
             head = run.get("head_sha") or ""
             branch = run.get("head_branch") or ""
+            known = st.ci.run(repo, run_id)
+            if known is not None:
+                out += self._late_link(db, repo, run, known, lots, settled)
+                continue
             if st.ci.head_replaced(repo, branch, head, run_id):
                 continue
             out += self._follow(db, repo, run, lots)
@@ -756,6 +763,55 @@ class Watcher:
                        and int(r["run_id"]) not in settled]
             out += self._conclude(db, repo, row, run=run, pending=pending)
         return out
+
+    def _late_link(self, db, repo: str, run: dict, row: dict, lots: list[dict],
+                   settled: set) -> list[dict]:
+        """#2021 : rattache une ligne restée sans lot et, si elle est déjà
+        terminale, délivre son verdict une seule fois.
+
+        Les runs d'un paquet (`integration/**`) sont vus avant que la
+        composition ne déclare sa branche : ceux qui se concluent entre-temps
+        ne sont plus revus vivants par `_follow` (#1321), et leur verdict
+        partait à personne. Le rattrapage les ramène ici, sous les mêmes
+        gardes qu'un rattachement vivant : une tête plus récente déjà vue sur
+        la branche (`head_replaced`, `branch_head` du lot) laisse la ligne sans
+        lot, car son verdict porterait sur une tête remplacée."""
+        st = storage.of(db)
+        run_id = int(run["id"])
+        status = row.get("status") or "running"
+        if status not in ("running", "success", "failure"):
+            return []
+        if row.get("work_item_id") is not None or row.get("verdict_message_id"):
+            return []
+        head = run.get("head_sha") or ""
+        branch = run.get("head_branch") or ""
+        if not branch or branch in BASE_BRANCHES:
+            return []
+        if (run.get("status") or "") != "completed":
+            return []
+        if st.ci.head_replaced(repo, branch, head, run_id):
+            return []
+        lot_id = lot_of_run(run, lots)
+        lot = next((l for l in lots if lot_id is not None and int(l["id"]) == int(lot_id)), None)
+        if lot is None or not recipient_of(lot):
+            return []
+        known_head = lot.get("branch_head") or ""
+        if known_head and head != known_head:
+            return []
+        st.ci.open_run(repo, run_id, head_sha=head, branch=branch,
+                       event=run.get("event") or "", base=base_of(run),
+                       work_item_id=int(lot["id"]), url=run.get("html_url"),
+                       workflow=workflow_of(run.get("path")),
+                       created_at=run.get("created_at"))
+        self.log("CI %s run %s: lot #%s linked late (branch set after the run)"
+                 % (repo, run_id, lot["id"]))
+        row = st.ci.run(repo, run_id) or row
+        if status == "running" or row.get("verdict_message_id"):
+            return []  # le relevé normal la conclura et enverra le verdict
+        pending = [r for r in st.ci.running(repo) if r.get("head_sha") == head
+                   and r.get("branch") == branch
+                   and int(r["run_id"]) not in settled]
+        return self._verdict(db, repo, row, run, status, pending=pending)
 
     # -- #845 : la garde de la CI ---------------------------------------------
     def _guard(self, db, repo: str) -> None:
@@ -1064,7 +1120,6 @@ class Watcher:
         """Une exécution qui n'est plus en cours : son verdict. `run` : son
         dernier état GitHub, déjà relevé ; `pending` : les autres workflows de
         la même tête encore en cours, que le verdict nomme."""
-        from . import work
         st = storage.of(db)
         if run is None:
             run = self.api("repos/%s/actions/runs/%s" % (repo, row["run_id"])) or {}
@@ -1076,6 +1131,14 @@ class Watcher:
         if status == "cancelled":
             return [{"action": "verdict", "repo": repo, "run_id": row["run_id"],
                      "status": status, "to": None}]
+        return self._verdict(db, repo, row, run, status, pending=pending)
+
+    def _verdict(self, db, repo: str, row: dict, run: dict, status: str, *,
+                 pending: list[dict] | None = None) -> list[dict]:
+        """Le verdict d'une exécution conclue, à l'assigné du lot rattaché
+        (#2021 : délivré aussi pour une ligne terminale rattachée tardivement)."""
+        from . import work
+        st = storage.of(db)
         failures = st.ci.failures(repo, int(row["run_id"]))
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)

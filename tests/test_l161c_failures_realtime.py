@@ -422,6 +422,64 @@ class WatcherTest(PgTestCase):
         self.assertEqual(self.watcher.tick(self.db), [])
         self.assertEqual(st.ci.run(DEPOT, 220)["work_item_id"], lot["id"])
 
+    def test_run_conclu_sans_lot_recoit_son_verdict_a_la_pose(self):
+        """#2021 : une ligne terminale restée sans lot (branche posée après la
+        conclusion) est rattachée au rattrapage et son verdict part une seule
+        fois à l'assigné — le cas des runs de paquet vus avant la pose."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        registry.upsert(self.db, "dev-d", harness="claude", host=self.cfg.host)
+        sha = "d1" * 20
+        self.api.live = [run_view(230, sha, "agent/dev-d-230")]
+        watcher.tick(self.db)
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 230)["work_item_id"])
+        # l'exécution se conclut avant qu'aucun lot ne porte la branche : la
+        # ligne reste terminale, sans lot et sans verdict
+        self.api.live = []
+        self.api.done[230] = completed(".github/workflows/tests.yml", "success")
+        self.api.terminated = [self.terminated(230, sha, "agent/dev-d-230",
+                                               conclusion="success")]
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("verdict", None)])
+        self.assertEqual(self.mails("dev-d"), [])
+        # la branche du lot est posée : le rattrapage rattache la ligne
+        # terminale et délivre son verdict, une seule fois
+        lot = work.add(self.db, title="L4 : branche posée après la conclusion",
+                       branch="agent/dev-d-230", assignee="dev-d")
+        out = watcher.tick(self.db)
+        self.assertEqual([(o["action"], o["to"]) for o in out], [("verdict", "dev-d")])
+        row = storage.of(self.db).ci.run(DEPOT, 230)
+        self.assertEqual(row["work_item_id"], lot["id"])
+        self.assertIsNotNone(row["verdict_message_id"])
+        self.assertIn(": green.", self.mails("dev-d")[-1]["body"])
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(len(self.mails("dev-d")), 1)
+
+    def test_ligne_terminale_sans_lot_non_rattachee_si_tete_remplacee(self):
+        """#2021 : une tête plus récente vue sur la branche laisse la ligne
+        terminale sans lot — son verdict serait périmé (même garde que #1321)."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        registry.upsert(self.db, "dev-e", harness="claude", host=self.cfg.host)
+        vieille, neuve = "e1" * 20, "e2" * 20
+        self.api.live = [run_view(240, vieille, "agent/dev-e-240")]
+        watcher.tick(self.db)
+        self.api.live = []
+        self.api.done[240] = completed(".github/workflows/tests.yml", "success")
+        self.api.terminated = [self.terminated(240, vieille, "agent/dev-e-240",
+                                               conclusion="success")]
+        self.assertEqual([o["action"] for o in watcher.tick(self.db)], ["verdict"])
+        # une tête plus récente de la même branche a été vue
+        self.api.live = [run_view(241, neuve, "agent/dev-e-240")]
+        self.api.terminated = []
+        watcher.tick(self.db)
+        self.api.live = []
+        work.add(self.db, title="L5 : tête remplacée", branch="agent/dev-e-240",
+                 assignee="dev-e")
+        self.api.terminated = [self.terminated(240, vieille, "agent/dev-e-240",
+                                               conclusion="success")]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 240)["work_item_id"])
+        self.assertEqual(self.mails("dev-e"), [])
+
     def test_urgent_puis_ordinaire_puis_verdict(self):
         sha = "c" * 40
         self.api.live = [run_view(201, sha, "lot/1-un")]
