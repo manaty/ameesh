@@ -962,7 +962,7 @@ class WorkItems(interface.WorkItems):
             "migration %s released (%s, #956)" % (number, why), actor)
 
     def reserve_migration(self, item_id, repo, number, floor, *, note, actor,
-                          release=False) -> dict | None:
+                          issue_ref, release=False) -> dict | None:
         """Réserve (ou libère, `release`) le numéro de migration d'un lot
         ouvert dans le dépôt `repo`, avec une ligne de journal. Sans
         `number` : le prochain libre de ce dépôt, au moins `floor`, calculé
@@ -973,7 +973,11 @@ class WorkItems(interface.WorkItems):
         DbError de l'index (#478). Seule la violation d'unicité de cet index
         réessaie : une autre erreur qui le nomme remonte telle quelle
         (codex #478 r1). Un `number` explicite déjà pris lève la DbError de
-        l'index, sans réessai."""
+        l'index, sans réessai. #1830 : `issue_ref` (lue par l'appelant) est une
+        condition du CAS, NULL et chaîne vide confondus — une correction
+        concurrente de la référence pendant le scan du dépôt ne peut plus
+        laisser `issue_ref` d'un dépôt avec `migration_repo` d'un autre ;
+        `release` l'ignore."""
         if release:
             value, params = "NULL", ()
         elif number is None:
@@ -986,6 +990,8 @@ class WorkItems(interface.WorkItems):
         # `release` libère aussi un lot déjà terminal (#956) ; les autres
         # chemins ne visent qu'un lot ouvert.
         guard = "" if release else " AND state NOT IN ('merged', 'promoted', 'closed')"
+        issue_guard = "" if release else " AND coalesce(issue_ref, '') = coalesce(%%s, '')"
+        issue_params = () if release else (issue_ref,)
         deadline = time.monotonic() + _RESERVE_BUDGET_S
         wait = _RESERVE_WAIT_BASE_S
         while True:
@@ -1017,10 +1023,11 @@ class WorkItems(interface.WorkItems):
                                     old["migration"], old["id"], old["state"]), actor)
                     sql = ("UPDATE work_items SET migration = %s, migration_repo = %%s,"
                            "       updated_at = now()"
-                           " WHERE id = %%s" + guard +
+                           " WHERE id = %%s" + guard + issue_guard +
                            " RETURNING %s") % (value, item_columns(self.db))
                     rows = tx.query(sql,
-                                    params + (None if release else repo, int(item_id)))
+                                    params + (None if release else repo, int(item_id))
+                                    + issue_params)
                     if not rows:
                         return None
                     WorkItems(tx)._event(int(item_id), rows[0]["state"],
