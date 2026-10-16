@@ -360,20 +360,30 @@ def _never_runs(test: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _is_exit_func(node: ast.expr, exit_names: set[str],
+                  sys_names: set[str], os_names: set[str]) -> bool:
+    """Whether an expression designates a known import-time termination: a
+    bound name, or `sys.exit`/`os._exit` (aliases of `sys`, `os` and of the
+    imported names included)."""
+    if isinstance(node, ast.NamedExpr):
+        # `(e := sys.exit)(1)` calls the assigned value immediately (#1860).
+        return _is_exit_func(node.value, exit_names, sys_names, os_names)
+    if isinstance(node, ast.Name):
+        return node.id in exit_names
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.attr == "exit":
+            return node.value.id in sys_names
+        if node.attr == "_exit":
+            return node.value.id in os_names
+    return False
+
+
 def _is_exit_call(node: ast.Call, exit_names: set[str],
                   sys_names: set[str], os_names: set[str]) -> bool:
     """Whether a call is a known import-time termination: the builtins
     `exit()`/`quit()`, `sys.exit()`/`os._exit()` (aliases of `sys`, `os` and of
     the imported names included)."""
-    func = node.func
-    if isinstance(func, ast.Name):
-        return func.id in exit_names
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        if func.attr == "exit":
-            return func.value.id in sys_names
-        if func.attr == "_exit":
-            return func.value.id in os_names
-    return False
+    return _is_exit_func(node.func, exit_names, sys_names, os_names)
 
 
 def _may_terminate(node: ast.AST, names: set[str], exit_names: set[str],
@@ -418,7 +428,9 @@ class _RuntimeImports(ast.NodeVisitor):
     (relecture Codex, B2 résiduel). A reachable termination — a guarded
     `raise`, an `except` that exits, `exit()`/`sys.exit()`/`os._exit()`, a
     false `assert` — stops the proofs too: the imports after it may never run
-    (#1627)."""
+    (#1627). A name bound to such a callable by assignment or by a star import
+    (`e = sys.exit`, `from os import *` then `_exit()`) terminates as well, the
+    binding being followed conservatively (#1860)."""
 
     def __init__(self, names: set[str]) -> None:
         self.names = names
@@ -474,6 +486,53 @@ class _RuntimeImports(ast.NodeVisitor):
                 node, self._exit_names, self._sys_names, self._os_names):
             self._terminated = True
 
+    def _target_names(self, target: ast.expr) -> list[str]:
+        """Les noms qu'une cible d'affectation lie vraiment : `e`, `e, f`,
+        `(e, *f)`. Un abonnement ou un attribut (`d[k]`, `obj.handler`) ne
+        rebaptise aucun nom et n'en lie aucun."""
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Starred):
+            return self._target_names(target.value)
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [name for element in target.elts
+                    for name in self._target_names(element)]
+        return []
+
+    def _learn_exit_names(self, target: ast.expr, value: ast.expr | None) -> None:
+        """Un nom affecté d'une sortie connue en devient une (#1860) :
+        `e = sys.exit` puis `e()`. L'ensemble ne rétrécit jamais — une
+        réaffectation peut être conditionnelle (#1474) : une preuve perdue
+        n'est jamais une fausse preuve. Une cible multiple lisible est suivie
+        élément par élément ; toute autre forme est gardée entière dès que la
+        valeur mentionne une sortie (conservateur)."""
+        if value is None:
+            return
+        if (isinstance(target, (ast.Tuple, ast.List))
+                and isinstance(value, (ast.Tuple, ast.List))
+                and len(target.elts) == len(value.elts)):
+            for sub_target, sub_value in zip(target.elts, value.elts):
+                self._learn_exit_names(sub_target, sub_value)
+            return
+        names = self._target_names(target)
+        if names and any(_is_exit_func(node, self._exit_names, self._sys_names,
+                                       self._os_names)
+                         for node in ast.walk(value)):
+            self._exit_names.update(names)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        for target in node.targets:
+            self._learn_exit_names(target, node.value)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        self._learn_exit_names(node.target, node.value)
+
     def visit_If(self, node: ast.If) -> None:
         if _never_runs(node.test, self.names):
             # the guard never runs: only its `else` does (at module level)
@@ -523,6 +582,13 @@ class _RuntimeImports(ast.NodeVisitor):
         elif module == "os":
             self._exit_names.update(alias.asname or alias.name
                                     for alias in node.names if alias.name == "_exit")
+        if any(alias.name == "*" for alias in node.names):
+            # #1860 : `from os import *` lie `_exit` au corps du module (les
+            # builtins `exit`/`quit` et `from sys import *` sont déjà couverts).
+            if module == "os":
+                self._exit_names.add("_exit")
+            elif module == "sys":
+                self._exit_names.add("exit")
         self._record(node)
 
 
