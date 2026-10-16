@@ -4080,6 +4080,7 @@
     "put"
    ],
    "canon": [
+    "claim_commit",
     "clear_pending_stop",
     "clear_responsible",
     "close_others",
