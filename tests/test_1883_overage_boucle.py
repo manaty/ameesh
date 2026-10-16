@@ -198,7 +198,8 @@ class OveragePartageTest(_Base):
         self.assertGreater(float(retenues["secondaire"]["until_ts"]), now)
 
         # runner B : une AUTRE configuration du même nom lit un compte sain
-        # (5 %, priorité 20) — la retenue l'emporte sur sa lecture locale
+        # (5 %, priorité 20) — la retenue ET le conflit d'identité (deux
+        # dossiers sous le même nom) l'emportent sur sa lecture locale
         c = _dossier(os.path.join(self.tmp, "comptes", "codex-3"), creds="auth.json")
         _journal(c, week=(5, now + 6 * DAY))
         autres = self._items(c)
@@ -208,12 +209,15 @@ class OveragePartageTest(_Base):
         self.assertEqual(choix.profile.name, "primaire", choix.why)
         self.assertEqual(len(self._bascules()), bascules)
 
-        # la retenue expirée, la rotation normale reprend (aucune lecture ne
-        # voit plus de dépassement)
+        # la retenue expirée et la configuration divergente nettoyée (le
+        # dossier de B n'existe plus : une seule identité pour ce nom), la
+        # rotation normale reprend sur le dossier de A, redevenu sain
+        self.db.execute("DELETE FROM account_identities")
         self.db.execute("UPDATE account_holds"
                         " SET until_ts = extract(epoch from now()) - 1")
-        choix = accounts.choose(self.db, self.cfg.host, "codex", autres,
-                                self._book(), now=time.time(), agent="runner-b")
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                self._book(), now=time.time(), agent="runner-a")
         self.assertEqual(choix.profile.name, "secondaire", choix.why)
         self.assertEqual(choix.switched["to"], "secondaire")
 
@@ -443,6 +447,106 @@ class OveragePartageTest(_Base):
                                 self._book(), now=now + 1.0, agent="runner-b")
         self.assertIsNone(choix.profile)
         self.assertIn("held for overage", choix.reason)
+
+
+class IdentiteComptesTest(_Base):
+    """#1883, arbitrage pilote (option a) : l'identité d'un compte est le
+    dossier résolu qu'il lit — deux configurations de l'hôte qui déclarent le
+    même nom vers deux dossiers ne servent pas de preuve l'une à l'autre. Le
+    compte est refusé au placement et signalé à l'owner, au lieu de prendre la
+    lecture d'un autre compte pour une lecture saine (incident du 16/10)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        reserve = mock.patch.object(accounts, "RESERVE", 0.0)
+        reserve.start()
+        self.addCleanup(reserve.stop)
+
+    def _book(self):
+        return cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+
+    def _declares(self, secondaire: str):
+        a = _dossier(os.path.join(self.tmp, "comptes", "codex-1"), creds="auth.json")
+        self.declared = [
+            {"name": "primaire", "path": a, "pace_multiplier": 10},
+            {"name": "secondaire", "path": secondaire,
+             "pace_multiplier": 10, "priority": 20},
+        ]
+        return accounts.parse({"codex": self.declared})["codex"]
+
+    def test_deux_configurations_deux_dossiers_refusent_le_compte(self):
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items_a = self._declares(b)
+        now = float(int(time.time()))
+        store = storage.of(self.db).accounts
+        # le runner A publie son empreinte : aucune autre, aucun conflit
+        self.assertEqual(accounts.identity_conflicts(store, self.cfg.host, "codex",
+                                                     items_a, now), set())
+        # le runner B déclare le MÊME nom vers un autre dossier (c), sain
+        c = _dossier(os.path.join(self.tmp, "comptes", "codex-3"), creds="auth.json")
+        _journal(items_a[0].path, week=(34, now + 6 * DAY))
+        _journal(c, week=(5, now + 6 * DAY))
+        items_b = self._declares(c)
+        self.assertEqual(accounts.identity_conflicts(store, self.cfg.host, "codex",
+                                                     items_b, now), {"secondaire"})
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items_b,
+                                self._book(), now=now, agent="runner-b")
+        self.assertEqual(choix.profile.name, "primaire", choix.why)
+        # l'alerte owner dit le conflit, sans date inventée (identité stable)
+        cfg = dataclasses.replace(self.cfg, accounts={"codex": self.declared})
+        alertes = [a for a in exploitation.alerts(cfg, self.db, now=now)
+                   if a["type"] == "account_identity"]
+        self.assertEqual([(a["harness"], a["account"]) for a in alertes],
+                         [("codex", "secondaire")])
+        self.assertIsNone(alertes[0]["since"])
+        self.assertEqual(alertes[0]["value"], 2.0)
+
+    def test_le_meme_dossier_dans_deux_configurations_ne_conflit_pas(self):
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        now = float(int(time.time()))
+        store = storage.of(self.db).accounts
+        self.assertEqual(accounts.identity_conflicts(
+            store, self.cfg.host, "codex", self._declares(b), now), set())
+        # deuxième configuration : les mêmes dossiers, donc la même identité
+        self.assertEqual(accounts.identity_conflicts(
+            store, self.cfg.host, "codex", self._declares(b), now), set())
+
+    def test_une_empreinte_perimee_ne_bloque_plus(self):
+        """Une configuration divergente qui cesse de tourner cesse d'être un
+        conflit après `IDENTITY_WINDOW_S` (sinon un profil retiré bloquerait le
+        compte pour toujours)."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items_a = self._declares(b)
+        now = float(int(time.time()))
+        store = storage.of(self.db).accounts
+        accounts.identity_conflicts(store, self.cfg.host, "codex", items_a, now)
+        c = _dossier(os.path.join(self.tmp, "comptes", "codex-3"), creds="auth.json")
+        items_b = self._declares(c)
+        self.assertEqual(accounts.identity_conflicts(store, self.cfg.host, "codex",
+                                                     items_b, now), {"secondaire"})
+        # l'empreinte divergente n'est plus republiée : elle vieillit
+        self.db.execute(
+            "UPDATE account_identities SET last_seen = now() - interval '2 hours'"
+            " WHERE account = 'secondaire' AND identity <> %s",
+            (accounts.identity_of(items_b[1]),))
+        self.assertEqual(accounts.identity_conflicts(store, self.cfg.host, "codex",
+                                                     items_b, now), set())
+
+    def test_simulation_et_choix_critique_ne_publient_pas(self):
+        """La publication d'empreinte est une écriture partagée : un choix
+        simulé ou critique (L242b) se contente de relire."""
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
+        items = self._declares(b)
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        accounts.choose(self.db, self.cfg.host, "codex", items, self._book(),
+                        now=now, critical=True)
+        accounts.choose(self.db, self.cfg.host, "codex", items, self._book(),
+                        now=now, simulate=True)
+        vues = storage.of(self.db).accounts.identities(
+            self.cfg.host, "codex", now - accounts.IDENTITY_WINDOW_S)
+        self.assertEqual(vues, {})
 
 
 class AlerteOverageTest(_Base):

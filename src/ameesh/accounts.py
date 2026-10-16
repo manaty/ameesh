@@ -142,6 +142,7 @@ deux configurations lisent deux dossiers sous le même nom de compte.
 """
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import re
@@ -1437,6 +1438,51 @@ def _held_for_overage(store, host: str, harness: str, now: float) -> set[str]:
     return held
 
 
+#: #1883 : vivacité d'une empreinte de dossier publiée pour l'hôte — une
+#: configuration divergente qui cesse de tourner cesse d'être un conflit après
+#: cette fenêtre, sinon un profil retiré bloquerait le compte pour toujours.
+IDENTITY_WINDOW_S = 3600.0
+
+
+def identity_of(profile: Profile) -> str | None:
+    """#1883 : l'empreinte du dossier résolu d'un compte `config_dir`.
+
+    Jamais le chemin : un dossier de configuration est un secret d'hôte, seuls
+    des noms et des empreintes passent par la base (`storage.accounts`). None
+    pour un compte sans dossier (clé d'API), qui n'a pas d'identité à défendre.
+    """
+    if profile.kind != "config_dir":
+        return None
+    return hashlib.sha256(os.path.realpath(profile.home()).encode("utf-8")).hexdigest()
+
+
+def identity_conflicts(store, host: str, harness: str, items: list[Profile],
+                       now: float, *, publish: bool = True) -> set[str]:
+    """#1883 (arbitrage pilote, option a) : les comptes dont l'identité est
+    contredite par une autre configuration de l'hôte.
+
+    Chaque processus publie l'empreinte du dossier résolu de ses comptes
+    `config_dir`, puis relit celles des autres : deux empreintes **vivantes**
+    (vues depuis `IDENTITY_WINDOW_S`) sous le même (hôte, harnais, nom) sont
+    deux dossiers différents derrière le même nom. Le compte est alors refusé
+    au placement — prendre la lecture de l'un pour une preuve saine de l'autre
+    est exactement l'incident de #1883 (le « secondaire » de deux profils de
+    pc-smichea, l'un à 47 %, l'autre à 34 %). `publish=False` (choix critique,
+    simulation : aucune écriture partagée) se contente de relire.
+    """
+    vues = store.identities(host, harness, now - IDENTITY_WINDOW_S)
+    conflits: set[str] = set()
+    for profile in items:
+        empreinte = identity_of(profile)
+        if empreinte is None:
+            continue
+        if publish:
+            store.publish_identity(host, harness, profile.name, empreinte)
+        if any(vue["identity"] != empreinte for vue in vues.get(profile.name, [])):
+            conflits.add(profile.name)
+    return conflits
+
+
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
            simulate: bool = False, session_account: str | None = None,
@@ -1511,24 +1557,37 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # dit sain (deux configurations peuvent lire deux dossiers sous le même
     # nom) : c'est le contrat « jamais de dépassement ».
     retenus = _held_for_overage(store, host, harness, now)
+    # #1883 (arbitrage pilote, option a) : deux configurations de l'hôte qui
+    # déclarent le même nom vers deux dossiers résolus rendent toute lecture
+    # ambiguë — le compte est refusé au placement (et signalé à l'owner), pas
+    # pris pour une preuve saine. Publier son empreinte est une écriture
+    # partagée : un choix critique ou simulé se contente de relire.
+    conflits = identity_conflicts(store, host, harness, items, now,
+                                  publish=not readonly)
 
-    # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu de
-    # retenues ; `choose` la rejoue sur un jeu FRAIS avant de rendre un
-    # compte (voir la reprise après l'appel).
-    def decide(retenus: set[str]) -> Choice:
-        """La décision de placement pour un jeu de retenues donné.
+    # #1883 (R2 auditeur, B1) : la décision est une fonction du jeu d'écartés
+    # (retenues d'overage, identités en conflit) ; `choose` la rejoue sur un
+    # jeu FRAIS avant de rendre un compte (voir la reprise après l'appel).
+    def decide(retenus: set[str], conflits: set[str]) -> Choice:
+        """La décision de placement pour un jeu d'écartés donné.
 
-        Un compte retenu ne reçoit aucun tour : les retenues publiées pour
-        l'hôte priment sur le forçage, la continuité et le classement.
-        Le jeu est relu à l'instant du placement (R2 auditeur, B1)."""
+        Un compte retenu ou d'identité contredite ne reçoit aucun tour : ces
+        écartés priment sur le forçage, la continuité et le classement.
+        Les jeux sont relus à l'instant du placement (R2 auditeur, B1)."""
         nonlocal row, cache
         candidates = healthy(items, sick)
+        ecartes = retenus | conflits
 
         # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
         # échec d'authentification est rendu tel quel : la garde de l'exécuteur
         # bloque l'agent, elle ne bascule pas contre un geste humain)
         def forced(profile: Profile) -> Choice:
             current = ev(profile)
+            if profile.name in conflits:
+                return Choice(None, profile, reason=(
+                    "account %s forced (ameesh accounts use): declared with another "
+                    "folder by a second configuration of this host" % profile.name),
+                    forced=True)
             if profile.name in retenus:
                 return Choice(None, profile, reason=(
                     "account %s forced (ameesh accounts use): in overage for another "
@@ -1549,7 +1608,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             # #1672 : le remplaçant doit être réellement plaçable — un compte à
             # relevé périmé ne lève pas le forçage pour une pause.
             free = [p for p in candidates if p.name != active.name
-                    and p.name not in retenus
+                    and p.name not in ecartes
                     and placeable(ev(p), now)
                     and (ev(p).ok if paced else ev(p).unpaced_ok)]
             if critical:
@@ -1572,17 +1631,18 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         # retenu ne l'est pas : c'est le PROCHAIN tour que ce choix décide, il ne
         # part pas sur un compte facturé au-delà du plan (R1 auditeur, B1).
         own = by_name(items, session_account) if session_account else None
-        if (own is not None and own in candidates and own.name not in retenus
+        if (own is not None and own in candidates and own.name not in ecartes
                 and ev(own).ok):
             return Choice(own, active, kept=True,
                           why="continuity: the session stays on %s, under its "
                               "threshold" % own.name)
         for profile in items:
             ev(profile)
-        # #1883 : jamais de placement sur un compte qu'un autre runner a fui
-        # en dépassement
-        if retenus:
-            candidates = [p for p in candidates if p.name not in retenus]
+        # #1883 : jamais de placement sur un compte qu'un autre runner a fui en
+        # dépassement, ni sur un nom que deux configurations déclarent vers
+        # deux dossiers
+        if ecartes:
+            candidates = [p for p in candidates if p.name not in ecartes]
         # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
         ranked = rank(candidates, cache, now)
         if not ranked and not paced:
@@ -1633,10 +1693,18 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                         and reading_outdated(cache[p.name].gauges, now)]
             why = "%sall %s accounts at threshold — %s" % (
                 pause_label(cache), harness, _label(cache))
+            ecartes_why = []
+            if conflits:
+                ecartes_why.append(
+                    "%s declared with different folders by two configurations of "
+                    "this host" % ", ".join(sorted(conflits)))
             if retenus:
-                why = ("%sno %s account to place: %s held for overage seen on this "
-                       "host — %s" % (pause_label(cache), harness,
-                                      ", ".join(sorted(retenus)), _label(cache)))
+                ecartes_why.append("%s held for overage seen on this host"
+                                   % ", ".join(sorted(retenus)))
+            if ecartes_why:
+                why = ("%sno %s account to place: %s — %s"
+                       % (pause_label(cache), harness, "; ".join(ecartes_why),
+                          _label(cache)))
             elif withheld:
                 why = ("%sno %s account to place: reading older than every open "
                        "window (%s) — %s" % (pause_label(cache), harness,
@@ -1702,15 +1770,18 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
 
     # #1883 (R2 auditeur, B1) : point unique de validation de TOUT retour qui
     # lance un tour (hors `auth_blocked`, que la garde de l'exécuteur ne lance
-    # pas). Les retenues sont relues à l'instant du placement, après la lecture
-    # des jauges comme après la bascule : un compte qu'un autre runner de l'hôte
-    # vient de fuir en dépassement ne reçoit pas de tour, même si le forçage, la
-    # continuité ou le classement l'ont retenu sur un instantané périmé (deux
-    # configurations peuvent lire deux dossiers sous le même nom).
-    choice = decide(retenus)
+    # pas). Les retenues d'overage ET les identités contredites sont relues à
+    # l'instant du placement, après la lecture des jauges comme après la
+    # bascule : un compte qu'un autre runner de l'hôte vient de fuir en
+    # dépassement, ou qu'une seconde configuration déclare vers un autre
+    # dossier, ne reçoit pas de tour — même si le forçage, la continuité ou le
+    # classement l'ont retenu sur un instantané périmé.
+    choice = decide(retenus, conflits)
     if choice.profile is not None and not choice.auth_blocked:
         frais = _held_for_overage(store, host, harness, now)
-        if choice.profile.name in frais:
+        conflits_frais = identity_conflicts(store, host, harness, items, now,
+                                            publish=False)
+        if choice.profile.name in frais or choice.profile.name in conflits_frais:
             # une seule reprise : la décision est rejouée sur l'état frais —
             # forçage levé pour un compte libre, continuité rompue, compte
             # écarté du classement. Le compte actif partagé est relu : une
@@ -1718,7 +1789,7 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             row = store.active(host, harness) or row
             active_name = row.get("account")
             active = by_name(items, active_name) or active
-            choice = decide(frais)
+            choice = decide(frais, conflits_frais)
     return choice
 
 

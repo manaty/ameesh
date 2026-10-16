@@ -93,6 +93,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L226b/#1883 : un compte de forfait facturé au-delà du plan —
                  # l'owner le sait tout de suite, la règle est « jamais de dépassement »
                  "account_overage",
+                 # #1883 : deux configurations de l'hôte déclarent le même nom de
+                 # compte vers deux dossiers — lecture ambiguë, compte refusé
+                 "account_identity",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
