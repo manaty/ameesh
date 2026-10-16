@@ -103,7 +103,11 @@ class Events(interface.Events):
     def prune(self, days, limit, timeout_s=None) -> int:
         # by `created_at`, on the database's clock (same clock as the guard);
         # the greatest position deleted raises the watermark in the SAME
-        # transaction; no SKIP LOCKED: the lock waits, bounded by `timeout_s`
+        # transaction; no SKIP LOCKED: the lock waits, bounded by `timeout_s`.
+        # #1711: the chosen batch is locked (FOR UPDATE) — a second pruner that
+        # waited on the first one's rows skips those it deleted and takes the
+        # next ones, instead of deleting nothing and reporting a stuck
+        # retention while the other one progresses
         with self.db.transaction() as tx:
             if timeout_s is not None:
                 # local to this transaction: a lock or a slow delete never
@@ -115,7 +119,7 @@ class Events(interface.Events):
                 "delete from ameesh_events where id in ("
                 " select id from ameesh_events"
                 " where created_at < now() - make_interval(days => %s::int)"
-                " order by created_at, id limit %s) returning tx::text as tx, id",
+                " order by created_at, id limit %s for update) returning tx::text as tx, id",
                 (int(days), int(limit)))
             if gone:
                 top = max((int(row["tx"]), int(row["id"])) for row in gone)
