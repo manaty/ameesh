@@ -384,6 +384,31 @@ class MapTest(unittest.TestCase):
         self.assertIn("no test is guaranteed to load: src/ameesh/code.py", out["phase2_why"])
         self.assertEqual(out["classes"]["test_a"], ["P3", ""])
 
+    def test_incomplete_map_keeps_the_full_suite(self):
+        # #1716 : #1690 nomme un artefact de mesure illisible sans rendre la
+        # carte suspecte ; un bloc couvert par l'artefact perdu ressortait donc
+        # avec le seul module lisible et la sélection se réduisait en silence.
+        # La carte est inutilisable : suite complète.
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        card = self.repo.card()
+        card["measure"] = {"parts": 5, "processus": 4, "artefacts_incomplets": [
+            {"fichier": "cov/.coverage.coupee",
+             "erreur": "DataError: file is not a database"}]}
+        card["modules"] = {m: {"durees": {"psycopg": 1.0, "psql": 1.0}, "echecs": []}
+                           for m in parts.modules()}
+        out = plan.classify(parts.modules(), card, NOW, head="HEAD", repo=self.repo.path)
+        self.assertFalse(out["map"]["used"])
+        self.assertIn("unreadable measure artefact", out["map"]["problem"])
+        self.assertFalse(out["phase2_safe"])
+        docs = {"version_only": False, "docs_only": False, "why": "", "files": []}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW, head="HEAD", repo=self.repo.path,
+                               base_ref="main", head_ref="lot/1716-carte-incomplete")
+        self.assertEqual(p["selection"]["mode"], "full")
+        self.assertIn("map not usable", p["selection"]["why"])
+        self.assertIn("unreadable measure artefact", p["selection"]["why"])
+
     def test_new_file_is_covered_by_the_test_that_imports_it(self):
         # #1339 : un fichier nouveau, inconnu de la carte, est couvert par le
         # test du lot qui l'importe (graphe d'import statique) ; la suite
@@ -775,6 +800,18 @@ class MapTest(unittest.TestCase):
         stranger = dict(card, commit="0" * 40)
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
+        # #1716 : une carte bâtie sur des mesures incomplètes (#1690) ne peut
+        # plus réduire la sélection à l'insu du plan. L'ancienne graphie
+        # `mesure` (L148 stage 6) est lue aussi.
+        for cle in ("measure", "mesure"):
+            with self.subTest(cle):
+                incomplet = dict(card, **{cle: {"artefacts_incomplets": [
+                    {"fichier": "cov/.coverage.coupee", "erreur": "DataError"}]}})
+                why, _ = plan.map_problem(incomplet, NOW, "HEAD", self.repo.path)
+                self.assertIn("unreadable measure artefact", why)
+                self.assertIn("cov/.coverage.coupee", why)
+        vide = dict(card, measure={"parts": 5, "processus": 5, "artefacts_incomplets": []})
+        self.assertEqual(plan.map_problem(vide, NOW, "HEAD", self.repo.path), ("", 0.0))
 
     def test_map_problem_partial_measure(self):
         """#1257 R1 B3 : une carte dont la fusion a écarté des couvertures est
@@ -1113,6 +1150,163 @@ class ImportGraphTest(unittest.TestCase):
                 self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
                                  {"src/ameesh/db.py"}, why)
 
+    def test_assigned_exit_aliases_and_star_imports_stop_proofs(self):
+        # #1860 : un alias de sortie par affectation (`e = sys.exit ; e()`) et
+        # `_exit()` après `from os import *` terminent aussi l'import : les
+        # imports suivants restent des arêtes possibles, jamais des preuves.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "sys.exit affecté": "import sys\n"
+                                "e = sys.exit\n"
+                                "e(1)\n"
+                                "import ameesh.db\n",
+            "os._exit affecté": "import os as o\n"
+                                "e = o._exit\n"
+                                "e(1)\n"
+                                "import ameesh.db\n",
+            "exit importé affecté": "from sys import exit as bye\n"
+                                    "e = bye\n"
+                                    "e(1)\n"
+                                    "import ameesh.db\n",
+            "quit builtin affecté": "q = quit\n"
+                                    "q()\n"
+                                    "import ameesh.db\n",
+            "chaîne d'alias": "import sys\n"
+                              "e = sys.exit\n"
+                              "f = e\n"
+                              "f(1)\n"
+                              "import ameesh.db\n",
+            "alias appelé dans son affectation": "import sys\n"
+                                                  "(e := sys.exit)(1)\n"
+                                                  "import ameesh.db\n",
+            "alias importé appelé dans son affectation": "from sys import exit as bye\n"
+                                                           "(e := bye)(1)\n"
+                                                           "import ameesh.db\n",
+            "affectation multiple": "import sys\n"
+                                    "e = f = sys.exit\n"
+                                    "f(1)\n"
+                                    "import ameesh.db\n",
+            "cible multiple lisible": "import sys\n"
+                                      "e, f = sys.exit, print\n"
+                                      "e(1)\n"
+                                      "import ameesh.db\n",
+            "affectation gardée": "import sys\n"
+                                  "if callable(sys):\n"
+                                  "    e = sys.exit\n"
+                                  "e(1)\n"
+                                  "import ameesh.db\n",
+            "affectation différée": "import sys\n"
+                                    "def quit_now():\n"
+                                    "    global e\n"
+                                    "    e = sys.exit\n"
+                                    "quit_now()\n"
+                                    "e(1)\n"
+                                    "import ameesh.db\n",
+            "from os import *": "from os import *\n"
+                                "_exit(1)\n"
+                                "import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # une affectation qui ne porte pas de sortie ne coupe aucune preuve
+        kept = {
+            "appel ordinaire": "e = print\n"
+                               "e('x')\n"
+                               "import ameesh.db\n",
+            "lambda ordinaire": "e = lambda: 0\n"
+                                "e()\n"
+                                "import ameesh.db\n",
+            "cible multiple ordinaire": "e, f = 1, 2\n"
+                                        "e()\n"
+                                        "import ameesh.db\n",
+            "nom affecté jamais appelé": "import sys\n"
+                                         "e = sys.exit\n"
+                                         "import ameesh.db\n",
+        }
+        for why, source in kept.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known, why)
+
+    def test_assigned_module_aliases_and_getattr_exits_stop_proofs(self):
+        # #1878, N de la relecture Claude de #1860 : un module sys/os renommé
+        # par affectation (`s = sys` puis `s.exit()`) et une lecture statique
+        # `getattr(sys, 'exit')` sont des sorties comme les autres : les
+        # imports suivants restent des arêtes possibles, jamais des preuves.
+        known = {"src/ameesh/db.py"}
+        stopped = {
+            "sys renommé": "import sys\n"
+                           "s = sys\n"
+                           "s.exit(1)\n"
+                           "import ameesh.db\n",
+            "os renommé": "import os\n"
+                          "o = os\n"
+                          "o._exit(1)\n"
+                          "import ameesh.db\n",
+            "module importé aliasé puis renommé": "import sys as s0\n"
+                                                  "s = s0\n"
+                                                  "s.exit(1)\n"
+                                                  "import ameesh.db\n",
+            "chaîne de renommages": "import sys\n"
+                                    "s = sys\n"
+                                    "t = s\n"
+                                    "t.exit(1)\n"
+                                    "import ameesh.db\n",
+            "paire de modules": "import sys, os\n"
+                                "s, o = sys, os\n"
+                                "o._exit(1)\n"
+                                "import ameesh.db\n",
+            "getattr sys.exit": "import sys\n"
+                                "getattr(sys, 'exit')(1)\n"
+                                "import ameesh.db\n",
+            "getattr os._exit": "import os\n"
+                                "getattr(os, '_exit')(1)\n"
+                                "import ameesh.db\n",
+            "getattr avec défaut": "import sys\n"
+                                   "getattr(sys, 'exit', None)(1)\n"
+                                   "import ameesh.db\n",
+            "getattr via module renommé": "import sys\n"
+                                          "s = sys\n"
+                                          "getattr(s, 'exit')(1)\n"
+                                          "import ameesh.db\n",
+            "getattr affecté puis appelé": "import sys\n"
+                                           "e = getattr(sys, 'exit')\n"
+                                           "e(1)\n"
+                                           "import ameesh.db\n",
+        }
+        for why, source in stopped.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), set(), why)
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known),
+                                 {"src/ameesh/db.py"}, why)
+        # une simple mention ne coupe rien : ni un module renommé non utilisé,
+        # ni un getattr d'un autre membre, d'un autre porteur ou dynamique
+        kept = {
+            "module renommé jamais appelé": "import sys\n"
+                                            "s = sys\n"
+                                            "import ameesh.db\n",
+            "getattr d'un autre membre": "import sys\n"
+                                         "getattr(sys, 'version')\n"
+                                         "import ameesh.db\n",
+            "getattr d'un porteur ordinaire": "class C:\n"
+                                              "    pass\n"
+                                              "getattr(C, 'exit')\n"
+                                              "import ameesh.db\n",
+            "getattr au nom dynamique": "import sys\n"
+                                        "name = 'exit'\n"
+                                        "getattr(sys, name)\n"
+                                        "import ameesh.db\n",
+        }
+        for why, source in kept.items():
+            with self.subTest(why):
+                self.assertEqual(plan._imported_files(source, "tests/test_a.py", known,
+                                                      guaranteed=True), known, why)
+
     def test_guaranteed_package_import_does_not_prove_the_member(self):
         # #1339, relecture Codex (B2 résidu) : `from ameesh import db` ne
         # prouve pas que `ameesh/db.py` est chargé — le paquet peut lier le nom
@@ -1386,7 +1580,11 @@ class PartialMeasureTest(unittest.TestCase):
         # carte fraîche et ancêtre de HEAD : seule la perte la rend inutilisable
         card = map_mod.merge([str(part)], _git(REPO, "rev-parse", "HEAD"))
         self.assertEqual(len(card["mesure"]["couverture_ignoree"]), 1)
-        mesure = dict(card["mesure"], couverture_ignoree=[])
+        # #1690 : le meme artefact tronque est aussi nomme dans
+        # `artefacts_incomplets` ; le temoin du temoin doit retirer les DEUX
+        # projections de la perte, sinon il n'est plus sain.
+        mesure = dict(card["mesure"], couverture_ignoree=[],
+                      artefacts_incomplets=[])
         saine = dict(card, measure=mesure, mesure=mesure)  # témoin du témoin
         self.assertEqual(plan.map_problem(saine, NOW, "HEAD", REPO)[0], "")
         probleme, _ = plan.map_problem(card, NOW, "HEAD", REPO)
@@ -2032,15 +2230,19 @@ class LotBranchTest(unittest.TestCase):
         self.assertIn(f"candidates: `{self.mods[0]}`", text)
 
     def test_parts_shrink_to_the_estimate(self):
+        # Liste fixe (#1800) : le témoin porte sur la formule de découpage
+        # (235 modules × 2 s = 470 s -> deux parts), pas sur l'inventaire du
+        # dépôt, qui grandit à chaque paquet et ferait basculer l'attente.
+        # Noms synthétiques : test_count, qui lit un fichier réel, est neutralisé.
+        mods = [f"test_fixe_{i:03d}" for i in range(235)]
+
         def card(seconds):
             return {"modules": {m: {"durees": {"psycopg": seconds, "psql": seconds}}
-                                for m in self.mods}}
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:10], card(1.0)), 1)
-        # 235 modules × 2 s = 470 s -> deux parts ; la tranche fixe garde le
-        # test indépendant du nombre de modules du dépôt (314 au 15/10, et
-        # chaque lot qui ajoute un module de test le faisait basculer à 3)
-        self.assertEqual(plan.lot_part_count("psycopg", self.mods[:235], card(2.0)), 2)
-        self.assertGreaterEqual(plan.lot_part_count("psycopg", self.mods, card(5.0)), 4)
+                                for m in mods}}
+        with mock.patch.object(plan.parts, "test_count", lambda module, tests=None: 1):
+            self.assertEqual(plan.lot_part_count("psycopg", mods[:10], card(1.0)), 1)
+            self.assertEqual(plan.lot_part_count("psycopg", mods, card(2.0)), 2)
+            self.assertGreaterEqual(plan.lot_part_count("psycopg", mods, card(5.0)), 4)
 
     def test_selected_matrix_never_exceeds_the_parts_cap(self):
         # un lot très large (60 s par module) reste dans PARTS : quatre parts

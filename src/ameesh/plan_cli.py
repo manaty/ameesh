@@ -457,6 +457,7 @@ def _project_lots(db, gh, args: argparse.Namespace) -> int:
         return 2
     report = plan_github.project_lots(
         db, gh, project, repo, dry_run=args.dry_run, settings=settings,
+        mappings=settings.process_for(project),
         forge_hosts=getattr(cfg, "forge_hosts", None) or (),
         local_host=getattr(cfg, "host", None))
     if args.json:
@@ -470,6 +471,8 @@ def _project_lots(db, gh, args: argparse.Namespace) -> int:
 _LOT_ACTIONS = {"create": ("to create", "created"), "update": ("to update", "updated"),
                 "close": ("to close", "closed"), "unchanged": ("unchanged", "unchanged"),
                 "refused": ("REFUSED", "REFUSED"),
+                "refused-projection": ("REFUSED (Process projection)",
+                                       "REFUSED (Process projection)"),
                 "deferred": ("deferred", "deferred to the next pass")}
 
 
@@ -489,6 +492,8 @@ def _print_lot_issues(report: dict) -> None:
         if row["action"] == "unchanged":
             quiet += 1
             continue
+        if row["action"] == "refused-projection":
+            continue                    # dit ci-dessous, avec son code
         verb = _LOT_ACTIONS.get(row["action"], (row["action"],) * 2)[0 if dry else 1]
         print("  work item %-5s %-6s %-17s %s%s%s" % (
             row["work_item"], "#%s" % row["number"] if row.get("number") else "", verb,
@@ -506,6 +511,13 @@ def _print_lot_issues(report: dict) -> None:
             row["work_item"], row["field"], ", ".join(row["reasons"]),
             "title of #%s kept as is" % row["number"] if row.get("number")
             else "nothing is published"))
+    for row in report.get("projection_refused") or []:
+        print("REFUSED (Process projection): work item %s pinned on %s@%s (%s); %s until the "
+              "admitted mapping covers it" % (
+                  row["work_item"], row["ref"] or "(none)", row["version"],
+                  ", ".join(row["codes"]),
+                  "issue #%s left unchanged" % row["number"] if row.get("number")
+                  else "no issue created"))
     for row in report["withheld"]:
         print("  withheld: work item %s, %s not published (%s)" % (
             row["work_item"], row["field"], ", ".join(row["reasons"])))

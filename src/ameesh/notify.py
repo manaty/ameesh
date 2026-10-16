@@ -17,9 +17,12 @@
         (default 15 min) takes the highest-priority unassigned lot of its
         team and the orchestrator is told; `--take-lot-idle 0` turns it
         off.
-        L233b: before any take, the intake and build lots of a non-critical
-        Claude agent paused on budget go to a free DeepSeek agent of the
-        same project (`ameesh.handoff.budget_handoff`);
+        L233b/L165: before any take, the non-started (`intake`) lots of a
+        non-critical Claude agent paused on budget are returned to the team
+        queue (no assignee, a journal note), where the automatic take gives
+        them to any free capable agent (DeepSeek or Codex); its started
+        (`build`) lots go to a free DeepSeek or Codex agent of the same
+        project (`ameesh.handoff.budget_handoff`);
         `--handoff-max-per-hour 0` turns it off.
         L126: on the host named by the `github` config key, each pass also
         maintains the GitHub issues of the lots
@@ -90,6 +93,12 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 # L226b/#1883 : un compte de forfait facturé au-delà du plan —
+                 # l'owner le sait tout de suite, la règle est « jamais de dépassement »
+                 "account_overage",
+                 # #1883 : deux configurations de l'hôte déclarent le même nom de
+                 # compte vers deux dossiers — lecture ambiguë, compte refusé
+                 "account_identity",
                  "host_not_ready", "host_power_low",
                  "host_unavailable", "host_drain_overdue", "lease_not_taken", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
@@ -116,6 +125,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "critical_budget_pause",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
                  "critical_turn_failures",
+                 # L242c : canon illisible, rôles critiques tenus
+                 "critical_roles_unreadable",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
@@ -164,6 +175,8 @@ TYPE_LABELS = {
     # #789 t2 (canon §9) : adressée aux agents (alert_briefs) ; poussée aux
     # humains si le type est dans `notify.types`
     "slo_breach": "internal deadline (SLO) overdue",
+    # #1107 (n2 P3 de #1035) : un lot que les passes d'alerte ne savent pas lire
+    "lot_unreadable": "work item unreadable by the alert passes",
     "host_pressure": "host under pressure",
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
@@ -216,6 +229,7 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
+    "critical_roles_unreadable": "canon unreadable: critical roles held",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",
@@ -988,7 +1002,7 @@ def group_orphan_lots(alerts: list, resolve) -> list:
 _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
-         "provider", "currency", "urgent",
+         "provider", "currency", "urgent", "severity", "level",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
@@ -1033,6 +1047,8 @@ class Notifier:
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
                  ) -> list:
+        from . import alert_ack
+        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         now = float(self.clock())
         if current is None:
             # #1179 : la console du pool local n'est pas lue par la passe
@@ -1043,7 +1059,27 @@ class Notifier:
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
-        notifications = group_orphan_lots(current, router.resolve)
+        acknowledgements = alert_ack.reconcile(
+            db, current, observed_ts=observed_ts, dry_run=self.dry_run,
+            observation_host=getattr(self.cfg, "host", None)) if db is not None else []
+        # Reuse each subject's route for acknowledgement and group membership;
+        # lot/package lookups belong to this snapshot, not to every projection.
+        routes = {id(a): router.resolve(a) for a in current}
+
+        def resolve_current(alert):
+            return routes[id(alert)]
+
+        notifications = group_orphan_lots(current, resolve_current)
+        # Retain all group identities, including fully acknowledged groups:
+        # filtering them out of wanted would falsely announce a resolution.
+        unacknowledged = [a for a in current if alert_ack.matches(
+            acknowledgements, a, resolve_current(a)[0]) is None]
+        audible = {key_of(a): a for a in group_orphan_lots(unacknowledged, resolve_current)}
+        subjects_by_key = {}
+        for subject in current:
+            group = group_orphan_lots([subject], resolve_current)[0]
+            subjects_by_key.setdefault(key_of(group), []).append({
+                "key": alert_ack.key_of(subject), "severity": alert_ack.severity(subject)})
         # #789 t2 (canon §9) : une alerte qui CIBLE le propriétaire
         # (`targets` contient "owner", le P1 d'un dépassement de SLO) ne se
         # perd pas — elle atteint l'humain même si son type a été retiré de
@@ -1073,6 +1109,8 @@ class Notifier:
                 # preuve de résolution.
                 continue
             del active[key]
+            if self._acknowledged(entry, acknowledgements):
+                self._mute(entry)
             if entry["alert"].get("type") not in self.ncfg.types \
                     and "owner" not in (entry["alert"].get("targets") or ()):
                 self.log("[%s] removed from notify.types: forgotten without resolution"
@@ -1082,6 +1120,30 @@ class Notifier:
             self._event(db, "alert.resolved", key, entry["alert"])
         for key, alert in wanted.items():
             entry = active.get(key)
+            subjects = subjects_by_key[key]
+            human, _ = (routes[id(alert)] if id(alert) in routes
+                        else router.resolve(alert))
+            muted = key not in audible
+            # A partial orphan group only mentions its unacknowledged members.
+            alert = audible.get(key, alert)
+            level = alert_ack.severity(alert)
+            changed_ack_level = any(r["principal"] == human
+                and any(r["alert_key"] == a["key"] and r["severity"] != a["severity"]
+                        for a in subjects)
+                for r in acknowledgements)
+            if entry is not None and ((entry.get("status") == "acknowledged" and not muted)
+                                      or changed_ack_level):
+                self._forget_summary(entry)
+                entry.update(status="nouvelle", channels={}, alert={
+                    k: alert.get(k) for k in _KEPT if alert.get(k) is not None})
+                entry.pop("escalated", None)
+            if muted:
+                if entry is None:
+                    entry = active[key] = {"alert": {k: alert.get(k) for k in _KEPT
+                        if alert.get(k) is not None}, "raised_ts": now, "channels": {}}
+                entry.update(human=human, severity=level, ack_subjects=subjects)
+                self._mute(entry)
+                continue
             if entry is None:
                 entry = active[key] = {
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
@@ -1109,9 +1171,13 @@ class Notifier:
                     self._raise(entry, router, now)
                 else:
                     self._retry(entry, "raised", now)
+            entry.update(severity=level, ack_subjects=subjects)
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
+            if self._acknowledged(entry, acknowledgements):
+                del self.state["resolved"][key]
+                continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
@@ -1193,6 +1259,33 @@ class Notifier:
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
                 del self.state["resolved"][key]
+
+    @staticmethod
+    def _acknowledged(entry: dict, rows: list) -> bool:
+        from . import alert_ack
+        subjects = entry.get("ack_subjects") or [{"key": alert_ack.key_of(entry["alert"]),
+                                                "severity": alert_ack.severity(entry["alert"])}]
+        return all(any(r["alert_key"] == a["key"] and r["severity"] == a["severity"]
+                       and r["principal"] == entry.get("human") for r in rows)
+                   for a in subjects)
+
+    def _forget_summary(self, entry: dict) -> None:
+        if entry.get("status") != "resumee":
+            return
+        bucket = self.state["summary"].get(entry.get("human"))
+        if bucket:
+            kind = entry["alert"]["type"]
+            remaining = bucket["raised"].get(kind, 0) - 1
+            if remaining > 0:
+                bucket["raised"][kind] = remaining
+            else:
+                bucket["raised"].pop(kind, None)
+            if not bucket["raised"] and not bucket["resolved"]:
+                self.state["summary"].pop(entry.get("human"), None)
+
+    def _mute(self, entry: dict) -> None:
+        self._forget_summary(entry)
+        entry.update(status="acknowledged", channels={})
 
     def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
         """Adopt persisted per-lot deliveries before checking for resolutions.
@@ -1298,10 +1391,12 @@ class Notifier:
             return
         for move in moved:
             item = move["item"]
+            queued = bool(move.get("queued"))
             entry = {"alert": {"type": "budget_handoff", "agent": move["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
                      "human": None, "source": "pause budget de %s" % move["previous"]}
-            self._record("budget_handoff", entry, "a_blanc" if self.dry_run else "prise", {})
+            self._record("budget_handoff", entry,
+                         "a_blanc" if self.dry_run else ("rendu" if queued else "prise"), {})
 
     # -- levée ----------------------------------------------------------------
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
@@ -1451,6 +1546,14 @@ class Notifier:
             if not briefs:
                 continue        # personne à prévenir : on réessaie au passage suivant
             if entry is not None:
+                # #1787 N1 : la relance repart aux destinataires de la levée,
+                # pas à ceux que l'état vivant désignerait maintenant (le brief
+                # d'un lot sans assigné est atomique, #1026) ; si aucun n'est
+                # plus joignable, rien ne part et `reminded` reste à poser.
+                keep = {str(n) for n in entry.get("to") or ()}
+                briefs = {n: t for n, t in briefs.items() if n in keep}
+                if not briefs:
+                    continue
                 raised = float(entry["sent_ts"])
                 briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
             payload = {"alert": kind, "reminder": entry is not None}
@@ -1528,6 +1631,9 @@ class Notifier:
             # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
             self._record("resolved", entry, "sans_envoi", {})
             return
+        if status == "acknowledged":
+            self._record("resolved", entry, "sans_envoi", {})
+            return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
             self.log("alert resolved [%s] %s (never sent: %s)" % (
                 alert.get("type"), _subject(alert), _DELIVERY_LABELS.get(status, status)))
@@ -1543,6 +1649,7 @@ class Notifier:
             self._record("resolved", entry, "abandonnee", {})
             return
         resolved = {"alert": alert, "raised_ts": entry.get("raised_ts"), "resolved_ts": now,
+                    "ack_subjects": entry.get("ack_subjects"),
                     "human": human, "source": entry.get("source"), "status": "envoi",
                     "channels": {name: {"ok": False, "attempts": 0, "error": None}
                                  for name in delivered}}
@@ -1750,7 +1857,7 @@ _DELIVERY_LABELS = {"a_blanc": "dry run", "envoyee": "sent", "echec": "failed",
                     "sans_destinataire": "no recipient", "sans_canal": "no channel",
                     "resumee": "summarized", "abandonnee": "abandoned",
                     "sans_envoi": "not sent", "prise": "taken", "nouvelle": "new",
-                    "envoi": "sending"}
+                    "rendu": "returned to the queue", "envoi": "sending"}
 
 
 def _format(record: dict) -> str:
@@ -1841,14 +1948,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--handoff-max-per-hour", type=int,
                         default=int(exploitation._env_float(
                             "AMEESH_HANDOFF_MAX_PER_HOUR", handoff.DEFAULT_MAX_PER_HOUR)),
-                        help="maximum lots handed per rolling hour from non-critical Claude "
-                             "agents paused on budget to free DeepSeek agents of the same "
-                             "project (default 4; 0 turns this off)")
+                        help="maximum lots returned to the queue or handed per rolling hour "
+                             "from non-critical Claude agents paused on budget, the handed "
+                             "ones to free DeepSeek or Codex agents of the same project "
+                             "(default 4; 0 turns this off)")
     parser.add_argument("--handoff-idle", type=float,
                         default=exploitation._env_float("AMEESH_HANDOFF_IDLE",
                                                         handoff.DEFAULT_IDLE_S),
-                        help="a DeepSeek agent takes a handed lot once idle for S seconds "
-                             "(default 300)")
+                        help="a DeepSeek or Codex agent takes a handed lot once idle for S "
+                             "seconds (default 300)")
     return parser
 
 

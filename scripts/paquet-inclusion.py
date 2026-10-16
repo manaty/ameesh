@@ -111,6 +111,17 @@ def blob_id(repo: Path, rev: str, path: str) -> str | None:
     return proc.stdout.decode("ascii", "replace").strip() or None
 
 
+def blob_size(repo: Path, rev: str, path: str) -> int | None:
+    """Taille du blob à cette révision, ou None s'il est absent/illisible."""
+    proc = git(repo, "cat-file", "-s", f"{rev}:{path}", check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.decode("ascii", "replace").strip())
+    except ValueError:
+        return None
+
+
 def blob_lines(repo: Path, rev: str, path: str) -> set[str] | None:
     """Les lignes du fichier à cette révision, ou None s'il est absent/binaire."""
     proc = git(repo, "show", f"{rev}:{path}", check=False)
@@ -448,11 +459,14 @@ def check_entry(repo: Path, entry: Entry, head: str, line_cache: dict) -> dict:
             )
             continue
         added = added_by_path.get(path)
-        if added is None and path not in added_by_path \
-                and blob_id(repo, parent, path) == blob_id(repo, commit, path):
-            # Aucun hunk pour ce chemin et blobs identiques : changement de mode
-            # seul (bit exécutable), sans delta de contenu — ce n'est pas un
-            # binaire (#1655 N1).
+        if added is None and path not in added_by_path and (
+            blob_id(repo, parent, path) == blob_id(repo, commit, path)
+            or blob_size(repo, commit, path) == 0
+        ):
+            # Aucun hunk pour ce chemin : un delta vide n'est pas un binaire.
+            # Blobs identiques : changement de mode seul (bit exécutable,
+            # #1655 N1). Blob vide au commit : fichier nouveau et vide, statut
+            # A sans blob parent ni ligne (#1684).
             added = []
         if added is None:
             checks.append(
