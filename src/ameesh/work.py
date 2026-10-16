@@ -1669,11 +1669,13 @@ def events(db: Db, item_id: int, limit: int = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
-#: les jalons d'un lot : `requested` et `merged` sont automatiques (0013),
-#: `closed` et `delivered` le sont aussi (fermeture, #988), `frozen` et
-#: `verdict` se déclarent par la CLI.
-MILESTONE_KINDS = ("requested", "frozen", "verdict", "merged", "closed", "delivered")
-MANUAL_KINDS = ("frozen", "verdict")
+#: les jalons d'un lot : `requested`, `merged`, `closed` et `delivered` sont
+#: automatiques (0013, 0026, fermeture #988) ; `frozen`, `verdict`, `fire` et
+#: `unfire` se déclarent par la CLI — le feu (`fire`/`unfire`, #1374) par
+#: `ameesh work fire` seulement, qui vérifie qu'il porte sur le gel courant
+#: (`ameesh.fire`).
+MILESTONE_KINDS = ("requested", "frozen", "verdict", "fire", "unfire", "merged", "closed", "delivered")
+MANUAL_KINDS = ("frozen", "verdict", "fire", "unfire")
 VERDICTS = ("ok", "blocked")
 
 #: les jalons affichés, du plus récent au plus ancien : (nom, colonne d'instant,
@@ -1715,11 +1717,12 @@ def milestone(
 ) -> dict:
     """Déclare un jalon que la machine à états ne peut pas déduire.
 
-    `frozen` (la branche est gelée pour la revue) et `verdict` (`ok` ou
-    `blocked`, avec le `sha` relu) sont les deux seuls : `requested`, `merged`,
-    `closed` et `delivered` sont écrits automatiquement (transitions et
-    fermeture, 0013 et #988), les déclarer à la main serait un mensonge sur la
-    frise.
+    `frozen` (la branche est gelée pour la revue), `verdict` (`ok` ou
+    `blocked`, avec le `sha` relu), et `fire`/`unfire` (le feu du pilote et son
+    retrait, #1374) sont les seuls déclarés : `requested`, `merged`, `closed`
+    et `delivered` sont écrits automatiquement (transitions, fermeture et
+    livraison hors cible : 0013, 0026, #988), les déclarer à la main serait un
+    mensonge sur la frise.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -1730,6 +1733,9 @@ def milestone(
     imbriqué ne commite pas). Absent (le défaut), le gel ne désigne personne :
     le raccord de la désignation des relecteurs se branche à l'activation du
     lot #1617, pas ici.
+
+    Le feu ne s'écrit pas ici sans contrôle : `ameesh.fire.give` vérifie qu'il
+    porte sur le gel courant, et `ameesh.fire.withdraw` qu'un feu est actif.
     """
     if kind not in MILESTONE_KINDS:
         raise WorkError("unknown milestone: %r (%s)" % (kind, ", ".join(MILESTONE_KINDS)))
