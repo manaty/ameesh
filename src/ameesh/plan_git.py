@@ -189,6 +189,51 @@ def same_commit(a, b) -> bool:
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
 
 
+def rebase_identity(repo: str, reviewed: str, frozen: str, target: str) -> dict:
+    """Le delta du lot est-il **mécaniquement constant** entre la tête relue
+    `reviewed` (celle d'un avis) et la tête gelée `frozen` (gel republié après
+    un rebase ou une correction de base) ?
+
+    Un rebase mécanique ne change pas le contenu du lot : les commits du lot
+    et leur diff écrasé ont les mêmes `patch-id` de part et d'autre. Les bases
+    sont la base commune de chaque tête avec `target` (le rebase déplace la
+    base, pas les commits du lot). Rend `{mechanical, detail}` ; `mechanical`
+    est faux dès qu'un SHA ou un delta est illisible — jamais de report sur un
+    doute (#1905, règle #87 appliquée à la main jusqu'ici)."""
+    old, new = _commit(repo, reviewed), _commit(repo, frozen)
+    if old is None or new is None:
+        return {"mechanical": False, "detail": "commit illisible"}
+    if old == new:
+        return {"mechanical": True, "detail": "même commit"}
+    tgt = _commit(repo, target) if target else None
+    if tgt is None:
+        return {"mechanical": False, "detail": "cible illisible"}
+    bases = {}
+    for name, head in (("old", old), ("new", new)):
+        base = _out(repo, "merge-base", head, tgt)
+        if not base:
+            return {"mechanical": False, "detail": "pas de base commune"}
+        bases[name] = base
+    try:
+        old_ids = _patch_ids(repo, "%s..%s" % (bases["old"], old))
+        new_ids = _patch_ids(repo, "%s..%s" % (bases["new"], new))
+    except (_NoVerbatim, MergeProbeError) as exc:
+        return {"mechanical": False, "detail": "delta illisible: %s" % (exc or "refusé")}
+    if old_ids and set(old_ids) == set(new_ids):
+        return {"mechanical": True,
+                "detail": "%d commit(s) de patch-id identiques" % len(old_ids)}
+    try:
+        old_squash = _diff_patch_id(repo, bases["old"], old)
+        new_squash = _diff_patch_id(repo, bases["new"], new)
+    except (_NoVerbatim, MergeProbeError):
+        old_squash = new_squash = None
+    if old_squash and old_squash == new_squash:
+        return {"mechanical": True, "detail": "diff écrasé de patch-id identique"}
+    common = len(set(old_ids) & set(new_ids))
+    return {"mechanical": False,
+            "detail": "%d/%d commit(s) de patch-id communs" % (common, len(old_ids))}
+
+
 def _freeze_mark(row: dict | None) -> dict | None:
     """Un jalon lu, réduit à ce que la provenance d'un gel effectif expose."""
     if row is None:
@@ -198,7 +243,8 @@ def _freeze_mark(row: dict | None) -> dict | None:
             "actor": row.get("actor") or "", "at_ts": row.get("at_ts")}
 
 
-def freeze_candidate(rows: list[dict]) -> dict:
+def freeze_candidate(rows: list[dict], repo: str | None = None,
+                     target: str | None = None) -> dict:
     """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
     favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
 
@@ -218,6 +264,9 @@ def freeze_candidate(rows: list[dict]) -> dict:
       de l'avis, le gel déclaré étant périmé (rebase) ;
     * gel postérieur à l'avis sur un autre commit : refus
       `freeze-after-verdict`, un nouvel avis est dû sur la tête gelée (#1283) ;
+      si `repo` est fourni et que le delta du lot est **mécaniquement
+      constant** entre la tête relue et la tête gelée (`rebase_identity`,
+      #1905), l'avis est porté sur la tête gelée, note `mechanical-rebase` ;
     * sans gel déclaré : le SHA de l'avis favorable ;
     * avis sans commit : il ne vaut que par l'instant, le gel déclaré (s'il
       existe) reste candidat, note `verdict-names-no-commit` ;
@@ -260,12 +309,19 @@ def freeze_candidate(rows: list[dict]) -> dict:
     if (last.get("verdict") or "ok") != "ok":
         out["causes"].append("blocked-verdict")
         return out
+    carried_from = None
     if f_sha and v_sha:
         if same_commit(f_sha, v_sha):
             out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
         elif f_at > v_at:
-            out["causes"].append("freeze-after-verdict")
-            return out
+            carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
+                       if repo else {"mechanical": False})
+            if not carried["mechanical"]:
+                out["causes"].append("freeze-after-verdict")
+                return out
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("mechanical-rebase: %s" % carried["detail"])
+            carried_from = v_sha
         else:
             out.update(sha=v_sha, origin="verdict")
             out["notes"].append("declared-freeze-stale")
@@ -285,7 +341,8 @@ def freeze_candidate(rows: list[dict]) -> dict:
     by_actor: dict = {}
     for v in verdicts:
         cand = commit_id(v.get("sha"))
-        applies = same_commit(cand, out["sha"]) if cand else (
+        applies = (same_commit(cand, out["sha"]) or
+                   (carried_from is not None and same_commit(cand, carried_from))) if cand else (
             freeze is None or float(v.get("at_ts") or 0) >= f_at)
         if not applies:
             continue

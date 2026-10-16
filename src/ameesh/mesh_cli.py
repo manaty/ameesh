@@ -1222,12 +1222,16 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
 
 def work_rows(db, *, state: str | None = None, assignee: str | None = None,
               limit: int | None = None, threshold: float | None = None,
-              freeze: bool = False) -> list:
+              freeze: bool = False, repo: str | None = None,
+              target: str | None = None) -> list:
     """The rows of `ameesh work list --json` (also `GET /api/v1/lots`, L84).
 
     `freeze` ajoute à chaque ligne le gel effectif dérivé (#1756), en un seul
     balayage de jalons : le composeur du paquet horaire lit ce champ au lieu
-    de JOINdre lui-même le dernier jalon `frozen`."""
+    de JOINdre lui-même le dernier jalon `frozen`. `repo` (dépôt git local) et
+    `target` (défaut : la cible du lot, sinon `origin/main`) permettent en plus
+    de porter un avis sur un gel republié quand le delta du lot est
+    mécaniquement constant (#1905) ; sans `repo`, le champ est inchangé."""
     from . import plan, plan_git, stagnation
     if threshold is None:
         threshold = stagnation.DEFAULT_THRESHOLD_S
@@ -1250,14 +1254,17 @@ def work_rows(db, *, state: str | None = None, assignee: str | None = None,
                     [row["id"] for row in rows]):
                 marks.setdefault(int(mark["work_item_id"]), []).append(mark)
             for row in rows:
-                row["freeze"] = plan_git.freeze_candidate(marks.get(int(row["id"]), []))
+                row["freeze"] = plan_git.freeze_candidate(
+                    marks.get(int(row["id"]), []), repo=repo,
+                    target=target or row.get("branch_target") or plan_git.DEFAULT_TARGET)
         return rows
 
     # L61 : lectures regroupées — deux allers-retours en tout
     return db_mod.batched(db, lire)
 
 
-def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
+def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
+                target: str | None = None) -> dict | None:
     """The object of `ameesh work show --json` (also `GET /api/v1/lots/{id}`)."""
     from . import canon as canon_mod, plan
 
@@ -1268,7 +1275,9 @@ def work_detail(cfg: Config, db, lot_id: int) -> dict | None:
         item["events"] = work.events(db, lot_id)
         item["milestones"] = work.milestones(db, lot_id)
         from . import plan_git
-        item["freeze"] = plan_git.freeze_candidate(item["milestones"])
+        item["freeze"] = plan_git.freeze_candidate(
+            item["milestones"], repo=repo,
+            target=target or item.get("branch_target") or plan_git.DEFAULT_TARGET)
         from .modules.storage import ModuleStore
         item["module_milestones"] = ModuleStore(db).milestones(lot_id)
         item["delays"] = work.timeline(db, lot_id)
@@ -1463,7 +1472,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "list":
             rows = work_rows(db, state=args.state, assignee=args.assignee, limit=args.limit,
                              threshold=stagnation.stale_after(args.stale_after),
-                             freeze=getattr(args, "freeze", False))
+                             freeze=getattr(args, "freeze", False),
+                             repo=getattr(args, "git_dir", None),
+                             target=getattr(args, "freeze_target", None))
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -1494,7 +1505,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "show":
             from . import estimates, lot_measures, resolutions
-            item = work_detail(cfg, db, args.id)
+            item = work_detail(cfg, db, args.id,
+                               repo=getattr(args, "git_dir", None),
+                               target=getattr(args, "freeze_target", None))
             if item is None:
                 print(USAGE_HINT % ("lot %s not found" % args.id), file=sys.stderr)
                 return 1
@@ -2461,10 +2474,22 @@ def build_parser() -> argparse.ArgumentParser:
                               "covers the head (origin, provenance, explicit causes)")
     pw_list.add_argument("--stale-after", default=None,
                          help="work item is stale with no activity for (default 6h, L29)")
+    pw_list.add_argument("--git-dir", default=None, metavar="D",
+                         help="#1905: local repository used to carry a verdict across a "
+                              "mechanically constant rebase (with --freeze)")
+    pw_list.add_argument("--freeze-target", default=None, metavar="REF",
+                         help="#1905: shared target of the rebase (default: the lot's "
+                              "target, else origin/main)")
     pw_list.set_defaults(func=cmd_work)
     pw_show = work_sub.add_parser("show")
     pw_show.add_argument("id", type=int)
     pw_show.add_argument("--json", action="store_true")
+    pw_show.add_argument("--git-dir", default=None, metavar="D",
+                         help="#1905: local repository used to carry a verdict across a "
+                              "mechanically constant rebase")
+    pw_show.add_argument("--freeze-target", default=None, metavar="REF",
+                         help="#1905: shared target of the rebase (default: the lot's "
+                              "target, else origin/main)")
     pw_show.set_defaults(func=cmd_work)
     from . import work_dependencies
     work_dependencies.add_parser(work_sub, cmd_work)
