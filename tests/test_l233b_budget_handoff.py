@@ -330,6 +330,42 @@ class HandoffTest(_Handoff):
         out = self.hand(canons=[principal, secondaire])
         self.assertEqual([m["item"]["id"] for m in out], [intake["id"]])
 
+    def test_canon_charge_pas_lu_en_entier_replie_critique(self):
+        # #424 r8 (qa-01) : un canon configuré et chargé, mais pas lu en entier
+        # (manifeste invalide), garde l'identité de son dossier : son `owns` ne
+        # revendique plus la ligne du registre, et rien ne prouve que l'agent
+        # n'est d'aucun canon. Sans verdict connu, le repli est critique — la
+        # reprise ne tire pas l'agent de son canon par défaut (baisse muette).
+        from ameesh.canon import Finding
+
+        def canon(name, default, cards, findings=()):
+            return types.SimpleNamespace(
+                readable=True, is_default=default, scope_unread=False,
+                load_findings=list(findings), federation={},
+                agents=[types.SimpleNamespace(
+                    title=agent, fiche=types.SimpleNamespace(data={"roles": roles},
+                                                             path="", ref=""))
+                    for agent, roles in cards.items()],
+                owns=lambda c, name=name, default=default: (c or None) == name
+                or (default and not c),
+                agent=lambda n: None)
+        principal = canon("A", True, {})
+        # le manifeste de B aurait donné `org-B` ; illisible, il reste le dossier
+        secondaire = canon("checkout-B", False, {"claude1": ["implementation"]},
+                           [Finding("federation-invalid", "error", "manifeste illisible")])
+        self.team()
+        self.db.execute("UPDATE agent_registry SET canon = 'org-B' WHERE name = %s",
+                        ("claude1",))
+        intake = self.lot("export")
+        from ameesh import canon as canon_mod
+        with mock.patch.object(canon_mod, "configured",
+                               return_value=("A", "checkout-B")):   # les deux chargés
+            out = handoff.budget_handoff(self.cfg, self.db, now=self.now,
+                                         canons=[principal, secondaire], declared=(),
+                                         orchestras=[self.orch], budget_check=lambda a: "")
+        self.assertEqual(out, [])
+        self.assertEqual(self.assignee(intake), "claude1")
+
     def test_seulement_un_agent_claude_vers_un_agent_deepseek(self):
         self.agent("codex1", "codex", team="nexlink")
         self.pause("codex1")

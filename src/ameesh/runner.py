@@ -7045,12 +7045,59 @@ class Runner:
 
     def is_critical(self, name: str, agent=None) -> bool:
         """L242b : agent critique, jamais en pause budget tant qu'un compte a
-        de la marge (`auditor.is_critical`, partagé avec L233b)."""
-        from . import auditor as auditor_mod
-        return auditor_mod.is_critical(self.cfg, self.db, name,
-                                       getattr(self, "_audit_canons", ()),
-                                       declared=getattr(self, "_orchestrators_declared", ()),
-                                       agent=agent)
+        de la marge. L242c : déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS` :
+        la surcharge explicite ; `AMEESH_ALERT_ORCHESTRATORS`), sinon par un
+        rôle critique de sa fiche, dans son canon propriétaire seulement
+        (`critical_roles` de l'organisation, défaut orchestrateur, conception,
+        auditeur, relecture). Canon propriétaire illisible (#424 r1) : le
+        dernier verdict lu, sinon critique (#424 r6). Canon propriétaire
+        configuré sur aucun canon de l'hôte (#424 r7) : non critique."""
+        if name in (getattr(self.cfg, "critical_agents", None) or ()):
+            return True
+        if name in getattr(self, "_orchestrators_declared", ()):
+            return True
+        from . import canon as canon_mod, sous_utilisation as su
+        canons = getattr(self, "_audit_canons", ())
+        if "_critical_memory" not in self.__dict__:
+            # #424 r2 : les verdicts lus avant un redémarrage ; None si le
+            # cache n'est pas digne de confiance (#424 r3 : tout y est inconnu)
+            self._critical_memory = su.critical_memory(self.cfg)
+            self._critical_known = {}
+        known = self._critical_known
+        last = known[name] if name in known else su.remembered(self._critical_memory, name)
+        # le registre n'est lu que pour un nom candidat, comme `is_auditor`
+        # (tous les canons configurés chargés : un absent ne dit rien)
+        if (getattr(self, "_canon_complete", True) and last is not True
+                and last != su.UNKNOWN
+                and all(su.fully_read(c) for c in canons)
+                and name not in su.critical_candidates(canons)):
+            return False
+        row = agent if agent is not None else registry.get(self.db, name)
+        foreign = su.foreign_canon(dict(row or {}, name=name), canons,
+                                   complete=getattr(self, "_canon_complete", False))
+        if foreign is not None:
+            # #424 r7 : état connu, pas une panne ; jamais retenu au cache
+            if su.warn_foreign(name):
+                log_async("[%s] owner canon %s is configured on no canon of this host:"
+                          " not critical" % (name, foreign))
+            return False
+        verdict, unknown = su.critical_verdict(
+            dict(row or {}, name=name), canons,
+            configured=bool(canon_mod.configured(self.cfg)), known=last)
+        if not unknown:
+            # #424 r3 : la mémoire ne suit qu'une écriture réussie (sinon
+            # nouvel essai au sondage suivant) ; #424 r4 : comparé au disque
+            # à chaque verdict, jamais à la mémoire (`resume` a pu l'écrire)
+            if (su.remember_critical(self.cfg, name, verdict)
+                    or su._memory_path(self.cfg) is None):
+                known[name] = verdict     # sans dossier d'état : la mémoire seule
+        elif self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
+            self._critical_held[name] = verdict
+            log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
+                      % (name, "critical" if verdict else "not critical",
+                         "last known" if isinstance(last, bool) else
+                         "unknown: fail-closed"))
+        return verdict
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:

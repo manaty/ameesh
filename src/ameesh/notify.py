@@ -116,6 +116,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "critical_budget_pause",
                  # #1268 : un agent critique enchaîne les échecs de tour réels
                  "critical_turn_failures",
+                 # L242c : canon illisible, rôles critiques tenus
+                 "critical_roles_unreadable",
                  # #330: an owner key registered or replaced lately
                  "owner_key_registered",
                  # L160e2: a merge queue no longer moves
@@ -216,6 +218,7 @@ TYPE_LABELS = {
     "critical_budget_pause": "critical agent paused on budget",
     # #1268 : deux échecs de tour réels d'affilée sur un agent critique
     "critical_turn_failures": "critical agent failing turns",
+    "critical_roles_unreadable": "canon unreadable: critical roles held",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",
