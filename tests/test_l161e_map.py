@@ -9,6 +9,7 @@ chaque processus ; `tests/support.py` relève les tables par classe ;
 """
 from __future__ import annotations
 
+import ast
 import datetime
 import gzip
 import importlib.util
@@ -557,6 +558,117 @@ class BoutEnBoutTest(unittest.TestCase):
                          ["test_bin_launchers"])
         self.assertGreaterEqual(c["mesure"]["processus"], 2)
         self.assertEqual(c["mesure"]["processus_sans_contexte"], 0)
+
+
+# --------------------------------------------------------------------------
+# #1632 : contrat d'attribution de la mesure
+# --------------------------------------------------------------------------
+
+_ARBRES: dict = {}
+
+
+def _fichier_module(nom: str):
+    """Le fichier d'un module `tests.x…` du dépôt, None s'il n'existe pas."""
+    base = REPO.joinpath(*nom.split("."))
+    for chemin in (base.with_suffix(".py"), base / "__init__.py"):
+        if chemin.is_file():
+            return chemin
+    return None
+
+
+def _arbre(chemin):
+    if chemin not in _ARBRES:
+        _ARBRES[chemin] = ast.parse(chemin.read_text(encoding="utf-8"))
+    return _ARBRES[chemin]
+
+
+def _liens(chemin) -> dict:
+    """Nom lié au niveau module -> (module, nom d'origine) pour les
+    `from … import …` (relatifs compris). Seul le niveau module compte : une
+    importation dans une fonction ne lie rien pour le collecteur unittest."""
+    liens = {}
+    for node in _arbre(chemin).body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        base = node.module or ""
+        if node.level:
+            base = "tests" + (f".{base}" if base else "")
+        for alias in node.names:
+            liens[alias.asname or alias.name] = (base, alias.name)
+    return liens
+
+
+def _classe(chemin, nom: str):
+    for node in _arbre(chemin).body:
+        if isinstance(node, ast.ClassDef) and node.name == nom:
+            return node
+    return None
+
+
+def _a_des_tests(module: str, nom: str, vus=None) -> bool:
+    """La classe `nom` de `module` porte-t-elle au moins un test (le sien ou un
+    hérité) — c'est-à-dire unittest la collecterait-il ? Une base hors du
+    dépôt de test (`unittest.TestCase`, `tests.support`) est supposée sans
+    test : le témoin ne mord que sur ce qu'il sait lire."""
+    vus = set() if vus is None else vus
+    if (module, nom) in vus:
+        return False
+    vus.add((module, nom))
+    chemin = _fichier_module(module)
+    if chemin is None:
+        return False
+    noeud = _classe(chemin, nom)
+    liens = _liens(chemin)
+    if noeud is None:
+        return _a_des_tests(*liens[nom], vus) if nom in liens else False
+    for item in noeud.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and item.name.startswith("test"):
+            return True
+    for base in noeud.bases:
+        if isinstance(base, ast.Attribute):   # _x.BaseTest
+            valeur = base.value
+            if isinstance(valeur, ast.Name) and valeur.id in liens:
+                module_base, nom_base = liens[valeur.id]
+                if _fichier_module(f"{module_base}.{nom_base}") \
+                        and _a_des_tests(f"{module_base}.{nom_base}", base.attr, vus):
+                    return True
+            continue
+        nom_base = base.id if isinstance(base, ast.Name) else None
+        if nom_base is None:
+            continue
+        if _classe(chemin, nom_base) is not None:
+            if _a_des_tests(module, nom_base, vus):
+                return True
+        elif nom_base in liens and _a_des_tests(*liens[nom_base], vus):
+            return True
+    return False
+
+
+class AttributionContractTest(unittest.TestCase):
+    """#1632 : `scripts/test-parts.py` attribue un test au module qui l'a DÉFINI
+    (`type(test).__module__`, `_module_of`), et `map.couverture_incomplete`
+    refuse une carte dont un module est mesuré hors de la part que le plan lui
+    assigne. Lier au niveau module une classe de test CONCRÈTE venue d'un autre
+    module la fait exécuter — et mesurer — dans la part du module importateur,
+    alors que le plan l'assigne au module d'origine : « mesure hors de sa part »,
+    carte jamais publiée. L'utiliser comme base se fait par le module
+    (`from . import test_x as _x` puis `_x.BaseTest`), qui ne collecte rien.
+    Une base abstraite (sans test, comme `_Base`) reste libre de tout lien :
+    unittest la collecte mais n'en tire aucun test."""
+
+    def test_aucune_classe_de_test_concrete_etrangere_liee_au_module(self):
+        fautes = []
+        for fichier in sorted((REPO / "tests").glob("test_*.py")):
+            module = f"tests.{fichier.stem}"
+            for lie, (cible, nom) in sorted(_liens(fichier).items()):
+                if cible == module:
+                    continue
+                if _a_des_tests(cible, nom):
+                    fautes.append(
+                        f"{fichier.name} : {lie} = {cible}.{nom} porte des tests ; "
+                        "lie le module et non la classe")
+        self.assertEqual([], fautes)
 
 
 if __name__ == "__main__":
