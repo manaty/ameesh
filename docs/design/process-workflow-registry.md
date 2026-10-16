@@ -5,6 +5,12 @@ Slice A (#1918): the strict `process_workflow` compiler. Slice C: finite
 verifiers and installed types. This document publishes the **seam** C plugs
 into and the invariants B guarantees.
 
+Slice A accepts several **distinct targets under one guard from the same
+stage** — the reference card has `draft -> backlog` and `draft -> sprint`
+under `planning`. The command carries `to_stage`, and the registry checks the
+exact `(to_stage, guard)` edge from `from_stage`; only an exact duplicate
+`(from, to, guard)` is refused (`edge-duplicate`).
+
 ## What B adds to the repository
 
 * additive migration `0452_process_workflow_registry`:
