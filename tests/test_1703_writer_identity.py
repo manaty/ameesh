@@ -34,7 +34,8 @@ class WriterProjectTest(unittest.TestCase):
         with mock.patch.object(merge_queue, "radar_project", return_value=None):
             got = merge_queue.writer_project(None, self.repo, "  ameesh ")
         self.assertEqual(got.name, "ameesh")
-        self.assertEqual(land.lock_key(got, "origin/main"), "ameesh:origin/main")
+        # #1374 names the target by its canonical branch: `origin/main` is `main`.
+        self.assertEqual(land.lock_key(got, "origin/main"), "ameesh:main")
 
     def test_an_empty_app_refuses_instead_of_inventing_a_key(self):
         for app in ("", "   ", None):
@@ -50,4 +51,5 @@ class WriterProjectTest(unittest.TestCase):
             "gates": ["true"]}}})
         got = merge_queue.writer_project(cfg, self.repo, "ameesh")
         self.assertEqual(got.name, "nexlink")
-        self.assertEqual(land.lock_key(got, "origin/develop"), "nexlink:origin/develop")
+        # idem : la clé porte la cible canonique (`origin/develop` → `develop`).
+        self.assertEqual(land.lock_key(got, "origin/develop"), "nexlink:develop")
