@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import ci, cli, hostcheck, mail, registry, storage, work
 from ameesh.runner import AgentWorker, Runner
@@ -224,10 +225,16 @@ class DoctorHooksTest(unittest.TestCase):
         return {"hooks": {event: [{"hooks": [{"type": "command", "command": command}]}]
                           for event, command in events.items()}}
 
-    def _lines(self, home: str, harness: str = "deepseek") -> dict:
+    def _lines(self, home: str, harness: str = "deepseek",
+               manager_path: str = "") -> dict:
+        """Les lignes du doctor ; `manager_path` remplace le PATH du
+        gestionnaire systemd (vide : celui de la session du doctor, le
+        comportement d'avant #514 N2)."""
         variable = {"deepseek": "DSH_HOME", "codex": "CODEX_HOME",
                     "claude": "CLAUDE_CONFIG_DIR"}[harness]
-        return hostcheck.hook_lines(None, [harness], environ={variable: home})
+        with mock.patch.object(hostcheck.adapters, "systemd_manager_path",
+                               return_value=manager_path):
+            return hostcheck.hook_lines(None, [harness], environ={variable: home})
 
     def test_hook_commands_reads_the_nested_format(self):
         document = self._document({"PostToolUse": "bin/agent-mail hook deepseek"})
@@ -247,6 +254,52 @@ class DoctorHooksTest(unittest.TestCase):
         texte = "\n".join(out["lines"])
         self.assertIn(missing, texte)
         self.assertIn("127", texte)
+
+    def test_binary_missing_sous_le_path_du_gestionnaire_est_ko(self):
+        """#514 N2 : le gestionnaire systemd peut lancer les harnais avec SON
+        PATH ; un binaire absent là sort en 127, même s'il est visible ici."""
+        home = self._home(binary=True)
+        self._write(home, self._document({"PostToolUse": "agent-mail hook deepseek",
+                                          "Stop": "agent-mail hook deepseek"}))
+        with mock.patch.dict(os.environ, {"PATH": home}):
+            out = self._lines(home, manager_path="/nowhere-l514")
+        self.assertFalse(out["ok"])
+        texte = "\n".join(out["lines"])
+        self.assertIn("systemd manager PATH", texte)
+        self.assertIn("127", texte)
+
+    def test_binary_visible_seulement_sous_le_gestionnaire_est_ko(self):
+        """#1395 (avis bloquant cx2) : la présence sous le gestionnaire ne
+        prouve pas que le hook tournera — le PATH réel du service est celui de
+        son unité ; absent de la session, le binaire reste un défaut."""
+        home = self._home(binary=True)
+        self._write(home, self._document({"PostToolUse": "agent-mail hook deepseek",
+                                          "Stop": "agent-mail hook deepseek"}))
+        with mock.patch.dict(os.environ, {"PATH": "/nowhere-l514"}):
+            out = self._lines(home, manager_path=home)
+        self.assertFalse(out["ok"], out["lines"])
+        texte = "\n".join(out["lines"])
+        self.assertIn("this session's PATH", texte)
+        self.assertIn("127", texte)
+
+    def test_binary_visible_dans_les_deux_contextes_est_ok(self):
+        home = self._home(binary=True)
+        self._write(home, self._document({"PostToolUse": "agent-mail hook deepseek",
+                                          "Stop": "agent-mail hook deepseek"}))
+        with mock.patch.dict(os.environ, {"PATH": home}):
+            out = self._lines(home, manager_path=home)
+        self.assertTrue(out["ok"], out["lines"])
+        self.assertIn("2 event(s)", "\n".join(out["lines"]))
+
+    def test_binary_missing_resout_le_path_donne(self):
+        """`_binary_missing` cherche un nom seul sous le PATH reçu ; vide ou
+        absent, il retombe sur le PATH ambiant (comme avant #514 N2)."""
+        home = self._home(binary=True)
+        self.assertFalse(hostcheck._binary_missing("agent-mail", path=home))
+        self.assertTrue(hostcheck._binary_missing("agent-mail", path="/nowhere-l514"))
+        with mock.patch.dict(os.environ, {"PATH": home}):
+            self.assertFalse(hostcheck._binary_missing("agent-mail"))
+            self.assertFalse(hostcheck._binary_missing("agent-mail", path=""))
 
     def test_found_command_and_all_events(self):
         home = self._home(binary=True)
