@@ -61,6 +61,56 @@ class Accounts(interface.Accounts):
                 (host, harness, depart, to, kind, reason, agent))
         return True
 
+    def switch_guarded(self, host, harness, *, expected, to, kind, reason, agent,
+                       now, hold_reason=None, hold_until=None) -> bool:
+        """#1883 : la bascule ET la retenue du compte quitté, sous le verrou."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "select account, forced from account_active"
+                " where host = %s and harness = %s for update", (host, harness))
+            # une retenue VALIDE sur la cible refuse la bascule (lue sous le
+            # verrou : une publication concurrente est visible ou l'est après
+            # nous, jamais entre les deux)
+            garde = tx.query(
+                "select 1 from account_holds where host = %s and harness = %s"
+                " and account = %s and until_ts is not null and until_ts > %s",
+                (host, harness, to, now))
+            if garde:
+                return False
+            if rows:
+                ligne = rows[0]
+                if expected is not None and ligne["account"] != expected:
+                    return False
+                if kind != "config" and ligne["forced"]:
+                    return False  # un forçage manuel n'est jamais défait par l'automate
+                if ligne["account"] == to:
+                    return False
+                tx.execute(
+                    "update account_active set account = %s, forced = false,"
+                    " updated_at = now() where host = %s and harness = %s",
+                    (to, host, harness))
+                depart = ligne["account"]
+            else:
+                if expected is not None:
+                    return False
+                tx.execute(
+                    "insert into account_active (host, harness, account, forced)"
+                    " values (%s, %s, %s, false)", (host, harness, to))
+                depart = None
+            tx.execute(
+                "insert into account_switches (host, harness, from_account, to_account,"
+                " kind, reason, agent) values (%s, %s, %s, %s, %s, %s, %s)",
+                (host, harness, depart, to, kind, reason, agent))
+            if hold_reason is not None and depart is not None:
+                tx.execute(
+                    "insert into account_holds (host, harness, account, until_ts, reason)"
+                    " values (%s, %s, %s, %s, %s)"
+                    " on conflict (host, harness, account) do update"
+                    " set until_ts = excluded.until_ts, reason = excluded.reason,"
+                    " created_at = now()",
+                    (host, harness, depart, hold_until, hold_reason))
+        return True
+
     def set_auto(self, host, harness, *, reason, expected=None) -> bool:
         with self.db.transaction() as tx:
             rows = tx.query(
