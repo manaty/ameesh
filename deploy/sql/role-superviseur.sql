@@ -309,6 +309,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- L78 (0368): conversation cursors and state, without message content.
     ('conversation_heads', ARRAY['agent', 'seq']),
+    ('agent_peek', ARRAY['agent', 'host', 'lease_epoch', 'captured_at']),
     ('conversation_log', ARRAY[
         'agent', 'seq', 'session', 'turn', 'kind', 'author', 'truncated',
         'event_id', 'created_at', 'project', 'lot', 'thread_entry'
