@@ -38,7 +38,8 @@
 #
 # Paramètres lus dans $BASCULE_ENV (défaut ~/.config/ameesh/bascule.env, celui
 # de la bascule L57) : VM (adresse WireGuard), PERSONAS_VM (personas servies
-# par le serveur). Aucun secret n'est lu ni affiché.
+# par le serveur ; liste vide admise, un hôte sans exécutant). Aucun secret
+# n'est lu ni affiché.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -60,7 +61,10 @@ if [ "$MODE" = agents ]; then
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
   [[ $HOTE_AGENTS =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "HOTE_AGENTS invalide" >&2; exit 2; }
 else
-  : "${VM:?VM manquant dans $BASCULE_ENV}" "${PERSONAS_VM:?PERSONAS_VM manquant dans $BASCULE_ENV}"
+  # #1928 : PERSONAS_VM défini mais vide est une configuration valide (hôte
+  # sans exécutant, ce que staging.sh écrit) ; les boucles serveur savent être
+  # vides. Seule une variable absente est refusée.
+  : "${VM:?VM manquant dans $BASCULE_ENV}" "${PERSONAS_VM?PERSONAS_VM manquant dans $BASCULE_ENV}"
 fi
 
 ICI="$(cd "$(dirname "$0")" && pwd)"
