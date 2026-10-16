@@ -104,6 +104,10 @@ FERMEES = {
     # (arbitrage pilote du 16/10) : la table reste fermée, aucun GRANT modifié.
     "account_identities": {"host", "harness", "account", "identity",
                            "first_seen", "last_seen"},
+    # #1922 (0452) : registre Process des workflows (révision/étape, reçus d'étape) —
+    # fermé tant que le contrat des rôles superviseur ne le classe pas (paquet du 16/10)
+    "work_items": {"workflow_ref", "workflow_stage", "workflow_version"},
+    "work_item_events": {"command_id", "evidence", "workflow_stage", "workflow_version"},
 }
 EXCLUES = {rel: SIGNATURES.get(rel, set()) | CONTENUS.get(rel, set()) | FERMEES.get(rel, set())
            for rel in set(SIGNATURES) | set(CONTENUS) | set(FERMEES)}
