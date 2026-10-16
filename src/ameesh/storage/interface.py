@@ -3035,14 +3035,6 @@ class TurnResources(Domain):
         exécuteur mort les a laissées derrière lui."""
 
     @abc.abstractmethod
-    def turn_at(self, host: str, ts: float) -> dict | None:
-        """L73/#2003 : la ligne du tour de `host` dont l'intervalle
-        [`started_ts`, `ended_ts`] contient `ts` (epoch), ou None. Elle
-        attribue un volume Docker anonyme créé pendant ce tour ; une ligne en
-        délai de grâce (`ended_at` posé, toujours `running`) ne couvre plus
-        rien après son `ended_at`."""
-
-    @abc.abstractmethod
     def churn(self, since_ts: float, short_s: float) -> list[dict]:
         """L125 : par agent (ordre du nom), les tours FINIS lancés depuis
         `since_ts` : `agent`, `turns`, `short_turns` (durée sous `short_s`

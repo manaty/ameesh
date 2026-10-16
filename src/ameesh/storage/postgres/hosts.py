@@ -431,17 +431,6 @@ class TurnResources(interface.TurnResources):
             "   AND coalesce(ended_at, started_at) < now() - make_interval(secs => %s)"
             + where + " ORDER BY started_at, id", tuple(params))
 
-    def turn_at(self, host, ts) -> dict | None:
-        # L73/#2003 : l'intervalle qui contient `ts` ; `ended_at` absent
-        # (tour en cours sans délai de grâce) couvre jusqu'à maintenant.
-        rows = self.db.query(
-            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
-            " WHERE host = %s AND started_at <= to_timestamp(%s)"
-            "   AND (ended_at IS NULL OR ended_at >= to_timestamp(%s))"
-            " ORDER BY started_at DESC, id DESC LIMIT 1",
-            (host, float(ts), float(ts)))
-        return rows[0] if rows else None
-
     def churn(self, since_ts, short_s) -> list[dict]:
         return self.db.query(
             """

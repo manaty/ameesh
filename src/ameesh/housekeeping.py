@@ -50,15 +50,18 @@ l'humain. Cinq familles, cinq règles :
   with no process of the user inside; never in a main checkout.
 
 * **Volumes Docker sans conteneur** (L73/#2003, [`reap_volumes`]) : seuls
-  ceux que le mesh peut ATTRIBUER sont récoltés après
-  `docker_volume_idle` (24 h) — un volume nommé étiqueté `ameesh.bench` par
-  `scripts/pg-up.sh`, ou un volume anonyme (`com.docker.volume.anonymous`)
-  créé pendant un tour d'ameesh de cet hôte (`turn_resources`). Un volume
-  nommé sans étiquette, un volume anonyme d'un instant sans tour enregistré,
-  une date de création illisible d'un volume anonyme : listés dans `others`
-  (borné) avec la commande `docker volume rm`, JAMAIS supprimés (précédent
-  #411 : les volumes nommés existants sont conservés) ; `docker volume rm`
-  refuse de lui-même un volume encore monté.
+  ceux dont le mesh a DÉCLARÉ le cycle de vie jetable sont récoltés —
+  l'étiquette `ameesh.bench=disposable`, posée par `scripts/pg-up.sh` quand
+  l'appelant a déclaré le banc de lot jetable (`AMEESH_PG_DISPOSABLE=1`) —
+  et seulement après `docker_volume_idle` (24 h) d'ABSENCE
+  CONTINUE, mesurée par les relevés successifs du ménage (jamais l'âge de
+  création). Le banc partagé persistant (`ameesh-pg-data`), tout volume nommé
+  sans étiquette, tout volume anonyme (`com.docker.volume.anonymous`, sans
+  provenance du mesh : il part avec le conteneur étiqueté qui l'a créé,
+  `rm -f -v`) : listés dans `others` (borné) avec la commande
+  `docker volume rm`, JAMAIS supprimés (précédent #411 : les volumes nommés
+  existants sont conservés) ; `docker volume rm` refuse de lui-même un volume
+  encore monté.
 
 * **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
   `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
@@ -144,12 +147,14 @@ TMP_TOP = 5
 #: #1547 (N3) : conteneurs hors tour détaillés dans le relevé de ménage — le
 #: journal garde le compte total (`others_total`), jamais une liste non bornée
 OTHERS_TOP = 20
-#: L73/#2003 : délai (secondes) sans conteneur avant qu'un volume Docker
-#: ATTRIBUÉ (volume de banc étiqueté, ou volume anonyme d'un tour fini) ne
-#: soit récolté. Les volumes non attribués ne sont jamais supprimés.
+#: L73/#2003 : délai (secondes) d'ABSENCE CONTINUE, mesuré par les relevés
+#: successifs du ménage, avant qu'un volume Docker DÉCLARÉ JETABLE
+#: (`ameesh.bench=disposable`) ne soit récolté. L'âge de création n'en tient
+#: pas lieu ; les volumes non déclarés ne sont jamais supprimés.
 DEFAULT_DOCKER_VOLUME_IDLE_S = 24 * 3600.0
-#: #2003 : volumes Docker non attribués détaillés dans le relevé — le journal
-#: garde le compte total, jamais une liste non bornée (comme `OTHERS_TOP`)
+#: #2003 : volumes Docker non déclarés jetables détaillés dans le relevé — le
+#: journal garde le compte total, jamais une liste non bornée (comme
+#: `OTHERS_TOP`)
 VOLUMES_TOP = 20
 #: L162/L230 : début de la raison rendue quand l'OS ne dit pas qui tient une
 #: entrée ; l'hôte qui a déclaré des processus illisibles sans doute
@@ -235,10 +240,11 @@ class Policy:
     tmpfs_alert: float = DEFAULT_TMPFS_ALERT
     docker_orphan_volumes_alert: int = 100
     docker_build_cache_alert: int = 20 * 1024 ** 3
-    #: #2003 : récolter les volumes Docker ATTRIBUÉS (banc étiqueté, volume
-    #: anonyme d'un tour fini) ; `false` : aucun volume n'est jamais supprimé
+    #: #2003 : récolter les volumes Docker DÉCLARÉS JETABLES par le mesh
+    #: (`ameesh.bench=disposable`) ; `false` : aucun volume n'est supprimé
     docker_volumes: bool = True
-    #: #2003 : inactivité (secondes) sans conteneur avant cette récolte
+    #: #2003 : absence continue (secondes, mesurée par les relevés) avant
+    #: cette récolte
     docker_volume_idle: float = DEFAULT_DOCKER_VOLUME_IDLE_S
     redirect: bool = True
     xdg_cache: bool = False
@@ -3040,28 +3046,62 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     return out
 
 
+#: #2003 : actions du journal qui portent un épisode d'absence continue d'un
+#: volume (le volume était sans conteneur à ce relevé-là)
+_VOLUME_EPISODE_ACTIONS = ("waiting", "kept")
+
+
+def _volume_episode(previous: dict | None, created: float | None) -> float | None:
+    """#2003 : début de l'épisode d'absence continue d'un volume, tel que le
+    dernier relevé du journal l'a laissé ; None quand l'épisode commence à ce
+    passage — aucune ligne, ligne d'une autre action (une reprise a refermé
+    l'épisode), identité de volume illisible ou différente (le nom a été
+    recréé : c'est un autre volume)."""
+    if not previous or created is None:
+        return None
+    if (previous.get("action") or "") not in _VOLUME_EPISODE_ACTIONS:
+        return None
+    data = previous.get("data") or {}
+    try:
+        if float(data.get("created")) != float(created):
+            return None
+        return float(data.get("episode_since"))
+    except (TypeError, ValueError):
+        return None
+
+
 def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = False,
                  now: float | None = None) -> dict:
     """Volumes Docker de l'hôte (L73/#2003) : récolte les volumes SANS
-    conteneur (arrêtés compris, `volume ls --filter dangling=true`) que le
-    mesh peut ATTRIBUER, après `policy.docker_volume_idle` :
+    conteneur (arrêtés compris, `volume ls --filter dangling=true`) dont le
+    mesh a DÉCLARÉ le cycle de vie jetable — l'étiquette `ameesh.bench`
+    [`containers.BENCH_DISPOSABLE`] que `scripts/pg-up.sh` pose sur le volume
+    d'un banc de lot quand son appelant l'a déclaré jetable
+    (`AMEESH_PG_DISPOSABLE=1`) — et seulement après `policy.docker_volume_idle`
+    d'ABSENCE CONTINUE.
 
-    * un volume nommé étiqueté `ameesh.bench` (`scripts/pg-up.sh`) est un banc
-      de test du mesh ;
-    * un volume anonyme (`com.docker.volume.anonymous`) créé pendant un tour
-      d'ameesh de CET hôte (intervalle de `turn_resources`, `turn_at`) suit la
-      règle des conteneurs : récolté quand ce tour n'est plus `running`.
+    La provenance n'est jamais déduite d'une proximité d'heure : un volume
+    anonyme (`com.docker.volume.anonymous`) ne porte aucune identité du mesh
+    et n'est jamais supprimé ici (les conteneurs étiquetés d'un tour partent
+    avec leurs volumes anonymes, `rm -f -v`) ; le banc partagé et persistant
+    (`ameesh-pg-data`) ne porte pas l'étiquette et n'est jamais récolté.
 
-    Les autres — volume nommé sans étiquette, volume anonyme créé hors de tout
-    tour enregistré de cet hôte, date de création illisible — ne sont JAMAIS
-    supprimés : listés dans `others` (borné à `VOLUMES_TOP`, compte total dans
-    `others_total`) avec la commande `docker volume rm` qu'un humain peut
-    décider (précédent #411 : les volumes nommés existants sont conservés).
-    Un volume de banc étiqueté dont la date est illisible est, lui, signalé
-    dans `ours` sans suppression : la garde d'âge ne peut pas être vérifiée.
-    `docker volume rm` refuse de lui-même un volume encore monté : la course
-    avec un `docker run` qui le reprend est fermée par Docker. Seul `docker`
-    est couvert (comme la mesure #411). `dry_run` : le plan seulement.
+    Le délai sans conteneur se mesure sur les relevés successifs : chaque
+    passage journalise l'épisode (`episode_since`, avec l'identité `created`
+    du volume) ; un premier relevé ne supprime donc jamais, une reprise du
+    volume (`referenced`) referme l'épisode, un volume recréé sous le même nom
+    en ouvre un nouveau. Le journal est celui du ménage (30 jours de
+    rétention) : au-delà, l'épisode repart, ce qui ne fait que retarder.
+
+    Les autres volumes — anonyme, nommé sans étiquette, étiquette non
+    jetable — ne sont JAMAIS supprimés : listés dans `others` (borné à
+    `VOLUMES_TOP`, compte total dans `others_total`) avec la commande
+    `docker volume rm` qu'un humain peut décider (précédent #411 : les volumes
+    nommés existants sont conservés). Un volume jetable dont l'identité est
+    illisible est signalé dans `ours` sans suppression. `docker volume rm`
+    refuse de lui-même un volume encore monté : la course avec un `docker run`
+    qui le reprend est fermée par Docker. Seul `docker` est couvert (comme la
+    mesure #411). `dry_run` : le plan seulement, aucun épisode n'est écrit.
 
     Rend `{entries, plan, ours, others, others_total}` ; `ours`/`others` à
     None si le moteur ne répond pas, comme [`reap_containers`]."""
@@ -3073,73 +3113,86 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
     binary = os.path.basename(getattr(runtime, "binary", "docker") or "docker")
     if binary != "docker" or not hasattr(runtime, "volumes"):
         return out
-    rows = runtime.volumes(dangling=True)
-    if rows is None:
+    all_rows = runtime.volumes(dangling=False)
+    dangling_rows = runtime.volumes(dangling=True)
+    if all_rows is None or dangling_rows is None:
         return out
     now = time.time() if now is None else float(now)
     idle = max(0.0, float(policy.docker_volume_idle))
-    candidates = [row for row in rows
-                  if containers_mod.BENCH_LABEL in (row.get("labels") or {})
-                  or containers_mod.ANONYMOUS_LABEL in (row.get("labels") or {})]
-    created = runtime.volume_created([row["name"] for row in candidates]) \
-        if candidates and hasattr(runtime, "volume_created") else {}
-    if created is None:               # relevé illisible : aucune attribution
-        created = {}
-    turns = storage.of(db).turn_resources
+    free = {row["name"] for row in dangling_rows}
     ours, others, others_total = [], [], 0
 
-    def _other(row: dict, name: str, base: dict, reason: str) -> None:
+    def _other(row: dict, name: str, reason: str) -> None:
         nonlocal others_total
         others_total += 1
         if len(others) < VOLUMES_TOP:
-            others.append(dict(
-                base, driver=row.get("driver"), detail=reason,
-                command="%s volume rm %s" % (binary, shlex.quote(name))))
+            others.append({"kind": "volume", "path": name, "driver": row.get("driver"),
+                           "detail": reason,
+                           "command": "%s volume rm %s" % (binary, shlex.quote(name))})
 
-    for row in rows:
-        name = row["name"]
-        labels = row.get("labels") or {}
-        base = {"kind": "volume", "path": name}
-        bench = labels.get(containers_mod.BENCH_LABEL)
-        anonymous = containers_mod.ANONYMOUS_LABEL in labels
-        if not bench and not anonymous:
-            _other(row, name, base,
-                   "no container references it; not attributable to the mesh")
+    declared = []
+    for row in all_rows:
+        label = (row.get("labels") or {}).get(containers_mod.BENCH_LABEL)
+        if label is None:
             continue
-        stamp = created.get(name)
-        if anonymous and not bench:
-            if stamp is None:
-                _other(row, name, base,
-                       "anonymous volume: creation time unreadable")
-                continue
-            turn = turns.turn_at(host, stamp)
-            if turn is None:
-                _other(row, name, base,
-                       "anonymous volume created outside any recorded turn of this host")
-                continue
-        elif stamp is None:
-            why = ("bench volume %s: creation time unreadable: flagged only" % bench)
+        if label == containers_mod.BENCH_DISPOSABLE:
+            declared.append(row)
+        elif row["name"] in free:
+            _other(row, row["name"],
+                   "labelled %s=%s: not declared disposable by the mesh"
+                   % (containers_mod.BENCH_LABEL, label))
+    for row in dangling_rows:
+        labels = row.get("labels") or {}
+        if containers_mod.BENCH_LABEL in labels:
+            continue                    # déclaré (plus bas) ou déjà signalé
+        if containers_mod.ANONYMOUS_LABEL in labels:
+            _other(row, row["name"],
+                   "anonymous volume: no mesh provenance (never deleted)")
+        else:
+            _other(row, row["name"],
+                   "no container references it; not declared disposable by the mesh")
+
+    previous: dict = {}
+    if db is not None:
+        try:
+            for line in storage.of(db).housekeeping.latest_by_path(host or None, "volume"):
+                if line.get("path"):
+                    previous[str(line["path"])] = line
+        except Exception:               # journal illisible : chaque épisode repart
+            previous = {}
+    stamps = runtime.volume_created([row["name"] for row in declared]) \
+        if declared and hasattr(runtime, "volume_created") else {}
+    if stamps is None:                  # inspection illisible : aucune identité
+        stamps = {}
+    for row in declared:
+        name = row["name"]
+        base = {"kind": "volume", "path": name}
+        stamp = stamps.get(name)
+        if name not in free:
+            # repris par un conteneur : l'épisode d'absence est refermé
+            if _volume_episode(previous.get(name), stamp) is not None:
+                out["entries"].append(dict(
+                    base, action="referenced",
+                    detail="volume %s is referenced again: the absence episode is closed" % name,
+                    data={"created": stamp}))
+            continue
+        if stamp is None:
+            why = "declared disposable: creation identity unreadable: flagged only"
             ours.append(dict(base, action="signalé", detail=why))
             out["plan"].append(dict(base, action="signalé", detail=why))
             continue
-        age = now - stamp
-        if bench:
-            attribution = "bench volume %s" % bench
-        else:
-            agent = turn.get("agent")
-            base = dict(base, agent=agent)
-            if turn.get("status") == "running":
-                detail = "turn %s in progress" % str(turn.get("turn_id"))[:8]
-                ours.append(dict(base, action="attend", detail=detail))
-                continue
-            attribution = "anonymous volume of turn %s (%s)" % (
-                str(turn.get("turn_id"))[:8], agent or "?")
-        if age < idle:
-            detail = "%s; no container for %s (under %s)" % (
-                attribution, fmt_idle(age), fmt_idle(idle))
+        since = _volume_episode(previous.get(name), stamp)
+        if since is None:
+            since = now
+        absence = max(0.0, now - since)
+        if absence < idle:
+            detail = "declared disposable; no container for %s (under %s)" % (
+                fmt_idle(absence), fmt_idle(idle))
+            out["entries"].append(dict(base, action="waiting", detail=detail,
+                                       data={"created": stamp, "episode_since": since}))
             ours.append(dict(base, action="attend", detail=detail))
             continue
-        why = "%s; no container for %s" % (attribution, fmt_idle(age))
+        why = "declared disposable; no container for %s" % fmt_idle(absence)
         out["plan"].append(dict(base, action="suppression", detail=why))
         if dry_run:
             ours.append(dict(base, action="suppression", detail=why))
@@ -3148,7 +3201,7 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
         entry = dict(base, action="removed" if ok else "kept",
                      detail=("%s: %s volume rm" % (why, binary)) if ok
                      else "%s: deletion refused — %s" % (why, error),
-                     data={"driver": row.get("driver"), "labels": labels})
+                     data={"created": stamp, "episode_since": since})
         out["entries"].append(entry)
         ours.append(entry)
     out["ours"] = ours
@@ -3200,8 +3253,9 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
     * conteneurs des tours d'ameesh finis (L73, `reap_containers`) ;
     * volumes Docker sans conteneur (L73/#2003, `reap_volumes`) : ceux que le
-      mesh peut attribuer sont récoltés après `docker_volume_idle`, les
-      autres signalés avec leur commande, jamais supprimés ;
+      mesh a déclarés jetables (`ameesh.bench=disposable`) sont récoltés après
+      `docker_volume_idle` d'absence continue, les autres signalés avec leur
+      commande, jamais supprimés ;
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
       attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
       abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
@@ -3408,9 +3462,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
-    # 4b. #2003 : volumes Docker sans conteneur — attribués (banc étiqueté,
-    #     volume anonyme d'un tour fini de cet hôte) récoltés après
-    #     `docker_volume_idle` ; les autres signalés, jamais supprimés
+    # 4b. #2003 : volumes Docker sans conteneur — ceux que le mesh a déclarés
+    #     jetables (`ameesh.bench=disposable`, banc de lot) récoltés après
+    #     `docker_volume_idle` d'absence continue ; les autres signalés,
+    #     jamais supprimés
     volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now)
     entries += volumes["entries"]
     plan += volumes["plan"]
@@ -3526,8 +3581,8 @@ def print_report(report: dict) -> None:
     volumes = report.get("volumes") or {}
     docker = (report.get("measure") or {}).get("docker_storage")
     if docker:
-        print("  Docker storage (orphan count reported; only volumes ATTRIBUTED to this "
-              "mesh are reaped, after the idle delay): "
+        print("  Docker storage (orphan count reported; only volumes this mesh DECLARED "
+              "DISPOSABLE are reaped, after a measured idle delay): "
               "%s orphan volumes; %s private reclaimable build cache" % (
                   docker.get("orphan_volumes"), _fmt(docker.get("build_cache_reclaimable_bytes"))))
         for error in docker.get("errors") or ():
@@ -3556,7 +3611,7 @@ def print_report(report: dict) -> None:
         print("    … %d more not listed (report bounded to %d)" % (reste, OTHERS_TOP))
     volumes_autres = volumes.get("others") or []
     if volumes_autres:
-        print("  Docker volumes without a container, not attributable to this mesh "
+        print("  Docker volumes without a container, not declared disposable by this mesh "
               "(never deleted by ameesh):")
         for v in volumes_autres:
             print("    %s  (%s)  →  %s" % (v.get("path"), v.get("detail") or "?",

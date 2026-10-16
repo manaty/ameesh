@@ -1,4 +1,4 @@
-# Docker storage: observation, attributed-volume retention (#2003) and owner cleanup (#411)
+# Docker storage: observation, declared-disposable volume retention (#2003) and owner cleanup (#411)
 
 Housekeeping samples Docker storage and counts `dangling=true` volumes
 (no container references, including stopped containers), and reads the
@@ -8,32 +8,38 @@ avoids `docker system df` and recursive volume-size scans, which were slow
 during the owner's concurrent prune. Podman and an absent Docker runtime are
 not measured by this feature.
 
-Since #2003 the same pass also **reaps attributed Docker volumes**: a dangling
-volume is deleted only when the mesh can say where it came from, and only
-after `docker_volume_idle` (default 24 h):
+Since #2003 the same pass also **reaps the dangling volumes the mesh has
+declared disposable**, and only those: conservation is the default, and the
+declaration is explicit. `scripts/pg-up.sh` labels a lot bench's volume
+`ameesh.bench=disposable` only when its caller declares that bench disposable
+(`AMEESH_PG_DISPOSABLE=1`, the per-agent bench of the README); without that
+declaration it creates no label, so the volume is kept whatever its creation
+time. A shared bench (`ameesh-pg`/`agent-mesh-pg`, default volume
+`${NAME}-data`, historically `ameesh-pg-data`) is deliberately persistent and is
+**never labelled**, even if the declaration is passed: its data survives the
+container, which is that script's contract. A labelled disposable volume is
+deleted only after `docker_volume_idle` (default 24 h) of **continuous
+absence**, measured by the successive housekeeping passes: each pass journals
+the episode (`episode_since`, plus the volume's creation identity), a first
+sighting never deletes, a volume referenced again closes the episode, and a
+name recreated under the same volume opens a new one. Creation age is used as
+identity and reporting information, never as the idle delay.
 
-* a named volume labelled `ameesh.bench` — `scripts/pg-up.sh` labels the
-  database volume it creates; a shared bench keeps its volume while its
-  container exists, stopped containers included;
-* an anonymous volume (`com.docker.volume.anonymous`) whose creation time
-  falls inside a recorded turn of this host (`turn_resources`); it follows the
-  container rule and is reaped once that turn is no longer `running`.
-
-Everything else is **never deleted automatically**: a named volume without the
-label, an anonymous volume created outside any recorded turn, or an anonymous
-volume whose creation time is unreadable is listed in the bounded `others`
-section with its exact `docker volume rm` command so a human decides; a
-labelled bench volume whose creation time is unreadable is flagged without a
-command, since the age guard cannot be checked. This preserves the #411 rule
-(existing named volumes are kept) while stopping the silent accumulation of
-anonymous volumes leaked by test benches that remove their container without
-`-v`. `docker volume rm` itself refuses a volume still mounted, so a
-`docker run` racing the reap wins. Set
-`docker_volumes: false` in the Host card to disable reaping on one host.
+Nothing else is ever deleted automatically: an anonymous volume
+(`com.docker.volume.anonymous`) carries no mesh provenance and is never reaped
+here — a mesh container labelled `ameesh.turn` is removed with its anonymous
+volumes (`docker rm -f -v`), which is what actually stops the leak; a named
+volume without the label, or with a non-disposable label, is listed in the
+bounded `others` section with its exact `docker volume rm` command so a human
+decides. A disposable volume whose creation identity is unreadable is flagged
+without a command, since the episode's identity cannot be established. This
+preserves the #411 rule (existing named volumes are kept). `docker volume rm`
+itself refuses a volume still mounted, so a `docker run` racing the reap wins.
+Set `docker_volumes: false` in the Host card to disable reaping on one host.
 
 `ameesh menage --json` exposes `measure.docker_storage` and `measure.volumes`;
 the text report shows the orphan count, the volumes being reaped or kept, and
-the unattributed ones with their command. The periodic housekeeping pass
+the undeclared ones with their command. The periodic housekeeping pass
 persists the same summary. `ameesh alerts` reads these persisted samples,
 without launching Docker. No migration is required.
 
@@ -43,8 +49,8 @@ are:
 ```yaml
 docker_orphan_volumes_alert: 100
 docker_build_cache_alert: 20GiB
-docker_volumes: true          # reap attributed dangling volumes
-docker_volume_idle: 24h       # delay before an attributed volume is reaped
+docker_volumes: true          # reap declared-disposable dangling volumes
+docker_volume_idle: 24h       # continuous absence before such a volume is reaped
 ```
 
 The strictest threshold across the host's canons wins; the longest
@@ -126,9 +132,9 @@ pruning. It can recover less than the measured 45.28 GB because age and
 retention further restrict eligibility. Request an owner decision through
 `ameesh decide ask --lot 411 --needs-signature`; this document and the manifest
 are the reviewable scope. The monitoring code performed no cleanup at the time
-of #411; #2003 (16 October 2026) later added the attributed-volume retention
-described at the top of this document, which never touches a named volume
-without the `ameesh.bench` label.
+of #411; #2003 (16 October 2026) later added the declared-disposable volume
+retention described at the top of this document, which only ever touches a
+dangling volume carrying `ameesh.bench=disposable`.
 
 Once the owner's volume prune has finished, refresh the read-only inventory
 before executing any separately approved action. If anonymous volumes remain,
