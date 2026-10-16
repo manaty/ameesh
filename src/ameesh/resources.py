@@ -1425,6 +1425,37 @@ def disk_warnings(reading: dict, limits: dict, history=()) -> list[dict]:
     return out
 
 
+#: #2022: a host whose last reading is older than this is `stale` in the
+#: fleet summary (16/10: manaty-mesh-1 unmeasured for 3 days, ameesh-tests
+#: deleted but still listed)
+FLEET_STALE_S = 3600.0
+
+
+def fleet_line(reading: dict, limits: dict, history=(), *, now: float) -> dict:
+    """#2022: one host of the fleet summary (`ameesh hosts --fleet`): `host`,
+    `age_s`, `stale`, `disk` (the worst volume: path, free, used share),
+    `disk_warnings` (`disk_warnings`), `zombies`, `procs`, `breaches` (the
+    keys of the pressure verdict) and `ok` (nothing to say)."""
+    age = max(0.0, now - float(reading.get("sampled_ts") or now))
+    vols = [v for v in reading.get("volumes") or () if isinstance(v, dict)
+            and v.get("disk_free_bytes") is not None]
+    low = min(vols, key=lambda v: v["disk_free_bytes"]) if vols else None
+    disk = None if low is None else {
+        "path": low.get("path"), "free": low["disk_free_bytes"],
+        "used": (1.0 - low["disk_free_bytes"] / low["disk_total_bytes"])
+        if low.get("disk_total_bytes") else None}
+    warnings = disk_warnings(reading, limits, history)
+    breaches = [b["key"] for b in pressure(reading, limits=limits)["breaches"]]
+    zombies = reading.get("procs_zombie")
+    many = zombies is not None and limits.get("max_zombies") is not None \
+        and zombies >= limits["max_zombies"]
+    stale = age > FLEET_STALE_S
+    return {"host": reading.get("host"), "age_s": round(age), "stale": stale,
+            "disk": disk, "disk_warnings": warnings, "zombies": zombies,
+            "procs": reading.get("procs_total"), "breaches": breaches,
+            "ok": not (stale or warnings or breaches or many)}
+
+
 def power_state(reading: dict | None, limits: dict | None = None) -> dict:
     """État d'alimentation (L106) : `ok`, `low` (sur batterie sous le seuil :
     plus de nouveau tour), `stop` (sous le seuil d'arrêt : arrêt propre), ou
