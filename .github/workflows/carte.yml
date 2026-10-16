@@ -44,16 +44,12 @@
 #     matrice verte (témoin K1/K2 de la R1).
 name: carte
 
+# #2116 — suspension temporaire des mesures automatiques (16/10/2026) :
+# quota d'artefacts et mesures répétées sans carte publiée. Le run 38931568303
+# a ses dix mesures vertes ; l'assemblage échoue sur doublons/hors-part (#1632).
+# Réactiver push/main et pull_request après correction de #1632 et un run
+# manuel complet : carte publiée liée à sa base exacte et coût mesuré.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - scripts/map.py
-      - scripts/map_measure.py
-      - scripts/test-parts.py
-      - tests/support.py
-      - .github/workflows/carte.yml
   workflow_dispatch:
 
 # #1314 — une carte de main n'est jamais annulée par la poussée suivante : la
@@ -187,7 +183,7 @@ jobs:
             # qui les touchait renvoyait le lot à la suite complète.
             .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9' 'pyyaml>=6'
           else
-            .venv-carte/bin/pip install -q 'coverage>=7.10'
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'pyyaml>=6'
           fi
           .venv-carte/bin/python scripts/map.py install
       - name: base jetable (sans fsync) et client psql
@@ -230,7 +226,9 @@ jobs:
   carte:
     name: carte
     needs: mesure
-    if: always()
+    # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
+    # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
+    if: always() && !cancelled()
     # supprimer les mesures du run (étape finale) ; le reste du workflow reste en lecture
     permissions:
       contents: read

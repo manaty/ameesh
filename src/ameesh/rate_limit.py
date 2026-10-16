@@ -4,8 +4,14 @@
 Un agent qui prend un 429 de débit transitoire doit attendre puis reprendre
 seul, à délais cadencés (1, 2, 5, 10 min), sans être compté comme un échec
 rapide (L48 : cinq échecs rapides arrêtent l'agent et exigent `ameesh resume`).
+Les autres pannes passagères du fournisseur suivent la même reprise : 5xx
+explicite (500, 502, 503, 504, 529), erreurs passagères de DeepSeek (`dsh:
+MALFORMED_RESPONSE: …`, `SERVER`, `RATE_LIMIT`, flux coupé ; bureau 15/10) et
+flux Codex coupé (`stream disconnected before completion`).
 Un **quota épuisé** (plafond de forfait, crédit) est distingué du débit
-passager : le même rythme lent s'applique, mais l'état et le texte le nomment.
+passager : le même rythme lent s'applique, l'état et le texte le nomment, mais
+L48 reste armé — cinq refus rapides arrêtent l'agent : un plafond n'est pas
+repris sans fin.
 Dans le doute — texte illisible — on ne conclut rien sur le budget : la garde
 comptable (L226b) reste seule juge, et l'agent suit la reprise cadencée. Un
 débit **comme un quota** ne se déduit que d'un texte du fournisseur (`error`,
@@ -45,6 +51,8 @@ QUOTA_PATTERNS = (
     re.compile(r"billing (?:hard )?limit (?:reached|exceeded)", re.I),
     re.compile(r"(?:spend|spending) limit (?:reached|exceeded)", re.I),
     re.compile(r"plafond (?:de |du )?(?:forfait|cr[eé]dit)", re.I),
+    # DeepSeek (dsh) : ligne d'erreur `dsh: QUOTA: …` (402, solde épuisé)
+    re.compile(r"\bdsh: QUOTA\b"),
 )
 
 #: motifs d'un débit passager (429, surcharge, Retry-After…) — signatures
@@ -57,12 +65,16 @@ QUOTA_PATTERNS = (
 #: `stderr_tail` —, jamais le résultat libre du tour (dernier message du
 #: modèle), qui peut *parler* d'un débit sans l'avoir subi.
 TRANSIENT_PATTERNS = (
-    # un « 429 » doit nommer un statut HTTP explicite : en-tête (`HTTP 429`,
-    # `HTTP/1.1 429`), statut (`status: 429`, `status_code=429`) ou code
-    # d'erreur fournisseur (`Error code: 429`, `API Error: 429`) — séparateurs
-    # et espaces, jamais de texte arbitraire entre le nom et le numéro
+    # un « 429 » (ou un 5xx passager : 500, 502, 503, 504, 529) doit nommer un
+    # statut HTTP explicite : en-tête (`HTTP 429`, `HTTP/1.1 503`), statut
+    # (`status: 429`, `last status: 503 Service Unavailable`, `status_code=429`)
+    # ou code d'erreur fournisseur (`Error code: 429`, `API Error: 500`) —
+    # séparateurs et espaces, jamais de texte arbitraire entre nom et numéro
     re.compile(r"\b(?:https?(?:/\d(?:\.\d)?)?|status(?:[_ ]?code)?|error code|api error)"
-               r"\b\s*[:=]?\s*429\b", re.I),
+               r"\b\s*[:=]?\s*(?:429|5(?:0[0234]|29))\b", re.I),
+    # ou un 5xx suivi immédiatement de la panne qu'il nomme (`502 Bad Gateway`)
+    re.compile(r"\b5(?:0[0234]|29)\b\s*[:=-]?\s*(?:internal server error|bad gateway"
+               r"|service unavailable|gateway time-?out|overloaded)\b", re.I),
     # ou « 429 » suivi immédiatement de la panne qu'il nomme (`429 Too Many
     # Requests`, `429: rate limit reached`, `429 Client Error: Too Many
     # Requests`) — toujours pas de texte arbitraire entre les deux
@@ -87,16 +99,20 @@ TRANSIENT_PATTERNS = (
     # ``dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event type mismatch``
     # et ``Service is too busy. We advise users to temporarily switch…``.
     # Signatures fournisseur positives uniquement (lues dans `error` et
-    # `stderr_tail`), jamais un mot libre du modèle.
-    re.compile(r"\bMALFORMED_RESPONSE\b"),
+    # `stderr_tail`), jamais un mot libre du modèle. Le code DeepSeek est
+    # ancré (`dsh: <CODE>:`) : un simple mot « MALFORMED_RESPONSE » dans un
+    # texte ne classe pas (même exigence que le 429).
     re.compile(r"DeepSeek Messages SSE event type mismatch", re.I),
-    re.compile(r"\bSSE\b[^\n]{0,40}\b(?:error|mismatch|failed|closed|reset)\b", re.I),
     re.compile(r"\bservice is too busy\b", re.I),
-    # un « 5xx » doit nommer un statut HTTP explicite, comme le 429 ci-dessus
-    re.compile(r"\b(?:https?(?:/\d(?:\.\d)?)?|status(?:[_ ]?code)?|error code|api error)"
-               r"\b\s*[:=]?\s*5\d\d\b", re.I),
-    re.compile(r"\b(?:internal server error|bad gateway|service unavailable|"
-               r"gateway time-?out)\b", re.I),
+    # DeepSeek (dsh) : ligne d'erreur `dsh: <CODE>: …` d'une panne passagère —
+    # débit, serveur, flux SSE malformé, coupé ou vide, attente, transport
+    # (bureau 15/10 : « dsh: MALFORMED_RESPONSE: DeepSeek Messages SSE event
+    # type mismatch » laissait trois agents bloqués)
+    re.compile(r"\bdsh: (?:RATE_LIMIT|SERVER|MALFORMED_RESPONSE|STREAM_CLOSED"
+               r"|EMPTY_RESPONSE|TIMEOUT|TRANSPORT)\b"),
+    # Codex : flux coupé au-delà de ses propres reprises, pendant du
+    # `STREAM_CLOSED` de DeepSeek (`stream disconnected before completion: …`)
+    re.compile(r"\bstream disconnected before completion\b", re.I),
 )
 
 #: genres rendus par `classify`
@@ -128,10 +144,11 @@ def classify(error: str | None = None, result: str | None = None,
              stderr_tail: str | None = None) -> str | None:
     """Le genre de panne fournisseur d'un tour en échec, None si aucun.
 
-    `rate_limited` : débit passager (429, surcharge) — attente et reprise.
+    `rate_limited` : panne passagère — débit (429), surcharge, 5xx explicite,
+    erreur passagère DeepSeek (`dsh: MALFORMED_RESPONSE`…) — attente et reprise.
     `quota` : plafond/forfait/crédit épuisé — distinct, jamais déduit d'un
     simple 429 (le doute reste un débit passager ; la garde comptable L226b
-    reste seule juge du budget).
+    reste seule juge du budget) ; L48 reste armé pour lui.
 
     Le quota prime sur le débit **parmi les textes du fournisseur** : un « 429 »
     sur l'erreur et un `insufficient_quota` sur stderr classent quota

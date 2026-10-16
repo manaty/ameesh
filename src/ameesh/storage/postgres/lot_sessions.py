@@ -154,6 +154,17 @@ class LotSessions(interface.LotSessions):
         return rows[0] if rows else {}
 
     def purge(self, name=None):
+        """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
+        sont plus assignés à leur agent ; rend les lignes supprimées.
+
+        Ne touche JAMAIS à `agent_registry` (#794, revue Claude B1 du
+        2026-10-14) : ce balayage n'a pas le bail de l'agent et peut tomber en
+        plein tour. La session ACTIVE d'un lot fini est fermée par l'agent qui
+        la détient, à son tour suivant, sous son bail
+        (`AgentWorker._close_finished_lot_session`) ; un lot seulement
+        réassigné (relecture, pilotage, audit) ne ferme jamais la session de
+        celui qui travaille dessus.
+        """
         sql = ("DELETE FROM agent_lot_sessions l USING work_items w"
                " WHERE w.id = l.work_item_id"
                "   AND (w.state IN " + _CLOSED + " OR w.assignee IS DISTINCT FROM l.agent)")
@@ -161,4 +172,5 @@ class LotSessions(interface.LotSessions):
         if name is not None:
             sql += " AND l.agent = %s"
             params = (name,)
-        return self.db.query(sql + " RETURNING " + _COLUMNS, params)
+        with self.db.transaction() as tx:
+            return tx.query(sql + " RETURNING " + _COLUMNS, params)

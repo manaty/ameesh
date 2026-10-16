@@ -1,0 +1,938 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L1651 (#1650) : la porte de file refuse un vert partiel.
+
+La tête gelée d'un lot ancien (antérieure au job de plan #1368) peut ne
+porter qu'une partie de ses parts : les statuts présents sont tous verts, la
+part jamais dispatchée n'a aucun statut, et `radar.commit_ci` lisait vert
+(#1470, cinq parts dues, une annoncée). Les témoins ci-dessous portent sur la
+porte : l'ensemble exact des parts dues est recalculé par le sélecteur
+versionné de la cible, et chaque part doit exister sur le SHA gelé et être
+terminale-success.
+
+Le sélecteur du dépôt de témoin est un faux volontairement minimal
+(`.ci/parts.json` + `scripts/ci/lot-plan.py`) : la sélection d'un vrai dépôt
+(Nexlink : `scripts/ci/lot-plan.mjs`) a ses propres témoins ; ici on éprouve
+la plomberie d'ameesh — arbre épinglé de la cible, change set NUL, sortie
+validée, décision de la porte."""
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import shutil
+import signal
+import sys
+import time
+import unittest
+from unittest import mock
+
+from ameesh import ci_parts, land, merge_queue, plan_git, radar, resolutions
+
+from .test_l160b_radar import _git, _write
+from .test_l160e2_land import _Land
+from .test_l160g_nexlink import _Gh, _run
+
+#: les cinq parts de code du contrat de témoin, et le Docs gate qui n'est
+#: jamais planifié (B2 de #1345, #1368)
+PARTS = [{"context": "lot/backend-suite", "paths": ["backend/**"]},
+         {"context": "lot/rollback-checks", "paths": ["rollback/**"]},
+         {"context": "lot/scripts-suite", "paths": ["scripts/**"]},
+         {"context": "lot/sync-checks", "paths": ["sync/**"]},
+         {"context": "lot/website-suite", "paths": ["website/**"]},
+         {"context": "lot/docs-gate", "paths": ["docs/**"]}]
+
+#: la dernière ligne du sélecteur de témoin, remplacée par les cas tordus
+WRITE = 'json.dump({"schema": "test-lot-plan/1", "due": due}, handle)'
+SELECTOR = '''\
+import fnmatch
+import json
+import os
+import sys
+
+options = {}
+args = sys.argv[1:]
+for index, arg in enumerate(args):
+    if arg.startswith("--"):
+        options[arg[2:]] = args[index + 1]
+root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+with open(os.path.join(root, ".ci", "parts.json"), encoding="utf-8") as handle:
+    parts = json.load(handle)
+with open(options["files"], "rb") as handle:
+    files = [name for name in handle.read().decode("utf-8").split("\\0") if name]
+due = []
+for part in parts:
+    if part["context"] == "lot/docs-gate":
+        continue
+    if any(fnmatch.fnmatchcase(name, glob) for name in files for glob in part["paths"]):
+        due.append(part["context"])
+with open(options["out"], "w", encoding="utf-8") as handle:
+    __WRITE__
+'''
+
+
+def selector(write=WRITE) -> str:
+    return SELECTOR.replace("__WRITE__", write)
+
+
+CI_PARTS = {"selector": "scripts/ci/lot-plan.py",
+            "argv": [sys.executable, "{selector}", "--files", "{files}", "--out", "{out}"],
+            "schema": "test-lot-plan/1"}
+PARTS_CONTRACT = radar.parse_ci_parts(CI_PARTS, "`radar.projects.p`")
+
+#: N3 de #1666 : un faux `bwrap` pour les témoins de plomberie — il comprend
+#: les options d'isolation, journalise sa ligne de commande (une par
+#: invocation : le témoin de démarrage puis le sélecteur) et exécute la
+#: commande avec l'environnement du bac à sable (`--clearenv` + `--setenv`).
+#: Le bac à sable **réel** (noyau, réseau, montages) a son propre témoin,
+#: sauté quand `bwrap` n'est pas installé sur l'hôte.
+FAKE_BWRAP = '''\
+#!{python}
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+env = {{}}
+cmd = []
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg == "--":
+        cmd = args[index + 1:]
+        break
+    if arg == "--clearenv":
+        env = {{}}
+        index += 1
+    elif arg in ("--die-with-parent", "--unshare-all", "--unshare-net"):
+        index += 1
+    elif arg in ("--ro-bind", "--bind"):
+        index += 3
+    elif arg == "--setenv":
+        env[args[index + 1]] = args[index + 2]
+        index += 3
+    elif arg in ("--proc", "--dev", "--tmpfs", "--chdir"):
+        if arg == "--chdir":
+            os.chdir(args[index + 1])
+        index += 2
+    elif arg.startswith("--"):
+        raise SystemExit("fake bwrap: unknown option %r" % arg)
+    else:
+        cmd = args[index:]
+        break
+if not cmd:
+    raise SystemExit("fake bwrap: no command")
+with open({log!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"argv": args, "env": env}}) + "\\n")
+os.execvpe(cmd[0], cmd, env)
+'''
+
+
+def fake_bwrap(path: str, log: str | None = None, fail: str | None = None) -> str:
+    """Écrit un faux `bwrap` : `fail` (un message sur stderr) simule un bac à
+    sable que le noyau refuse (espaces de noms indisponibles) ; sinon la
+    commande est exécutée et sa ligne de commande journalisée."""
+    if fail is not None:
+        source = "#!%s\nimport sys\nsys.stderr.write(%r)\nraise SystemExit(1)\n" % (
+            sys.executable, fail + "\n")
+    else:
+        source = FAKE_BWRAP.format(python=sys.executable, log=log)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(source)
+    os.chmod(path, 0o755)
+    return path
+
+
+def contexts(**states) -> dict:
+    """Le retour d'un lecteur de CI : `green` ne regarde que les statuts
+    présents, comme `radar.commit_ci` — c'est le trou que la porte ferme.
+    N1 de #1666 : les parts dues se lisent dans l'espace des **statuts de
+    commit** (`statuses`) ; `contexts` (runs, checks et statuts mêlés) ne les
+    prouve plus."""
+    return {"runs": len(states) or 1, "green": all(v == "success" for v in states.values()),
+            "pending": [k for k, v in states.items() if v == "pending"],
+            "failed": [k for k, v in states.items() if v == "failed"],
+            "contexts": dict(states), "statuses": dict(states)}
+
+
+def labels_only(**states) -> dict:
+    """Un lecteur dont les libellés d'états n'existent que dans `contexts`
+    (un run ou un check homonyme d'une part) : aucune part n'est prouvée, le
+    rollup peut pourtant être vert (N1 de #1666)."""
+    return dict(contexts(**states), statuses={})
+
+
+class SettingsTest(unittest.TestCase):
+    def parse(self, parts):
+        return radar.parse_settings({"projects": {
+            "p": {"repo": "/r", "ci_required": True, "ci_parts": parts}}}).projects["p"]
+
+    def test_the_versioned_contract_is_read(self):
+        project = self.parse(dict(CI_PARTS, rev="develop"))
+        self.assertEqual(project.ci_parts.selector, "scripts/ci/lot-plan.py")
+        self.assertEqual(project.ci_parts.rev, "develop")
+        self.assertEqual(project.ci_parts.due, "due")
+        self.assertEqual(project.ci_parts.argv[0], sys.executable)
+
+    def test_ambiguous_or_unsafe_declarations_are_refused(self):
+        for parts, why in (
+                ("scripts/ci/x.py", "object"),
+                (dict(CI_PARTS, selector="/etc/passwd"), "inside the repository"),
+                (dict(CI_PARTS, selector="a/../../x"), "inside the repository"),
+                (dict(CI_PARTS, selector=""), "relative path"),
+                (dict(CI_PARTS, argv=[]), "non-empty list"),
+                (dict(CI_PARTS, argv=["node", "x", "--files", "{files}"]), "{out} is required"),
+                (dict(CI_PARTS, argv=["node", "x", "--out", "{out}"]), "{files} is required"),
+                (dict(CI_PARTS, argv=["node", "{unknown}", "--files", "{files}",
+                                      "--out", "{out}"]), "unknown placeholder"),
+                (dict(CI_PARTS, argv=["node", "{", "--files", "{files}", "--out", "{out}"]),
+                 "stray brace"),
+                (dict(CI_PARTS, rev="a..b"), "ci_parts.rev"),
+                (dict(CI_PARTS, due=""), "non-empty text"),
+                (dict(CI_PARTS, schema=3), "non-empty text"),
+                (dict(CI_PARTS, extra="x"), "unknown key")):
+            with self.subTest(why=why):
+                with self.assertRaisesRegex(radar.SettingsError, why):
+                    self.parse(parts)
+
+    def test_an_inert_contract_is_refused(self):
+        """`ci_parts` ne se lit que dans la CI du commit gelé : sans
+        `ci_required`, la déclaration ne prouverait rien."""
+        with self.assertRaisesRegex(radar.SettingsError, "ci_required must be true"):
+            radar.parse_settings({"projects": {
+                "p": {"repo": "/r", "ci_parts": dict(CI_PARTS)}}})
+
+
+class _Contract(_Land):
+    """Un dépôt de témoin dont la cible porte le contrat versionné."""
+
+    #: les témoins de plomberie exécutent le sélecteur via un faux `bwrap`
+    #: (N3 de #1666) ; le bac à sable réel a son propre témoin, sans faux
+    FAKE_SANDBOX = True
+
+    def setUp(self):
+        super().setUp()
+        _write(self.repo, "scripts/ci/lot-plan.py", selector())
+        _write(self.repo, ".ci/parts.json", json.dumps(PARTS))
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "ci: the versioned selection source")
+        _git(self.repo, "push", "-q", "origin", "main")
+        self.project = dataclasses.replace(self.project, ci_required=True,
+                                           ci_parts=PARTS_CONTRACT)
+        if self.FAKE_SANDBOX:
+            #: N3 de #1666 : le contrat exige un bac à sable ; les témoins de
+            #: plomberie en installent un faux dans le PATH, qui journalise sa
+            #: ligne de commande et exécute le sélecteur sans isoler.
+            fake_dir = os.path.join(self.tmp, "sandbox-bin")
+            os.makedirs(fake_dir)
+            self.bwrap_log = os.path.join(self.tmp, "bwrap.argv")
+            fake_bwrap(os.path.join(fake_dir, "bwrap"), self.bwrap_log)
+            patch = mock.patch.dict(
+                os.environ, {"PATH": fake_dir + os.pathsep + os.environ.get("PATH", "")})
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def publish_main(self):
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "contract change")
+        _git(self.repo, "push", "-q", "-f", "origin", "main")
+
+    def base(self):
+        return _git(self.repo, "rev-parse", "main")
+
+    def lot_touching(self, *dirs, marker=""):
+        """Une tête gelée **sans** le sélecteur (branche d'avant le contrat),
+        qui touche les répertoires donnés."""
+        branch = self.fake.lots[4]["branch"]
+        _git(self.repo, "checkout", "-q", branch)
+        for name in dirs:
+            _write(self.repo, "%s/file%s.txt" % (name, marker), "x\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "delta")
+        _git(self.repo, "push", "-q", "origin", branch)
+        _git(self.repo, "checkout", "-q", "main")
+        return branch
+
+    def clone(self):
+        return resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+
+
+class ContractTest(_Contract):
+    """Le contrat versionné : le sélecteur est lu dans l'arbre de la cible,
+    jamais dans celui de la tête gelée."""
+
+    def test_an_old_head_is_judged_by_the_target_contract(self):
+        branch = self.lot_touching("backend", "scripts", "sync", "website", "rollback")
+        tip = _git(self.repo, "rev-parse", branch)
+        # la tête gelée ne porte pas le plan : c'est le trou #1470
+        self.assertIsNone(plan_git._commit(self.repo, branch + ":scripts/ci/lot-plan.py"))
+        found = ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertEqual(found["due"], ("lot/backend-suite", "lot/rollback-checks",
+                                        "lot/scripts-suite", "lot/sync-checks",
+                                        "lot/website-suite"))
+        self.assertEqual(found["schema"], "test-lot-plan/1")
+        self.assertEqual(found["selector"], "scripts/ci/lot-plan.py")
+        self.assertEqual(found["merge_base"], _git(self.repo, "merge-base", "main", branch))
+
+    def test_a_docs_only_change_set_makes_no_code_part_due(self):
+        branch = self.lot_touching("docs")
+        tip = _git(self.repo, "rev-parse", branch)
+        self.assertEqual(ci_parts.due(self.project, tip, self.base(), self.repo)["due"], ())
+
+    def test_the_head_cannot_suppress_a_part_with_its_own_selector(self):
+        """Le sélecteur de la tête (saboté) ne compte pas : le contrat est
+        celui de la cible. Le changement de `scripts/**` rend scripts-suite
+        due, backend-suite l'est par le delta backend."""
+        branch = self.fake.lots[4]["branch"]
+        _git(self.repo, "checkout", "-q", branch)
+        _write(self.repo, "scripts/ci/lot-plan.py", "raise SystemExit(0)\n")
+        _write(self.repo, "backend/file.txt", "x\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "delta + sabotaged selector")
+        _git(self.repo, "push", "-q", "origin", branch)
+        _git(self.repo, "checkout", "-q", "main")
+        tip = _git(self.repo, "rev-parse", branch)
+        self.assertEqual(ci_parts.due(self.project, tip, self.base(), self.repo)["due"],
+                         ("lot/backend-suite", "lot/scripts-suite"))
+
+    def test_a_selector_absent_from_the_pinned_tree_refuses(self):
+        os.remove(os.path.join(self.repo, "scripts/ci/lot-plan.py"))
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        with self.assertRaisesRegex(ci_parts.PartsError, "not in the tree"):
+            ci_parts.due(self.project, tip, self.base(), self.repo)
+
+    def test_an_unreadable_part_table_refuses(self):
+        _write(self.repo, ".ci/parts.json", "{not json")
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        with self.assertRaisesRegex(ci_parts.PartsError, "failed \\(exit 1\\)"):
+            ci_parts.due(self.project, tip, self.base(), self.repo)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX signal return codes")
+    def test_a_selector_terminated_by_signal_refuses(self):
+        """A runtime crash must remain a failure, never an empty valid plan."""
+        _write(self.repo, "scripts/ci/lot-plan.py",
+               selector("os.kill(os.getpid(), %d)" % signal.SIGTERM))
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        with self.assertRaisesRegex(ci_parts.PartsError, r"failed \(exit -%d\)" % signal.SIGTERM):
+            ci_parts.due(self.project, tip, self.base(), self.repo)
+
+    def test_a_malformed_or_unknown_plan_refuses(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        for write, why in (
+                ('json.dump({"schema": "other/1", "due": []}, handle)',
+                 "plan schema is 'other/1'"),
+                ('json.dump({"due": []}, handle)', "declares no schema"),
+                ('json.dump({"schema": "test-lot-plan/1", "due": "x"}, handle)',
+                 "not a list of part names"),
+                ('json.dump({"schema": "test-lot-plan/1", "due": ["a", "a"]}, handle)',
+                 "repeats a part"),
+                ("handle.write('{')", "no readable plan")):
+            with self.subTest(why=why):
+                _write(self.repo, "scripts/ci/lot-plan.py", selector(write))
+                self.publish_main()
+                with self.assertRaisesRegex(ci_parts.PartsError, why):
+                    ci_parts.due(self.project, tip, self.base(), self.repo)
+                _write(self.repo, "scripts/ci/lot-plan.py", selector())
+                self.publish_main()
+
+    def test_a_missing_frozen_commit_or_base_refuses(self):
+        with self.assertRaisesRegex(ci_parts.PartsError, "not in"):
+            ci_parts.due(self.project, "b" * 40, self.base(), self.repo)
+        with self.assertRaisesRegex(ci_parts.PartsError, "not a commit"):
+            ci_parts.due(self.project, self.base(), "nosuchref", self.repo)
+
+    def test_a_hand_built_contract_cannot_read_outside_the_tree(self):
+        project = dataclasses.replace(self.project, ci_parts=radar.CiParts(
+            selector="../../etc/passwd",
+            argv=(sys.executable, "{selector}", "--files", "{files}", "--out", "{out}")))
+        with self.assertRaisesRegex(ci_parts.PartsError, "not a path inside the repository"):
+            ci_parts.due(project, self.base(), self.base(), self.repo)
+
+    def test_the_selector_runs_without_the_host_environment(self):
+        """Le sélecteur vient du dépôt : il ne voit pas les jetons ni les DSN
+        de l'hôte qui exécute la porte."""
+        with mock.patch.dict(os.environ, {"AMEESH_SENTINEL": "secret", "GH_TOKEN": "t",
+                                          "LD_LIBRARY_PATH": "/runtime/lib",
+                                          "LD_PRELOAD": "/private/injected.so"}):
+            env = ci_parts.selector_env("/root", "/home")
+        self.assertNotIn("AMEESH_SENTINEL", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("LD_PRELOAD", env)
+        self.assertEqual(env["LD_LIBRARY_PATH"], "/runtime/lib")
+        self.assertEqual(env["GITHUB_WORKSPACE"], "/root")
+        self.assertEqual(env["HOME"], "/home")
+        self.assertIn("PATH", env)
+
+
+class GateTest(_Contract):
+    """La porte : 1/5 refuse, 5/5 autorise, absent/skipped/cancelled refusent,
+    docs-only respecte la classification."""
+
+    def setUp(self):
+        super().setUp()
+        self.parts = ("lot/backend-suite", "lot/rollback-checks", "lot/scripts-suite",
+                      "lot/sync-checks", "lot/website-suite")
+
+    def enter_with(self, *dirs, contexts=None, marker=""):
+        self.lot_touching(*dirs, marker=marker)
+        self.ready(4)
+        return merge_queue.enter(None, 4, repo=self.repo, actor="orch", ci=None,
+                                 clone=self.clone(), project=self.project,
+                                 commit_ci=lambda sha: contexts)
+
+    def test_five_of_five_enters(self):
+        row = self.enter_with("backend", "scripts", "sync", "website", "rollback",
+                              contexts=contexts(**{part: "success" for part in self.parts}))
+        self.assertEqual(row["state"], "queued")
+
+    def test_one_of_five_is_refused(self):
+        with self.assertRaisesRegex(merge_queue.QueueError, "4 of 5 missing or not successful"):
+            self.enter_with("backend", "scripts", "sync", "website", "rollback",
+                            contexts=contexts(**{"lot/backend-suite": "success"}))
+        self.assertNotIn(4, self.fake.queue_rows)
+
+    def test_a_pending_or_red_part_is_refused_and_named(self):
+        for index, (part, state) in enumerate((("lot/website-suite", "pending"),
+                                               ("lot/sync-checks", "failed"))):
+            with self.subTest(part=part):
+                states = {name: "success" for name in self.parts}
+                states[part] = state
+                with self.assertRaisesRegex(merge_queue.QueueError, part.replace("/", "/")):
+                    self.enter_with("backend", "scripts", "sync", "website", "rollback",
+                                    contexts=contexts(**states), marker=str(index))
+
+    def test_skipped_and_cancelled_runs_are_not_green_parts(self):
+        sha = "a" * 40
+        skipped = radar.commit_ci(self.project, sha, gh=_Gh([
+            _run("lot/backend-suite", conclusion="skipped")]))
+        self.assertTrue(skipped["green"])                    # ne bloque aucun rollup
+        self.assertEqual(skipped["contexts"]["lot/backend-suite"], "failed")
+        cancelled = radar.commit_ci(self.project, sha, gh=_Gh([
+            _run("lot/backend-suite", conclusion="cancelled")]))
+        self.assertEqual(cancelled["contexts"]["lot/backend-suite"], "failed")
+        for runs in (skipped, cancelled):
+            with self.subTest(contexts=runs["contexts"]):
+                with self.assertRaises(merge_queue.QueueError):
+                    merge_queue._required_ci(self.project, sha, commit_ci=lambda s: runs,
+                                             parts=["lot/backend-suite"])
+
+    def test_a_workflow_run_named_like_a_part_does_not_prove_it(self):
+        """N1 de #1666 : un run Actions nommé `lot/backend-suite` qui réussit
+        n'est pas la part — elle n'existe que dans les statuts de commit."""
+        runs = labels_only(**{"lot/backend-suite": "success"})
+        self.assertTrue(runs["green"])
+        self.assertEqual(runs["statuses"], {})
+        with self.assertRaisesRegex(merge_queue.QueueError, "lot/backend-suite"):
+            merge_queue._required_ci(self.project, "a" * 40, commit_ci=lambda s: runs,
+                                     parts=["lot/backend-suite"])
+
+    def test_an_external_check_named_like_a_part_does_not_prove_it(self):
+        """N1 de #1666 : un check d'une app tierce homonyme d'une part ne la
+        prouve pas davantage — l'espace des parts est celui des statuts."""
+        check = {"id": 7, "app": {"id": 9, "slug": "external-ci"},
+                 "name": "lot/backend-suite", "head_sha": "a" * 40,
+                 "status": "completed", "conclusion": "success",
+                 "started_at": "2026-10-12T10:00:00Z",
+                 "completed_at": "2026-10-12T11:00:00Z"}
+        runs = radar.commit_ci(self.project, "a" * 40, gh=_Gh([_run("ci")], checks=[check]))
+        self.assertEqual(runs["contexts"]["9/lot/backend-suite"], "success")
+        self.assertEqual(runs["statuses"], {})
+        with self.assertRaisesRegex(merge_queue.QueueError, "lot/backend-suite"):
+            merge_queue._required_ci(self.project, "a" * 40, commit_ci=lambda s: runs,
+                                     parts=["lot/backend-suite"])
+
+    def test_a_real_commit_status_proves_the_part(self):
+        """N1 de #1666 : le statut de commit, lui, prouve la part."""
+        runs = radar.commit_ci(self.project, "a" * 40, gh=_Gh(
+            [_run("ci")], statuses=[{"context": "lot/backend-suite", "state": "success"}]))
+        self.assertEqual(runs["statuses"], {"lot/backend-suite": "success"})
+        merge_queue._required_ci(self.project, "a" * 40, commit_ci=lambda s: runs,
+                                 parts=["lot/backend-suite"])
+
+    def test_a_reader_without_the_status_space_proves_nothing(self):
+        """N1 de #1666 : un lecteur qui ne sépare pas les espaces (dict d'avant
+        la clé `statuses`) ne prouve aucune part — jamais de repli sur
+        `contexts`."""
+        runs = {"runs": 1, "green": True, "pending": [], "failed": [],
+                "contexts": {"lot/backend-suite": "success"}}
+        with self.assertRaisesRegex(merge_queue.QueueError, "lot/backend-suite"):
+            merge_queue._required_ci(self.project, "a" * 40, commit_ci=lambda s: runs,
+                                     parts=["lot/backend-suite"])
+
+    def test_an_old_green_attempt_does_not_cover_the_latest_cancelled_one(self):
+        rows = [_run("lot/backend-suite"),
+                _run("lot/backend-suite", conclusion="cancelled", at="2026-10-12T21:00:00Z")]
+        runs = radar.commit_ci(self.project, "a" * 40, gh=_Gh(rows))
+        self.assertEqual(runs["contexts"]["lot/backend-suite"], "failed")
+        with self.assertRaises(merge_queue.QueueError):
+            merge_queue._required_ci(self.project, "a" * 40, commit_ci=lambda s: runs,
+                                     parts=["lot/backend-suite"])
+
+    def test_docs_only_respects_the_classification(self):
+        row = self.enter_with("docs", contexts=contexts(**{"lot/docs-gate": "success"}))
+        self.assertEqual(row["state"], "queued")
+
+    def test_the_queue_note_keeps_the_provenance_of_the_proof(self):
+        self.enter_with("backend", "scripts", "sync", "website", "rollback",
+                        contexts=contexts(**{part: "success" for part in self.parts}))
+        note = [text for lot, text, actor in self.fake.notes if "queued at" in text][-1]
+        self.assertIn("parts scripts/ci/lot-plan.py@%s (5 due)" % self.base()[:12], note)
+
+    def test_a_divergent_versioned_rev_is_refused(self):
+        self.project = dataclasses.replace(
+            self.project, ci_parts=dataclasses.replace(self.project.ci_parts, rev="release"))
+        self.lot_touching("backend")
+        self.ready(4)
+        with self.assertRaisesRegex(merge_queue.QueueError, "versioned at release"):
+            merge_queue.enter(None, 4, repo=self.repo, actor="orch", ci=None,
+                              clone=self.clone(), project=self.project,
+                              commit_ci=lambda sha: contexts())
+
+    def test_an_unknown_selector_on_the_target_refuses(self):
+        os.remove(os.path.join(self.repo, "scripts/ci/lot-plan.py"))
+        self.publish_main()
+        with self.assertRaisesRegex(merge_queue.QueueError, "cannot be proven"):
+            self.enter_with("backend", contexts=contexts(**{"lot/backend-suite": "success"}))
+
+    def test_the_landing_replays_the_proof_on_the_same_target(self):
+        self.lot_touching("backend", "scripts", "sync", "website", "rollback")
+        self.ready(4)
+        merge_queue.enter(None, 4, repo=self.repo, actor="orch", ci=None, clone=self.clone(),
+                          project=self.project,
+                          commit_ci=lambda sha: contexts(**{p: "success" for p in self.parts}))
+        self.fake.queue_rows[4]["rank"] = 1
+        before = _git(self.origin, "rev-parse", "main")
+        with mock.patch.object(radar, "commit_ci",
+                               return_value=contexts(**{"lot/backend-suite": "success"})):
+            out = land.land_head(self.cfg, None, self.project, self.fake._row(4),
+                                 owner="runner-1")
+        self.assertEqual(out["result"], "ejected", out)
+        self.assertIn("missing or not successful", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+
+
+class CommitCiContextsTest(unittest.TestCase):
+    """`commit_ci` rend, libellé par libellé, l'état des statuts du SHA gelé,
+    et sépare l'espace des statuts de commit de celui des runs et checks
+    (N1 de #1666)."""
+
+    project = radar.Project("n", "/r", github="o/nexlink", ci_required=True)
+
+    def test_statuses_and_skipped_checks_are_read_on_the_exact_sha(self):
+        statuses = [{"context": "lot/backend-suite", "state": "success"},
+                    {"context": "lot/scripts-suite", "state": "failure"}]
+        runs = radar.commit_ci(self.project, "a" * 40,
+                               gh=_Gh([_run("ci", conclusion="skipped")], statuses=statuses))
+        self.assertEqual(runs["contexts"]["lot/backend-suite"], "success")
+        self.assertEqual(runs["contexts"]["lot/scripts-suite"], "failed")
+        self.assertEqual(runs["contexts"]["ci"], "failed")
+        # N1 de #1666 : l'espace des statuts ne porte que les statuts — le run
+        # Actions `ci`, même classé « failed » dans `contexts`, n'y est pas.
+        self.assertEqual(runs["statuses"], {"lot/backend-suite": "success",
+                                            "lot/scripts-suite": "failed"})
+
+    def test_a_run_of_another_sha_is_never_read(self):
+        from ameesh import plan_github
+        with self.assertRaises(plan_github.GithubError):
+            radar.commit_ci(self.project, "a" * 40,
+                            gh=_Gh([dict(_run("ci"), headSha="b" * 40)]))
+
+
+class ProofCacheTest(_Contract):
+    """N2 de #1666 : la preuve est mise en cache par couple (commit de base,
+    tête gelée) et par contrat ; une entrée revalidée évite l'extraction de
+    l'arbre de la cible aux contrôles répétés (admission puis atterrissages)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache = ci_parts.cache_dir(self.cfg)
+        self.assertEqual(self.cache, os.path.join(self.cfg.state_dir, "radar", "ci-parts"))
+
+    def counting(self):
+        """Compte les extractions et les exécutions du sélecteur du test."""
+        real_extract, real_plan = ci_parts.extract, ci_parts._plan_file
+        calls = {"extract": 0, "selector": 0}
+
+        def extract(*args, **kwargs):
+            calls["extract"] += 1
+            return real_extract(*args, **kwargs)
+
+        def plan_file(*args, **kwargs):
+            calls["selector"] += 1
+            return real_plan(*args, **kwargs)
+
+        patcher = mock.patch.multiple(ci_parts, extract=extract, _plan_file=plan_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
+    def entry(self, proof):
+        key = ci_parts._cache_key(self.project.ci_parts, proof["base"], proof["frozen"])
+        return os.path.join(self.cache, key + ".json")
+
+    def test_a_second_control_of_the_same_pair_reuses_the_cached_proof(self):
+        branch = self.lot_touching("backend", "scripts")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        first = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        second = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        self.assertEqual(first, second)
+        self.assertEqual(first["due"], ("lot/backend-suite", "lot/scripts-suite"))
+        self.assertEqual(calls, {"extract": 1, "selector": 1})
+
+    def test_another_frozen_head_or_base_is_another_proof(self):
+        branch = self.lot_touching("backend")
+        first_tip = _git(self.repo, "rev-parse", branch)
+        second_tip = _git(self.repo, "rev-parse", self.lot_touching("backend", marker="2"))
+        calls = self.counting()
+        ci_parts.due(self.project, first_tip, self.base(), self.repo, cache=self.cache)
+        ci_parts.due(self.project, second_tip, self.base(), self.repo, cache=self.cache)
+        self.assertEqual(calls["extract"], 2)
+        _write(self.repo, "backend/marker-base.txt", "x\n")
+        self.publish_main()
+        ci_parts.due(self.project, second_tip, self.base(), self.repo, cache=self.cache)
+        self.assertEqual(calls["extract"], 3)
+
+    def test_another_contract_is_another_proof(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        other = dataclasses.replace(
+            self.project,
+            ci_parts=dataclasses.replace(
+                self.project.ci_parts,
+                argv=tuple(self.project.ci_parts.argv) + ("--marker", "2")))
+        ci_parts.due(other, tip, self.base(), self.repo, cache=self.cache)
+        self.assertEqual(calls["extract"], 2)
+
+    def test_a_corrupt_cache_entry_is_ignored_and_recomputed(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        first = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        path = self.entry(first)
+        self.assertTrue(os.path.isfile(path))
+        junk = ("{not json",
+                json.dumps({"version": ci_parts.PARTS_CACHE_VERSION,
+                            "schema": "test-lot-plan/1", "due": ["a", "a"],
+                            "base": "a" * 40, "merge_base": "a" * 40, "frozen": "a" * 40}))
+        for index, text in enumerate(junk):
+            with self.subTest(junk=index):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                again = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+                self.assertEqual(again, first)
+        self.assertEqual(calls["extract"], 3)          # 1 calcul + 2 recalculs
+
+    def test_an_expired_entry_is_pruned_and_recomputed(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        first = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        old = time.time() - ci_parts.PARTS_CACHE_TTL - 60
+        os.utime(self.entry(first), (old, old))
+        self.assertEqual(
+            ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache), first)
+        self.assertEqual(calls["extract"], 2)
+
+    def test_an_expired_entry_is_ignored_when_pruning_cannot_remove_it(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        first = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        old = time.time() - ci_parts.PARTS_CACHE_TTL - 60
+        path = self.entry(first)
+        os.utime(path, (old, old))
+        with mock.patch.object(ci_parts.os, "remove", side_effect=PermissionError):
+            ci_parts._cache_prune(self.cache, time.time())
+        self.assertTrue(os.path.isfile(path))
+        # Le nettoyage est un effort : sa panne ne prolonge pas une preuve.
+        with mock.patch.object(ci_parts, "_cache_prune"):
+            again = ci_parts.due(self.project, tip, self.base(), self.repo, cache=self.cache)
+        self.assertEqual(again, first)
+        self.assertEqual(calls["extract"], 2)
+
+    def test_without_a_cache_every_control_recomputes(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        calls = self.counting()
+        ci_parts.due(self.project, tip, self.base(), self.repo)
+        ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertEqual(calls["extract"], 2)
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_a_host_without_state_has_no_cache(self):
+        self.assertIsNone(ci_parts.cache_dir(object()))
+
+
+#: un sélecteur qui lance un petit-fils puis dort : au délai dépassé, le
+#: groupe entier doit mourir (N4 de #1666)
+GRANDCHILD_SELECTOR = '''\
+import subprocess
+import sys
+import time
+
+subprocess.Popen([sys.executable, "-c",
+                  "import time; time.sleep(600)  # __MARKER__"])
+time.sleep(600)
+'''
+
+
+@unittest.skipUnless(os.path.isdir("/proc"), "Linux: /proc is read to find the grandchild")
+class TimeoutGroupTest(_Contract):
+    """N4 de #1666 : au délai dépassé, le sélecteur **et ses petits-enfants**
+    meurent — `subprocess.run(timeout=…)` ne tuait que l'enfant direct."""
+
+    marker = "ameesh1666grandchild"
+
+    def _grandchild(self):
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % name, "rb") as handle:
+                    if self.marker.encode() in handle.read():
+                        return int(name)
+            except OSError:
+                continue
+        return None
+
+    def _reap(self):
+        pid = self._grandchild()
+        if pid:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+
+    def test_the_timeout_kills_the_selector_and_its_grandchild(self):
+        _write(self.repo, "scripts/ci/lot-plan.py",
+               GRANDCHILD_SELECTOR.replace("__MARKER__", self.marker))
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        self.addCleanup(self._reap)
+        with mock.patch.object(ci_parts, "PARTS_TIMEOUT", 3):
+            with self.assertRaisesRegex(ci_parts.PartsError, "timed out"):
+                ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertIsNone(self._grandchild())
+
+
+class SandboxTest(_Contract):
+    """N3 de #1666 : le sélecteur du dépôt ne tourne jamais sur l'hôte."""
+
+    def invocations(self):
+        with open(self.bwrap_log, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_without_bwrap_the_proof_is_refused_and_nothing_starts(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        with mock.patch.object(ci_parts, "sandbox_binary", lambda: None), \
+                mock.patch.object(ci_parts, "extract",
+                                  side_effect=AssertionError("the tree was extracted")):
+            with self.assertRaisesRegex(ci_parts.PartsError, "no sandbox"):
+                ci_parts.due(self.project, tip, self.base(), self.repo)
+        #: aucun bac à sable n'a démarré (le journal du faux bwrap n'existe
+        #: pas) et rien n'a été extrait : pas de repli vers l'exécution hôte
+        self.assertFalse(os.path.exists(self.bwrap_log))
+
+    def test_a_sandbox_that_cannot_isolate_refuses_before_any_extraction(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        dead = fake_bwrap(
+            os.path.join(self.tmp, "dead-bwrap"),
+            fail="bwrap: Creating new namespace failed: Operation not permitted")
+        with mock.patch.object(ci_parts, "sandbox_binary", lambda: dead), \
+                mock.patch.object(ci_parts, "extract",
+                                  side_effect=AssertionError("the tree was extracted")):
+            with self.assertRaisesRegex(ci_parts.PartsError, "cannot be isolated"):
+                ci_parts.due(self.project, tip, self.base(), self.repo)
+
+    def test_every_selector_env_variable_reaches_the_sandbox(self):
+        """Composition avec #1938 : `LD_LIBRARY_PATH` (runtime relocalisé) doit
+        survivre au bac à sable, sans liste figée de variables."""
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        real = ci_parts.selector_env
+        with mock.patch.object(
+                ci_parts, "selector_env",
+                lambda root, home: dict(real(root, home),
+                                        LD_LIBRARY_PATH="/opt/hostedtoolcache/lib")):
+            ci_parts.due(self.project, tip, self.base(), self.repo)
+        run = self.invocations()[-1]
+        self.assertEqual(run["env"]["LD_LIBRARY_PATH"], "/opt/hostedtoolcache/lib")
+
+    def test_the_selector_runs_with_the_network_cut_and_a_read_only_tree(self):
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        proof = ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertEqual(proof["due"], ("lot/backend-suite",))
+        calls = self.invocations()
+        self.assertEqual(len(calls), 2)      # le témoin de démarrage, puis le sélecteur
+        probe, run = calls[0]["argv"], calls[1]["argv"]
+        self.assertIn("--unshare-net", probe)
+        self.assertIn("--unshare-all", run)
+        self.assertIn("--die-with-parent", run)
+        self.assertIn("--clearenv", run)
+        readonly, writable, setenv = {}, {}, {}
+        index = 0
+        while index < len(run):
+            if run[index] in ("--ro-bind", "--bind"):
+                target = readonly if run[index] == "--ro-bind" else writable
+                target[run[index + 1]] = run[index + 2]
+                index += 3
+            elif run[index] == "--setenv":
+                setenv[run[index + 1]] = run[index + 2]
+                index += 3
+            else:
+                index += 1
+        tree = [path for path in readonly if path.endswith(os.sep + "tree")]
+        self.assertEqual(len(tree), 1)
+        self.assertEqual(readonly[tree[0]], tree[0])
+        changed = [path for path in readonly if path.endswith("changed.nul")]
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(readonly[changed[0]], changed[0])
+        #: ni la racine ni un répertoire personnel : le bac à sable ne voit que
+        #: le runtime, l'arbre, les entrées et sa sortie (le temporaire de la
+        #: preuve peut lui-même vivre sous un chemin personnel : ce sont ses
+        #: **parents** qui ne sont jamais montés)
+        self.assertNotIn("/", readonly)
+        #: N3 de #1666 : hors du runtime système, le binaire du sélecteur et
+        #: les `lib`/`lib64` de son préfixe sont montés en lecture seule (le
+        #: préfixe entier exposerait le HOME). Sur un runner CI, l'interpréteur
+        #: qui exécute le sélecteur vit dans le toolcache : ces montages
+        #: dépendent de l'hôte et se recalculent depuis la ligne de commande.
+        real = run[run.index("--") + 1]
+        extra = os.path.dirname(real) or "/"
+        if os.path.basename(extra) == "bin":
+            extra = os.path.dirname(extra) or "/"
+        mounted = list(ci_parts.SANDBOX_RUNTIME) + list(ci_parts.SANDBOX_LINKER)
+        if not any(extra == path or extra.startswith(path.rstrip("/") + "/")
+                   for path in ci_parts.SANDBOX_RUNTIME):
+            mounted += [real] + [os.path.join(extra, name) for name in ("lib", "lib64")]
+        expected = {path for path in mounted if os.path.exists(path)}
+        self.assertEqual(set(readonly), expected | {tree[0], changed[0]})
+        self.assertEqual(len(writable), 2)   # travail et sortie, rien d'autre
+        self.assertEqual(setenv["GITHUB_WORKSPACE"], tree[0])
+        self.assertIn(setenv["HOME"], writable)
+        self.assertEqual(setenv["TMPDIR"], setenv["HOME"])
+        self.assertEqual(run[run.index("--chdir") + 1], tree[0])
+        cmd = run[run.index("--") + 1:]
+        self.assertEqual(cmd[0], os.path.realpath(sys.executable))
+        self.assertEqual(cmd[1], os.path.join(tree[0], "scripts", "ci", "lot-plan.py"))
+        self.assertEqual(cmd[2], "--files")
+        self.assertEqual(cmd[3], changed[0])
+        self.assertEqual(cmd[4], "--out")
+        self.assertIn(os.path.dirname(cmd[5]), writable)   # le plan s'écrit dans la sortie
+
+
+#: N3 de #1666 : un sélecteur qui n'écrit un plan que si l'hôte et le réseau
+#: sont hors de portée du bac à sable réel
+REAL_SANDBOX_SELECTOR = '''\
+import json
+import os
+import socket
+import sys
+
+if os.path.exists("/etc/passwd"):
+    raise SystemExit("the host filesystem is readable")
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=2).close()
+except OSError:
+    pass
+else:
+    raise SystemExit("the network is reachable")
+out = sys.argv[sys.argv.index("--out") + 1]
+with open(out, "w", encoding="utf-8") as handle:
+    json.dump({"schema": "test-lot-plan/1", "due": ["lot/backend-suite"]}, handle)
+'''
+
+
+@unittest.skipUnless(shutil.which("bwrap"), "bwrap is not installed on this host")
+class RealSandboxTest(_Contract):
+    """N3 de #1666 : le bac à sable réel — le plan est prouvé et le sélecteur
+    ne voit ni les fichiers de l'hôte ni le réseau (sauté sans `bwrap`)."""
+
+    FAKE_SANDBOX = False
+
+    def test_a_relocated_runtime_does_not_expose_its_parent_directory(self):
+        runtime = os.path.join(self.tmp, "runtime")
+        os.makedirs(os.path.join(runtime, "bin"))
+        program = os.path.join(runtime, "bin", "sh")
+        shutil.copyfile(shutil.which("sh", path=os.defpath), program)
+        os.chmod(program, 0o755)
+        marker = os.path.join(runtime, "private-marker")
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("private fixture")
+        source = ('test ! -e "$1" || exit 99\n'
+                  'printf \'%s\' \'{"schema":"test-lot-plan/1",'
+                  '"due":["lot/backend-suite"]}\' > "$2"\n')
+        _write(self.repo, "scripts/ci/lot-plan.py", source)
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        plan = dataclasses.replace(PARTS_CONTRACT,
+                                   argv=(program, "{selector}", marker, "{out}"))
+        project = dataclasses.replace(self.project, ci_parts=plan)
+        proof = ci_parts.due(project, tip, self.base(), self.repo)
+        self.assertEqual(proof["due"], ("lot/backend-suite",))
+
+    def test_the_real_sandbox_proves_the_plan_and_hides_host_and_network(self):
+        _write(self.repo, "scripts/ci/lot-plan.py", REAL_SANDBOX_SELECTOR)
+        self.publish_main()
+        branch = self.lot_touching("backend")
+        tip = _git(self.repo, "rev-parse", branch)
+        proof = ci_parts.due(self.project, tip, self.base(), self.repo)
+        self.assertEqual(proof["due"], ("lot/backend-suite",))
+        self.assertEqual(proof["schema"], "test-lot-plan/1")
+
+
+class PlanFileTest(unittest.TestCase):
+    """Le plan est écrit par le sélecteur (code de la cible) dans un répertoire
+    inscriptible du bac à sable, puis lu par l'hôte : seul un fichier ordinaire
+    borné est lu, jamais un lien ni une FIFO."""
+
+    PLAN = mock.Mock(schema="test-lot-plan/1", due="due")
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix="test-1666-plan-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.path = os.path.join(self.dir, "plan.json")
+
+    def write(self, path, data):
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    def test_a_regular_plan_is_read(self):
+        self.write(self.path, {"schema": "test-lot-plan/1", "due": ["backend"]})
+        self.assertEqual(ci_parts._plan_file(self.path, self.PLAN),
+                         ("test-lot-plan/1", ("backend",)))
+
+    def test_a_link_to_a_host_file_is_not_followed(self):
+        host = os.path.join(self.dir, "host-file.json")
+        self.write(host, {"schema": "test-lot-plan/1", "due": []})
+        os.symlink(host, self.path)
+        with self.assertRaisesRegex(ci_parts.PartsError, "no readable plan"):
+            ci_parts._plan_file(self.path, self.PLAN)
+
+    def test_a_fifo_is_refused_without_blocking(self):
+        os.mkfifo(self.path)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ci_parts.PartsError, "not a regular file"):
+            ci_parts._plan_file(self.path, self.PLAN)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_an_oversized_plan_is_refused(self):
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(" " * (ci_parts.PLAN_MAX_BYTES + 1))
+        with self.assertRaisesRegex(ci_parts.PartsError, "exceeds"):
+            ci_parts._plan_file(self.path, self.PLAN)

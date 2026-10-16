@@ -18,6 +18,24 @@ _ACTIVE = ("select account, forced, extract(epoch from updated_at)::float8 as up
            " from account_active where host = %s and harness = %s")
 
 
+def _verrou_placement(tx, host, harness) -> None:
+    """#1883 (R3 auditeur, B1) : LE verrou de placement d'un couple (hôte,
+    harnais).
+
+    Toute publication de retenue (`switch_guarded`, `hold`) et toute lecture
+    d'état de placement (`placement_state`) le prennent en tête de
+    transaction : les deux jeux (retenues, identités) sont alors cohérents
+    entre eux, et une publication concurrente est soit antérieure à la lecture
+    — visible —, soit postérieure — elle attend la fin de la lecture.
+    L'advisory couvre le cas d'une ligne `account_active` absente (premier
+    placement), là où un `FOR UPDATE` ne verrouille rien. La clé porte le
+    schéma courant, comme `canon_sync` : une base de test porte plusieurs
+    schémas, deux schémas ne doivent pas s'attendre."""
+    tx.query("select pg_advisory_xact_lock(hashtextextended("
+             "current_schema() || ':ameesh-placement:' || %s, 0))",
+             ("%s/%s" % (host, harness),))
+
+
 class Accounts(interface.Accounts):
 
     def active(self, host, harness) -> dict | None:
@@ -61,6 +79,70 @@ class Accounts(interface.Accounts):
                 (host, harness, depart, to, kind, reason, agent))
         return True
 
+    def switch_guarded(self, host, harness, *, expected, to, kind, reason, agent,
+                       now, hold_reason=None, hold_until=None) -> bool:
+        """#1883 : la bascule ET la retenue du compte quitté, sous le verrou."""
+        with self.db.transaction() as tx:
+            # #1883 (R3 auditeur, B1) : le verrou de placement, pris par TOUTE
+            # publication de retenue et par `placement_state`. L'advisory
+            # sérialise même sans ligne `account_active` (premier placement) ;
+            # le FOR UPDATE qui suit garde le compare-and-changer.
+            _verrou_placement(tx, host, harness)
+            rows = tx.query(
+                "select account, forced from account_active"
+                " where host = %s and harness = %s for update", (host, harness))
+            # une retenue VALIDE sur la cible refuse la bascule (lue sous le
+            # verrou : une publication concurrente est visible ou l'est après
+            # nous, jamais entre les deux)
+            garde = tx.query(
+                "select 1 from account_holds where host = %s and harness = %s"
+                " and account = %s and until_ts is not null and until_ts > %s",
+                (host, harness, to, now))
+            if garde:
+                return False
+            if rows:
+                ligne = rows[0]
+                if expected is not None and ligne["account"] != expected:
+                    return False
+                if kind != "config" and ligne["forced"]:
+                    return False  # un forçage manuel n'est jamais défait par l'automate
+                if ligne["account"] == to:
+                    return False
+                tx.execute(
+                    "update account_active set account = %s, forced = false,"
+                    " updated_at = now() where host = %s and harness = %s",
+                    (to, host, harness))
+                depart = ligne["account"]
+            else:
+                if expected is not None:
+                    return False
+                tx.execute(
+                    "insert into account_active (host, harness, account, forced)"
+                    " values (%s, %s, %s, false)", (host, harness, to))
+                depart = None
+            tx.execute(
+                "insert into account_switches (host, harness, from_account, to_account,"
+                " kind, reason, agent) values (%s, %s, %s, %s, %s, %s, %s)",
+                (host, harness, depart, to, kind, reason, agent))
+            if hold_reason is not None and depart is not None:
+                tx.execute(
+                    "insert into account_holds (host, harness, account, until_ts, reason)"
+                    " values (%s, %s, %s, %s, %s)"
+                    " on conflict (host, harness, account) do update"
+                    " set until_ts = excluded.until_ts, reason = excluded.reason,"
+                    " created_at = now()",
+                    (host, harness, depart, hold_until, hold_reason))
+            # #1883 (R2 auditeur, B2) : les retenues ÉCHUES de la cible sont
+            # nettoyées DANS la transaction, sous le même verrou. Un DELETE
+            # après le commit effacerait une retenue publiée entre-temps par un
+            # autre runner (sa bascule attend le verrou, donc passe après) ;
+            # une retenue VALIDE, elle, a déjà refusé la bascule plus haut.
+            tx.execute(
+                "delete from account_holds where host = %s and harness = %s"
+                " and account = %s and (until_ts is null or until_ts <= %s)",
+                (host, harness, to, now))
+        return True
+
     def set_auto(self, host, harness, *, reason, expected=None) -> bool:
         with self.db.transaction() as tx:
             rows = tx.query(
@@ -86,17 +168,67 @@ class Accounts(interface.Accounts):
         return {r["account"]: {"until_ts": r["until_ts"], "reason": r["reason"]} for r in rows}
 
     def hold(self, host, harness, account, until_ts, reason) -> None:
-        self.db.execute(
-            "insert into account_holds (host, harness, account, until_ts, reason)"
-            " values (%s, %s, %s, %s, %s)"
-            " on conflict (host, harness, account) do update"
-            " set until_ts = excluded.until_ts, reason = excluded.reason, created_at = now()",
-            (host, harness, account, until_ts, reason))
+        """#1883 : toute publication de retenue prend le verrou de placement,
+        pour qu'aucune lecture d'état (`placement_state`) ne puisse manquer une
+        retenue publiée pendant qu'elle lit."""
+        with self.db.transaction() as tx:
+            _verrou_placement(tx, host, harness)
+            tx.execute(
+                "insert into account_holds (host, harness, account, until_ts, reason)"
+                " values (%s, %s, %s, %s, %s)"
+                " on conflict (host, harness, account) do update"
+                " set until_ts = excluded.until_ts, reason = excluded.reason,"
+                " created_at = now()",
+                (host, harness, account, until_ts, reason))
 
     def release(self, host, harness, account) -> None:
         self.db.execute(
             "delete from account_holds where host = %s and harness = %s and account = %s",
             (host, harness, account))
+
+    def identities(self, host, harness, since) -> dict:
+        rows = self.db.query(
+            "select account, identity, extract(epoch from last_seen)::float8 as last_ts"
+            " from account_identities where host = %s and harness = %s"
+            " and extract(epoch from last_seen) >= %s", (host, harness, since))
+        vues: dict = {}
+        for r in rows:
+            vues.setdefault(r["account"], []).append(
+                {"identity": r["identity"], "last_ts": r["last_ts"]})
+        return vues
+
+    def publish_identity(self, host, harness, account, identity) -> None:
+        self.db.execute(
+            "insert into account_identities (host, harness, account, identity)"
+            " values (%s, %s, %s, %s)"
+            " on conflict (host, harness, account, identity) do update"
+            " set last_seen = now()", (host, harness, account, identity))
+
+    def placement_state(self, host, harness, since) -> dict:
+        """#1883 (R3 auditeur, B1) : retenues et identités, en UNE transaction
+        sous le verrou de placement.
+
+        Les deux SELECT voient le même état vis-à-vis des publications de
+        retenue : `switch_guarded` et `hold` prennent le même verrou, donc une
+        retenue publiée pendant cette lecture est antérieure (visible) ou
+        postérieure (elle attend le commit)."""
+        with self.db.transaction() as tx:
+            _verrou_placement(tx, host, harness)
+            retenues = {
+                r["account"]: {"until_ts": r["until_ts"], "reason": r["reason"]}
+                for r in tx.query(
+                    "select account, until_ts, reason from account_holds"
+                    " where host = %s and harness = %s", (host, harness))}
+            vues: dict = {}
+            for r in tx.query(
+                    "select account, identity,"
+                    " extract(epoch from last_seen)::float8 as last_ts"
+                    " from account_identities where host = %s and harness = %s"
+                    " and extract(epoch from last_seen) >= %s",
+                    (host, harness, since)):
+                vues.setdefault(r["account"], []).append(
+                    {"identity": r["identity"], "last_ts": r["last_ts"]})
+        return {"holds": retenues, "identities": vues}
 
     def switches(self, host, harness, limit) -> list:
         clauses = ["host = %s"]

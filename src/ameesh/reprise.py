@@ -20,10 +20,12 @@ longer asked to "resume session X" by digging through
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 
@@ -224,11 +226,12 @@ def locate(cfg: Config, harness: str, session_id: str,
 
 def holders(path: str | None, session_id: str) -> list[dict]:
     """Les processus qui tiennent la session : fichier ouvert (ou dossier
-    ouvert ou courant), ou id de session sur la ligne de commande (`codex
-    resume <id>`, `claude --resume <id>`) — hors ce processus et ses
-    ascendants, dont la ligne de commande porte l'id passé à `ameesh adopt`.
-    Par la couche plateforme (L63) ; les processus illisibles (autre
-    utilisateur, disparus) sont ignorés.
+    ouvert ou courant), ou id de session sur la ligne de commande d'une
+    REPRISE (`codex resume <id>`, `claude --resume <id>`, `dsh --session-id
+    <id>`) — hors ce processus et ses ascendants, dont la ligne de commande
+    porte l'id passé à `ameesh adopt`. L'id simplement CITÉ (brief, message,
+    chemin) ne compte pas (#1283). Par la couche plateforme (L63) ; les
+    processus illisibles (autre utilisateur, disparus) sont ignorés.
 
     Lève `platform.NotAvailable` si l'OS ne permet pas de le vérifier :
     jamais de liste vide qui voudrait dire « personne » sans contrôle.
@@ -237,7 +240,22 @@ def holders(path: str | None, session_id: str) -> list[dict]:
     écriture ; une session interactive démarrée sans `--resume` n'est donc vue
     que si elle écrit au moment du contrôle.
     """
-    return platform.holders(path, session_id, exclude=platform.ancestry())
+    return platform.holders(path, session_id, exclude=platform.ancestry(),
+                            session=True)
+
+
+def recently_modified(path: str | None) -> bool:
+    """A recently written external journal may still have a live writer.
+
+    Some harnesses close their journal between writes. Wait a quiet minute
+    before adoption or unleased resumption, even when no open fd was found.
+    """
+    if not path:
+        return False
+    try:
+        return time.time() - os.stat(path).st_mtime < 60
+    except FileNotFoundError:
+        return False
 
 
 def session_cwd(harness: str, path: str) -> str | None:
@@ -728,6 +746,272 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
 
 
 # --------------------------------------------------------------------------
+# #794 : le brief MINIMAL d'une session dédiée à un lot
+# --------------------------------------------------------------------------
+
+#: Bornes du brief de lot (décision du bureau, 2026-10-13) : plus serré que le
+#: brief de reprise, il ne porte que le canon, la fiche du lot, le diff de sa
+#: branche et son fil réduit aux décisions et messages non lus. Ni transcript
+#: d'une session, ni autre lot, ni synthèse de rotation.
+LOT_BRIEF_MAX_BYTES = 16000
+LOT_NOTES_MAX = 6
+LOT_NOTE_CHARS = 600
+LOT_MAIL_MAX = 8
+LOT_MAIL_CHARS = 300
+LOT_DECISIONS_MAX = 5
+LOT_DIFF_MAX_LINES = 40
+LOT_DIFF_MAX_BYTES = 3000
+LOT_DIFF_TIMEOUT_S = 15.0
+#: branches candidates pour le merge-base quand le lot n'a pas de cible
+LOT_DIFF_BASES = ("origin/HEAD", "origin/main", "main", "master")
+
+
+def _stamp(value) -> str:
+    """Un instant lisible en UTC : epoch, datetime, ou ISO du pilote psql."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        ts = float(value)
+    elif isinstance(value, str):
+        try:
+            ts = datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return value[:16]
+    else:
+        try:
+            ts = value.timestamp()
+        except AttributeError:
+            return str(value)[:16]
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.gmtime(ts))
+    except (OSError, ValueError, OverflowError):
+        return "?"
+
+
+def _git(cwd: str, args) -> tuple[str | None, str]:
+    """`git -C cwd args`, borné en durée ; (sortie, erreur). Jamais d'exception."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, *args], capture_output=True, text=True,
+            timeout=LOT_DIFF_TIMEOUT_S,
+            env=dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_PAGER="cat",
+                     LC_ALL="C", GIT_TERMINAL_PROMPT="0"))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, type(exc).__name__
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        return None, detail[0] if detail else "git failed"
+    return proc.stdout, ""
+
+
+def _lot_diff(item: dict, cwd: str) -> list[str]:
+    """Le diff de la branche du lot (stat et derniers commits), borné.
+
+    Jamais fatal : sans branche, sans dépôt, sans git ou sans merge-base, la
+    section le dit et la session neuve sait où reprendre. N2 (revue Claude du
+    2026-10-14) : `branch` et `branch_target` viennent de `work.set_branch` et
+    ne sont jamais passés à git comme des options — un nom qui commence par
+    `-` est refusé, et `--end-of-options` précède toute référence."""
+    section = ["## Diff of the lot's branch"]
+    branche = (item.get("branch") or "").strip()
+    if not branche:
+        return section + ["- no branch yet: the agent opens the lot's worktree and "
+                          "branch in the first turns."]
+    if branche.startswith("-"):
+        return section + ["- branch name %r refused (starts with '-')" % branche]
+    if not cwd or not os.path.isdir(cwd):
+        return section + ["- branch %s (diff unreadable: no working directory)"
+                          % branche]
+    tete, err = _git(cwd, ["rev-parse", "--verify", "--quiet", "--end-of-options",
+                           branche + "^{commit}"])
+    if not tete:
+        return section + ["- branch %s (diff unreadable: %s)" % (branche, err or "unknown ref")]
+    tete = tete.strip()
+    cible = (item.get("branch_target") or "").strip()
+    if cible.startswith("-"):
+        cible = ""
+    racine = base_nom = None
+    for candidat in ([cible] if cible else list(LOT_DIFF_BASES)):
+        sortie, _ = _git(cwd, ["merge-base", "--end-of-options", candidat, branche])
+        if sortie and sortie.strip():
+            racine, base_nom = sortie.strip(), candidat
+            break
+    if racine is None:
+        return section + ["- branch %s, head %s (no merge-base with %s: diff unreadable)"
+                          % (branche, tete[:12], cible or "/".join(LOT_DIFF_BASES))]
+    out = ["- %s: base %s (%s) → head %s" % (branche, base_nom, racine[:12], tete[:12])]
+    stat, _ = _git(cwd, ["diff", "--stat", "--no-color", "--end-of-options",
+                         racine, branche])
+    if stat:
+        stat_lignes = [l for l in stat.splitlines() if l.strip()][:LOT_DIFF_MAX_LINES]
+        out += ["  - " + fil.excerpt(l, 300) for l in stat_lignes]
+        out = _clip_lines(out, LOT_DIFF_MAX_BYTES)
+    journal, _ = _git(cwd, ["log", "--oneline", "--no-decorate", "-5",
+                            "--end-of-options", "%s..%s" % (racine, branche)])
+    if journal:
+        out.append("  - last commits:")
+        out += ["    - " + fil.excerpt(l, 200) for l in journal.splitlines()[:5]]
+    return section + out
+
+
+def _clip_lines(lines: list[str], limit: int) -> list[str]:
+    """`lines` bornées à `limit` octets UTF-8 (la dernière ligne tronquée)."""
+    out: list[str] = []
+    reste = limit
+    for line in lines:
+        taille = _octets(line) + 1
+        if taille > reste:
+            if reste > 1:
+                out.append(_clip(line, reste - 1))
+            break
+        out.append(line)
+        reste -= taille
+    return out
+
+
+def _lot_sheet(db, item: dict) -> list[str]:
+    """La fiche du lot : identité, état, attente, estimate, branche, notes."""
+    lot = item.get("id")
+    out = ["## Lot #%s — %s" % (lot, fil.excerpt(item.get("title") or "", 160))]
+    champs = ["state: %s" % (item.get("state") or "?")]
+    for cle in ("type", "priority", "assignee"):
+        if item.get(cle) is not None:
+            champs.append("%s: %s" % (cle, item[cle]))
+    if not item.get("assignee"):
+        champs.append("assignee: none")
+    out.append("- " + " · ".join(champs))
+    try:
+        jalons = work_mod.timeline(db, int(lot)) or {}
+    except Exception:
+        jalons = {}
+    dates = ["%s: %s" % (nom, _stamp(jalons[cle]))
+             for nom, cle in (("created", "requested_ts"), ("frozen", "frozen_ts"),
+                              ("review", "reviewed_ts"), ("merged", "merged_ts"))
+             if jalons.get(cle)]
+    if dates:
+        out.append("- " + " · ".join(dates))
+    attente = None
+    try:
+        desc = stagnation.describe(db, [item]).get(int(lot)) or {}
+        attente = (desc.get("waiting") or {}).get("label")
+    except Exception:
+        attente = None
+    meta = []
+    if item.get("estimate_minutes") is not None:
+        from . import estimates
+        par = ""
+        if item.get("estimate_by"):
+            par = " (by %s%s)" % (item["estimate_by"],
+                                  ", " + _stamp(item["estimate_at"])
+                                  if item.get("estimate_at") else "")
+        meta.append("estimate: %s%s" % (estimates.label(item["estimate_minutes"]), par))
+    if attente:
+        meta.append("waiting for: %s" % attente)
+    for cle in ("app", "source"):
+        if item.get(cle):
+            meta.append("%s: %s" % (cle, item[cle]))
+    if item.get("issue_ref"):
+        meta.append("issue: %s" % item["issue_ref"])
+    if meta:
+        out.append("- " + " · ".join(meta))
+    if item.get("branch"):
+        branche = ["branch: %s" % item["branch"]]
+        if item.get("branch_target"):
+            branche.append("target: %s" % item["branch_target"])
+        if item.get("branch_head"):
+            branche.append("head: %s" % str(item["branch_head"])[:12])
+        out.append("- " + " · ".join(branche))
+    try:
+        events = work_mod.events(db, int(lot), LOT_NOTES_MAX * 3)
+    except Exception:
+        events = []
+    notes = [e for e in events if (e.get("note") or "").strip()][:LOT_NOTES_MAX]
+    if notes:
+        out.append("- last notes (oldest first):")
+        out += ["  - %s %s: %s" % (_stamp(e.get("created_ts")), e.get("actor") or "?",
+                                   fil.excerpt(e.get("note") or "", LOT_NOTE_CHARS))
+                for e in reversed(notes)]
+    return out
+
+
+def _lot_thread(db, name: str, lot: str) -> list[str]:
+    """Le fil du lot, réduit aux décisions en attente et messages non lus."""
+    section = ["## Lot thread — decisions and unread messages"]
+    lignes: list[str] = []
+    try:
+        decisions = storage.of(db).decisions.pending_for_lot(str(lot))
+    except Exception:
+        decisions = []
+    for d in decisions[:LOT_DECISIONS_MAX]:
+        question = ((d.get("payload") or {}).get("decision") or {}).get("question") \
+            or d.get("body") or ""
+        lignes.append("- decision #%s (from %s, %s): %s" % (
+            d.get("id"), d.get("sender") or "?", _stamp(d.get("created_ts")),
+            fil.excerpt(question, LOT_MAIL_CHARS)))
+    try:
+        non_lus = [m for m in mail.unread(db, name)
+                   if str(m.get("work_item_id") or "").strip() == str(lot)]
+    except Exception:
+        non_lus = []
+    for m in non_lus[:LOT_MAIL_MAX]:
+        lignes.append("- unread #%s (from %s, %s): %s" % (
+            m.get("id"), m.get("sender") or "?", _stamp(m.get("created_ts")),
+            fil.excerpt(m.get("body") or "", LOT_MAIL_CHARS)))
+    if len(non_lus) > LOT_MAIL_MAX:
+        lignes.append("- … and %d more unread messages for this lot (`ameesh mail inbox %s`)"
+                      % (len(non_lus) - LOT_MAIL_MAX, name))
+    if not lignes:
+        lignes = ["- no pending decision and no unread message for this lot."]
+    return section + lignes + [""]
+
+
+def lot_brief(cfg: Config, db, row: dict | None, lot, *, consigne: str = "",
+              reason: str = "") -> str:
+    """Le brief déterministe d'une session NEUVE dédiée à un lot (#794).
+
+    Contenu minimal décidé par le bureau le 2026-10-13 : canon (les règles de
+    travail, ajoutées par `with_process_rules`), fiche du lot, diff de sa
+    branche, fil du lot réduit aux décisions en attente et messages non lus.
+    Aucun transcript, aucun autre lot, aucune synthèse : une session par lot,
+    jamais partagée."""
+    row = dict(row or {})
+    name = row.get("name") or "?"
+    project = fil.project_for(cfg, row.get("team") or row.get("workstream"))
+    head = ["# Session dedicated to lot #%s (ameesh, deterministic)" % lot, "",
+            "Built by ameesh without a model call%s. This session is dedicated to lot "
+            "#%s: work only on it here; the other lots keep their own sessions, put "
+            "aside and resumed when their turn comes." % (
+                " — %s" % reason if reason else "", lot), ""]
+    ident = ["## Identity and role",
+             "- agent: %s (harness %s), host %s" % (name, row.get("harness") or "?",
+                                                    row.get("host") or "?"),
+             "- working directory: %s" % (row.get("cwd") or "not set"),
+             "- project: %s%s" % (project, " (team %s)" % row["team"]
+                                  if row.get("team") else ""),
+             "- human owner: %s" % (row.get("responsible") or "none")]
+    if row.get("capabilities"):
+        caps = row["capabilities"]
+        ident.append("- capabilities: %s" % (", ".join(map(str, caps))
+                                             if isinstance(caps, (list, tuple)) else caps))
+    ident += _role(cfg, name)
+    try:
+        item = work_mod.get(db, int(lot)) if str(lot).isdigit() else None
+    except Exception:
+        item = None
+    if item is None:
+        fiche = ["## Lot #%s" % lot, "- lot unreadable or unknown to ameesh"]
+    else:
+        fiche = _lot_sheet(db, item)
+    diff = _lot_diff(item or {}, row.get("cwd") or "")
+    fin = ["## Instructions", (consigne or "").strip() or DEFAULT_RESUME]
+    text = "\n".join(head + ident + [""] + fiche + [""] + diff + [""]
+                     + _lot_thread(db, name, str(lot)) + fin)
+    return with_process_rules(cfg, _clip(text.replace("\x00", ""), LOT_BRIEF_MAX_BYTES),
+                              agent=name, canon_id=row.get("canon"),
+                              host=row.get("host") or "")
+
+
+# --------------------------------------------------------------------------
 # adopt
 # --------------------------------------------------------------------------
 
@@ -849,6 +1133,14 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                  % (session_id, ", ".join("pid %d" % t["pid"] for t in tenants)))
         warn(avert)
         constats.append(avert)
+    recent = recently_modified(path)
+    if recent and not force:
+        raise RepriseError("session %s was modified in the last 60 seconds: close the "
+                           "interactive session first and wait for a quiet minute" % session_id)
+    if recent:
+        avert = "--force: session %s adopted with activity in the last 60 seconds" % session_id
+        warn(avert)
+        constats.append(avert)
     # dossier de travail : --cwd, sinon celui du journal de session, sinon le registre
     noted = session_cwd(harness, path) if path else None
     if cwd:
@@ -924,10 +1216,10 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                        "".join("\n- %s" % c for c in constats)),
                project=_project(cfg, after),
                meta={"audit": "adopt", "session": session_id, "account": compte or "",
-                     "harness": harness, "forced": bool(tenants),
+                     "harness": harness, "forced": bool(tenants or recent),
                      "previous_session": result.get("previous_session") or ""})
     return {"agent": name, "session": session_id, "harness": harness, "account": compte,
-            "path": path, "cwd": effectif, "forced": bool(tenants),
+            "path": path, "cwd": effectif, "forced": bool(tenants or recent),
             "wakeable": ok,
             "previous_session": result.get("previous_session"),
             "previous_mode": result.get("previous_mode"), "notes": constats}
@@ -954,6 +1246,21 @@ def _local_session(cfg: Config, row: dict) -> str | None:
         return session
     except OSError:
         return None
+
+
+def _critical(cfg: Config, row: dict) -> bool:
+    """L242c : comme `Runner.is_critical` (`auditor.is_critical`) — déclaré, ou
+    rôle critique de sa fiche dans son canon propriétaire ; canon lisible, le
+    verdict rafraîchit le cache (#424 r3) ; illisible, le dernier verdict lu,
+    sinon critique (#424 r6) ; canon configuré sur aucun canon de l'hôte
+    (#424 r7) : non critique."""
+    from . import auditor as auditor_mod, canon as canon_mod, sous_utilisation as su
+    try:
+        canons = canon_mod.load_configured(cfg) if canon_mod.configured(cfg) else []
+    except Exception:
+        canons = []
+    return auditor_mod.is_critical(cfg, None, row["name"], canons,
+                                   declared=su.declared_orchestrators(), agent=row)
 
 
 def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
@@ -993,8 +1300,10 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
                              simulate=True, session_account=origine,
-                             critical=row["name"] in (getattr(cfg, "critical_agents", None)
-                                                      or ()))
+                             critical=_critical(cfg, row),
+                             # #1580 (tranche 3) : le compte simulé pour cet
+                             # agent tient compte de son modèle
+                             model=row.get("model") or book.model_of(row["name"]))
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
@@ -1014,7 +1323,9 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
         sick = auth_failure.failing(db, cfg.host, harness)
     except db_mod.DbError:
         sick = {}
-    usable, raison = account_turn.summary_possible(old, book, items, sick=sick)
+    usable, raison = account_turn.summary_possible(
+        old, book, items, sick=sick,
+        model=row.get("model") or book.model_of(row["name"]))
     if usable:
         out.update(keep=True, deterministic=False,
                    why="session %s (account %s) is not portable to %s; the old "
@@ -1061,6 +1372,20 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
         warn("no runner holds %s's lease on %s: the instruction waits until a runner "
              "serves it again" % (name, row.get("host") or "?"))
     decision = plan(cfg, db, row, fresh=fresh)
+    if (not live and decision["keep"] and decision["session"]
+            and (row.get("host") or "") == cfg.host):
+        session = decision["session"]
+        _account, path, _searched = locate(cfg, row.get("harness") or "", session,
+                                          decision["previous"])
+        try:
+            tenants = holders(path or os.path.join(cfg.agent_dir(name), "session"), session)
+            recent = recently_modified(path)
+        except (platform.NotAvailable, OSError) as exc:
+            raise RepriseError("cannot check that session %s is closed: %s" % (session, exc)) from exc
+        if tenants or recent:
+            raise RepriseError("session %s is still open or was modified in the last 60 seconds: "
+                               "close the interactive session first and wait for a quiet minute"
+                               % session)
     for text in decision["warnings"]:
         warn(text)
     consigne = (brief or "").strip() or DEFAULT_RESUME

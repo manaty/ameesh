@@ -4,8 +4,14 @@
 
   agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
                [--dry-run] [--max-turns N] [--migrate]
+               [--take-idle S] [--take-max-per-hour N]
+               [--take-lot-idle S] [--take-lot-max-per-hour N] [--take-interval S]
         claims this host's agents, renews their leases, starts a turn
         when a message arrives (LISTEN/NOTIFY) or after inactivity.
+        Every --take-interval seconds, takes for its own idle agents the
+        best-ranked lot that fits them (L119/L165, #804) — the same guarded
+        `backlog.auto_take` that `ameesh notify` calls, so distribution no
+        longer depends on a central notifier.
   agent-runner register <name> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXT]
                [--session ID] [--chantier C] [--model M] [--budget USD]
         registers an agent (the v1 equivalent of "nexlink-agent start").
@@ -34,6 +40,7 @@ import json
 import math
 import os
 import queue
+import select
 import shutil
 import signal
 import subprocess
@@ -47,7 +54,7 @@ from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
 from . import persona_memory as memory_mod
-from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
+from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, NAME_RE, Config
 from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import load as load_config
 
@@ -163,8 +170,10 @@ BOOT_REVIEW_EVERY_S = 60.0
 BOOT_REVIEW_MAX_ROWS = 2000
 #: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
 BOOT_REVIEW_START = ("running", 0)
-#: L76 : après un démarrage résident raté, un tour par événement pendant ce délai
-RESIDENT_RETRY_S = 600.0
+#: L76 : après un échec du processus résident (démarrage raté, mort), un tour
+#: par événement pendant ce délai, doublé à chaque échec de suite, borné
+RESIDENT_RETRY_MIN_S = 60.0
+RESIDENT_RETRY_MAX_S = 3600.0
 #: L76 : attente de la fin d'un tour résident après son flux (harnais tué)
 RESIDENT_END_WAIT_S = 5.0
 #: #339: this host's rows whose group is gone are settled at start and then
@@ -173,6 +182,9 @@ RESIDENT_END_WAIT_S = 5.0
 #: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
 LIVE_REVIEW_EVERY_S = 300.0
 LIVE_REVIEW_IDLE_S = 600.0
+#: L498 : attente maximale du READY du trampoline de cgroup (secondes) —
+#: le placement précède l'exec du harnais, quelques millisecondes en pratique
+TURN_CGROUP_READY_S = 30.0
 #: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
 #: l'alerte `mail_undeliverable` est de 15 min)
 DEAD_LETTER_SWEEP_EVERY_S = 3600.0
@@ -195,6 +207,43 @@ def _finite_ts(value) -> bool:
         return math.isfinite(float(value))
     except (TypeError, ValueError):
         return False
+
+#: #804 : cadence de la prise automatique déclenchée par l'exécuteur pour ses
+#: propres agents au repos (secondes ; 0 coupe la prise de l'exécuteur). Le
+#: débit horaire, lui, est compté en base pour tout le mesh (L119, 0037).
+TAKE_INTERVAL_S = 60.0
+
+
+def local_take(db, cfg, agents, settings, *, dry_run: bool = False, alerts=None,
+               **kw) -> list:
+    """#804 : prise automatique pour un ensemble d'agents (ceux de cet
+    exécuteur), avec les garde-fous de `backlog.auto_take` (repos réel,
+    budget, hôtes en pause, plafonds horaires comptés en base) ; l'appelant
+    passe aussi l'alerte `balance_low` du moment (#754, owner 13/10).
+
+    `settings` porte `idle_s`/`max_per_hour`/`lot_idle_s`/`lot_max_per_hour` ;
+    `kw` surcharge les autres réglages d'`auto_take` (tests, diagnostic). Rend
+    les prises faites ; l'appelant isole la panne éventuelle.
+    """
+    from . import backlog
+    names = {str(name) for name in (agents or ()) if name}
+    if not names:
+        return []
+    options = dict(settings)
+    options.update(kw)
+    return backlog.auto_take(cfg, db, agents=names, dry_run=dry_run, alerts=alerts,
+                             **options)
+
+
+def local_balance_alerts(db, thresholds, now: float) -> list:
+    """#754 (owner, 13/10) : l'alerte `balance_low` du moment, avec les mêmes
+    seuils qu'`ameesh alerts` et `ameesh notify` — un agent au token ne prend
+    jamais sous cette alerte. `notify` ne publie pas d'état d'alerte : on
+    relit le solde au moment de la passe, une seule implémentation
+    (`sous_utilisation.balance_low`)."""
+    from . import sous_utilisation
+    listing = storage.of(db).operations.listing()
+    return sous_utilisation.balance_low(db, listing, now, **(thresholds or {}))
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -374,6 +423,8 @@ class AgentWorker(threading.Thread):
         #: L76 : après un démarrage résident raté, un tour par événement
         #: jusqu'à cette échéance (monotone)
         self._resident_refused_until = 0.0
+        #: L76 T2 : échecs du résident de suite (remis à zéro par un tour abouti)
+        self._resident_failures = 0
         self.nudged = False
         #: L48 : le dernier tour a échoué vite (harnais absent, introuvable,
         #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
@@ -482,6 +533,14 @@ class AgentWorker(threading.Thread):
         #: résumé, worker relancé) : repli sur le grand livre
         self.last_turn_context: int | None = None
         self.last_turn_context_session: str | None = None
+        #: L81 (étude §6.3) : instant monotone du dernier message humain en
+        #: attente — un entretien de session résidente ne le précède pas de
+        #: moins de `resident_runner.QUIET_S`, sauf dépassement dur
+        self._dernier_humain = 0.0
+        #: L81 (étude §6.1) : relu cumulé par session — il appartient à la
+        #: session, pas au processus : un résident endormi puis réveillé sur
+        #: le même id reprend son cumul (sinon 240+240 élude le seuil)
+        self._resident_reread: dict[str, int] = {}
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -571,8 +630,12 @@ class AgentWorker(threading.Thread):
         """La session à reprendre : celle du registre, sinon le fichier local.
 
         Un fichier local **antérieur** au dernier oubli de session
-        (`session_reset_ts`, posé par `ameesh restart` appliqué sans bail)
-        n'est pas repris : il est effacé (L26).
+        (`session_reset_ts`, posé par `ameesh restart` appliqué sans bail, et
+        par tout `clear_session`, #794) n'est jamais repris. Le retrait du
+        fichier est un nettoyage au mieux : la décision ne dépend pas de sa
+        réussite, sinon un `unlink` refusé (PermissionError) ferait
+        ressusciter l'ancienne session — sur ce worker comme sur un worker
+        recréé, qui relit `session_reset_ts` au registre.
         """
         session = (self.agent or {}).get("session_id")
         if session:
@@ -581,10 +644,14 @@ class AgentWorker(threading.Thread):
         reset = (self.agent or {}).get("session_reset_ts")
         if fichier and reset:
             try:
-                if os.stat(self._path("session")).st_mtime <= float(reset):
-                    os.unlink(self._path("session"))
-                    return None
+                perime = os.stat(self._path("session")).st_mtime <= float(reset)
             except OSError:
+                return None
+            if perime:
+                try:
+                    os.unlink(self._path("session"))
+                except OSError:
+                    pass
                 return None
         return fichier
 
@@ -730,6 +797,7 @@ class AgentWorker(threading.Thread):
         retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         # L76 : rien ne survit au bail, pas même un processus résident inactif
         self._close_resident("lease released")
+        self._release_session_lock()
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         # L113 : le travail part au serveur sous le bail, puis le dossier est
         # effacé (même bail perdu : rien ne doit rester sur l'appareil)
@@ -1113,7 +1181,7 @@ class AgentWorker(threading.Thread):
         # L125 : un courrier passif (accusé, copie, diffusion) n'ouvre pas de tour
         if mail.unread_active(self.db, self.name, limit=1):
             return True
-        return self.idle_due()
+        return self.retry_due() or self.idle_due()
 
     def request_preempt(self) -> None:
         """Un message prioritaire préempte le tour en cours (0018, R19).
@@ -1445,6 +1513,11 @@ class AgentWorker(threading.Thread):
         ni annulée à chaque passage (2026-10-10 : 62 rotations annulées en une
         soirée), et la ligne de fin de l'épisode de pression la cite.
         """
+        # L81 (étude §6) : l'entretien d'une session résidente se décide entre
+        # deux tours, sur la mesure enregistrée au dernier tour.
+        entretien = self._resident_maintenance()
+        if entretien and self._resident_maintain(entretien):
+            return True
         if self.proc is None and (self.rotation_forcee or self.context_rotation_due()
                                   or self.rotation_due()):
             if self._held_by_pressure(self.runner.host_pressure()):
@@ -1464,6 +1537,136 @@ class AgentWorker(threading.Thread):
             return False
         return self._rotate("turns=%d, tokens=%.0f, last turn=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
+
+    def _resident_maintenance(self) -> str:
+        """L81 : ce que la session résidente demande entre deux tours
+        (`resident_runner.maintenance`), '' si elle peut continuer."""
+        from . import resident_runner
+        with self.lock:
+            rp = self.resident
+        if rp is None:
+            return ""
+        # L81 (étude §6.3) : l'entretien se décide AVANT le `pick` — un message
+        # humain en attente, ou remis par le hook pendant le tour qui vient de
+        # finir, doit tenir la fenêtre de calme dès cette décision.
+        self._humain_observe()
+        rotate = self.session_policy() != "jamais"
+        return rp.maintenance_due(
+            cap=self.context_max_tokens() if rotate else 0,
+            reread_max=resident_runner.reread_max(
+                self._state_read(resident_runner.REREAD_MAX_SETTING)) if rotate else 0)
+
+    def _humain_observe(self) -> None:
+        """L81 (étude §6.3) : rafraîchit la fenêtre de calme avant la décision
+        d'entretien. Deux sources : le courrier humain NON ENCORE REMIS (le
+        `_mail_spec` ne le voit qu'au `pick`, après l'entretien), et celui
+        remis par le hook PENDANT le tour — déjà lu, mais daté dans l'état du
+        tour (`cli.tour_lu`)."""
+        try:
+            rows = mail.unread_active(self.db, self.name)
+        except db_mod.DbError:
+            rows = []           # la décision d'entretien a ses propres gardes
+        if any(self._from_human(m) for m in rows):
+            self._dernier_humain = time.monotonic()
+            return
+        from . import cli as cli_mod
+        ts = float(cli_mod.tour_lu(self.cfg, self.name).get("humain") or 0.0)
+        if not ts:
+            return
+        marque = time.monotonic() - max(0.0, time.time() - ts)
+        if marque > 0:
+            self._dernier_humain = max(self._dernier_humain, marque)
+
+    def _humain_recent(self, quiet: float | None = None) -> bool:
+        """L81 (étude §6.3) : un message humain en attente depuis moins de
+        `quiet` secondes interdit un entretien non urgent (le seuil de relu
+        cumulé, la compaction) ; le dépassement dur, lui, passe outre."""
+        from . import resident_runner
+        delai = resident_runner.QUIET_S if quiet is None else quiet
+        return bool(self._dernier_humain) and \
+            time.monotonic() - self._dernier_humain < delai
+
+    def _resident_reread_load(self, session: str | None) -> int:
+        """L81 (étude §6.1) : relu cumulé déjà mesuré pour cette session."""
+        return int(self._resident_reread.get(session or "", 0))
+
+    def _resident_reread_keep(self, rp) -> None:
+        """L81 (étude §6.1) : enregistre le cumul de la session du processus
+        après chaque tour mesuré, pour celui qui la reprendra."""
+        session = rp.session or ""
+        if session:
+            self._resident_reread[session] = rp.session_reread
+
+    def _resident_maintain(self, decision: str) -> bool:
+        """L81 (étude §6.2/§6.3) : exécute la décision d'entretien d'une
+        session résidente — la rotation (quand calme pour le seuil de relu
+        cumulé, sans attendre pour le plafond dur), la compaction native
+        (quand calme). Rend True si l'entretien a eu lieu : pour une rotation
+        le processus est alors fermé et le prochain tour en ouvre un neuf sur
+        le résumé (étude §6.3)."""
+        from . import resident_runner
+        with self.lock:
+            rp = self.resident
+        if rp is None:
+            return False
+        if decision == resident_runner.ROTATE:
+            raison = ("context cap: %d tokens reread in the last turn (cap %d)"
+                      % (rp.last_reread, self.context_max_tokens()))
+        elif decision == resident_runner.ALERT:
+            if self._humain_recent():
+                return False
+            raison = ("resident session re-read: %d tokens (threshold %.0f)"
+                      % (rp.session_reread, resident_runner.reread_max(
+                          self._state_read(resident_runner.REREAD_MAX_SETTING))))
+        elif decision == resident_runner.COMPACT:
+            if self._humain_recent():
+                return False
+            if not self._rotation_allowed():
+                return False
+            return self._native_compact(rp)
+        else:
+            return False
+        if not self._rotation_allowed():
+            return False
+        if not self._rotate(raison):
+            return False
+        self._close_resident("rotated: %s" % raison)
+        return True
+
+    def _native_compact(self, rp) -> bool:
+        """L81 (étude §6.2) : compaction native du résident — `/compact` servi
+        comme un message entre deux tours, quand calme. Le harnais rapporte
+        alors une frontière (`compact_boundary`) et la session continue ; sans
+        frontière, la compaction n'a pas eu lieu et le délai de reprise
+        (`COMPACT_RETRY_S`, porté par le processus) évite la boucle."""
+        from . import resident_runner
+        avant = rp.compactions
+        rp.compact_requested()
+        ok = self.run_turn({"kind": "prompt",
+                            "prompt": resident_runner.COMPACT_COMMAND, "ids": []})
+        courant = self.resident or rp
+        if not ok:
+            log_async("[%s] native compaction cancelled: the turn did not complete"
+                      % self.name)
+            self._fil_note("Native compaction cancelled: the turn did not complete. "
+                           "The session goes on.",
+                           meta={"action": "compaction", "etat": "annulee"})
+            return False
+        if courant.compactions <= avant:
+            log_async("[%s] native compaction: no compact_boundary reported "
+                      "(context %s)" % (self.name, courant.last_context))
+            self._conversation_state(
+                "Native compaction asked (%s): the harness reported no "
+                "compact_boundary; the session goes on."
+                % resident_runner.COMPACT_COMMAND,
+                meta={"action": "compaction", "etat": "sans-frontiere"})
+            return False
+        self._conversation_state(
+            "Session compacted: context %s → %s tokens."
+            % (courant.compact_pre, courant.compact_post),
+            meta={"action": "compaction", "pre": courant.compact_pre,
+                  "post": courant.compact_post})
+        return True
 
     def _rotation_allowed(self) -> bool:
         """L226b : le tour de résumé d'une rotation est un appel de modèle. Il
@@ -1562,12 +1765,34 @@ class AgentWorker(threading.Thread):
         self.last_turn_reread = 0
         self.last_turn_reread_session = None
         self.last_turn_context = self.last_turn_context_session = None
+        # L81 (étude §6.1) : l'ancienne session ne sera plus reprise, son cumul
+        # de relu n'a plus à être gardé.
+        self._resident_reread.pop(ancienne or "", None)
         self._fil_note(
             "Session rotation (%s): the old id (%s) is kept in "
             "`session-history.jsonl`; the new session starts from the summary below.\n\n%s"
             % (raison, ancienne or "new", resume),
             meta={"action": "rotation", "session": ancienne or "", "raison": raison})
+        # L81 (étude §6.3) : la rotation est annoncée dans la conversation.
+        self._conversation_state(
+            "Session rotated (%s): the old id (%s) is kept in "
+            "`session-history.jsonl`; the new session starts from the summary."
+            % (raison, ancienne or "new"),
+            session=ancienne, meta={"action": "rotation", "raison": raison})
         return True
+
+    def _conversation_state(self, text: str, *, session: str | None = None,
+                            meta: dict | None = None) -> None:
+        """L78/L81 : une ligne d'état dans la conversation de l'agent (visible
+        en `ameesh chat`), sans jamais casser le geste qu'elle raconte."""
+        try:
+            from . import conversation, fil as fil_mod
+            log = conversation.Log(
+                self.db, self.cfg, agent=self.name,
+                project=fil_mod.project_for(self.cfg, fil_mod.agent_project(self.agent)))
+            log.append("state", text, session=session, meta=meta)
+        except Exception as exc:  # noqa: BLE001
+            log_async("[%s] conversation state not recorded (%s)" % (self.name, exc))
 
     # -- rotation au changement de lot (0025, L26) ---------------------------
     def turn_lot(self, spec: dict) -> str | None:
@@ -1639,14 +1864,19 @@ class AgentWorker(threading.Thread):
     def lot_rotation_due(self, lot: str | None) -> bool:
         """Changement de session au changement de lot dû ? (politique `par-lot`)
 
-        Seulement si le lot du tour est connu, que la session courante a un
-        lot noté et qu'il diffère. Jamais pendant un tour. #408 : même sans
-        session courante, celle mise de côté pour le lot du tour est reprise.
+        Seulement si le lot du tour est connu. La session courante est celle
+        d'un AUTRE lot (bascule), ou n'a AUCUN lot noté alors qu'elle a déjà
+        tourné : elle n'est jamais partagée entre lots, pas même adoptée par le
+        premier lot venu (#794, décision du bureau du 2026-10-13). Jamais
+        pendant un tour. #408 : même sans session courante, celle mise de côté
+        pour le lot du tour est reprise.
         """
         if not lot or self.proc is not None or self.session_policy() != "par-lot":
             return False
         courant = (self.agent or {}).get("session_work_item")
-        return bool(courant) and str(courant) != str(lot)
+        if courant:
+            return str(courant) != str(lot)
+        return bool(self.current_session())
 
     def rotate_for_lot(self, spec: dict | None) -> dict | None:
         """Avant un tour : passe à la session du lot du tour s'il change
@@ -1656,24 +1886,205 @@ class AgentWorker(threading.Thread):
         oubli : un retour sur ce lot (relecture, décision, déblocage) la
         reprendra avec `--resume`. Celle du lot du tour est reprise si elle a
         été ouverte sous le même harnais, le même compte et le même dossier ;
-        sinon une session neuve s'ouvre sur le brief déterministe (L39) du
-        lot. Bail perdu ou base injoignable : le tour part dans la session
-        courante, le nouveau lot y est noté (pas de nouvel essai à chaque tour).
+        sinon une session neuve s'ouvre sur le brief MINIMAL du lot (#794 :
+        canon, fiche, diff, fil du lot). Une session sans lot noté qui a déjà
+        tourné n'est jamais adoptée par un lot : elle est oubliée avant
+        d'ouvrir celle du lot (#794). Bail perdu ou base injoignable : le tour
+        part dans la session courante, le nouveau lot y est noté (pas de
+        nouvel essai à chaque tour).
         """
         if not spec:
             return spec
         lot = spec.get("lot")
-        if not self.lot_rotation_due(lot):
+        if self.proc is not None or self.session_policy() != "par-lot":
             return spec
-        courant = (self.agent or {}).get("session_work_item")
-        if not self._switch_lot(str(courant), str(lot)):
+        courant = str((self.agent or {}).get("session_work_item") or "").strip()
+        if courant and (not lot or str(lot) == courant) \
+                and self._close_finished_lot_session(courant):
+            # le lot de la session active est fini : elle est fermée ici,
+            # avant le tour (même lot, ou tour sans lot) ; un tour sur un
+            # AUTRE lot passe par la bascule, qui la ferme aussi.
+            courant = ""
+        if not lot:
+            return spec
+        if courant:
+            if courant == str(lot):
+                return spec
+            if not self._switch_lot(courant, str(lot)):
+                try:
+                    if storage.of(self.db).operations.set_session_work_item(
+                            self.name, self.runner.runner_id, self.epoch, str(lot)):
+                        self.agent["session_work_item"] = str(lot)
+                except db_mod.DbError as exc:
+                    log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+            return spec
+        # aucun lot noté : une session qui a déjà tourné ne sera jamais
+        # partagée avec un lot ; celle qui va s'ouvrir est celle du lot.
+        if self.current_session() and not self._forget_lotless_session():
             try:
                 if storage.of(self.db).operations.set_session_work_item(
                         self.name, self.runner.runner_id, self.epoch, str(lot)):
                     self.agent["session_work_item"] = str(lot)
             except db_mod.DbError as exc:
                 log_async("[%s] session lot not recorded (%s)" % (self.name, exc))
+            return spec
+        self._open_lot_session(lot)
         return spec
+
+    #: états d'un lot FINI (#794) : sa session se ferme, comme la purge le
+    #: faisait — fusionné, livré (`promoted`) ou fermé.
+    LOT_FINISHED_STATES = ("merged", "promoted", "closed")
+
+    def _close_finished_lot_session(self, lot: str) -> bool:
+        """#794 B1 (revue Claude du 2026-10-14) : ferme la session active d'un
+        lot FINI avant le tour suivant — « la session se ferme à la fusion ».
+
+        Trois garde-fous : seulement un lot fini (un lot encore ouvert mais
+        non assigné à l'agent — relecture, pilotage, audit — ne ferme jamais
+        sa session) ; seulement en politique `par-lot` (les politiques `jamais`
+        et `taille` gardent leur session longue) ; jamais pendant un tour, et
+        l'oubli est fencé par le bail, comme `_forget_lotless_session`. Le
+        fichier local qui portait la session est retiré dans la foulée ; s'il
+        ne peut pas l'être (PermissionError), l'oubli tient quand même :
+        `session_reset_at` est posé sous le bail, donc `current_session` ne le
+        relit pas, worker recréé compris. Rend True si la session a été fermée.
+        """
+        if self.proc is not None or self.session_policy() != "par-lot":
+            return False
+        lot = str(lot or "").strip()
+        if not lot.isdigit():
+            return False
+        try:
+            from . import work as work_mod
+            item = work_mod.get(self.db, int(lot))
+        except db_mod.DbError as exc:
+            log_async("[%s] finished lot #%s not checked (%s)" % (self.name, lot, exc))
+            return False
+        if not item or item.get("state") not in self.LOT_FINISHED_STATES:
+            return False
+        session = self.current_session()
+        try:
+            oubliee = registry.clear_session(self.db, self.name, self.runner.runner_id,
+                                             self.epoch)
+        except db_mod.DbError as exc:
+            log_async("[%s] session %s of finished lot #%s not forgotten (%s)"
+                      % (self.name, session or "?", lot, exc))
+            return False
+        if not oubliee:
+            log_async("[%s] session of finished lot #%s not forgotten: lease lost"
+                      % (self.name, lot))
+            return False
+        try:
+            os.unlink(self._path("session"))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # P2 bloquant du contrôle bureau (14/10) : le fichier reste, mais
+            # l'oubli est durable — `session_reset_at` vient d'être posé dans
+            # la même écriture fencée, donc `current_session` ne le relira pas
+            # (worker recréé compris).
+            log_async("[%s] local session file not removed (%s): already stale "
+                      "after the reset" % (self.name, exc))
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self._reset_session_counts()
+        self._state_note("session_harness", "")
+        if not self.resume_summary:
+            # un tour sans lot (reprise, veille, courrier ambigu) ouvrira une
+            # session neuve : le brief déterministe l'ouvre, comme
+            # `_ecarte_session`. Un résumé déjà en attente (rotation) est
+            # gardé : il décrit la session qu'on vient de fermer.
+            try:
+                from . import reprise
+                brief = reprise.deterministic_brief(
+                    self.cfg, self.db, self.agent, session=session,
+                    reason="the session of lot #%s, which is finished" % lot,
+                    consigne="This turn's instruction follows this brief: resume your "
+                             "work from there.")
+            except Exception as exc:  # un brief manquant n'empêche pas l'oubli
+                log_async("[%s] deterministic brief unavailable (%s)" % (self.name, exc))
+            else:
+                if not self._resume_keep(brief, "ameesh"):
+                    self.resume_summary, self.resume_origin = brief, "ameesh"
+        log_async("[%s] session %s closed: lot #%s is finished"
+                  % (self.name, session or "?", lot))
+        self._fil_note(
+            "Session %s closed at the lot's end: lot #%s is finished; a new "
+            "session opens on the next turn's brief." % (session or "?", lot),
+            meta={"action": "session-lot-fin", "session": session or "", "lot": lot})
+        return True
+
+    def _forget_lotless_session(self) -> bool:
+        """#794 : oublie la session active qui n'a aucun lot noté.
+
+        Elle a été ouverte par un tour dont le lot était inconnu (reprise,
+        veille, courrier ambigu) : l'adopter pour un lot ferait porter à ce
+        lot le contexte d'un autre. Oubli fencé par le bail, comme une
+        rotation ; le fichier local est retiré dans la foulée, et s'il ne peut
+        pas l'être, le `session_reset_at` posé sous le bail le rend périmé
+        (#794)."""
+        session = self.current_session()
+        try:
+            oubliee = registry.clear_session(self.db, self.name, self.runner.runner_id,
+                                             self.epoch)
+        except db_mod.DbError as exc:
+            log_async("[%s] lotless session %s not forgotten (%s)"
+                      % (self.name, session or "?", exc))
+            return False
+        if not oubliee:
+            log_async("[%s] lotless session not forgotten: lease lost" % self.name)
+            return False
+        try:
+            os.unlink(self._path("session"))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            # #794 : même oubli durable que la session d'un lot fini — le
+            # fichier non retiré est antérieur au reset posé par l'écriture
+            # fencée, donc jamais repris.
+            log_async("[%s] local session file not removed (%s): already stale "
+                      "after the reset" % (self.name, exc))
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self._reset_session_counts()
+        self._state_note("session_harness", "")
+        self.resume_summary = None
+        log_async("[%s] session %s had no lot: forgotten, never shared with a lot"
+                  % (self.name, session or "?"))
+        self._fil_note("Session %s had no lot (opened by a turn whose lot was "
+                       "unknown): forgotten, it will never be shared between lots."
+                       % (session or "?"), meta={"action": "session-sans-lot",
+                                                 "session": session or ""})
+        return True
+
+    def _open_lot_session(self, lot: str) -> None:
+        """#794 : la session qui va s'ouvrir est dédiée au lot `lot` ; son
+        ouverture est le brief minimal du lot, jamais un brief de reprise
+        général.
+
+        N1 (revue Claude du 2026-10-14) : un résumé de rotation (origine
+        `agent`, payé par un tour de résumé) décrit la MÊME session de lot ;
+        il ouvre la session neuve, la fiche du lot le complète, et le tout est
+        réécrit sur disque (`RESUME_PENDING`) pour qu'un redémarrage du worker
+        ne ressuscite pas l'ancien résumé seul.
+        """
+        brief = self._lot_brief(str(lot), "", {}) or ""
+        if self.resume_summary and self.resume_origin == "agent":
+            resume, origin = self.resume_summary + "\n\n" + brief, "agent"
+        else:
+            resume, origin = brief, "ameesh"
+        if resume and not self._resume_keep(resume, origin):
+            # disque indisponible : la mémoire au moins, le tour partira
+            self.resume_summary, self.resume_origin = resume, origin
+        elif not resume:
+            self.resume_summary, self.resume_origin = "", "ameesh"
+        self._reset_session_counts()
+        log_async("[%s] new session for lot %s: minimal lot brief" % (self.name, lot))
+
+    def _reset_session_counts(self) -> None:
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self.last_turn_reread = 0
+        self.last_turn_reread_session = None
+        self.last_turn_context = self.last_turn_context_session = None
 
     def _switch_lot(self, courant: str, lot: str) -> bool:
         """#408 : met de côté la session du lot `courant`, rend active celle
@@ -1710,11 +2121,7 @@ class AgentWorker(threading.Thread):
             except OSError:
                 pass
         self.agent = registry.get(self.db, self.name) or self.agent
-        self.session_turns = 0
-        self.session_tokens = 0.0
-        self.last_turn_reread = 0
-        self.last_turn_reread_session = None
-        self.last_turn_context = self.last_turn_context_session = None
+        self._reset_session_counts()
         if not repris:
             self.resume_summary = self._lot_brief(lot, courant, out)
             self.resume_origin = "ameesh"
@@ -1727,7 +2134,7 @@ class AgentWorker(threading.Thread):
                 "session %s put aside for lot %s" % (out["parked"], courant)
                 if out.get("parked") else "no session to put aside",
                 "session %s of lot %s resumed" % (repris, lot) if repris
-                else "new session for lot %s, opened on the resume brief" % lot,
+                else "new session for lot %s, opened on the lot brief" % lot,
                 " Session %s of lot %s not resumed (%s)." % (
                     out["discarded"], lot,
                     "lot finished or no longer assigned to the agent"
@@ -1739,13 +2146,15 @@ class AgentWorker(threading.Thread):
         return True
 
     def _lot_brief(self, lot: str, courant: str, out: dict) -> str | None:
-        """Le brief déterministe (L39) d'une session neuve dédiée au lot `lot`."""
+        """#794 : le brief MINIMAL d'une session neuve dédiée au lot `lot` :
+        canon, fiche du lot, diff de sa branche, fil du lot réduit aux
+        décisions et messages non lus (décision du bureau, 2026-10-13)."""
         try:
             from . import reprise, work as work_mod
             item = work_mod.get(self.db, int(lot)) if str(lot).isdigit() else None
             branche = (item or {}).get("branch")
-            return reprise.deterministic_brief(
-                self.cfg, self.db, self.agent, session=None,
+            return reprise.lot_brief(
+                self.cfg, self.db, self.agent, lot,
                 reason="new session dedicated to lot #%s" % lot,
                 consigne="This session is dedicated to lot #%s%s. Your other lots keep "
                          "their own sessions (the one of lot #%s is put aside and will "
@@ -2398,14 +2807,54 @@ class AgentWorker(threading.Thread):
     def interrupt_allowed(self, row: dict) -> bool:
         """Un message ne préempte que s'il vient d'un expéditeur habilité (0018).
 
-        Sans canon (L2), `AMEESH_INTERRUPT_SENDERS` est la seule autorisation ;
-        la capacité « interrupt » d'une fiche canon s'ajoutera ici. Un urgent
-        non habilité est remis comme un message normal (et l'abus est journalisé).
+        L'owner (`human:*`) interrompt toujours ; un événement du système
+        (`ameesh`) seulement s'il est vérifiable en base (#795) : la fin de CI
+        d'un lot de cet agent, pas un `--from ameesh` imité (garde L317c).
+        Les agents passent par `AMEESH_INTERRUPT_SENDERS` ; la capacité
+        « interrupt » d'une fiche canon s'ajoutera ici. Un urgent non habilité
+        est remis comme un message normal (et l'abus est journalisé).
         """
         sender = (row.get("sender") or row.get("from") or "").strip()
-        if bool(sender) and sender in self.cfg.interrupt_senders:
+        if not sender:
+            return False
+        from . import work
+        if sender.startswith(work.HUMAN_PREFIX):
             return True
-        return self._deep_analysis_interrupt(sender, row)
+        if sender in self.cfg.interrupt_senders:
+            return True
+        return (self._system_event_interrupt(sender, row)
+                or self._deep_analysis_interrupt(sender, row))
+
+    def _system_event_interrupt(self, sender: str, row: dict) -> bool:
+        """#795 : l'événement système qui perce le tour — la fin de CI d'un lot
+        de cet agent. Vérifié en base : l'exécution est enregistrée, le lot
+        qu'elle suit est bien assigné à l'agent, et ce courrier est celui que
+        la CI a posé pour cette exécution (verdict ou première alerte). Un
+        payload `ci` imité sous l'expéditeur `ameesh` ne préempte donc pas."""
+        from . import work
+        if sender != work.SYSTEM_SENDER:
+            return False
+        ci = mail.message_payload(row).get("ci")
+        if not isinstance(ci, dict):
+            return False
+        try:
+            run = storage.of(self.db).ci.run(str(ci.get("repo") or ""),
+                                             int(ci.get("run_id") or 0))
+            message_id = int(row.get("id") or 0)
+        except (db_mod.DbError, TypeError, ValueError):
+            return False
+        if not run or not message_id:
+            return False
+        # le lot est celui de l'exécution (le courrier de CI le porte aussi,
+        # mais la ligne de boîte ne rend pas `work_item_id`) : un lot relevé
+        # par l'exécution et assigné à un autre agent ne perce pas ce tour.
+        lot = (work.get(self.db, int(run["work_item_id"]))
+               if run.get("work_item_id") else None)
+        if not lot or (lot.get("assignee") or "") != self.name:
+            return False
+        posed = {int(run.get(cle) or 0)
+                 for cle in ("urgent_message_id", "verdict_message_id")}
+        return message_id in posed
 
     def _deep_analysis_interrupt(self, sender: str, row: dict) -> bool:
         """L317c (#315 r1) : la demande d'analyse profonde (`deep_analysis`)
@@ -3102,6 +3551,8 @@ class AgentWorker(threading.Thread):
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
         Le tour porte son lot (`lot`, L26) quand il est déductible."""
+        if self._attach_pending():
+            return None
         spec = self._pick()
         if spec is not None:
             # #408 : le réveil sur un lot actionnable porte déjà son lot
@@ -3117,7 +3568,12 @@ class AgentWorker(threading.Thread):
             return None
         self.agent = agent
         if agent.get("operator_paused"):
-            return None  # L87b: keep prompts and mail; budget/pressure cannot lift this hold.
+            # L87b : rien n'est consommé, aucun tour ne démarre. L232a n'est pas
+            # un tour : un drainage d'hôte garde le droit de réserver puis de
+            # clore le passage de ce worker, sinon le bail source reste tenu et
+            # l'hôte ne se vide pas tant que la pause tient (N1 de la R2 #1462).
+            self.maybe_relocate({})
+            return None
         if self._session_en_attente is not None:
             self._enregistre_session()
         if self._marque_base(agent):
@@ -3209,6 +3665,9 @@ class AgentWorker(threading.Thread):
             # l'exécuteur reprend la MÊME session (registre), une fois.
             self._reprise_attach = False
             return {"kind": "idle", "prompt": adapters.ATTACH_RESUME_PROMPT, "ids": []}
+        if self.retry_due():
+            # #1270 : échéance d'une reprise cadencée sans consigne en attente
+            return {"kind": "idle", "prompt": adapters.RETRY_PROMPT, "ids": []}
         if all(mail.passive_reason(m) for m in messages):
             # #408 : un courrier qui réveillera l'agent passe avant (fenêtre L125)
             reveil = self._lot_wake_spec()
@@ -3312,6 +3771,10 @@ class AgentWorker(threading.Thread):
         events = [m for m in active if mail.is_event(m)]
         others = [m for m in active if not mail.is_event(m)]
         mail_due = bool(others) and self._mail_due(others)
+        if others and any(self._from_human(m) for m in others):
+            # L81 (étude §6.3) : tant qu'un message humain attend, l'entretien
+            # d'une session résidente lui laisse la place (fenêtre de calme).
+            self._dernier_humain = time.monotonic()
         if not mail_due and not (events and self._events_due(events)):
             return None  # regroupement en cours, ou rien que du courrier passif
         if events:
@@ -3481,7 +3944,53 @@ class AgentWorker(threading.Thread):
             "remaining": reste,
         }
 
+    def _release_session_lock(self) -> None:
+        lock = getattr(self, "_session_lock", None)
+        if lock is not None:
+            self._session_lock = None
+            lock.close()
+
+    def _attach_pending(self) -> bool:
+        from .platform import session_lock
+        if not session_lock.requested(self.state_dir):
+            return False
+        if not getattr(self, "_session_turn_depth", 0):
+            self._close_resident("attach requested")
+            self._release_session_lock()
+        return True
+
     def run_turn(self, spec: dict) -> bool:
+        """Exclude attach for the whole turn and life of its resident."""
+        self.fast_failure = False
+        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        from .platform import session_lock
+        if self._attach_pending():
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        if getattr(self, "_session_lock", None) is None:
+            self._session_lock = session_lock.try_lock(self.state_dir, "session-use")
+            if self._session_lock is None:
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+                return False
+        if self._attach_pending():
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
+        try:
+            return self._run_guarded_turn(spec)
+        finally:
+            self._session_turn_depth -= 1
+            if not self._session_turn_depth:
+                try:
+                    if session_lock.requested(self.state_dir):
+                        self._close_resident("attach requested after turn")
+                finally:
+                    if self.resident is None:
+                        self._release_session_lock()
+
+    def _run_guarded_turn(self, spec: dict) -> bool:
         """Un tour. Pour un tour de courrier, protocole de remise unique :
         réservation sous un jeton (registre verrouillé, bail contrôlé), consigne
         rendue sur les messages réservés, remise soldée juste après le lancement
@@ -3492,10 +4001,6 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
-        self.fast_failure = False
-        if (registry.get(self.db, self.name) or {}).get("operator_paused"):
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            return False
         candidats = spec.get("candidats")
         if self.runner.draining.is_set():
             # Drainage commencé entre le choix du tour et son lancement : rien
@@ -3608,6 +4113,20 @@ class AgentWorker(threading.Thread):
                 % len(incertains),
                 meta={"action": "remise-incertaine", "messages": incertains})
 
+    def _github_env(self, env: dict, lot) -> None:
+        """#1645 : journal des gestes gh et identité GitHub par rôle. Jamais
+        bloquant : une erreur laisse l'identité héritée, et le dit."""
+        from . import github_identity
+        try:
+            info = github_identity.apply(env, self.name, self.cfg.config_dir,
+                                         self.cfg.state_dir, lot)
+        except Exception as exc:  # noqa: BLE001 — le tour part quand même
+            log("[%s] github identity not applied: %s" % (self.name, exc))
+            return
+        if info.get("problem"):
+            log("[%s] github identity %s: %s"
+                % (self.name, info.get("identity"), info["problem"]))
+
     def _mediated_env(self, env: dict) -> None:
         """L109 : la session du harnais d'un exécuteur médié parle au serveur
         avec un jeton de session lié au bail (jamais d'accès à la base) :
@@ -3627,39 +4146,83 @@ class AgentWorker(threading.Thread):
             log_async("[%s] jeton de session indisponible (%s) : les commandes ameesh de la "
                       "session échoueront" % (self.name, db_mod.explain(exc)))
 
-    def _open_turn_resource(self, turn_id: str, pgid: int | None) -> None:
-        """Rattache le groupe du tour (L31, 0028) ; ne casse jamais le tour."""
-        self._turn_open = False
-        self._turn_open = self._attach_resource(turn_id, pgid)
+    @staticmethod
+    def _read_turn_cgroup_ready(fd: int, timeout: float = TURN_CGROUP_READY_S) -> str:
+        """L498 : lit le READY du trampoline sur le descripteur dédié, avec une
+        borne indépendante (le harnais, lui, garde son stdout intact). Rend ""
+        si le signal manque, si le fils est mort avant, ou à l'expiration."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        data = b""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            try:
+                readable, _, _ = select.select([fd], [], [], remaining)
+            except OSError:
+                return ""
+            if not readable:
+                return ""
+            try:
+                chunk = os.read(fd, 256)
+            except OSError:
+                return ""
+            if not chunk:
+                return ""
+            data += chunk
+            if b"\n" in data:
+                return data.split(b"\n", 1)[0].decode("ascii", "replace")
 
-    def _attach_resource(self, turn_id: str, pgid: int | None) -> bool:
+    def _open_turn_resource(self, turn_id: str, pgid: int | None,
+                            cgroup: str | None = None) -> None:
+        """Rattache le groupe (L31, 0028) et le cgroup (L498) du tour ; ne
+        casse jamais le tour."""
+        self._turn_open = False
+        self._turn_open = self._attach_resource(turn_id, pgid, cgroup=cgroup)
+
+    def _attach_resource(self, turn_id: str, pgid: int | None,
+                         cgroup: str | None = None) -> bool:
         """La ligne de ressource d'un tour, ou d'une vie de processus résident
-        (L76) ; False si elle n'a pas pu être ouverte."""
+        (L76) ; False si elle n'a pas pu être ouverte. Le cgroup délégué du
+        tour (L498) est enregistré après la ligne, s'il y en a un."""
         try:
             from . import containers as containers_mod
             storage.of(self.db).turn_resources.open_turn(
                 turn_id, self.name, self.runner.host, pgid=pgid,
                 label=containers_mod.turn_labels(turn_id, self.name))
-            return True
         except Exception as exc:  # ne casse jamais un tour
             log("[%s] could not attach the resources of turn %s (%s)"
                 % (self.name, turn_id[:8], exc))
             return False
+        if cgroup and not getattr(self.runner, "mediated", False):
+            try:
+                storage.of(self.db).turn_resources.attach_cgroup(turn_id, cgroup)
+            except Exception as exc:  # la propriété locale du cgroup reste entière
+                log("[%s] cgroup %s of turn %s not recorded (%s)"
+                    % (self.name, cgroup, turn_id[:8], exc))
+        return True
 
     def _close_turn_resource(self, turn_id: str, pgid: int | None, *,
-                             survives: bool = False) -> None:
+                             survives: bool = False,
+                             cgroup: str | None = None) -> None:
         """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
 
-        Un groupe encore vivant après l'arrêt escaladé, ou un conteneur qui
-        porte encore l'étiquette du tour, est signalé orphelin : **jamais
-        supprimé** ici."""
-        if not getattr(self, "_turn_open", False):
+        Un groupe encore vivant après l'arrêt escaladé, un cgroup qui ne se
+        vide pas, ou un conteneur qui porte encore l'étiquette du tour, est
+        signalé orphelin : **jamais supprimé** ici. Appelée seulement quand le
+        travail de fond n'est PAS confié au suivi (`background.start`) : le
+        cgroup du tour est alors tué et enlevé, sa latence et son pic mémoire
+        journalisés (L498, mesures)."""
+        recorded = getattr(self, "_turn_open", False)
+        if not recorded and not cgroup:
             return
         self._turn_open = False
-        self._release_resource(turn_id, pgid, survives=survives)
+        self._release_resource(turn_id, pgid, survives=survives, cgroup=cgroup,
+                               recorded=recorded)
 
     def _release_resource(self, turn_id: str, pgid: int | None, *,
-                          survives: bool = False) -> None:
+                          survives: bool = False, cgroup: str | None = None,
+                          recorded: bool = True) -> None:
         from .turn_processes import group_running
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
@@ -3668,18 +4231,37 @@ class AgentWorker(threading.Thread):
                 conteneurs = runtime.running_for_turn(turn_id)
             except Exception:  # un moteur indisponible n'est pas un orphelin
                 conteneurs = []
-        orphelin = survives or bool(conteneurs) or group_running(pgid)
-        try:
-            storage.of(self.db).turn_resources.close_turn(
-                turn_id, orphan=orphelin, containers=conteneurs or None)
-        except Exception as exc:  # ne casse jamais la fin d'un tour
-            log("[%s] could not close the resources of turn %s (%s)"
-                % (self.name, turn_id[:8], exc))
-            return
+        emptied = None
+        if cgroup:
+            from .platform import turn_cgroup
+            peak = turn_cgroup.memory_peak(cgroup)
+            started = time.monotonic()
+            try:
+                emptied = turn_cgroup.kill(cgroup)
+            except Exception as exc:
+                log_async("[%s] turn %s cgroup %s not killed (%s)"
+                          % (self.name, turn_id[:8], cgroup, exc))
+                emptied = False
+            log("[%s] turn %s cgroup cleanup: %s in %d ms (memory peak %s)"
+                % (self.name, turn_id[:8],
+                   "emptied and removed" if emptied else "still populated",
+                   int((time.monotonic() - started) * 1000),
+                   "%d bytes" % peak if peak is not None else "unknown"))
+        orphelin = (survives or bool(conteneurs) or group_running(pgid)
+                    or emptied is False)
+        if recorded:
+            try:
+                storage.of(self.db).turn_resources.close_turn(
+                    turn_id, orphan=orphelin, containers=conteneurs or None)
+            except Exception as exc:  # ne casse jamais la fin d'un tour
+                log("[%s] could not close the resources of turn %s (%s)"
+                    % (self.name, turn_id[:8], exc))
+                return
         if orphelin:
             log("[%s] orphan resource of turn %s: %s"
                 % (self.name, turn_id[:8],
-                   ", ".join(conteneurs) if conteneurs else "surviving process group"))
+                   ", ".join(conteneurs) if conteneurs else
+                   (cgroup if emptied is False else "surviving process group")))
 
     # -- L76 : processus résident -----------------------------------------
     def _resident_refusal(self, adapter, audit_exempt: bool) -> str:
@@ -3697,7 +4279,7 @@ class AgentWorker(threading.Thread):
         if self.runner.is_auditor(self.name, self.agent):
             return "auditor (its turns keep their own bounds)"
         if time.monotonic() < self._resident_refused_until:
-            return "resident start failed recently"
+            return "resident failed recently (%d in a row)" % self._resident_failures
         return resident_runner.refusal(adapter)
 
     def _spawn_resident(self, argv, **kwargs) -> subprocess.Popen:
@@ -3714,12 +4296,27 @@ class AgentWorker(threading.Thread):
             self.pgid = proc.pid
         return proc
 
+    def _resident_probe(self, rp) -> bool:
+        """T3 : la sonde de vivacité bornée, hors tour (aucun tour ne court).
+        Jamais d'exception : un pilote qui se trompe vaut « muet », pas un
+        tour cassé."""
+        from . import resident_runner
+        try:
+            return bool(rp.driver.probe(resident_runner.PROBE_TIMEOUT_S))
+        except Exception as exc:  # noqa: BLE001 — la sonde ne casse pas le tour
+            log("[%s] liveness probe failed (%s): treated as silent"
+                % (self.name, exc))
+            return False
+
     def _resident_for_turn(self, adapter, *, key: tuple, session: str | None, cwd: str,
                            env: dict, model, effort, tier, lot, stderr_path: str):
         """Le processus résident qui sert ce tour : celui qui tourne si sa clé
         de lancement et sa session sont celles du tour, sinon un neuf (repris
-        sur la session). None si le démarrage échoue : ce tour, et les
-        suivants pendant RESIDENT_RETRY_S, sont servis un par événement."""
+        sur la session). Un résident muet (il vit, son protocole ne répond
+        plus) est arrêté et compté comme un échec : ce tour est servi un par
+        événement. None si le démarrage échoue : ce tour, et les suivants
+        pendant une attente croissante (`_resident_failed`), sont servis un
+        par événement."""
         from . import containers as containers_mod, resident, resident_runner
         with self.lock:
             rp = self.resident
@@ -3729,6 +4326,16 @@ class AgentWorker(threading.Thread):
                         "launch settings changed" if rp.key != key else
                         "session changed" if (rp.session or None) != (session or None) else
                         "a turn still running" if rp.driver.busy else "")
+            if not pourquoi and rp.probe_due():
+                # T3 : sonde bornée, hors tour (le tour n'est pas lancé) — un
+                # processus muet ne sert pas ce tour
+                if self._resident_probe(rp):
+                    rp.mark_alive()
+                else:
+                    raison = "silent: no answer to the liveness probe"
+                    self._resident_failed(raison)
+                    self._close_resident(raison)
+                    return None
             if not pourquoi:
                 return rp
             self._close_resident("restarted: %s" % pourquoi)
@@ -3745,6 +4352,10 @@ class AgentWorker(threading.Thread):
             adapter, cwd=cwd, session=session, model=model or None, effort=effort or None,
             tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident)
         rp = resident_runner.ResidentProcess(driver, key=key, life_id=life_id, stderr=stderr)
+        # L81 (étude §6.1) : le cumul de relu appartient à la session — un
+        # processus relancé sur le même id (réveil après sommeil, réglages
+        # changés) reprend le cumul du précédent.
+        rp.session_reread = self._resident_reread_load(driver.session_id or session)
         driver.on_event = rp.on_event
         try:
             driver.start()
@@ -3755,9 +4366,7 @@ class AgentWorker(threading.Thread):
                 self.pgid = None
             with self.runner.launch_lock:
                 self.runner.harness_pids.discard(rp.pgid)
-            self._resident_refused_until = time.monotonic() + RESIDENT_RETRY_S
-            log("[%s] resident start failed (%s): one turn per event for %ds"
-                % (self.name, exc, int(RESIDENT_RETRY_S)))
+            self._resident_failed("start failed (%s)" % exc)
             return None
         rp.resource_open = self._attach_resource(life_id, rp.pgid)
         with self.lock:
@@ -3765,6 +4374,32 @@ class AgentWorker(threading.Thread):
         log("[%s] resident process started (pid %s, session %s)"
             % (self.name, rp.pgid, driver.session_id or "new"))
         return rp
+
+    def _resident_failed(self, raison: str) -> None:
+        """T2 : un échec du résident — un tour par événement pendant une
+        attente qui double à chaque échec de suite (RESIDENT_RETRY_MIN_S à
+        RESIDENT_RETRY_MAX_S). Les tours, eux, restent comptés par la série
+        d'échecs rapides de L48, qui arrête l'agent si eux aussi échouent."""
+        self._resident_failures += 1
+        # l'exposant borné : 2 ** 1024 ne tient pas dans un flottant (codex r1, #422)
+        attente = min(RESIDENT_RETRY_MIN_S * 2 ** min(self._resident_failures - 1, 32),
+                      RESIDENT_RETRY_MAX_S)
+        self._resident_refused_until = time.monotonic() + attente
+        log("[%s] resident %s (failure %d in a row): one turn per event for %ds"
+            % (self.name, raison, self._resident_failures, int(attente)))
+
+    def _note_dormant(self, raison: str) -> None:
+        """T2 : l'agent est `dormant` — bail gardé, processus arrêté, réveil
+        au prochain tour sur sa session. Dit dans son statut s'il est `idle`
+        (un `blocked`, un `stopped` restent tels quels), bail tenu."""
+        try:
+            # une seule écriture, conditionnelle (codex r1, #422) : un agent
+            # arrêté ou mis en pause entre-temps n'est jamais remis `idle`
+            storage.of(self.db).operations.set_dormant(
+                self.name, self.runner.runner_id, self.epoch,
+                "dormant: %s; woken by its next turn" % raison)
+        except db_mod.DbError as exc:
+            log_async("[%s] dormant status not written (%s)" % (self.name, db_mod.explain(exc)))
 
     def _close_resident(self, reason: str) -> None:
         """Arrête le processus résident (son groupe entier) et ferme sa ligne
@@ -3785,6 +4420,8 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 if self.resident is rp:
                     self.resident = None
+            if not getattr(self, "_session_turn_depth", 0):
+                self._release_session_lock()
         with self.runner.launch_lock:
             self.runner.harness_pids.discard(rp.pgid)
         if rp.resource_open:
@@ -3814,7 +4451,12 @@ class AgentWorker(threading.Thread):
         fin = tour.wait(RESIDENT_END_WAIT_S)
         if fin is None:
             return 1, "resident turn did not end"
+        # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
+        # courant, fenêtre, relu du tour et relu cumulé de la session.
+        rp.record_turn(fin)
+        self._resident_reread_keep(rp)
         if fin.status == resident.COMPLETED:
+            self._resident_failures = 0     # T2 : la série d'échecs est close
             return 0, None
         if fin.status == resident.INTERRUPTED:
             return (0, None) if voulu else (1, "resident turn interrupted")
@@ -3834,32 +4476,54 @@ class AgentWorker(threading.Thread):
             pass
         rp.turns += 1
         rp.last_used = time.monotonic()
+        rp.mark_alive()          # T3 : le tour qui vient de finir est une preuve de vie
+        urgence = self._urgent_end() or (
+            "the host is withdrawing" if self.host_yield is not None else
+            "stopping" if self.stopping.is_set() else "")
         raison = ("exited" if not rp.alive else
-                  "its turn did not end" if rp.driver.busy else
-                  self._urgent_end() or (
-                      "the host is withdrawing" if self.host_yield is not None else
-                      "stopping" if self.stopping.is_set() else ""))
+                  "its turn did not end" if rp.driver.busy else urgence)
+        if raison and not urgence:
+            self._resident_failed("process %s during its turn" % raison)
         if raison:
             self._close_resident(raison)
 
     def _resident_between_turns(self) -> None:
-        """Entre deux tours : un résident mort est fermé ; un résident
-        inactif depuis `resident_sleep` est endormi (bail gardé, réveil au
-        prochain tour sur sa session) ; `resident=off` l'arrête."""
+        """Entre deux tours : un résident mort est fermé (un échec, T2) ; un
+        résident inactif depuis `resident_sleep`, ou sous la pression de
+        l'hôte, est endormi — `dormant` (bail gardé, réveil au prochain tour
+        sur sa session) ; `resident=off` l'arrête ; un résident muet (T3) est
+        sondé, borné, hors tour : sans réponse il est arrêté et compté comme
+        un échec résident, le tour suivant repart sur un processus neuf."""
         from . import resident_runner
         with self.lock:
             rp = self.resident
         if rp is None:
             return
         if not rp.alive:
+            self._resident_failed("process exited between turns")
             self._close_resident("exited")
         elif not resident_runner.enabled(self._state_read(resident_runner.SETTING)):
             self._close_resident("resident=off")
+        elif self.runner.host_pressure().get("blocked"):
+            # T2 : sous la pression de l'hôte (L31), un résident inactif dort
+            # le premier — sa mémoire est rendue, son bail gardé
+            self._close_resident("asleep: host under pressure")
+            self._note_dormant("asleep, host under pressure")
         else:
             sommeil = resident_runner.sleep_seconds(
                 self._state_read(resident_runner.SLEEP_SETTING))
             if sommeil and time.monotonic() - rp.last_used >= sommeil:
                 self._close_resident("asleep after %ds without a turn" % int(sommeil))
+                self._note_dormant("asleep after %ds without a turn" % int(sommeil))
+            elif rp.probe_due():
+                # T3 : il vit ; son protocole répond-il encore ? La sonde est
+                # bornée et hors tour (aucun tour ne court ici)
+                if self._resident_probe(rp):
+                    rp.mark_alive()
+                else:
+                    raison = "silent between turns: no answer to the liveness probe"
+                    self._resident_failed(raison)
+                    self._close_resident(raison)
 
     def _menage_apres_tour(self, menage_tour, turn_id: str, spec: dict) -> None:
         """L73 : quota du dossier temporaire, worktrees apparus, /tmp signalé ;
@@ -4118,6 +4782,9 @@ class AgentWorker(threading.Thread):
         # pour les autres, incident du 13/10/2026).
         identite.update(identity.git_identity(self.name))
         env.update(identite)
+        # #1645 : chaque geste gh du tour est consigné (agent, tour, lot), et
+        # le tour porte le jeton de son rôle GitHub quand il est configuré.
+        self._github_env(env, lot_du_tour)
         if getattr(self.runner, "mediated", False):
             self._mediated_env(env)
         if not account_turn.apply(self, env, compte):
@@ -4297,7 +4964,14 @@ class AgentWorker(threading.Thread):
         #: L226b : début de la sortie d'erreur de CE tour dans `stderr.log`
         #: (ouvert en ajout) : l'échec d'un tour précédent n'y est pas relu
         stderr_debut = None
+        #: L498 : cgroup délégué du tour. None = repli PID/PGID (délégation
+        #: absente) ou tour exempté (le scope de l'auditeur est un frère de
+        #: l'unité, hors d'elle : décision de route). Le placement précède
+        #: l'exec du harnais ; un placement refusé refuse le lancement.
+        cgroup_path = None
+        ready_r = ready_w = None
         try:
+            from .platform import turn_cgroup
             with open(stderr_path, "ab") as stderr:
                 stderr_debut = stderr.tell()
                 if cle_resident is not None:
@@ -4308,17 +4982,44 @@ class AgentWorker(threading.Thread):
                         model=model, effort=effort, tier=tier, lot=lot_du_tour,
                         stderr_path=stderr_path)
                 if rp is None:
+                    # L498 : le cgroup délégué ne concerne que le lancement d'un
+                    # harnais par événement ; le processus résident (L76) sert
+                    # plusieurs tours et ne prend pas de cgroup par tour.
+                    if not audit_exempt:
+                        root = self.runner.turn_cgroup_root()
+                        if root is not None:
+                            # Publish creation and ownership together: reconciliation
+                            # must never see a directory before its live turn id.
+                            with self.runner._turn_cgroups_lock:
+                                cgroup_path = turn_cgroup.create(root, turn_id)
+                                if cgroup_path is None:
+                                    log("[%s] turn %s refused: cannot create a turn cgroup "
+                                        "under %s" % (self.name, turn_id[:8], root))
+                                    raise _LancementImpossible(
+                                        "turn cgroup refused: cannot create %s/turn-%s"
+                                        % (root, turn_id))
+                                self.runner._turn_cgroups_live.add(turn_id)
+                            ready_r, ready_w = os.pipe()
                     try:
                         # Le moissonneur de l'exécuteur ne touche jamais un harnais,
                         # même pas pendant son lancement (voir `background`).
                         with self.runner.launch_lock:
+                            if cgroup_path is not None:
+                                commande = turn_cgroup.command(
+                                    cgroup_path, ready_w,
+                                    self.runner.audit_command(
+                                        self.name, argv, self.agent, exempt=False,
+                                        seconds=audit_seconds))
+                            else:
+                                commande = self.runner.audit_command(
+                                    self.name, argv, self.agent, exempt=audit_exempt,
+                                    seconds=audit_seconds)
                             proc = subprocess.Popen(
-                                self.runner.audit_command(self.name, argv, self.agent,
-                                                          exempt=audit_exempt,
-                                                          seconds=audit_seconds),
+                                commande,
                                 cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                                 text=True, bufsize=1, env=env,
                                 start_new_session=True,  # son groupe : on peut le tuer en entier
+                                pass_fds=(ready_w,) if ready_w is not None else (),
                             )
                             self.runner.harness_pids.add(proc.pid)
                     except RuntimeError as exc:
@@ -4326,6 +5027,12 @@ class AgentWorker(threading.Thread):
                     except OSError as exc:
                         raise _LancementImpossible("could not launch %s: %s"
                                                    % (argv[0], exc.strerror or exc)) from exc
+                    finally:
+                        # Le parent ne garde pas l'écriture : sinon la lecture du
+                        # READY attendrait son propre descripteur jusqu'à la borne.
+                        if ready_w is not None:
+                            os.close(ready_w)
+                            ready_w = None
             if rp is not None:
                 # publié le temps du tour : le veilleur, la perte du bail, la
                 # préemption et l'arrêt le tuent comme un harnais de tour
@@ -4343,10 +5050,22 @@ class AgentWorker(threading.Thread):
                     self.pgid = proc.pid  # start_new_session : le groupe porte son pid
                 # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
                 # tour, pour repérer ce qui survivrait à sa fin.
-                self._open_turn_resource(turn_id, proc.pid)
-            # Le trampoline valide le cgroup AVANT de lancer le harnais.
-            # L'attente de ce signal est bornée par le minuteur indépendant.
-            # Un scope refusé ne consomme aucun courrier.
+                self._open_turn_resource(turn_id, proc.pid, cgroup=cgroup_path)
+                # L498 : le trampoline a validé le placement AVANT d'exec le
+                # harnais ; sans READY, le lancement est refusé — aucun repli
+                # silencieux, aucun courrier consommé.
+                if ready_r is not None:
+                    ready = self._read_turn_cgroup_ready(ready_r)
+                    os.close(ready_r)
+                    ready_r = None
+                    if ready != turn_cgroup.READY:
+                        log("[%s] turn %s refused: turn cgroup placement not validated "
+                            "(missing READY, harness not run)" % (self.name, turn_id[:8]))
+                        raise _LancementImpossible(
+                            "turn cgroup not validated: placement refused or no READY")
+            # Le scope du tour exempté (auditeur) valide son plafond mémoire
+            # AVANT de lancer le harnais ; l'attente du READY est bornée par le
+            # minuteur indépendant. Un scope refusé ne consomme aucun courrier.
             if audit_exempt and (proc.stdout is None
                                  or proc.stdout.readline().strip() != audit_guard.READY):
                 raise _LancementImpossible("auditor scope not validated: memory cap "
@@ -4526,6 +5245,14 @@ class AgentWorker(threading.Thread):
             pgid = self.pgid
             if rp is not None:
                 self._resident_turn_end(rp)
+            # L498 : les descripteurs du READY ne survivent pas au tour (le
+            # descripteur d'écriture est déjà fermé après le Popen).
+            if ready_r is not None:
+                os.close(ready_r)
+                ready_r = None
+            if ready_w is not None:
+                os.close(ready_w)
+                ready_w = None
             # Fin NORMALE (harnais fini et moissonné, aucun arrêt d'urgence) :
             # ce qui tourne encore — processus du groupe, conteneurs du tour
             # sans lot — garde un délai de grâce (`background`). Sinon, ou
@@ -4537,7 +5264,8 @@ class AgentWorker(threading.Thread):
                         and not self.runner.once and self.turn_grace_seconds() > 0
                         and not self._urgent_end()):
                     fond = self.runner.background.survivors(
-                        turn_id, pgid, handles=background_handles)
+                        turn_id, pgid, handles=background_handles,
+                        cgroup=cgroup_path)
             except Exception as exc:  # dans le doute, le nettoyage d'avant
                 log_async("[%s] background work of turn %s not examined (%s)"
                           % (self.name, turn_id[:8], exc))
@@ -4559,7 +5287,7 @@ class AgentWorker(threading.Thread):
                 self.runner.background.start(
                     agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
                     containers=fond[1], grace_s=self.turn_grace_seconds(),
-                    handles=background_handles)
+                    handles=background_handles, cgroup=cgroup_path)
             elif rp is None:
                 if background_handles:
                     from .background import Entry
@@ -4572,7 +5300,13 @@ class AgentWorker(threading.Thread):
                                     unverified=handoff_failed or any(
                                         h.live() for h in background_handles.values()))
                     cleanup_survives |= self.runner.background._kill(cleanup)
-                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives)
+                self._close_turn_resource(turn_id, pgid, survives=cleanup_survives,
+                                          cgroup=cgroup_path)
+            # Le cgroup du tour a été soit confié au suivi (`background.start`,
+            # qui l'a enregistré), soit tué et fermé ci-dessus : il n'est plus
+            # « ouvert » pour la réconciliation.
+            with self.runner._turn_cgroups_lock:
+                self.runner._turn_cgroups_live.discard(turn_id)
             self._background_handles = None
             self._menage_apres_tour(menage_tour, turn_id, spec)
             if conversation_recorder is not None:
@@ -4751,17 +5485,20 @@ class AgentWorker(threading.Thread):
                 self.fast_failure = False
                 self._avec_reprise("child session discarded",
                                    self._ecarte_session_fille, session)
-            # #1270 : un 429 de débit (ou un quota fournisseur) n'est pas un
-            # échec rapide — il attend puis reprend seul, à délais cadencés ;
-            # le quota est distingué du débit passager et la garde comptable
-            # (L226b) reste seule juge du budget. Un échec d'une autre cause
+            # #1270 : une panne passagère du fournisseur (429, 5xx, flux
+            # DeepSeek) n'est pas un échec rapide — elle attend puis reprend
+            # seule, à délais cadencés. Un quota épuisé suit la même cadence
+            # mais reste compté par L48 : cinq refus arrêtent l'agent, un
+            # plafond n'est pas repris sans fin ; la garde comptable (L226b)
+            # reste seule juge du budget. Un échec d'une autre cause
             # efface l'épisode (hors refus de session fille, qui n'est pas une
             # panne fournisseur et n'efface ni n'étend l'épisode).
             genre = rate_limit_mod.classify(
                 error, self.last_final,
                 auth_failure.stderr_tail(stderr_path, start=stderr_debut))
             if genre:
-                self.fast_failure = False
+                if genre == rate_limit_mod.RATE_LIMITED:
+                    self.fast_failure = False
                 if genre == self.rate_limit:
                     self.rate_limit_streak += 1
                 else:
@@ -4926,6 +5663,18 @@ class AgentWorker(threading.Thread):
             return max(0.0, self.rate_limit_retry_at - time.time())
         return rate_limit_mod.delay(self.rate_limit_streak)
 
+    def retry_due(self) -> bool:
+        """#1270 : un tour de reprise est dû — l'échéance d'un épisode de
+        débit passager est passée. Seul un tour de consigne remet sa consigne
+        en attente ; un tour de courrier, d'événements ou de reprise en échec
+        ne laisse rien (le courrier est soldé au lancement), et l'agent
+        restait `blocked` jusqu'au courrier suivant ou à la relance
+        d'inactivité — cas réels du 14/10 (Codex, tour « événements ») et du
+        15/10 (DeepSeek, tour « messages »). Un quota épuisé n'est pas repris
+        ainsi : il n'est pas repris sans fin."""
+        return (self.rate_limit == rate_limit_mod.RATE_LIMITED
+                and self.retry_remaining() <= 0)
+
     def _attendre_reprise(self, duree: float) -> None:
         """Attend l'échéance de reprise sans se laisser court-circuiter.
 
@@ -4977,8 +5726,8 @@ class AgentWorker(threading.Thread):
         relancé toutes les 5 s sans fin.
 
         #1270 : pour un épisode de débit/quota, c'est le temps **restant**
-        jusqu'à l'échéance durable (`retry at`) — jamais l'arrêt L48, jamais
-        un délai repoussé par un réveil."""
+        jusqu'à l'échéance durable (`retry at`) — jamais un délai repoussé par
+        un réveil ; L48 n'arrête jamais un débit passager, un quota si."""
         if self.rate_limit:
             return self.retry_remaining()
         base = self.runner.failure_backoff
@@ -5204,6 +5953,9 @@ class Runner:
         wait: float = 0.0,
         dry_run: bool = False,
         max_turns: int | None = None,
+        take: dict | None = None,
+        take_interval: float = TAKE_INTERVAL_S,
+        take_balance: dict | None = None,
     ):
         from .host_gate import gate_choice
         try:
@@ -5219,6 +5971,18 @@ class Runner:
         self.wait = wait
         self.dry_run = dry_run
         self.max_turns = max_turns
+        #: #804 : réglages de la prise automatique que CET exécuteur déclenche
+        #: pour ses propres agents (`None` : pas de prise) et sa cadence ; les
+        #: seuils viennent des options et variables d'`ameesh notify`
+        #: (`--take-*`, `AMEESH_TAKE_*`), lus dans `main`.
+        self.take = take or None
+        self.take_interval = (max(0.0, float(take_interval))
+                              if self.take and take_interval else 0.0)
+        #: #754 (owner, 13/10) : seuils de l'alerte `balance_low` lus des
+        #: options `--balance-*` / `AMEESH_ALERT_BALANCE_*`, partagés avec
+        #: `ameesh alerts` et `ameesh notify` (`exploitation.balance_thresholds`).
+        self.take_balance = dict(take_balance or {})
+        self._take_next = 0.0
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
@@ -5254,6 +6018,7 @@ class Runner:
         #: au plus `drain_seconds` ; un second signal arrête tout de suite
         self.drain_seconds = max(0.0, float(getattr(cfg, "drain_seconds", 1800.0)))
         self.draining = threading.Event()
+        self._stop_signal_received = False
         self._drain_deadline = 0.0
         self._drain_since = 0.0
         self._drain_woken = False
@@ -5319,6 +6084,16 @@ class Runner:
         #: compris : `launch_lock`)
         from . import background as background_mod
         self.background = background_mod.Tracker(self, log=log_async)
+        #: L498 : racine cgroup déléguée de cette unité (None = repli
+        #: PID/PGID), sondée une fois — le réglage d'unité ne change pas
+        #: sans redémarrage de l'exécuteur
+        self._turn_cgroup_root: str | None = None
+        self._turn_cgroup_probed = False
+        #: L498 : tours de CE processus dont le cgroup est ouvert (posé au
+        #: lancement, retiré en fin de tour) — la réconciliation ne tue
+        #: jamais un cgroup encore vivant
+        self._turn_cgroups_live: set[str] = set()
+        self._turn_cgroups_lock = threading.Lock()
         #: #453 : une suite de tests lancée hors `ameesh heavy` a le plafond
         #: de durée d'une commande lourde
         from . import suite_cap
@@ -5716,6 +6491,45 @@ class Runner:
             log_async("event log: %d event(s) past retention deleted" % gone)
         return gone
 
+    def take_pass(self) -> list:
+        """#804 : l'exécuteur déclenche la prise pour ses propres agents.
+
+        `backlog.auto_take` n'est plus appelée seulement par `ameesh notify` :
+        ici, sur l'hôte où ces agents tournent, avec les mêmes garde-fous
+        (repos réel, budget, hôtes en pause, `balance_low`, plafonds horaires
+        comptés en base). Seuls les agents servis par cet exécuteur — leurs
+        workers vivants — sont preneurs ; la liste du mesh reste entière pour
+        les gardes et l'avertissement des orchestrateurs. Un hôte sous pression
+        est écarté comme par `ameesh notify` (alerte `host_pressure` locale).
+        """
+        if self.once or self.mediated or not self.take:
+            return []
+        with self.lock:
+            names = {name for name, worker in self.workers.items() if worker.is_alive()}
+        if not names:
+            return []
+        alerts = []
+        try:
+            if self.host_pressure().get("blocked"):
+                alerts.append({"type": "host_pressure", "host": self.host})
+        except Exception:
+            pass  # relevé illisible : on ne devine pas la pression
+        try:
+            alerts += local_balance_alerts(self.db, self.take_balance, time.time())
+        except Exception as exc:
+            # Solde illisible : on ne devine pas. Un agent au token pourrait
+            # être sous le seuil, on le retient ; un forfait, lui, ne dépense
+            # pas ce solde et reste preneur.
+            alerts.append({"type": "balance_low", "unreadable": True})
+            log_async("auto-take: balance unreadable (%s); token agents held"
+                      % type(exc).__name__)
+        taken = local_take(self.db, self.cfg, names, self.take,
+                           dry_run=self.dry_run, alerts=alerts)
+        for take in taken:
+            log_async("auto-take: %s takes lot #%s (%s)" % (
+                take.get("agent"), (take.get("item") or {}).get("id"), take.get("kind")))
+        return taken
+
     def sweep(self) -> None:
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
@@ -5753,6 +6567,17 @@ class Runner:
             self._note_gate_wait("host gate: %s%s" % (
                 gate.describe(), "; ack not written: " + error if error else ""))
             return  # host gate closed: registry diagnosis without taking a lease
+        # #804 : la prise au repos est déclenchée ici, par l'exécuteur de
+        # l'hôte, et non par un `ameesh notify` central (mêmes garde-fous).
+        # Avant la réclamation : le lot pris et son courrier partent dans la
+        # même passe ; une panne de prise ne fait pas tomber l'exécuteur.
+        if self.take_interval > 0 and time.monotonic() >= self._take_next:
+            self._take_next = time.monotonic() + self.take_interval
+            try:
+                self.take_pass()
+            except Exception as exc:
+                log_async("auto-take pass failed (%s): runner continues"
+                          % type(exc).__name__)
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -6021,6 +6846,7 @@ class Runner:
         ordinaire (`systemctl restart`) ne tue donc plus le tour en cours.
         Second signal, borne nulle, ou passage unique : arrêt immédiat, comme
         avant (tour arrêté, consigne remise en attente)."""
+        self._stop_signal_received = True
         if self.once or self.drain_seconds <= 0 or self.draining.is_set():
             immediat = self.draining.is_set()
             self.stop.set()
@@ -6563,8 +7389,12 @@ class Runner:
 
     def lot_sessions_purge(self, db) -> list[dict]:
         """#408 : les sessions mises de côté (et les réveils) des lots
-        fusionnés, livrés, fermés ou réassignés sont oubliées ; les
-        transcripts du harnais restent au ménage. Ne lève jamais."""
+        fusionnés, livrés, fermés ou réassignés sont purgées. #794 : la session
+        ACTIVE d'un lot FINI n'est PAS fermée ici — ce balayage n'a pas le bail
+        de l'agent et peut tomber en plein tour (revue Claude B1 du
+        2026-10-14) ; elle est fermée par son agent, à son tour suivant, sous
+        son bail (`AgentWorker._close_finished_lot_session`). Les transcripts
+        du harnais restent au ménage. Ne lève jamais."""
         try:
             purges = storage.of(db).lot_sessions.purge()
         except db_mod.DbError as exc:
@@ -6572,8 +7402,9 @@ class Runner:
             return []
         for row in purges:
             if row.get("session_id"):
-                log_async("[%s] session %s of lot #%s forgotten (lot finished or reassigned)"
-                          % (row["agent"], row["session_id"], row["work_item_id"]))
+                log_async("[%s] session %s put aside for lot #%s dropped (lot finished "
+                          "or reassigned)" % (row["agent"], row["session_id"],
+                                              row["work_item_id"]))
         return purges
 
     def expire_threads_once(self, db, now: float | None = None,
@@ -6913,6 +7744,17 @@ class Runner:
         return (bool(getattr(self, "mediated", False)) and not self.once
                 and getattr(self, "host_gate", None) is not None)
 
+    def stop_on_signal(self) -> bool:
+        """L2009 : un signal d'arrêt a-t-il déjà été traité ?
+
+        `stop` ne dit rien ici : `shutdown` le pose dans tous les cas. Le
+        marqueur de `request_stop` conserve aussi l'arrêt immédiat (drainage
+        nul ou passage unique), qui ne pose pas `draining`. Le retrait médié
+        pose `sigterm_requested`. Le remplacement d'image s'interdit alors
+        de se remplacer."""
+        return (bool(getattr(self, "_stop_signal_received", False))
+                or self.draining.is_set() or bool(self.sigterm_requested))
+
     def _sigterm_drained(self) -> bool:
         """Retrait engagé par SIGTERM et terminé (aucun bail détenu). Engage
         le retrait au premier appel qui suit le signal."""
@@ -7045,12 +7887,70 @@ class Runner:
 
     def is_critical(self, name: str, agent=None) -> bool:
         """L242b : agent critique, jamais en pause budget tant qu'un compte a
-        de la marge (`auditor.is_critical`, partagé avec L233b)."""
-        from . import auditor as auditor_mod
-        return auditor_mod.is_critical(self.cfg, self.db, name,
-                                       getattr(self, "_audit_canons", ()),
-                                       declared=getattr(self, "_orchestrators_declared", ()),
-                                       agent=agent)
+        de la marge. L242c : déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS` :
+        la surcharge explicite ; `AMEESH_ALERT_ORCHESTRATORS`), sinon par un
+        rôle critique de sa fiche, dans son canon propriétaire seulement
+        (`critical_roles` de l'organisation, défaut orchestrateur, conception,
+        auditeur, relecture). Canon propriétaire illisible (#424 r1) : le
+        dernier verdict lu, sinon critique (#424 r6). Canon propriétaire
+        configuré sur aucun canon de l'hôte (#424 r7) : non critique, et
+        jamais gravé au cache (#921 : rien ne doit déclasser un agent)."""
+        if name in (getattr(self.cfg, "critical_agents", None) or ()):
+            return True
+        if name in getattr(self, "_orchestrators_declared", ()):
+            return True
+        from . import canon as canon_mod, sous_utilisation as su
+        canons = getattr(self, "_audit_canons", ())
+        if "_critical_memory" not in self.__dict__:
+            # #424 r2 : les verdicts lus avant un redémarrage ; None si le
+            # cache n'est pas digne de confiance (#424 r3 : tout y est inconnu)
+            self._critical_memory = su.critical_memory(self.cfg)
+            self._critical_known = {}
+        known = self._critical_known
+        last = known[name] if name in known else su.remembered(self._critical_memory, name)
+        # le registre n'est lu que pour un nom candidat, comme `is_auditor`
+        # (tous les canons configurés chargés : un absent ne dit rien)
+        if (getattr(self, "_canon_complete", True) and last is not True
+                and last != su.UNKNOWN
+                and all(su.fully_read(c) for c in canons)
+                and name not in su.critical_candidates(canons)):
+            return False
+        row = agent if agent is not None else registry.get(self.db, name)
+        foreign = su.foreign_canon(dict(row or {}, name=name), canons,
+                                   complete=getattr(self, "_canon_complete", False))
+        if foreign is not None:
+            # #424 r7 : état connu, pas une panne ; jamais retenu au cache
+            if su.warn_foreign(name):
+                log_async("[%s] owner canon %s is configured on no canon of this host:"
+                          " not critical" % (name, foreign))
+            return False
+        configured = bool(canon_mod.configured(self.cfg))
+        verdict, unknown = su.critical_verdict(
+            dict(row or {}, name=name), canons, configured=configured, known=last)
+        if unknown:
+            if self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
+                self._critical_held[name] = verdict
+                log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
+                          % (name, "critical" if verdict else "not critical",
+                             "last known" if isinstance(last, bool) else
+                             "unknown: fail-closed"))
+        elif configured or canons:
+            # #921 : ne rien graver du verdict de repli « hôte sans canon » —
+            # ni sur le disque, ni dans la mémoire du processus (elle nourrit
+            # `known` au passage suivant) : ce « non critique » serait tenu
+            # quand un canon devient configuré mais illisible, et déclasserait
+            # l'agent au lieu du repli critique (#424 r6). Un verdict n'est un
+            # fait sur l'agent que si un canon est en jeu (`configured or
+            # canons`, l'exact inverse du repli de `critical_verdict`) ; en
+            # service, des canons chargés impliquent `configured`, comme la
+            # garde `and configured` d'`auditor.is_critical`.
+            # #424 r3 : la mémoire ne suit qu'une écriture réussie (sinon
+            # nouvel essai au sondage suivant) ; #424 r4 : comparé au disque
+            # à chaque verdict, jamais à la mémoire (`resume` a pu l'écrire)
+            if (su.remember_critical(self.cfg, name, verdict)
+                    or su._memory_path(self.cfg) is None):
+                known[name] = verdict     # sans dossier d'état : la mémoire seule
+        return verdict
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:
@@ -7268,6 +8168,85 @@ class Runner:
             except adapters.HarnessMissing as exc:
                 texte = "host not ready: %s" % exc
             log("harness %s (%s): %s" % (harness, ", ".join(sorted(noms)), texte))
+
+    def turn_cgroup_root(self) -> str | None:
+        """L498 : la racine cgroup déléguée de cette unité, ou None (repli
+        PID/PGID : hôte non Linux, délégation absente, racine non inscriptible,
+        `DelegateSubgroup=runner` manquant). Sondée une fois par exécuteur et
+        journalisée une fois — le code reste inerte là où la délégation n'est
+        pas posée."""
+        if not self._turn_cgroup_probed:
+            from .platform import turn_cgroup
+            root, reason = turn_cgroup.root_for_runner()
+            self._turn_cgroup_root = root
+            # Publish readiness only after the result, including to workers
+            # probing concurrently: a pending probe is not a PID/PGID fallback.
+            self._turn_cgroup_probed = True
+            if root is None:
+                log_async("per-turn cgroup unavailable (%s): keeping PID/PGID ownership"
+                    % reason)
+            else:
+                log_async("per-turn cgroup: delegated root %s" % root)
+        return self._turn_cgroup_root
+
+    def _live_turn_ids(self) -> set | None:
+        """Les tours de CE processus encore ouverts : cgroup posé au lancement
+        et pas encore clos, et travail de fond en grâce. None si le suivi du
+        fond est illisible : on ne tue alors rien à l'aveugle."""
+        with self._turn_cgroups_lock:
+            live = set(self._turn_cgroups_live)
+        try:
+            with self.background.lock:
+                live.update(entry.turn_id for entry in self.background.entries
+                            if entry.state == "running")
+        except Exception as exc:  # jamais de nettoyage sur un état inconnu
+            log_async("turn cgroups not reconciled: background state unreadable (%s)"
+                      % exc)
+            return None
+        return live
+
+    def reconcile_turn_cgroups(self, *, startup: bool = False) -> int:
+        """L498 : enlève les cgroups `turn-*` de la racine déléguée qui n'ont
+        plus de tour ouvert dans ce processus — au démarrage (`startup`, ce
+        qu'un exécuteur mort a laissé : orphelins préexistants) et au passage
+        périodique (nouveaux). Un cgroup dont le tour est en cours, ou dont le
+        travail de fond est suivi, est laissé. `cgroup.kill` puis
+        `populated 0` puis `rmdir` ; ce qui ne se vide pas est signalé avec
+        son chemin, jamais enlevé de force. Ne lève jamais."""
+        root = self.turn_cgroup_root()
+        if root is None:
+            return 0
+        from .platform import turn_cgroup
+        # Fail-closed : un état du fond illisible ne balaie rien, donc on le
+        # sonde AVANT d'énumérer. L'énumération précède la prise de référence
+        # qui décide : un tour créé pendant l'énumération est dans `live`, un
+        # tour créé après est absent des chemins. Création et publication
+        # partagent `_turn_cgroups_lock` avec la référence.
+        if self._live_turn_ids() is None:
+            return 0
+        paths = turn_cgroup.orphans(root)
+        live = self._live_turn_ids()
+        if live is None:
+            return 0
+        killed = 0
+        for path in paths:
+            turn_id = turn_cgroup.turn_id_of(path.rsplit("/", 1)[-1])
+            if not turn_id or turn_id in live:
+                continue
+            origine = "pre-existing" if startup else "new"
+            try:
+                emptied = turn_cgroup.kill(path)
+            except Exception as exc:
+                log_async("turn cgroup %s (%s) not reconciled (%s)"
+                          % (path, origine, exc))
+                continue
+            if emptied:
+                killed += 1
+                log("turn cgroup %s (%s orphan): killed and removed" % (path, origine))
+            else:
+                log_async("turn cgroup %s (%s orphan) could not be emptied; "
+                          "reported, nothing deleted" % (path, origine))
+        return killed
 
     def report_boot_orphans(self) -> list[dict]:
         """Après une coupure (L106) : les ressources de tour de CET hôte encore
@@ -7567,6 +8546,7 @@ class Runner:
         self.log_harnesses()
         self.report_boot_orphans()
         self.settle_dead_turns()
+        self.reconcile_turn_cgroups(startup=True)  # L498 : cgroups d'un exécuteur mort
         reprise = Reprise(self.db_retry_max)
         code = 0
         try:
@@ -7590,6 +8570,7 @@ class Runner:
                     self.report_boot_orphans()      # #220 r2 : solde différé
                 if time.monotonic() >= self.live_review_at:
                     self.settle_dead_turns()        # #339
+                    self.reconcile_turn_cgroups()   # L498
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
@@ -7656,6 +8637,40 @@ def build_parser() -> argparse.ArgumentParser:
                         help="fallback polling interval in seconds (default 5)")
     parser.add_argument("--idle-nudge", type=float, default=None,
                         help="nudge after N seconds of inactivity (default 1200)")
+    # #804 : prise automatique déclenchée par l'exécuteur pour ses propres
+    # agents — mêmes options et variables d'environnement qu'`ameesh notify`
+    # (`AMEESH_TAKE_*`) ; les réglages sont lus par `notify.take_settings`,
+    # une seule implémentation.
+    from . import backlog, exploitation
+    parser.add_argument("--take-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_IDLE",
+                                                        backlog.DEFAULT_TAKE_IDLE_S),
+                        help="take an item from the improvement backlog for an idle agent "
+                             "after S seconds without a lot (default 1800; 0 turns it off)")
+    parser.add_argument("--take-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
+                        help="maximum backlog takes per rolling hour, for the whole mesh "
+                             "(default 2)")
+    parser.add_argument("--take-lot-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
+                                                        backlog.DEFAULT_LOT_IDLE_S),
+                        help="take the best unassigned lot of an idle agent's team after S "
+                             "seconds (default 900; 0 turns it off)")
+    parser.add_argument("--take-lot-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
+                        help="maximum team lots taken per rolling hour, for the whole mesh "
+                             "(default 6)")
+    parser.add_argument("--take-interval", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_INTERVAL",
+                                                        TAKE_INTERVAL_S),
+                        help="seconds between two takes by this runner (default 60; 0 turns "
+                             "the runner's take off)")
+    # #754 (owner, 13/10) : la prise refuse tant qu'une alerte `balance_low`
+    # est vive ; les seuils de cette alerte sont ceux d'`ameesh alerts` et
+    # d'`ameesh notify` (une seule déclaration, dans `exploitation`).
+    exploitation.add_balance_arguments(parser)
     parser.add_argument("--migrate", action="store_true", help="apply migrations before starting")
     return parser
 
@@ -7739,6 +8754,12 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int,
     env.update(identity.git_identity(name))
     if harness:
         env["AMEESH_HARNESS"] = harness  # L224 : comme pour un tour
+    # #1645 : journal gh et identité GitHub du rôle, comme pour un tour
+    from . import github_identity
+    try:
+        github_identity.apply(env, name, cfg.config_dir, cfg.state_dir)
+    except Exception:  # noqa: BLE001 — la session part avec l'identité héritée
+        pass
     return env
 
 
@@ -7976,7 +8997,34 @@ def _attach_permission_mode(cfg: Config, name: str, harness: str,
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
-               ttl: float | None = None) -> int:
+               ttl: float | None = None, max_seconds: float | None = None) -> int:
+    from contextlib import ExitStack
+    from . import attach as attach_mod
+    from .platform import session_lock
+    if not NAME_RE.match(name or ""):
+        print("invalid agent name: %r" % name, file=sys.stderr)
+        return 1
+    max_seconds = attach_mod.DEFAULT_MAX if max_seconds is None else max_seconds
+    attach_mod.Deadline(max_seconds)  # validate before taking a lock or lease
+    with ExitStack() as locks:
+        # The runner's requested() probe briefly holds this same lock. Give
+        # that probe time to finish before declaring a duplicate session.
+        for _ in range(10):
+            request = session_lock.try_lock(cfg.agent_dir(name), "attach-request")
+            if request is not None:
+                break
+            time.sleep(0.01)
+        if request is None:
+            print("agent %s already has an attach request/session: close it first" % name,
+                  file=sys.stderr)
+            return 3
+        locks.enter_context(request)
+        return _run_attach(cfg, db, name, wait=wait, ttl=ttl,
+                           max_seconds=max_seconds, locks=locks)
+
+
+def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
+                ttl: float | None, max_seconds: float, locks) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
 
     Le bail est pris même s'il est déjà détenu par un exécuteur **sans tour en
@@ -7986,6 +9034,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     renouvelé tant que la session vit, le harnais est arrêté si le bail est
     perdu, et le bail est rendu à la sortie.
     """
+    from . import attach as attach_mod
+    from .platform import session_lock
     agent = registry.get(db, name)
     if agent is None:
         print("unknown agent: %s" % name, file=sys.stderr)
@@ -8017,7 +9067,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     owner = attach_owner(cfg.host)
     ttl = max(5.0, ttl or cfg.lease_ttl)
     registry.reap(db, cfg.host)
+    handoff_end = time.monotonic() + attach_mod.HANDOFF_TIMEOUT
+    session_guard = None
     while True:
+        current = registry.get(db, name) or {}
+        if ((current.get("lease_owner") or "").startswith("attach:")
+                and float(current.get("lease_expires_ts") or 0) > time.time()):
+            print("agent %s already has an attached session: close it first" % name,
+                  file=sys.stderr)
+            return 3
         if registry.turn_in_progress(db, name):
             if not wait:
                 print("a turn is in progress for %s (rerun with --wait to wait)"
@@ -8026,6 +9084,23 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             print("turn in progress for %s: waiting…" % name, file=sys.stderr, flush=True)
             time.sleep(2.0)
             continue
+        if session_guard is None:
+            session_guard = session_lock.try_lock(cfg.agent_dir(name), "session-use")
+            if session_guard is None:
+                if time.monotonic() >= handoff_end:
+                    print("agent %s: resident did not hand back its session; attach refused"
+                          % name, file=sys.stderr)
+                    return 3
+                time.sleep(0.1)
+                continue
+            locks.enter_context(session_guard)
+        # No runner can start a turn while this guard is held. Refresh the
+        # session after --wait, before taking a lease that needs cleanup.
+        finished = registry.get(db, name) or {}
+        if ((finished.get("harness") or "") == (agent.get("harness") or "")
+                and agent_incarnation(finished) == agent_incarnation(agent)):
+            agent = dict(agent, session_id=finished.get("session_id"),
+                         pending_prompt=finished.get("pending_prompt"))
         lease = registry.attach_claim(db, name, owner, ttl)
         if lease:
             break
@@ -8063,6 +9138,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     stop = threading.Event()
     perdu = threading.Event()
     etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
+    limit = attach_mod.Deadline(max_seconds)
+    expired = threading.Event()
 
     def battement() -> None:
         interval = max(3.0, ttl / 3.0)
@@ -8090,6 +9167,15 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         bornée par l'échéance, comme le veilleur d'`AgentWorker`.
         """
         while not stop.is_set():
+            if limit.expired():
+                expired.set()
+                perdu.set()
+                log_async("[%s] attach: maximum duration reached; returning to runner" % name)
+                return
+            remaining = limit.notice()
+            if remaining is not None:
+                log_async("[%s] attach ends in %.0fs; close the session to return to the runner"
+                          % (name, remaining))
             if etat["deadline"] <= 0:
                 stop.wait(0.5)
                 continue
@@ -8105,12 +9191,35 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     proc: subprocess.Popen | None = None
     code = 0
     holds: list = []
+    def check_inputs() -> None:
+        prompt_since = time.time() if agent.get("pending_prompt") else None
+        alerted_since = None
+        while not stop.is_set():
+            try:
+                queued = registry.get(db, name) or {}
+                if not queued.get("pending_prompt"):
+                    prompt_since = None
+                elif prompt_since is None:
+                    prompt_since = time.time()
+                since = attach_mod.waiting_since(db, name, queued, prompt_since)
+                if since is None:
+                    alerted_since = None
+                elif time.time() - since >= attach_mod.INPUT_DELAY and since != alerted_since:
+                    log_async("[%s] attach: inputs waiting for more than 10 min; "
+                              "close the session to return to the runner" % name)
+                    alerted_since = since
+            except db_mod.DbError as exc:
+                log_async("[%s] attach: cannot check waiting inputs (%s)" % (name, exc))
+            stop.wait(attach_mod.INPUT_CHECK)
+
+    inputs = threading.Thread(target=check_inputs, daemon=True, name="%s-attach-inputs" % name)
     try:
         # codex verdict #182 (P2): everything after taking the lease is under the
         # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
         # slow `claude --help`) still releases the lease
         thread.start()
         veille.start()
+        inputs.start()
         argv = adapter.interactive_command(
             agent.get("session_id"),
             permission_mode=_attach_permission_mode(
@@ -8124,6 +9233,10 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
             return 1  # le `finally` rend le bail
+        if limit.expired():
+            return 124
+        if perdu.is_set():
+            return 1
         log_async("[%s] interactive session: %s" % (name, " ".join(argv)))
         proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
@@ -8136,6 +9249,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                 break
             time.sleep(0.2)
         code = proc.wait()
+        if expired.is_set():
+            code = 124
     except KeyboardInterrupt:
         if proc is not None:
             stop_group_now(proc, "interrupted (attach)", name=name)
@@ -8146,7 +9261,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         stop.set()
         for hold in holds:          # L219: the session is over
             hold.release()
-        for worker in (thread, veille):
+        for worker in (thread, veille, inputs):
             if worker.ident is not None:    # started (L223)
                 worker.join(timeout=5)
         try:
@@ -8158,14 +9273,17 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
 
 
 def attach_main(argv: list[str] | None = None) -> int:
+    from . import attach as attach_mod
     argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(
         prog="ameesh attach",
-        description="Open an interactive session on an agent's lease (C9).")
+        description="Put the resident to sleep for bounded native access, then return its lease (L82).")
     parser.add_argument("agent")
     parser.add_argument("--wait", action="store_true",
                         help="wait for a turn in progress to end before taking the lease")
     parser.add_argument("--ttl", type=float, default=None, help="lease duration in seconds")
+    parser.add_argument("--max", type=attach_mod.duration, default=attach_mod.DEFAULT_MAX,
+                        help="maximum interactive duration (default: 2h; e.g. 30m, 4h)")
     parsed = parser.parse_args(argv)
     cfg = load_config()
     adapters.configure(cfg)  # L106 : `harness_bins` de l'hôte
@@ -8181,7 +9299,8 @@ def attach_main(argv: list[str] | None = None) -> int:
         except db_mod.SchemaMissing as exc:
             print("ameesh attach: %s" % exc, file=sys.stderr)
             return 1
-        code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl)
+        code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl,
+                          max_seconds=parsed.max)
         return code
     finally:
         try:
@@ -8192,6 +9311,70 @@ def attach_main(argv: list[str] | None = None) -> int:
             _sortie_sure(code)
 
 
+#: signaux d'arrêt de l'exécuteur : SIGTERM de systemd, SIGINT du terminal
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+class StopRequested(Exception):
+    """L2009 : un signal d'arrêt a été reçu avant que l'exécuteur ne tourne.
+
+    L'attente de la base au démarrage pose un gestionnaire temporaire ; quand
+    la base finit par répondre, le signal ne doit pas être avalé (incident du
+    16/10 : l'unité restait `deactivating/stop-sigterm` et l'exécuteur
+    reprenait des tours). L'appelant sort proprement, sans tour ni bail.
+    `signum` dit lequel."""
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = int(signum)
+
+
+def _signal_label(signum: int) -> str:
+    """Nom lisible d'un signal (`SIGTERM`), pour le journal."""
+    try:
+        return signal.Signals(signum).name
+    except ValueError:  # pragma: no cover - signal inconnu du système
+        return str(signum)
+
+
+def _replace_image_or_stop(runner) -> int:
+    """L790/L2009 : remplacement d'image entre deux tours, ou sortie propre.
+
+    Un signal d'arrêt reçu pendant que l'exécuteur se remplace ne doit jamais
+    être perdu (incident #2009 : `systemctl restart` concurrent du redémarrage
+    L790, unité `deactivating/stop-sigterm` 26 min, tours repris). S'il a déjà
+    été traité, on ne se remplace pas : on sort en 0, ce que le service attend.
+    Sinon les dispositions d'arrêt repassent au DÉFAUT avant l'`exec` : un
+    signal reçu ensuite tue le processus — l'arrêt demandé est honoré — au lieu
+    d'être consommé par le gestionnaire de l'image sortante. Le contrôle qui
+    suit la remise au défaut rattrape un gestionnaire déjà déclenché dont
+    l'effet (drainage, retrait médié) n'était pas encore visible. Rend le code
+    de sortie quand l'`exec` échoue (le service relance)."""
+    if runner is not None and runner.stop_on_signal():
+        # Le journal est déjà fermé (`_sortie_sure`) : écriture directe, comme
+        # le message du remplacement ; quelques octets, jamais bloquante.
+        print("agent-runner: image replacement cancelled: stop already requested",
+              file=sys.stderr, flush=True)
+        return 0
+    anciens = {}
+    for sig in STOP_SIGNALS:
+        try:
+            anciens[sig] = signal.signal(sig, signal.SIG_DFL)
+        except ValueError:  # hors du fil principal (tests)
+            pass
+    try:
+        if runner is not None and runner.stop_on_signal():
+            print("agent-runner: image replacement cancelled: stop requested "
+                  "during the replacement", file=sys.stderr, flush=True)
+            return 0
+        _restart_with_installed_code()
+    finally:
+        # Atteint seulement si l'`exec` n'a pas remplacé l'image (échec) ou si
+        # un arrêt a été rattrapé : on rend les dispositions d'avant.
+        for sig, ancien in anciens.items():
+            signal.signal(sig, ancien)
+    return EXIT_RESTART
+
+
 def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
     """Connexion de l'exécuteur au démarrage.
 
@@ -8200,12 +9383,21 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
     pas encore là (2026-10-10 : un exécuteur du poste sorti en échec à 12:35:20,
     relancé à la main à 12:39) — n'est plus une sortie en échec : attente
     croissante (2 s… `db_retry_max`), jusqu'à la base ou un signal d'arrêt. En
-    `--once`, l'échec reste immédiat."""
+    `--once`, l'échec reste immédiat.
+
+    L2009 : un signal d'arrêt reçu pendant cette attente n'est jamais avalé,
+    même quand la base finit par répondre. Le gestionnaire temporaire ne sert
+    qu'à sortir de l'attente : il lève `StopRequested`, et l'appelant sort
+    proprement (code 0, aucun tour, aucun bail)."""
     reprise = Reprise(float(getattr(cfg, "db_retry_max", 60.0)))
     arret = threading.Event()
+    signaux: list[int] = []
     anciens = {}
+    db = None
     if wait:
         def handler(signum, _frame):
+            # gestionnaire de signal : des drapeaux seulement
+            signaux.append(signum)
             arret.set()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -8217,7 +9409,9 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
             try:
                 db = db_mod.connect(cfg)
             except db_mod.Unavailable as exc:
-                if not wait or arret.is_set():
+                if arret.is_set():
+                    return None
+                if not wait:
                     print("agent-runner: %s unreachable: %s"
                           % ("mesh server" if getattr(cfg, "backend", None) == "mediated"
                              else "database", exc), file=sys.stderr)
@@ -8227,8 +9421,6 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
                     "in %ds (failure %d)" % (db_mod.explain(exc), int(attente),
                                              reprise.echecs))
                 if arret.wait(attente):
-                    print("agent-runner: stop requested before the database answered",
-                          file=sys.stderr)
                     return None
                 continue
             bilan = reprise.retablie()
@@ -8239,6 +9431,38 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
     finally:
         for sig, ancien in anciens.items():
             signal.signal(sig, ancien)
+        if arret.is_set():
+            # L2009 : le signal a été consommé pendant l'attente — ne pas
+            # l'avaler. La base éventuellement ouverte est rendue ici, `main`
+            # ne la verra jamais.
+            closer = getattr(db, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # la sortie ne dépend pas de cette fermeture
+                    pass
+            raise StopRequested(signaux[0] if signaux else signal.SIGTERM)
+
+
+def _take_settings(args) -> dict | None:
+    """#804 : réglages de la prise de l'exécuteur, lus des options et
+    variables d'environnement d'`ameesh notify` (une seule implémentation).
+    `None` quand les deux prises (file d'amélioration, lots de l'équipe)
+    sont coupées."""
+    from . import notify
+    settings = notify.take_settings(args)
+    if settings is not None:
+        # #754 : la prise par un agent au token est acquise ; l'ancien
+        # `allow_paid` n'a plus d'objet.
+        settings.pop("allow_paid", None)
+    return settings
+
+
+def _take_balance(args) -> dict:
+    """#754 : seuils de l'alerte `balance_low` de la prise de l'exécuteur,
+    lus des mêmes options que celles d'`ameesh alerts` et `ameesh notify`."""
+    from . import exploitation
+    return exploitation.balance_thresholds(args)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -8301,7 +9525,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print("agent-runner: %s" % exc, file=sys.stderr)
         return 2
-    db = _connect_at_start(cfg, wait=not parsed.once)
+    try:
+        db = _connect_at_start(cfg, wait=not parsed.once)
+    except StopRequested as exc:
+        # L2009 : un signal d'arrêt a été reçu pendant l'attente de la base —
+        # sortie propre (code 0, le service ne relance pas), sans tour ni bail.
+        print("agent-runner: %s received at startup: exiting without a turn"
+              % _signal_label(exc.signum), file=sys.stderr)
+        return 0
     if db is None:
         return 1
     #: 1 tant que `run` n'a pas rendu : une exception sort en échec, y compris
@@ -8326,6 +9557,8 @@ def main(argv: list[str] | None = None) -> int:
             runner = Runner(
                 cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
                 dry_run=parsed.dry_run, max_turns=parsed.max_turns,
+                take=_take_settings(parsed), take_interval=parsed.take_interval,
+                take_balance=_take_balance(parsed),
             )
         except db_mod.DbError as exc:
             if not mediated:
@@ -8379,8 +9612,11 @@ def main(argv: list[str] | None = None) -> int:
     # telle quelle (mêmes options, même identité) pour reprendre le code neuf,
     # sans attendre un humain. Si le remplacement direct échoue, le code 75
     # sort en échec et le service (`Restart=on-failure`) relance l'exécuteur.
+    # L2009 : un signal d'arrêt reçu entre-temps fait sortir proprement (0) au
+    # lieu de se remplacer — le remplacer avalerait le signal et l'unité
+    # resterait `deactivating` pendant que l'image neuve reprend des tours.
     if code == EXIT_RESTART:
-        _restart_with_installed_code()
+        code = _replace_image_or_stop(runner)
     return code
 
 
