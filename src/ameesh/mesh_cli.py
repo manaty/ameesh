@@ -246,7 +246,10 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # regroupé par projet (tri stable : dans un projet, l'ordre de
         # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
         rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
-        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+        # #1782 : la colonne HARNESS fait 10, pas 9 — la valeur étoilée d'un
+        # harnais vivant de 9 lettres (`(live or '?')[:9] + '*'`) en fait 10 ;
+        # à 9, la ligne entière se décalait d'un caractère.
+        print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
             "KEY", "SEEN"))
         session_differs = False
@@ -272,7 +275,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             starred = bool(live) and live != declared
             if starred:
                 session_differs = True
-            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+            print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
                 (row.get("host") or "")[:10],
