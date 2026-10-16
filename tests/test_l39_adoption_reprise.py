@@ -12,6 +12,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
+import sys
 import time
 import unittest
 import uuid
@@ -25,6 +27,9 @@ from .support import FAKEBIN, PgTestCase
 #: #1196 : un SID unique par exécution. Un SID fixe se retrouve dans l'argv du
 #: CLI d'un job parallèle (psql/psycopg du même run) ; `holders()` le voit et
 #: refuse `adopt` à tort — test dépendant de l'environnement (canon §3).
+#: Identifiant FICTIF, tiré à chaque exécution : un id fixe publié (fil,
+#: documentation) peut être cité par un processus réel du même hôte et faire
+#: croire à une session ouverte (#1283). Voir `reprise.holders`.
 SID = str(uuid.uuid4())
 
 
@@ -141,6 +146,26 @@ class AdoptTest(_Base):
         self.assertEqual((row["chantier"], row["harness"], row["pending_prompt"],
                           row["session_account"]),
                          ("atelier", "codex", "Termine le lot 12.", "primaire"))
+
+    def test_un_brief_qui_cite_la_session_ne_bloque_pas_l_adoption(self):
+        """#1283 : un processus réel dont l'argv CITE l'id (brief JSON) n'est
+        pas un détenteur ; l'adoption n'a pas à être forcée pour lui."""
+        comptes = self._codex()
+        _rollout(comptes["codex"][0]["path"], SID, self.travail)
+        pret = os.path.join(self.tmp, "citant-pret")
+        citant = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys, time; open(sys.argv[1], 'w').close(); time.sleep(60)",
+             pret, "--json", json.dumps({"brief": "reprends la session %s" % SID})])
+        self.addCleanup(lambda: (citant.kill(), citant.wait()))
+        fin = time.monotonic() + 10
+        while not os.path.exists(pret):
+            self.assertLess(time.monotonic(), fin, "délai dépassé")
+            time.sleep(0.05)
+        out = reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
+                            harness="codex")
+        self.assertFalse(out["forced"])
+        self.assertEqual(registry.get(self.db, "coord")["session_id"], SID)
 
     def test_introuvable_refus_clair(self):
         comptes = self._codex()
