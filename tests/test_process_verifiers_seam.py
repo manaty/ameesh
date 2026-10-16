@@ -157,6 +157,29 @@ class SeamTest(unittest.TestCase):
         self.assertIn("milestones", snapshot.sources)
         self.assertNotIn("observations", snapshot.sources)
 
+    def test_seam_avec_le_vrai_process_registry(self):
+        """Le jour ou B est fusionne, l'appelable rend son Verification reel."""
+        try:
+            from ameesh import process_registry as pr
+        except ImportError:  # pragma: no cover - B fusionne ensuite
+            self.skipTest("#1922 (B) pas encore fusionne dans ce worktree")
+        raw = pr.Command(work_item_id=7, command_id=COMMAND_ID,
+                         expected_version=0,
+                         authority=pr.Authority(actor="agent:dev1",
+                                                source="runner",
+                                                runner_id="runner-1"),
+                         workflow_ref="canon@abc:workflow.json",
+                         workflow_version=3, action="advance",
+                         from_stage="work", to_stage="next",
+                         guard="start_work", evidence={})
+        real = pr.VerificationContext(db=None, work_item=item(), command=raw,
+                                      spec=None, from_stage="work",
+                                      to_stage="next")
+        result = server_verifier("start_work", pr.Verification)(real)
+        self.assertIsInstance(result, pr.Verification)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.facts["code"], "accepted")
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
