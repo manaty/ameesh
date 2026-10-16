@@ -28,6 +28,8 @@ from ameesh.process_verifiers import (CODE_TYPES, GUARD_NAMES, HOLDS,
 REV = "a" * 40
 OTHER = "b" * 40
 COMMAND_ID = "11111111-1111-4111-8111-111111111111"
+AUTHOR = "agent:dev1"
+REVIEWER = "agent:reviewer"
 ALL_SOURCES = ("milestones", "receipts", "observations", "decisions",
                "deliveries")
 
@@ -86,8 +88,9 @@ def full_snapshot(**overrides) -> Snapshot:
         milestones=(
             {"kind": "frozen", "sha": REV, "verdict": None},
             {"kind": "merged", "sha": REV, "verdict": None},
-            {"kind": "verdict", "sha": REV, "verdict": "blocked"},
-            {"kind": "verdict", "sha": REV, "verdict": "ok"},
+            {"kind": "verdict", "sha": REV, "verdict": "blocked",
+             "actor": REVIEWER},
+            {"kind": "verdict", "sha": REV, "verdict": "ok", "actor": REVIEWER},
         ),
         receipts=RECEIPTS,
         observations=OBSERVATIONS,
@@ -97,6 +100,22 @@ def full_snapshot(**overrides) -> Snapshot:
     )
     values.update(overrides)
     return Snapshot(**values)
+
+
+def blocked_snapshot(**overrides) -> Snapshot:
+    """Tete gelee et blocage courant du relecteur designe (qa_repair, R3).
+
+    Fixture nommee : le cas ne depend plus de l'ordre des jalons de
+    `full_snapshot` (`milestones[:-1]`).
+    """
+    values = dict(milestones=(
+        {"kind": "frozen", "sha": REV, "verdict": None},
+        {"kind": "merged", "sha": REV, "verdict": None},
+        {"kind": "verdict", "sha": REV, "verdict": "blocked",
+         "actor": REVIEWER},
+    ))
+    values.update(overrides)
+    return full_snapshot(**values)
 
 
 def command_for(guard: str, **overrides) -> Command:
@@ -158,7 +177,7 @@ class VerificateursTest(unittest.TestCase):
         self.assertEqual(tuple(cap.guard for cap in caps), GUARD_NAMES)
         by_name = {cap.guard: cap for cap in caps}
         self.assertEqual(by_name["staging_pass"].sources,
-                         ("receipts", "observations"))
+                         ("milestones", "receipts", "observations"))
         self.assertEqual(by_name["merged_and_staging_deployed"].references,
                          ("merge", "staging"))
         self.assertEqual(by_name["review_requested"].references, ("head",))
@@ -178,9 +197,7 @@ class VerificateursTest(unittest.TestCase):
     def test_un_accord_par_garde(self):
         for guard in GUARD_NAMES:
             with self.subTest(guard=guard):
-                snapshot = full_snapshot()
-                if guard == "qa_repair":
-                    snapshot = full_snapshot(milestones=snapshot.milestones[:-1])
+                snapshot = blocked_snapshot() if guard == "qa_repair" else full_snapshot()
                 decision = verify(command_for(guard), snapshot)
                 self.assertTrue(decision.accepted, (guard, decision))
                 self.assertEqual(decision.code, "accepted")
@@ -194,17 +211,17 @@ class VerificateursTest(unittest.TestCase):
             ("review_requested", {"references": {"head": OTHER}}, {},
              "freeze-missing"),
             ("qa_started", {}, {"milestones": ()}, "freeze-missing"),
-            ("qa_repair", {}, {"milestones": ()}, "verdict-missing"),
+            ("qa_repair", {}, {"milestones": ()}, "freeze-missing"),
             ("merged_and_staging_deployed",
              {"references": {"merge": OTHER,
                              "staging": "obs-staging-deployed"}}, {},
              "merge-missing"),
             ("staging_pass", {"references": {"staging": "nope"}}, {},
-             "source-unavailable"),
+             "evidence-missing"),
             ("staging_failure", {"references": {"staging": "obs-staging-pass"}},
              {}, "observation-result-mismatch"),
             ("preprod_deployed", {"references": {"preprod": "nope"}}, {},
-             "source-unavailable"),
+             "evidence-missing"),
             ("preprod_pass",
              {"references": {"preprod": "obs-preprod-fail"}}, {},
              "observation-result-mismatch"),
@@ -300,11 +317,81 @@ class VerificateursTest(unittest.TestCase):
 
     # -- preuves de deploiement : observation reelle et recu accepte -------
 
-    def test_observation_non_installee_refuse(self):
+    def test_observation_inconnue_refuse_une_preuve_absente(self):
+        """N4 #1924 : collection collectee mais observation inconnue =
+        evidence-missing ; `source-unavailable` reste reserve a la collection
+        non collectee (porte de verify)."""
         decision = verify(command_for("staging_pass"),
                           full_snapshot(observations=()))
-        self.assertRefusal("source-unavailable", decision)
-        self.assertIn("non installee", decision.message)
+        self.assertRefusal("evidence-missing", decision)
+        self.assertIn("inconnue", decision.message)
+        self.assertRefusal(
+            "evidence-missing",
+            verify(command_for("staging_pass", references={"staging": "nope"}),
+                   full_snapshot()))
+        self.assertRefusal(
+            "source-unavailable",
+            verify(command_for("staging_pass"),
+                   full_snapshot(sources=("milestones", "receipts"))))
+
+    def test_matrice_declare_les_sources_lues(self):
+        """N3 #1924 : staging/preprod/repair_started lisent les jalons (la
+        revision reelle), la matrice doit exiger `milestones`."""
+        for guard in ("staging_pass", "staging_failure", "preprod_deployed",
+                      "preprod_pass", "preprod_failure", "repair_started"):
+            with self.subTest(guard=guard):
+                decision = verify(
+                    command_for(guard),
+                    full_snapshot(sources=("receipts", "observations")))
+                self.assertRefusal("source-unavailable", decision)
+                self.assertIn("milestones", decision.message)
+
+    def test_verdict_courant_par_acteur(self):
+        """N1 #1924 : un blocage n'est pas masque par le ok d'un autre
+        relecteur ; l'auto-verdict de l'assigne ne vaut pas revue."""
+        cross = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": REV, "verdict": None},
+            {"kind": "merged", "sha": REV, "verdict": None},
+            {"kind": "verdict", "sha": REV, "verdict": "blocked",
+             "actor": REVIEWER},
+            {"kind": "verdict", "sha": REV, "verdict": "ok",
+             "actor": "agent:other-reviewer"}))
+        self.assertRefusal("completion-review-missing",
+                           verify(command_for("work_completed"), cross))
+        # le blocage du relecteur ouvre la reparation malgre le ok d'un autre
+        self.assertTrue(verify(command_for("qa_repair"), cross).accepted)
+        # le meme relecteur leve son blocage (fixture pleine)
+        self.assertTrue(verify(command_for("work_completed"),
+                               full_snapshot()).accepted)
+        # l'ok de l'assigne ne vaut pas revue
+        self_ok = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": REV, "verdict": None},
+            {"kind": "merged", "sha": REV, "verdict": None},
+            {"kind": "verdict", "sha": REV, "verdict": "ok", "actor": AUTHOR}))
+        self.assertRefusal("completion-review-missing",
+                           verify(command_for("work_completed"), self_ok))
+        # le blocage de l'assigne n'ouvre pas la reparation
+        self_blocked = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": REV, "verdict": None},
+            {"kind": "verdict", "sha": REV, "verdict": "blocked",
+             "actor": AUTHOR}))
+        self.assertRefusal("verdict-missing",
+                           verify(command_for("qa_repair"), self_blocked))
+        # un verdict sans acteur n'est pas attribuable : pas une revue
+        anonymous = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": REV, "verdict": None},
+            {"kind": "merged", "sha": REV, "verdict": None},
+            {"kind": "verdict", "sha": REV, "verdict": "ok"}))
+        self.assertRefusal("completion-review-missing",
+                           verify(command_for("work_completed"), anonymous))
+
+    def test_lot_promu_est_terminal(self):
+        """N5 #1924 : `promoted` est terminal, aucune reouverture."""
+        promoted = full_snapshot(item=item(state="promoted"))
+        self.assertRefusal("terminal-reopening",
+                           verify(command_for("planning"), promoted))
+        self.assertRefusal("terminal-reopening",
+                           verify(hold_command("blocked"), promoted))
 
     def test_demande_de_deploiement_ne_prouve_pas_son_succes(self):
         without_witness = tuple(
@@ -461,13 +548,15 @@ class VerificateursTest(unittest.TestCase):
         linked = full_snapshot(
             milestones=({"kind": "frozen", "sha": OTHER, "verdict": None},
                         {"kind": "merged", "sha": REV, "verdict": None},
-                        {"kind": "verdict", "sha": OTHER, "verdict": "ok"}),
+                        {"kind": "verdict", "sha": OTHER, "verdict": "ok",
+                         "actor": REVIEWER}),
             revision=REV)
         self.assertTrue(verify(command_for("work_completed"), linked).accepted)
         on_merge_only = full_snapshot(
             milestones=({"kind": "frozen", "sha": OTHER, "verdict": None},
                         {"kind": "merged", "sha": REV, "verdict": None},
-                        {"kind": "verdict", "sha": REV, "verdict": "ok"}),
+                        {"kind": "verdict", "sha": REV, "verdict": "ok",
+                         "actor": REVIEWER}),
             revision=REV)
         self.assertRefusal(
             "completion-review-missing",
@@ -476,8 +565,10 @@ class VerificateursTest(unittest.TestCase):
         regressed = full_snapshot(milestones=(
             {"kind": "frozen", "sha": REV, "verdict": None},
             {"kind": "merged", "sha": REV, "verdict": None},
-            {"kind": "verdict", "sha": REV, "verdict": "ok"},
-            {"kind": "verdict", "sha": REV, "verdict": "blocked"}))
+            {"kind": "verdict", "sha": REV, "verdict": "ok",
+             "actor": REVIEWER},
+            {"kind": "verdict", "sha": REV, "verdict": "blocked",
+             "actor": REVIEWER}))
         self.assertRefusal(
             "completion-review-missing",
             verify(command_for("work_completed"), regressed))
@@ -496,7 +587,8 @@ class VerificateursTest(unittest.TestCase):
                 self.assertTrue(verify(command_for(guard), stale).accepted)
         blocked = full_snapshot(milestones=(
             {"kind": "frozen", "sha": OTHER, "verdict": None},
-            {"kind": "verdict", "sha": OTHER, "verdict": "blocked"},
+            {"kind": "verdict", "sha": OTHER, "verdict": "blocked",
+             "actor": REVIEWER},
             {"kind": "frozen", "sha": REV, "verdict": None}))
         self.assertRefusal(
             "revision-mismatch",
@@ -518,13 +610,26 @@ class VerificateursTest(unittest.TestCase):
                    two))
 
     def test_reparation_refuse_un_blocage_remplace_par_un_go(self):
-        snapshot = full_snapshot()
+        """N1 #1924 : le ok du relecteur leve son propre blocage (plus de
+        reparation) ; la fixture nommee rouvre la reparation sur un blocage
+        courant, sans dependre de l'ordre des jalons (R3)."""
         self.assertRefusal("verdict-missing",
-                           verify(command_for("qa_repair"), snapshot))
-        blocked = snapshot.milestones + (
-            {"kind": "verdict", "sha": REV, "verdict": "blocked"},)
+                           verify(command_for("qa_repair"), full_snapshot()))
         self.assertTrue(verify(command_for("qa_repair"),
-                               full_snapshot(milestones=blocked)).accepted)
+                               blocked_snapshot()).accepted)
+
+    def test_reparation_exige_un_gel_borne(self):
+        """R2 #1924 : sans jalon frozen, qa_repair ne compare pas la tete a
+        la revision : refus fail-closed, comme qa_started."""
+        self.assertRefusal(
+            "freeze-missing",
+            verify(command_for("qa_repair"),
+                   full_snapshot(milestones=(
+                       {"kind": "verdict", "sha": REV, "verdict": "blocked",
+                        "actor": REVIEWER},))))
+        self.assertRefusal(
+            "freeze-missing",
+            verify(command_for("qa_repair"), full_snapshot(milestones=())))
 
     def test_staging_refuse_une_fusion_depassee_par_un_gel(self):
         milestones = full_snapshot().milestones + (
@@ -559,7 +664,7 @@ class VerificateursTest(unittest.TestCase):
         self.assertTrue(decision.accepted, decision)
 
     def test_reparations_bornees(self):
-        blocked = full_snapshot().milestones[:-1]
+        blocked = blocked_snapshot().milestones
         at_bound = full_snapshot(item=item(loops=MAX_REPAIRS),
                                  milestones=blocked)
         for guard in ("qa_repair", "staging_failure", "preprod_failure",
@@ -712,7 +817,7 @@ class CapacitesTest(unittest.TestCase):
         self.assertEqual(caps["review_requested"].available, ("milestones",))
         self.assertEqual(caps["review_requested"].missing, ())
         self.assertTrue(caps["review_requested"].executable)
-        self.assertEqual(caps["staging_pass"].available, ())
+        self.assertEqual(caps["staging_pass"].available, ("milestones",))
         self.assertEqual(caps["staging_pass"].missing,
                          ("receipts", "observations"))
         self.assertFalse(caps["staging_pass"].executable)

@@ -425,30 +425,32 @@ def _milestone(snapshot: Snapshot, kind: str, sha: str = "") -> Mapping | None:
     return None
 
 
-def _verdict(snapshot: Snapshot, verdict: str, sha: str = "") -> Mapping | None:
-    for row in snapshot.milestones:
-        if _text(row.get("kind")) != "verdict":
-            continue
-        if _text(row.get("verdict")) != verdict:
-            continue
-        if sha and _text(row.get("sha")) != sha:
-            continue
-        return row
-    return None
+def _current_verdict(snapshot: Snapshot, sha: str) -> str:
+    """Le **dernier** verdict de chaque acteur sur cette revision.
 
-
-def _current_verdict(milestones, sha: str) -> str:
-    """Le **dernier** verdict enregistre sur cette revision (`""` si aucun).
-
-    Un verdict ok suivi d'un verdict bloque sur la meme revision ne vaut pas
-    ok : l'historique des verdicts est borne au verdict courant.
+    Un verdict n'est une revue que s'il porte un acteur reel, distinct de
+    l'assigne : l'auto-verdict de l'auteur (ok comme bloque) ne vaut pas
+    revue, et un verdict sans acteur n'est pas attribuable. Le blocage d'un
+    relecteur n'est leve que par un ok plus recent du meme relecteur ; le ok
+    d'un autre ne le masque pas (N1 de la revue #1924, regle du registre
+    #1756). Rend `"blocked"` si un blocage tient, sinon `"ok"` si une revue
+    est ok, sinon `""`.
     """
-    verdict = ""
-    for row in milestones or ():
-        if (_text(row.get("kind")) == "verdict"
-                and _text(row.get("sha")) == sha):
-            verdict = _text(row.get("verdict"))
-    return verdict
+    assignee = _text(snapshot.item.get("assignee"))
+    latest: dict[str, str] = {}
+    for row in snapshot.milestones or ():
+        if (_text(row.get("kind")) != "verdict"
+                or _text(row.get("sha")) != sha):
+            continue
+        actor = _text(row.get("actor"))
+        if not actor or actor == assignee:
+            continue
+        latest[actor] = _text(row.get("verdict"))
+    if "blocked" in latest.values():
+        return "blocked"
+    if "ok" in latest.values():
+        return "ok"
+    return ""
 
 
 def _observation(snapshot: Snapshot, ident: str) -> Mapping | None:
@@ -492,9 +494,10 @@ def _failed_observation(snapshot: Snapshot, ident: str = "") -> Mapping | None:
 
 
 def _closed(snapshot: Snapshot) -> bool:
+    """Lot terminal : `closed` comme `promoted` (N5 de la revue #1924)."""
     if snapshot.item.get("closed_at"):
         return True
-    return _text(snapshot.item.get("state")) == "closed"
+    return _text(snapshot.item.get("state")) in ("closed", "promoted")
 
 
 #: Jalons qui portent une revision reelle.
@@ -630,11 +633,16 @@ def _check_qa_repair(command: Command, snapshot: Snapshot) -> Decision:
     if not sha:
         return _refuse("revision-missing",
                        "snapshot sans revision de travail", snapshot)
+    # R2 de la revue #1924 : sans gel, la tete de la commande n'est comparable
+    # a rien ; fail-closed comme qa_started.
+    if _milestone(snapshot, "frozen", sha) is None:
+        return _refuse("freeze-missing",
+                       "aucun gel de la revision %s" % sha, snapshot)
     if current and sha != current:
         return _refuse("revision-mismatch",
                        "verdict de %s : la tete relue est %s"
                        % (sha, current), snapshot)
-    if _current_verdict(snapshot.milestones, sha) != "blocked":
+    if _current_verdict(snapshot, sha) != "blocked":
         return _refuse("verdict-missing",
                        "aucun verdict bloque sur la revision %s" % sha, snapshot)
     if _loops(snapshot) >= MAX_REPAIRS:
@@ -653,9 +661,12 @@ def _observation_proof(command: Command, snapshot: Snapshot, env: str,
     ident = _ref(command, ref_key)
     observation = _observation(snapshot, ident)
     if observation is None:
-        return _refuse("source-unavailable",
-                       "observation %s non installee" % (ident or "(absente)"),
-                       snapshot)
+        # N4 de la revue #1924 : la collection est collectee (exigee par la
+        # matrice), une observation absente est une preuve manquante, pas une
+        # source indisponible.
+        return _refuse("evidence-missing",
+                       "observation %s inconnue de la collection collectee"
+                       % (ident or "(absente)"), snapshot)
     if _text(observation.get("env")) != env:
         return _refuse("observation-result-mismatch",
                        "observation %s hors de l'environnement %s"
@@ -788,7 +799,7 @@ def _check_work_completed(command: Command, snapshot: Snapshot) -> Decision:
                        "resultat propre du type non-code requis", snapshot)
     if policy.requires_review:
         head = reviewed_head_for(snapshot.milestones, revision)
-        if _current_verdict(snapshot.milestones, head) != "ok":
+        if _current_verdict(snapshot, head) != "ok":
             return _refuse("completion-review-missing",
                            "revue applicable absente ou non ok sur la tete "
                            "relue %s" % (head or "(absente)"), snapshot)
@@ -816,22 +827,22 @@ _SPECS = (
               ("milestones", "receipts", "observations"),
               ("merge", "staging"), (), _check_merged_and_staging_deployed),
     GuardSpec("staging_pass", "observation staging pass de la revision",
-              ("receipts", "observations"), ("staging",), (),
+              ("milestones", "receipts", "observations"), ("staging",), (),
               _check_staging_pass),
     GuardSpec("staging_failure", "observation staging fail et reparation permise",
-              ("receipts", "observations"), ("staging",), (),
+              ("milestones", "receipts", "observations"), ("staging",), (),
               _check_staging_failure),
     GuardSpec("preprod_deployed", "observation preprod deployee de la revision",
-              ("receipts", "observations"), ("preprod",), (),
+              ("milestones", "receipts", "observations"), ("preprod",), (),
               _check_preprod_deployed),
     GuardSpec("preprod_pass", "observation preprod pass de la revision",
-              ("receipts", "observations"), ("preprod",), (),
+              ("milestones", "receipts", "observations"), ("preprod",), (),
               _check_preprod_pass),
     GuardSpec("preprod_failure", "observation preprod fail et reparation permise",
-              ("receipts", "observations"), ("preprod",), (),
+              ("milestones", "receipts", "observations"), ("preprod",), (),
               _check_preprod_failure),
     GuardSpec("repair_started", "reparation engagee sur un echec observe",
-              ("receipts", "observations"), ("failure",), (),
+              ("milestones", "receipts", "observations"), ("failure",), (),
               _check_repair_started),
     GuardSpec("stop_work", "arret explicite (abandon/supersession)",
               (), ("reason",), ("superseded_by",), _check_stop_work),
