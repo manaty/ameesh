@@ -228,6 +228,16 @@ IDLE_PROMPT = (
     "take up your assignment (board, workstream). If you have nothing to do, "
     "say so with agent-mail send orchestrateur, then stop."
 )
+#: #1270 : reprise cadencée d'un tour tombé sur une panne passagère du
+#: fournisseur, quand ce tour ne laissait aucune consigne en attente (courrier,
+#: événements, reprise : le courrier est soldé au lancement)
+RETRY_PROMPT = (
+    "Retry: your previous turn stopped on a transient provider error (rate "
+    "limit, overload, server or stream error); the runner waited, then resumes "
+    "it. Pick up where it stopped without redoing what is done: if that turn "
+    "brought messages or events you have not handled yet, handle them first, "
+    "then continue your lot. If nothing is left to do, stop."
+)
 
 #: #408 (L165b, règle 1) : réveil sur un lot actionnable de l'agent au repos
 LOT_WAKE_PROMPT = (
