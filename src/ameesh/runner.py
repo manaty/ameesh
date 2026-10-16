@@ -8033,7 +8033,13 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     max_seconds = attach_mod.DEFAULT_MAX if max_seconds is None else max_seconds
     attach_mod.Deadline(max_seconds)  # validate before taking a lock or lease
     with ExitStack() as locks:
-        request = session_lock.try_lock(cfg.agent_dir(name), "attach-request")
+        # The runner's requested() probe briefly holds this same lock. Give
+        # that probe time to finish before declaring a duplicate session.
+        for _ in range(10):
+            request = session_lock.try_lock(cfg.agent_dir(name), "attach-request")
+            if request is not None:
+                break
+            time.sleep(0.01)
         if request is None:
             print("agent %s already has an attach request/session: close it first" % name,
                   file=sys.stderr)
