@@ -501,9 +501,13 @@ def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: st
                "last seen %s" % head[:12] if head else "no commit seen",
                ", target %s" % item["branch_target"] if item.get("branch_target") else "",
                reason, int(item_id), plan_git.short_branch(name))
-    row = st.work.set_branch(item_id, None, None, note=note, actor=actor)
+    row = st.work.detach_branch(item_id, current, note=note, actor=actor)
     if row is None:
-        raise WorkError("lot %s already %s: branch not detached" % (item_id, item["state"]))
+        now = get(db, item_id) or item
+        if now["state"] in MERGED_STATES or now["state"] == "closed":
+            raise WorkError("lot %s already %s: branch not detached" % (item_id, now["state"]))
+        raise WorkError("lot %s: its branch changed meanwhile (now %s): nothing detached, "
+                        "read the lot again" % (item_id, now.get("branch") or "none"))
     return row
 
 
