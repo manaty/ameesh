@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#987 : relancer une exécution « tests » dont un job hébergé a été annulé
-faute de runner.
+"""#987 : relancer une exécution « tests » (ou « paquet », #2119) dont un job
+hébergé a été annulé faute de runner.
 
 GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
 tentatives — annotation « The job was not acquired by Runner of type hosted »,
@@ -13,7 +13,10 @@ aucun défaut de code ; et l'API refuse de rejouer le job tant que l'exécution
 tourne (« workflow run containing this job is already running »).
 
 `.github/workflows/relance-hosted.yml` se déclenche à la conclusion de
-« tests » et appelle ce script après la fin de l'exécution. Si les seuls jobs
+« tests » et de « paquet » (#2119 : `paquet.yml` appelle `tests.yml` par
+`workflow_call`, et GitHub n'émet pas d'événement `workflow_run` pour le
+workflow réutilisable appelé — l'exécution terminée est celle du portier) et
+appelle ce script après la fin de l'exécution. Si les seuls jobs
 en échec sont des jobs hébergés annulés avant leur premier pas, il relance les
 jobs en échec (`rerun-failed-jobs`), une seule fois : la tentative suivante
 prouve si la capacité est revenue. Un échec réel ailleurs, ou une deuxième
