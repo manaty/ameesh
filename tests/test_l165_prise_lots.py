@@ -444,6 +444,22 @@ class PriseDeLotTest(_Lots):
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
                          [("claude1", un["id"]), ("deepseek7", deux["id"])])
 
+    def test_orchestrateur_sert_un_lot_qu_aucun_autre_ne_prend(self):
+        """#1739 : sans autre preneur, l'orchestrateur prend le lot laissé, et
+        la note d'attribution garde la trace du repli."""
+        self.agent("orchestrateur", team="nexlink", since_s=5 * HEURE)
+        lot = self.lot("demande")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"], t.get("fallback")) for t in out],
+                         [("orchestrateur", lot["id"], True)])
+        self.assertNotIn("orchestrateur", out[0]["notified"])
+        note = self.db.query(
+            "SELECT note FROM work_item_events WHERE work_item_id = %s"
+            " ORDER BY id DESC LIMIT 1", (lot["id"],))[0]["note"]
+        self.assertIn(backlog.LOT_TAKE_NOTE, note)
+        self.assertIn("aucun autre preneur ; orchestrateur", note)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "orchestrateur")
+
     def test_lot_avant_la_file_et_garde_fous(self):
         self.agent("claude1", team="nexlink")
         element = self.element("dette", 90, team="nexlink")
