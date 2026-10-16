@@ -189,6 +189,10 @@ def _protected_regular(path: Path, *, owners: tuple, modes: tuple) -> os.stat_re
         raise Refused('file_type')
     if info.st_uid not in owners or stat.S_IMODE(info.st_mode) not in modes:
         raise Refused('file_mode')
+    if info.st_nlink != 1:
+        # un lien dur ferait lire (ou prendre pour géré) l'inode d'un autre
+        # fichier, peut-être hors du répertoire contrôlé.
+        raise Refused('file_links')
     return info
 
 
@@ -370,7 +374,8 @@ class Installeur:
     """
 
     def __init__(self, document: dict, *, read_as=None, now=time.time,
-                 uid: int | None = None, gid: int | None = None):
+                 uid: int | None = None, gid: int | None = None,
+                 isolate: bool | None = None):
         _exact(document, _KEYS['helper'], 'helper')
         if document['version'] != 1:
             raise Refused('helper_version')
@@ -385,6 +390,9 @@ class Installeur:
         self.gid = os.getegid() if gid is None else gid
         self.read_as = read_as
         self.now = now
+        # root n'agit jamais par chemin dans un répertoire tenu par un compte :
+        # la transaction d'un `account_file` s'y déroule aux droits du compte.
+        self.isolate = self.uid == 0 if isolate is None else isolate
         self.destinations = {}
         for item in document['destinations'] or ():
             destination = Destination(item)
@@ -433,6 +441,8 @@ class Installeur:
         retour arrière : deux processus du helper ne peuvent pas entrelacer la
         valeur, la version et la précédente d'une même destination.
         """
+        if destination.kind == 'account_file' and self.isolate:
+            return self._as_account(destination, request, value)
         if request['operation'] == 'revoke':
             if value:
                 # une révocation ne transporte aucune valeur.
@@ -443,6 +453,82 @@ class Installeur:
             raise Refused('value_size')
         with self._locked(destination):
             return self.install(destination, request, value)
+
+    def _as_account(self, destination: Destination, request: dict, value: bytes) -> dict:
+        """Mène l'opération d'un `account_file` dans un fils aux droits du compte.
+
+        Le répertoire appartient au compte : il peut en échanger les entrées à
+        tout instant (lien symbolique, lien dur, renommage). Contrôler puis agir
+        par chemin en root lui donnerait une écriture root ailleurs. Le fils
+        abandonne root (groupes, gid, uid réels, effectifs et sauvegardés) avant
+        tout accès au répertoire : un échange ne lui ouvre que ce que le compte
+        peut déjà faire. Le contrôle de santé y devient la lecture réelle du
+        fichier par le compte. Seul le reçu (ou la catégorie d'erreur) revient.
+        """
+        owner, group = self._owner_ids(destination)
+        if owner == 0:
+            raise Refused('destination_bridge')
+        reader, writer = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # pragma: no cover - mesuré par le reçu du parent
+            status = 1
+            try:
+                os.close(reader)
+                if os.geteuid() == 0:
+                    os.setgroups([])
+                os.setresgid(group, group, group)
+                os.setresuid(owner, owner, owner)
+                if os.getresuid() != (owner,) * 3 or os.getresgid() != (group,) * 3:
+                    raise OSError('privileges kept')
+                child = Installeur.__new__(Installeur)
+                child.__dict__.update(self.__dict__)
+                child.uid, child.gid, child.isolate = owner, group, False
+                child.read_as = _read_as_self
+                try:
+                    outcome = {'receipt': child.perform(request, destination, value)}
+                except Refused as exc:
+                    outcome = {'refused': exc.category}
+                except Uncertain as exc:
+                    outcome = {'uncertain': exc.category}
+                data = json.dumps(outcome, sort_keys=True).encode()
+                while data:
+                    data = data[os.write(writer, data):]
+                status = 0
+            except BaseException:
+                status = 1
+            finally:
+                os._exit(status)
+        os.close(writer)
+        chunks, size = [], 0
+        try:
+            while True:
+                part = os.read(reader, 4096)
+                if not part:
+                    break
+                size += len(part)
+                if size > MAX_BYTES:
+                    break
+                chunks.append(part)
+        finally:
+            os.close(reader)
+            _, code = os.waitpid(pid, 0)
+        if code != 0 or size > MAX_BYTES:
+            # le fils a pu agir avant de mourir : l'issue n'est pas connue.
+            raise Uncertain('account_transaction')
+        try:
+            outcome = json.loads(b''.join(chunks))
+        except ValueError:
+            raise Uncertain('account_transaction') from None
+        if not isinstance(outcome, dict) or len(outcome) != 1:
+            raise Uncertain('account_transaction')
+        (kind, item), = outcome.items()
+        if kind == 'refused' and isinstance(item, str):
+            raise Refused(item)
+        if kind == 'uncertain' and isinstance(item, str):
+            raise Uncertain(item)
+        if kind != 'receipt' or not isinstance(item, dict):
+            raise Uncertain('account_transaction')
+        return item
 
     # -- transaction d'une destination ------------------------------------
     def _backup_path(self, destination: Destination) -> Path:
@@ -842,9 +928,11 @@ class Installeur:
             return True
         try:
             return bool(self.read_as(destination.account, destination.path))
-        except SecretError:
-            raise
         except Exception:
+            # appelé après l'écriture : un refus du contrôle (même
+            # `health_unavailable`) est un échec de santé, et la transaction
+            # se défait au lieu de rendre un reçu « sans effet » sur une valeur
+            # écrite.
             return False
 
     def _receipt(self, request: dict, destination: Destination,
@@ -979,6 +1067,17 @@ class Livraison:
 def handle(payload: bytes, enrollment: dict, *, read_as=None) -> bytes:
     """Point d'entrée du helper d'installation : une trame, un reçu."""
     return Installeur(enrollment, read_as=read_as).handle(payload)
+
+
+def _read_as_self(account: str, path: Path) -> bool:
+    """Santé dans le fils du compte : l'ouverture réelle par le compte lui-même."""
+    if pwd.getpwuid(os.geteuid()).pw_name != account:
+        return False
+    try:
+        _read_private(path, owners=(os.geteuid(),), modes=(0o600,), limit=MAX_BYTES)
+    except Refused:
+        return False
+    return True
 
 
 def default_read_as(account: str, path: Path) -> bool:

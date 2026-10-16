@@ -790,6 +790,100 @@ class InstalleurTest(Materiel):
         self.assertFalse(self.key.exists())
 
 
+class CompteIsoleTest(Materiel):
+    """B1 R2 dev4 : root n'agit pas par chemin dans le répertoire du compte.
+
+    Hors root, le fils abandonne ses droits vers le même compte : le chemin
+    réel (fork, setresuid, reçu par tube) est exercé sans privilège.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.installeur = coffre.Installeur(self.helper_document, read_as=None,
+                                            isolate=True)
+
+    def test_installation_rotation_revocation_dans_le_fils(self):
+        premier, _ = self.handle()
+        self.assertTrue(premier["ok"], premier)
+        self.assertEqual(self.key.read_bytes(), CANARY)
+        rejeu, _ = self.installer(premier["version"])
+        self.assertTrue(rejeu["replayed"])
+        second, _ = self.handle(value=b"sk-canary-v2", operation="rotate")
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["previous"], premier["version"])
+        revoque, _ = self.handle(b"", operation="revoke", version=premier["version"])
+        self.assertTrue(revoque["ok"], revoque)
+        self.assertFalse(self.key.with_name(self.key.name + ".previous").exists())
+
+    def test_refus_du_fils_rendu_en_categorie(self):
+        self.handle()
+        receipt, _ = self.handle(value=b"autre")
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "rotation_required")
+
+    def test_sante_lue_par_le_compte(self):
+        # la santé du fils est l'ouverture réelle par le compte nommé : un
+        # autre compte que celui du fils ne la rend pas, et l'installation
+        # se défait.
+        original = coffre._read_as_self
+
+        def sabote(account, path):
+            self.assertTrue(original(account, path))
+            return original("compte-absent", path)
+
+        coffre._read_as_self = sabote
+        self.addCleanup(setattr, coffre, "_read_as_self", original)
+        receipt, _ = self.handle()
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "health")
+        self.assertFalse(self.key.exists())
+
+    def test_fils_mort_issue_incertaine(self):
+        original = coffre.Installeur.install
+        coffre.Installeur.install = lambda *a, **k: os._exit(9)
+        self.addCleanup(setattr, coffre.Installeur, "install", original)
+        payload, _ = self.trame()
+        with self.assertRaises(coffre.Uncertain) as caught:
+            self.installeur.handle(payload)
+        self.assertEqual(caught.exception.category, "account_transaction")
+
+    def test_compte_root_refuse(self):
+        document = self.destination_document(account="root", owner="root",
+                                             group="root")
+        helper = dict(self.helper_document, destinations=[document])
+        # uid injecté à 0 : le refus tombe avant le fils et avant tout effet.
+        installeur = coffre.Installeur(helper, read_as=None, uid=0, isolate=True)
+        payload, _ = self.trame(destination=document)
+        receipt = json.loads(installeur.handle(payload))
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "destination_bridge")
+
+
+class LiensEtSanteTest(Materiel):
+    def test_lien_dur_refuse(self):
+        self.handle()
+        ailleurs = self.root / "ailleurs"
+        os.link(self.key, ailleurs)
+        receipt, _ = self.handle(value=b"v2", operation="rotate")
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "file_links")
+        self.assertEqual(ailleurs.read_bytes(), CANARY)
+
+    def test_refus_de_sante_apres_effet_defait(self):
+        # N2 R2 dev4 : un refus levé par le contrôle après l'écriture ne rend
+        # pas un reçu « sans effet » sur une valeur écrite.
+        def refuse(account, path):
+            raise coffre.Refused("health_unavailable")
+
+        installeur = coffre.Installeur(self.helper_document, read_as=refuse)
+        payload, _ = self.trame()
+        receipt = json.loads(installeur.handle(payload))
+        self.assertFalse(receipt["ok"])
+        self.assertEqual(receipt["category"], "health")
+        self.assertFalse(self.key.exists())
+        self.assertFalse(self.key.with_name(self.key.name + ".pending").exists())
+
+
 class Transport:
     def __init__(self, installeur):
         self.installeur = installeur

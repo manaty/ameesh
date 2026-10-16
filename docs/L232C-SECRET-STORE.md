@@ -61,6 +61,23 @@ Two destination kinds:
   `key_file`.
 - `env_file` — the system store: `0640 root:<group>` in a `0750` directory.
 
+### Root never acts by path in an account's directory
+
+An `account_file` lives in a directory the account owns: the account can swap
+its entries at any moment (symbolic link, hard link, rename), so a root check
+followed by a root write by path would give it a root write elsewhere. When
+the helper runs as root, the whole operation on an `account_file` (lock,
+recovery, record, value, health, rollback, revocation) runs in a forked child
+that first drops every privilege to the account (`setgroups([])`, then real,
+effective and saved gid and uid); only the receipt, or the error category,
+comes back through a pipe. A swap then only reaches what the account could
+already reach. A child that dies without answering leaves the outcome unknown
+(`account_transaction`, uncertain: the next locked operation recovers). In the
+child, the health check is the real read of the file by the account itself.
+An `account_file` for `root` is refused (`destination_bridge`). Every file the
+store reads must have a single link (`file_links`): a hard link cannot make
+another inode pass for a managed file.
+
 ## Atomic install, replay and rotation
 
 An install writes a temporary file in the destination directory
@@ -126,13 +143,18 @@ current one (`current_version`); the current credential is never removed by a
 revocation.
 
 Health: an `account_file` install requires an injected health check,
-`read_as(account, path)`. The default implementation runs a bounded
-`runuser -u <account> -- /bin/cat <path>` (root only); without root or an
-injected check the install is refused **before any effect**
-(`health_unavailable`). If the check fails, the previous version is restored
-(or a first install is removed) and the receipt is `ok: false, category:
-health`: the account is never declared served on a guess.
-`env_file` uses a root read-back.
+`read_as(account, path)`. As root, the check is the account's own read inside
+the unprivileged child (above). Outside that child, the default implementation
+runs a bounded `runuser -u <account> -- /bin/cat <path>` (root only); with no
+check injected, the install is refused **before any effect**
+(`health_unavailable`). If the check fails, or raises once the value is
+written, the previous version is restored (or a first install is removed) and
+the receipt is `ok: false, category: health`: the account is never declared
+served on a guess, and a written value never comes back as a refusal "without
+effect".
+`env_file` uses a root read-back. An `env_file` currently receives the raw
+value, not a `KEY=value` line (R2 dev4, N3): its consumer must be settled
+before a system destination is enrolled.
 
 ## Journal
 
@@ -167,7 +189,7 @@ journal carries no value, no digest and no connection string.
 
 ## Tests
 
-`tests/test_l232c_coffre.py` (50 cases, no database, no root, no network):
+`tests/test_l232c_coffre.py` (57 cases, no database, no root, no network):
 
     PYTHONPATH=src python3 -m unittest tests.test_l232c_coffre
 
@@ -183,4 +205,7 @@ cleanup, orphan temporary, two successive stops — the second in the middle of
 the recovery, before the intent is erased — a copy left after the intent is
 gone, and the `fsync` of every cleanup transition), concurrent rotations and
 rotate/revoke, an inter-process `flock` holder, and a subprocess canary through
-the helper entry point.
+the helper entry point, the unprivileged child for an `account_file` (install,
+replay, rotation, revocation, a refusal carried back as a category, the
+account's own health read, a child that dies, a `root` account refused), a
+hard-linked destination, and a health check that raises after the write.
