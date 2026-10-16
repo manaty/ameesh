@@ -18,6 +18,9 @@ from urllib.parse import urlsplit
 SCHEMA = "ameesh-vm-executor-recipe/1"
 FIELDS = {"schema", "image", "server_url", "mesh", "host", "volume",
           "state_dir", "ack_dir", "enroll_dir", "cpus", "memory_mb", "tmp_mb"}
+#: L159 §1 (recette PROV-3, reprise par a2) : le conteneur ne peut pas forker
+#: sans borne ; valeur de la recette d'origine (N4 de la relecture #194).
+PIDS_LIMIT = 512
 
 
 def command(recipe: dict) -> list[str]:
@@ -75,6 +78,7 @@ def command(recipe: dict) -> list[str]:
             "--env=AMEESH_HOST_GATE_LENDING=1",
             "--cpus=%s" % cpus, "--memory=%sm" % recipe["memory_mb"],
             "--memory-swap=%sm" % recipe["memory_mb"],
+            "--pids-limit=%d" % PIDS_LIMIT,
             "--tmpfs=/tmp:rw,nosuid,nodev,size=%sm,mode=1777" % recipe["tmp_mb"]]
     for key, target, mode in (
             ("volume", "/var/lib/ameesh-exec", "rw"),

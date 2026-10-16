@@ -12,6 +12,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import threading
 import time
 
@@ -21,6 +22,24 @@ from .vm_recipe import command
 
 
 NAME = "ameesh-vm-executor"
+#: #1781 N3 : `shutil.rmtree(dir_fd=)` n'existe qu'à partir de Python 3.11,
+#: alors que `pyproject.toml` déclare 3.9. Sur 3.9/3.10, l'effacement de
+#: révocation (code 6) lèverait une TypeError après le lancement et le volume
+#: resterait : refus au démarrage, avant tout lancement.
+RMTREE_DIR_FD_MIN = (3, 11)
+
+
+def require_supported_python(version_info=None) -> None:
+    """Refuse un interpréteur où l'effacement de révocation ne peut pas courir.
+
+    `supervise` l'appelle avant toute autre chose : le défaut est un refus
+    net, pas une erreur au moment d'effacer le volume."""
+    info = sys.version_info if version_info is None else version_info
+    if tuple(info[:2]) < RMTREE_DIR_FD_MIN:
+        raise ValueError(
+            "the mediated supervisor requires Python >= %d.%d "
+            "(shutil.rmtree(dir_fd=) for the revocation wipe); found %d.%d"
+            % (RMTREE_DIR_FD_MIN + tuple(info[:2])))
 
 
 def directory(path: str) -> int:
@@ -68,6 +87,7 @@ def gate_state(path: str, now: float) -> str:
 
 def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
               run=subprocess.run, now=time.time, log=print) -> int:
+    require_supported_python()
     argv = command(recipe)
     if os.geteuid() == 0:
         raise ValueError("supervisor requires the dedicated non-root guest identity")
