@@ -634,7 +634,7 @@ def _check_qa_repair(command: Command, snapshot: Snapshot) -> Decision:
         return _refuse("revision-mismatch",
                        "verdict de %s : la tete relue est %s"
                        % (sha, current), snapshot)
-    if _verdict(snapshot, "blocked", sha) is None:
+    if _current_verdict(snapshot.milestones, sha) != "blocked":
         return _refuse("verdict-missing",
                        "aucun verdict bloque sur la revision %s" % sha, snapshot)
     if _loops(snapshot) >= MAX_REPAIRS:
@@ -684,7 +684,7 @@ def _check_merged_and_staging_deployed(command: Command,
         return _refuse("merge-missing",
                        "aucune fusion reelle de %s" % (merge or "(absente)"),
                        snapshot)
-    current = merged_of(snapshot.milestones)
+    current = _revision(snapshot)
     if merge != current:
         return _refuse("revision-mismatch",
                        "fusion %s depassee par %s"

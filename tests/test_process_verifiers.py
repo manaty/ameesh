@@ -178,7 +178,10 @@ class VerificateursTest(unittest.TestCase):
     def test_un_accord_par_garde(self):
         for guard in GUARD_NAMES:
             with self.subTest(guard=guard):
-                decision = verify(command_for(guard), full_snapshot())
+                snapshot = full_snapshot()
+                if guard == "qa_repair":
+                    snapshot = full_snapshot(milestones=snapshot.milestones[:-1])
+                decision = verify(command_for(guard), snapshot)
                 self.assertTrue(decision.accepted, (guard, decision))
                 self.assertEqual(decision.code, "accepted")
                 self.assertEqual(decision.stage, "next")
@@ -514,6 +517,23 @@ class VerificateursTest(unittest.TestCase):
                                            "staging": "obs-staging-deployed"}),
                    two))
 
+    def test_reparation_refuse_un_blocage_remplace_par_un_go(self):
+        snapshot = full_snapshot()
+        self.assertRefusal("verdict-missing",
+                           verify(command_for("qa_repair"), snapshot))
+        blocked = snapshot.milestones + (
+            {"kind": "verdict", "sha": REV, "verdict": "blocked"},)
+        self.assertTrue(verify(command_for("qa_repair"),
+                               full_snapshot(milestones=blocked)).accepted)
+
+    def test_staging_refuse_une_fusion_depassee_par_un_gel(self):
+        milestones = full_snapshot().milestones + (
+            {"kind": "frozen", "sha": OTHER},)
+        self.assertRefusal(
+            "revision-mismatch",
+            verify(command_for("merged_and_staging_deployed"),
+                   full_snapshot(milestones=milestones)))
+
     def test_relecteur_independant(self):
         self.assertRefusal(
             "reviewer-not-independent",
@@ -539,13 +559,16 @@ class VerificateursTest(unittest.TestCase):
         self.assertTrue(decision.accepted, decision)
 
     def test_reparations_bornees(self):
-        at_bound = full_snapshot(item=item(loops=MAX_REPAIRS))
+        blocked = full_snapshot().milestones[:-1]
+        at_bound = full_snapshot(item=item(loops=MAX_REPAIRS),
+                                 milestones=blocked)
         for guard in ("qa_repair", "staging_failure", "preprod_failure",
                       "repair_started"):
             with self.subTest(guard=guard):
                 self.assertRefusal("repair-bound",
                                    verify(command_for(guard), at_bound))
-        under = full_snapshot(item=item(loops=MAX_REPAIRS - 1))
+        under = full_snapshot(item=item(loops=MAX_REPAIRS - 1),
+                              milestones=blocked)
         self.assertTrue(verify(command_for("qa_repair"), under).accepted)
 
     def test_holds(self):
