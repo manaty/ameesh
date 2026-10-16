@@ -240,6 +240,43 @@ class DelaiTest(unittest.TestCase):
         self.assertEqual([rate_limit.delay(n) for n in (1, 2, 3, 4, 5, 99)],
                          [60.0, 120.0, 300.0, 600.0, 600.0, 600.0])
 
+    def test_borne_de_reprise_atteignable_et_stable(self):
+        # #1592 : la borne de la reprise cadencée est atteinte dès le 4e
+        # palier et ne croît plus — un code classé passager ne se reprend pas
+        # sans fin à délai croissant.
+        delais = [rate_limit.delay(n) for n in range(1, 12)]
+        self.assertEqual(delais, sorted(delais), "le délai ne recule jamais")
+        self.assertEqual(delais[3], rate_limit.DELAYS[-1], "borne au 4e palier")
+        self.assertEqual(rate_limit.delay(10 ** 6), rate_limit.DELAYS[-1])
+        self.assertEqual(rate_limit.delay(0), rate_limit.DELAYS[0])
+
+
+class CodesDshTest(unittest.TestCase):
+    """#1592 : la source dsh des codes passagers est consignée.
+
+    Le descripteur `dsh-llm` (dsh 0.2.0-rc.2) retente lui-même TIMEOUT
+    (watchdog d'inactivité du flux) et TRANSPORT (réseau) par cinq essais ;
+    ameesh classe passagère la ligne `dsh: <CODE>:` qu'il émet après ces
+    essais (#1270) — TIMEOUT et TRANSPORT compris — et la reprend à délais
+    cadencés. Un code nu, sans la signature `dsh: <CODE>:`, n'est pas classé ;
+    `test_pannes_passageres_deepseek` couvre les autres formes réelles.
+    """
+
+    def test_codes_dsh_emis_apres_ses_reprises_sont_passagers(self):
+        for texte in ("dsh: TIMEOUT: DeepSeek Messages stream idle timeout",
+                      "dsh: TRANSPORT: Messages transport failed"):
+            with self.subTest(texte=texte):
+                self.assertEqual(rate_limit.classify(error=texte),
+                                 rate_limit.RATE_LIMITED)
+                self.assertEqual(rate_limit.classify(stderr_tail=texte),
+                                 rate_limit.RATE_LIMITED)
+
+    def test_codes_nus_sans_signature_dsh_ne_sont_pas_classes(self):
+        for texte in ("TIMEOUT", "TRANSPORT"):
+            with self.subTest(texte=texte):
+                self.assertIsNone(rate_limit.classify(error=texte))
+                self.assertIsNone(rate_limit.classify(stderr_tail=texte))
+
 
 class EtatTest(unittest.TestCase):
     def test_aller_retour(self):

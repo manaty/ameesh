@@ -24,6 +24,24 @@ worker — y compris l'**échéance absolue** de reprise, qu'aucun courrier, res
 ou budget ne court-circuite. Un succès le fait disparaître. L'alerte #1268
 `critical_turn_failures` n'est levée qu'après `PERSIST_S` (15 min) d'un
 épisode de débit **entier** : un 429 d'une minute ne réveille personne.
+
+Source des codes du harnais dsh (#1592, N1 de la R2 qa-01 de #1270) : sur dsh
+0.2.0-rc.2, le descripteur `dsh-llm` retente lui-même EMPTY_RESPONSE,
+RATE_LIMIT, SERVER, TIMEOUT et TRANSPORT (maxRetries 5, backoff 0,5 à 10 s
+avec jitter). TIMEOUT est émis par le watchdog d'inactivité du flux, local
+(`MESSAGES_IDLE`, « DeepSeek Messages stream idle timeout ») ou mappé d'un
+message fournisseur `/timeout/i` : un flux qui ne produit plus, jamais un
+plafond déterministe du harnais. TRANSPORT est un échec réseau/transport
+(Messages transport failed, socket/fetch). ameesh classe passagère toute
+ligne `dsh: <CODE>:` — TIMEOUT et TRANSPORT compris, déjà retentés par dsh
+(#1270) : une remontée après ses cinq essais reprend à délais cadencés au
+lieu d'arrêter l'agent, et un `TIMEOUT`/`TRANSPORT` nu (sans la signature
+`dsh: <CODE>:`) n'est pas classé. MALFORMED_RESPONSE et STREAM_CLOSED,
+absents du jeu par défaut de dsh (échec immédiat), n'en sont pas moins
+passagers pour l'incident #1270. Borne de cette reprise : `DELAYS` est atteint
+dès le 4e palier (600 s) et ne croît plus, et l'alerte #1268 n'est levée
+qu'après `PERSIST_S` (15 min) d'un épisode entier — le témoin
+`test_borne_de_reprise_atteignable_et_stable` fixe le plafond.
 """
 from __future__ import annotations
 
