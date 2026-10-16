@@ -232,15 +232,20 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # et le compte par agent en dérivent.
         lots = work.delays(db, limit=500)
         open_by_agent: dict[str, int] = {}
+        build_by_agent: dict[str, int] = {}
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
+                if lot.get("state") == "build":
+                    # §4 (owner 14/10/2026) : le compte d'en-cours est tous
+                    # projets confondus, comme le plafond lui-même
+                    build_by_agent[lot["assignee"]] = build_by_agent.get(lot["assignee"], 0) + 1
         # regroupé par projet (tri stable : dans un projet, l'ordre de
         # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
         rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
-        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
-            "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS", "BUDGET",
-            "KEY", "SEEN"))
+        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-5s %-13s %-4s %s" % (
+            "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS",
+            "BUILD", "BUDGET", "KEY", "SEEN"))
         session_differs = False
         for row in rows:
             status = row.get("status") or "?"
@@ -259,12 +264,16 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             starred = bool(live) and live != declared
             if starred:
                 session_differs = True
-            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+            # §4 : la colonne BUILD dit l'en-cours de l'agent (tous projets
+            # confondus) ; « n! » au-delà du plafond, que le balayage rend.
+            wip = build_by_agent.get(row["name"], 0)
+            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
                 (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
-                open_by_agent.get(row["name"], 0), _budget(row),
+                open_by_agent.get(row["name"], 0),
+                "%d!" % wip if wip > work.BUILD_LIMIT else str(wip), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
@@ -287,6 +296,13 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                                if name in counts)
             waiting = " — oldest freeze: %s" % _fmt_age(now - oldest) if oldest else ""
             print("items    : %d (%s)%s" % (len(lots), detail, waiting))
+        # §4 : qui dépasse le plafond d'en-cours (le balayage rend le surplus)
+        over = sorted(name for name, count in build_by_agent.items()
+                      if count > work.BUILD_LIMIT)
+        if over:
+            print("wip      : %d agent(s) above the §4 cap (%d lots in build): %s — "
+                  "ameesh work wip [--apply] returns the surplus to the team queue"
+                  % (len(over), work.BUILD_LIMIT, ", ".join(over)))
         return 0
     finally:
         db.close()
@@ -1351,6 +1367,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
             return backlog.run(db, args, cfg)
+        if args.work_command in ("wip", "return"):   # limite d'en-cours (§4)
+            from . import wip
+            return wip.run(db, args, cfg)
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)
@@ -1430,18 +1449,26 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
-                              branch_target=args.target, force=args.force)
+                              branch_target=args.target, force=args.force,
+                              wip_exception=args.wip_exception)
             if out.get("queue_warning"):
                 print("lot #%d not assigned to %s (before: %s)" % (
                     out["item"]["id"], args.agent, out["previous"] or "nobody"))
                 print("warning: %s" % out["queue_warning"], file=sys.stderr)
             elif out["previous"] == out["item"]["assignee"]:
-                print("lot #%d: branch %s (assigned to %s)" % (
-                    out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
+                if args.wip_exception:
+                    print("lot #%d: WIP exception recorded for %s%s" % (
+                        out["item"]["id"], out["item"]["assignee"],
+                        "; branch %s" % out["item"]["branch"] if args.branch else ""))
+                else:
+                    print("lot #%d: branch %s (assigned to %s)" % (
+                        out["item"]["id"], out["item"].get("branch"),
+                        out["item"]["assignee"]))
             else:
-                print("lot #%d assigned to %s (before: %s)%s" % (
+                print("lot #%d assigned to %s (before: %s)%s%s" % (
                     out["item"]["id"], out["item"]["assignee"], out["previous"] or "nobody",
-                    "; branch %s" % out["item"]["branch"] if args.branch else ""))
+                    "; branch %s" % out["item"]["branch"] if args.branch else "",
+                    "; WIP exception (§4)" if args.wip_exception else ""))
             _print_assignment(out["check"])
             return 0
         if args.work_command == "delegate":
@@ -2587,6 +2614,11 @@ def build_parser() -> argparse.ArgumentParser:
                            help="work item branch (L118); allowed on a work item already assigned "
                                 "to this agent")
     pw_assign.add_argument("--target", default=None, help="target branch (see work add)")
+    pw_assign.add_argument("--wip-exception", default=None, metavar="REASON",
+                           help="explicit pilot exception to the §4 WIP limit (at most %d "
+                                "lots in build per agent): this lot may stay beyond the cap; "
+                                "reserved to humans and orchestrator/design agents"
+                                % work.BUILD_LIMIT)
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
     pw_delegate = work_sub.add_parser(
@@ -2654,6 +2686,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
     from . import backlog
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
+    from . import wip
+    wip.add_parsers(work_sub, cmd_work)  # limite d'en-cours §4 (owner 14/10)
     from . import unrecorded
     unrecorded.add_parser(work_sub, cmd_work)  # demandes d'humains sans lot (L130)
     from . import resolutions

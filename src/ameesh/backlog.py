@@ -47,6 +47,11 @@ pour les gardes et l'avertissement des orchestrateurs. Garde-fous :
   de sélection ; le graphe est revérifié dans la transaction de prise. Un
   interblocage de cette transaction avec une autre (#1496) vaut une prise
   perdue entre-temps : l'élément reste libre, le passage continue.
+* **§4 (owner 14/10/2026) : la prise refuse le troisième lot en `build`** —
+  le compte et l'écriture sont dans la même transaction sous le verrou de
+  l'agent (`assign_capped`), donc deux prises simultanées ne le franchissent
+  pas. Le surplus des lots déjà en `build` est rendu à la file par le
+  balayage (`ameesh work wip`, `ameesh.wip`).
 
 **Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
 sans lot en cours depuis `lot_idle_s` (15 min par défaut) prend lui-même le
@@ -83,6 +88,9 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   `waiting_human`, `blocked`), ou dont le début prévu est après aujourd'hui,
   ne l'occupe pas ; il reste libre tant que son dernier tour n'a laissé ni
   courrier ni consigne en attente. Le lot qu'il prend, lui, l'occupe.
+* **§4** : un lot `build` sans assigné est un lot rendu à la file par la
+  limite d'en-cours — il reste prenable (avant les `intake` de même priorité),
+  avec sa branche et ses avis ; l'agent le reprend sans repartir de zéro.
 
 Le cœur reste générique : rien ici ne nomme un métier. La source d'un élément
 est un texte libre ; le circuit (relecture, vérifications, intégration) est
@@ -96,6 +104,7 @@ import time
 
 from . import storage
 from .db import Db, DbError, is_deadlock
+from .storage import interface
 
 ITEM_TYPE = "improvement"
 PRIORITIES = (1, 2, 3)
@@ -103,13 +112,16 @@ DEFAULT_PRIORITY = 2
 #: prise automatique : au repos depuis 30 min, au plus 2 prises par heure
 DEFAULT_TAKE_IDLE_S = 1800.0
 DEFAULT_TAKE_MAX_PER_HOUR = 2
-#: préfixe de la note de journal d'une prise automatique (compte du débit)
-AUTO_TAKE_NOTE = "prise automatique"
+#: préfixe de la note de journal d'une prise automatique (compte du débit) —
+#: texte défini dans `storage.interface.ASSIGN_NOTE_PREFIXES`, avec tous les
+#: débuts de note d'une attribution (une prise postérieure efface une exception
+#: pilote §4 antérieure)
+AUTO_TAKE_NOTE = interface.AUTO_TAKE_NOTE
 #: L165 : un lot non assigné de l'équipe est pris après 15 min de repos, au
 #: plus 6 par heure pour tout le mesh ; débit compté à part de la file
 DEFAULT_LOT_IDLE_S = 900.0
 DEFAULT_LOT_MAX_PER_HOUR = 6
-LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+LOT_TAKE_NOTE = interface.LOT_TAKE_NOTE
 #: âge minimal d'un lot pris : l'orchestrateur qui vient de le créer le confie
 LOT_MIN_AGE_S = 300.0
 #: #1677 (c) : quand aucun lot n'est prenable, la prise propose une relecture
@@ -460,8 +472,14 @@ def _default_budget_check(cfg, db):
 
 def lot_take_message(item: dict, orchestras: list) -> str:
     stack = (item.get("stack_on") or "").strip()
+    branch = (item.get("branch") or "").strip()
+    head = (item.get("branch_head") or "").strip()
+    resumed = ("" if not branch else
+               "It comes back from the queue with its branch %s%s: resume it, "
+               "do not restart from scratch.\n" % (branch, " (%s)" % head[:12] if head else ""))
     return ("Lot #%d, taken on your own (L165): you were idle and this lot of your team "
             "had no taker: %s%s\n"
+            "%s"
             "%s can reassign it; if they give you something else, that comes first. "
             "Follow your project's normal flow (review, checks, integration "
             "by whoever has the right). Forbidden in this lot: any irreversible or "
@@ -472,6 +490,7 @@ def lot_take_message(item: dict, orchestras: list) -> str:
             "%s" % (
                 int(item["id"]), item["title"],
                 "\n%s" % item["body"] if (item.get("body") or "").strip() else "",
+                resumed,
                 ", ".join(orchestras) if orchestras else "The orchestrator",
                 int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator",
                 # #1677 : le lot s'empile sur des bloqueurs encore en qa à
@@ -525,12 +544,20 @@ def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
 
 def lot_takeable(item: dict, today: str | None = None) -> bool:
     """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
-    qui attend un humain (seuls les lots `intake` sans assigné arrivent ici),
-    de décision (demande de décision en attente, jalon de décision ouvert,
-    capacité `decision` exigée) ni de production (capacité `production`
-    exigée) ; jamais un lot sans équipe connue, ni un lot dont le début prévu
-    est après `today` (« AAAA-MM-JJ »)."""
-    if item.get("state") != "intake" or (item.get("assignee") or "").strip():
+    qui attend un humain (seuls les lots `intake` ou `build` sans assigné
+    arrivent ici), de décision (demande de décision en attente, jalon de
+    décision ouvert, capacité `decision` exigée) ni de production (capacité
+    `production` exigée) ; jamais un lot sans équipe connue, ni un lot dont le
+    début prévu est après `today` (« AAAA-MM-JJ »).
+
+    §4 : un lot `build` sans assigné n'est prenable que s'il a été RENDU à la
+    file par la limite d'en-cours (`returned_to_queue` : la note de retour est
+    postérieure à la dernière attribution) — un lot en cours sans preneur
+    (prérequis, travail confié par courrier) n'est pas à la file."""
+    if item.get("state") not in ("intake", "build") \
+            or (item.get("assignee") or "").strip():
+        return False
+    if item.get("state") == "build" and not item.get("returned_to_queue"):
         return False
     start = str(item.get("planned_start") or "")[:10]
     if today and start and start > today:
@@ -613,7 +640,12 @@ def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None
     Le serveur annule alors la prise entière (rien d'écrit) : c'est une prise
     perdue entre-temps, comme une course perdue, et non une panne du passage.
     L'élément reste libre et le prochain passage le revérifie en entier ;
-    toute autre erreur remonte."""
+    toute autre erreur remonte.
+
+    §4 (#1359) : la prise passe par `assign`, dont le chemin `ready_only`
+    délègue à `assign_capped` — le plafond d'en-cours est vérifié sous le
+    verrou de l'agent ; un refus (`None`) suit le même chemin qu'une prise
+    perdue entre-temps (`_still_free`, `_cap_reached`)."""
     try:
         return st.work.assign(int(item["id"]), assignee, current=None, note=note,
                               actor=SENDER, take=take, ready_only=True)
@@ -731,6 +763,35 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                         "kind": kind, "notified": []})
             break
     return out
+
+def _still_free(st, item_id) -> bool:
+    """Le lot est-il encore prenable (sans assigné, dans un état de prise) ?
+
+    `assign_capped` rend None pour des refus distincts — le plafond §4 atteint
+    (le lot n'a pas bougé : le garder pour un autre preneur), une prise
+    concurrente (le lot a bougé : le retirer) ou un refus sous verrou (une
+    dépendance est apparue depuis la sélection, L165 : le lot reste prenable
+    mais plus pour cette passe) : cette relecture et `_cap_reached` les
+    distinguent."""
+    item = st.work.get(int(item_id))
+    if item is None:
+        return False
+    return (not (item.get("assignee") or "").strip()
+            and item.get("state") in ("intake", "build"))
+
+
+def _cap_reached(st, agent: str) -> bool:
+    """§4 : l'agent est-il au plafond d'en-cours ?
+
+    Distingue, après un refus `None` de `assign_capped` sur un lot encore
+    prenable, le plafond (arrêter cet agent : il ne peut plus rien prendre) du
+    refus sous verrou — dépendance apparue (L165) : passer au lot suivant.
+    Relecture hors du verrou de la prise : un agent redescendu entre-temps fait
+    seulement retenter la prise, un agent remonté au plafond est refusé de
+    nouveau par `assign_capped`."""
+    from . import work
+
+    return st.work.count_builds(agent) >= work.BUILD_LIMIT
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
@@ -883,6 +944,11 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 break
             if not within_budget(row):
                 continue
+            # §4 canon : au plus 2 lots en build par agent — la prise
+            # automatique refuse le troisième (le témoin concurrent est dans
+            # le stockage : `assign_capped` recompte sous le verrou de l'agent)
+            if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
+                continue
             agent = registry.get(db, row["name"])
             if agent is None:
                 continue
@@ -927,9 +993,18 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                          work.takes_rule(check))
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
-                lots.remove(item)
                 if done is None:
-                    continue                # pris entre-temps : lot suivant
+                    # refus sous le verrou de l'agent : plafond §4 (rien n'a
+                    # bougé : le lot reste à prendre par un autre agent), lot
+                    # devenu non prenable (dépendance apparue, L165) ou pris
+                    # entre-temps
+                    if not _still_free(st, item["id"]):
+                        lots.remove(item)
+                        continue        # pris entre-temps : lot suivant
+                    if _cap_reached(st, check["assignee"]):
+                        break           # agent au plafond : au suivant
+                    continue            # refus sous verrou : lot suivant
+                lots.remove(item)
                 done = dict(done, lot_team=item["lot_team"],
                             stack_on=item.get("stack_on"))
                 payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
@@ -980,6 +1055,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             break
         if not within_budget(row):
             continue
+        # §4 : le plafond de lots en build vaut aussi pour la file
+        if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
+            continue
         agent = registry.get(db, row["name"])
         if agent is None:
             continue
@@ -1015,9 +1093,16 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                      work.takes_rule(check))
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
-            queue.remove(item)
             if done is None:
-                continue                    # pris entre-temps : élément suivant
+                # idem lots d'équipe : plafond (garder), élément devenu non
+                # prenable (dépendance apparue) ou pris entre-temps
+                if not _still_free(st, item["id"]):
+                    queue.remove(item)
+                    continue                # pris entre-temps : élément suivant
+                if _cap_reached(st, check["assignee"]):
+                    break                   # agent au plafond : au suivant
+                continue                    # refus sous verrou : élément suivant
+            queue.remove(item)
             message_id = mail.send(db, SENDER, check["assignee"], take_message(done),
                                    kind="event", work_item_id=str(done["id"]),
                                    payload={"backlog": {"lot": int(done["id"]),

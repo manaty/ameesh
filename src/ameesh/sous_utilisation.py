@@ -526,9 +526,16 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
 
 def is_backlog_item(lot: dict) -> bool:
     """Élément de la file d'amélioration encore à prendre (L119) : il attend un
-    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant."""
-    return (lot.get("type") == "improvement" and not (lot.get("assignee") or "").strip()
-            and lot.get("state") == "intake")
+    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant.
+    §4 : un élément `build` sans assigné n'est un élément de la file que s'il a
+    été RENDU (`returned_to_queue`) — un élément en cours sans preneur n'y est
+    pas."""
+    if (lot.get("assignee") or "").strip():
+        return False
+    if lot.get("state") == "intake":
+        return lot.get("type") == "improvement"
+    return (lot.get("type") == "improvement" and lot.get("state") == "build"
+            and bool(lot.get("returned_to_queue")))
 
 
 def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> list:
