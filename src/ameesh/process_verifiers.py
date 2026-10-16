@@ -460,18 +460,37 @@ def _observation(snapshot: Snapshot, ident: str) -> Mapping | None:
     return None
 
 
-def _witness(snapshot: Snapshot, observation_id: str) -> Mapping | None:
-    """Le recu B accepte qui reference cette observation, s'il existe.
+def _receipt_facts(receipt: Mapping) -> Mapping:
+    """Les faits structures d'un recu B (#1922).
 
-    Un recu explicitement non accepte ne prouve rien ; l'absence du drapeau
-    vaut accepte (la collection ne porte que des recus acceptes).
+    B projette `facts` (les faits du client) a cote du blob
+    `process-receipt/1` garde sous `evidence` ; un recu brut non projete porte
+    les memes faits dans `evidence.facts`. Rend un mapping vide si rien n'est
+    lisible : aucun fait simule.
+    """
+    facts = receipt.get("facts")
+    if isinstance(facts, Mapping):
+        return facts
+    evidence = receipt.get("evidence")
+    if isinstance(evidence, Mapping):
+        nested = evidence.get("facts")
+        if isinstance(nested, Mapping):
+            return nested
+    return {}
+
+
+def _witness(snapshot: Snapshot, observation_id: str) -> Mapping | None:
+    """Le recu B accepte dont les faits referencent cette observation.
+
+    Un recu explicitement non accepte ne prouve rien ; B ne projette que des
+    recus acceptes (`command_id` non nul). Les faits sont lus dans la
+    projection `facts` de B, jamais dans un `evidence.observation` direct
+    (N7 de la revue #1924).
     """
     for receipt in snapshot.receipts:
         if receipt.get("accepted") is False:
             continue
-        evidence = receipt.get("evidence") or {}
-        if isinstance(evidence, Mapping) and _text(
-                evidence.get("observation")) == observation_id:
+        if _text(_receipt_facts(receipt).get("observation")) == observation_id:
             return receipt
     return None
 

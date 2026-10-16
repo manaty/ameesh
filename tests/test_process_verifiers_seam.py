@@ -25,7 +25,9 @@ COMMAND_ID = "11111111-1111-4111-8111-111111111111"
 OBSERVATION = {"id": "obs-staging-pass", "env": "staging", "sha": REV,
                "kind": "pass"}
 RECEIPTS = ({"guard": "deploy_observation", "accepted": True,
-             "evidence": {"observation": "obs-staging-pass"}},)
+             "facts": {"observation": "obs-staging-pass"},
+             "evidence": {"schema": "process-receipt/1",
+                          "facts": {"observation": "obs-staging-pass"}}},)
 SOURCES = {
     "milestones": ({"kind": "frozen", "sha": REV},
                    {"kind": "merged", "sha": REV}),

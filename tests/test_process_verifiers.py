@@ -44,10 +44,16 @@ OBSERVATIONS = (
     {"id": "obs-preprod-fail", "env": "preprod", "sha": REV, "kind": "fail"},
 )
 
-#: les recus acceptes de B, chacun referencant une observation distincte.
+#: les recus acceptes de B (#1922), chacun referencant une observation distincte.
+#: Forme reellement projetee par B : `facts` porte les faits du client, le blob
+#: `process-receipt/1` reste sous `evidence` (N7 de la revue #1924).
 RECEIPTS = tuple(
-    {"guard": "deploy_observation", "action": "advance", "event_id": index + 1,
-     "accepted": True, "evidence": {"observation": observation["id"]}}
+    {"accepted": True, "guard": "deploy_observation", "event_id": index + 1,
+     "command_id": "22222222-2222-4222-8222-%012d" % (index + 1),
+     "workflow_stage": "work", "workflow_version": 3, "sha256": "c" * 64,
+     "evidence": {"schema": "process-receipt/1",
+                  "facts": {"observation": observation["id"]}},
+     "facts": {"observation": observation["id"]}}
     for index, observation in enumerate(OBSERVATIONS))
 
 #: references minimales qui font accepter chaque garde sur la fixture pleine.
@@ -396,17 +402,24 @@ class VerificateursTest(unittest.TestCase):
     def test_demande_de_deploiement_ne_prouve_pas_son_succes(self):
         without_witness = tuple(
             receipt for receipt in RECEIPTS
-            if receipt["evidence"]["observation"] != "obs-staging-pass")
+            if receipt["facts"]["observation"] != "obs-staging-pass")
         decision = verify(command_for("staging_pass"),
                           full_snapshot(receipts=without_witness))
         self.assertRefusal("observation-unwitnessed", decision)
         refused = tuple(
             dict(receipt, accepted=False)
-            if receipt["evidence"]["observation"] == "obs-staging-pass"
+            if receipt["facts"]["observation"] == "obs-staging-pass"
             else receipt for receipt in RECEIPTS)
         decision = verify(command_for("staging_pass"),
                           full_snapshot(receipts=refused))
         self.assertRefusal("observation-unwitnessed", decision)
+        # un recu brut non projete (blob sous `evidence`) reste un temoin :
+        # les faits sont lus dans `evidence.facts` a defaut de `facts` (N7).
+        raw = ({"accepted": True, "guard": "deploy_observation",
+                "evidence": {"schema": "process-receipt/1",
+                             "facts": {"observation": "obs-staging-pass"}}},)
+        self.assertTrue(verify(command_for("staging_pass"),
+                               full_snapshot(receipts=raw)).accepted)
 
     def test_observation_d_une_autre_revision(self):
         other = ({"id": "obs-staging-pass", "env": "staging", "sha": OTHER,
