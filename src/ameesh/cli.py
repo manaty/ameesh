@@ -766,17 +766,18 @@ class _Remise:
             # possible — chemin d'origine en une seule réservation, budget du
             # hook préservé (L61). Le filtrage par lot ne sert qu'au
             # multi-projet déclaré.
-            rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                                porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
-                                limit=borne)
-            self.ouverte = bool(rows)
-            self.msgs = [mail.normalize(row) for row in rows]
-            self.reste = 1 if len(self.msgs) >= borne else 0
-            return self.msgs
+            return self._reserver_simple(borne)
         besoin, lus = borne, 0
         self.msgs = []
         while len(self.msgs) < borne:
             ids = self._deliverable(besoin)
+            if ids is None:
+                # #811 : la fiche du registre n'est pas servie à une session
+                # médiée (contrat 1.1, `agents.get` refusé au jeton de
+                # session) : la règle du lot retenu n'est pas décidable ici.
+                # Réservation simple, comme avant #811 — jamais moins de
+                # courrier remis.
+                return self._reserver_simple(borne)
             if len(ids) <= lus:       # boîte épuisée ou backend à page bornée
                 break
             lus = len(ids)
@@ -799,13 +800,31 @@ class _Remise:
         self.reste = 1 if len(self.msgs) >= borne else 0
         return self.msgs
 
-    def _deliverable(self, borne: int) -> list[int]:
+    def _reserver_simple(self, borne: int) -> list[dict]:
+        """#811 : réservation sans filtre de lot (mono-projet, ou règle du lot
+        retenu indécidable) — le chemin d'origine du hook, budget L61 gardé."""
+        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            limit=borne)
+        self.ouverte = bool(rows)
+        self.msgs = [mail.normalize(row) for row in rows]
+        self.reste = 1 if len(self.msgs) >= borne else 0
+        return self.msgs
+
+    def _deliverable(self, borne: int) -> list[int] | None:
         """#811 B1/R3 : les ids à réserver, les lots retenus laissés en place.
 
         Même règle que l'exécuteur (`lot_workdir.deliverable_unread`), dérivée
-        du registre et du Host pour être visible du hook."""
+        du registre et du Host pour être visible du hook. Rend `None` quand
+        elle n'est pas décidable ici : une session médiée n'a pas `agents.get`
+        (contrat 1.1) et l'appelant réserve alors sans filtre, comme avant
+        #811."""
         from . import lot_workdir, registry
-        agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+        from .mediated_executor.contract import NotSupportedRemotely
+        try:
+            agent = registry.get(self.bk.db, self.name) or {"name": self.name}
+        except NotSupportedRemotely:
+            return None
         rows = lot_workdir.deliverable_unread(self.cfg, self.bk.db, agent, besoin=borne)
         return [int(row["id"]) for row in rows if row.get("id") is not None]
 
