@@ -29,7 +29,16 @@ Regles de decision :
 * une preuve de deploiement staging/preprod est un **recu B accepte qui
   reference une observation reelle distincte** : un recu de demande de
   deploiement ne prouve pas son succes (`observation-unwitnessed`) ; une
-  observation referencee mais non installee refuse (`source-unavailable`).
+  observation referencee mais non installee refuse (`source-unavailable`) ;
+* la **tete relue** (dernier gel, `reviewed_head_of`) et la **revision
+  courante** (dernier jalon de revision : gel, fusion ou livraison,
+  `revision_of`) sont deux valeurs distinctes : une revue ne vaut que sur la
+  tete relue courante, un deploiement que sur la revision courante ; toute
+  reference a une tete ou une fusion depassee refuse (`revision-mismatch`) ;
+* la completion d'un type qui exige une revue (tous les types installes)
+  **relie la livraison a la tete relue** qui a ete fusionnee/livree
+  (`reviewed_head_for`) : une livraison acceptee sans verdict ok applicable ne
+  complete pas (`completion-review-missing`).
 
 Registre fini (contrat #1379, commentaire 6207021753) : `GUARD_NAMES`. Types
 installes opt-in : `INSTALLED_TYPES` ; les types de code (`CODE_TYPES`)
@@ -253,12 +262,14 @@ class Capability:
     * `installed` : etat reel du registre serveur de B si sonde (`None` = non
       sonde) ;
     * `available` / `missing` : sources exigees **reellement** disponibles ou
-      absentes, si un jeu de sources a ete fourni (`()` = non sonde) ;
+      absentes ; `sources_probed` dit si un jeu de sources a ete fourni (sans
+      lui, aucune source exigee n'est reputee disponible) ;
     * `conditional_sources` : sources exigees seulement pour certaines entrees
       (ex. `decisions` pour `waiting_human`), jamais comptees dans `missing`.
 
     Fail-closed : `executable` n'est vrai que si l'installation est **prouvee**
-    et les sources exigees disponibles ; sinon `refusal` nomme le refus exact.
+    et, pour une garde qui exige des sources, que ces sources ont ete **lues**
+    et sont disponibles ; sinon `refusal` nomme le refus exact.
     """
 
     guard: str
@@ -271,13 +282,18 @@ class Capability:
     available: tuple[str, ...] = ()
     missing: tuple[str, ...] = ()
     conditional_sources: tuple[str, ...] = ()
+    sources_probed: bool = False
 
     @property
     def executable(self) -> bool:
-        """Vrai seulement si l'installation est prouvee et les sources exigees
-        disponibles (non sonde = non executable, jamais un accord par
-        defaut)."""
-        return self.installed is True and not self.missing
+        """Vrai seulement si l'installation est prouvee et, quand la garde
+        exige des sources, qu'elles ont ete lues et sont disponibles (une
+        source non lue n'est jamais reputee disponible)."""
+        if self.installed is not True:
+            return False
+        if not self.sources:
+            return True
+        return self.sources_probed and not self.missing
 
     @property
     def refusal(self) -> str:
@@ -286,7 +302,7 @@ class Capability:
             return "guard-unsupported"
         if self.installed is not True:
             return HOST_REFUSAL_CODES[0]
-        if self.missing:
+        if self.sources and (not self.sources_probed or self.missing):
             return "source-unavailable"
         return ""
 
@@ -390,7 +406,13 @@ def _loops(snapshot: Snapshot) -> int:
 
 
 def _revision(snapshot: Snapshot) -> str:
-    return _text(snapshot.revision)
+    """La revision courante : les jalons reels priment la valeur declaree.
+
+    Un snapshot dont les jalons sont collectes ne peut pas se declarer sur une
+    autre revision que le dernier jalon reel (`revision-mismatch` ensuite) ;
+    sans jalons, la revision declaree fait foi.
+    """
+    return revision_of(snapshot.milestones) or _text(snapshot.revision)
 
 
 def _milestone(snapshot: Snapshot, kind: str, sha: str = "") -> Mapping | None:
@@ -413,6 +435,20 @@ def _verdict(snapshot: Snapshot, verdict: str, sha: str = "") -> Mapping | None:
             continue
         return row
     return None
+
+
+def _current_verdict(milestones, sha: str) -> str:
+    """Le **dernier** verdict enregistre sur cette revision (`""` si aucun).
+
+    Un verdict ok suivi d'un verdict bloque sur la meme revision ne vaut pas
+    ok : l'historique des verdicts est borne au verdict courant.
+    """
+    verdict = ""
+    for row in milestones or ():
+        if (_text(row.get("kind")) == "verdict"
+                and _text(row.get("sha")) == sha):
+            verdict = _text(row.get("verdict"))
+    return verdict
 
 
 def _observation(snapshot: Snapshot, ident: str) -> Mapping | None:
@@ -461,13 +497,64 @@ def _closed(snapshot: Snapshot) -> bool:
     return _text(snapshot.item.get("state")) == "closed"
 
 
+#: Jalons qui portent une revision reelle.
+REVISION_KINDS = ("frozen", "merged", "delivered")
+
+
 def revision_of(milestones) -> str:
-    """La tete de travail native : gel, puis fusion, puis livraison."""
-    for kind in ("frozen", "merged", "delivered"):
-        for row in milestones or ():
-            if _text(row.get("kind")) == kind and _text(row.get("sha")):
-                return _text(row.get("sha"))
-    return ""
+    """La revision courante : le sha du **dernier** jalon de revision.
+
+    L'ordre des jalons fait foi (id croissant) : un gel posterieur a une fusion
+    est la nouvelle tete de travail, une fusion posterieure a un gel donne le
+    commit fusionne/deploye. Un rang de genre ne prime jamais sur l'ordre : un
+    gel ancien ne masque pas une fusion recente.
+    """
+    revision = ""
+    for row in milestones or ():
+        if (_text(row.get("kind")) in REVISION_KINDS
+                and _text(row.get("sha"))):
+            revision = _text(row.get("sha"))
+    return revision
+
+
+def reviewed_head_of(milestones) -> str:
+    """La tete relue : le sha du dernier gel (jamais une fusion)."""
+    head = ""
+    for row in milestones or ():
+        if _text(row.get("kind")) == "frozen" and _text(row.get("sha")):
+            head = _text(row.get("sha"))
+    return head
+
+
+def merged_of(milestones) -> str:
+    """Le dernier commit fusionne reel (sha), ou vide."""
+    merged = ""
+    for row in milestones or ():
+        if _text(row.get("kind")) == "merged" and _text(row.get("sha")):
+            merged = _text(row.get("sha"))
+    return merged
+
+
+def reviewed_head_for(milestones, revision: str) -> str:
+    """La tete relue qui s'applique a une revision donnee.
+
+    Le dernier gel anterieur a la fusion/livraison de cette revision est la
+    tete jugee ; une revision encore gelee (aucune fusion/livraison
+    posterieure) est sa propre tete relue ; sans lien prouvable, la revision
+    elle-meme est exigee (fail-closed : la revue d'une autre tete ne vaut
+    pas).
+    """
+    if not revision:
+        return ""
+    head = ""
+    for row in milestones or ():
+        kind = _text(row.get("kind"))
+        sha = _text(row.get("sha"))
+        if kind == "frozen" and sha:
+            head = sha
+        elif kind in ("merged", "delivered") and sha == revision:
+            return head or revision
+    return revision
 
 
 # --------------------------------------------------------------------------
@@ -505,6 +592,11 @@ def _check_review_requested(command: Command, snapshot: Snapshot) -> Decision:
     if _milestone(snapshot, "frozen", head) is None:
         return _refuse("freeze-missing",
                        "aucun gel de la tete %s" % (head or "(absente)"), snapshot)
+    current = reviewed_head_of(snapshot.milestones)
+    if head != current:
+        return _refuse("revision-mismatch",
+                       "gel %s depasse par la tete relue %s"
+                       % (head, current or "(absente)"), snapshot)
     reviewer = _text(snapshot.item.get("reviewer"))
     if not reviewer:
         return _refuse("reviewer-missing", "aucun relecteur designe", snapshot)
@@ -515,23 +607,33 @@ def _check_review_requested(command: Command, snapshot: Snapshot) -> Decision:
 
 
 def _check_qa_started(command: Command, snapshot: Snapshot) -> Decision:
-    head = _ref(command, "head") or _revision(snapshot)
+    current = reviewed_head_of(snapshot.milestones)
+    head = _ref(command, "head") or current or _revision(snapshot)
     if not head:
         return _refuse("revision-missing",
                        "snapshot sans revision de travail", snapshot)
     if _milestone(snapshot, "frozen", head) is None:
         return _refuse("freeze-missing",
                        "aucun gel de la revision %s" % head, snapshot)
+    if current and head != current:
+        return _refuse("revision-mismatch",
+                       "gel %s depasse par la tete relue %s"
+                       % (head, current), snapshot)
     if not _text(snapshot.item.get("reviewer")):
         return _refuse("reviewer-missing", "aucun relecteur designe", snapshot)
     return _accept(command, ("head",) if _ref(command, "head") else ())
 
 
 def _check_qa_repair(command: Command, snapshot: Snapshot) -> Decision:
-    sha = _ref(command, "head") or _revision(snapshot)
+    current = reviewed_head_of(snapshot.milestones)
+    sha = _ref(command, "head") or current or _revision(snapshot)
     if not sha:
         return _refuse("revision-missing",
                        "snapshot sans revision de travail", snapshot)
+    if current and sha != current:
+        return _refuse("revision-mismatch",
+                       "verdict de %s : la tete relue est %s"
+                       % (sha, current), snapshot)
     if _verdict(snapshot, "blocked", sha) is None:
         return _refuse("verdict-missing",
                        "aucun verdict bloque sur la revision %s" % sha, snapshot)
@@ -582,6 +684,11 @@ def _check_merged_and_staging_deployed(command: Command,
         return _refuse("merge-missing",
                        "aucune fusion reelle de %s" % (merge or "(absente)"),
                        snapshot)
+    current = merged_of(snapshot.milestones)
+    if merge != current:
+        return _refuse("revision-mismatch",
+                       "fusion %s depassee par %s"
+                       % (merge, current or "(absente)"), snapshot)
     return _observation_proof(command, snapshot, "staging", "staging",
                               "deployed", merge)
 
@@ -657,6 +764,7 @@ def _check_work_completed(command: Command, snapshot: Snapshot) -> Decision:
         return _refuse("revision-missing",
                        "snapshot sans revision de travail", snapshot)
     policy = completion_policy(_text(snapshot.item.get("type")))
+    references = ("outcome",)
     if policy.requires_delivery:
         ident = _ref(command, "delivery")
         if not ident:
@@ -674,15 +782,17 @@ def _check_work_completed(command: Command, snapshot: Snapshot) -> Decision:
         if _text(delivery.get("sha")) != revision:
             return _refuse("revision-mismatch",
                            "livraison d'une autre revision que la tete", snapshot)
-        return _accept(command, ("delivery",))
-    if not _ref(command, "outcome"):
+        references = ("delivery",)
+    elif not _ref(command, "outcome"):
         return _refuse("completion-evidence-missing",
                        "resultat propre du type non-code requis", snapshot)
-    if _verdict(snapshot, "ok", revision) is None:
-        return _refuse("completion-review-missing",
-                       "revue applicable absente ou non ok sur la revision",
-                       snapshot)
-    return _accept(command, ("outcome",))
+    if policy.requires_review:
+        head = reviewed_head_for(snapshot.milestones, revision)
+        if _current_verdict(snapshot.milestones, head) != "ok":
+            return _refuse("completion-review-missing",
+                           "revue applicable absente ou non ok sur la tete "
+                           "relue %s" % (head or "(absente)"), snapshot)
+    return _accept(command, references)
 
 
 # --------------------------------------------------------------------------
@@ -930,7 +1040,8 @@ def _capability(name: str, purpose: str, required: tuple,
         references=tuple(references), known=True, reserved=reserved,
         installed=None if installed is None else name in installed,
         available=seen, missing=missing,
-        conditional_sources=tuple(conditional_sources))
+        conditional_sources=tuple(conditional_sources),
+        sources_probed=available is not None)
 
 
 def capabilities(*, registry: Any = None, sources: Any = None,

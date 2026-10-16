@@ -20,6 +20,7 @@ from ameesh.process_verifiers import (GUARD_NAMES, INSTALLED_TYPES,
                                       install_verifiers, server_verifier)
 
 REV = "a" * 40
+OTHER = "b" * 40
 COMMAND_ID = "11111111-1111-4111-8111-111111111111"
 OBSERVATION = {"id": "obs-staging-pass", "env": "staging", "sha": REV,
                "kind": "pass"}
@@ -202,6 +203,31 @@ class SeamTest(unittest.TestCase):
         self.assertEqual(held.action, "hold")
         self.assertEqual(held.hold, "blocked")
 
+    def test_context_snapshot_revision_suit_le_dernier_jalon(self):
+        """Un gel ancien ne masque pas une fusion recente (revue Codex B4)."""
+        sources = dict(SOURCES)
+        sources["milestones"] = ({"kind": "frozen", "sha": OTHER},
+                                 {"kind": "merged", "sha": REV})
+        snapshot = context_snapshot(context(sources=sources))
+        self.assertEqual(snapshot.revision, REV)
+        self.assertEqual(snapshot.workflow_stage, "work")
+
+    def test_appelable_staging_pass_apres_fusion_differente(self):
+        """La preuve de staging porte sur le commit fusionne, pas sur le gel
+        qui l'a precedee (revue Codex B4)."""
+        registry = Registry()
+        install_verifiers(registry)
+        sources = dict(SOURCES)
+        sources["milestones"] = ({"kind": "frozen", "sha": OTHER},
+                                 {"kind": "merged", "sha": REV})
+        result = registry.installed["staging_pass"](
+            context(sources=sources,
+                    command=command(guard="staging_pass",
+                                    evidence={"staging": "obs-staging-pass"})))
+        self.assertIsInstance(result, Verification)
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.facts["code"], "accepted")
+
     def test_context_snapshot_derive_revision_et_sources(self):
         snapshot = context_snapshot(context())
         self.assertEqual(snapshot.revision, REV)
@@ -271,7 +297,11 @@ class SeamTest(unittest.TestCase):
         real = pr.VerificationContext(db=None, work_item=item(), command=raw,
                                       spec=None, from_stage="work",
                                       to_stage="next")
-        result = server_verifier("start_work", pr.Verification)(real)
+        # banc sans base : le lecteur reel de B est remplace (la lecture des
+        # sources reste chez B, dans sa transaction) ; B convertit toute
+        # exception d'un verificateur en refus `verifier-error`.
+        with mock.patch.object(pr, "read_sources", lambda context: {}):
+            result = server_verifier("start_work", pr.Verification)(real)
         self.assertIsInstance(result, pr.Verification)
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(result.facts["code"], "accepted")

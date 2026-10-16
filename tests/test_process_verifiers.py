@@ -20,7 +20,9 @@ from ameesh.process_verifiers import (CODE_TYPES, GUARD_NAMES, HOLDS,
                                       SOURCE_COLLECTIONS, Capability, Command,
                                       Snapshot, available_sources,
                                       capabilities, capability_report,
-                                      completion_policy, type_capability,
+                                      completion_policy, merged_of,
+                                      reviewed_head_for, reviewed_head_of,
+                                      revision_of, type_capability,
                                       type_capabilities, verify, verify_hold)
 
 REV = "a" * 40
@@ -324,12 +326,38 @@ class VerificateursTest(unittest.TestCase):
         self.assertRefusal("revision-mismatch", decision)
 
     def test_revision_de_travail_requise(self):
-        without = full_snapshot(revision="")
+        without = full_snapshot(revision="", milestones=())
         for guard in ("staging_pass", "preprod_deployed", "repair_started",
                       "work_completed"):
             with self.subTest(guard=guard):
                 self.assertRefusal("revision-missing",
                                    verify(command_for(guard), without))
+
+    def test_revision_courante_suit_le_dernier_jalon(self):
+        """Un gel ancien ne masque pas une fusion recente (revue Codex B4)."""
+        ms = ({"kind": "frozen", "sha": OTHER, "verdict": None},
+              {"kind": "merged", "sha": REV, "verdict": None})
+        self.assertEqual(revision_of(ms), REV)
+        self.assertEqual(reviewed_head_of(ms), OTHER)
+        self.assertEqual(merged_of(ms), REV)
+        snap = full_snapshot(milestones=ms, revision=revision_of(ms))
+        self.assertTrue(verify(command_for("staging_pass"), snap).accepted)
+        self.assertRefusal(
+            "revision-mismatch",
+            verify(command_for("staging_pass"),
+                   full_snapshot(milestones=ms,
+                                 revision=revision_of(ms),
+                                 observations=({"id": "obs-staging-pass",
+                                                "env": "staging", "sha": OTHER,
+                                                "kind": "pass"},))))
+        # un gel posterieur a une fusion redevient la revision courante
+        third = "c" * 40
+        cycle = ms + ({"kind": "frozen", "sha": third, "verdict": None},)
+        self.assertEqual(revision_of(cycle), third)
+        self.assertEqual(reviewed_head_of(cycle), third)
+        self.assertEqual(reviewed_head_for(cycle, REV), OTHER)
+        self.assertEqual(reviewed_head_for(ms, REV), OTHER)
+        self.assertEqual(reviewed_head_for(cycle, third), third)
 
     # -- types et completion ----------------------------------------------
 
@@ -414,6 +442,77 @@ class VerificateursTest(unittest.TestCase):
                    without_review))
 
     # -- relecture, arret, reparations, holds ------------------------------
+
+    def test_completion_code_exige_la_revue_applicable(self):
+        """Livraison acceptee sans revue : refus (revue Codex B2)."""
+        without_review = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": REV, "verdict": None},
+            {"kind": "merged", "sha": REV, "verdict": None}))
+        self.assertRefusal(
+            "completion-review-missing",
+            verify(command_for("work_completed"), without_review))
+
+    def test_completion_code_relie_livraison_et_tete_relue(self):
+        """La revue porte sur la tete relue fusionnee, pas sur le commit de
+        fusion quand il differe (revue Codex B2/B4)."""
+        linked = full_snapshot(
+            milestones=({"kind": "frozen", "sha": OTHER, "verdict": None},
+                        {"kind": "merged", "sha": REV, "verdict": None},
+                        {"kind": "verdict", "sha": OTHER, "verdict": "ok"}),
+            revision=REV)
+        self.assertTrue(verify(command_for("work_completed"), linked).accepted)
+        on_merge_only = full_snapshot(
+            milestones=({"kind": "frozen", "sha": OTHER, "verdict": None},
+                        {"kind": "merged", "sha": REV, "verdict": None},
+                        {"kind": "verdict", "sha": REV, "verdict": "ok"}),
+            revision=REV)
+        self.assertRefusal(
+            "completion-review-missing",
+            verify(command_for("work_completed"), on_merge_only))
+        # un verdict bloque posterieur au ok ne complete pas
+        regressed = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": REV, "verdict": None},
+            {"kind": "merged", "sha": REV, "verdict": None},
+            {"kind": "verdict", "sha": REV, "verdict": "ok"},
+            {"kind": "verdict", "sha": REV, "verdict": "blocked"}))
+        self.assertRefusal(
+            "completion-review-missing",
+            verify(command_for("work_completed"), regressed))
+
+    def test_references_historiques_bornees(self):
+        """Un gel depasse ne vaut plus (revue Codex B3)."""
+        stale = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": OTHER, "verdict": None},
+            {"kind": "frozen", "sha": REV, "verdict": None}))
+        for guard in ("review_requested", "qa_started"):
+            with self.subTest(guard=guard):
+                self.assertRefusal(
+                    "revision-mismatch",
+                    verify(command_for(guard, references={"head": OTHER}),
+                           stale))
+                self.assertTrue(verify(command_for(guard), stale).accepted)
+        blocked = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": OTHER, "verdict": None},
+            {"kind": "verdict", "sha": OTHER, "verdict": "blocked"},
+            {"kind": "frozen", "sha": REV, "verdict": None}))
+        self.assertRefusal(
+            "revision-mismatch",
+            verify(command_for("qa_repair", references={"head": OTHER}),
+                   blocked))
+        self.assertRefusal(
+            "verdict-missing", verify(command_for("qa_repair"), blocked))
+
+    def test_fusion_historique_bornee(self):
+        two = full_snapshot(milestones=(
+            {"kind": "frozen", "sha": OTHER, "verdict": None},
+            {"kind": "merged", "sha": OTHER, "verdict": None},
+            {"kind": "merged", "sha": REV, "verdict": None}))
+        self.assertRefusal(
+            "revision-mismatch",
+            verify(command_for("merged_and_staging_deployed",
+                               references={"merge": OTHER,
+                                           "staging": "obs-staging-deployed"}),
+                   two))
 
     def test_relecteur_independant(self):
         self.assertRefusal(
@@ -544,6 +643,7 @@ class CapacitesTest(unittest.TestCase):
                 self.assertIsNone(cap.installed)
                 self.assertEqual(cap.available, ())
                 self.assertEqual(cap.missing, ())
+                self.assertFalse(cap.sources_probed)
                 self.assertFalse(cap.executable)
                 self.assertEqual(cap.refusal, HOST_REFUSAL_CODES[0])
         reserved = capabilities(include_reserved=True)
@@ -566,6 +666,21 @@ class CapacitesTest(unittest.TestCase):
                          GUARD_NAMES)
         self.assertEqual(report.executable_guards,
                          GUARD_NAMES + RESERVED_VERIFIERS)
+
+    def test_sources_non_lues_ne_sont_pas_executables(self):
+        """Sans lecture des sources, aucune garde qui en exige n'est declaree
+        executable (revue Codex B1) : seule l'installation ne suffit pas."""
+        full = FakeRegistry(*(GUARD_NAMES + RESERVED_VERIFIERS))
+        unread = capability_report(registry=full)
+        self.assertEqual(unread.executable_guards,
+                         ("planning", "start_work", "stop_work", "hold"))
+        self.assertFalse(unread.capability("staging_pass").executable)
+        self.assertEqual(unread.refusal("staging_pass"), "source-unavailable")
+        self.assertFalse(unread.capability("review_requested").sources_probed)
+        read = capability_report(registry=full, sources=ALL_SOURCES)
+        self.assertEqual(read.executable_guards,
+                         GUARD_NAMES + RESERVED_VERIFIERS)
+        self.assertTrue(read.capability("staging_pass").executable)
 
     def test_sources_sondees_disponibles_et_manquantes(self):
         caps = {cap.guard: cap for cap in capabilities(
