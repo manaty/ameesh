@@ -260,6 +260,11 @@ class Gauge:
     #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
     #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
     read_at: float | None = None
+    #: #1580 (tranche 3) : le modèle auquel ce seau est propre (le `title` du
+    #: widget omarchy, ex. « Fable Weekly » → « fable »), '' pour une fenêtre
+    #: générale. Un seau propre à un modèle ne compte que pour une session de
+    #: ce modèle (`accounts.gauges_of`) ; l'affichage les montre tous.
+    scope: str = ""
 
     def elapsed(self, now: float) -> float:
         """Part écoulée de la fenêtre, 1.0 quand on ne sait pas la dater."""
