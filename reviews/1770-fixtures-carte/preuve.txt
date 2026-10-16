@@ -1,0 +1,29 @@
+#1770 — preuve bornee : fixtures de la carte sur un petit arbre source (option (c) du pilote)
+Commit candidat : 7f7202a4 (parent 5d8f7b01, re-ancrage sur main cb77f899)
+Portee : tests/test_l161e_map.py seulement — aucun produit, aucune garde de completude,
+aucune assertion de corruption/couverture retiree, BoutEnBoutTest (vrai bout-en-bout
+sous-processus) inchange.
+
+AVANT (harnais de mesure reel, coverage installe, CI) :
+- run 38970754856, base cb77f899, part psycopg 2/6 : test_l161e_map = 1437,2 s (34 tests),
+  part annulee au plafond 40 min.
+- run 38952610544, base edf2bf3d, part psycopg 5/6 : test_l161e_map = 1441,98 s (33 tests),
+  part annulee aussi (40m31s).
+- Cause : chaque appel de carte.merge rescannait SRC.rglob("*.py") sur tout le depot
+  (264 fichiers, ~10 s en local, ~40 s par appel sur runner charge) ; les 14 cas de
+  corruption (CouvertureTronqueeTest, ArtefactIncompletTest) appellent merge plusieurs fois.
+
+APRES (meme harnais, sur VM ameesh-agents-1 via offload, coverage 7.16.2 embarque) :
+- PYTHONPATH=src:.qa-1770/coverage-pkg python3 scripts/test-parts.py run --part 1 --parts 1
+  --driver psycopg --list tests/parts/fixture-1770.txt --label "1770 fixture apres + coverage"
+- Ran 34 tests in 18.802s — OK (skipped=1) ; total 22,0 s ; aucun rouge.
+- Les 14 cas lents tournent bien (1 seul saut, comme en local) : ils ne sont plus sautes.
+
+MESURE LOCALE (agents-2, coverage 7.16.2, meme code) :
+- les 14 cas : 147,935 s -> 0,421 s (x351) ;
+- module complet : 34 tests en 18,186 s, OK (1 saute).
+
+LECTURE : le module passe de ~24 min a ~19 s ; la part psycopg 2/6 qui le portait
+(~2231 s de tests) repasse largement sous le plafond de 40 min, sans toucher a la
+matrice 6/4 ni au plafond. Le poids statique du plan pourra etre re-mesure normalement
+par la prochaine carte complete.
