@@ -4131,8 +4131,13 @@ class AgentWorker(threading.Thread):
             self._release_session_lock()
         return True
 
-    def run_turn(self, spec: dict) -> bool:
-        """Exclude attach for the whole turn and life of its resident."""
+    def run_turn(self, spec: dict) -> bool | None:
+        """Exclude attach for the whole turn and life of its resident.
+
+        Rend `True` (tour lancé), `False` (échec) ou `None` quand le tour est
+        **différé** sans échec (#1686 N2) : attach demandé ou verrou de session
+        tenu ; la consigne est restaurée. Le worker ne compte pas un report
+        comme un échec rapide et ne lui applique pas l'attente d'échec."""
         self.fast_failure = False
         if (registry.get(self.db, self.name) or {}).get("operator_paused"):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
@@ -4140,15 +4145,15 @@ class AgentWorker(threading.Thread):
         from .platform import session_lock
         if self._attach_pending():
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            return False
+            return None
         if getattr(self, "_session_lock", None) is None:
             self._session_lock = session_lock.try_lock(self.state_dir, "session-use")
             if self._session_lock is None:
                 registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-                return False
+                return None
         if self._attach_pending():
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            return False
+            return None
         self._session_turn_depth = getattr(self, "_session_turn_depth", 0) + 1
         try:
             return self._run_guarded_turn(spec)
@@ -6118,6 +6123,17 @@ class AgentWorker(threading.Thread):
                     # la série d'échecs rapides (L48) n'est pas touchée.
                     self._consigne_a_restaurer = True
                     self._panne_de_base(exc, "the turn")
+                    continue
+                if reussi is None:
+                    # #1686 N2 : tour différé (attach demandé ou verrou de
+                    # session tenu) — la consigne est restaurée, le tour n'a pas
+                    # échoué : ni compteur d'échecs rapides, ni attente d'échec
+                    # croissante. On retente au pas court, sans boucle serrée et
+                    # sans dépasser l'échéance du bail (le renouvellement du
+                    # tour suivant doit rester possible) : le verrou est rendu à
+                    # la fin du post-tour du résident.
+                    self.wake.wait(timeout=self.wait_timeout(0.5))
+                    self.wake.clear()
                     continue
                 if reussi:
                     self.fast_failures = 0
@@ -9280,7 +9296,11 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
     owner = attach_owner(cfg.host)
     ttl = max(5.0, ttl or cfg.lease_ttl)
     registry.reap(db, cfg.host)
-    handoff_end = time.monotonic() + attach_mod.HANDOFF_TIMEOUT
+    # #1686 N1 : le budget de passation court à partir du **premier conflit de
+    # verrou**, pas depuis l'entrée dans l'attente du tour : un `--wait` plus
+    # long que le budget ne fait plus refuser (3) un résident qui tient encore
+    # son verrou le temps du post-tour (`_backup_session`, `_sync_memory`).
+    handoff_end = None
     session_guard = None
     while True:
         current = registry.get(db, name) or {}
@@ -9300,6 +9320,8 @@ def _run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool,
         if session_guard is None:
             session_guard = session_lock.try_lock(cfg.agent_dir(name), "session-use")
             if session_guard is None:
+                if handoff_end is None:
+                    handoff_end = time.monotonic() + attach_mod.HANDOFF_TIMEOUT
                 if time.monotonic() >= handoff_end:
                     print("agent %s: resident did not hand back its session; attach refused"
                           % name, file=sys.stderr)
