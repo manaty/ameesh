@@ -172,8 +172,12 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         return _waiting("start", assignee)
     if state == "build":
         return _waiting("build", assignee)
-    # qa : en revue
-    if jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current"):
+    # qa : en revue — approuvé par un verdict `ok` courant, ou dispensé de
+    # re-verdict par le pilote (#1979 : résolution de composition mécanique,
+    # canon §11 bis/#87) ; dans les deux cas la suite est la fusion, et aucun
+    # rappel ne part à un relecteur.
+    if (jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current")) \
+            or jalons.get("verdict_required", True) is False:
         merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
         last = merges[-1] if merges else None
         if last is None or last.get("state") == "cancelled":

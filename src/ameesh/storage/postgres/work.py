@@ -417,18 +417,20 @@ class WorkItems(interface.WorkItems):
                                     why="état %s" % state, actor=actor)
             return rows[0]
 
-    def designate_reviewer(self, item_id, reviewer, *, actor) -> dict | None:
+    def designate_reviewer(self, item_id, reviewer, *, actor, event=None) -> dict | None:
         """#705 : pose (ou change) le relecteur désigné d'un lot en `qa`, et le
         journalise ; None si le lot n'est plus en `qa` (rien d'écrit). La
         colonne vient de la migration 0421 : sans elle, l'écriture est refusée
-        avec la marche à suivre (les lectures, elles, s'en passent)."""
+        avec la marche à suivre (les lectures, elles, s'en passent).
+        #1979 : `reviewer` vide efface la désignation, et `event` remplace la
+        ligne de journal par défaut (retrait, « verdict non requis »)."""
         if not has_reviewer(self.db):
             raise DbError("work_items.reviewer is missing (migration 0421): "
                           "run \"ameesh migrate\", then designate the reviewer")
         with self.db.transaction() as tx:
-            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor)
+            return WorkItems(tx)._designate_reviewer(item_id, reviewer, actor, event)
 
-    def _designate_reviewer(self, item_id, reviewer, actor) -> dict | None:
+    def _designate_reviewer(self, item_id, reviewer, actor, event=None) -> dict | None:
         """`designate_reviewer` dans la transaction ouverte : l'écriture et sa
         ligne de journal ensemble. #705 r2 (B1) : la règle « le relecteur n'est
         pas l'assigné » est relue DANS l'update — l'appelant a lu la ligne
@@ -441,7 +443,8 @@ class WorkItems(interface.WorkItems):
             (reviewer, int(item_id), reviewer))
         if not rows:
             return None
-        self._event(int(item_id), "qa", "reviewer %s designated" % reviewer, actor)
+        self._event(int(item_id), "qa",
+                    event or ("reviewer %s designated" % reviewer), actor)
         return rows[0]
 
     def assign(self, item_id, assignee, *, current, note, actor,
