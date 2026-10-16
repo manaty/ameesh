@@ -213,7 +213,7 @@ effort=…, tier=…, on_event=…)`):
 | `steer(text)` | `user` line written at once: read at the next safe point | `turn/steer` (`expectedTurnId`); refused: a new `turn/start` after the end of the turn | `session/cancel`, then `session/prompt` with the input |
 | `interrupt()` | `control_request` `interrupt` | `turn/interrupt` | `session/cancel` |
 | end of turn | `result` once every input written has been echoed (`--replay-user-messages`) | `turn/completed` | answer to `session/prompt` |
-| `probe()` | process alive | `thread/read` | `session/list` (any answer) |
+| `probe(timeout)` | `control_request` `initialize` sent again, bounded (any answer, a refusal too: alive) | `thread/read` | `session/list` (any answer) |
 | usage | `result.usage`; context of the last call; cost = difference of the cumulative `total_cost_usd` | `thread/tokenUsage/updated.last`, `modelContextWindow` | `usage_update` (`used`, `size`, cumulative cost) |
 
 A turn steered one or more times is **one** logical turn: its `TurnResult`

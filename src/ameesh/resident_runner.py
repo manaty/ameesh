@@ -12,7 +12,10 @@ lease:
   process;
 * `launch_key`: what, when it changes, makes the next turn restart the
   process (model, effort, tier, account, working directory, binary);
-* `refusal`: why a turn stays at one turn per event.
+* `refusal`: why a turn stays at one turn per event;
+* `probe_due` / `mark_alive`: the bounded liveness probe of an idle resident
+  (T3): a process that lives but no longer answers its protocol is stopped,
+  and counted as a resident failure by the runner.
 
 The runner side keeps the invariants of a turn process: the harness group is
 published as `AgentWorker.proc` / `pgid` for the whole life of the process,
@@ -46,6 +49,11 @@ SLEEP_SETTING = "resident_sleep"
 DEFAULT_SLEEP_S = 1800
 #: protocols whose events the ledger reads as they are (see the module doc)
 PROTOCOLS = ("claude-stream-json",)
+#: L76 T3: a resident whose last proof of life is older than this is probed
+#: (bounded) outside its turns, before it serves another one
+PROBE_EVERY_S = 30.0
+#: L76 T3: the bound of one liveness probe (the driver's own timeout)
+PROBE_TIMEOUT_S = resident.PROBE_TIMEOUT
 #: file of the agent's state directory naming the turn in progress, read by
 #: the hook instead of `AMEESH_TURN_ID`, fixed when the process started
 TURN_FILE = "resident-turn"
@@ -164,6 +172,9 @@ class ResidentProcess:
         self.events: queue.Queue = queue.Queue()
         self.started = time.monotonic()
         self.last_used = self.started
+        #: L76 T3: last proof of life — the start handshake, the end of a
+        #: turn, or an answered probe (`mark_alive`)
+        self.probed_at = self.started
         self.turns = 0
         #: its `turn_resources` row (under `life_id`) is open
         self.resource_open = False
@@ -216,6 +227,15 @@ class ResidentProcess:
             if turn.done:
                 break
         yield from self.drain()
+
+    def mark_alive(self) -> None:
+        """L76 T3: a proof of life (the end of a turn, an answered probe)."""
+        self.probed_at = time.monotonic()
+
+    def probe_due(self, now: float | None = None) -> bool:
+        """L76 T3: the last proof of life is old enough to probe it again."""
+        return ((now if now is not None else time.monotonic()) - self.probed_at
+                >= PROBE_EVERY_S)
 
     def kill_now(self) -> None:
         """SIGKILL to the whole group, nothing written before (lost lease).

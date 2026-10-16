@@ -11,3 +11,4 @@
 * [ameesh-approve: three hosting options](ameesh-approve-hebergement-equipes.md) - One WebAuthn identity per team, three hosting modes, switchover without re-enrollment.
 * [Durable host handoffs](../HOST-HANDOFFS.md) - Planner, lot-boundary fence, journal, simulated adapter contract and recovery (L232a).
 * [Explorations](explorations/index.md) - Ideas off the roadmap: problems, intuitions and open questions, with no delivery commitment.
+* [Pilot: the resident agent](../PILOT-RESIDENT-AGENT.md) - Measurement plan of L76: memory, cost over a day, cache on spaced turns, bounded liveness probe, rollback (T3, #285).
