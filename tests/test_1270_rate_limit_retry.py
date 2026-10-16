@@ -536,28 +536,34 @@ class BailTest(_Base):
     TTL = 2.0
     REPRISE = 4.0
 
-    def _worker_court(self, name: str):
+    def _worker_court(self, name: str, ttl: float | None = None):
+        ttl = self.TTL if ttl is None else ttl
         cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=10.0,
                                   budget_check_interval=0.0, poll=0.05)
         runner = Runner(cfg, self.db, once=False)
-        runner.lease_ttl = self.TTL
+        runner.lease_ttl = ttl
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
         self.register(name, "claude", cwd=cwd)
-        lease = registry.claim(self.db, name, runner.runner_id, self.TTL)
+        lease = registry.claim(self.db, name, runner.runner_id, ttl)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
         self.addCleanup(worker.watchdog_stop.set)
         return worker
 
-    def _horloge(self, worker, *, bail_restant: float | None = None):
+    def _horloge(self, worker, *, bail_restant: float | None = None,
+                 oracle: bool = True):
         """Horloge virtuelle et oracle de bail, branchés sur le worker.
 
         `renew` enregistre la marge (`lease_deadline - maintenant`) et refuse,
         comme le vrai, dès qu'elle n'est pas strictement positive ; chaque
         renouvellement accepté repousse l'échéance d'un bail. `wake.wait`
         avance l'horloge du délai demandé : aucune attente réelle, aucune
-        latence de base — le témoin ne dépend plus de l'ordonnancement."""
+        latence de base — le témoin ne dépend plus de l'ordonnancement.
+
+        `oracle=False` garde le **vrai** `renew()` (et son `_renew_call`,
+        bouchonné par le témoin de panne) : l'horloge et le réveil restent
+        virtuels."""
         horloge = {"t": 1000.0}
         renews: list[float] = []
 
@@ -570,7 +576,8 @@ class BailTest(_Base):
             worker.lease_deadline = horloge["t"] + worker.runner.lease_ttl
             return True
 
-        worker.renew = renew
+        if oracle:
+            worker.renew = renew
         worker.lease_deadline = horloge["t"] + (
             worker.runner.lease_ttl if bail_restant is None else bail_restant)
         worker.wake = SimpleNamespace(
@@ -580,15 +587,15 @@ class BailTest(_Base):
             set=lambda: None)
         return horloge, renews
 
-    def _lance(self, worker, *, pick=None, avant_reprise=None):
+    def _lance(self, worker, *, pick=None, avant_reprise=None, renew_call=None):
         """La boucle de service réelle, ses entrées/sorties isolées.
 
         Le veilleur est neutralisé : il lit l'horloge réelle, pas l'horloge
         virtuelle du témoin (#2139). `avant_reprise` est joué par
         `maybe_rotate`, entre le renouvellement de boucle et la lecture de
-        l'échéance de reprise."""
-        return mock.patch.multiple(
-            worker,
+        l'échéance de reprise. `renew_call` remplace l'appel de base (panne
+        simulée) ; `renew()` reste le vrai."""
+        patches = dict(
             ensure_watchdog=mock.Mock(),
             placed_elsewhere=mock.Mock(return_value=""),
             pick=pick or mock.Mock(return_value={"kind": "consigne"}),
@@ -596,10 +603,15 @@ class BailTest(_Base):
             maybe_rotate=(mock.Mock(side_effect=avant_reprise)
                           if avant_reprise else mock.Mock()),
             apply_restart_if_requested=mock.Mock())
+        if renew_call is not None:
+            patches["_renew_call"] = mock.Mock(side_effect=renew_call)
+        return mock.patch.multiple(worker, **patches)
 
-    def _joue(self, worker, horloge, *, pick=None, avant_reprise=None) -> None:
+    def _joue(self, worker, horloge, *, pick=None, avant_reprise=None,
+              renew_call=None) -> None:
         """Exécute la boucle réelle (`run`) sur l'horloge virtuelle, sans attente."""
-        with self._lance(worker, pick=pick, avant_reprise=avant_reprise), \
+        with self._lance(worker, pick=pick, avant_reprise=avant_reprise,
+                         renew_call=renew_call), \
                 mock.patch("ameesh.runner.time.time",
                            side_effect=lambda: horloge["t"]), \
                 mock.patch("ameesh.runner.time.monotonic",
@@ -694,6 +706,90 @@ class BailTest(_Base):
                          "le worker doit reprendre après l'échéance, bail tenu "
                          "(renouvellements : %r)" % (renews,))
         self._verifie_bail(worker, renews, tours, echeance)
+
+    def test_panne_de_base_espace_les_essais_et_reprend(self):
+        """#2139 : sur une panne de base, `renew()` rend True **sans prolonger**
+        le bail. Les essais doivent être espacés (délai court L72) au lieu de
+        boucler à vide, et la cadence nominale reprend au retour de la base.
+
+        Le vrai `renew()` est exercé (`_renew_call` seul est bouchonné) : la
+        boucle `run()` réelle, sur l'horloge virtuelle. TTL 300 s, bail à 50 s
+        de l'échéance — le cas de la sonde mesh-design (#2139)."""
+        worker = self._worker_court("rl9", ttl=300.0)
+        horloge, _ = self._horloge(worker, bail_restant=50.0, oracle=False)
+        tours: list[float] = []
+        appels: list[float] = []
+        echeance = horloge["t"] + 400.0
+        limite = 12
+        pannes = 3
+        worker.rate_limit = rate_limit.RATE_LIMITED
+        worker.rate_limit_streak = 1
+        worker.rate_limit_since = horloge["t"]
+        worker.rate_limit_retry_at = echeance
+        worker.run_turn = lambda spec: (tours.append(horloge["t"]),
+                                        worker.stopping.set(), True)[-1]
+
+        def renew_call():
+            appels.append(horloge["t"])
+            if len(appels) > limite:  # garde-fou : l'ancien code bouclait à vide
+                worker.stopping.set()
+                return True, horloge["t"] + worker.runner.lease_ttl, None
+            if len(appels) <= pannes:
+                return True, None, db_mod.Unavailable("base injoignable (témoin)")
+            return True, horloge["t"] + worker.runner.lease_ttl, None
+
+        self._joue(worker, horloge, renew_call=renew_call)
+        self.assertLessEqual(len(appels), limite,
+                             "les essais de renouvellement bouclent à vide : %r"
+                             % (appels,))
+        # panne : essais espacés du délai court, jamais nuls
+        self.assertEqual([round(b - a, 3) for a, b in zip(appels[:3], appels[1:4])],
+                         [2.0, 2.0, 2.0],
+                         "les essais en panne ne sont pas espacés : %r" % (appels,))
+        # retour de la base : la cadence nominale (ttl/3) reprend
+        self.assertEqual(round(appels[4] - appels[3], 3), 100.0,
+                         "la cadence nominale ne reprend pas : %r" % (appels,))
+        self.assertFalse(worker.lease_lost.is_set(),
+                         "le bail a été perdu pendant la panne")
+        self.assertEqual(worker.renew_failures, 0)
+        self.assertEqual(len(tours), 1)
+        self.assertGreaterEqual(tours[-1], echeance - 0.05,
+                                "le tour ne part pas à l'échéance de reprise")
+
+    def test_panne_de_base_permanente_s_arrete_a_l_echeance(self):
+        """#2139 : panne permanente — les essais restent espacés et s'arrêtent à
+        l'échéance du bail, sans relèvement ni plancher après la deadline."""
+        worker = self._worker_court("rl10", ttl=300.0)
+        horloge, _ = self._horloge(worker, bail_restant=8.0, oracle=False)
+        tours: list[float] = []
+        appels: list[float] = []
+        limite = 12
+        deadline = worker.lease_deadline
+        echeance = deadline + 400.0
+        worker.rate_limit = rate_limit.RATE_LIMITED
+        worker.rate_limit_streak = 1
+        worker.rate_limit_since = horloge["t"]
+        worker.rate_limit_retry_at = echeance
+        worker.run_turn = lambda spec: (tours.append(horloge["t"]),
+                                        worker.stopping.set(), True)[-1]
+
+        def renew_call():
+            appels.append(horloge["t"])
+            if len(appels) > limite:  # garde-fou : l'ancien code bouclait à vide
+                worker.stopping.set()
+                return True, horloge["t"] + worker.runner.lease_ttl, None
+            return True, None, db_mod.Unavailable("base injoignable (témoin)")
+
+        self._joue(worker, horloge, renew_call=renew_call)
+        self.assertLessEqual(len(appels), 6,
+                             "les essais ne s'arrêtent pas à l'échéance : %r"
+                             % (appels,))
+        self.assertLessEqual(max(appels), deadline,
+                             "un essai a lieu après l'échéance du bail : %r"
+                             % (appels,))
+        self.assertTrue(worker.lease_lost.is_set(),
+                        "l'échéance du bail n'a pas arrêté le worker")
+        self.assertEqual(tours, [], "aucun tour ne doit partir sur un bail perdu")
 
 
 class CadenceTest(unittest.TestCase):
