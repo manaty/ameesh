@@ -128,10 +128,13 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
         delay = 30
         state_path = str(Path(recipe["state_dir"]) / "state.json")
         ack_path = str(Path(recipe["ack_dir"]) / "ack.json")
+        launched = False
         while not stop.is_set():
-            # A dead guard ends supervision, including between two windows.
+            # A dead guard ends supervision once we have run, including
+            # between two windows. Before the first launch a stale gate only
+            # waits: at boot the guard may not have renewed its heartbeat yet.
             gate = gate_state(state_path, now())
-            if gate == "stale":
+            if gate == "stale" and launched:
                 return 0
             if gate != "available":
                 stop.wait(1)
@@ -149,6 +152,7 @@ def supervise(recipe: dict, stop: threading.Event, *, launch=subprocess.Popen,
             stopping = None
             try:
                 process = launch(argv)
+                launched = True
                 while process.poll() is None:
                     ack = read_guest_json(ack_path)
                     if ack and ack.get("schema") == "ameesh-host-ack/1":

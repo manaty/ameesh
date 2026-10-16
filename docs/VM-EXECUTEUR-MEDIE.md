@@ -126,7 +126,9 @@ La suite dépend de la cause (#1402) :
   `guard.stopped` et la redémarre après `restart_after_seconds`. Une sortie du
   superviseur avant le `stop_guest` du garde la lui aurait cachée.
 - porte périmée (garde absent ou arrêté) ou signal : le superviseur sort 0,
-  et seul l'opérateur le redémarre.
+  et seul l'opérateur le redémarre. Avant son premier lancement, une porte
+  périmée le fait seulement attendre : au démarrage de la VM, le garde n'a
+  pas encore forcément renouvelé un battement expiré par le redémarrage.
 
 Le journal donne le code brut de l'exécuteur et, pour une fin par signal, le
 nom du signal (`-9 (SIGKILL)`). Une telle fin reste traitée comme une erreur

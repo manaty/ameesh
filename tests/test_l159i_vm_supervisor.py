@@ -336,6 +336,26 @@ class VMSupervisor(unittest.TestCase):
         self.assertEqual(stop.waits, 1, 'stale gate must end the supervisor before another wait')
         self.assertEqual(len(launches), 1)
 
+    def test_stale_gate_at_boot_waits_for_the_guard_instead_of_exiting(self):
+        """The unit starts with the VM, before the guard renews a heartbeat
+        left expired by the reboot: it must wait, not exit for good."""
+        self.state.unlink()
+        launches = []
+        class Stop:
+            waits = 0
+            def is_set(inner):
+                return bool(launches)
+            def wait(inner, _):
+                inner.waits += 1
+                if inner.waits == 2:
+                    self.state.write_text(json.dumps({'schema': 'ameesh-host-state/1',
+                        'state': 'available', 'seq': 2, 'until_ts': 200, 'expires_ts': 190}))
+                return False
+        stop = Stop()
+        self.assertEqual(self.supervise(lambda _: launches.append(1) or Process(0), stop), 0)
+        self.assertEqual(stop.waits, 2)
+        self.assertEqual(launches, [1])
+
     def test_signal_exit_is_logged_with_its_name(self):
         """#1402 N3 : un rc négatif (signal) reste 2, et le journal garde le rc
         brut et le nom du signal."""
