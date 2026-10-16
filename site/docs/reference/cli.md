@@ -349,6 +349,9 @@ ameesh work project-github --app PROJECT [--repo R] [--dry-run]   # one issue pe
 ameesh work resolve <lot> --with <other> [--json]     # prepare a conflict resolution (L160d)
 ameesh work queue add <id> | remove <id> | show [--target BRANCH] [--json]   # merge queue (L160e)
 ameesh work land <id> [--project P] [--json]          # land the queue head (L160e2)
+ameesh release open <id> --base SHA                   # freeze the release perimeter (L750)
+ameesh release check <id> [--repo R] [--json]         # moved base, full suite on the head (L756)
+ameesh release reason <id> --text "…"                 # record why the release base moved after the freeze
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]

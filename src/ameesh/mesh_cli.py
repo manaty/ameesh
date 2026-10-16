@@ -20,7 +20,8 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
   agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
-  agent-mesh work migration <id> [--number N | --release]   reserve the work item's migration number (L122)
+  agent-mesh work migration <id> [--number N | --release] [--skip-branch B]   reserve the work item's migration number (L122)
+  agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -58,7 +59,7 @@ from . import accounts as accounts_mod
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
-from . import fil, signing, storage, work
+from . import fil, release, signing, storage, work
 from .config import Config
 from .db import Db
 from .deprecated import HiddenAliasParser
@@ -215,7 +216,8 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         rows = registry.overview(db)
         # L62 : le projet de chaque agent (équipe, à défaut chantier), en
         # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
-        from .projects import agent_project, project_label
+        # (L243 : la colonne dit « ameesh+1 » quand l'agent en a plusieurs)
+        from .projects import agent_project, agent_project_label, project_label
         for row in rows:
             row["project"] = agent_project(row)
         if args.json:
@@ -246,7 +248,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
             print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
-                row["name"][:20], project_label(row["project"])[:12],
+                row["name"][:20], project_label(agent_project_label(row))[:12],
                 (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
@@ -702,11 +704,13 @@ def _print_host_menage(menage: dict) -> None:
     if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
         ours = conteneurs.get("ameesh") or []
         autres = conteneurs.get("others") or []
+        total = conteneurs.get("others_total")
+        total = len(autres) if total is None else total
         print("  containers %d started by an ameesh turn%s; %d other(s) reported%s" % (
             len(ours),
             " (%s)" % "; ".join("%s: %s" % (c["path"], c.get("detail") or c["action"])
                                  for c in ours[:3]) if ours else "",
-            len(autres),
+            total,
             " (never removed: %s)" % "; ".join(c["command"] for c in autres[:5])
             if autres else ""))
     faits = menage.get("last_24h") or []
@@ -733,6 +737,11 @@ def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh ci status` (L161c) : voir `ameesh.ci.cmd_ci`."""
     from . import ci
     return ci.cmd_ci(cfg, args)
+
+
+def cmd_release(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh release open|check|reason` (L750/L756) : voir `ameesh.release`."""
+    return release.run(cfg, args)
 
 
 def cmd_housekeeping(cfg: Config, args: argparse.Namespace) -> int:
@@ -1202,7 +1211,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
         return
-    if args.work_command in (*_OWN_ACTOR, "set-app", "backfill-app") or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -1578,7 +1587,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "migration":
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
-                                          repo=args.repo, actor=args.actor, cfg=cfg)
+                                          repo=args.repo, actor=args.actor, cfg=cfg,
+                                          skip_branches=tuple(args.skip_branch or ()))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             elif item.get("migration") is None:
@@ -1624,6 +1634,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import work_projects
             item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
             print("lot #%d: project %s" % (item["id"], item["app"]))
+            return 0
+        if args.work_command == "issue-ref":
+            if bool(args.ref) == bool(args.none):
+                raise work.WorkError("issue-ref: pass owner/repo#N, or --none to clear")
+            item = work.set_issue_ref(db, args.id, None if args.none else args.ref,
+                                      actor=args.actor, cfg=cfg)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                print("lot #%d: issue_ref %s" % (item["id"], item.get("issue_ref") or "—"))
             return 0
         if args.work_command == "backfill-app":
             from . import work_projects
@@ -2269,6 +2289,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_ci_status.add_argument("--json", action="store_true", help="`ameesh-ci-status/1` report")
     p_ci_status.set_defaults(func=cmd_ci)
 
+    # L750/L756 : le périmètre d'une release et sa porte (`ameesh release`)
+    release.add_parser(sub, cmd_release)
+
     p_models = sub.add_parser("models", help="model catalog (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
 
@@ -2438,6 +2461,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "worktree and branches count (default: the clone declared in "
                              "radar.projects, else the current git repository; its origin "
                              "must be the lot's repository)")
+    pw_mig.add_argument("--skip-branch", action="append", default=None, metavar="BRANCH",
+                        help="also ignore this branch in the scan, in addition to the lot's own "
+                             "branch (repeatable): the integration branch of a package being "
+                             "composed, whose renumbered files must not count against the "
+                             "reservation (#1603)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")
@@ -2525,6 +2553,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_app.add_argument("--actor", default="",
                         help="human, orchestrator or design agent; default: bound session")
     pw_app.set_defaults(func=cmd_work)
+    pw_iref = work_sub.add_parser(
+        "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
+    pw_iref.add_argument("id", type=int)
+    pw_iref.add_argument("ref", nargs="?", default=None,
+                         help="the new reference, owner/repo#N (default: keep, use --none to clear)")
+    pw_iref.add_argument("--none", action="store_true",
+                         help="clear the issue reference (the lot stays where it is)")
+    pw_iref.add_argument("--json", action="store_true")
+    pw_iref.add_argument("--actor", default="",
+                         help="human, orchestrator or design agent; default: bound session")
+    pw_iref.set_defaults(func=cmd_work)
     pw_backfill = work_sub.add_parser("backfill-app", help="fill uniquely inferred projects of open lots")
     pw_backfill.add_argument("--dry-run", action="store_true")
     pw_backfill.add_argument("--actor", default="")

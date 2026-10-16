@@ -31,6 +31,7 @@ import argparse
 import dataclasses
 import getpass
 import json
+import math
 import os
 import queue
 import shutil
@@ -179,6 +180,8 @@ DEAD_LETTER_SWEEP_EVERY_S = 3600.0
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
 LIVE_REVIEW_START_SLACK_S = 300.0
+#: L85 : rétention du journal d'événements, au plus une fois par heure
+EVENTS_PRUNE_EVERY_S = 3600.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -5363,6 +5366,9 @@ class Runner:
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
+        #: L85 : dernière rétention du journal d'événements (monotone), son erreur
+        self._events_pruned_at: float | None = None
+        self._events_prune_error: str | None = None
         #: L159f : porte d'hôte — None sans porte (hôte classique : rien ne
         #: change). Celle de la configuration dès maintenant ; celle d'un hôte
         #: prêteur (fiche Host avec `policy.lend`) au premier `canon sync`,
@@ -5665,10 +5671,63 @@ class Runner:
                              " [dry-run]" if row.get("dry_run") else ""))
         return done
 
+    def prune_events_once(self, now: float | None = None) -> int | None:
+        """L85 : rétention du journal `ameesh_events` (0033 §9), au plus une
+        fois par heure et par exécuteur, bornée (`PRUNE_MAX_BATCHES` lots,
+        `PRUNE_MAX_S` secondes ; le reste à l'heure suivante) ; rien en dry-run
+        ni en exécuteur médié (le journal est au serveur du mesh). Une erreur
+        (base, réglage) est journalisée une fois, jamais fatale à la passe.
+
+        #928/F6 : l'élagage passe par sa PROPRE connexion. Sa transaction
+        (jusqu'à `PRUNE_MAX_S`, avec verrous et délais) tiendrait sinon le
+        verrou de transaction de la connexion partagée de l'exécuteur, sur
+        lequel les renouvellements de bail attendent."""
+        from . import events as events_mod
+
+        now = time.monotonic() if now is None else now
+        if self.dry_run or getattr(self, "mediated", False) or (
+                self._events_pruned_at is not None
+                and now - self._events_pruned_at < EVENTS_PRUNE_EVERY_S):
+            return None
+        self._events_pruned_at = now
+        db, own = self.db, None
+        if getattr(self, "cfg", None) is not None:
+            try:
+                own = db_mod.open_db(self.cfg)
+            except db_mod.DbError as exc:
+                message = "event log retention not applied (%s)" % exc
+                if message != self._events_prune_error:
+                    log_async(message)
+                self._events_prune_error = message
+                return None
+            db = own
+        try:
+            gone = events_mod.prune(db, max_batches=events_mod.PRUNE_MAX_BATCHES,
+                                    max_s=events_mod.PRUNE_MAX_S)
+            # rien supprimé alors qu'il reste des événements expirés : la
+            # rétention est bloquée (jamais un 0 silencieux)
+            left = 0 if gone else events_mod.expired(db)
+            if left:
+                raise ValueError("%d expired event(s) left, none deleted" % left)
+        except (db_mod.DbError, ValueError) as exc:
+            message = "event log retention not applied (%s)" % exc
+            if message != self._events_prune_error:
+                log_async(message)
+            self._events_prune_error = message
+            return None
+        finally:
+            if own is not None:
+                own.close()
+        self._events_prune_error = None
+        if gone:
+            log_async("event log: %d event(s) past retention deleted" % gone)
+        return gone
+
     def sweep(self) -> None:
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
+        self.prune_events_once()   # L85 : après la moisson des baux, bornée
         finished = []
         with self.lock:
             for name, worker in list(self.workers.items()):
@@ -6530,9 +6589,10 @@ class Runner:
         housekeeping pass: entries older than `thread_retention_days` leave
         this host's thread files. Never raises.
 
-        L361b : l'hôte médié n'a pas de transaction ; la connexion de
-        l'exécuteur (`self.db`) porte l'opération serveur `threads.recount`,
-        qui verrouille, recompte et expire en une seule fois."""
+        L361b : a mediated host has no transaction; the executor connection
+        (`self.db`) carries the server operation `threads.recount`, which
+        locks, counts again and expires in one shot. When it has to open one
+        itself, it closes it; a connection it was given is left open."""
         now = time.time() if now is None else now
         # the day counted on the monotonic clock (r8), the wall clock kept
         # for the retention thresholds
@@ -6541,35 +6601,40 @@ class Runner:
         if due is not None and tick < due:
             return None
         self._threads_expire_next = tick + 86400.0
+        created = None
         if db is None:
             db = getattr(self, "db", None)
         if db is None and not self.dry_run and fil.expiry_unavailable(self.cfg, None):
-            # L361b : un hôte médié n'a pas de ménage local ; sa connexion
-            # d'exécuteur porte `threads.recount`. Sans elle, rien n'expire.
+            # L361b: a mediated host has no local housekeeping; its executor
+            # connection carries `threads.recount`. Without it, nothing expires.
             try:
-                db = db_mod.connect(self.cfg)
+                db = created = db_mod.connect(self.cfg)
             except db_mod.DbError as exc:
                 log_async("thread expiry skipped: index unavailable (%s)"
                           % " ".join(str(exc).split())[:200])
                 return None
         try:
-            reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
-        except fil.ExpiryUnavailable as exc:  # said once per pass
-            log_async("thread expiry skipped: %s" % exc)
-            return None
-        except Exception as exc:  # never fatal for the runner
-            log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
-            return None
-        for report in reports:
-            if report.get("error") or report.get("held"):
-                log_async("thread expiry %s: %s" % (report["thread"],
-                                                     report.get("error") or report["held"]))
-            if report["dropped"]:
-                log_async("thread %s: %d entr%s before %s %s, %d kept" % (
-                    report["thread"], report["dropped"],
-                    "y" if report["dropped"] == 1 else "ies", report["before"],
-                    "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
-        return reports
+            try:
+                reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
+            except fil.ExpiryUnavailable as exc:  # said once per pass
+                log_async("thread expiry skipped: %s" % exc)
+                return None
+            except Exception as exc:  # never fatal for the runner
+                log_async("thread expiry failed (%s: %s)" % (type(exc).__name__, exc))
+                return None
+            for report in reports:
+                if report.get("error") or report.get("held"):
+                    log_async("thread expiry %s: %s" % (report["thread"],
+                                                         report.get("error") or report["held"]))
+                if report["dropped"]:
+                    log_async("thread %s: %d entr%s before %s %s, %d kept" % (
+                        report["thread"], report["dropped"],
+                        "y" if report["dropped"] == 1 else "ies", report["before"],
+                        "would expire [dry-run]" if self.dry_run else "expired", report["kept"]))
+            return reports
+        finally:
+            if created is not None:      # only the connection opened here
+                created.close()
 
     def sweep_dead_letters_once(self, db, now: float | None = None,
                                 clock: float | None = None) -> dict | None:
@@ -7275,7 +7340,8 @@ class Runner:
         étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
         Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
         réutilisé ; les zombies seuls ne comptent pas), processus à
-        l'environnement illisible lancé après la ligne, moteur muet, table
+        l'environnement illisible lancé pendant le tour (marges comprises ;
+        sans fin connue, tout lancement depuis son début), moteur muet, table
         des processus ou démarrage de l'hôte inconnus. Pas avant le feu vert
         du démarrage (`_boot_settle_ready` :
         un conteneur relancé par sa politique peut manquer encore). Une ligne
@@ -7325,16 +7391,29 @@ class Runner:
                     % (exc, int(LIVE_REVIEW_EVERY_S)))
                 return []
             unread = scan["unread"]
-            if None in unread:
+            if any(stamp is None or not math.isfinite(stamp) for stamp in unread):
                 log("turn resources not settled: a process with an unreadable "
                     "environment and no start time; next review in %ds"
                     % int(LIVE_REVIEW_EVERY_S))
                 return []
-            latest = max(unread, default=None)
+            def unread_may_belong(row: dict) -> bool:
+                if not unread:
+                    return False
+                start, end = row.get("started_ts"), row.get("ended_ts")
+                if start is None or not math.isfinite(start):
+                    return True  # no lower bound proves a process unrelated
+                if end is not None and (not math.isfinite(end) or end < start):
+                    return True
+                # #1266: inspect EVERY start, not just the latest: a process
+                # after the end must not hide a possible survivor born inside.
+                # An unfinished turn retains #339's unbounded upper interval.
+                return any(stamp >= start - LIVE_REVIEW_START_SLACK_S
+                           and (end is None or stamp <= end + LIVE_REVIEW_START_SLACK_S)
+                           for stamp in unread)
+
             candidates = [row for row in candidates
                           if row["turn_id"] not in scan["values"]
-                          and (latest is None or row.get("started_ts") is None
-                               or latest < float(row["started_ts"]) - LIVE_REVIEW_START_SLACK_S)]
+                          and not unread_may_belong(row)]
             if not candidates:
                 return []
             engines, silent = containers_mod.all_runtimes(self.cfg)

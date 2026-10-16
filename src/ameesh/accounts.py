@@ -25,12 +25,16 @@ Types de profil :
 
 * `config_dir` : un dossier de configuration du harnais, passé par
   `CLAUDE_CONFIG_DIR` (Claude Code), `CODEX_HOME` (Codex) ou `DSH_HOME`
-  (DeepSeek Harness). Sans `path`, c'est le dossier que le harnais prendrait
-  de lui-même dans l'environnement de l'exécuteur (variable héritée, sinon
-  son dossier par défaut) ; ses jauges y sont lues. Un dossier
+  (DeepSeek Harness). Sans `path`, c'est le **dossier par défaut du harnais**
+  (`~/.claude`, `~/.codex`, `~/.dsh`) — jamais celui que l'environnement de
+  l'exécuteur désigne : un compte déclaré n'hérite pas du compte ambiant
+  (L1078), sans quoi deux profils pouvaient se disputer le même dossier et
+  les mêmes jauges. Ses jauges y sont lues. Un dossier
   déclaré doit appartenir à l'utilisateur et être privé (0700) ; ses
   identifiants doivent être présents (présence seulement : ameesh ne lit
-  jamais leur contenu).
+  jamais leur contenu). Un profil synthétique (hors configuration, nom
+  `(default)` : session d'avant L30, hôte sans comptes déclarés) garde, lui,
+  le dossier de l'environnement de l'exécuteur.
 * `api_key_env` : une clé d'API passée au harnais par une variable
   d'environnement (`env`, par défaut `DEEPSEEK_API_KEY` pour DeepSeek). La clé
   vient d'une variable de l'environnement de l'exécuteur (`key_env`) ou d'un
@@ -61,19 +65,28 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    relevé compte pour 0 % utilisé, donc passe en premier ; à égalité, la
    capacité inutilisée qui **expire le plus tôt** (`expiry`, la règle 0034 du
    matin), puis l'ordre déclaré ;
-4. sinon pause : tous les comptes sont au seuil.
+4. sinon pause : tous les comptes sont au seuil, ou écartés faute d'un relevé
+   assez récent pour placer (voir « Fraîcheur du relevé »).
 
 **Fraîcheur du relevé** (#1561) : un relevé **périmé** — une fenêtre datée
 s'est remise à zéro depuis la lecture (typiquement la fenêtre de 5 h) alors
 qu'une autre court encore (les 7 jours) — n'est plus un instantané courant de
 l'état du compte : la fenêtre encore ouverte n'en est qu'une borne
 inférieure, le compte a pu servir depuis. Un tel compte est **non vérifié** :
-il ne passe jamais avant un compte à relevé courant, quel que soit l'ordre de
-bascule (étape 3, `rank`), et sa raison le dit (`explain`) au lieu d'annoncer
-un « 30 % utilisé » trompeur ; il reste utilisable, et sans compte vérifié il
-est essayé (L71, « essayé, pas écarté ») — son premier tour rapporte sa
-jauge. Un relevé **absent** garde la règle L117 : un compte jamais utilisé
-compte pour 0 % et passe en premier, pour ne pas laisser un forfait inutilisé.
+il ne passe jamais avant un compte à relevé courant, et sa raison le dit
+(`explain`) au lieu d'annoncer un « 30 % utilisé » trompeur ; il reste
+**essayé** faute de mieux (L71), son premier tour rapportant sa jauge.
+#1672 **borne cet essai** : un relevé plus vieux que ce qui reste de
+**chaque** fenêtre encore ouverte est une information trop ancienne pour
+engager un tour — prudence, pas preuve d'un quota atteint —, le compte est
+écarté du placement (`rank`) et, sans compte plaçable, le choix **pause** ; la
+remise à zéro qui motive la pause le rouvre (L71, 0 %). Le 15/10, le choix
+automatique a pris un compte Claude à sa limite hebdomadaire sur la foi d'un
+relevé de 30 % vieux de quatre jours. La **continuité** garde son chemin —
+une session déjà sur le compte y reste, c'est son tour qui rapporte la jauge —,
+et un forçage manuel reste souverain. Un relevé **absent** garde la règle
+L117 : un compte jamais utilisé compte pour 0 % et passe en premier, pour ne
+pas laisser un forfait inutilisé.
 Le relevé porte son horodatage (`Gauge.read_at`) : marqueur de compte Claude,
 date du journal de session Codex.
 
@@ -107,8 +120,11 @@ Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
 Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
 de compte qui précède chaque tour ; Codex : les journaux de session du
 `CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
-0 % (`Gauge.used_at`, L71) : un compte sans relevé courant est essayé, pas
-écarté — son premier tour rapporte sa jauge.
+0 % (`Gauge.used_at`, L71) ; une fois **toutes** les fenêtres datées remises à
+zéro, le relevé redevient courant (0 %) et le compte replaçable. Un relevé
+seulement **partiel** ne place plus de session quand il est plus vieux que
+toute fenêtre encore ouverte (#1672, « Fraîcheur du relevé ») ; en deçà, il
+reste plaçable après les relevés courants.
 
 Chaque choix porte sa raison (`Choice.why`, « no reading: unverified, le plus
 en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
@@ -132,7 +148,7 @@ from typing import Callable, NamedTuple
 
 from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
-from .cost import PACE_CEILING, stale_reading
+from .cost import PACE_CEILING, reading_outdated, stale_reading
 
 #: #1469: a billing account id (`openai-manaty`), the same on every host
 BILLING_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -205,6 +221,22 @@ def _all_account_keys(key: str) -> set[str]:
         _account_key(ident, key) for ident in harnesses.known_ids()) if value}
 
 
+def _expand_home(path: str, environ=None) -> str:
+    """Résout `~` avec le HOME de `environ` (l'environnement de l'exécuteur),
+    sinon celui du processus : un dossier de compte se lit dans *cet*
+    environnement, et un `~` n'y désigne pas le même utilisateur."""
+    environ = os.environ if environ is None else environ
+    home = environ.get("HOME") or ""
+    if home and (path == "~" or path.startswith("~/")):
+        if path == "~":
+            resolved = home
+        elif home == "/":
+            resolved = "/" + path[2:]
+        else:
+            resolved = home.rstrip("/") + path[1:]
+        return os.path.abspath(resolved)
+    return os.path.abspath(os.path.expanduser(str(path)))
+
 
 class AccountError(ValueError):
     """Configuration des comptes invalide, ou profil inutilisable."""
@@ -251,6 +283,11 @@ class Profile:
     pace_ceiling: float = PACE_CEILING
     pace_ceiling_end: float | None = None
     pace_ceiling_end_hours: float = PACE_CEILING_END_HOURS
+    #: Vrai pour un profil issu de la configuration de l'hôte (`parse`) : un
+    #: profil déclaré sans `path` désigne le dossier par défaut du harnais, pas
+    #: celui de l'environnement de l'exécuteur (L1078). Faux pour un profil
+    #: synthétique (« (default) » : hôte sans comptes, session d'avant L30).
+    declared: bool = False
 
     @property
     def default(self) -> bool:
@@ -260,18 +297,25 @@ class Profile:
     def home(self, environ=None) -> str:
         """Le dossier de configuration effectif du harnais pour ce compte.
 
-        Sans `path` (compte par défaut, ou clé d'API) : celui que le harnais
-        prendrait de lui-même dans l'environnement de l'exécuteur — sa variable
-        (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `DSH_HOME`) si elle est posée,
-        sinon son dossier par défaut. C'est aussi là que `launch_env` le lance
-        et que ses jauges sont lues (un seul mécanisme).
+        * dossier déclaré (`path`) : ce dossier ;
+        * **compte déclaré sans dossier** : le dossier par défaut du harnais
+          (`~/.claude`, `~/.codex`, `~/.dsh`), jamais la variable de
+          l'environnement de l'exécuteur — un compte déclaré n'hérite pas du
+          compte ambiant (L1078) ;
+        * profil synthétique (hors configuration, `(default)`) ou clé d'API :
+          celui que le harnais prendrait de lui-même dans l'environnement de
+          l'exécuteur — sa variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+          `DSH_HOME`) si elle est posée, sinon son dossier par défaut. C'est
+          aussi là que `launch_env` le lance et que ses jauges sont lues
+          (un seul mécanisme).
         """
         if self.kind == "config_dir" and self.path:
             return self.path
         environ = os.environ if environ is None else environ
+        if self.kind == "config_dir" and self.declared:
+            return _expand_home(default_home_of(self.harness), environ)
         inherited = environ.get(config_env_of(self.harness)) or ""
-        return os.path.abspath(os.path.expanduser(
-            inherited or default_home_of(self.harness)))
+        return _expand_home(inherited or default_home_of(self.harness), environ)
 
     def session_store(self) -> str:
         """Le dossier des sessions du harnais pour ce compte (chemin résolu)."""
@@ -477,7 +521,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
                 priority=priority, overage=overage, **caps,
-                pace_multiplier=pace_multiplier,
+                pace_multiplier=pace_multiplier, declared=True,
                 billing_account=billing, reserve_usd=reserve,
                 pace_ceiling=pace_ceiling,
                 pace_ceiling_end=pace_ceiling_end,
@@ -604,9 +648,14 @@ def launch_env(env: dict, declared: dict[str, list[Profile]], profile: Profile |
         env.pop(name, None)
     if profile is not None:
         variable = config_env_of(profile.harness)
-        if variable and profile.path == "" and environ.get(variable):
-            # compte sans dossier déclaré : le dossier hérité de l'exécuteur
-            # pour CE harnais (pas celui d'un autre harnais, ni d'un autre compte)
+        if (variable and profile.path == "" and environ.get(variable)
+                and not (profile.declared and profile.kind == "config_dir")):
+            # profil synthétique ou clé d'API : le dossier hérité de
+            # l'exécuteur pour CE harnais (pas celui d'un autre harnais, ni
+            # d'un autre compte). Un compte déclaré sans dossier, lui, désigne
+            # le dossier par défaut du harnais : la variable reste retirée
+            # (`auth_variables`), donc le harnais prend son dossier par défaut
+            # — jamais celui du compte ambiant (L1078).
             env[variable] = environ[variable]
         apply_env(env, profile, environ)
 
@@ -617,11 +666,13 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     Le profil est **validé ici, au lancement** (dossier 0700 et identifiants
     présents, fichier de clé 0600, variable présente), quel que soit l'état de
     la garde de budget : un profil devenu invalide depuis le choix refuse le
-    tour. `config_dir` : la variable du dossier ; pour le compte par
-    défaut (sans chemin), le dossier hérité de l'exécuteur est conservé par
-    `launch_env`. `api_key_env` : la clé, lue dans la variable de l'exécuteur ou le
-    fichier privé. La clé ne quitte cette fonction que dans `env` ; un échec
-    lève `AccountError` sans jamais citer la clé.
+    tour. `config_dir` : la variable du dossier pour un dossier déclaré ;
+    un compte déclaré sans dossier garde la variable absente (le harnais prend
+    son dossier par défaut, L1078), un profil synthétique garde le dossier
+    hérité de l'exécuteur (`launch_env`). `api_key_env` : la clé, lue dans la
+    variable de l'exécuteur ou le fichier privé. La clé ne quitte cette
+    fonction que dans `env` ; un échec lève `AccountError` sans jamais citer
+    la clé.
     """
     environ = os.environ if environ is None else environ
     problems = check(profile, environ)
@@ -632,7 +683,9 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     if profile.kind == "config_dir":
         if not profile.default and variable:
             env[variable] = profile.path
-        # compte par défaut : `env` garde le dossier hérité (voir `launch_env`)
+        # compte par défaut : la variable du dossier reste absente (profil
+        # déclaré : dossier par défaut du harnais) ou héritée (profil
+        # synthétique, voir `launch_env`)
         return
     if profile.key_file:
         try:
@@ -714,18 +767,52 @@ class Evaluation:
         return not self.hard
 
 
-def gauges_of(book, profile: Profile, items: list[Profile]) -> list:
-    """Les jauges de forfait du compte, lues dans SES journaux."""
+def default_home(harness: str, environ=None) -> str:
+    """Le dossier de configuration par défaut du harnais (`~/.claude`,
+    `~/.codex`, `~/.dsh`), `~` résolu dans `environ` s'il est fourni."""
+    return _expand_home(default_home_of(harness), environ)
+
+
+def primary_of(harness: str, items: list[Profile], environ=None) -> Profile | None:
+    """Le compte « par défaut » du harnais parmi les profils déclarés (L1078).
+
+    C'est celui dont le dossier de configuration est le dossier par défaut du
+    harnais — jamais le premier de la liste, jamais celui que l'environnement
+    de l'exécuteur désigne. Les relevés Claude sans marqueur de compte
+    (sessions d'avant L30) ne sont attribués qu'à lui : une liste réduite au
+    seul secondaire ne les lui prend pas.
+    """
+    cible = os.path.realpath(default_home(harness, environ))
+    for profile in items:
+        if profile.kind != "config_dir":
+            continue
+        if os.path.realpath(profile.home(environ)) == cible:
+            return profile
+    return None
+
+
+def gauges_of(book, profile: Profile, items: list[Profile], environ=None) -> list:
+    """Les jauges de forfait du compte, lues dans SES journaux (L1078).
+
+    Le primaire d'un relevé Claude est le compte **par défaut du harnais**
+    (`primary_of`), pas le premier profil de la liste. Un compte Codex est lu
+    dans son propre dossier de sessions : le dossier par défaut du harnais
+    pour un profil déclaré sans dossier, jamais le `CODEX_HOME` ambiant de
+    l'exécuteur, qui peut être celui d'un autre compte.
+    """
     if profile.harness == "claude":
-        return book.claude_gauges(account=profile.name, primary=items[0].name)
+        primary = primary_of(profile.harness, items, environ)
+        return book.claude_gauges(account=profile.name,
+                                  primary=primary.name if primary is not None else None)
     if profile.harness == "codex":
         # Un seul mécanisme (cost.CostBook) : argument > AMEESH_CODEX_SESSIONS >
-        # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte déclaré a son
-        # CODEX_HOME : ses sessions sont passées en argument. Le compte par
-        # défaut est celui de l'environnement : le mécanisme sans argument.
-        if profile.default:
-            return book.codex_gauges()
-        return book.codex_gauges(sessions=os.path.join(profile.home(), "sessions"))
+        # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte qui désigne un
+        # dossier (déclaré, ou synthétique avec `path`) lit SES sessions ; le
+        # profil synthétique sans dossier garde le mécanisme de l'exécuteur.
+        if profile.declared or profile.path:
+            return book.codex_gauges(
+                sessions=os.path.join(profile.home(environ), "sessions"))
+        return book.codex_gauges()
     return []
 
 
@@ -928,7 +1015,9 @@ def _release(profile: Profile, depasses, hard, now: float,
 
     `ceilings` (#1176) : le plafond effectif de chaque fenêtre. Un relèvement
     de fin de fenêtre déjà prouvé peut libérer la fenêtre avant sa remise à
-    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro.
+    zéro : c'est cette heure-là qu'on annonce, pas la remise à zéro — mais
+    seulement quand le rythme y a rejoint l'usage ; sinon la fenêtre reste
+    tenue jusqu'au croisement du rythme sous le plafond relevé (#1227 N1).
     """
     dated = []
     for gauge in depasses:
@@ -949,7 +1038,17 @@ def _release(profile: Profile, depasses, hard, now: float,
             if (ceiling is not None and ceiling.from_ts is not None
                     and ceiling.end is not None and ceiling.from_ts > now
                     and gauge.used_at(now) < ceiling.end - cut):
-                free = min(free, ceiling.from_ts)
+                # #1227 (N1) : `from_ts` n'est annoncé que si le rythme y
+                # dépasse déjà l'usage ; sinon la fenêtre reste tenue après le
+                # relèvement, et l'heure est le croisement sous le plafond
+                # relevé (`free_at` avec `end`), qui tombe alors après
+                # `from_ts`. Un croisement déjà atteint avant le relèvement
+                # (`free < from_ts`) reste l'heure annoncée : `free_at` ne
+                # dépend pas du plafond tant que l'usage reste sous lui.
+                crossing = gauge.free_at(now, cut, profile.pace_multiplier,
+                                         ceiling.end)
+                if crossing is not None and free >= ceiling.from_ts:
+                    free = max(ceiling.from_ts, crossing)
         dated.append((free, gauge))
     return max(dated, key=lambda pair: pair[0])
 
@@ -973,7 +1072,7 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if result.problems:
         result.reason = "unusable profile: %s" % "; ".join(result.problems)
         return result
-    result.gauges = gauges_of(book, profile, items)
+    result.gauges = gauges_of(book, profile, items, environ)
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
@@ -1176,9 +1275,28 @@ def explain(result: Evaluation, now: float) -> str:
     return "%s %.0f%% used (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
+def placeable(result: Evaluation, now: float) -> bool:
+    """#1672 : ce relevé autorise-t-il le **placement** d'une session ?
+
+    Un relevé **partiel** (une fenêtre datée remise à zéro, une autre encore
+    ouverte) reste plaçable tant que son âge ne dépasse pas ce qui reste de
+    **chaque** fenêtre encore ouverte (`cost.reading_outdated`) : au-delà,
+    c'est une information trop ancienne pour engager un tour — le 15/10, un
+    relevé de 30 % vieux de quatre jours a envoyé un tour sur un compte Claude
+    à sa limite hebdomadaire. C'est une **prudence**, pas la preuve d'un quota
+    atteint : le relevé n'est qu'une borne inférieure, et la remise à zéro qui
+    rend la pause nécessaire la rouvre (L71, 0 %).
+
+    Oui pour un relevé **absent** (L117 : un compte jamais utilisé passe en
+    premier), pour un relevé **courant** et pour un relevé dont toutes les
+    fenêtres datées sont échues (L71, 0 %). La continuité et le forçage ne
+    passent pas par ici."""
+    return not result.gauges or not reading_outdated(result.gauges, now)
+
+
 def rank(items: list[Profile], evaluations: dict, now: float, *,
          paced: bool = True) -> list[Profile]:
-    """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
+    """Les comptes plaçables, du premier à consommer au dernier (0034 amendée).
 
     Clé (#1561) : d'abord un relevé **courant** — un compte dont le relevé est
     périmé (une fenêtre remise à zéro depuis la lecture, une autre encore
@@ -1189,16 +1307,26 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
     fenêtre en cours, après) ; puis l'ordre déclaré.
 
+    #1672 : ce dernier recours est **borné**. Un relevé plus vieux que ce qui
+    reste de chaque fenêtre encore ouverte (`cost.reading_outdated`) est une
+    information trop ancienne pour engager un tour : il **écarte** le compte du
+    placement — le 15/10, le choix automatique a pris un compte Claude à sa
+    limite hebdomadaire sur la foi d'un relevé de 30 % vieux de quatre jours,
+    et le tour a été refusé ; sans compte plaçable, le choix pause. La
+    continuité (`choose`, étape 2) garde son chemin : une session déjà sur le
+    compte y reste et son tour rapporte la jauge ; un forçage manuel reste
+    souverain.
+
     Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
     un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
-    laisser un forfait inutilisé ; c'est le seul cas où l'absence passe avant
-    un relevé courant. Un compte non vérifié (relevé périmé) reste utilisable :
-    sans compte vérifié il est essayé (L71, « essayé, pas écarté »), et son
-    premier tour rapporte sa jauge.
+    laisser un forfait inutilisé. Un relevé dont **toutes** les fenêtres
+    datées sont remises à zéro est courant (L71, 0 %) : le compte est
+    replaçable.
 
     `paced=False` (garde de budget désactivée) : un compte au seuil de son
     rythme reste utilisable, jamais un compte écarté par une règle absolue
-    (`Evaluation.hard`)."""
+    (`Evaluation.hard`) — ni un compte à relevé trop ancien, dont l'état réel
+    est inconnu."""
     def key(pair):
         index, profile = pair
         result = evaluations[profile.name]
@@ -1209,15 +1337,18 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
         return (1 if unverified else 0,
                 priority(profile), round(lag(gauges, now, result.limits)[0], 6),
                 found[0] if found is not None else float("inf"), index)
+
     usable = [(i, p) for i, p in enumerate(items)
-              if (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
+              if placeable(evaluations[p.name], now)
+              and (evaluations[p.name].ok if paced else evaluations[p.name].unpaced_ok)]
     return [p for _i, p in sorted(usable, key=key)]
 
 
 def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
     « no reading: unverified, tried first (L117) ; avant : primaire seven_day
-    35 % utilisé (rythme 55 %) »."""
+    35 % utilisé (rythme 55 %) ». Un relevé périmé (#1561) n'apparaît que
+    faute de relevé courant, et le dit."""
     first = ranked[0]
     gauges = evaluations[first.name].gauges
     if not gauges:
@@ -1228,6 +1359,8 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     elif stale_reading(gauges, now):
         # #1561 : aucun relevé courant n'est disponible ; il est essayé faute
         # de mieux (L71), pas choisi sur un rythme qui n'est plus mesuré.
+        # #1672 ne l'écarte que lorsqu'il est plus vieux que toute fenêtre
+        # encore ouverte (`placeable`) ; ici il reste dans le rang.
         why = "%s, tried (no current reading)" % explain(evaluations[first.name], now)
     elif len(ranked) > 1 and priority(first) < priority(ranked[1]):
         # L226b: the failover order decided, not the pace
@@ -1327,8 +1460,11 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             return held
         # L226b (bureau, 2026-10-12): a forced account at its threshold does
         # not hold the agent while another healthy account is under its own —
-        # the force is lifted (journaled `auto`) and the automatic choice runs
+        # the force is lifted (journaled `auto`) and the automatic choice runs.
+        # #1672 : le remplaçant doit être réellement plaçable — un compte à
+        # relevé périmé ne lève pas le forçage pour une pause.
         free = [p for p in candidates if p.name != active.name
+                and placeable(ev(p), now)
                 and (ev(p).ok if paced else ev(p).unpaced_ok)]
         if critical:
             pass        # L242b : choix propre à l'agent, le forçage reste aux autres
@@ -1388,8 +1524,26 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                               harness, "; ".join("%s: %s" % (p.name, sick[p.name].get(
                                   "reason") or "authentication failing")
                                   for p in items if p.name in sick)))
-        return Choice(None, active, reason="%sall %s accounts at threshold — %s"
-                      % (pause_label(cache), harness, _label(cache)))
+        # #1672 : un relevé plus vieux que toute fenêtre encore ouverte est
+        # écarté du placement — le dire, plutôt que de le compter comme « au
+        # seuil » (le relevé ne mesure plus l'état du compte). C'est une
+        # prudence sur une information ancienne, pas la preuve d'un quota.
+        # la remise à zéro la plus proche d'une fenêtre encore ouverte rouvre
+        # le compte (L71) : l'annoncer, comme pause_label le fait au seuil
+        from .cost import until_label
+        withheld = ["%s until %s" % (p.name, until_label(min(
+                        float(g.resets_at) for g in cache[p.name].gauges
+                        if g.resets_at and not g.reset_passed(now)), now))
+                    for p in items
+                    if p.name not in sick and cache[p.name].gauges
+                    and reading_outdated(cache[p.name].gauges, now)]
+        why = "%sall %s accounts at threshold — %s" % (
+            pause_label(cache), harness, _label(cache))
+        if withheld:
+            why = ("%sno %s account to place: reading older than every open "
+                   "window (%s) — %s" % (pause_label(cache), harness,
+                                         ", ".join(withheld), _label(cache)))
+        return Choice(None, active, reason=why)
     target = ranked[0]
     why = reason_of(ranked, cache, now)
     if beyond:
@@ -1520,7 +1674,9 @@ def report(cfg, db, book, *, now: float | None = None,
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
                 # #1075/#1028 : le rythme du compte, pour les affichages qui
-                # lisent ses jauges hors d'`evaluate` (cost.report, progress)
+                # lisent ses jauges hors d'`evaluate` (cost.report, progress) ;
+                # #1227 N3 : ces lecteurs recalculent le plafond de rythme du
+                # compte, pas seulement sa valeur
                 "pace_multiplier": profile.pace_multiplier,
                 # L226b: failover order and overage flags
                 "priority": priority(profile),
