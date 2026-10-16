@@ -9336,8 +9336,89 @@ def _signal_label(signum: int) -> str:
         return str(signum)
 
 
+def _message_remplacement(message: str) -> None:
+    """#2032 : diagnostic du chemin de remplacement, jamais bloquant.
+
+    Le journal est fermé (`_sortie_sure`) et un tube plein ne doit pas retenir
+    l'arrêt : écriture best-effort sur stderr, `EAGAIN` perdu (même doctrine
+    que `_ecrire_sans_attendre`)."""
+    _ecrire_sans_attendre(2, (message + "\n").encode("utf-8", "replace"))
+
+
+class _CaptureArret:
+    """#2032 : capte un signal d'arrêt pendant la remise au défaut.
+
+    Fenêtre de quelques µs : un signal d'arrêt est livré, le gestionnaire C de
+    CPython lève son drapeau, puis `signal.signal(sig, SIG_DFL)` remplace le
+    gestionnaire avant que le gestionnaire Python n'ait tourné — le drapeau
+    part avec le gestionnaire et l'arrêt est perdu : l'image neuve reprend des
+    tours et l'unité reste `deactivating` (même incident que #2009). Le tube
+    d'éveil (`signal.set_wakeup_fd`) reçoit le numéro du signal du gestionnaire
+    C lui-même, **à la livraison** ; sa lecture après la remise au défaut
+    prouve l'arrêt, que le gestionnaire Python ait tourné ou non. Le tube
+    d'éveil précédent, s'il en existait un, est rendu à l'identique ; hors du
+    fil principal (tests), l'armement est simplement sans effet.
+    """
+
+    def __init__(self) -> None:
+        self.lu = -1
+        self.ecrit = -1
+        self.ancien = -1
+
+    def armer(self) -> None:
+        """Arme le tube d'éveil ; jamais d'exception (chemin d'arrêt)."""
+        try:
+            lu, ecrit = os.pipe()
+        except OSError:
+            return
+        try:
+            os.set_blocking(lu, False)
+            os.set_blocking(ecrit, False)
+            ancien = signal.set_wakeup_fd(ecrit, warn_on_full_buffer=False)
+        except (OSError, ValueError, AttributeError):
+            for fd in (lu, ecrit):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            return
+        self.lu, self.ecrit, self.ancien = lu, ecrit, ancien
+
+    def arret_vu(self) -> bool:
+        """Vide le tube ; vrai si un signal d'arrêt y est tombé."""
+        if self.lu < 0:
+            return False
+        vu = False
+        while True:
+            try:
+                data = os.read(self.lu, 64)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not data:
+                break
+            vu = vu or any(octet in STOP_SIGNALS for octet in data)
+        return vu
+
+    def fermer(self) -> None:
+        """Rend le tube d'éveil précédent et ferme les descripteurs."""
+        if self.ecrit >= 0:
+            try:
+                signal.set_wakeup_fd(self.ancien)
+            except (OSError, ValueError, AttributeError):
+                pass
+        for fd in (self.lu, self.ecrit):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.lu = self.ecrit = self.ancien = -1
+
+
 def _replace_image_or_stop(runner) -> int:
-    """L790/L2009 : remplacement d'image entre deux tours, ou sortie propre.
+    """L790/L2009/#2032 : remplacement d'image entre deux tours, ou sortie propre.
 
     Un signal d'arrêt reçu pendant que l'exécuteur se remplace ne doit jamais
     être perdu (incident #2009 : `systemctl restart` concurrent du redémarrage
@@ -9347,14 +9428,17 @@ def _replace_image_or_stop(runner) -> int:
     signal reçu ensuite tue le processus — l'arrêt demandé est honoré — au lieu
     d'être consommé par le gestionnaire de l'image sortante. Le contrôle qui
     suit la remise au défaut rattrape un gestionnaire déjà déclenché dont
-    l'effet (drainage, retrait médié) n'était pas encore visible. Rend le code
-    de sortie quand l'`exec` échoue (le service relance)."""
+    l'effet (drainage, retrait médié) n'était pas encore visible. #2032 : le
+    tube d'éveil armé avant la remise au défaut capte en plus le signal livré
+    dans la fenêtre, même si le gestionnaire Python est remplacé avant d'avoir
+    tourné — la course de quelques µs ne perd plus l'arrêt. Rend le code de
+    sortie quand l'`exec` échoue (le service relance)."""
     if runner is not None and runner.stop_on_signal():
-        # Le journal est déjà fermé (`_sortie_sure`) : écriture directe, comme
-        # le message du remplacement ; quelques octets, jamais bloquante.
-        print("agent-runner: image replacement cancelled: stop already requested",
-              file=sys.stderr, flush=True)
+        _message_remplacement("agent-runner: image replacement cancelled: "
+                              "stop already requested")
         return 0
+    capture = _CaptureArret()
+    capture.armer()
     anciens = {}
     for sig in STOP_SIGNALS:
         try:
@@ -9363,15 +9447,24 @@ def _replace_image_or_stop(runner) -> int:
             pass
     try:
         if runner is not None and runner.stop_on_signal():
-            print("agent-runner: image replacement cancelled: stop requested "
-                  "during the replacement", file=sys.stderr, flush=True)
+            _message_remplacement("agent-runner: image replacement cancelled: "
+                                  "stop requested during the replacement")
+            return 0
+        if capture.arret_vu():
+            _message_remplacement("agent-runner: image replacement cancelled: "
+                                  "stop delivered during the replacement")
             return 0
         _restart_with_installed_code()
     finally:
         # Atteint seulement si l'`exec` n'a pas remplacé l'image (échec) ou si
-        # un arrêt a été rattrapé : on rend les dispositions d'avant.
+        # un arrêt a été rattrapé : on rend le tube d'éveil et les dispositions
+        # d'avant.
+        capture.fermer()
         for sig, ancien in anciens.items():
-            signal.signal(sig, ancien)
+            try:
+                signal.signal(sig, ancien)
+            except ValueError:  # hors du fil principal (tests)
+                pass
     return EXIT_RESTART
 
 
@@ -9649,18 +9742,19 @@ def _restart_with_installed_code() -> bool:
     avec les mêmes arguments et le même environnement, sans passer par un
     superviseur. Rend `False` si le remplacement échoue, ou si le mode d'appel
     n'est pas rejouable (l'appelant sort alors en `EXIT_RESTART`, que le
-    service relance)."""
+    service relance). #2032 : les diagnostics de ce chemin n'attendent jamais
+    le puits (`_message_remplacement`)."""
     argv = _restart_argv()
     if not argv:
-        print("agent-runner: outdated code — invocation mode not replayable "
-              "(python < 3.10): the service must restart it", file=sys.stderr, flush=True)
+        _message_remplacement("agent-runner: outdated code — invocation mode not "
+                              "replayable (python < 3.10): the service must restart it")
         return False
-    print("agent-runner: outdated code — restarting with the installed package",
-          file=sys.stderr, flush=True)
+    _message_remplacement("agent-runner: outdated code — restarting with the "
+                          "installed package")
     try:
         os.execv(argv[0], argv)
     except OSError as exc:
-        print("agent-runner: restart failed: %s" % exc, file=sys.stderr, flush=True)
+        _message_remplacement("agent-runner: restart failed: %s" % exc)
         return False
     return True
 

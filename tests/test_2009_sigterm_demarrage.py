@@ -22,6 +22,13 @@ Témoins : unités déterministes (le signal est posé par la doublure de
 connexion, ou pendant le remplacement), bout en bout (connexion de démarrage
 ralentie par `sitecustomize`, vrai SIGTERM), et le témoin attendu du lot — un
 réveil courrier pendant le drainage ne lance aucun tour.
+
+#2032 (suite) : la fenêtre de quelques µs entre la livraison d'un signal et la
+remise au défaut pouvait encore perdre l'arrêt si le gestionnaire Python
+n'avait pas tourné avant d'être remplacé. Un tube d'éveil
+(`signal.set_wakeup_fd`) reçoit l'octet du gestionnaire C à la livraison et
+survit à la remise au défaut ; les diagnostics du chemin de remplacement
+n'attendent plus le puits.
 """
 from __future__ import annotations
 
@@ -168,6 +175,183 @@ class ReplaceImageOrStopTest(unittest.TestCase):
         self.assertIs(vus["int"], signal.SIG_DFL)
         self.assertIs(signal.getsignal(signal.SIGTERM), temoin,
                       "les dispositions d'avant sont rendues quand l'exec échoue")
+
+
+class CaptureArretPendantLeRemplacementTest(unittest.TestCase):
+    """#2032 : la remise au défaut ne perd plus un arrêt livré dans la fenêtre.
+
+    La course : le gestionnaire C de CPython note le signal, puis
+    `signal.signal(sig, SIG_DFL)` remplace le gestionnaire Python avant qu'il
+    n'ait tourné — le drapeau part avec lui. Le tube d'éveil reçoit l'octet du
+    gestionnaire C lui-même, à la livraison, et survit à la remise au défaut.
+    """
+
+    def _capture(self):
+        capture = runner_mod._CaptureArret()
+        self.addCleanup(capture.fermer)
+        return capture
+
+    def _temoin(self, signum=signal.SIGTERM):
+        """Gestionnaire muet, rendu à la fin du témoin."""
+        def muet(_signum, _frame):
+            pass
+
+        ancien = signal.signal(signum, muet)
+        self.addCleanup(signal.signal, signum, ancien)
+
+    def test_octet_ecrit_a_la_livraison_avant_le_gestionnaire_python(self):
+        capture = self._capture()
+        vus = {}
+
+        def temoin(_signum, _frame):
+            vus["vu"] = capture.arret_vu()
+
+        ancien = signal.signal(signal.SIGTERM, temoin)
+        self.addCleanup(signal.signal, signal.SIGTERM, ancien)
+        capture.armer()
+        os.kill(os.getpid(), signal.SIGTERM)
+        self.assertTrue(vus.get("vu"),
+                        "le tube d'éveil est écrit par le gestionnaire C, avant "
+                        "que le gestionnaire Python ne tourne")
+
+    def test_arret_livre_survit_a_la_remise_au_defaut(self):
+        capture = self._capture()
+        self._temoin()
+        capture.armer()
+        os.kill(os.getpid(), signal.SIGTERM)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)  # la remise au défaut
+        self.assertTrue(capture.arret_vu(),
+                        "l'arrêt livré ne doit pas partir avec le gestionnaire Python")
+
+    def test_aucun_arret_sans_signal(self):
+        capture = self._capture()
+        capture.armer()
+        self.assertFalse(capture.arret_vu())
+
+    def test_signal_etranger_n_est_pas_un_arret(self):
+        capture = self._capture()
+        self._temoin(signal.SIGUSR1)
+        capture.armer()
+        os.kill(os.getpid(), signal.SIGUSR1)
+        self.assertFalse(capture.arret_vu(), "seuls SIGTERM/SIGINT sont des arrêts")
+
+
+class _CaptureDoublure:
+    """Doublure du tube d'éveil : l'ordre et le verdict sont ce qu'on vérifie."""
+
+    def __init__(self, *, vu: bool = False, journal: list | None = None) -> None:
+        self.vu = vu
+        self.journal = journal if journal is not None else []
+        self.arme = False
+        self.ferme = False
+
+    def armer(self) -> None:
+        self.arme = True
+        self.journal.append("armer")
+
+    def arret_vu(self) -> bool:
+        return self.vu
+
+    def fermer(self) -> None:
+        self.ferme = True
+
+
+class CaptureBranchement2032Test(unittest.TestCase):
+    """#2032 : la capture est armée avant la remise au défaut et fait sortir en 0."""
+
+    def test_capture_armee_avant_la_remise_au_defaut(self):
+        journal: list = []
+        capture = _CaptureDoublure(journal=journal)
+
+        def faux_signal(signum, handler):
+            journal.append(("signal", signum, handler))
+            return signal.SIG_DFL
+
+        with mock.patch.object(runner_mod, "_CaptureArret", return_value=capture), \
+                mock.patch.object(runner_mod.signal, "signal",
+                                  side_effect=faux_signal), \
+                mock.patch.object(runner_mod, "_restart_with_installed_code",
+                                  return_value=False), \
+                mock.patch.object(runner_mod, "_message_remplacement"):
+            self.assertEqual(runner_mod._replace_image_or_stop(_FakeRunner()),
+                             runner_mod.EXIT_RESTART)
+        self.assertEqual(journal[0], "armer",
+                         "le tube doit être armé avant la remise au défaut")
+        remises = [entree[1] for entree in journal[1:] if entree[0] == "signal"]
+        self.assertEqual(remises[:len(runner_mod.STOP_SIGNALS)],
+                         list(runner_mod.STOP_SIGNALS))
+        self.assertEqual(len(remises), 2 * len(runner_mod.STOP_SIGNALS),
+                         "les dispositions d'avant sont rendues dans le `finally`")
+        self.assertTrue(capture.ferme, "le tube d'éveil est rendu dans tous les cas")
+
+    def test_arret_capture_pendant_le_remplacement_fait_sortir_en_zero(self):
+        capture = _CaptureDoublure(vu=True)
+        with mock.patch.object(runner_mod, "_CaptureArret", return_value=capture), \
+                mock.patch.object(runner_mod, "_restart_with_installed_code") as restart, \
+                mock.patch.object(runner_mod, "_message_remplacement"):
+            self.assertEqual(runner_mod._replace_image_or_stop(_FakeRunner()), 0)
+        restart.assert_not_called()
+        self.assertTrue(capture.arme)
+        self.assertTrue(capture.ferme)
+
+
+class RemplacementSansAttenteTest(unittest.TestCase):
+    """#2032 : le diagnostic du chemin de remplacement n'attend jamais le puits."""
+
+    @staticmethod
+    def _tube_plein():
+        """Remplit un tube sans toucher au mode du descripteur partagé."""
+        r, w = os.pipe()
+        ecrits = [0]
+        copie = os.dup(w)
+
+        def remplir() -> None:
+            try:
+                while True:
+                    os.write(copie, b"x")
+                    ecrits[0] += 1
+            except OSError:
+                pass
+            finally:
+                os.close(copie)
+
+        threading.Thread(target=remplir, daemon=True,
+                         name="remplir-tube-2032").start()
+        dernier, stable = -1, time.monotonic()
+        while time.monotonic() - stable < 0.3:
+            time.sleep(0.05)
+            if ecrits[0] != dernier:
+                dernier, stable = ecrits[0], time.monotonic()
+        assert ecrits[0] > 0, "tube non rempli"
+        return r, w
+
+    def test_ecriture_sans_attendre_tube_plein(self):
+        r, w = self._tube_plein()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        debut = time.monotonic()
+        runner_mod._ecrire_sans_attendre(w, b"diagnostic\n")
+        self.assertLess(time.monotonic() - debut, 1.0,
+                        "un tube plein ne doit pas retenir le diagnostic")
+
+    def test_message_de_remplacement_sans_attente(self):
+        with mock.patch.object(runner_mod, "_ecrire_sans_attendre") as ecrire:
+            runner_mod._message_remplacement("agent-runner: essai")
+        ecrire.assert_called_once_with(2, b"agent-runner: essai\n")
+
+    def test_remplacement_utilise_l_ecriture_sans_attente(self):
+        with mock.patch.object(runner_mod, "_ecrire_sans_attendre") as ecrire, \
+                mock.patch.object(runner_mod, "_restart_with_installed_code") as restart:
+            self.assertEqual(
+                runner_mod._replace_image_or_stop(_FakeRunner(draining=True)), 0)
+        restart.assert_not_called()
+        self.assertEqual(ecrire.call_args[0][0], 2)
+
+    def test_restart_utilise_l_ecriture_sans_attente(self):
+        with mock.patch.object(runner_mod, "_restart_argv", return_value=[]), \
+                mock.patch.object(runner_mod, "_ecrire_sans_attendre") as ecrire:
+            self.assertFalse(runner_mod._restart_with_installed_code())
+        self.assertEqual(ecrire.call_args[0][0], 2)
 
 
 class RunnerStopOnSignalTest(unittest.TestCase):
