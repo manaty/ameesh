@@ -362,7 +362,12 @@ class PriseDeLotTest(_Lots):
             {"state": "intake", "lot_team": "web", "planned_start": "2026-10-11"},
             "2026-10-11"))
 
-    def test_equipe_du_lot_fiche_puis_application(self):
+    def test_prise_par_le_projet_du_lot_pas_par_l_equipe_de_la_fiche(self):
+        """#811 : la prise suit le projet du lot (`app` d'abord, comme le
+        dossier de travail et `projects.lot_project`) ; `lot_team` (équipe du
+        lot, sinon de sa fiche ou de la fiche parente, sinon son application)
+        reste lu pour le personnel et les alertes, il ne route plus la prise —
+        la garde L243 « projet primaire » est levée."""
         self.agent("web1", team="web")
         self.agent("api1", team="api")
         self.db.execute("INSERT INTO work_packages (id, kind, title, team, canon_ref)"
@@ -374,13 +379,33 @@ class PriseDeLotTest(_Lots):
         sans_equipe = self.lot("sans équipe", app="")
         par_app = self.lot("par l'application", app="api")
         rows = {i["id"]: i for i in storage.of(self.db).work.unassigned_lots(10)}
+        # lot_team : équipe de la fiche puis application (stockage inchangé).
         self.assertEqual(rows[par_fiche["id"]]["lot_team"], "web")
         self.assertEqual(rows[par_app["id"]]["lot_team"], "api")
         self.assertIsNone(rows[sans_equipe["id"]]["lot_team"])
         out = self.take()
+        # `par_fiche` a pour projet `app=api` : api1 le prend (le plus ancien
+        # des deux lots api) ; web1 ne déclare pas api et ne prend rien.
         self.assertEqual(sorted((t["agent"], t["item"]["id"]) for t in out),
-                         [("api1", par_app["id"]), ("web1", par_fiche["id"])])
+                         [("api1", par_fiche["id"])])
+        # `par_app` reste à la file : api1 tient déjà un lot non démarré (#540).
+        self.assertIsNone(work.get(self.db, par_app["id"])["assignee"])
         self.assertIsNone(work.get(self.db, sans_equipe["id"])["assignee"])
+
+    def test_prise_sans_app_par_l_equipe_du_lot(self):
+        """#811 : sans `app`, le projet du lot retombe sur son équipe
+        (`backlog._lot_project`), et c'est l'agent de cette équipe qui le
+        prend — le repli d'équipe ne disparaît pas avec l'arbitrage projet."""
+        self.agent("web1", team="web")
+        self.agent("api1", team="api")
+        sans_app = self.lot("sans app, équipe web", app="")
+        self.db.execute("UPDATE work_items SET team = 'web' WHERE id = %s",
+                        (sans_app["id"],))
+        rows = {i["id"]: i for i in storage.of(self.db).work.unassigned_lots(10)}
+        self.assertEqual(rows[sans_app["id"]]["lot_team"], "web")
+        out = self.take()
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("web1", sans_app["id"])])
 
     def test_capacites_et_harnais(self):
         self.agent("claude1", team="nexlink", capabilities=["read"])
