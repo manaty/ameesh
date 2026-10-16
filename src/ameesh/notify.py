@@ -111,6 +111,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "ci_runner_stuck", "ci_queue_saturated",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
                  "host_disk_low",
+                 # #2022 : un volume presque plein, ou au plancher de pause bientôt
+                 "host_disk_soon_full",
                  # L225 : des tours sans tarif au barème échappent à la dépense
                  "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
@@ -212,6 +214,7 @@ TYPE_LABELS = {
     "ci_queue_saturated": "CI queue beyond its SLO",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
+    "host_disk_soon_full": "disk almost full, or filling up",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",
     "docker_build_cache": "Docker reclaimable build cache above threshold",
     "docker_storage_unavailable": "Docker storage inventory unavailable",

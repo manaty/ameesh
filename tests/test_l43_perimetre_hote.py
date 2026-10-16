@@ -326,6 +326,9 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             # #246: btrfs floors, nobody declares them
             "min_btrfs_unallocated": resources.DEFAULT_MIN_BTRFS_UNALLOCATED,
             "min_btrfs_metadata_headroom": resources.DEFAULT_MIN_BTRFS_METADATA_HEADROOM,
+            # #2022: early disk warning, nobody declares it
+            "warn_disk_used": resources.DEFAULT_WARN_DISK_USED,
+            "warn_disk_free": resources.DEFAULT_WARN_DISK_FREE,
         })
         self.assertEqual(got["max_agents"], 3)
         self.assertEqual(got["origin"], {
@@ -337,6 +340,8 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "max_cpu_pressure": resources.DEFAULT_ORIGIN,
             "min_btrfs_unallocated": resources.DEFAULT_ORIGIN,
             "min_btrfs_metadata_headroom": resources.DEFAULT_ORIGIN,
+            "warn_disk_used": resources.DEFAULT_ORIGIN,
+            "warn_disk_free": resources.DEFAULT_ORIGIN,
             "max_agents": ID_T})
         self.assertEqual(got["fiches"], [ID_A, ID_T])
         # une fiche qui se tait n'impose pas le défaut à celle qui déclare

@@ -89,10 +89,25 @@ POWER_KEYS = ("min_battery_percent", "stop_battery_percent")
 #: on 10/10 a load of 43 for 12 CPU did not say how badly the workstation
 #: suffered, the PSI does. No default: a host declares it in its Host fiche.
 PRESSURE_KEYS = ("max_cpu_pressure",)
+#: #2022: early disk warning, well before `min_disk_free` pauses the agents
+#: (16/10: agents-1 reached 99 %, 11 agents paused, nobody warned before).
+#: A WARNING only: it alerts, it never closes a turn. Used share or free
+#: space, whichever comes first, on every volume.
+WARN_KEYS = ("warn_disk_used", "warn_disk_free")
+DEFAULT_WARN_DISK_USED = 0.85
+DEFAULT_WARN_DISK_FREE = 15 * 1024 ** 3
+#: #2022: the trend — `min_disk_free` reached within this horizon, by a least
+#: squares fit of the volume's free space over the last readings (critical
+#: within the shorter one); the fit needs enough points over enough time
+DISK_TREND_WINDOW_S = 6 * 3600.0
+DISK_TREND_HORIZON_S = 24 * 3600.0
+DISK_TREND_CRITICAL_S = 6 * 3600.0
+DISK_TREND_MIN_POINTS = 6
+DISK_TREND_MIN_SPAN_S = 3600.0
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
 THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
                   "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS,
-                  *BTRFS_KEYS)
+                  *BTRFS_KEYS, *WARN_KEYS)
 #: L159c : plafonds mémoire des unités d'agent, dans `policy.resources` aussi.
 #: Ce ne sont pas des seuils de contre-pression : systemd les fait respecter
 #: (`MemoryMax`), `ameesh doctor` vérifie l'écart entre le canon et l'unité.
@@ -105,7 +120,7 @@ DEFAULT_AGENT_MEMORY_MAX = 6 * 1024 ** 3
 #: `MemoryHigh` (reprise de mémoire, ralentissement) à cette part du plafond dur
 AGENT_MEMORY_HIGH_RATIO = 0.9
 #: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
-FRACTION_KEYS = ("max_tmpfs_used",)
+FRACTION_KEYS = ("max_tmpfs_used", "warn_disk_used")
 #: dossier des sources d'alimentation (Linux) ; surchargé par les tests
 POWER_SUPPLY_ENV = "AMEESH_POWER_SUPPLY_DIR"
 POWER_SUPPLY_DIR = platform.host.POWER_SUPPLY_DIR
@@ -284,6 +299,17 @@ def disk_free(path: str | None) -> int | None:
         return None
     try:
         return int(shutil.disk_usage(path).free)
+    except OSError:
+        return None
+
+
+def disk_total(path: str | None) -> int | None:
+    """#2022: size of the filesystem holding `path` (the used share of the
+    early warning), None when unreadable."""
+    if not path:
+        return None
+    try:
+        return int(shutil.disk_usage(path).total)
     except OSError:
         return None
 
@@ -508,7 +534,8 @@ def volumes(paths) -> list[dict]:
     unreadable or not btrfs); `unreadable` when the filesystem cannot be
     reached at all (#306); `fstype` from the mount table (L64: a btrfs whose
     allocation is not read is told apart from a filesystem that has none),
-    None without one."""
+    None without one; `disk_total_bytes` (#2022: the used share of the early
+    warning)."""
     out: list[dict] = []
     seen: dict[str, dict] = {}
     mounts = platform.mountinfo() if platform.is_linux() else []
@@ -529,6 +556,7 @@ def volumes(paths) -> list[dict]:
         else:
             probe = _probe(path)
             volume["disk_free_bytes"] = disk_free(probe)
+            volume["disk_total_bytes"] = disk_total(probe)
             volume.update(btrfs_usage(probe))
         seen[key] = volume
         out.append(volume)
@@ -1050,6 +1078,8 @@ def thresholds(policy=None) -> dict:
     cpu_pressure = parse_percent(raw.get("max_cpu_pressure"))
     unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
     headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
+    warn_used = parse_fraction(raw.get("warn_disk_used"))
+    warn_free = parse_bytes(raw.get("warn_disk_free"))
     cpus = cpu_count() or 1
     return {
         "min_mem_available": DEFAULT_MIN_MEM_AVAILABLE if mem is None else mem,
@@ -1068,12 +1098,16 @@ def thresholds(policy=None) -> dict:
                                   else unallocated),
         "min_btrfs_metadata_headroom": (DEFAULT_MIN_BTRFS_METADATA_HEADROOM
                                         if headroom is None else headroom),
+        # #2022: early disk warning (never a pause)
+        "warn_disk_used": DEFAULT_WARN_DISK_USED if warn_used is None else warn_used,
+        "warn_disk_free": DEFAULT_WARN_DISK_FREE if warn_free is None else warn_free,
     }
 
 
 #: L43 (0031) : seuils PLANCHERS (plus strict = plus haut) ; les autres sont
 #: des plafonds (plus strict = plus bas)
-FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS, *BTRFS_KEYS)
+FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS, *BTRFS_KEYS,
+              "warn_disk_free")
 #: provenance d'une limite qu'aucune fiche Host ne déclare
 DEFAULT_ORIGIN = "défaut"
 
@@ -1245,6 +1279,95 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
                     "value": etat["battery_percent"], "limit": etat["min"],
                     "critical": False, "power": etat["state"]})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
+    return out
+
+
+def disk_floor_eta(points, floor: int) -> float | None:
+    """#2022: seconds until the free space reaches `floor`, by a least squares
+    fit of `points` ((ts, free bytes), any order) — None when the fit has too
+    few points or too short a span (`DISK_TREND_MIN_*`), or when the space is
+    not shrinking; 0 when already at or under the floor. Counted from the
+    last point."""
+    pts = sorted((float(ts), float(free)) for ts, free in points or ()
+                 if ts is not None and free is not None)
+    if len(pts) < DISK_TREND_MIN_POINTS or pts[-1][0] - pts[0][0] < DISK_TREND_MIN_SPAN_S:
+        return None
+    n = len(pts)
+    mean_t = sum(t for t, _f in pts) / n
+    mean_f = sum(f for _t, f in pts) / n
+    var = sum((t - mean_t) ** 2 for t, _f in pts)
+    if var <= 0:
+        return None
+    slope = sum((t - mean_t) * (f - mean_f) for t, f in pts) / var
+    if slope >= 0:
+        return None
+    # from the fitted value at the last point: one noisy last reading does
+    # not move the estimate
+    fitted = mean_f + slope * (pts[-1][0] - mean_t)
+    return max(0.0, (fitted - floor) / -slope)
+
+
+def _volume_series(history, path: str) -> list[tuple[float, int]]:
+    """(ts, free) of the volume `path` along `history` (readings); a reading
+    from before 0359 (no `volumes`) counts when its `disk_path` is `path`."""
+    out = []
+    for past in history or ():
+        ts = past.get("sampled_ts")
+        vols = past.get("volumes") or []
+        match = next((v for v in vols if isinstance(v, dict) and (
+            v.get("path") == path or path in (v.get("paths") or ()))), None)
+        if match is not None:
+            out.append((ts, match.get("disk_free_bytes")))
+        elif not vols and past.get("disk_path") == path:
+            out.append((ts, past.get("disk_free_bytes")))
+    return out
+
+
+def disk_warnings(reading: dict, limits: dict, history=()) -> list[dict]:
+    """#2022: the volumes of `reading` to warn about BEFORE `min_disk_free`
+    pauses the agents, one entry per volume: `path`, `free`, `total`,
+    `used` (share, None without a total), `reasons` (`used`: share at or
+    over `warn_disk_used`; `free`: under `warn_disk_free`; `trend`: the floor
+    reached within `DISK_TREND_HORIZON_S` by the fit of `history`, the
+    readings of the last `DISK_TREND_WINDOW_S`), `floor_eta_s` (None without
+    a trend) and `critical` (floor already crossed, or reached within
+    `DISK_TREND_CRITICAL_S`). A warning, never a breach: `pressure` ignores
+    it. A volume without a reading is skipped: nothing is guessed."""
+    floor = limits.get("min_disk_free") or 0
+    warn_used = limits.get("warn_disk_used")
+    warn_free = limits.get("warn_disk_free")
+    vols = reading.get("volumes") or []
+    if not vols and reading.get("disk_free_bytes") is not None:
+        vols = [{"path": reading.get("disk_path"),
+                 "disk_free_bytes": reading.get("disk_free_bytes")}]
+    out = []
+    for vol in vols:
+        free = vol.get("disk_free_bytes") if isinstance(vol, dict) else None
+        if free is None:
+            continue
+        total = vol.get("disk_total_bytes")
+        used = (1.0 - free / total) if total else None
+        reasons = []
+        if used is not None and warn_used is not None and used >= warn_used:
+            reasons.append("used")
+        if warn_free is not None and free < warn_free:
+            reasons.append("free")
+        series = _volume_series(history, vol.get("path"))
+        if reading.get("sampled_ts") is not None:
+            series.append((reading["sampled_ts"], free))
+        eta = disk_floor_eta(series, floor)
+        if eta is not None and eta <= DISK_TREND_HORIZON_S:
+            reasons.append("trend")
+        else:
+            eta = None
+        if not reasons:
+            continue
+        out.append({"path": vol.get("path"), "free": free, "total": total, "used": used,
+                    "reasons": reasons, "floor_eta_s": eta,
+                    "critical": free < floor or (eta is not None
+                                                 and eta <= DISK_TREND_CRITICAL_S)})
+    out.sort(key=lambda w: (not w["critical"], w["floor_eta_s"] is None,
+                            w["floor_eta_s"] or 0.0, w["free"]))
     return out
 
 
