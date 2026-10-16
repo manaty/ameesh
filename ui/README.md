@@ -134,7 +134,8 @@ The theme goes through public CSS tokens (`--ameesh-color-page`,
 * `docs/ui/CONTRAT-HOTE.md` — the host contract, in detail;
 * `docs/ui/GUIDE-ELECTRON.md` — preload, partitions per mesh, notifications, CSP;
 * `docs/ui/GUIDE-PAGE-WEB.md` — ES module, SRI, CORS, token provider;
-* `ui/examples/` — a fictional organisation, opened with the components.
+* `ui/examples/acme-mesh/` — a fictional organisation, opened with the components
+  (`node ui/examples/acme-mesh/fixtures-server.mjs`).
 
 ## Develop
 
