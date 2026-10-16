@@ -386,7 +386,9 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
     run on the exact head, green, its jobs included (`skipped`/`neutral`/unread
     jobs certify nothing). QueueError otherwise (no run, running, missing, red,
     unreadable); `full_ci` reads the runs (`radar.full_suite_ci` by default
-    when the project has a GitHub repo)."""
+    when the project has a GitHub repo). Une suite non **déclarée** est refusée
+    pour ce qu'elle est — la clé `radar.projects.<p>.full_suite` manquante —,
+    jamais comme une lecture gh impossible (#886)."""
     from . import plan_github, radar
     who = "lot #%s" % lot if lot is not None else "this lot"
     reader = full_ci
@@ -395,6 +397,14 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
             raise QueueError("%s is class release: no full-suite reader (project without a "
                              "GitHub repository) — a full run on the frozen head %s is required"
                              % (who, sha[:12]))
+        if not tuple(getattr(project, "full_suite", ()) or ()):
+            # #886 (P3, R2 mty-amh-qa-01 sur PR manaty/ameesh#633) : une
+            # déclaration manquante n'est pas une panne de lecture ; le message
+            # nomme la clé et ne renvoie pas à « once gh works ».
+            raise QueueError("%s is class release: project %s declares no full suite "
+                             "(radar.projects.%s.full_suite — the workflow files of the full "
+                             "run): a green full-suite run on the frozen head %s is required"
+                             % (who, project.name, project.name, sha[:12]))
         reader = lambda one: radar.full_suite_ci(project, one)
     try:
         runs = reader(sha)
