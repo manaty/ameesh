@@ -60,8 +60,10 @@ L125 :
   hérité ;
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
   fenêtre de 90 s du courrier) ;
-* verdict (vert, ou rouge avec la liste) : un événement ordinaire ; rien pour
-  une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
+* verdict (vert, ou rouge avec la liste) : un événement **urgent** (#795) —
+  la fin de CI perce le tour en cours ; le courrier et la référence qui le
+  rend vérifiable (`ci_runs.verdict_message_id`) sont publiés dans la même
+  transaction (#795 N2) ; rien pour une exécution annulée ou remplacée ; le verdict nomme le workflow et, quand
   d'autres workflows de la même tête tournent encore, le dit — un vert de
   `backend-suite.yml` n'est pas « la CI est verte » ;
 * **rouge hérité** : un test qui échouait déjà à la dernière exécution conclue
@@ -80,6 +82,7 @@ Le réessai d'un échec (étude : « premier échec confirmé ») n'est pas enco
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from datetime import datetime
@@ -516,9 +519,11 @@ def pending_text(run: dict, lot: dict | None, waited: float, cancelled: list[int
 
 
 def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
-          urgent: bool) -> int:
+          urgent: bool, after_commit: list | None = None) -> int:
     """Envoie ; un texte refusé comme illisible (extrait binaire ou encodé)
-    part sans ses extraits."""
+    part sans ses extraits. `after_commit` (une liste) : l'écriture du fil y
+    est ajoutée, à exécuter par l'appelant après le commit de sa transaction
+    (#795 N2)."""
     from . import mail, work
     from .fil import UnreadableBody
     body = dict(payload)
@@ -526,10 +531,43 @@ def _send(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
         body["urgent"] = True
     try:
         return mail.send(db, work.SYSTEM_SENDER, to, text, kind="event",
-                         work_item_id=str(lot) if lot else None, payload=body)
+                         work_item_id=str(lot) if lot else None, payload=body,
+                         after_commit=after_commit)
     except UnreadableBody:
         return mail.send(db, work.SYSTEM_SENDER, to, short, kind="event",
-                         work_item_id=str(lot) if lot else None, payload=body)
+                         work_item_id=str(lot) if lot else None, payload=body,
+                         after_commit=after_commit)
+
+
+@contextlib.contextmanager
+def _atomic(db):
+    """#795 N2 : la transaction qui porte le courrier et sa preuve.
+
+    Le trigger `agent_mailbox` n'émet son `pg_notify` qu'au commit : un
+    lecteur ne voit donc le courrier qu'une fois `ci_runs.urgent_message_id`
+    ou `verdict_message_id` écrit, et `_system_event_interrupt` l'accepte.
+    Un exécuteur médié (L109) n'a pas de transaction : ses opérations restent
+    séquentielles (pas de NOTIFY local à intercaler)."""
+    if storage.is_remote(db):
+        yield db
+        return
+    with db.transaction() as tx:
+        yield tx
+
+
+def _send_posed(db, to: str, text: str, short: str, *, lot: int | None, payload: dict,
+                urgent: bool, pose) -> int:
+    """Dépose le courrier de l'événement et pose sa preuve dans la même
+    transaction : `pose(stockage, message_id)` écrit la référence relue par
+    l'exécuteur. Le fil externe n'est écrit qu'après le commit."""
+    threads: list = []
+    with _atomic(db) as tx:
+        message_id = _send(tx, to, text, short, lot=lot, payload=payload,
+                           urgent=urgent, after_commit=threads)
+        pose(storage.of(tx), message_id)
+    for record in threads:
+        record(db.cfg, db)
+    return message_id
 
 
 def recipient_of(lot: dict | None) -> str | None:
@@ -1379,12 +1417,18 @@ class Watcher:
                           "tests": [f["test"] for f in own]}}
         if unknown_base:
             payload["ci_passif"] = True
-        message_id = _send(db, to, text, short, lot=lot["id"], payload=payload, urgent=urgent)
-        if urgent:
-            st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
-            row["urgent_message_id"] = message_id
-        st.ci.set_failure_message(repo, run_id, attempt,
-                                  [(f["part"], f["test"]) for f in own], message_id)
+        def pose(st, message_id: int) -> None:
+            if urgent:
+                st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
+                row["urgent_message_id"] = message_id
+            st.ci.set_failure_message(repo, int(row["run_id"]), attempt,
+                                      [(f["part"], f["test"]) for f in own], message_id)
+
+        # #795 N2 : le courrier et sa preuve (`urgent_message_id`, `message_id`
+        # des échecs) dans la même transaction : le NOTIFY du courrier n'est
+        # délivré qu'au commit, quand l'exécuteur peut déjà le vérifier.
+        message_id = _send_posed(db, to, text, short, lot=lot["id"], payload=payload,
+                                 urgent=urgent, pose=pose)
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
@@ -1444,8 +1488,16 @@ class Watcher:
                           "attempt": int(view.get("run_attempt") or 1),
                           "failures": len([f for f in failures if not f.get("inherited")]),
                           "inherited": len([f for f in failures if f.get("inherited")])}}
-        message_id = _send(db, to, text, text, lot=lot["id"], payload=payload, urgent=False)
-        st.ci.set_message(repo, int(row["run_id"]), "verdict", message_id)
+        # #795 : la fin de CI est un événement qui perce le tour en cours
+        # (0018 §2) — le verdict (vert ou rouge) part urgent, comme la première
+        # alerte d'échec. L'exécuteur ne le préempte que s'il est vérifiable en
+        # base (`interrupt_allowed` : exécution relevée + lot de l'agent).
+        # #795 N2 : le courrier du verdict et `verdict_message_id` dans la même
+        # transaction, sans quoi un relevé intercalé refuse la préemption.
+        message_id = _send_posed(
+            db, to, text, text, lot=lot["id"], payload=payload, urgent=True,
+            pose=lambda st, mid: st.ci.set_message(repo, int(row["run_id"]),
+                                                   "verdict", mid))
         return [{"action": "verdict", "repo": repo, "run_id": row["run_id"], "status": status,
                  "to": to, "message_id": message_id}]
 
