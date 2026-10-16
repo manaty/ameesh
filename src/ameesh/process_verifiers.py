@@ -840,7 +840,9 @@ def context_command(context: Any) -> Command:
 
 def _context_sources(context: Any) -> Mapping:
     """Les sources lues par B : attribut `sources`, lecteur du contexte, ou
-    `read_sources` publie par `process_registry`. Aucune lecture SQL ici."""
+    `read_sources(context) -> Mapping` publie par `process_registry` (convention
+    confirmee par le pilote le 16/10, lue dans sa transaction, sources
+    reellement disponibles seulement). Aucune lecture SQL ici."""
     sources = getattr(context, "sources", None)
     if isinstance(sources, Mapping):
         return sources

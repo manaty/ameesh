@@ -7,8 +7,11 @@ from_stage, to_stage). B reste seul a lire les sources ; C ne lit rien.
 """
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from ameesh.process_verifiers import (GUARD_NAMES, RESERVED_VERIFIERS,
                                       context_command, context_snapshot,
@@ -185,6 +188,30 @@ class SeamTest(unittest.TestCase):
         self.assertEqual(snapshot.revision, REV)
         self.assertIn("milestones", snapshot.sources)
         self.assertNotIn("observations", snapshot.sources)
+
+    def test_sources_par_read_sources_du_module(self):
+        """La convention confirmee par le pilote : process_registry.read_sources
+        (context) -> Mapping, lu dans la transaction de B."""
+        import ameesh
+        module = types.ModuleType("ameesh.process_registry")
+        calls = []
+
+        def read_sources(context):
+            calls.append(context)
+            return {"milestones": ({"kind": "frozen", "sha": REV},)}
+
+        module.read_sources = read_sources
+        without = SimpleNamespace(db=object(), work_item=item(),
+                                  command=command(), spec=object(),
+                                  from_stage="work", to_stage="next")
+        with mock.patch.dict(sys.modules,
+                             {"ameesh.process_registry": module}):
+            snapshot = context_snapshot(without)
+        if getattr(ameesh, "process_registry", None) is module:
+            delattr(ameesh, "process_registry")
+        self.assertEqual(calls, [without])
+        self.assertEqual(snapshot.revision, REV)
+        self.assertIn("milestones", snapshot.sources)
 
     def test_seam_avec_le_vrai_process_registry(self):
         """Le jour ou B est fusionne, l'appelable rend son Verification reel."""
