@@ -531,7 +531,10 @@ live attestation (exact keys `target_sha256` of the enrolled `restore_dsn`,
 unusable after five minutes, `CAPACITY_TTL_SECONDS`) must cover twice the
 pinned uncompressed source size
 (`source_bytes` in the inventory) on top of the release disk floor; a missing,
-stale, unsafe or differently bound attestation is refused the same way. The
+stale, unsafe or differently bound attestation is refused the same way. An
+inventory that carries no `source_bytes` (written before the K2 bound) is
+refused identically: the pair is recreated from the live source (a re-dump)
+before any copy, and no operator-declared size is accepted. The
 private staging download reserves the artifact size. Insufficient or
 unattested space is a definitive refusal, never a partial copy. `pin`
 registers those exact bytes before migration with the manifest rollback deadline
